@@ -159,9 +159,16 @@ export function consumeAccountSignupTicket(): string | null {
  * origin with the token in the fragment (the deployment points
  * `GAUGEDESK_OIDC_POST_LOGIN_URL` at this client).
  */
-export function beginLogin(controlPlaneBase: string): void {
+export function beginLogin(controlPlaneBase: string, provider?: string): void {
     if (typeof window === "undefined") return;
-    window.location.href = `${controlPlaneBase.replace(/\/+$/, "")}/auth/login`;
+    // Which consumer entrance was pressed (DR-0189 §1). Omitted means the
+    // deployment's first one, which is what every caller meant before there was
+    // more than one. Built as a separate query string so the navigation below
+    // keeps the literal path on it: `check-client-calls.mjs` reads the demand
+    // side of this route out of that literal, and a base assigned to a variable
+    // first is a route the check can no longer see anybody asking for.
+    const query = provider ? `?provider=${encodeURIComponent(provider)}` : "";
+    window.location.href = `${controlPlaneBase.replace(/\/+$/, "")}/auth/login${query}`;
 }
 
 export interface AccountRecoveryChallenge {
@@ -318,9 +325,31 @@ export interface PasskeyAccountCreated {
 /** What the signup page may know about a parked provider ticket before it asks
  *  for a passkey: the address the provider attested, and the name it offered. */
 export interface ConsumerSignupClaim {
+    /** The address to show. Proved when `emailProof` is `"attested"`; otherwise
+     *  a prefill the provider asserted and nothing has checked. */
     readonly email: string;
     readonly displayName: string | null;
     readonly provider: string;
+    /** What the button and the prose should call this provider. */
+    readonly providerLabel: string;
+    /** How step 1 of ADR 0146 §1 is satisfied here (DR-0189 §4). `"attested"`
+     *  is DR-0177's one-click creation; `"code"` means the person proves the
+     *  address with a code we send before anything is created. */
+    readonly emailProof: "attested" | "code";
+}
+
+/** The prose name for a provider slug, for a response that carried no label. */
+function providerLabelFor(slug: string): string {
+    switch (slug) {
+        case "google":
+            return "Google";
+        case "microsoft":
+            return "Microsoft";
+        case "apple":
+            return "Apple";
+        default:
+            return "your provider";
+    }
 }
 
 /** Read the non-secret projection of a signup ticket. Does not spend it. */
@@ -334,15 +363,26 @@ export async function claimConsumerSignup(
         { ticket },
         "That sign-in link has expired. Press Continue with Google again.",
     );
-    if (typeof body.email !== "string" || !body.email) {
+    const emailProof = body.email_proof === "code" ? "code" : "attested";
+    // An attested claim must carry its address; an unproved one need not, because
+    // a provider that attests nothing may also assert nothing usable.
+    if (emailProof === "attested" && (typeof body.email !== "string" || !body.email)) {
         throw new Error("Account authentication response is malformed.");
     }
     return {
-        email: body.email,
+        email: typeof body.email === "string" ? body.email : "",
         displayName: typeof body.display_name === "string" && body.display_name
             ? body.display_name
             : null,
         provider: typeof body.provider === "string" ? body.provider : "google",
+        providerLabel: typeof body.provider_label === "string" && body.provider_label
+            ? body.provider_label
+            // A control plane that predates DR-0189 sends no label. During a
+            // rolling deploy a new card can meet one, and "your provider" in
+            // place of "Google" would be a visible regression, so the slug
+            // answers for it.
+            : providerLabelFor(typeof body.provider === "string" ? body.provider : ""),
+        emailProof,
     };
 }
 
@@ -367,6 +407,55 @@ export async function completeConsumerSignup(
         "/auth/account/consumer-signup/complete",
         { ticket },
         "That sign-in link has expired. Press Continue with Google again.",
+    );
+    return createdAccount(finished);
+}
+
+/** Send a code to the address a provider-without-attestation signup will use.
+ *
+ * Entra ID emits no `email_verified` claim and its address claims are mutable,
+ * so the Microsoft entrance cannot take DR-0177's one-click path. Step 1 of ADR
+ * 0146 §1 is "verify an email address", not "send a code" — an emailed code is
+ * the other proof it already admits, and this is that proof (DR-0189 §4).
+ *
+ * The ticket is not spent here: a mistyped address or an undelivered code must
+ * leave the person able to try again rather than cross the provider twice. */
+export async function startConsumerSignupEmail(
+    controlPlaneBase: string,
+    ticket: string,
+    email: string,
+): Promise<AccountEmailChallenge> {
+    const started = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/consumer-signup/email/start",
+        { ticket, email },
+        "That sign-in link has expired. Press Continue again.",
+    );
+    if (typeof started.challenge_id !== "string" || !started.challenge_id) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    return {
+        challengeId: started.challenge_id,
+        expiresIn: typeof started.expires_in === "number" ? started.expires_in : 600,
+    };
+}
+
+/** Prove the address with the code, then create the account (DR-0189 §4).
+ *
+ * The sibling of {@link completeConsumerSignup}, ending in the same append with
+ * the same recovery batch and no passkey required. The only difference is which
+ * of step 1's two proofs supplied the verified address. */
+export async function completeConsumerSignupEmail(
+    controlPlaneBase: string,
+    ticket: string,
+    challengeId: string,
+    code: string,
+): Promise<PasskeyAccountCreated> {
+    const finished = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/consumer-signup/email/complete",
+        { ticket, challenge_id: challengeId, code },
+        "That code did not match. Ask for a new one.",
     );
     return createdAccount(finished);
 }

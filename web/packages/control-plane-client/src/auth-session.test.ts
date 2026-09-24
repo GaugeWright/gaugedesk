@@ -3,6 +3,8 @@ import {
     bearer,
     beginLogin,
     claimConsumerSignup,
+    completeConsumerSignupEmail,
+    startConsumerSignupEmail,
     consumeAccountSignupTicket,
     consumeCallbackToken,
     decodeSubject,
@@ -355,6 +357,75 @@ describe("provider-neutral passkey account entry", () => {
         )).rejects.toThrow(/no recovery codes/i);
     });
 
+    it("creates a Microsoft-first account by proving the address with a code", async () => {
+        // DR-0189 §4. Entra ID emits no `email_verified`, so the one-click
+        // entrance is closed to it and the address is proved the other way step
+        // 1 admits. The account still lands in one append with a recovery batch
+        // and no passkey — the only difference from Google is which proof
+        // supplied the verified address.
+        const fetch = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                email: "work.person@example.test",
+                display_name: "Work Person",
+                provider: "microsoft",
+                provider_label: "Microsoft",
+                email_proof: "code",
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                challenge_id: "email-challenge-1",
+                expires_in: 600,
+            }), { status: 202, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                account_id: "work-person",
+                recovery_codes: ["HKPR-7T2M-QJ4X", "B9WD-LN3F-VZ6K"],
+            }), {
+                status: 200,
+                headers: { "content-type": "application/json", "set-cookie": "opaque-session" },
+            }));
+        vi.stubGlobal("fetch", fetch);
+
+        await expect(claimConsumerSignup("https://auth.example/", "ticket-ms")).resolves.toEqual({
+            email: "work.person@example.test",
+            displayName: "Work Person",
+            provider: "microsoft",
+            providerLabel: "Microsoft",
+            emailProof: "code",
+        });
+        await expect(startConsumerSignupEmail(
+            "https://auth.example/",
+            "ticket-ms",
+            "work.person@example.test",
+        )).resolves.toEqual({ challengeId: "email-challenge-1", expiresIn: 600 });
+        await expect(completeConsumerSignupEmail(
+            "https://auth.example/",
+            "ticket-ms",
+            "email-challenge-1",
+            "123456",
+        )).resolves.toMatchObject({
+            recoveryCodes: ["HKPR-7T2M-QJ4X", "B9WD-LN3F-VZ6K"],
+        });
+
+        // The address is never sent as a signup fact; it is sent to be proved,
+        // and the account is created by the route that spends the proof.
+        const paths = fetch.mock.calls.map(([url]) => String(url));
+        expect(paths[1]).toContain("/auth/account/consumer-signup/email/start");
+        expect(paths[2]).toContain("/auth/account/consumer-signup/email/complete");
+        expect(paths.some((path) => path.includes("/register/start"))).toBe(false);
+    });
+
+    it("refuses a claim that says it is attested but carries no address", async () => {
+        // An attested claim whose address is missing is a malformed response, not
+        // an invitation to create an account over an empty string.
+        const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+            display_name: "Nobody",
+            provider: "google",
+            email_proof: "attested",
+        }), { status: 200, headers: { "content-type": "application/json" } }));
+        vi.stubGlobal("fetch", fetch);
+        await expect(claimConsumerSignup("https://auth.example/", "ticket-bad"))
+            .rejects.toThrow(/malformed/i);
+    });
+
     it("creates a Google-first account without ever sending an email code", async () => {
         // ADR 0146 §1 step 1 is "verify an email address", not "send a code" —
         // the provider already attested one, so the two email calls the passkey
@@ -391,6 +462,8 @@ describe("provider-neutral passkey account entry", () => {
         await expect(claimConsumerSignup("https://auth.example/", "ticket-1")).resolves.toEqual({
             email: "person@example.test",
             displayName: "Person One",
+            providerLabel: "Google",
+            emailProof: "attested",
             provider: "google",
         });
         await expect(finishConsumerSignupAccount(

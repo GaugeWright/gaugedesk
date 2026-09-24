@@ -29,6 +29,8 @@ import {
     consumeCallbackToken,
     endSession,
     completeConsumerSignup,
+    completeConsumerSignupEmail,
+    startConsumerSignupEmail,
     finishAccountRecovery,
     finishPasskeyAccountCreation,
     refreshHostedAccountSession,
@@ -476,16 +478,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }
         });
     });
-    const beginAccountAdmission = async (): Promise<void> => {
+    const beginAccountAdmission = async (provider?: string): Promise<void> => {
         if (oidcRedirectAvailable) {
-            beginLogin(controlPlaneBase());
+            beginLogin(controlPlaneBase(), provider);
             return;
         }
         // Desktop: the control plane mints and holds the verifier and returns the
         // account login URL for the system browser; gaugewright:// completes the
         // native handoff through the shell seam. A dev web return instead lands
         // back on this origin, so the round trip must stay in this tab.
-        const { url, webReturn } = await api.hubSessionStart();
+        const { url, webReturn } = await api.hubSessionStart(provider);
         if (webReturn) {
             window.location.assign(url);
             return;
@@ -2097,6 +2099,30 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 return {
                     email: claim.email,
                     suggestedName: claim.displayName ?? undefined,
+                    providerLabel: claim.providerLabel,
+                    // DR-0189 §4: a provider that attests no address (Entra ID
+                    // emits no `email_verified`) proves it with a code instead,
+                    // and then takes the same creation the attested path takes.
+                    emailProof: claim.emailProof === "code"
+                        ? {
+                            start: (address: string) =>
+                                startConsumerSignupEmail(
+                                    controlPlaneBase(),
+                                    accountSignupTicket,
+                                    address,
+                                ),
+                            finish: async (challengeId: string, emailCode: string) => {
+                                const created = await completeConsumerSignupEmail(
+                                    controlPlaneBase(),
+                                    accountSignupTicket,
+                                    challengeId,
+                                    emailCode,
+                                );
+                                pendingNativeReturn = created.nativeReturn;
+                                return created.recoveryCodes;
+                            },
+                        }
+                        : undefined,
                     // DR-0177: the provider's verified email satisfies ADR
                     // 0146 §1's step 1, so this finishes without a passkey
                     // ceremony. `name` is no longer asked for — Google attested
@@ -2161,14 +2187,23 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     // home over `gaugewright://`. A composition that does serve
                     // the login shell still redirects, which that function
                     // decides.
-                    begin: beginAccountAdmission,
+                    begin: () => beginAccountAdmission("google"),
                 },
-                // Placeholders until a connection exists for each.
-                // They are rendered rather than hidden so the row
-                // is the shape it will keep, and they say what they
-                // are rather than failing silently when pressed.
+                {
+                    id: "microsoft",
+                    label: "Continue with Microsoft",
+                    // DR-0189. The same route as Google's, naming the entrance:
+                    // work, school and personal Microsoft accounts all arrive
+                    // here and nobody is asked which they hold. A deployment
+                    // with no Microsoft client id answers 409 and the card
+                    // reports it, which is the honest failure — the button is
+                    // not hidden on a guess about server configuration.
+                    begin: () => beginAccountAdmission("microsoft"),
+                },
+                // A placeholder until a connection exists for it. Rendered
+                // rather than hidden so the row is the shape it will keep, and
+                // it says what it is rather than failing silently when pressed.
                 { id: "apple", label: "Continue with Apple (not yet available)", begin: () => undefined },
-                { id: "microsoft", label: "Continue with Microsoft (not yet available)", begin: () => undefined },
             ]}
             recovery={localDevLogin ? undefined : {
                 start: (email) => startAccountRecovery(controlPlaneBase(), email),

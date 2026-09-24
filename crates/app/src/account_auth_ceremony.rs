@@ -433,6 +433,17 @@ impl AccountAuthRuntime {
         self.complete_email_for(challenge_id, code, EmailChallengePurpose::Verification, now)
     }
 
+    /// Spend a verification ticket and return the address it proved.
+    ///
+    /// The provider-with-no-attestation entrance needs the address the *code*
+    /// proved, not the one the request carried, and it needs the ticket spent so
+    /// one code cannot create two accounts (DR-0189 §4).
+    fn take_verified_email(&self, ticket: &str, now: u64) -> Option<String> {
+        let mut store = self.lock();
+        let entry = store.verified.remove(ticket)?;
+        (entry.expires_at > now).then_some(entry.email)
+    }
+
     fn complete_email_for(
         &self,
         challenge_id: &str,
@@ -1424,10 +1435,23 @@ async fn post_consumer_signup_claim(
             crate::auth_oidc::binding_matches(signup.browser_binding.expose(), presented)
         })
         .map(|signup| {
+            // Which entrance this is, and whether the address it carries has
+            // been proved. Before DR-0189 both answers were constants; a card
+            // that assumed them would offer a Microsoft signup a one-click
+            // "create account" over an address nothing has checked.
+            let provider = crate::auth_oidc::consumer_provider(&signup.connection_id);
             json!({
-                "email": signup.verified_email,
+                "email": signup.email.for_display(),
                 "display_name": signup.display_name,
-                "provider": "google",
+                "provider": provider.map(|provider| provider.slug).unwrap_or("oidc"),
+                "provider_label": provider
+                    .map(|provider| provider.label)
+                    .unwrap_or("your provider"),
+                "email_proof": if signup.email.attested().is_some() {
+                    "attested"
+                } else {
+                    "code"
+                },
             })
         })
     else {
@@ -1470,6 +1494,13 @@ async fn post_consumer_signup_registration_start(
     else {
         return CeremonyError::UnknownOrExpired.response();
     };
+    // Both entrances below create an account, so both need step 1 satisfied by
+    // the provider. A ticket whose address is unproved belongs to the code
+    // entrance and is refused here rather than silently treated as verified
+    // (DR-0189 §4).
+    let Some(attested) = signup.email.attested().map(str::to_owned) else {
+        return CeremonyError::UnknownOrExpired.response();
+    };
     let display_name = if body.display_name.trim().is_empty() {
         signup.display_name.clone().unwrap_or_default()
     } else {
@@ -1479,14 +1510,14 @@ async fn post_consumer_signup_registration_start(
         connection_id: signup.connection_id.clone(),
         issuer: signup.issuer.clone(),
         subject: signup.subject.clone(),
-        label: signup.verified_email.clone(),
+        label: attested.clone(),
         provider_expires_at_ms: signup.provider_expires_at_ms,
         refresh_token: signup.refresh_token.clone(),
         native_return: signup.native_return.clone(),
         native_handoff_challenge: signup.native_handoff_challenge.clone(),
     };
     match runtime.start_registration_for_verified_email(
-        &signup.verified_email,
+        &attested,
         &display_name,
         Some(context),
         unix_now(),
@@ -1500,6 +1531,117 @@ async fn post_consumer_signup_registration_start(
     }
 }
 
+/// Send a code to the address a provider-without-attestation signup will use.
+///
+/// The ticket is peeked, never spent: a mistyped address, an undelivered code or
+/// an abandoned tab must leave the person able to try again rather than having to
+/// cross the provider a second time. It is spent by the completion below.
+///
+/// The address comes from the request rather than the token because the token
+/// asserts nothing anybody checked — the prefill is a convenience and a person
+/// may legitimately want their account on a different address.
+async fn post_consumer_signup_email_start(
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+    Json(body): Json<ConsumerSignupEmailStartRequest>,
+) -> Response {
+    let runtime = match runtime(&auth) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.response(),
+    };
+    let presented = crate::net_http::signup_binding_cookie(&headers).unwrap_or_default();
+    // An attested ticket belongs to the one-click entrance. Letting it through
+    // here would add a code to a flow that does not need one, and — worse —
+    // would let the request choose an address the provider never attested.
+    let admitted = auth
+        .pending_consumer_signup_mut()
+        .peek(&body.ticket, std::time::Instant::now())
+        .map(|signup| {
+            crate::auth_oidc::binding_matches(signup.browser_binding.expose(), presented)
+                && signup.email.attested().is_none()
+        })
+        .unwrap_or(false);
+    if !admitted {
+        return CeremonyError::UnknownOrExpired.response();
+    }
+    let email = body.email.clone();
+    let now = unix_now();
+    let result = tokio::task::spawn_blocking(move || runtime.begin_email(&email, now)).await;
+    match result.unwrap_or(Err(CeremonyError::Unavailable)) {
+        Ok(challenge_id) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"challenge_id": challenge_id, "expires_in": EMAIL_TTL_SECS})),
+        )
+            .into_response(),
+        Err(error) => error.response(),
+    }
+}
+
+/// Prove the address with the code, then create the account (DR-0189 §4).
+///
+/// This is the sibling of [`post_consumer_signup_complete`] and ends in the same
+/// append. The difference is one line of evidence: there the provider attested
+/// the address, here a code we sent to it came back. DR-0177's principle is a
+/// verified email plus a verified subject, and it does not care which of step
+/// 1's two proofs supplied the first half.
+async fn post_consumer_signup_email_complete(
+    State(wb): State<SharedWorkbench>,
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+    Json(body): Json<ConsumerSignupEmailCompleteRequest>,
+) -> Response {
+    let runtime = match runtime(&auth) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.response(),
+    };
+    let presented = crate::net_http::signup_binding_cookie(&headers).unwrap_or_default();
+    let matches_binding = auth
+        .pending_consumer_signup_mut()
+        .peek(&body.ticket, std::time::Instant::now())
+        .map(|signup| {
+            crate::auth_oidc::binding_matches(signup.browser_binding.expose(), presented)
+                && signup.email.attested().is_none()
+        })
+        .unwrap_or(false);
+    if !matches_binding {
+        return CeremonyError::UnknownOrExpired.response();
+    }
+    // The code first: a wrong one must not spend the provider ticket, or a
+    // mistyped digit would send the person back across the provider.
+    let verification = match runtime.complete_email(&body.challenge_id, &body.code, unix_now()) {
+        Ok(ticket) => ticket,
+        Err(error) => return error.response(),
+    };
+    let Some(email) = runtime.take_verified_email(&verification, unix_now()) else {
+        return CeremonyError::UnknownOrExpired.response();
+    };
+    let Some(signup) = auth
+        .pending_consumer_signup_mut()
+        .take(&body.ticket, std::time::Instant::now())
+    else {
+        return CeremonyError::UnknownOrExpired.response();
+    };
+    let context = ConsumerSignupContext {
+        connection_id: signup.connection_id.clone(),
+        issuer: signup.issuer.clone(),
+        subject: signup.subject.clone(),
+        label: email.clone(),
+        provider_expires_at_ms: signup.provider_expires_at_ms,
+        refresh_token: signup.refresh_token.clone(),
+        native_return: signup.native_return.clone(),
+        native_handoff_challenge: signup.native_handoff_challenge.clone(),
+    };
+    // `create_account_from_verified_provider` runs `decide_verify_email`, which
+    // refuses an address another account already holds — so the ADR 0146 §1
+    // collision refusal is enforced here, where the address means something,
+    // rather than on the unproved one at the callback (DR-0189 §5).
+    let outcome = {
+        let mut guard = wb.lock_unpoisoned();
+        runtime.create_account_from_verified_provider(&mut guard, &email, context, unix_now())
+    };
+    registration_response(outcome, &auth)
+}
+
 /// Create the account from the provider identity alone (DR-0177).
 ///
 /// The sibling of `post_consumer_signup_registration_start`, and the one the
@@ -1510,6 +1652,19 @@ async fn post_consumer_signup_registration_start(
 /// The passkey entrance is deliberately kept beside it rather than replaced.
 /// Adding a passkey is what makes the provider replaceable, and DR-0177 offers
 /// that rather than requiring it.
+#[derive(Deserialize)]
+struct ConsumerSignupEmailStartRequest {
+    ticket: String,
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct ConsumerSignupEmailCompleteRequest {
+    ticket: String,
+    challenge_id: String,
+    code: String,
+}
+
 async fn post_consumer_signup_complete(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
@@ -1537,11 +1692,18 @@ async fn post_consumer_signup_complete(
     else {
         return CeremonyError::UnknownOrExpired.response();
     };
+    // Both entrances below create an account, so both need step 1 satisfied by
+    // the provider. A ticket whose address is unproved belongs to the code
+    // entrance and is refused here rather than silently treated as verified
+    // (DR-0189 §4).
+    let Some(attested) = signup.email.attested().map(str::to_owned) else {
+        return CeremonyError::UnknownOrExpired.response();
+    };
     let context = ConsumerSignupContext {
         connection_id: signup.connection_id.clone(),
         issuer: signup.issuer.clone(),
         subject: signup.subject.clone(),
-        label: signup.verified_email.clone(),
+        label: attested.clone(),
         provider_expires_at_ms: signup.provider_expires_at_ms,
         refresh_token: signup.refresh_token.clone(),
         native_return: signup.native_return.clone(),
@@ -1549,12 +1711,7 @@ async fn post_consumer_signup_complete(
     };
     let outcome = {
         let mut guard = wb.lock_unpoisoned();
-        runtime.create_account_from_verified_provider(
-            &mut guard,
-            &signup.verified_email,
-            context,
-            unix_now(),
-        )
+        runtime.create_account_from_verified_provider(&mut guard, &attested, context, unix_now())
     };
     registration_response(outcome, &auth)
 }
@@ -1855,6 +2012,17 @@ pub fn routes() -> axum::Router<SharedWorkbench> {
     axum::Router::new()
         .route("/auth/account/email/start", post(post_email_start))
         .route("/auth/account/email/complete", post(post_email_complete))
+        // The entrance for a provider that attests no address (DR-0189 §4). Same
+        // ticket and same browser binding as the attested entrance; the person
+        // proves the address with a code first.
+        .route(
+            "/auth/account/consumer-signup/email/start",
+            post(post_consumer_signup_email_start),
+        )
+        .route(
+            "/auth/account/consumer-signup/email/complete",
+            post(post_consumer_signup_email_complete),
+        )
         .route(
             "/auth/account/passkey/register/start",
             post(post_registration_start),
@@ -2516,7 +2684,9 @@ mod tests {
             .pending_consumer_signup_mut()
             .begin(
                 crate::auth_oidc::PendingConsumerSignup {
-                    verified_email: "new.person@example.com".into(),
+                    email: crate::auth_oidc::ConsumerSignupEmail::Attested(
+                        "new.person@example.com".into(),
+                    ),
                     connection_id: "consumer-google".into(),
                     connection_revision: "rev-1".into(),
                     issuer: "https://accounts.google.com".into(),

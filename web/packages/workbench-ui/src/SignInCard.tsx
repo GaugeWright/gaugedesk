@@ -73,9 +73,26 @@ export interface SignInProvider {
  *  account-creation step it is, with the email field gone because asking again
  *  for an address Google already proved would be theatre. */
 export interface SignInProviderSignup {
-    /** The address the provider verified. Not editable here: it is evidence,
-     *  not a field. */
+    /** The address the provider verified, where `emailProof` is absent: evidence,
+     *  not a field, so the card shows it and does not ask again. Where
+     *  `emailProof` is present nothing has checked it, and it is a prefill the
+     *  person may correct. */
     email: string;
+    /** What to call this provider in prose. Absent reads as Google, which is
+     *  what every caller meant before there was more than one. */
+    providerLabel?: string;
+    /** Present only when the provider attests no address, so step 1 of ADR 0146
+     *  §1 has to be satisfied the other way it admits — a code sent to the
+     *  address (DR-0189 §4). Entra ID is the case: it emits no `email_verified`,
+     *  and its address claims are mutable values a tenant sets.
+     *
+     *  `finish` ends in the same account creation `create` does, with the same
+     *  recovery batch and no passkey; the only difference is which proof
+     *  supplied the verified address. */
+    emailProof?: {
+        start(email: string): Promise<{ readonly challengeId: string; readonly expiresIn: number }>;
+        finish(challengeId: string, code: string): Promise<readonly string[]>;
+    };
     /** The provider's `name` claim, if it offered one. Shown, not asked for. */
     suggestedName?: string;
     /** Creates the account and links the provider subject, resolving with the
@@ -122,6 +139,8 @@ type Step =
     | { at: "personal"; email: string }
     | { at: "create"; email: string; challenge?: { id: string; expiresIn: number } }
     | { at: "provider-create"; email: string }
+    | { at: "provider-email"; email: string }
+    | { at: "provider-code"; email: string; challenge: { id: string; expiresIn: number } }
     // `done` rather than a fixed call, because both entrances end here and they
     // hand over differently — a desktop signup leaves for `gaugewright://`, a
     // browser one reloads. The one thing they share is that neither may run
@@ -171,7 +190,9 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
     // asking for what the person just finished handing over.
     const [step, setStep] = createSignal<Step>(
         props.providerSignup
-            ? { at: "provider-create", email: props.providerSignup.email }
+            ? props.providerSignup.emailProof
+                ? { at: "provider-email", email: props.providerSignup.email }
+                : { at: "provider-create", email: props.providerSignup.email }
             : { at: "identify" },
     );
     const [email, setEmail] = createSignal(props.providerSignup?.email ?? "");
@@ -199,7 +220,11 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
         if (untrack(step).at !== "identify") return;
         setEmail(signup.email);
         setDisplayName(signup.suggestedName ?? "");
-        setStep({ at: "provider-create", email: signup.email });
+        setStep(
+            signup.emailProof
+                ? { at: "provider-email", email: signup.email }
+                : { at: "provider-create", email: signup.email },
+        );
     });
 
     /** The current step when it is `kind`, else undefined — the shape `<Show>`
@@ -308,6 +333,50 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
         event.preventDefault();
         void run("create that account", async () => {
             const codes = await props.providerSignup!.create();
+            setStep({
+                at: "codes",
+                email: current.email,
+                codes,
+                done: () => props.providerSignup!.complete(),
+            });
+        });
+    };
+
+    const providerLabel = () => props.providerSignup?.providerLabel ?? "Google";
+
+    /** The address the provider-email step will use: what the person typed, else
+     *  the prefill the step carries.
+     *
+     *  One expression, read by both the submit guard and the button's disabled
+     *  state. They were two, and they disagreed: the button enabled itself from
+     *  the prefill while the guard required a typed value, so pressing it did
+     *  nothing at all on the path where the person accepts the address as
+     *  offered — which is the common one. */
+    const providerEmailAddress = (prefill: string): string =>
+        (email().trim() || prefill).trim();
+
+    const startProviderEmailProof = (address: string) =>
+        void run("send that code", async () => {
+            const started = await props.providerSignup!.emailProof!.start(address);
+            setStep({
+                at: "provider-code",
+                email: address,
+                challenge: { id: started.challengeId, expiresIn: started.expiresIn },
+            });
+            setStatus(`Enter the code sent to ${address}.`);
+        });
+
+    const finishProviderEmailProof = (
+        event: SubmitEvent,
+        current: Extract<Step, { at: "provider-code" }>,
+    ) => {
+        event.preventDefault();
+        if (!code().trim()) return;
+        void run("create that account", async () => {
+            const codes = await props.providerSignup!.emailProof!.finish(
+                current.challenge.id,
+                code().trim(),
+            );
             setStep({
                 at: "codes",
                 email: current.email,
@@ -496,11 +565,87 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                     )}
             </Show>
 
+            <Show when={at('provider-email')}>
+                {(current) => (
+                        <form
+                            class="signin__act"
+                            data-signin-provider-email
+                            onSubmit={(event) => {
+                                event.preventDefault();
+                                const address = providerEmailAddress(current().email);
+                                if (address) startProviderEmailProof(address);
+                            }}
+                        >
+                            {/* Said plainly, because the person pressed one
+                                button and is being asked for something the
+                                Google path does not ask for. The reason is the
+                                provider's, not theirs. */}
+                            <p class="signin__status">
+                                {providerLabel()} signed you in but does not confirm email
+                                addresses, so GaugeDesk will send a code to yours.
+                            </p>
+                            <label class="signin__field">
+                                <span class="signin__label">Your email</span>
+                                <input
+                                    name="email"
+                                    type="email"
+                                    autocomplete="email"
+                                    required
+                                    value={email() || current().email}
+                                    onInput={(event) => setEmail(event.currentTarget.value)}
+                                />
+                            </label>
+                            <button
+                                class="signin__primary"
+                                data-signin-provider-email-send
+                                type="submit"
+                                disabled={busy() || !providerEmailAddress(current().email)}
+                            >
+                                {busy() ? "Sending…" : "Email me a code"}
+                            </button>
+                        </form>
+                    )}
+            </Show>
+
+            <Show when={at('provider-code')}>
+                {(current) => (
+                        <form
+                            class="signin__act"
+                            data-signin-provider-code
+                            onSubmit={(event) => finishProviderEmailProof(event, current())}
+                        >
+                            <p class="signin__resolved">
+                                <span>{current().email}</span>
+                                <button class="signin__change" type="button" onClick={restart}>Change</button>
+                            </p>
+                            <label class="signin__field">
+                                <span class="signin__label">Email code</span>
+                                <input
+                                    name="email-code"
+                                    inputmode="numeric"
+                                    autocomplete="one-time-code"
+                                    required
+                                    value={code()}
+                                    onInput={(event) => setCode(event.currentTarget.value)}
+                                />
+                            </label>
+                            <button
+                                class="signin__primary"
+                                data-signin-provider-code-create
+                                type="submit"
+                                disabled={busy() || !code().trim()}
+                            >
+                                {busy() ? "Creating…" : "Create account"}
+                            </button>
+                        </form>
+                    )}
+            </Show>
+
             <Show when={at('provider-create')}>
                 {(current) => (
                         <form class="signin__act" data-signin-provider-create onSubmit={(event) => finishProviderSignup(event, current())}>
                             <p class="signin__resolved">
-                                <span>Google verified {current().email}</span>
+                                <span>{providerLabel()} verified {current().email}</span>
                             </p>
                             {/* One button. The name field that used to sit here
                                 asked for something the provider had already
@@ -521,10 +666,27 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                 {(current) => (
                     <div class="signin__act" data-signin-codes>
                         <p class="signin__resolved"><span>Account created for {current().email}</span></p>
+                        {/* The sentence has to be true of the account that was
+                            just created. A provider signup creates no passkey
+                            (DR-0177 offers it rather than requiring it), so
+                            naming one here would promise a way back in through
+                            a credential the person does not have. */}
                         <p class="signin__status">
-                            Save these recovery codes somewhere safe. With a verified email
-                            they are the way back into your account if you lose your
-                            passkey — and this is the only time they are shown.
+                            <Show
+                                when={props.providerSignup}
+                                fallback={
+                                    <>
+                                        Save these recovery codes somewhere safe. With a verified
+                                        email they are the way back into your account if you lose
+                                        your passkey — and this is the only time they are shown.
+                                    </>
+                                }
+                            >
+                                Save these recovery codes somewhere safe. With a verified email
+                                they are the way back into your account if you lose access to
+                                your {providerLabel()} sign-in — and this is the only time they
+                                are shown.
+                            </Show>
                         </p>
                         <ul class="signin__codes">
                             <For each={current().codes}>{(code) => <li>{code}</li>}</For>

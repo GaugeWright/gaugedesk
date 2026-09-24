@@ -464,14 +464,30 @@ fn challenge_for(verifier: &str) -> String {
 /// The Hub login URL that begins a native handoff bound to `challenge`. The
 /// return is the `gaugewright://` scheme unless a dev web return (ADR 0140)
 /// asks the Hub to hand the code back to a loopback browser origin instead.
-fn login_url(hub: &str, challenge: &str, web_return: Option<&str>) -> String {
+fn login_url(
+    hub: &str,
+    challenge: &str,
+    web_return: Option<&str>,
+    provider: Option<&str>,
+) -> String {
     // The challenge alphabet is base64url (alphanumeric, `-`, `_`) — URL-safe by
     // construction; only the return URI needs encoding.
     let return_to = match web_return {
         Some(uri) => encode_return(uri),
         None => encode_return(NATIVE_RETURN),
     };
-    format!("{hub}/auth/login?return_to={return_to}&handoff_challenge={challenge}")
+    let mut url = format!("{hub}/auth/login?return_to={return_to}&handoff_challenge={challenge}");
+    // Which entrance the person pressed (DR-0189 §1). The Hub decides whether it
+    // offers that one; this only carries the choice across the handoff, so that
+    // a desktop showing two buttons does not send both to the same provider.
+    // Restricted to the slug alphabet so nothing here can add a query parameter.
+    if let Some(provider) = provider.map(str::trim).filter(|slug| {
+        !slug.is_empty() && slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    }) {
+        url.push_str("&provider=");
+        url.push_str(provider);
+    }
+    url
 }
 
 /// Percent-encode a return URI for a query value. The admitted return alphabets
@@ -820,7 +836,16 @@ fn status_json(record: Option<&SessionRecord>, available: bool) -> Value {
 
 /// `POST /account/hub-session/start` — mint the verifier, hold it here, and
 /// return the Hub login URL for the client to open in the system browser.
-pub async fn post_signin_start() -> impl IntoResponse {
+#[derive(Deserialize, Default)]
+pub struct SigninStart {
+    /// Which consumer entrance the person pressed; absent keeps the Hub's own
+    /// default, so a client that predates DR-0189 is unchanged.
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+pub async fn post_signin_start(body: Option<Json<SigninStart>>) -> impl IntoResponse {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
     let Some(hub) = hub_base() else {
         return (
             StatusCode::CONFLICT,
@@ -839,7 +864,7 @@ pub async fn post_signin_start() -> impl IntoResponse {
         started: Instant::now(),
     });
     Json(json!({
-        "url": login_url(&hub, &challenge, web_return.as_deref()),
+        "url": login_url(&hub, &challenge, web_return.as_deref(), body.provider.as_deref()),
         "return": web_return.as_deref().unwrap_or(NATIVE_RETURN),
     }))
     .into_response()
@@ -1075,7 +1100,7 @@ mod tests {
 
     #[test]
     fn login_url_pins_the_native_return_and_carries_the_challenge() {
-        let url = login_url("https://auth.example.test", "abc-_123", None);
+        let url = login_url("https://auth.example.test", "abc-_123", None, None);
         assert_eq!(
             url,
             "https://auth.example.test/auth/login?return_to=gaugewright%3A%2F%2Fauth%2Fcallback&handoff_challenge=abc-_123"
@@ -1088,11 +1113,28 @@ mod tests {
             "https://auth.example.test",
             "abc-_123",
             Some("http://localhost:5176/auth/native-return"),
+            None,
         );
         assert_eq!(
             url,
             "https://auth.example.test/auth/login?return_to=http%3A%2F%2Flocalhost%3A5176%2Fauth%2Fnative-return&handoff_challenge=abc-_123"
         );
+    }
+
+    #[test]
+    fn login_url_carries_the_provider_and_refuses_an_unslug_like_one() {
+        assert!(
+            login_url("https://hub.test", "abc", None, Some("microsoft"))
+                .ends_with("&provider=microsoft")
+        );
+        // Nothing here may add a parameter of its own.
+        for hostile in ["mic&rosoft", "a=b", "a b", " ", "a?b", "a#b"] {
+            let url = login_url("https://hub.test", "abc", None, Some(hostile));
+            assert!(
+                !url.contains("provider="),
+                "{hostile:?} must not reach the URL, got {url}"
+            );
+        }
     }
 
     #[test]

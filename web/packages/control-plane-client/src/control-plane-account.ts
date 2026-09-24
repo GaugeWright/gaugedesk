@@ -684,8 +684,9 @@ export async function hubSessionStatus(json: RouteJson): Promise<HubSessionStatu
  *  current tab rather than open a new one. */
 export async function hubSessionStart(
     json: RouteJson,
+    provider?: string,
 ): Promise<{ url: string; webReturn: boolean }> {
-    const o = (await json("POST", "/account/hub-session/start", {})) as {
+    const o = (await json("POST", "/account/hub-session/start", provider ? { provider } : {})) as {
         url?: string;
         return?: string;
     };

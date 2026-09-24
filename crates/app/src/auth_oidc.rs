@@ -92,6 +92,12 @@ pub struct PendingAuth {
     /// identifies the consumer-provider fallback; an enterprise callback may
     /// not recover tenant or connection identity from callback input.
     pub login_context: Option<PendingEnterpriseLogin>,
+    /// Exact consumer connection selected on the authorize leg (DR-0189 §1).
+    /// Set for every consumer ceremony and `None` for an enterprise one. Once a
+    /// deployment offers more than one consumer entrance, the callback can no
+    /// longer infer which it is finishing, and it must not learn that from
+    /// callback input — so it is pinned here beside the issuer and the nonce.
+    pub consumer_connection_id: Option<String>,
     /// Why this browser ceremony was started. A corporate connection test uses
     /// the same registered callback as ordinary OIDC sign-in, but its verified
     /// result is folded as revision-bound evidence and must never mint a login,
@@ -271,6 +277,38 @@ impl PendingAuthStore {
     }
 }
 
+/// What has proved the person controls the address a consumer signup will use.
+#[derive(Clone, Debug)]
+pub enum ConsumerSignupEmail {
+    /// The provider attested it (`email_verified`), which DR-0177 accepts as
+    /// step 1 on its own. From `id_token_verified_email`, never callback input.
+    Attested(String),
+    /// Nothing has proved it yet. The provider asserts no verified address —
+    /// Entra has no such claim — so a code must come back before the account is
+    /// created. The address here is a prefill for the form and carries no
+    /// authority whatever; it is deliberately not usable as an account fact.
+    Unproved { prefill: Option<String> },
+}
+
+impl ConsumerSignupEmail {
+    /// The attested address, or `None` when nothing has proved one. The only way
+    /// to reach an address that may be treated as a verified contact.
+    pub fn attested(&self) -> Option<&str> {
+        match self {
+            Self::Attested(email) => Some(email),
+            Self::Unproved { .. } => None,
+        }
+    }
+
+    /// The address to show in the form, proved or not. Display only.
+    pub fn for_display(&self) -> Option<&str> {
+        match self {
+            Self::Attested(email) => Some(email),
+            Self::Unproved { prefill } => prefill.as_deref(),
+        }
+    }
+}
+
 /// Verified Google facts parked between a first-time provider callback and the
 /// passkey ceremony that will actually create the account (ADR 0146 §1).
 ///
@@ -288,9 +326,12 @@ impl PendingAuthStore {
 /// Google subject is an authenticator *on* the account, never the account.
 #[derive(Clone, Debug)]
 pub struct PendingConsumerSignup {
-    /// From `id_token_verified_email` — the provider's `email` claim, admitted
-    /// only with `email_verified == true`. Never callback input.
-    pub verified_email: String,
+    /// The address this signup will record, and what has proved it.
+    ///
+    /// A sum rather than a string plus a flag, so no caller can read the address
+    /// without seeing which kind it is: creating an account from an unproved one
+    /// is the failure this type exists to make unrepresentable (DR-0189 §4).
+    pub email: ConsumerSignupEmail,
     pub connection_id: String,
     pub connection_revision: String,
     pub issuer: String,
@@ -872,6 +913,16 @@ pub fn start_login(
     }
     let client_id = sso.audiences.first().ok_or(LoginError::NotConfigured)?;
     let endpoints = discover_endpoints(&sso.issuer, http).map_err(LoginError::Discovery)?;
+    // What this login will verify `iss` against. For every ordinary connection it
+    // is the configured issuer; for a multi-tenant authority it is the tenant
+    // template the authority declares, at the same origin (DR-0189 §2).
+    let accepted_issuer = crate::identity_oidc::accepted_issuer(&sso.issuer, &endpoints.issuer)
+        .ok_or_else(|| {
+            LoginError::Discovery(format!(
+                "the authority at {} declares issuer {}, which is neither the configured issuer nor a tenant template at the same origin",
+                sso.issuer, endpoints.issuer
+            ))
+        })?;
     let pkce = Pkce::generate().map_err(LoginError::Pkce)?;
     // 16 CSPRNG bytes hex-encoded — unguessable, so a forged `state` cannot collide
     // with a live login (the CSRF binding the OP echoes back).
@@ -904,7 +955,7 @@ pub fn start_login(
         nonce,
         token_endpoint: endpoints.token_endpoint,
         jwks_uri: endpoints.jwks_uri,
-        issuer: sso.issuer.clone(),
+        issuer: accepted_issuer,
         audiences: sso.audiences.clone(),
         redirect_uri: redirect_uri.to_string(),
         mapping,
@@ -914,6 +965,8 @@ pub fn start_login(
         native_return: None,
         native_handoff_challenge: None,
         login_context: None,
+        // Set by the handler, which knows which authority it is serving.
+        consumer_connection_id: None,
         purpose: PendingAuthPurpose::Login,
     };
     Ok((url, state, pending))
@@ -1066,6 +1119,43 @@ fn id_token_verified_email(id_token: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// The `iss` of an **already-verified** id-token.
+///
+/// This is the concrete issuer, which for a multi-tenant authority names the
+/// tenant that issued the token and is therefore not the template the connection
+/// was pinned with. Durable state keys on this, because the tenant is part of the
+/// authenticator's identity (DR-0189 §3): the same person's work and personal
+/// accounts are two links, and keying on the template would collapse them into
+/// one — and let a subject from any tenant resolve against another's link.
+///
+/// Safe to read off the payload: `authenticate` has already demanded that this
+/// exact value equal the accepted issuer with the token's own tenant substituted.
+fn id_token_issuer(id_token: &str) -> Option<String> {
+    id_token_claims(id_token)?
+        .get("iss")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// The address a token merely *asserts*, with nothing attesting control of it.
+///
+/// Deliberately not named `verified`: Entra ID emits no `email_verified` claim,
+/// and its `email`, `preferred_username` and `upn` are mutable values a tenant
+/// administrator sets and is not constrained to domains the tenant owns. So this
+/// is a prefill for a form and nothing else — the only thing that turns it into
+/// an account fact is a code coming back to it (DR-0189 §4).
+fn id_token_asserted_email(id_token: &str) -> Option<String> {
+    let claims = id_token_claims(id_token)?;
+    ["email", "preferred_username"].iter().find_map(|key| {
+        claims
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| value.contains('@'))
+            .map(str::to_string)
+    })
 }
 
 /// Provider-token expiry in epoch milliseconds. The token was already verified
@@ -1523,19 +1613,187 @@ fn admit_native_refresh(
 /// adapter. It is intentionally outside the organization connection namespace.
 pub const CONSUMER_GOOGLE_CONNECTION_ID: &str = "consumer-google";
 
+/// Stable provider-connection identity for the consumer Microsoft adapter
+/// (DR-0189). Same namespace rule as Google's.
+pub const CONSUMER_MICROSOFT_CONNECTION_ID: &str = "consumer-microsoft";
+
+/// How a consumer provider's entrance proves the person controls the address it
+/// will record as a verified contact (DR-0189 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailProof {
+    /// The provider attests it with `email_verified`, which DR-0177 accepts on
+    /// its own: the account is created from the callback with no further step.
+    ProviderAttested,
+    /// The provider attests nothing, so the address is proved the other way step
+    /// 1 admits — a code we send to it. Entra ID has no `email_verified` claim
+    /// and its `email`/`upn` are mutable, tenant-settable values, so this is the
+    /// only honest reading of a Microsoft token.
+    EmailedCode,
+}
+
+/// A consumer identity provider the hosted account may offer as an entrance.
+///
+/// Everything provider-specific about a consumer entrance is here, so adding a
+/// third is this table plus a client id, and no handler has to know which
+/// provider it is serving. `authority` is where discovery and authorization
+/// happen; the issuer a token must claim comes from that authority's own
+/// metadata through `accepted_issuer`, which is how Microsoft's tenant template
+/// arrives without being configured anywhere (DR-0189 §2).
+#[derive(Clone, Copy, Debug)]
+pub struct ConsumerProvider {
+    pub connection_id: &'static str,
+    /// What the person selects it by: `/auth/login?provider=<slug>`.
+    pub slug: &'static str,
+    /// What the button and the session projection say.
+    pub label: &'static str,
+    pub authority: &'static str,
+    /// Env var, under the `GAUGEDESK_` prefix, holding the OAuth client id.
+    pub client_id_env: &'static str,
+    /// Env var holding the client secret, where the OP is confidential.
+    pub client_secret_env: &'static str,
+    /// Env var that may override `authority`, for a dev or regional endpoint.
+    pub authority_env: &'static str,
+    pub email_proof: EmailProof,
+}
+
+pub const CONSUMER_GOOGLE: ConsumerProvider = ConsumerProvider {
+    connection_id: CONSUMER_GOOGLE_CONNECTION_ID,
+    slug: "google",
+    label: "Google",
+    authority: "https://accounts.google.com",
+    client_id_env: "GOOGLE_CLIENT_ID",
+    client_secret_env: "GOOGLE_CLIENT_SECRET",
+    authority_env: "OIDC_ISSUER",
+    email_proof: EmailProof::ProviderAttested,
+};
+
+pub const CONSUMER_MICROSOFT: ConsumerProvider = ConsumerProvider {
+    connection_id: CONSUMER_MICROSOFT_CONNECTION_ID,
+    slug: "microsoft",
+    label: "Microsoft",
+    // `common`, so work, school and personal accounts enter the same door and
+    // nobody is asked which they hold (DR-0189 §1).
+    authority: "https://login.microsoftonline.com/common/v2.0",
+    client_id_env: "MICROSOFT_CLIENT_ID",
+    client_secret_env: "MICROSOFT_CLIENT_SECRET",
+    authority_env: "MICROSOFT_OIDC_AUTHORITY",
+    email_proof: EmailProof::EmailedCode,
+};
+
+/// Every consumer entrance this build knows how to offer, in the order the
+/// signed-out card presents them.
+pub const CONSUMER_PROVIDERS: [ConsumerProvider; 2] = [CONSUMER_GOOGLE, CONSUMER_MICROSOFT];
+
+/// The provider owning `connection_id`, or `None` for an organization connection.
+pub fn consumer_provider(connection_id: &str) -> Option<ConsumerProvider> {
+    CONSUMER_PROVIDERS
+        .iter()
+        .copied()
+        .find(|provider| provider.connection_id == connection_id)
+}
+
+/// The provider a person selected by slug.
+pub fn consumer_provider_by_slug(slug: &str) -> Option<ConsumerProvider> {
+    CONSUMER_PROVIDERS
+        .iter()
+        .copied()
+        .find(|provider| provider.slug == slug)
+}
+
+impl ConsumerProvider {
+    /// This provider's authority for this deployment, after any env override.
+    pub fn configured_authority(&self) -> String {
+        gaugedesk_env::var(self.authority_env)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| self.authority.to_string())
+    }
+
+    /// The connection record for this provider, or `None` when this deployment
+    /// has configured no client id for it. A provider without a client id is
+    /// simply not offered; it is never a startup failure.
+    pub fn configured_connection(&self) -> Option<SsoConnectionRecord> {
+        if !web_account_mode() {
+            return None;
+        }
+        let client_id =
+            gaugedesk_env::var(self.client_id_env).filter(|value| !value.trim().is_empty())?;
+        Some(consumer_sso(
+            self.connection_id,
+            &self.configured_authority(),
+            &client_id,
+        ))
+    }
+
+    /// The client secret for a confidential OP, where one is configured.
+    pub fn client_secret(&self) -> Option<crate::secret::Secret> {
+        gaugedesk_env::var(self.client_secret_env)
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into)
+    }
+}
+
+/// Whether `connection` would still admit the issuer and audiences a ceremony
+/// pinned on its authorize leg.
+///
+/// The pinned issuer is what the authority's metadata declared then, which for a
+/// multi-tenant authority is a tenant template and therefore not the connection's
+/// own `issuer` string (DR-0189 §2). So this asks the same question the login leg
+/// asked — would this connection accept that issuer — rather than comparing the
+/// two strings, which was only ever equality by coincidence of the single-tenant
+/// case.
+pub fn connection_still_accepts(
+    connection: &SsoConnectionRecord,
+    pinned_issuer: &str,
+    pinned_audiences: &[String],
+) -> bool {
+    connection.audiences == pinned_audiences
+        && crate::identity_oidc::accepted_issuer(&connection.issuer, pinned_issuer).as_deref()
+            == Some(pinned_issuer)
+}
+
+/// The consumer connection a session was minted by, read from the method the
+/// session itself records (`consumer-oidc:<connection>`, ADR 0147 §1).
+///
+/// A refresh has to reach the provider that issued the grant. Before DR-0189
+/// there was one, so "the configured connection" and "this session's connection"
+/// were the same sentence; with two they are not, and using the wrong one sends
+/// a Microsoft refresh token to Google's token endpoint.
+pub fn session_consumer_connection(
+    method: &str,
+) -> Option<(ConsumerProvider, SsoConnectionRecord)> {
+    configured_consumer_connection(method.strip_prefix("consumer-oidc:")?)
+}
+
+/// Every consumer entrance this deployment actually offers.
+pub fn configured_consumer_connections() -> Vec<(ConsumerProvider, SsoConnectionRecord)> {
+    CONSUMER_PROVIDERS
+        .iter()
+        .filter_map(|provider| {
+            provider
+                .configured_connection()
+                .map(|connection| (*provider, connection))
+        })
+        .collect()
+}
+
+/// One configured consumer entrance by connection id. This is how a callback and
+/// a refresh recover their provider: from server-held state naming the
+/// connection, never from a request parameter choosing one.
+pub fn configured_consumer_connection(
+    connection_id: &str,
+) -> Option<(ConsumerProvider, SsoConnectionRecord)> {
+    let provider = consumer_provider(connection_id)?;
+    provider
+        .configured_connection()
+        .map(|connection| (provider, connection))
+}
+
 /// A Google (or any OIDC) SSO connection for the hosted web account, from env — so the hub
 /// offers "Continue with Google" without a manual `/admin/sso` POST. `GAUGEDESK_GOOGLE_CLIENT_ID`
 /// is the OAuth client id (the id-token `aud`); the issuer defaults to Google's, overridable via
 /// `GAUGEDESK_OIDC_ISSUER`. `None` unless web-account mode with a client id configured.
 pub fn web_account_sso_from_env() -> Option<SsoConnectionRecord> {
-    if !web_account_mode() {
-        return None;
-    }
-    let client_id = gaugedesk_env::var("GOOGLE_CLIENT_ID").filter(|s| !s.trim().is_empty())?;
-    let issuer = gaugedesk_env::var("OIDC_ISSUER")
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "https://accounts.google.com".to_string());
-    Some(google_sso(&issuer, &client_id))
+    CONSUMER_GOOGLE.configured_connection()
 }
 
 /// Back-link every legacy consumer account once, before this composition serves a
@@ -1593,17 +1851,22 @@ pub fn backlink_legacy_consumer_accounts(wb: &mut Workbench) -> usize {
     }
 }
 
-/// Build an OIDC SSO connection record for `issuer` + `client_id` (pure; the env wrapper is
-/// [`web_account_sso_from_env`]). Stable consumer id, no enforce-SSO (the hosted account is opt-in
-/// login, not a locked-down org).
-pub fn google_sso(issuer: &str, client_id: &str) -> SsoConnectionRecord {
+/// Build an OIDC SSO connection record for a consumer `authority` + `client_id`
+/// (pure; the env wrapper is [`ConsumerProvider::configured_connection`]). No
+/// enforce-SSO: the hosted account is opt-in login, not a locked-down org.
+///
+/// `authority` lands in the record's `issuer` field because that is the string
+/// discovery is performed against. What a token's `iss` must equal is decided at
+/// login from the authority's own metadata (DR-0189 §2), so for a multi-tenant
+/// authority the two are deliberately not the same string.
+pub fn consumer_sso(connection_id: &str, authority: &str, client_id: &str) -> SsoConnectionRecord {
     let mut connection = SsoConnectionRecord {
-        id: CONSUMER_GOOGLE_CONNECTION_ID.to_string(),
+        id: connection_id.to_string(),
         op: RecordOp::Upsert,
         revision: String::new(),
         credential_revision: None,
         protocol: SsoProtocol::Oidc,
-        issuer: issuer.to_string(),
+        issuer: authority.to_string(),
         audiences: vec![client_id.to_string()],
         metadata: String::new(),
         saml_sp_entity_id: String::new(),
@@ -1613,6 +1876,12 @@ pub fn google_sso(issuer: &str, client_id: &str) -> SsoConnectionRecord {
     };
     connection.seal_revision();
     connection
+}
+
+/// The Google consumer connection, by name. Kept because the legacy back-link and
+/// the tests that predate DR-0189 speak of it directly.
+pub fn google_sso(issuer: &str, client_id: &str) -> SsoConnectionRecord {
+    consumer_sso(CONSUMER_GOOGLE_CONNECTION_ID, issuer, client_id)
 }
 
 /// A safe label for the already-authenticated sign-in session. This is a
@@ -1638,7 +1907,18 @@ fn session_method(sso: Option<&SsoConnectionRecord>) -> (&'static str, &'static 
 /// default for a server-minted opaque session.
 fn session_label_for_method(method: &str) -> (&'static str, &'static str) {
     match method {
-        method if method.starts_with("consumer-oidc:") => ("google", "Google"),
+        method if method.starts_with("consumer-oidc:") => {
+            // The label is the provider's, not a guess. An unconfigured or
+            // retired connection still labels honestly as consumer sign-in
+            // rather than claiming a provider this session did not use.
+            match method
+                .strip_prefix("consumer-oidc:")
+                .and_then(consumer_provider)
+            {
+                Some(provider) => (provider.slug, provider.label),
+                None => ("oidc", "Consumer sign-in"),
+            }
+        }
         method if method.starts_with("enterprise-oidc:") => ("oidc", "Corporate sign-in (OIDC)"),
         method if method.starts_with("enterprise-saml:") => ("saml", "Corporate sign-in (SAML)"),
         "recovery" => ("recovery", "Recovery code"),
@@ -1756,14 +2036,6 @@ pub fn expired_session_hint_cookie_value(domain: Option<&str>, secure: bool) -> 
     );
     c.push_str("; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
     c
-}
-
-/// The OAuth **client secret** for a confidential OP (Google), from `GAUGEDESK_GOOGLE_CLIENT_SECRET`.
-/// `None` when unset — a public PKCE client (Okta/Entra) needs no secret at exchange.
-fn google_client_secret_from_env() -> Option<crate::secret::Secret> {
-    gaugedesk_env::var("GOOGLE_CLIENT_SECRET")
-        .filter(|s| !s.trim().is_empty())
-        .map(Into::into)
 }
 
 /// The `Set-Cookie` value for the login session, from env: `GAUGEDESK_SESSION_COOKIE_DOMAIN`
@@ -2011,7 +2283,7 @@ async fn begin_enterprise_browser_login(
 }
 
 enum OidcConnectionAuthority {
-    Consumer,
+    Consumer(ConsumerProvider),
     Enterprise {
         login_context: PendingEnterpriseLogin,
         client_secret: Option<crate::secret::Secret>,
@@ -2061,17 +2333,24 @@ async fn prepare_oidc_browser_login(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response())
         }
     };
-    // Consumer login retains the deployment-level Google credential. An
-    // enterprise login receives only the exact organization credential
-    // resolved before this function; it never falls back across authorities.
-    let (enterprise_login, client_secret) = match options.authority {
-        OidcConnectionAuthority::Consumer => (None, google_client_secret_from_env()),
+    // Consumer login retains the deployment-level credential of the provider it
+    // is actually using. An enterprise login receives only the exact
+    // organization credential resolved before this function; neither ever falls
+    // back across authorities, and after DR-0189 that includes not falling back
+    // across consumer providers.
+    let (enterprise_login, consumer_connection_id, client_secret) = match options.authority {
+        OidcConnectionAuthority::Consumer(provider) => (
+            None,
+            Some(provider.connection_id.to_string()),
+            provider.client_secret(),
+        ),
         OidcConnectionAuthority::Enterprise {
             login_context,
             client_secret,
-        } => (Some(login_context), client_secret),
+        } => (Some(login_context), None, client_secret),
     };
     pending.client_secret = client_secret;
+    pending.consumer_connection_id = consumer_connection_id;
     pending.native_return = options.native_return;
     pending.native_handoff_challenge = options.native_handoff_challenge;
     pending.login_context = enterprise_login;
@@ -2149,10 +2428,33 @@ pub async fn get_login(
         )
         .await;
     }
-    // Hosted web account: fall back to the Google connection from env, so the hub offers
-    // "Continue with Google" without a stored /admin/sso record (ADR 0077).
-    let sso = web_account_sso_from_env();
-    let Some(sso) = sso else {
+    // Hosted web account: fall back to a consumer connection from env, so the hub
+    // offers "Continue with Google" or "Continue with Microsoft" without a stored
+    // /admin/sso record (ADR 0077, DR-0189 §1).
+    //
+    // The request names a slug, not a connection: an unknown or unconfigured one
+    // is refused rather than silently served by another provider, because
+    // "continue with Microsoft" quietly running Google is worse than an error.
+    let configured = configured_consumer_connections();
+    let selected = match query.provider.as_deref().map(str::trim) {
+        Some(slug) if !slug.is_empty() => {
+            match configured
+                .iter()
+                .find(|(provider, _)| provider.slug.eq_ignore_ascii_case(slug))
+            {
+                Some(found) => Some(found.clone()),
+                None => {
+                    return (
+                        StatusCode::CONFLICT,
+                        format!("{slug} sign-in is not configured on this server"),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        _ => configured.first().cloned(),
+    };
+    let Some((provider, sso)) = selected else {
         return (StatusCode::CONFLICT, "no SSO connection configured").into_response();
     };
     begin_oidc_browser_login(
@@ -2160,7 +2462,7 @@ pub async fn get_login(
         &headers,
         sso,
         OidcBrowserOptions {
-            authority: OidcConnectionAuthority::Consumer,
+            authority: OidcConnectionAuthority::Consumer(provider),
             native_return,
             native_handoff_challenge: query.handoff_challenge,
             purpose: PendingAuthPurpose::Login,
@@ -2193,10 +2495,17 @@ fn durable_independent_session(
 fn resolve_consumer_oidc_account(
     state: &crate::account_auth::AccountAuth,
     connection: &SsoConnectionRecord,
+    accepted_issuer: &str,
     verified_issuer: &str,
     subject: &str,
 ) -> Option<LoginResolution> {
-    if connection.protocol != SsoProtocol::Oidc || connection.issuer != verified_issuer {
+    // The token's issuer must be one the ceremony's pinned rule admits. For a
+    // single-tenant connection that is equality, exactly as before; for a
+    // tenant-templated one it is membership of the family, which a comparison
+    // against the connection's own `common` authority could never be.
+    if connection.protocol != SsoProtocol::Oidc
+        || !crate::identity_oidc::issuer_matches_tenant_template(accepted_issuer, verified_issuer)
+    {
         return None;
     }
     let link = state.active_external_subject(
@@ -2226,53 +2535,117 @@ enum ConsumerCallbackDecision {
     /// Nobody has this subject and the provider attested an address: ADR 0146
     /// §1 step 1 is satisfied, so carry the person into passkey creation.
     Signup { verified_email: String },
+    /// Nobody has this subject and the provider attests no address, so §1 step 1
+    /// is not satisfied and cannot be by anything in the token (DR-0189 §4).
+    /// The address the provider asserted may seed the field and proves nothing.
+    SignupNeedsEmailProof { asserted_email: Option<String> },
     /// The bounded product message the browser receives.
-    Refuse(StatusCode, &'static str),
+    Refuse(StatusCode, String),
+}
+
+/// The verified facts one consumer callback decides on.
+///
+/// A struct because they travel together and mean nothing apart: five of the
+/// seven come from the same verified token and the other two from the ceremony's
+/// pinned state, and an argument list long enough to need this grouping is also
+/// long enough to transpose two `&str` by accident.
+struct ConsumerCallbackFacts<'a> {
+    provider: ConsumerProvider,
+    connection: &'a SsoConnectionRecord,
+    /// The issuer rule pinned on the authorize leg — a tenant template for a
+    /// multi-tenant authority.
+    accepted_issuer: &'a str,
+    /// The concrete issuer the verified token claims. Durable state keys on it.
+    verified_issuer: &'a str,
+    subject: &'a str,
+    /// An address the provider attested (`email_verified`).
+    attested_email: Option<String>,
+    /// An address the provider merely asserted, which proves nothing.
+    asserted_email: Option<String>,
 }
 
 fn decide_consumer_callback(
     account_auth: &crate::account_auth::AccountAuth,
-    connection: &SsoConnectionRecord,
-    verified_issuer: &str,
-    subject: &str,
-    verified_email: Option<String>,
+    facts: ConsumerCallbackFacts<'_>,
 ) -> ConsumerCallbackDecision {
-    if let Some(resolution) =
-        resolve_consumer_oidc_account(account_auth, connection, verified_issuer, subject)
-    {
+    let ConsumerCallbackFacts {
+        provider,
+        connection,
+        accepted_issuer,
+        verified_issuer,
+        subject,
+        attested_email,
+        asserted_email,
+    } = facts;
+    let label = provider.label;
+    if let Some(resolution) = resolve_consumer_oidc_account(
+        account_auth,
+        connection,
+        accepted_issuer,
+        verified_issuer,
+        subject,
+    ) {
         return ConsumerCallbackDecision::Login(resolution);
     }
-    let Some(verified_email) = verified_email else {
-        return ConsumerCallbackDecision::Refuse(
-            StatusCode::FORBIDDEN,
-            "Google did not return a verified email address for this account, so GaugeDesk cannot create one. Create your account with a passkey instead.",
-        );
-    };
-    let Some(verified_email) = crate::account_auth::normalize_email_contact(&verified_email) else {
-        return ConsumerCallbackDecision::Refuse(
-            StatusCode::BAD_REQUEST,
-            "Google returned an email address GaugeDesk cannot use",
-        );
-    };
+    // A subject an account deliberately removed is refused before anything about
+    // an address is considered, because that refusal is true whatever the
+    // provider said about email — and it is the one the person needs to read.
     if account_auth
         .external_subject_of_any_status(&connection.id, verified_issuer, subject)
         .is_some()
     {
         return ConsumerCallbackDecision::Refuse(
             StatusCode::FORBIDDEN,
-            "this Google sign-in was removed from a GaugeDesk account; sign in with your passkey or a recovery code, then link Google again in Account Settings",
+            format!(
+                "this {label} sign-in was removed from a GaugeDesk account; sign in with your passkey or a recovery code, then link {label} again in Account Settings"
+            ),
         );
     }
-    if account_auth
-        .account_holding_active_email(&verified_email)
-        .is_some()
-    {
-        return ConsumerCallbackDecision::Refuse(
-            StatusCode::CONFLICT,
-            "a GaugeDesk account already uses this email address; sign in with your passkey or a recovery code, then link Google in Account Settings",
-        );
+    match provider.email_proof {
+        EmailProof::ProviderAttested => {
+            let Some(attested_email) = attested_email else {
+                return ConsumerCallbackDecision::Refuse(
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "{label} did not return a verified email address for this account, so GaugeDesk cannot create one. Create your account with a passkey instead."
+                    ),
+                );
+            };
+            let Some(attested_email) =
+                crate::account_auth::normalize_email_contact(&attested_email)
+            else {
+                return ConsumerCallbackDecision::Refuse(
+                    StatusCode::BAD_REQUEST,
+                    format!("{label} returned an email address GaugeDesk cannot use"),
+                );
+            };
+            if account_auth
+                .account_holding_active_email(&attested_email)
+                .is_some()
+            {
+                return ConsumerCallbackDecision::Refuse(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "a GaugeDesk account already uses this email address; sign in with your passkey or a recovery code, then link {label} in Account Settings"
+                    ),
+                );
+            }
+            ConsumerCallbackDecision::Signup {
+                verified_email: attested_email,
+            }
+        }
+        // Nothing is decided about the address here, and deliberately not the
+        // collision either: an address this callback has not proved control of
+        // must not be able to ask whether an account holds it, or a Microsoft
+        // account would be an oracle for which addresses are registered. The
+        // collision is checked where it means something — after the code comes
+        // back (DR-0189 §4, §5).
+        EmailProof::EmailedCode => ConsumerCallbackDecision::SignupNeedsEmailProof {
+            asserted_email: asserted_email
+                .as_deref()
+                .and_then(crate::account_auth::normalize_email_contact),
+        },
     }
-    ConsumerCallbackDecision::Signup { verified_email }
 }
 
 /// A provider callback whose subject resolves to no account: park the verified
@@ -2301,7 +2674,7 @@ fn decide_consumer_callback(
 ///   entirely the wrong person.
 fn begin_consumer_signup(
     auth: &AuthShellState,
-    verified_email: String,
+    email: ConsumerSignupEmail,
     connection: &SsoConnectionRecord,
     verified_issuer: &str,
     verified: &VerifiedOidcIdentity,
@@ -2331,7 +2704,7 @@ fn begin_consumer_signup(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     };
     let signup = PendingConsumerSignup {
-        verified_email,
+        email,
         connection_id: connection.id.clone(),
         connection_revision: connection.current_revision(),
         issuer: verified_issuer.to_owned(),
@@ -2435,11 +2808,21 @@ pub(crate) fn binding_matches(expected: &str, presented: &str) -> bool {
 /// by this request. The returned authorization URL is opened by the Desk in a
 /// real browser; the provider callback needs no access to the Desk webview's
 /// cookie because the exact initiating session digest lives in pending state.
+/// Which consumer entrance to link. Absent means the first one configured, so a
+/// caller that predates DR-0189 and sends no body keeps its meaning.
+#[derive(Deserialize, Default)]
+pub struct ConsumerLinkStartRequest {
+    #[serde(default)]
+    provider: Option<String>,
+}
+
 pub async fn post_consumer_oidc_link_start(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
     headers: HeaderMap,
+    body: Option<Json<ConsumerLinkStartRequest>>,
 ) -> impl IntoResponse {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
     if crate::net_http::bearer(&headers).is_none()
         && crate::account_signin::hub_session_actor(&wb).is_some()
     {
@@ -2501,10 +2884,18 @@ pub async fn post_consumer_oidc_link_start(
         account_id
     };
 
-    let Some(connection) = web_account_sso_from_env() else {
+    let configured = configured_consumer_connections();
+    let selected = match body.provider.as_deref().map(str::trim) {
+        Some(slug) if !slug.is_empty() => configured
+            .iter()
+            .find(|(provider, _)| provider.slug.eq_ignore_ascii_case(slug))
+            .cloned(),
+        _ => configured.first().cloned(),
+    };
+    let Some((provider, connection)) = selected else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Google account linking is not configured",
+            "that account linking is not configured",
         )
             .into_response();
     };
@@ -2519,7 +2910,7 @@ pub async fn post_consumer_oidc_link_start(
         &headers,
         connection,
         OidcBrowserOptions {
-            authority: OidcConnectionAuthority::Consumer,
+            authority: OidcConnectionAuthority::Consumer(provider),
             native_return: None,
             native_handoff_challenge: None,
             purpose,
@@ -2615,6 +3006,12 @@ pub struct LoginQuery {
     return_to: Option<String>,
     #[serde(default)]
     handoff_challenge: Option<String>,
+    /// Which consumer entrance to use (`google`, `microsoft`). Absent means the
+    /// first one this deployment offers, so every link that predates DR-0189
+    /// keeps its meaning. It selects among the entrances the deployment has
+    /// configured; it cannot introduce one.
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 fn native_return_uri(
@@ -2829,6 +3226,7 @@ pub async fn get_callback(
     let enterprise_login = pending.login_context.clone();
     let pending_issuer = pending.issuer.clone();
     let pending_audiences = pending.audiences.clone();
+    let pending_consumer_connection = pending.consumer_connection_id.clone();
     let finished = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
         finish_callback_verified(&pending, &code, &http)
@@ -2858,21 +3256,26 @@ pub async fn get_callback(
     // It mints no session, provisions no tenant, stores no refresh grant, and
     // exposes no provider credential.
     if let PendingAuthPurpose::ConsumerOidcLink(context) = &purpose {
-        let Some(connection) = web_account_sso_from_env() else {
+        // The connection comes from the ceremony's own pinned context, never from
+        // the callback, so a second configured provider cannot be reached by
+        // returning to this leg with different input.
+        let Some((provider, connection)) = configured_consumer_connection(&context.connection_id)
+        else {
             return (
                 StatusCode::CONFLICT,
-                "Google account linking is no longer configured",
+                "that account linking is no longer configured",
             )
                 .into_response();
         };
-        if connection.id != context.connection_id
-            || connection.current_revision() != context.connection_revision
-            || connection.issuer != pending_issuer
-            || connection.audiences != pending_audiences
+        if connection.current_revision() != context.connection_revision
+            || !connection_still_accepts(&connection, &pending_issuer, &pending_audiences)
         {
             return (
                 StatusCode::CONFLICT,
-                "Google sign-in changed while you were linking it; return to GaugeDesk and start again",
+                format!(
+                    "{} sign-in changed while you were linking it; return to GaugeDesk and start again",
+                    provider.label
+                ),
             )
                 .into_response();
         }
@@ -2901,10 +3304,17 @@ pub async fn get_callback(
                 )
                     .into_response();
             }
+            let Some(token_issuer) = id_token_issuer(&verified.id_token) else {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "the sign-in result could not be read",
+                )
+                    .into_response();
+            };
             let record = match crate::account_auth::ExternalSubjectRecord::new(
                 &context.account_id,
                 &connection.id,
-                &connection.issuer,
+                &token_issuer,
                 verified.authority.as_str(),
                 crate::account_auth::ExternalSubjectKind::ConsumerOidc,
                 crate::account::session_now_ms(),
@@ -3052,14 +3462,17 @@ pub async fn get_callback(
             }
         }
     } else {
-        let Some(connection) = web_account_sso_from_env() else {
+        let Some((provider, connection)) = pending_consumer_connection
+            .as_deref()
+            .and_then(configured_consumer_connection)
+        else {
             return (
                 StatusCode::CONFLICT,
                 "consumer sign-in is no longer configured",
             )
                 .into_response();
         };
-        if connection.issuer != pending_issuer || connection.audiences != pending_audiences {
+        if !connection_still_accepts(&connection, &pending_issuer, &pending_audiences) {
             return (
                 StatusCode::CONFLICT,
                 "consumer sign-in changed while you were signing in; start again",
@@ -3086,20 +3499,49 @@ pub async fn get_callback(
         // and an account, with this subject linked onto it. The refusal that
         // used to stand here told them to sign in with a passkey they had no
         // way to own and link Google from a settings page they could not reach.
+        // The concrete issuer this token claims, which the verifier has already
+        // bound to the pinned rule. Durable state keys on it, not on the rule.
+        let Some(token_issuer) = id_token_issuer(&verified.id_token) else {
+            return (
+                StatusCode::FORBIDDEN,
+                "the sign-in result could not be read",
+            )
+                .into_response();
+        };
         match decide_consumer_callback(
             &account_auth,
-            &connection,
-            &pending_issuer,
-            verified.authority.as_str(),
-            id_token_verified_email(&verified.id_token),
+            ConsumerCallbackFacts {
+                provider,
+                connection: &connection,
+                accepted_issuer: &pending_issuer,
+                verified_issuer: &token_issuer,
+                subject: verified.authority.as_str(),
+                attested_email: id_token_verified_email(&verified.id_token),
+                asserted_email: id_token_asserted_email(&verified.id_token),
+            },
         ) {
             ConsumerCallbackDecision::Login(resolution) => resolution,
             ConsumerCallbackDecision::Signup { verified_email } => {
                 return begin_consumer_signup(
                     &auth,
-                    verified_email,
+                    ConsumerSignupEmail::Attested(verified_email),
                     &connection,
-                    &pending_issuer,
+                    &token_issuer,
+                    &verified,
+                    native_return,
+                    native_handoff_challenge,
+                );
+            }
+            // Same ticket, same browser binding, same single spend — the person
+            // just has one more thing to do before anything is created.
+            ConsumerCallbackDecision::SignupNeedsEmailProof { asserted_email } => {
+                return begin_consumer_signup(
+                    &auth,
+                    ConsumerSignupEmail::Unproved {
+                        prefill: asserted_email,
+                    },
+                    &connection,
+                    &token_issuer,
                     &verified,
                     native_return,
                     native_handoff_challenge,
@@ -3276,7 +3718,7 @@ pub async fn get_refresh(
     }
     let bearer = crate::net_http::bearer(&headers).map(str::to_string);
     let now_ms = crate::account::session_now_ms();
-    let (person, session_id, refresh_token) = {
+    let (person, session_id, refresh_token, session_method) = {
         let g = wb.lock_unpoisoned();
         let person = g.actor(bearer.as_deref());
         if person == "anonymous" {
@@ -3293,8 +3735,11 @@ pub async fn get_refresh(
             Ok(grant) => grant,
             Err(reason) => return (StatusCode::UNAUTHORIZED, reason).into_response(),
         };
+        // Which provider minted this session, so the grant is refreshed at that
+        // provider's token endpoint (DR-0189).
+        let method = g.resolve_account_session(token).map(|(_, method)| method);
         match g.unseal_account_secret(&grant.sealed) {
-            Some(rt) => (person, session_id, rt),
+            Some(rt) => (person, session_id, rt, method),
             None => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -3304,11 +3749,15 @@ pub async fn get_refresh(
             }
         }
     };
-    let Some(sso) = web_account_sso_from_env() else {
+    let Some((provider, sso)) = session_method
+        .as_deref()
+        .and_then(session_consumer_connection)
+        .or_else(|| configured_consumer_connections().into_iter().next())
+    else {
         return (StatusCode::CONFLICT, "web-account SSO not configured").into_response();
     };
     let client_id = sso.audiences.first().cloned().unwrap_or_default();
-    let client_secret = google_client_secret_from_env().map(|s| s.expose().to_string());
+    let client_secret = provider.client_secret().map(|s| s.expose().to_string());
     let issuer = sso.issuer.clone();
     // Discovery + the refresh grant touch the network — off the async runtime.
     let refreshed = tokio::task::spawn_blocking(move || {
@@ -3367,7 +3816,7 @@ pub async fn post_native_refresh(
     // presents only its bearer — no device header — and admission reads the bound
     // device from the STORED native grant, so omitting or forging `x-gw-device`
     // cannot bypass revocation (SOC 2 F-4.2). The header is not consulted here.
-    let (person, session_id, refresh_token) = {
+    let (person, session_id, refresh_token, session_method) = {
         let g = wb.lock_unpoisoned();
         let person = g.actor(bearer.as_deref());
         if person == "anonymous" {
@@ -3381,8 +3830,11 @@ pub async fn post_native_refresh(
             Ok(grant) => grant,
             Err(reason) => return (StatusCode::UNAUTHORIZED, reason).into_response(),
         };
+        // The provider that minted this session, for the same reason the browser
+        // leg reads it (DR-0189).
+        let method = g.resolve_account_session(token).map(|(_, method)| method);
         match g.unseal_account_secret(&grant.sealed) {
-            Some(token) => (person, session_id, token),
+            Some(token) => (person, session_id, token, method),
             None => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -3392,11 +3844,17 @@ pub async fn post_native_refresh(
             }
         }
     };
-    let Some(sso) = web_account_sso_from_env() else {
+    let Some((provider, sso)) = session_method
+        .as_deref()
+        .and_then(session_consumer_connection)
+        .or_else(|| configured_consumer_connections().into_iter().next())
+    else {
         return (StatusCode::CONFLICT, "web-account SSO not configured").into_response();
     };
     let client_id = sso.audiences.first().cloned().unwrap_or_default();
-    let client_secret = google_client_secret_from_env().map(|secret| secret.expose().to_string());
+    let client_secret = provider
+        .client_secret()
+        .map(|secret| secret.expose().to_string());
     let issuer = sso.issuer.clone();
     let refreshed = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
@@ -3961,6 +4419,240 @@ iqlTEKVISscuchxZtKQJ4k8=
         );
     }
 
+    /// The Google path, which is what every decision test below is about.
+    /// DR-0189 added the provider and the asserted address to the real
+    /// signature; neither changes what Google does, so they are pinned here
+    /// rather than repeated in twenty call sites.
+    fn decide_google(
+        account_auth: &crate::account_auth::AccountAuth,
+        connection: &SsoConnectionRecord,
+        verified_issuer: &str,
+        subject: &str,
+        attested_email: Option<String>,
+    ) -> ConsumerCallbackDecision {
+        decide_consumer_callback(
+            account_auth,
+            ConsumerCallbackFacts {
+                provider: CONSUMER_GOOGLE,
+                connection,
+                accepted_issuer: verified_issuer,
+                verified_issuer,
+                subject,
+                attested_email,
+                asserted_email: None,
+            },
+        )
+    }
+
+    // ---- the Microsoft entrance (DR-0189) ------------------------------------
+
+    fn microsoft_connection() -> SsoConnectionRecord {
+        consumer_sso(
+            CONSUMER_MICROSOFT_CONNECTION_ID,
+            CONSUMER_MICROSOFT.authority,
+            "ms-client",
+        )
+    }
+
+    /// A concrete tenant issuer, which is what a verified Microsoft token claims
+    /// — never the connection's own `common` authority.
+    const MS_TENANT_ISSUER: &str =
+        "https://login.microsoftonline.com/72f988bf-86f1-41af-91ab-2d7cd011db47/v2.0";
+
+    /// What the ceremony pins: the family, from the authority's own metadata.
+    const MS_ACCEPTED_ISSUER: &str = "https://login.microsoftonline.com/{tenantid}/v2.0";
+
+    #[test]
+    fn a_microsoft_signup_asks_for_an_email_proof_rather_than_refusing() {
+        // The whole point of DR-0189 §4. Entra attests nothing, so the Google
+        // path's "no verified email" refusal would close the entrance to every
+        // person who pressed the button.
+        let state = crate::account_auth::AccountAuth::default();
+        let connection = microsoft_connection();
+        let decision = decide_consumer_callback(
+            &state,
+            ConsumerCallbackFacts {
+                provider: CONSUMER_MICROSOFT,
+                connection: &connection,
+                accepted_issuer: MS_ACCEPTED_ISSUER,
+                verified_issuer: MS_TENANT_ISSUER,
+                subject: "ms-subject-new",
+                attested_email: None,
+                asserted_email: Some("  New.Person@Example.COM ".to_string()),
+            },
+        );
+        assert_eq!(
+            decision,
+            ConsumerCallbackDecision::SignupNeedsEmailProof {
+                asserted_email: Some("new.person@example.com".to_string()),
+            },
+        );
+    }
+
+    #[test]
+    fn a_microsoft_signup_does_not_consult_the_account_an_unproved_address_holds() {
+        // The asserted address is not evidence, so it must not be allowed to ask
+        // a question about other accounts either: answering differently for a
+        // registered address would make any Microsoft account an oracle for
+        // which addresses have GaugeDesk accounts.
+        let mut state = crate::account_auth::AccountAuth::default();
+        state.emails.insert(
+            "email-1".to_string(),
+            crate::account_auth::VerifiedEmailRecord {
+                id: "email-1".to_string(),
+                op: Default::default(),
+                account_id: "account-someone-else".to_string(),
+                email: "taken@example.com".to_string(),
+                verified_at: 1_000,
+                status: crate::account_auth::AuthMethodStatus::Active,
+            },
+        );
+        assert!(state
+            .account_holding_active_email("taken@example.com")
+            .is_some());
+        let connection = microsoft_connection();
+        let decision = decide_consumer_callback(
+            &state,
+            ConsumerCallbackFacts {
+                provider: CONSUMER_MICROSOFT,
+                connection: &connection,
+                accepted_issuer: MS_ACCEPTED_ISSUER,
+                verified_issuer: MS_TENANT_ISSUER,
+                subject: "ms-subject-new",
+                attested_email: None,
+                asserted_email: Some("taken@example.com".to_string()),
+            },
+        );
+        assert_eq!(
+            decision,
+            ConsumerCallbackDecision::SignupNeedsEmailProof {
+                asserted_email: Some("taken@example.com".to_string()),
+            },
+            "an unproved address must get the same answer whether or not it is taken",
+        );
+    }
+
+    #[test]
+    fn a_microsoft_refusal_names_microsoft() {
+        // A person who removed their Microsoft sign-in and is told to re-link
+        // "Google" has been given an instruction that does not match any button
+        // they can see.
+        let mut state = crate::account_auth::AccountAuth::default();
+        let connection = microsoft_connection();
+        let mut revoked = crate::account_auth::ExternalSubjectRecord::new(
+            "account-1",
+            &connection.id,
+            MS_TENANT_ISSUER,
+            "ms-subject-removed",
+            crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+            1_000,
+        )
+        .expect("record");
+        revoked.status = crate::account_auth::AuthMethodStatus::Revoked;
+        state.external_subjects.insert(revoked.id.clone(), revoked);
+
+        let decision = decide_consumer_callback(
+            &state,
+            ConsumerCallbackFacts {
+                provider: CONSUMER_MICROSOFT,
+                connection: &connection,
+                accepted_issuer: MS_ACCEPTED_ISSUER,
+                verified_issuer: MS_TENANT_ISSUER,
+                subject: "ms-subject-removed",
+                attested_email: None,
+                asserted_email: Some("person@example.com".to_string()),
+            },
+        );
+        match decision {
+            ConsumerCallbackDecision::Refuse(status, message) => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert!(message.contains("Microsoft"), "{message}");
+                assert!(!message.contains("Google"), "{message}");
+            }
+            other => panic!("expected a refusal naming Microsoft, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tenant_issuer_resolves_against_the_common_connection() {
+        // The link is keyed by the concrete tenant issuer, not by the `common`
+        // authority the connection carries, so this is the assertion that the
+        // two are allowed to differ.
+        let mut state = crate::account_auth::AccountAuth::default();
+        let connection = microsoft_connection();
+        let link = crate::account_auth::ExternalSubjectRecord::new(
+            "account-7",
+            &connection.id,
+            MS_TENANT_ISSUER,
+            "ms-subject-known",
+            crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+            1_000,
+        )
+        .expect("record");
+        state.external_subjects.insert(link.id.clone(), link);
+
+        assert_eq!(
+            decide_consumer_callback(
+                &state,
+                ConsumerCallbackFacts {
+                    provider: CONSUMER_MICROSOFT,
+                    connection: &connection,
+                    accepted_issuer: MS_ACCEPTED_ISSUER,
+                    verified_issuer: MS_TENANT_ISSUER,
+                    subject: "ms-subject-known",
+                    attested_email: None,
+                    asserted_email: None,
+                },
+            ),
+            ConsumerCallbackDecision::Login(LoginResolution {
+                account_id: "account-7".to_string(),
+                session_method: "consumer-oidc:consumer-microsoft".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_session_labels_the_provider_that_minted_it() {
+        assert_eq!(
+            session_label_for_method("consumer-oidc:consumer-microsoft"),
+            ("microsoft", "Microsoft")
+        );
+        assert_eq!(
+            session_label_for_method("consumer-oidc:consumer-google"),
+            ("google", "Google")
+        );
+        // A connection this build does not know must not be labelled as one it
+        // does; it says what it can honestly say.
+        assert_eq!(
+            session_label_for_method("consumer-oidc:consumer-retired"),
+            ("oidc", "Consumer sign-in")
+        );
+    }
+
+    #[test]
+    fn a_pinned_tenant_template_is_still_accepted_by_its_connection() {
+        // What the callback re-checks. `connection.issuer` is the `common`
+        // authority and the pinned issuer is the template, so a string equality
+        // here — which is what the code did before DR-0189 — would refuse every
+        // Microsoft callback.
+        let connection = microsoft_connection();
+        let template = "https://login.microsoftonline.com/{tenantid}/v2.0";
+        assert!(connection_still_accepts(
+            &connection,
+            template,
+            &["ms-client".to_string()]
+        ));
+        assert!(!connection_still_accepts(
+            &connection,
+            "https://login.microsoftonline.com.evil.test/{tenantid}/v2.0",
+            &["ms-client".to_string()]
+        ));
+        assert!(
+            !connection_still_accepts(&connection, template, &["another-client".to_string()]),
+            "a changed client id must still refuse"
+        );
+    }
+
     fn pending_auth() -> PendingAuth {
         PendingAuth {
             verifier: "v".into(),
@@ -3975,6 +4667,7 @@ iqlTEKVISscuchxZtKQJ4k8=
             native_return: None,
             native_handoff_challenge: None,
             login_context: None,
+            consumer_connection_id: Some(CONSUMER_GOOGLE_CONNECTION_ID.to_string()),
             purpose: PendingAuthPurpose::Login,
         }
     }
@@ -4515,6 +5208,86 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(
             !sso.enforce_sso,
             "hosted account is opt-in login, not locked-down"
+        );
+    }
+
+    #[test]
+    fn a_multi_tenant_authority_pins_the_template_it_declares() {
+        // The end of the DR-0189 §2 chain, through the real login leg: discovery
+        // runs against the `common` authority, that document declares the tenant
+        // template, and the template is what the callback will verify `iss`
+        // against. Before this, `pending.issuer` was the configured string and a
+        // Microsoft token could not have matched it.
+        let authority = "https://login.microsoftonline.com/common/v2.0";
+        let template = "https://login.microsoftonline.com/{tenantid}/v2.0";
+        let mut gets = BTreeMap::new();
+        gets.insert(
+            format!("{authority}/.well-known/openid-configuration"),
+            json!({
+                "issuer": template,
+                "authorization_endpoint": AUTHZ_ENDPOINT,
+                "token_endpoint": TOKEN_ENDPOINT,
+                "jwks_uri": JWKS_URI,
+            })
+            .to_string(),
+        );
+        let op = MockOp {
+            gets,
+            token_response: String::new(),
+            seen_form: Mutex::new(Vec::new()),
+        };
+        let connection = consumer_sso(CONSUMER_MICROSOFT_CONNECTION_ID, authority, "ms-client");
+        let (_url, _state, pending) = start_login(
+            &connection,
+            "http://localhost:1421/auth/callback",
+            "openid profile email",
+            ClaimMapping::default(),
+            &op,
+        )
+        .expect("login starts");
+        assert_eq!(
+            pending.issuer, template,
+            "the ceremony pins the declared family, not the authority it discovered through"
+        );
+        // And the connection still admits it, which is what the callback rechecks.
+        assert!(connection_still_accepts(
+            &connection,
+            &pending.issuer,
+            &pending.audiences
+        ));
+    }
+
+    #[test]
+    fn an_authority_declaring_a_foreign_issuer_refuses_the_login() {
+        // The guard on the same chain: a document that names an issuer nobody
+        // configured must stop the ceremony, not silently become the pin.
+        let mut gets = BTreeMap::new();
+        gets.insert(
+            format!("{ISSUER}/.well-known/openid-configuration"),
+            json!({
+                "issuer": "https://evil.test",
+                "authorization_endpoint": AUTHZ_ENDPOINT,
+                "token_endpoint": TOKEN_ENDPOINT,
+                "jwks_uri": JWKS_URI,
+            })
+            .to_string(),
+        );
+        let op = MockOp {
+            gets,
+            token_response: String::new(),
+            seen_form: Mutex::new(Vec::new()),
+        };
+        let error = start_login(
+            &oidc_sso(),
+            "http://localhost:1421/auth/callback",
+            "openid",
+            ClaimMapping::default(),
+            &op,
+        )
+        .expect_err("a foreign declared issuer refuses");
+        assert!(
+            matches!(error, LoginError::Discovery(ref message) if message.contains("evil.test")),
+            "{error:?}"
         );
     }
 
@@ -5134,6 +5907,7 @@ iqlTEKVISscuchxZtKQJ4k8=
             &state,
             &connection,
             &connection.issuer,
+            &connection.issuer,
             "google-subject-7",
         )
         .expect("exact active link resolves");
@@ -5143,6 +5917,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(resolve_consumer_oidc_account(
             &state,
             &connection,
+            &connection.issuer,
             "https://other.example",
             "google-subject-7",
         )
@@ -5154,6 +5929,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(resolve_consumer_oidc_account(
             &state,
             &connection,
+            &connection.issuer,
             &connection.issuer,
             "google-subject-7",
         )
@@ -5236,6 +6012,7 @@ iqlTEKVISscuchxZtKQJ4k8=
             &state,
             &connection,
             &connection.issuer,
+            &connection.issuer,
             "google-subject-new",
         )
         .is_none());
@@ -5244,7 +6021,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         // address is normalized on the way in, because it becomes a verified
         // contact on an account and contacts are compared, not displayed.
         assert_eq!(
-            decide_consumer_callback(
+            decide_google(
                 &state,
                 &connection,
                 &connection.issuer,
@@ -5270,7 +6047,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         .unwrap();
         linked.external_subjects.insert(link.id.clone(), link);
         assert_eq!(
-            decide_consumer_callback(
+            decide_google(
                 &linked,
                 &connection,
                 &connection.issuer,
@@ -5293,7 +6070,7 @@ iqlTEKVISscuchxZtKQJ4k8=
     fn google_without_a_verified_email_still_refuses_rather_than_creating_an_account() {
         let connection = google_sso("https://accounts.google.com", "client");
         let state = crate::account_auth::AccountAuth::default();
-        let decision = decide_consumer_callback(
+        let decision = decide_google(
             &state,
             &connection,
             &connection.issuer,
@@ -5356,13 +6133,14 @@ iqlTEKVISscuchxZtKQJ4k8=
             &state,
             &connection,
             &connection.issuer,
+            &connection.issuer,
             "google-subject-7",
         )
         .is_none());
         // And signup refuses it too, rather than treating "no active link" as
         // "never seen".
         assert!(matches!(
-            decide_consumer_callback(
+            decide_google(
                 &state,
                 &connection,
                 &connection.issuer,
@@ -5393,7 +6171,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         .unwrap();
         state.emails.insert(email.id.clone(), email);
 
-        let decision = decide_consumer_callback(
+        let decision = decide_google(
             &state,
             &connection,
             &connection.issuer,
@@ -5418,7 +6196,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         );
         // A different address on the same store is still free to sign up.
         assert_eq!(
-            decide_consumer_callback(
+            decide_google(
                 &state,
                 &connection,
                 &connection.issuer,
@@ -5448,7 +6226,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert_eq!(
             store
                 .peek(&ticket, now)
-                .map(|s| s.verified_email.clone())
+                .map(|s| s.email.for_display().unwrap_or_default().to_string())
                 .as_deref(),
             Some("new.person@example.com"),
         );
@@ -5482,7 +6260,7 @@ iqlTEKVISscuchxZtKQJ4k8=
 
     fn test_signup(email: &str) -> PendingConsumerSignup {
         PendingConsumerSignup {
-            verified_email: email.to_string(),
+            email: ConsumerSignupEmail::Attested(email.to_string()),
             connection_id: CONSUMER_GOOGLE_CONNECTION_ID.to_string(),
             connection_revision: "revision".to_string(),
             issuer: "https://accounts.google.com".to_string(),

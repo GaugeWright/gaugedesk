@@ -259,6 +259,81 @@ impl OidcIdentityProvider {
     }
 }
 
+/// The placeholder a tenant-templated issuer carries, spelled the way Microsoft's
+/// own `common` discovery document spells its `issuer` (DR-0189 §2).
+pub const TENANT_PLACEHOLDER: &str = "{tenantid}";
+
+/// The claim naming the tenant that issued a token.
+const TENANT_CLAIM: &str = "tid";
+
+/// Whether `value` is a bare tenant guid — `8-4-4-12` hex, nothing else.
+///
+/// This is what stops a `tid` from smuggling anything into the expected issuer.
+/// Without it a tenant claim of `../../accounts.google.com` or
+/// `x/v2.0#` would be substituted verbatim into a URL we then demand equality
+/// against, and the attacker would be choosing the string on both sides.
+fn is_tenant_guid(value: &str) -> bool {
+    let groups = [8_usize, 4, 4, 4, 12];
+    let mut parts = value.split('-');
+    for width in groups {
+        let Some(part) = parts.next() else {
+            return false;
+        };
+        if part.len() != width || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    parts.next().is_none()
+}
+
+/// The tenant a token claims, read from the **unverified** payload.
+///
+/// Reading an unverified claim is safe here for exactly one reason, and it is
+/// worth stating because the safety is not local: the value is used only to
+/// compute the issuer string that the signed token must then match exactly,
+/// against keys fetched from the authority. A caller who names their own tenant
+/// gets a verifier demanding a token issued by that tenant and signed by the
+/// authority — which is what a multi-tenant authority means. A caller who names
+/// somebody else's gets a refusal, because no key of the authority signed a
+/// token whose `iss` names a tenant that did not issue it.
+fn unverified_tenant(credential: &str) -> Option<String> {
+    let payload = credential.split('.').nth(1)?;
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
+    let claims: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+    claims.get(TENANT_CLAIM)?.as_str().map(str::to_owned)
+}
+
+/// Substitute `tenant` into an issuer `template`, refusing anything that is not a
+/// bare tenant guid (DR-0189 §2: substitution, then exact equality).
+pub fn substitute_tenant(template: &str, tenant: &str) -> Option<String> {
+    if !is_tenant_guid(tenant) {
+        return None;
+    }
+    Some(template.replace(TENANT_PLACEHOLDER, tenant))
+}
+
+/// Whether `issuer` is a concrete member of the family `template` describes.
+///
+/// For a verified token this is a shape question, not a trust question: the
+/// verifier has already demanded that `iss` equal the template with this token's
+/// own tenant substituted. Callers that key durable state by the verified issuer
+/// use this to confirm the issuer belongs to the connection that admitted it.
+pub fn issuer_matches_tenant_template(template: &str, issuer: &str) -> bool {
+    let Some(placeholder_at) = template.find(TENANT_PLACEHOLDER) else {
+        return template == issuer;
+    };
+    let (prefix, rest) = template.split_at(placeholder_at);
+    let suffix = &rest[TENANT_PLACEHOLDER.len()..];
+    let Some(middle) = issuer
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    is_tenant_guid(middle)
+}
+
 impl IdentityProvider for OidcIdentityProvider {
     fn authenticate(&self, credential: &str) -> Option<AuthorityId> {
         // Read the header to pick the key — but never trust it for verification: the
@@ -266,8 +341,18 @@ impl IdentityProvider for OidcIdentityProvider {
         let header = decode_header(credential).ok()?;
         let key = self.select_key(header.kid.as_deref(), header.alg)?;
 
+        // A templated issuer names a family of tenants, so the issuer this token
+        // must claim is computed from the token's own tenant and then demanded
+        // exactly (DR-0189 §2). A non-templated issuer is unchanged.
+        let expected_issuer = if self.issuer.contains(TENANT_PLACEHOLDER) {
+            let tenant = unverified_tenant(credential)?;
+            substitute_tenant(&self.issuer, &tenant)?
+        } else {
+            self.issuer.clone()
+        };
+
         let mut validation = Validation::new(key.alg);
-        validation.set_issuer(&[self.issuer.as_str()]);
+        validation.set_issuer(&[expected_issuer.as_str()]);
         validation.set_audience(&self.audiences);
         // `exp` is required and validated by default; `nbf` validated when present.
 
@@ -275,6 +360,21 @@ impl IdentityProvider for OidcIdentityProvider {
             decode::<serde_json::Map<String, serde_json::Value>>(credential, &key.key, &validation)
                 .ok()?;
         let claims = token.claims;
+
+        // The verified payload must carry the same tenant the expected issuer was
+        // built from. Today this cannot fail: both reads parse the same payload
+        // bytes with the same parser, so deleting it breaks no test — it was
+        // checked by mutation, not assumed. It is kept because it is the only
+        // place the binding between the unverified read and the verified claim is
+        // stated in code, and a later change to `unverified_tenant` (a different
+        // source, a laxer parser) would turn it from redundant into load-bearing
+        // without anybody having to notice that it had.
+        if self.issuer.contains(TENANT_PLACEHOLDER) {
+            let verified_tenant = claims.get(TENANT_CLAIM)?.as_str()?;
+            if substitute_tenant(&self.issuer, verified_tenant)? != expected_issuer {
+                return None;
+            }
+        }
 
         let subject = claims.get(&self.mapping.subject_claim)?.as_str()?;
         if subject.is_empty() {
@@ -350,6 +450,11 @@ pub struct OidcEndpoints {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub jwks_uri: String,
+    /// The issuer the authority's own metadata declares. Usually the string the
+    /// document was fetched from; a multi-tenant authority declares a tenant
+    /// template here instead (DR-0189 §2). Read it through
+    /// [`accepted_issuer`] rather than trusting it directly.
+    pub issuer: String,
 }
 
 /// Fetch + parse `{issuer}/.well-known/openid-configuration` into its endpoints.
@@ -370,7 +475,55 @@ pub fn discover_endpoints(issuer: &str, http: &impl HttpGet) -> Result<OidcEndpo
         authorization_endpoint: field("authorization_endpoint")?,
         token_endpoint: field("token_endpoint")?,
         jwks_uri: field("jwks_uri")?,
+        issuer: field("issuer")?,
     })
+}
+
+/// Which issuer a login may verify against, given what was **configured** and what
+/// the authority's metadata **declares** (DR-0189 §2).
+///
+/// Validating `iss` against the discovery document is what OIDC says to do, but
+/// taking the declared value on trust would let a misconfigured or hostile OP
+/// widen an issuer an administrator pinned. So exactly two answers are admitted:
+///
+/// - the declaration agrees with the configuration — every ordinary connection,
+///   and no change in behaviour; or
+/// - the declaration is a tenant template at the **same origin** as the
+///   configured authority — a multi-tenant OP, where the configured string names
+///   the authority (`…/common/v2.0`) and the declaration names the family
+///   (`…/{tenantid}/v2.0`).
+///
+/// Anything else is a refusal, not a fallback: an authority whose metadata names
+/// an issuer we did not ask for is a misconfiguration at best.
+pub fn accepted_issuer(configured: &str, declared: &str) -> Option<String> {
+    if configured == declared {
+        return Some(declared.to_string());
+    }
+    if declared.contains(TENANT_PLACEHOLDER) && same_origin(configured, declared) {
+        return Some(declared.to_string());
+    }
+    None
+}
+
+/// Whether two URLs share scheme, host and port — compared by parsing, never by
+/// prefix, so `https://login.microsoftonline.com.evil.test` is a different origin
+/// from `https://login.microsoftonline.com`.
+fn same_origin(a: &str, b: &str) -> bool {
+    fn origin(url: &str) -> Option<(String, String)> {
+        let (scheme, rest) = url.split_once("://")?;
+        if scheme.is_empty() {
+            return None;
+        }
+        let authority = rest.split(['/', '?', '#']).next()?;
+        if authority.is_empty() {
+            return None;
+        }
+        Some((scheme.to_ascii_lowercase(), authority.to_ascii_lowercase()))
+    }
+    match (origin(a), origin(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// A blocking `application/x-www-form-urlencoded` POST — the seam the auth-code **token
@@ -670,6 +823,219 @@ JHmZgYDG5oeiHH3XvE7+GU3ekV0tajXPJ4/hHX7Y3fHB/fLZDDBkB+2hdg==
         let mut claims = base_claims();
         claims["iss"] = serde_json::json!("https://evil.example.com");
         assert_eq!(idp.authenticate(&mint(&claims)), None);
+    }
+
+    // ---- tenant-templated issuers (DR-0189 §2) -------------------------------
+
+    const TENANT: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+    const OTHER_TENANT: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
+    const TEMPLATE: &str = "https://login.microsoftonline.com/{tenantid}/v2.0";
+
+    fn tenant_provider() -> OidcIdentityProvider {
+        OidcIdentityProvider::new(TEMPLATE, [AUDIENCE.to_string()])
+            .with_es256_pem(Some(KID.to_string()), ES256_PUBLIC_PEM)
+            .expect("public key parses")
+    }
+
+    fn tenant_claims(iss: &str, tid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "iss": iss,
+            "aud": AUDIENCE,
+            "sub": "pairwise-subject",
+            "tid": tid,
+            "exp": now() + 3600,
+            "iat": now(),
+        })
+    }
+
+    #[test]
+    fn a_tenant_token_authenticates_against_its_own_issuer() {
+        let idp = tenant_provider();
+        let iss = format!("https://login.microsoftonline.com/{TENANT}/v2.0");
+        let token = mint(&tenant_claims(&iss, TENANT));
+        assert_eq!(
+            idp.authenticate(&token),
+            Some(AuthorityId::new("pairwise-subject"))
+        );
+    }
+
+    #[test]
+    fn a_second_tenant_authenticates_against_the_same_template() {
+        // The point of a multi-tenant authority: no tenant is enumerated, and
+        // admitting one does not admit it *instead* of the others.
+        let idp = tenant_provider();
+        let iss = format!("https://login.microsoftonline.com/{OTHER_TENANT}/v2.0");
+        assert!(idp
+            .authenticate(&mint(&tenant_claims(&iss, OTHER_TENANT)))
+            .is_some());
+    }
+
+    #[test]
+    fn an_issuer_naming_a_different_tenant_than_tid_is_rejected() {
+        // The whole substitution rule in one assertion. `iss` and `tid` are both
+        // in the signed payload, so a token can carry a mismatched pair; the
+        // expected issuer is built from `tid`, so `iss` must agree with it.
+        let idp = tenant_provider();
+        let iss = format!("https://login.microsoftonline.com/{OTHER_TENANT}/v2.0");
+        assert_eq!(idp.authenticate(&mint(&tenant_claims(&iss, TENANT))), None);
+    }
+
+    #[test]
+    fn a_token_without_a_tenant_claim_is_rejected() {
+        let idp = tenant_provider();
+        let iss = format!("https://login.microsoftonline.com/{TENANT}/v2.0");
+        let mut claims = tenant_claims(&iss, TENANT);
+        claims.as_object_mut().expect("object").remove("tid");
+        assert_eq!(idp.authenticate(&mint(&claims)), None);
+    }
+
+    #[test]
+    fn a_tenant_that_is_not_a_guid_is_rejected() {
+        // Each of these would be substituted verbatim into the expected issuer by
+        // a rule that only did `replace`, handing the caller both sides of the
+        // comparison. The last two are the ones that look harmless.
+        let idp = tenant_provider();
+        for tid in [
+            "common",
+            "../../accounts.google.com",
+            "a/../b",
+            "72f988bf86f141af91ab2d7cd011db47",
+            "72f988bf-86f1-41af-91ab-2d7cd011db4",
+            "72f988bf-86f1-41af-91ab-2d7cd011db47-",
+            "72f988bf-86f1-41af-91ab-2d7cd011dbZZ",
+            "",
+        ] {
+            let iss = TEMPLATE.replace(TENANT_PLACEHOLDER, tid);
+            assert_eq!(
+                idp.authenticate(&mint(&tenant_claims(&iss, tid))),
+                None,
+                "tenant {tid:?} must not be substituted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_issuer_that_merely_contains_the_authority_host_is_rejected() {
+        // Every one of these passes a `starts_with`, an `ends_with`, or a
+        // `contains` on the authority host. That is why the rule is equality
+        // after substitution and not any of those three.
+        let idp = tenant_provider();
+        for iss in [
+            "https://login.microsoftonline.com.evil.test/{tenantid}/v2.0",
+            "https://evil.test/login.microsoftonline.com/{tenantid}/v2.0",
+            "https://login.microsoftonline.com/{tenantid}/v2.0.evil.test",
+            "https://login.microsoftonline.com/{tenantid}/v2.0/../../evil",
+        ] {
+            let iss = iss.replace(TENANT_PLACEHOLDER, TENANT);
+            assert_eq!(
+                idp.authenticate(&mint(&tenant_claims(&iss, TENANT))),
+                None,
+                "issuer {iss:?} must not be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_templated_issuer_still_ignores_a_tenant_claim() {
+        // A connection with one exact issuer must not acquire template behaviour
+        // because a token happens to carry `tid`.
+        let idp = provider();
+        let mut claims = base_claims();
+        claims["tid"] = serde_json::json!(TENANT);
+        assert!(idp.authenticate(&mint(&claims)).is_some());
+
+        claims["iss"] =
+            serde_json::json!(format!("https://login.microsoftonline.com/{TENANT}/v2.0"));
+        assert_eq!(idp.authenticate(&mint(&claims)), None);
+    }
+
+    #[test]
+    fn a_declared_issuer_that_agrees_with_the_configuration_is_accepted() {
+        assert_eq!(
+            accepted_issuer("https://accounts.google.com", "https://accounts.google.com"),
+            Some("https://accounts.google.com".to_string())
+        );
+    }
+
+    #[test]
+    fn a_tenant_template_at_the_same_origin_is_accepted() {
+        assert_eq!(
+            accepted_issuer(
+                "https://login.microsoftonline.com/common/v2.0",
+                "https://login.microsoftonline.com/{tenantid}/v2.0"
+            ),
+            Some("https://login.microsoftonline.com/{tenantid}/v2.0".to_string())
+        );
+    }
+
+    #[test]
+    fn a_declared_issuer_at_another_origin_is_refused() {
+        // The regression this guard exists for: an administrator pinned an issuer,
+        // and the document at it must not be able to name a different one — with or
+        // without a template to dress it up.
+        assert_eq!(
+            accepted_issuer("https://idp.example.com", "https://evil.test"),
+            None
+        );
+        assert_eq!(
+            accepted_issuer(
+                "https://login.microsoftonline.com/common/v2.0",
+                "https://login.microsoftonline.com.evil.test/{tenantid}/v2.0"
+            ),
+            None
+        );
+        assert_eq!(
+            accepted_issuer(
+                "https://login.microsoftonline.com/common/v2.0",
+                "http://login.microsoftonline.com/{tenantid}/v2.0"
+            ),
+            None,
+            "a scheme downgrade is a different origin"
+        );
+    }
+
+    #[test]
+    fn a_differing_declaration_without_a_template_is_refused() {
+        // Same origin, no template: the document simply disagrees with the pin, and
+        // a disagreement is not a licence to follow it.
+        assert_eq!(
+            accepted_issuer(
+                "https://login.microsoftonline.com/common/v2.0",
+                "https://login.microsoftonline.com/other/v2.0"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn same_origin_compares_scheme_host_and_port() {
+        assert!(same_origin("https://a.test/x", "https://a.test/y?q=1"));
+        assert!(!same_origin("https://a.test", "https://a.test:8443"));
+        assert!(!same_origin("https://a.test", "https://a.test.evil"));
+        assert!(!same_origin("https://a.test", "https://evil/a.test"));
+        assert!(!same_origin("not-a-url", "not-a-url"));
+    }
+
+    #[test]
+    fn issuer_matches_tenant_template_accepts_only_a_guid_member() {
+        assert!(issuer_matches_tenant_template(
+            TEMPLATE,
+            &format!("https://login.microsoftonline.com/{TENANT}/v2.0")
+        ));
+        assert!(!issuer_matches_tenant_template(
+            TEMPLATE,
+            "https://login.microsoftonline.com/common/v2.0"
+        ));
+        assert!(!issuer_matches_tenant_template(
+            TEMPLATE,
+            "https://login.microsoftonline.com//v2.0"
+        ));
+        // A non-templated rule is plain equality.
+        assert!(issuer_matches_tenant_template(ISSUER, ISSUER));
+        assert!(!issuer_matches_tenant_template(
+            ISSUER,
+            "https://other.test"
+        ));
     }
 
     #[test]
