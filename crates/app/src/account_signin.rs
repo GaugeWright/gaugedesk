@@ -21,8 +21,7 @@
 //! wording instead of a dead button).
 
 use std::io::Read as _;
-use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
@@ -114,6 +113,10 @@ pub fn gaugeapp_proxy_routes() -> Router<SharedWorkbench> {
 /// Latest-wins record family holding the sealed Hub session in the account scope.
 const RECORD_KIND: &str = "hub-session";
 const RECORD_ID: &str = "session";
+/// Latest-wins record family holding the one in-flight sign-in's sealed PKCE
+/// verifier, so it survives the restart that the browser leg invites (DR-0198).
+const RECORD_KIND_PENDING: &str = "hub-signin-pending";
+const PENDING_RECORD_ID: &str = "pending";
 /// Refresh when the Hub's next provider-renewal time is within this window.
 const REFRESH_SKEW_MS: i64 = 10 * 60 * 1000;
 /// A started sign-in that was never completed expires after this long.
@@ -431,19 +434,89 @@ pub async fn get_signin_tenants(State(wb): State<SharedWorkbench>) -> Response {
     }
 }
 
-/// One in-flight sign-in: the verifier stays here — in this process — until the
-/// deep-linked code comes back. Single slot: starting again replaces it.
-struct PendingSignin {
-    verifier: String,
-    started: Instant,
+/// One in-flight sign-in, at rest in the account scope (DR-0198). The person
+/// leaves this application to authenticate, so the verifier has to outlive the
+/// process that minted it — an updater restart, a quit, or a crash during the
+/// browser leg used to discard it silently and refuse the code that came back
+/// as though no sign-in had ever been started.
+///
+/// The verifier is authentication material, so it is sealed exactly as the
+/// bearer it will be exchanged for is (`SEC-4`), never written in clear.
+/// Latest-wins and single-use: starting again replaces it, and redeeming
+/// appends the cleared tombstone rather than deleting the row (`INV-6`).
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+struct PendingRecord {
+    id: String,
+    /// The sealed PKCE verifier. Empty is the consumed tombstone.
+    sealed: String,
+    /// Wall clock, because this outlives the process an `Instant` is relative
+    /// to. Only ever compared against [`PENDING_TTL`], and the Hub bounds the
+    /// same exchange independently, so a clock step costs at worst one retry.
+    started_ms: i64,
+    /// Which entrance began it, for the projection and the logs. Not authority:
+    /// the Hub decides what it honours.
+    #[serde(default)]
+    provider: String,
 }
 
-fn pending() -> MutexGuard<'static, Option<PendingSignin>> {
-    static PENDING: OnceLock<Mutex<Option<PendingSignin>>> = OnceLock::new();
-    PENDING
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn write_pending(wb: &SharedWorkbench, record: &PendingRecord) -> Result<(), String> {
+    wb.lock_unpoisoned()
+        .write_account_record_in(
+            ACCOUNT_SCOPE,
+            RECORD_KIND_PENDING,
+            PENDING_RECORD_ID,
+            record,
+        )
+        .map_err(|error| format!("could not store the sign-in attempt: {error:?}"))
+}
+
+fn latest_pending(wb: &SharedWorkbench) -> Option<PendingRecord> {
+    let workbench = wb.lock_unpoisoned();
+    let rows = workbench
+        .store_ref()
+        .records(ACCOUNT_SCOPE, RECORD_KIND_PENDING)
+        .ok()?;
+    let record: PendingRecord = serde_json::from_str(rows.last()?).ok()?;
+    if record.sealed.is_empty() {
+        return None;
+    }
+    Some(record)
+}
+
+/// Why a stored sign-in could not be used, kept apart from "there was none" so
+/// the person is told which of the two happened.
+enum PendingOutcome {
+    Ready(String),
+    Expired,
+    None,
+}
+
+/// Single-use take: clear the record first, then unseal, so a second callback
+/// or a replay finds the tombstone whatever happens next.
+fn take_pending(wb: &SharedWorkbench) -> PendingOutcome {
+    let Some(record) = latest_pending(wb) else {
+        return PendingOutcome::None;
+    };
+    let cleared = PendingRecord {
+        id: PENDING_RECORD_ID.to_string(),
+        sealed: String::new(),
+        started_ms: record.started_ms,
+        provider: record.provider.clone(),
+    };
+    if let Err(error) = write_pending(wb, &cleared) {
+        // Refuse rather than redeem what could be redeemed twice.
+        tracing::warn!("could not consume the sign-in attempt: {error}");
+        return PendingOutcome::None;
+    }
+    if now_ms().saturating_sub(record.started_ms) > PENDING_TTL.as_millis() as i64 {
+        return PendingOutcome::Expired;
+    }
+    match wb.lock_unpoisoned().unseal_account_secret(&record.sealed) {
+        Some(verifier) => PendingOutcome::Ready(verifier),
+        // Sealed under a key this workbench no longer holds: the attempt is
+        // unusable, and it is not the same fact as never having started one.
+        None => PendingOutcome::Expired,
+    }
 }
 
 /// A fresh 32-byte verifier, base64url without padding (43 chars — the shape
@@ -844,7 +917,10 @@ pub struct SigninStart {
     provider: Option<String>,
 }
 
-pub async fn post_signin_start(body: Option<Json<SigninStart>>) -> impl IntoResponse {
+pub async fn post_signin_start(
+    State(wb): State<SharedWorkbench>,
+    body: Option<Json<SigninStart>>,
+) -> impl IntoResponse {
     let body = body.map(|Json(body)| body).unwrap_or_default();
     let Some(hub) = hub_base() else {
         return (
@@ -859,10 +935,25 @@ pub async fn post_signin_start(body: Option<Json<SigninStart>>) -> impl IntoResp
     };
     let verifier = new_verifier();
     let challenge = challenge_for(&verifier);
-    *pending() = Some(PendingSignin {
-        verifier,
-        started: Instant::now(),
-    });
+    // Seal and store before handing out the URL. A verifier that reached the
+    // browser but not the store is a sign-in that cannot complete, so fail
+    // here — where it can still be reported — rather than at the callback.
+    let Some(sealed) = wb.lock_unpoisoned().seal_account_secret(&verifier) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not seal the sign-in attempt",
+        )
+            .into_response();
+    };
+    let record = PendingRecord {
+        id: PENDING_RECORD_ID.to_string(),
+        sealed,
+        started_ms: now_ms(),
+        provider: body.provider.clone().unwrap_or_default(),
+    };
+    if let Err(message) = write_pending(&wb, &record) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+    }
     Json(json!({
         "url": login_url(&hub, &challenge, web_return.as_deref(), body.provider.as_deref()),
         "return": web_return.as_deref().unwrap_or(NATIVE_RETURN),
@@ -893,27 +984,29 @@ pub async fn post_signin_callback(
         return (StatusCode::BAD_REQUEST, "missing handoff code").into_response();
     }
     // Single-use take, like the Hub's own state store: a second callback (or a
-    // replay) finds nothing.
-    let taken = pending().take();
-    let Some(taken) = taken else {
-        tracing::warn!("hub-session callback refused: no sign-in was started on this device");
-        return (
-            StatusCode::BAD_REQUEST,
-            "no sign-in was started on this device",
-        )
-            .into_response();
+    // replay) finds the tombstone. Unlike the Hub's, this one is at rest, so a
+    // restart during the browser leg no longer discards it (DR-0198).
+    let verifier = match take_pending(&wb) {
+        PendingOutcome::Ready(verifier) => verifier,
+        PendingOutcome::Expired => {
+            tracing::warn!("hub-session callback refused: the sign-in attempt expired");
+            return (
+                StatusCode::BAD_REQUEST,
+                "the sign-in attempt expired; start again",
+            )
+                .into_response();
+        }
+        PendingOutcome::None => {
+            tracing::warn!("hub-session callback refused: no sign-in was started on this device");
+            return (
+                StatusCode::BAD_REQUEST,
+                "no sign-in was started on this device",
+            )
+                .into_response();
+        }
     };
-    if taken.started.elapsed() > PENDING_TTL {
-        tracing::warn!("hub-session callback refused: the sign-in attempt expired");
-        return (
-            StatusCode::BAD_REQUEST,
-            "the sign-in attempt expired; start again",
-        )
-            .into_response();
-    }
     let code = request.code.trim().to_string();
-    let redeemed =
-        tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &taken.verifier)).await;
+    let redeemed = tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &verifier)).await;
     let session = match redeemed {
         Ok(Ok(session)) => session,
         Ok(Err(message)) => {
@@ -1230,6 +1323,91 @@ mod tests {
         let projection = status_json(Some(&record), true);
         assert_eq!(projection["linked"], true);
         assert_eq!(projection["expired"], true);
+    }
+
+    /// Store a sign-in the way `post_signin_start` does.
+    fn start_pending(wb: &SharedWorkbench, verifier: &str, started_ms: i64) {
+        let sealed = wb
+            .lock_unpoisoned()
+            .seal_account_secret(verifier)
+            .expect("seal the verifier");
+        write_pending(
+            wb,
+            &PendingRecord {
+                id: PENDING_RECORD_ID.to_string(),
+                sealed,
+                started_ms,
+                provider: "google".to_string(),
+            },
+        )
+        .expect("store the attempt");
+    }
+
+    #[test]
+    fn a_started_sign_in_outlives_the_process_that_began_it() {
+        let root = tempfile::tempdir().unwrap();
+        let verifier = new_verifier();
+        {
+            let wb = crate::open_workbench(root.path()).unwrap();
+            start_pending(&wb, &verifier, now_ms());
+        }
+        // The browser leg is where an updater restart, a quit, or a crash
+        // lands. A second workbench over the same root is that restart.
+        let wb = crate::open_workbench(root.path()).unwrap();
+        match take_pending(&wb) {
+            PendingOutcome::Ready(taken) => assert_eq!(taken, verifier),
+            _ => panic!("the attempt did not survive the restart"),
+        }
+    }
+
+    #[test]
+    fn the_verifier_is_never_stored_in_clear() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let verifier = new_verifier();
+        start_pending(&wb, &verifier, now_ms());
+        let record = latest_pending(&wb).expect("a stored attempt");
+        assert!(!record.sealed.contains(&verifier), "sealed, not plain");
+        assert!(!record.sealed.is_empty());
+    }
+
+    #[test]
+    fn redeeming_is_single_use() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        start_pending(&wb, &new_verifier(), now_ms());
+        assert!(matches!(take_pending(&wb), PendingOutcome::Ready(_)));
+        // A replay, or a second deep link, finds the tombstone.
+        assert!(matches!(take_pending(&wb), PendingOutcome::None));
+        assert!(latest_pending(&wb).is_none());
+    }
+
+    #[test]
+    fn an_interrupted_sign_in_is_not_the_same_fact_as_no_sign_in() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        // Nothing was ever started here.
+        assert!(matches!(take_pending(&wb), PendingOutcome::None));
+        // One was, but the person left it in the browser for too long.
+        let stale = now_ms() - PENDING_TTL.as_millis() as i64 - 1;
+        start_pending(&wb, &new_verifier(), stale);
+        assert!(matches!(take_pending(&wb), PendingOutcome::Expired));
+        // Expiry consumes it too, so the stale code cannot be retried.
+        assert!(matches!(take_pending(&wb), PendingOutcome::None));
+    }
+
+    #[test]
+    fn starting_again_replaces_the_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let first = new_verifier();
+        let second = new_verifier();
+        start_pending(&wb, &first, now_ms());
+        start_pending(&wb, &second, now_ms());
+        match take_pending(&wb) {
+            PendingOutcome::Ready(taken) => assert_eq!(taken, second, "latest wins"),
+            _ => panic!("the second attempt should be redeemable"),
+        }
     }
 
     #[test]
