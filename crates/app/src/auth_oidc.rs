@@ -929,6 +929,27 @@ pub fn start_login(
     mapping: ClaimMapping,
     http: &impl HttpGet,
 ) -> Result<(String, String, PendingAuth), LoginError> {
+    // Everything that is not a consumer entrance — organization connections and
+    // every test that predates the provider table — keeps the behaviour it had.
+    start_login_with(
+        sso,
+        redirect_uri,
+        scope,
+        mapping,
+        OfflineGrant::AccessTypeOffline,
+        http,
+    )
+}
+
+/// [`start_login`] for a connection whose refresh-token mechanism is known.
+pub fn start_login_with(
+    sso: &SsoConnectionRecord,
+    redirect_uri: &str,
+    scope: &str,
+    mapping: ClaimMapping,
+    offline: OfflineGrant,
+    http: &impl HttpGet,
+) -> Result<(String, String, PendingAuth), LoginError> {
     if sso.protocol != SsoProtocol::Oidc {
         return Err(LoginError::NotConfigured);
     }
@@ -956,19 +977,17 @@ pub fn start_login(
     // `finish_callback`), binding the token to this browser login (replay/injection
     // defense, `INV-20`).
     let nonce = hex::encode(crate::session::random_bytes::<16>());
-    // Request **offline access** (ADR 0077 session refresh): Google returns a refresh token on the
-    // consent grant only with `access_type=offline`. `prompt=consent` (opt-in via env) forces the
-    // consent screen so a refresh token is re-issued even for an already-granted account — the hub
-    // sets it; enterprise SSO leaves it off (seamless SSO). Standard OAuth ignores unknown params.
-    let mut extra = String::from("&access_type=offline");
-    if gaugedesk_env::var("OIDC_PROMPT_CONSENT").as_deref() == Some("1") {
-        extra.push_str("&prompt=consent");
-    }
+    // Request **offline access** (ADR 0077 session refresh) the way this provider
+    // issues it — see [`OfflineGrant`]. `GAUGEDESK_OIDC_PROMPT_CONSENT` still
+    // governs Google's consent screen and no longer reaches anybody else's.
+    let prompt_consent = gaugedesk_env::var("OIDC_PROMPT_CONSENT").as_deref() == Some("1");
+    let extra = offline.authorize_params(prompt_consent);
+    let scope = offline.scope(scope);
     let url = authorize_url(
         &endpoints.authorization_endpoint,
         client_id,
         redirect_uri,
-        scope,
+        &scope,
         &state,
         &nonce,
         &pkce.challenge,
@@ -1661,6 +1680,61 @@ pub enum EmailProof {
     EmailedCode,
 }
 
+/// How a provider issues the refresh token the session-refresh leg needs
+/// (ADR 0077): the hub mints each fresh id-token for Home access from it, and a
+/// session without one ends when its first id-token does — about an hour in.
+///
+/// It is per provider because the two mechanisms are incompatible, not merely
+/// different, and applying one provider's to the other is how the Microsoft
+/// entrance shipped: Google's parameters on every request, so Entra never
+/// issued a refresh token and every Microsoft session died on its first expiry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfflineGrant {
+    /// Google: `access_type=offline` on the authorize request. A refresh token
+    /// comes only on a consent grant, which is why `GAUGEDESK_OIDC_PROMPT_CONSENT`
+    /// forces the consent screen — without it an already-granted account gets
+    /// no refresh token at all.
+    AccessTypeOffline,
+    /// The Microsoft identity platform: the `offline_access` scope, and nothing
+    /// else. A refresh token comes with every grant that includes it, so
+    /// forcing the consent screen buys nothing — and costs a great deal, because
+    /// `prompt=consent` demands the *user's* consent even where an administrator
+    /// has already granted it, which in a tenant that disables user consent
+    /// blocks a work account from signing in at all. Entra ignores
+    /// `access_type`; it is left off rather than sent as noise.
+    OfflineAccessScope,
+}
+
+impl OfflineGrant {
+    /// The scope to request, given the deployment's base scope.
+    pub fn scope(self, base: &str) -> String {
+        match self {
+            Self::AccessTypeOffline => base.to_string(),
+            Self::OfflineAccessScope => {
+                if base.split_whitespace().any(|s| s == "offline_access") {
+                    base.to_string()
+                } else {
+                    format!("{} offline_access", base.trim())
+                }
+            }
+        }
+    }
+
+    /// Extra authorize-request parameters, already `&`-prefixed.
+    pub fn authorize_params(self, prompt_consent: bool) -> String {
+        match self {
+            Self::AccessTypeOffline => {
+                let mut extra = String::from("&access_type=offline");
+                if prompt_consent {
+                    extra.push_str("&prompt=consent");
+                }
+                extra
+            }
+            Self::OfflineAccessScope => String::new(),
+        }
+    }
+}
+
 /// A consumer identity provider the hosted account may offer as an entrance.
 ///
 /// Everything provider-specific about a consumer entrance is here, so adding a
@@ -1684,6 +1758,7 @@ pub struct ConsumerProvider {
     /// Env var that may override `authority`, for a dev or regional endpoint.
     pub authority_env: &'static str,
     pub email_proof: EmailProof,
+    pub offline_grant: OfflineGrant,
 }
 
 pub const CONSUMER_GOOGLE: ConsumerProvider = ConsumerProvider {
@@ -1695,6 +1770,7 @@ pub const CONSUMER_GOOGLE: ConsumerProvider = ConsumerProvider {
     client_secret_env: "GOOGLE_CLIENT_SECRET",
     authority_env: "OIDC_ISSUER",
     email_proof: EmailProof::ProviderAttested,
+    offline_grant: OfflineGrant::AccessTypeOffline,
 };
 
 pub const CONSUMER_MICROSOFT: ConsumerProvider = ConsumerProvider {
@@ -1708,6 +1784,7 @@ pub const CONSUMER_MICROSOFT: ConsumerProvider = ConsumerProvider {
     client_secret_env: "MICROSOFT_CLIENT_SECRET",
     authority_env: "MICROSOFT_OIDC_AUTHORITY",
     email_proof: EmailProof::EmailedCode,
+    offline_grant: OfflineGrant::OfflineAccessScope,
 };
 
 /// Every consumer entrance this build knows how to offer, in the order the
@@ -2349,11 +2426,15 @@ async fn prepare_oidc_browser_login(
     let scope =
         gaugedesk_env::var("OIDC_SCOPE").unwrap_or_else(|| "openid profile email".to_string());
     let mapping = claim_mapping_for(&sso);
+    let offline = match &options.authority {
+        OidcConnectionAuthority::Consumer(provider) => provider.offline_grant,
+        OidcConnectionAuthority::Enterprise { .. } => OfflineGrant::AccessTypeOffline,
+    };
 
     // Discovery touches the network — run it off the async runtime (ureq is blocking).
     let started = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
-        start_login(&sso, &redirect_uri, &scope, mapping, &http)
+        start_login_with(&sso, &redirect_uri, &scope, mapping, offline, &http)
     })
     .await;
     let (url, state, mut pending) = match started {
@@ -5649,6 +5730,127 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(
             matches!(error, LoginError::Discovery(ref message) if message.contains("evil.test")),
             "{error:?}"
+        );
+    }
+
+    // ---- the refresh-token mechanism is per provider --------------------------
+
+    fn query_of(url: &str) -> std::collections::BTreeMap<String, String> {
+        url.split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| {
+                let v = v.replace('+', " ");
+                let decoded = percent_decode(&v);
+                (k.to_string(), decoded)
+            })
+            .collect()
+    }
+
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn microsoft_asks_for_offline_access_and_never_forces_consent() {
+        // The whole bug, as it shipped: Google's parameters on a Microsoft
+        // request. Entra issued no refresh token, and `prompt=consent` demanded
+        // user consent on every sign-in.
+        let grant = CONSUMER_MICROSOFT.offline_grant;
+        assert_eq!(grant, OfflineGrant::OfflineAccessScope);
+        assert_eq!(
+            grant.scope("openid profile email"),
+            "openid profile email offline_access"
+        );
+        // Even where the deployment asks for the consent screen, Microsoft does
+        // not get it — that setting is Google's.
+        assert_eq!(grant.authorize_params(true), "");
+        assert_eq!(grant.authorize_params(false), "");
+    }
+
+    #[test]
+    fn google_keeps_access_type_offline_and_its_consent_prompt() {
+        let grant = CONSUMER_GOOGLE.offline_grant;
+        assert_eq!(grant, OfflineGrant::AccessTypeOffline);
+        assert_eq!(grant.scope("openid profile email"), "openid profile email");
+        assert_eq!(
+            grant.authorize_params(true),
+            "&access_type=offline&prompt=consent"
+        );
+        assert_eq!(grant.authorize_params(false), "&access_type=offline");
+    }
+
+    #[test]
+    fn offline_access_is_not_requested_twice() {
+        // A deployment that already put it in GAUGEDESK_OIDC_SCOPE must not end
+        // up asking for it twice.
+        assert_eq!(
+            OfflineGrant::OfflineAccessScope.scope("openid offline_access profile"),
+            "openid offline_access profile"
+        );
+    }
+
+    #[test]
+    fn a_microsoft_authorize_url_carries_offline_access_and_no_google_parameters() {
+        // Through the real login leg, not just the helper: this is the URL a
+        // person's browser is sent to.
+        let op = mock_op(String::new());
+        let (url, _state, _pending) = start_login_with(
+            &oidc_sso(),
+            "http://localhost:1421/auth/callback",
+            "openid profile email",
+            ClaimMapping::default(),
+            OfflineGrant::OfflineAccessScope,
+            &op,
+        )
+        .expect("login starts");
+        let query = query_of(&url);
+        let scope = query.get("scope").expect("a scope is requested");
+        assert!(
+            scope.split_whitespace().any(|s| s == "offline_access"),
+            "Microsoft must be asked for offline_access, got scope {scope:?}"
+        );
+        assert!(!query.contains_key("access_type"), "{url}");
+        assert!(!query.contains_key("prompt"), "{url}");
+    }
+
+    #[test]
+    fn start_login_without_a_grant_is_unchanged_for_every_other_caller() {
+        // Organization connections and the tests that predate the provider table
+        // go through `start_login`, which must keep the old request exactly.
+        let op = mock_op(String::new());
+        let (url, _state, _pending) = start_login(
+            &oidc_sso(),
+            "http://localhost:1421/auth/callback",
+            "openid profile email",
+            ClaimMapping::default(),
+            &op,
+        )
+        .expect("login starts");
+        let query = query_of(&url);
+        assert_eq!(
+            query.get("access_type").map(String::as_str),
+            Some("offline")
+        );
+        assert_eq!(
+            query.get("scope").map(String::as_str),
+            Some("openid profile email")
         );
     }
 

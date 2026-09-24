@@ -35,8 +35,8 @@
 
 use gaugedesk_app::identity::IdentityProvider;
 use gaugedesk_app::identity_oidc::{
-    accepted_issuer, discover_endpoints, issuer_matches_tenant_template, substitute_tenant,
-    ClaimMapping, HttpGet, OidcIdentityProvider, TENANT_PLACEHOLDER,
+    accepted_issuer, discover_endpoints, issuer_matches_tenant_template, refresh_id_token,
+    substitute_tenant, ClaimMapping, HttpGet, OidcIdentityProvider, TENANT_PLACEHOLDER,
 };
 use gaugedesk_app::net_http::HttpClient;
 
@@ -284,5 +284,48 @@ fn the_pre_dr_0189_pin_and_a_foreign_tenant_both_refuse_a_real_token() {
     assert!(
         pinned_to_foreign_tenant.authenticate(&token).is_none(),
         "a genuine token from one tenant must not verify against another tenant's issuer"
+    );
+}
+
+#[test]
+#[ignore = "needs a genuine Entra refresh token; run via scripts/entra-oidc-check.sh"]
+fn a_real_entra_refresh_token_renews_through_the_hubs_own_refresh() {
+    // The session-refresh leg, exactly as the hub runs it: `refresh_id_token`,
+    // which sends no `scope`, and which fails the refresh unless the response
+    // carries an id-token. The Microsoft entrance first shipped asking Entra for
+    // no refresh token at all, so this leg had never been reached for Microsoft;
+    // whether Entra answers a scope-less refresh with an id-token is a fact
+    // about the vendor, and this is where it is checked rather than assumed.
+    let (Some(refresh_token), Some(client_id)) = (
+        env_or_skip("ENTRA_REFRESH_TOKEN"),
+        env_or_skip("ENTRA_CLIENT_ID"),
+    ) else {
+        return;
+    };
+    let http = HttpClient::new();
+    let endpoints = discover_endpoints(COMMON_AUTHORITY, &http).expect("discovery");
+
+    // A public client, so no secret — the conformance registration holds none.
+    let fresh = refresh_id_token(
+        &endpoints.token_endpoint,
+        &client_id,
+        None,
+        &refresh_token,
+        &http,
+    )
+    .expect("Entra answers the hub's scope-less refresh with an id-token");
+
+    let jwks = http.get(&endpoints.jwks_uri).expect("live key set");
+    let provider = OidcIdentityProvider::new(endpoints.issuer.clone(), [client_id])
+        .with_mapping(ClaimMapping::default())
+        .with_jwks(&jwks)
+        .expect("live key set parses");
+    assert!(
+        provider.authenticate(&fresh).is_some(),
+        "the refreshed id-token verifies against the declared template, as the first one did"
+    );
+    println!(
+        "refresh ✔  a fresh id-token ({} chars) verified",
+        fresh.len()
     );
 }
