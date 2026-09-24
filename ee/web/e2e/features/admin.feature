@@ -32,13 +32,6 @@ Feature: Administration GaugeApp
     Given the enterprise workbench is open for an administered tenant
     Then Administration shows its menu, agent, and People workspace
 
-  # roster-assignment-authenticated-production-client
-  @transport @authenticated
-  Scenario: authenticated workbench assignment uses the active member roster
-    Given the authenticated enterprise workbench has an assignable onboarding task
-    When I assign the onboarding task to the active owner
-    Then the onboarding task shows the active owner
-
   # resource-access-authenticated-production-client
   @transport @authenticated
   Scenario: an authenticated resource owner grants withheld context without identity impersonation

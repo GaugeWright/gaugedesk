@@ -1,8 +1,8 @@
 import { createMemo, createResource, createSignal, For, onCleanup, onMount, Show, type JSX, type Signal } from "solid-js";
-import { RouteHttpError } from "@gaugewright/control-plane-client";
+import { Rejected, RouteHttpError } from "@gaugewright/control-plane-client";
 import type {
-    ProjectId, ProjectTrackerBacklog, ReadableProjectTracker,
-    TrackerCompletionIntent, TrackerCompletionResult,
+    ProjectId, ProjectTrackerBacklog, ProjectTrackerIssue, ProjectTrackerTasks, ReadableProjectTracker, RosterPerson,
+    TrackerCompletionIntent, TrackerCompletionResult, TrackerControlIntent, TrackerIssueControl,
 } from "@gaugewright/control-plane-client";
 
 export interface ProjectTrackerApi {
@@ -10,9 +10,25 @@ export interface ProjectTrackerApi {
     listProjectTrackers(project: ProjectId): Promise<ReadableProjectTracker[]>;
     readProjectTrackerBacklog(project: ProjectId, queue: string): Promise<ProjectTrackerBacklog>;
     completeProjectTrackerIssue(project: ProjectId, queue: string, item: string, intent: TrackerCompletionIntent): Promise<TrackerCompletionResult>;
+    /** Claim, renew, release or reassign (WHIP-4). Absent: the view is read-only. */
+    controlProjectTrackerIssue?(project: ProjectId, queue: string, item: string, intent: TrackerControlIntent): Promise<TrackerCompletionResult>;
+    /** Who the Home says is asking, from the person's own task read. */
+    readProjectTrackerTasks?(project: ProjectId, queue: string): Promise<ProjectTrackerTasks>;
+    /** Who a task can be directed at. */
+    getRoster?(): Promise<RosterPerson[]>;
 }
 
-type Loaded = { trackers: ReadableProjectTracker[]; backlog: ProjectTrackerBacklog | null };
+/** How long taking or keeping a task holds it before it frees itself. */
+const LEASE_SECONDS = 4 * 60 * 60;
+
+/** A lease as the Home reports it (UTC), in the reader's own time. */
+function leaseLabel(expiresAt: string | null): string {
+    if (!expiresAt) return "";
+    const date = new Date(`${expiresAt.replace(" ", "T")}Z`);
+    return Number.isNaN(date.getTime()) ? expiresAt : date.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+}
+
+type Loaded = { trackers: ReadableProjectTracker[]; backlog: ProjectTrackerBacklog | null; me: string | null };
 type ReadResult = { value: Loaded } | { error: string };
 export type PendingTrackerCompletion = { project: ProjectId; queue: string; item: string; intent: TrackerCompletionIntent; message: string; busy: boolean };
 
@@ -61,7 +77,10 @@ export function ProjectTrackerPanel(props: {
                     return { error: "This tracker is no longer readable. Choose another tracker from the project menu." };
                 }
                 const backlog = selected ? await props.api.readProjectTrackerBacklog(project, selected) : null;
-                return { value: { trackers, backlog } };
+                const me = selected && props.api.readProjectTrackerTasks
+                    ? await props.api.readProjectTrackerTasks(project, selected).then(tasks => tasks.actor, () => null)
+                    : null;
+                return { value: { trackers, backlog, me } };
             } catch (reason) {
                 if (reason instanceof RouteHttpError) {
                     if (reason.status === 401) return { error: "Sign in to read project tasks." };
@@ -93,6 +112,39 @@ export function ProjectTrackerPanel(props: {
         setOverride(false);
         setMessage("");
     };
+    const me = () => loaded()?.me ?? null;
+    const [roster] = createResource(() => (props.api.getRoster ? props.api.getRoster().catch(() => []) : Promise.resolve([] as RosterPerson[])));
+    const personName = (authority: string | null) =>
+        !authority ? "" : authority === me() ? "you" : roster()?.find(person => person.authority === authority)?.display ?? authority;
+    const [acting, setActing] = createSignal(false);
+    // One key per intended change, kept across a retry of that same change.
+    let controlKey: { control: string; requestId: string } | null = null;
+    async function act(issue: ProjectTrackerIssue, control: TrackerIssueControl, done: string) {
+        const tracker = backlog()?.tracker;
+        if (!tracker || !props.api.controlProjectTrackerIssue || acting()) return;
+        const intent = JSON.stringify([issue.subjectId, control]);
+        if (controlKey?.control !== intent) controlKey = { control: intent, requestId: crypto.randomUUID() };
+        setActing(true);
+        setMessage("");
+        try {
+            await props.api.controlProjectTrackerIssue(props.project, tracker.queue, issue.id, {
+                subjectId: issue.subjectId, control, requestId: controlKey.requestId,
+            });
+            controlKey = null;
+            setMessage(done);
+            refresh();
+        } catch (reason) {
+            if (reason instanceof Rejected || (reason instanceof RouteHttpError && reason.status === 409)) {
+                controlKey = null;
+                setMessage("The task changed since you read it. It has been refreshed; try again if you still want to.");
+                refresh();
+            } else {
+                setMessage("Couldn’t confirm the change. Trying again repeats the same request.");
+            }
+        } finally {
+            setActing(false);
+        }
+    }
     const replacePending = (command: PendingTrackerCompletion) => setPending(items => [
         ...items.filter(item => item.intent.requestId !== command.intent.requestId), command,
     ]);
@@ -171,9 +223,51 @@ export function ProjectTrackerPanel(props: {
                                 <h4>{issue().title || issue().id}</h4>
                                 <dl class="project-task-facts">
                                     <dt>Status</dt><dd>{issue().status.replaceAll("_", " ")}</dd>
-                                    <dt>Assigned to</dt><dd>{issue().assignedTo ?? "Unassigned"}</dd>
-                                    <dt>Claimed by</dt><dd>{issue().claimedBy ?? "No current claim"}</dd>
+                                    <dt>Assigned to</dt><dd>
+                                        <Show when={props.api.controlProjectTrackerIssue && backlog()?.tracker.canComplete && active(issue().status)}
+                                            fallback={personName(issue().assignedTo) || "Unassigned"}>
+                                            <select aria-label="Assigned to" data-task-assignee value={issue().assignedTo ?? ""} disabled={acting()}
+                                                onChange={event => {
+                                                    const to = event.currentTarget.value || null;
+                                                    void act(issue(), { kind: "assign", expectedAssignee: issue().assignedTo, assignedTo: to },
+                                                        to ? `Assigned to ${personName(to)}.` : "Unassigned.");
+                                                }}>
+                                                <option value="">Unassigned</option>
+                                                <Show when={issue().assignedTo && !roster()?.some(person => person.authority === issue().assignedTo)}>
+                                                    <option value={issue().assignedTo!}>{personName(issue().assignedTo)}</option>
+                                                </Show>
+                                                <For each={roster() ?? []}>{person => <option value={person.authority}>
+                                                    {person.authority === me() ? `You (${person.display})` : person.display}
+                                                </option>}</For>
+                                            </select>
+                                        </Show>
+                                    </dd>
+                                    <dt>Claimed by</dt><dd data-task-claim>
+                                        {issue().claimedBy
+                                            ? `${personName(issue().claimedBy)}${issue().claimExpiresAt ? ` until ${leaseLabel(issue().claimExpiresAt)}` : ""}`
+                                            : "No current claim"}
+                                    </dd>
+                                    <Show when={issue().closedBy}>
+                                        <dt>Closed by</dt><dd data-task-closed-by>{personName(issue().closedBy)}</dd>
+                                    </Show>
                                 </dl>
+                                <Show when={issue().closingSummary}>
+                                    <p class="project-task-instructions" data-task-closing-summary>{issue().closingSummary}</p>
+                                </Show>
+                                <Show when={props.api.controlProjectTrackerIssue && backlog()?.tracker.canComplete && active(issue().status)}>
+                                    <div class="project-task-claim" data-task-claim-controls>
+                                        <Show when={!issue().claimedBy}>
+                                            <button type="button" disabled={acting()} onClick={() => void act(issue(), { kind: "claim", leaseSeconds: LEASE_SECONDS }, "You’ve taken this task.")}>Take this task</button>
+                                        </Show>
+                                        <Show when={issue().claimedBy && issue().claimedBy === me()}>
+                                            <button type="button" disabled={acting()} onClick={() => void act(issue(), { kind: "renew", leaseSeconds: LEASE_SECONDS }, "You’ll keep it a while longer.")}>Keep it longer</button>
+                                            <button type="button" disabled={acting()} onClick={() => void act(issue(), { kind: "release", expectedHolder: me() }, "You’ve let it go.")}>Let it go</button>
+                                        </Show>
+                                        <Show when={issue().claimedBy && issue().claimedBy !== me()}>
+                                            <p class="muted">It frees itself when {personName(issue().claimedBy)}’s claim runs out.</p>
+                                        </Show>
+                                    </div>
+                                </Show>
                                 <p class="project-task-instructions">{issue().body || "No additional instructions."}</p>
                                 <Show when={currentPending()} fallback={
                                     <Show when={backlog()?.tracker.canComplete && active(issue().status)}>

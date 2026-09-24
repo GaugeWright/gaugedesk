@@ -91,7 +91,6 @@ pub mod net_relay;
 pub mod net_server;
 pub mod net_tls;
 pub mod official_skills;
-pub mod onboarding;
 pub mod open_api;
 pub mod open_route_stack;
 pub mod open_runtime;

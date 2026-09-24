@@ -4909,6 +4909,16 @@
         "file": "crates/app/src/project_workflow_chat.rs"
       },
       "profile": "project-workflow-launch"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::prepare_tracker_control",
+        "capability": "publish",
+        "count": 1,
+        "expression": "inputs . publish (& [input] , | | { admission . commit_dispatch :: < ProductActionAdmission > (scope , & request . request_id , command . clone () , & dispatch ,) . map_err (native_error) })",
+        "file": "crates/app/src/project_tracker_control.rs"
+      },
+      "profile": "project-tracker-completion"
     }
   ]
 }

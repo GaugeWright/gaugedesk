@@ -455,3 +455,109 @@ fn a_run_is_stopped_by_its_launcher_or_an_admin_and_its_tasks_stay() {
         gaugedesk_whip_runtime::host_actions::action_result::ActionInstanceStatus::Cancelled
     );
 }
+
+/// Away-assignee recovery through the backlog (WHIP-4): a task on the
+/// project's shared `tasks` tracker, assigned to someone who is away, is
+/// reassigned and claimed by a colleague who then closes it — and the closure
+/// says who closed it.
+#[test]
+fn a_colleague_takes_over_an_away_assignees_task_and_closes_it() {
+    use crate::project_tracker::{
+        CompleteTrackerIssue, ControlTrackerIssue, TrackerCompletionClaim, TrackerIssueControl,
+    };
+    let (_root, shared, _owner, mut request) = fixture(&project_basics());
+    let chat = chat(&shared);
+    let mut wb = shared.lock_unpoisoned();
+    home_owned(&mut wb, &request.target);
+    wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    let away = member(&mut wb, "member-a", Some(DEFAULT_PROJECT));
+    let colleague = member(&mut wb, "member-b", Some(DEFAULT_PROJECT));
+    request.cut = wb
+        .chat_workflow_source(&chat, "lessons/hello.whip")
+        .unwrap()
+        .cut;
+    request.inputs = BTreeMap::from([(
+        "learner".into(),
+        serde_json::json!({ "authority": "member-a" }),
+    )]);
+    wb.launch_project_workflow(&away, &request, LIMITS).unwrap();
+    wb.step_project_workflow(&away, &request.project, &request.request_id, LIMITS)
+        .unwrap();
+
+    let backlog = wb
+        .read_project_tracker_backlog(&colleague, DEFAULT_PROJECT, "tasks")
+        .unwrap();
+    let task = backlog.issues[0].clone();
+    assert_eq!(task.assigned_to.as_deref(), Some("member-a"));
+    assert!(
+        wb.read_project_tracker_tasks(&colleague, DEFAULT_PROJECT, "tasks")
+            .unwrap()
+            .backlog
+            .issues
+            .is_empty(),
+        "not the colleague's until it is theirs"
+    );
+
+    let act = |id: &str, control| ControlTrackerIssue {
+        project: DEFAULT_PROJECT.into(),
+        queue: "tasks".into(),
+        item_id: task.id.clone(),
+        subject_id: task.subject_id.clone(),
+        request_id: id.into(),
+        control,
+    };
+    wb.control_project_tracker_issue(
+        &colleague,
+        &act(
+            "take-over",
+            TrackerIssueControl::Assign {
+                expected_assignee: Some("member-a".into()),
+                assigned_to: Some("member-b".into()),
+            },
+        ),
+        LIMITS,
+    )
+    .unwrap();
+    wb.control_project_tracker_issue(
+        &colleague,
+        &act("claim", TrackerIssueControl::Claim { lease_seconds: 900 }),
+        LIMITS,
+    )
+    .unwrap();
+    assert_eq!(
+        wb.read_project_tracker_tasks(&colleague, DEFAULT_PROJECT, "tasks")
+            .unwrap()
+            .backlog
+            .issues
+            .len(),
+        1,
+        "now it is in the colleague's queue"
+    );
+    wb.complete_project_tracker_issue(
+        &colleague,
+        &CompleteTrackerIssue {
+            project: DEFAULT_PROJECT.into(),
+            queue: "tasks".into(),
+            item_id: task.id.clone(),
+            subject_id: task.subject_id.clone(),
+            request_id: "close".into(),
+            summary: "Posted the note for them".into(),
+            claim: TrackerCompletionClaim::Holder {
+                holder: "member-b".into(),
+            },
+        },
+        LIMITS,
+    )
+    .unwrap();
+    let closed = wb
+        .read_project_tracker_backlog(&away, DEFAULT_PROJECT, "tasks")
+        .unwrap()
+        .issues
+        .remove(0);
+    assert_eq!(closed.status, "closed");
+    assert_eq!(closed.closed_by.as_deref(), Some("member-b"));
+    assert_eq!(
+        closed.closing_summary.as_deref(),
+        Some("Posted the note for them")
+    );
+}

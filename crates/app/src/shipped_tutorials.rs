@@ -50,7 +50,7 @@ impl Workbench {
     /// provisioned with its tenant's owner — that directory's one active owner.
     /// A directory with several owners names nobody here: whose the tutorials
     /// are is not something to guess.
-    fn home_owner_account(&self) -> Option<String> {
+    pub(crate) fn home_owner_account(&self) -> Option<String> {
         let claimed = self
             .store_ref()
             .records(ORG_SCOPE, CLAIM_KIND)

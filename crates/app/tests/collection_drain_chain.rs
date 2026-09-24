@@ -283,6 +283,45 @@ async fn send(app: &Router, method: &str, uri: &str, body: Option<&str>) -> (u16
     )
 }
 
+/// The Home's owner, signed in: whose queue `/tasks` is when no chat names
+/// another owner (WHIP-4).
+fn owner_bearer(workbench: &SharedWorkbench) -> String {
+    use gaugedesk_app::org::{MembershipRecord, MembershipStatus, RecordOp, ORG_ID, ORG_SCOPE};
+    let mut wb = workbench.lock_unpoisoned();
+    let owner = MembershipRecord {
+        id: "local-user".into(),
+        op: RecordOp::Upsert,
+        org_id: ORG_ID.into(),
+        authority: "local-user".into(),
+        email: String::new(),
+        role: "owner".into(),
+        status: MembershipStatus::Active,
+        managed_by_scim: false,
+        team: None,
+    };
+    wb.store_mut()
+        .append_record(
+            ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&owner).unwrap(),
+        )
+        .unwrap();
+    wb.mint_account_session("local-user", "passkey", 3600)
+        .unwrap()
+}
+
+async fn get_as(app: &Router, uri: &str, bearer: &str) -> Value {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
 async fn a_chat(app: &Router) -> String {
     let (_, workspace) = send(app, "GET", "/workspace", None).await;
     let target = workspace["projects"]
@@ -905,6 +944,7 @@ async fn a_projects_own_gate_screens_a_drained_item_into_the_workspace() {
 #[tokio::test]
 async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     let (dir, workbench, app, edge, _log) = setup();
+    let reviewer = owner_bearer(&workbench);
     drain(&workbench, &edge, PROJECT);
     let chat = a_chat(&app).await;
 
@@ -951,7 +991,7 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
 
     // And the top bar says so while it waits (ADR 0110 §7, GATE-6): one
     // `screen` task, project-scoped, naming the chat a reviewer opens to look.
-    let (_, waiting_now) = send(&app, "GET", "/tasks", None).await;
+    let waiting_now = get_as(&app, "/tasks", &reviewer).await;
     let screen: Vec<&Value> = waiting_now["tasks"]
         .as_array()
         .expect("the task queue is a list")
@@ -1009,7 +1049,7 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
 
     // ...and the pill goes with it. A count that outlived its item would send a
     // person to an empty queue, which is the failure the top bar exists to avoid.
-    let (_, after) = send(&app, "GET", "/tasks", None).await;
+    let after = get_as(&app, "/tasks", &reviewer).await;
     assert!(
         !after["tasks"]
             .as_array()

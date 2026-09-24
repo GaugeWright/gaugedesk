@@ -63,3 +63,26 @@ Feature: Project task backlog presentation (WHIP-4)
     And I open the backlog task "Review the project outline"
     And the original task completion returns
     Then completion feedback does not appear on the other task
+
+  Scenario: taking, letting go of and reassigning a task each send one governed control
+    When I open the backlog task "Organize the shared folder"
+    And I take the task
+    Then the task is mine until its lease runs out
+    When I let the task go
+    Then the task is released as its expected holder
+    When I assign the task to myself
+    Then the task is reassigned only if it was still unassigned
+
+  Scenario: a contested claim refreshes the task instead of claiming it
+    When I open the backlog task "Organize the shared folder"
+    And someone else claims the task first
+    And I take the task
+    Then the backlog says the task changed and shows its holder
+
+  Scenario: a completed task keeps who completed it after its claim is gone
+    When I open the backlog task "Make a personal assistant"
+    And I submit a completion whose response is lost
+    And I retry the pending task completion
+    And I include completed backlog tasks
+    And I open the backlog task "Make a personal assistant"
+    Then the closed task says who closed it and what they reported

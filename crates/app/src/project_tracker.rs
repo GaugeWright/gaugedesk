@@ -962,6 +962,41 @@ pub struct CompleteTrackerIssue {
     pub claim: TrackerCompletionClaim,
 }
 
+/// A person's control over one ordinary native issue (WHIP-4): take it, keep
+/// it, let it go, or direct it at someone. Assignment is advisory and never
+/// grants access; a claim is what makes the work someone's, and its lease is
+/// what keeps a quiet holder from stranding it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TrackerIssueControl {
+    /// Claim it for the next `lease_seconds`.
+    Claim { lease_seconds: u32 },
+    /// Extend the caller's own claim to `lease_seconds` from now.
+    Renew { lease_seconds: u32 },
+    /// Release a claim, naming the holder expected to hold it now.
+    Release { expected_holder: Option<String> },
+    /// Direct it at someone, or nobody, if it is still directed at
+    /// `expected_assignee` — so two people reassigning cannot silently race.
+    Assign {
+        expected_assignee: Option<String>,
+        assigned_to: Option<String>,
+    },
+}
+
+/// Human intent to control one ordinary native issue. No caller supplies
+/// authority or storage; a repeated request key replays the original act.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlTrackerIssue {
+    pub project: String,
+    pub queue: String,
+    pub item_id: String,
+    /// Permanent subject returned by the admitted backlog read.
+    pub subject_id: String,
+    pub request_id: String,
+    pub control: TrackerIssueControl,
+}
+
 #[path = "project_tracker_query.rs"]
 mod query;
 pub use query::{

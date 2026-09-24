@@ -434,6 +434,32 @@ async fn staged_progress(app: &Router, uri: &str, key: &str) -> (StatusCode, Str
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// The Home's owner, signed in: in a one-person Home, whose queue `/tasks`
+/// is, and who a chat created with no account belongs to (WHIP-4).
+fn owner_bearer(wb: &crate::SharedWorkbench) -> String {
+    let mut wb = wb.lock_unpoisoned();
+    let owner = crate::org::MembershipRecord {
+        id: "local-user".into(),
+        op: crate::org::RecordOp::Upsert,
+        org_id: crate::org::ORG_ID.into(),
+        authority: "local-user".into(),
+        email: String::new(),
+        role: "owner".into(),
+        status: crate::org::MembershipStatus::Active,
+        managed_by_scim: false,
+        team: None,
+    };
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&owner).unwrap(),
+        )
+        .unwrap();
+    wb.mint_account_session("local-user", "passkey", 3600)
+        .unwrap()
+}
+
 async fn send_as(
     app: &Router,
     method: &str,
@@ -1612,6 +1638,7 @@ async fn project_home_rolls_up_runs_outputs_and_audit() {
             collection_recipient: None,
         });
         g.write_chat_record(ChatRecord {
+            owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: "chat-1".into(),
@@ -4870,6 +4897,7 @@ fn lineage_chat(
     cut: Option<i64>,
 ) -> crate::library::ChatRecord {
     crate::library::ChatRecord {
+        owner: None,
         schema: crate::library::LIBRARY_RECORD_SCHEMA,
         extra: Default::default(),
         id: id.into(),
@@ -5092,6 +5120,7 @@ fn deleting_a_project_crypto_erases_its_chats_content() {
         collection_recipient: None,
     });
     wb.write_chat_record(ChatRecord {
+        owner: None,
         schema: crate::library::LIBRARY_RECORD_SCHEMA,
         extra: Default::default(),
         id: "chat-erase".into(),
@@ -6233,17 +6262,18 @@ async fn delete_agent_refuses_default_and_survives_restart_rehydration() {
 async fn a_clean_turn_queues_no_task() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();
+    let bearer = owner_bearer(&wb);
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"q1"}"#)).await;
 
     // This is about what a *turn* contributes.
-    let (s, before) = send(&app, "GET", "/tasks", None).await;
+    let (s, before) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert_eq!(s, StatusCode::OK);
     assert!(!before.contains(r#""id":"q1""#), "no task yet: {before}");
 
     send(&app, "POST", "/chats/q1/task", Some(r#"{"prompt":"go"}"#)).await;
 
-    let (_, after) = send(&app, "GET", "/tasks", None).await;
+    let (_, after) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert!(
         !after.contains(r#""id":"q1""#),
         "a clean turn settles itself and asks for nothing: {after}"
@@ -6258,6 +6288,7 @@ async fn a_clean_turn_queues_no_task() {
 async fn every_clean_turn_auto_advances_without_queuing() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = lean_workbench();
+    let bearer = owner_bearer(&wb);
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"noop1"}"#)).await;
 
@@ -6270,7 +6301,7 @@ async fn every_clean_turn_auto_advances_without_queuing() {
         Some(r#"{"prompt":"[no-write] just think"}"#),
     )
     .await;
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let (_, body) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert!(
         !body.contains(r#""kind":"review""#),
         "no review for a no-op turn: {body}"
@@ -6292,7 +6323,7 @@ async fn every_clean_turn_auto_advances_without_queuing() {
         Some(r#"{"prompt":"now write"}"#),
     )
     .await;
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let (_, body) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert!(
         !body.contains(r#""kind":"review""#),
         "a normal change auto-syncs: {body}"
@@ -6373,6 +6404,7 @@ async fn task_queue_types_asks_repair_and_answer() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = seeded_workbench();
     let wb2 = std::sync::Arc::clone(&wb);
+    let bearer = owner_bearer(&wb);
     let app = open_control_plane(wb);
 
     // Two chats cut from the same base. rb runs first and its clean turn settles
@@ -6412,7 +6444,7 @@ async fn task_queue_types_asks_repair_and_answer() {
             )
             .expect("the workspace reports a conflict");
     }
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let (_, body) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert!(
         body.contains(r#""id":"ra""#) && body.contains(r#""kind":"repair""#),
         "conflicted chat queues repair: {body}"
@@ -6423,7 +6455,7 @@ async fn task_queue_types_asks_repair_and_answer() {
     wb2.lock_unpoisoned()
         .ask_question("ra", "Which environment?", &[], None, false)
         .expect("the agent asks");
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let (_, body) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert!(
         body.contains(r#""kind":"answer""#),
         "an open question queues answer: {body}"
@@ -6452,7 +6484,7 @@ async fn task_queue_types_asks_repair_and_answer() {
             .expect("it is open")
             .recipient
     };
-    let projected = wb2.lock_unpoisoned().task_queue_value();
+    let projected = wb2.lock_unpoisoned().task_queue_value("local-user");
     let answer = projected["tasks"]
         .as_array()
         .expect("tasks is an array")
@@ -6469,6 +6501,86 @@ async fn task_queue_types_asks_repair_and_answer() {
     );
 }
 
+/// WHIP-4: the bar is this person's queue. An agent's question with no named
+/// recipient goes to the chat's owner — the account that created it, or, for a
+/// chat created with no account, the Home's owner — and `/tasks` shows each
+/// signed-in person only what is assigned to them. The reader is never
+/// substituted for a missing assignee, and a signed-out read is refused.
+#[tokio::test]
+async fn the_task_bar_shows_each_person_only_their_own_work() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = lean_workbench();
+    let owner = owner_bearer(&wb);
+    let colleague = {
+        let mut guard = wb.lock_unpoisoned();
+        let member = crate::org::MembershipRecord {
+            id: "member-b".into(),
+            op: crate::org::RecordOp::Upsert,
+            org_id: crate::org::ORG_ID.into(),
+            authority: "member-b".into(),
+            email: String::new(),
+            role: "member".into(),
+            status: crate::org::MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        guard
+            .store_mut()
+            .append_record(
+                crate::org::ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&member).unwrap(),
+            )
+            .unwrap();
+        guard
+            .mint_account_session("member-b", "passkey", 3600)
+            .unwrap()
+    };
+    let wb2 = std::sync::Arc::clone(&wb);
+    let app = open_control_plane(wb);
+
+    // The colleague's own chat, and one created with no account signed in.
+    let (status, _) = send_as(
+        &app,
+        "POST",
+        "/chats",
+        Some(r#"{"id":"theirs"}"#),
+        &colleague,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    send(&app, "POST", "/chats", Some(r#"{"id":"anonymous"}"#)).await;
+    {
+        let mut guard = wb2.lock_unpoisoned();
+        assert_eq!(
+            guard.library.chats["theirs"].owner.as_deref(),
+            Some("member-b")
+        );
+        assert_eq!(guard.library.chats["anonymous"].owner, None);
+        for chat in ["theirs", "anonymous"] {
+            guard
+                .ask_question(chat, "Which environment?", &[], None, false)
+                .expect("the agent asks");
+        }
+    }
+
+    let ids = |body: &str| -> Vec<String> {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        value["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (_, mine) = send_as(&app, "GET", "/tasks", None, &owner).await;
+    assert_eq!(ids(&mine), vec!["anonymous".to_owned()], "{mine}");
+    let (_, theirs) = send_as(&app, "GET", "/tasks", None, &colleague).await;
+    assert_eq!(ids(&theirs), vec!["theirs".to_owned()], "{theirs}");
+    let (status, _) = send(&app, "GET", "/tasks", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 /// ATTN-2 (ADR 0082 §3): the operator's attention rules re-shape the queue —
 /// muting `changes` drops the review task *and* its nav badge, while opting
 /// `turn-settled` into the queue raises the `reply` ask the defaults never show
@@ -6478,6 +6590,7 @@ async fn attention_rules_reshape_queue_and_badges() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = lean_workbench();
     let wb2 = std::sync::Arc::clone(&wb);
+    let bearer = owner_bearer(&wb);
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"at1"}"#)).await;
     send(&app, "POST", "/chats/at1/task", Some(r#"{"prompt":"go"}"#)).await;
@@ -6501,7 +6614,7 @@ async fn attention_rules_reshape_queue_and_badges() {
     }
 
     // Defaults: the conflict queues `repair`; no `reply` pill.
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let (_, body) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert!(
         body.contains(r#""kind":"repair""#) && !body.contains(r#""kind":"reply""#),
         "defaults hold: {body}"
@@ -6521,7 +6634,7 @@ async fn attention_rules_reshape_queue_and_badges() {
     .await;
     assert_eq!(s, StatusCode::OK);
 
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let (_, body) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert!(!body.contains(r#""kind":"repair""#), "repair muted: {body}");
     assert!(
         body.contains(r#""id":"at1""#) && body.contains(r#""kind":"reply""#),
@@ -6548,6 +6661,7 @@ async fn attention_rules_reshape_queue_and_badges() {
 async fn advancement_rules_auto_advance_covered_turns_only() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = lean_workbench();
+    let bearer = owner_bearer(&wb);
     let app = open_control_plane(wb);
 
     // A rule covering the fake agent's write (`agent-note.txt` at the root).
@@ -6570,7 +6684,7 @@ async fn advancement_rules_auto_advance_covered_turns_only() {
         merge.contains("Advanced"),
         "covered turn auto-advanced: {merge}"
     );
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
+    let (_, body) = send_as(&app, "GET", "/tasks", None, &bearer).await;
     assert!(
         !body.contains(r#""kind":"review""#),
         "no review queued: {body}"
@@ -6619,87 +6733,6 @@ async fn admitted_run_events_reach_the_live_stream() {
     assert!(phases[0].contains("Requested"));
     assert!(phases[1].contains("Admitted"));
     assert!(phases[2].contains("Running"));
-}
-
-/// The onboarding checklist (ADR 0075 Phase 2) is retired (DR-0185). A fresh
-/// workbench files none of it, even under the real runtime it used to seed
-/// under; and a root that already carries it keeps the items as evidence while
-/// the task bar leaves them out. Another issue in the same queue still shows,
-/// because the queue is where the account-global tracker files its work.
-#[tokio::test]
-async fn the_retired_onboarding_checklist_is_neither_filed_nor_shown() {
-    let _real = crate::test_support::real_agent_env();
-    let dir = tempfile::tempdir().unwrap();
-    let wb = Arc::new(Mutex::new(
-        crate::workbench_state::build_workbench(dir.path()).unwrap(),
-    ));
-    let boundary = crate::workbench_state::ACCOUNT_GLOBAL_BOUNDARY;
-    let issue_titles = |body: &str| -> Vec<String> {
-        let v: serde_json::Value = serde_json::from_str(body).unwrap();
-        v["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|t| t["kind"] == "issue")
-            .filter_map(|t| t["title"].as_str().map(str::to_owned))
-            .collect()
-    };
-
-    {
-        let mut guard = wb.lock_unpoisoned();
-        let tracker = guard.tracker_for_boundary(boundary).expect("tracker opens");
-        assert!(
-            !tracker
-                .has_items(crate::onboarding::ONBOARDING_QUEUE)
-                .expect("has_items"),
-            "a fresh workbench files no checklist",
-        );
-        // What an older release left behind, and one ordinary issue beside it.
-        for (title, step) in [
-            ("Connect a model", "credential"),
-            ("Send your first message", "first_turn"),
-            ("Create a project", "project"),
-            ("Assign this onboarding step", "assignment-contract"),
-        ] {
-            tracker
-                .file_item(
-                    crate::onboarding::ONBOARDING_QUEUE,
-                    title,
-                    "",
-                    &[],
-                    &serde_json::json!({ "step": step }),
-                    Some("onboarding-system"),
-                )
-                .expect("the item files");
-        }
-    }
-
-    let app = open_control_plane(wb.clone());
-    let (status, body) = send(&app, "GET", "/tasks", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        issue_titles(&body),
-        vec!["Assign this onboarding step".to_owned()],
-        "only the ordinary issue is work: {body}",
-    );
-
-    // Linking a credential no longer touches the tracker; the legacy step
-    // stays open as it was, and stays out of the bar.
-    let (status, _) = send(
-        &app,
-        "POST",
-        "/account/credentials",
-        Some(r#"{"provider":"anthropic","token":"sk-test-xyz"}"#),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let open = wb
-        .lock_unpoisoned()
-        .tracker_for_boundary(boundary)
-        .expect("tracker opens")
-        .list_items(Some(crate::onboarding::ONBOARDING_QUEUE), Some("open"))
-        .expect("list_items");
-    assert_eq!(open.len(), 4, "legacy items are preserved, not rewritten");
 }
 
 /// Every project has a gate from creation, and it is review-by-hand.
@@ -6865,92 +6898,6 @@ async fn every_project_is_created_with_the_default_gate() {
     );
     crate::gate::admit_installed(&seeded)
         .expect("a new project's seeded gate compiles and satisfies its envelope");
-}
-
-/// `GATE-3f`: `assigned_to` is a roster authority, and assignment stays advisory.
-///
-/// The advisory half is the decision the row asked for, and it is enforced here
-/// rather than only documented: WhippleScript kept assignment advisory because it
-/// lacks an authority model, GaugeDesk *has* one and still does not gate claiming.
-/// Enforcing "only the assignee may claim" turns an away assignee into stuck work,
-/// which inverts the premise of a shared queue. Exclusivity is `claim`'s job, and
-/// it is earned by taking the work rather than granted by being named.
-#[tokio::test]
-async fn assignment_binds_to_the_roster_and_never_gates_a_claim() {
-    let (_dir, wb) = workbench();
-    let boundary = crate::workbench_state::ACCOUNT_GLOBAL_BOUNDARY;
-
-    let (owner, filed) = {
-        let mut guard = wb.lock_unpoisoned();
-        let owner = guard.authority().as_str().to_owned();
-        let tracker = guard.tracker_for_boundary(boundary).expect("tracker opens");
-        let item = tracker
-            .file_item(
-                crate::onboarding::ONBOARDING_QUEUE,
-                "Someone should look at this",
-                "",
-                &[],
-                &serde_json::Value::Null,
-                Some("agent"),
-            )
-            .expect("the issue files");
-        (owner, item.id)
-    };
-
-    // A name nobody on the roster answers to is refused, and the refusal names
-    // who could have been chosen.
-    let refusal = wb
-        .lock_unpoisoned()
-        .assign_work_item(boundary, &filed, Some("nobody@example.com"))
-        .expect_err("an off-roster assignee is refused");
-    assert!(
-        matches!(refusal, crate::roster::AssignError::NotOnRoster { .. }),
-        "refused for being off-roster: {refusal}",
-    );
-    assert!(
-        refusal.to_string().contains(&owner),
-        "names the roster: {refusal}"
-    );
-
-    // The acting authority is on it, so assigning to them resolves to an
-    // authority rather than storing whatever string arrived.
-    let assigned = wb
-        .lock_unpoisoned()
-        .assign_work_item(boundary, &filed, Some(&owner))
-        .expect("the owner is on the roster");
-    assert_eq!(assigned.as_deref(), Some(owner.as_str()));
-    let projected = wb.lock_unpoisoned().task_queue_value();
-    assert_eq!(projected["tasks"][0]["id"], filed);
-    assert_eq!(projected["tasks"][0]["boundary"], boundary);
-    assert_eq!(projected["tasks"][0]["assignee"], owner);
-
-    // ...and somebody else can still claim it. This is the load-bearing
-    // assertion: the assignment is a recommendation, not a lock.
-    let outcome = wb
-        .lock_unpoisoned()
-        .tracker_for_boundary(boundary)
-        .expect("tracker opens")
-        .claim_item(&filed, "someone-else", None)
-        .expect("a claim is admitted");
-    // `Claimed` is the claim being taken. A refused one reports the existing
-    // holder or a conflict instead — so this asserts the claim went through for
-    // somebody the item was not assigned to.
-    assert_eq!(
-        format!("{outcome:?}"),
-        "Claimed",
-        "a non-assignee may claim",
-    );
-
-    // Clearing it means "whoever has access" — the inbox default, not an error.
-    let cleared = wb
-        .lock_unpoisoned()
-        .assign_work_item(boundary, &filed, None)
-        .expect("clearing is allowed");
-    assert_eq!(cleared, None);
-    assert!(
-        wb.lock_unpoisoned().task_queue_value()["tasks"][0]["assignee"].is_null(),
-        "the task projection must read admitted assignment, not synthesize the acting owner",
-    );
 }
 
 /// CMP-17 reproduction under instrumentation.

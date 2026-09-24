@@ -141,19 +141,17 @@ export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask
             agent: string;
             kind: string;
             assignee?: string;
-            boundary?: string;
             project?: string;
             waiting?: number;
         }[];
     };
-    const kinds = new Set(["answer", "repair", "reply", "issue", "screen"]);
+    const kinds = new Set(["answer", "repair", "reply", "screen"]);
     return o.tasks.map((t) => ({
         id: t.id,
         title: t.title,
         agent: t.agent,
         kind: (kinds.has(t.kind) ? t.kind : "reply") as HumanTask["kind"],
         assignee: t.assignee,
-        boundary: t.boundary,
         project: t.project,
         waiting: t.waiting,
     }));
@@ -179,24 +177,6 @@ export async function getRoster(transport: WorkbenchTransport): Promise<RosterPe
             role: field("role"),
         };
     });
-}
-
-/** Direct a tracker item at an active roster authority, or clear it with null. */
-export async function assignWorkItem(
-    transport: WorkbenchTransport,
-    boundary: string,
-    item: string,
-    to: string | null,
-): Promise<string | null> {
-    const value = (await transport.json(
-        "POST",
-        `/work-items/${encodeURIComponent(item)}/assign`,
-        { boundary_id: boundary, to },
-    )) as { assigned_to?: unknown };
-    if (value.assigned_to !== null && typeof value.assigned_to !== "string") {
-        throw new Error("work item assignment: expected assigned_to");
-    }
-    return value.assigned_to ?? null;
 }
 
 /** Content search across chat transcripts (SEARCH-1) and worktree files (SEARCH-2).

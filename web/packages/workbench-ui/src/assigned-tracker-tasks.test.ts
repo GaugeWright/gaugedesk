@@ -5,7 +5,7 @@ import type { ProjectId } from "@gaugewright/control-plane-client";
 const personal = { id: "personal" as ProjectId, name: "Personal" };
 const work = { id: "work" as ProjectId, name: "Work" };
 const tracker = (project: string, queue: string) => ({ projectId: project, workspaceId: `ws-${project}`, queue, resourceId: `r-${queue}`, canComplete: true });
-const issue = (id: string, title: string) => ({ id, subjectId: `subject-${id}`, title, body: "", status: "open" as const, assignedTo: "learner", claimedBy: null, filedBy: "learner", labels: [], createdAt: "t", updatedAt: "t" });
+const issue = (id: string, title: string) => ({ id, subjectId: `subject-${id}`, title, body: "", status: "open" as const, assignedTo: "learner", claimedBy: null, claimExpiresAt: null, closedBy: null, closingSummary: null, filedBy: "learner", labels: [], createdAt: "t", updatedAt: "t" });
 
 describe("assigned tracker tasks", () => {
     it("gathers each readable tracker's assignments with the context that opens them", async () => {

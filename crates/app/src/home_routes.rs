@@ -561,6 +561,7 @@ mod tests {
                 created_position: 0,
             });
             guard.write_chat_record(ChatRecord {
+                owner: None,
                 schema: crate::library::LIBRARY_RECORD_SCHEMA,
                 extra: Default::default(),
                 id: "foreign-chat".into(),

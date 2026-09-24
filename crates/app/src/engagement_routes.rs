@@ -203,6 +203,7 @@ impl Workbench {
         let branch = eng.branch().to_string();
         let path = eng.path().to_string_lossy().to_string();
         self.write_created_chat_record(ChatRecord {
+            owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: id.clone(),
@@ -1032,9 +1033,13 @@ pub(crate) struct CreateEngagement {
 /// target. The placement owns context; the selected target owns the candidate files.
 pub(crate) async fn create_engagement(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
+    authenticated: Option<axum::Extension<crate::identity::AuthenticatedActionContext>>,
     Json(body): Json<CreateEngagement>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    let creator = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+        .map(|context| context.actor().as_str().to_owned());
     // An explicit embedding id keeps its raw value as the title; a minted id gets
     // the "new chat" placeholder so the nav renders it as "Untitled" until the first
     // message auto-titles it (state/chat-title) — never the raw `chat-…` token.
@@ -1043,15 +1048,20 @@ pub(crate) async fn create_engagement(
         None => (crate::library::gen_id("chat"), "new chat".to_string()),
     };
     match wb.create_default_engagement(id, title) {
-        Ok(created) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": created.id,
-                "branch": created.branch,
-                "path": created.path,
-            })),
-        )
-            .into_response(),
+        Ok(created) => {
+            if let Some(creator) = &creator {
+                wb.claim_chat_owner(&created.id, creator);
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": created.id,
+                    "branch": created.branch,
+                    "path": created.path,
+                })),
+            )
+                .into_response()
+        }
         Err(EngagementCreateError::Exists) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "engagement exists" })),
@@ -1728,11 +1738,6 @@ pub(crate) async fn post_stop(
 #[cfg(debug_assertions)]
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct TestResetQuery {
-    /// Seed one real tracker item after the reset so browser tests can exercise
-    /// the production roster/assignment client. This remains behind the same
-    /// test-only process guard as the reset itself.
-    #[serde(default)]
-    assignable_task: bool,
     /// Seed a real project chat with one context handle whose payload access is
     /// still Init, for production-client request/approval journeys.
     #[serde(default)]
@@ -1950,32 +1955,6 @@ pub(crate) async fn post_test_reset(
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("test recovery seed: {error:?}"),
-                    )
-                        .into_response();
-                }
-            }
-            if query.assignable_task {
-                let tracker = match fresh.account_tracker() {
-                    Ok(tracker) => tracker,
-                    Err(error) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("test tracker: {error}"),
-                        )
-                            .into_response()
-                    }
-                };
-                if let Err(error) = tracker.file_item(
-                    crate::onboarding::ONBOARDING_QUEUE,
-                    "Assign this onboarding step",
-                    "Browser fixture for the production roster and assignment path.",
-                    &[],
-                    &serde_json::json!({ "step": "assignment-contract" }),
-                    Some("test-system"),
-                ) {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("test tracker seed: {error}"),
                     )
                         .into_response();
                 }

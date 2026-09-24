@@ -56,37 +56,20 @@ export function QueueSheet(props: QueueSheetProps): JSX.Element {
                     >
                         {(t: HumanTask, i) => (
                             <li>
-                                {/* Onboarding issues (ADR 0075) carry a whip work-item
-                                    id, not an engagement, so their row is informational
-                                    — it doesn't jump to a chat. Review rows navigate. */}
-                                <Show
-                                    when={t.kind === "issue"}
-                                    fallback={
-                                        <button
-                                            type="button"
-                                            class="queue-sheet-item"
-                                            classList={{ current: i() === 0 }}
-                                            data-queue-task={t.id}
-                                            onClick={() => props.onJump(t.id as EngagementId)}
-                                        >
-                                            <Show when={i() === 0}>
-                                                <span class="queue-item-current">current</span>
-                                            </Show>
-                                            <span class="queue-item-kind">{t.kind}</span>
-                                            <span class="queue-item-title">{displayChatTitle(t.title)}</span>
-                                            <span class="queue-item-agent">{t.agent}</span>
-                                        </button>
-                                    }
+                                <button
+                                    type="button"
+                                    class="queue-sheet-item"
+                                    classList={{ current: i() === 0 }}
+                                    data-queue-task={t.id}
+                                    onClick={() => props.onJump(t.id as EngagementId)}
                                 >
-                                    <div
-                                        class="queue-sheet-item queue-sheet-issue"
-                                        data-queue-task={t.id}
-                                        data-queue-kind="issue"
-                                    >
-                                        <span class="queue-item-kind">onboarding</span>
-                                        <span class="queue-item-title">{displayChatTitle(t.title)}</span>
-                                    </div>
-                                </Show>
+                                    <Show when={i() === 0}>
+                                        <span class="queue-item-current">current</span>
+                                    </Show>
+                                    <span class="queue-item-kind">{t.kind}</span>
+                                    <span class="queue-item-title">{displayChatTitle(t.title)}</span>
+                                    <span class="queue-item-agent">{t.agent}</span>
+                                </button>
                             </li>
                         )}
                     </For>

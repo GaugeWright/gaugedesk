@@ -6908,6 +6908,42 @@
       }
     },
     {
+      "id": "home.project-tracker.control",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/projects/:project/trackers/:queue/issues/:item_id/control",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "current-recipient-project-workspace-tracker",
+      "capability": "control-native-tracker-issue",
+      "requestSchema": "rust:gaugedesk-app/project_tracker_routes/ControlBody+Idempotency-Key",
+      "responseSchema": "rust:gaugedesk-app/project_workflow/ProjectWorkflowStep",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-tracker.test.ts#claims, releases and reassigns under one request key each"
+        ],
+        "authority": [
+          "crates/app/src/project_tracker_control_tests.rs#reassignment_compares_first_and_never_grants_access"
+        ],
+        "journey": [
+          "crates/app/src/project_tracker_route_tests.rs#desktop_and_hosted_backlog_completion_use_authenticated_native_receipts"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_tracker_control_tests.rs#a_claim_is_leased_renewed_and_released_by_request_key"
+        ]
+      }
+    },
+    {
       "id": "home.project.workflow-launch",
       "jurisdiction": "private-home",
       "transport": "http-json",
@@ -7937,53 +7973,17 @@
       },
       "evidence": {
         "contract": [
-          "ee/web/e2e/features/admin.feature#roster-assignment-authenticated-production-client"
+          "crates/app/src/tests.rs#the_task_bar_shows_each_person_only_their_own_work"
         ],
         "authority": [
-          "crates/app/src/tests.rs#assignment_binds_to_the_roster_and_never_gates_a_claim"
+          "crates/app/src/agent_question.rs#an_unknown_recipient_is_refused_with_the_roster"
         ],
         "journey": [
-          "ee/web/e2e/features/admin.feature#roster-assignment-authenticated-production-client"
+          "crates/app/src/tests.rs#the_task_bar_shows_each_person_only_their_own_work"
         ],
         "deployed": [],
         "property": [
-          "crates/app/src/tests.rs#assignment_binds_to_the_roster_and_never_gates_a_claim"
-        ]
-      }
-    },
-    {
-      "id": "home.work-item.assign",
-      "jurisdiction": "private-home",
-      "transport": "http-json",
-      "method": "POST",
-      "path": "/work-items/:item_id/assign",
-      "producer": "gaugedesk-app hosted Home composition",
-      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
-      "authentication": "local-owner-or-account-session-and-home-admission",
-      "scope": "person-home-tracker-boundary-item",
-      "capability": "assign-tracker-work-item",
-      "requestSchema": "gw://schemas/work-item-assignment/v1",
-      "responseSchema": "gw://schemas/work-item-assignment-result/v1",
-      "sideEffect": "mutation",
-      "risk": "important",
-      "compatibility": {
-        "contractVersion": 1,
-        "minimumConsumer": 1,
-        "maximumConsumer": null
-      },
-      "evidence": {
-        "contract": [
-          "ee/web/e2e/features/admin.feature#roster-assignment-authenticated-production-client"
-        ],
-        "authority": [
-          "crates/app/src/tests.rs#assignment_binds_to_the_roster_and_never_gates_a_claim"
-        ],
-        "journey": [
-          "ee/web/e2e/features/admin.feature#roster-assignment-authenticated-production-client"
-        ],
-        "deployed": [],
-        "property": [
-          "crates/app/src/tests.rs#assignment_binds_to_the_roster_and_never_gates_a_claim"
+          "crates/app/src/agent_question.rs#an_unknown_recipient_is_refused_with_the_roster"
         ]
       }
     },

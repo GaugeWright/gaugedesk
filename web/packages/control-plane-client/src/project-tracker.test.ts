@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { completeProjectTrackerIssue, listProjectTrackers, subscribeAnyProjectTrackerChanges, parseProjectTrackerBacklog, readProjectTrackerBacklog, readProjectTrackerTasks, subscribeProjectTrackerChanges, type TrackerCompletionIntent } from "./project-tracker";
+import { completeProjectTrackerIssue, controlProjectTrackerIssue, listProjectTrackers, subscribeAnyProjectTrackerChanges, parseProjectTrackerBacklog, readProjectTrackerBacklog, readProjectTrackerTasks, subscribeProjectTrackerChanges, type TrackerCompletionIntent, type TrackerControlIntent } from "./project-tracker";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 
 const tracker = { project_id: "personal", workspace_id: "workspace-personal", queue: "tutorials", resource_id: "native-tracker", can_complete: true };
@@ -83,6 +83,22 @@ describe("project tracker native client", () => {
         expect(await completeProjectTrackerIssue(transport, "personal", "tutorials", "WS-1", intent)).toEqual(first);
         expect(requests[0]).toEqual(["POST", "/projects/personal/trackers/tutorials/issues/WS-1/complete", { subject_id: "permanent-subject", summary: "I did it", claim: { kind: "holder", holder: "claimed-worker" } }, { idempotencyKey: "original-request" }]);
         expect(requests[1]).toEqual(requests[0]);
+    });
+    it("claims, releases and reassigns under one request key each", async () => {
+        const requests: unknown[] = [];
+        const transport: WorkbenchTransport = { base: "", json: async (...args) => { requests.push(args); return completion; } };
+        const claim: TrackerControlIntent = { subjectId: "permanent-subject", control: { kind: "claim", leaseSeconds: 3600 }, requestId: "claim-1" };
+        const first = await controlProjectTrackerIssue(transport, "personal", "tasks", "WS-1", claim);
+        expect(await controlProjectTrackerIssue(transport, "personal", "tasks", "WS-1", claim)).toEqual(first);
+        await controlProjectTrackerIssue(transport, "personal", "tasks", "WS-1", { subjectId: "permanent-subject", control: { kind: "release", expectedHolder: "me" }, requestId: "release-1" });
+        await controlProjectTrackerIssue(transport, "personal", "tasks", "WS-1", { subjectId: "permanent-subject", control: { kind: "assign", expectedAssignee: "away", assignedTo: null }, requestId: "assign-1" });
+        expect(requests).toEqual([
+            ["POST", "/projects/personal/trackers/tasks/issues/WS-1/control", { subject_id: "permanent-subject", control: { kind: "claim", lease_seconds: 3600 } }, { idempotencyKey: "claim-1" }],
+            ["POST", "/projects/personal/trackers/tasks/issues/WS-1/control", { subject_id: "permanent-subject", control: { kind: "claim", lease_seconds: 3600 } }, { idempotencyKey: "claim-1" }],
+            ["POST", "/projects/personal/trackers/tasks/issues/WS-1/control", { subject_id: "permanent-subject", control: { kind: "release", expected_holder: "me" } }, { idempotencyKey: "release-1" }],
+            ["POST", "/projects/personal/trackers/tasks/issues/WS-1/control", { subject_id: "permanent-subject", control: { kind: "assign", expected_assignee: "away", assigned_to: null } }, { idempotencyKey: "assign-1" }],
+        ]);
+        await expect(controlProjectTrackerIssue(transport, "p", "q", "i", { ...claim, requestId: " " })).rejects.toThrow();
     });
     it("encodes generated project queue and issue identities as single path segments", async () => {
         const parts = ["a/b", "with spaces", "?query#fragment", "a%2Fb", "日本語"];

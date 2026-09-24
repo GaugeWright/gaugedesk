@@ -70,6 +70,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             post(crate::project_tracker_routes::complete_issue),
         )
         .route(
+            "/projects/{project}/trackers/{queue}/issues/{item_id}/control",
+            post(crate::project_tracker_routes::control_issue),
+        )
+        .route(
             "/projects/{project}/workflows",
             post(crate::project_workflow_routes::launch),
         )
@@ -94,7 +98,6 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             post(crate::project_workflow_routes::stop_chat_whip),
         )
         .route("/roster", get(lr::get_roster))
-        .route("/work-items/{item_id}/assign", post(lr::assign_work_item))
         .route("/search", get(lr::search))
         .route("/archetypes", post(lr::create_agent))
         .route(

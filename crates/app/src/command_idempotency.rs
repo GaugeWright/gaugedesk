@@ -123,7 +123,15 @@ fn native_tracker_command_path(path: &str) -> bool {
     let parts: Vec<_> = path.split('/').filter(|part| !part.is_empty()).collect();
     matches!(
         parts.as_slice(),
-        ["projects", _, "trackers", _, "issues", _, "complete"]
+        [
+            "projects",
+            _,
+            "trackers",
+            _,
+            "issues",
+            _,
+            "complete" | "control"
+        ]
     )
 }
 

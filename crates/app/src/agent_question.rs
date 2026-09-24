@@ -166,11 +166,17 @@ impl Workbench {
         people.into_values().collect()
     }
 
-    /// The default recipient for `chat_id`: its owner. The single-authority
-    /// collapse makes that the acting authority; when chats carry a distinct
-    /// owner this reads it instead and no call site changes.
-    pub fn default_addressee(&self, _chat_id: &str) -> String {
-        self.authority().as_str().to_owned()
+    /// The default recipient for `chat_id`: its owner (ADR 0113 §2) — the
+    /// account that created it, or, for a chat created with no account signed
+    /// in, the Home's owner (DR-0187). Only a Home nobody owns falls back to
+    /// its own acting authority, and then no person's bar shows the task.
+    pub fn default_addressee(&self, chat_id: &str) -> String {
+        self.library
+            .chats
+            .get(chat_id)
+            .and_then(|chat| chat.owner.clone())
+            .or_else(|| self.home_owner_account())
+            .unwrap_or_else(|| self.authority().as_str().to_owned())
     }
 
     /// Ask a person a question. Returns the question's id.

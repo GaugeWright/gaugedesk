@@ -489,52 +489,6 @@ Then("the run phase is {string}", async ({ page }, phase: string) => {
 
 // ---- human task queue (top bar) ----
 
-Given("an assignable onboarding task", async ({ page, request }) => {
-    const response = await request.post(`${aliceCP}/test/reset?assignable_task=true`, {
-        headers: mutationHeaders(),
-    });
-    if (!response.ok()) throw new Error(`task seed failed: ${response.status()} ${await response.text()}`);
-    const roster = page.waitForResponse((candidate) => {
-        const url = new URL(candidate.url());
-        return candidate.request().method() === "GET" && url.pathname === "/roster";
-    });
-    const tasks = page.waitForResponse((candidate) => {
-        const url = new URL(candidate.url());
-        return candidate.request().method() === "GET" && url.pathname === "/tasks";
-    });
-    await page.goto("/");
-    expect((await roster).status()).toBe(200);
-    const taskResponse = await tasks;
-    expect(taskResponse.status()).toBe(200);
-    expect((await taskResponse.json()).tasks).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "issue", boundary: "account::global" }),
-    ]));
-    await expect(page.getByRole("combobox", {
-        name: "assign Assign this onboarding step",
-        exact: true,
-    })).toBeVisible();
-});
-
-When("I assign the onboarding task to the active owner", async ({ page }) => {
-    const assigned = page.waitForResponse((candidate) => {
-        const url = new URL(candidate.url());
-        return candidate.request().method() === "POST"
-            && /^\/work-items\/[^/]+\/assign$/.test(url.pathname);
-    });
-    await page.getByRole("combobox", {
-        name: "assign Assign this onboarding step",
-        exact: true,
-    }).selectOption("local-user");
-    expect((await assigned).status()).toBe(200);
-});
-
-Then("the onboarding task shows the active owner", async ({ page }) => {
-    await expect(page.getByRole("combobox", {
-        name: "assign Assign this onboarding step",
-        exact: true,
-    })).toHaveValue("local-user");
-});
-
 // Only tool lines with additive detail (a command's full text / output, a file's
 // contents) are expandable now; a file write is a tight non-expandable one-liner.
 // So target the first *expandable* tool line, not merely the first tool line.

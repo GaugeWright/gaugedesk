@@ -15,6 +15,11 @@ export interface ProjectTrackerIssue {
     status: "open" | "in_progress" | "closed" | "canceled" | "archived";
     assignedTo: string | null;
     claimedBy: string | null;
+    /** When the current claim's lease runs out (UTC `YYYY-MM-DD HH:MM:SS`). */
+    claimExpiresAt: string | null;
+    /** Who closed it and what they reported, while it is closed. */
+    closedBy: string | null;
+    closingSummary: string | null;
     filedBy: string | null;
     labels: string[];
     createdAt: string;
@@ -85,6 +90,12 @@ function identity(value: unknown): string {
 function nullable(value: unknown): string | null {
     return value === null ? null : identity(value);
 }
+/** A field a Home that predates it leaves out: absent reads as none. */
+function optional(value: unknown): string | null {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "string") throw new Error("Invalid optional tracker field");
+    return value;
+}
 function parseTracker(value: unknown): ReadableProjectTracker {
     const raw = record(value);
     if (typeof raw.can_complete !== "boolean") throw new Error("Missing tracker permission projection");
@@ -100,7 +111,9 @@ export function parseProjectTrackerBacklog(value: unknown): ProjectTrackerBacklo
         if (!Array.isArray(item.labels) || item.labels.some(label => typeof label !== "string")) throw new Error("Invalid tracker labels");
         return {
             id: identity(item.id), subjectId: identity(item.subject_id), title: text(item.title), body: text(item.body), status: status as ProjectTrackerIssue["status"],
-            assignedTo: nullable(item.assigned_to), claimedBy: nullable(item.claimed_by), filedBy: nullable(item.filed_by), labels: item.labels as string[], createdAt: text(item.created_at), updatedAt: text(item.updated_at),
+            assignedTo: nullable(item.assigned_to), claimedBy: nullable(item.claimed_by),
+            claimExpiresAt: optional(item.claim_expires_at), closedBy: optional(item.closed_by), closingSummary: optional(item.closing_summary),
+            filedBy: nullable(item.filed_by), labels: item.labels as string[], createdAt: text(item.created_at), updatedAt: text(item.updated_at),
         };
     });
     if (new Set(issues.map(issue => issue.id)).size !== issues.length || new Set(issues.map(issue => issue.subjectId)).size !== issues.length) throw new Error("Conflicting tracker issue identities");
@@ -135,5 +148,40 @@ export async function completeProjectTrackerIssue(transport: WorkbenchTransport,
     const admission = record(snapshot.admission);
     const status = text(snapshot.instance_status);
     if (!["running", "paused", "completed", "failed", "cancelled"].includes(status)) throw new Error("Unknown completion status");
+    return { instanceId: identity(admission.instance_ref), status: status as TrackerCompletionResult["status"], executedEffect: nullable(raw.executed_effect), recoveredEffect: nullable(raw.recovered_effect) };
+}
+
+/** Take, keep, let go of, or redirect one task (WHIP-4). A reassignment names
+ *  the assignee it expects, so a stale view cannot silently win. */
+export type TrackerIssueControl =
+    | { kind: "claim"; leaseSeconds: number }
+    | { kind: "renew"; leaseSeconds: number }
+    | { kind: "release"; expectedHolder: string | null }
+    | { kind: "assign"; expectedAssignee: string | null; assignedTo: string | null };
+
+export interface TrackerControlIntent {
+    subjectId: string;
+    control: TrackerIssueControl;
+    /** Created once for this exact intent and retained across delivery retries. */
+    requestId: string;
+}
+
+function controlWire(control: TrackerIssueControl): Record<string, unknown> {
+    switch (control.kind) {
+        case "claim": case "renew": return { kind: control.kind, lease_seconds: control.leaseSeconds };
+        case "release": return { kind: "release", expected_holder: control.expectedHolder };
+        case "assign": return { kind: "assign", expected_assignee: control.expectedAssignee, assigned_to: control.assignedTo };
+    }
+}
+
+export async function controlProjectTrackerIssue(transport: WorkbenchTransport, project: string, queue: string, itemId: string, intent: TrackerControlIntent): Promise<TrackerCompletionResult> {
+    identity(intent.requestId);
+    const raw = record(await transport.json("POST", `/projects/${encodeURIComponent(project)}/trackers/${encodeURIComponent(queue)}/issues/${encodeURIComponent(itemId)}/control`, {
+        subject_id: intent.subjectId, control: controlWire(intent.control),
+    }, { idempotencyKey: intent.requestId }));
+    const snapshot = record(raw.snapshot);
+    const admission = record(snapshot.admission);
+    const status = text(snapshot.instance_status);
+    if (!["running", "paused", "completed", "failed", "cancelled"].includes(status)) throw new Error("Unknown task change status");
     return { instanceId: identity(admission.instance_ref), status: status as TrackerCompletionResult["status"], executedEffect: nullable(raw.executed_effect), recoveredEffect: nullable(raw.recovered_effect) };
 }

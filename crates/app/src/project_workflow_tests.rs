@@ -455,6 +455,9 @@ mod supervision;
 #[path = "project_tracker_completion_tests.rs"]
 mod completion;
 
+#[path = "project_tracker_control_tests.rs"]
+mod control;
+
 #[path = "project_tracker_query_tests.rs"]
 mod backlog;
 

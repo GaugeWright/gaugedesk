@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 
 use gaugedesk_core::ids::{AuthorityId, HomeId};
 use gaugedesk_store::Store;
-use gaugedesk_tracker::WhipTrackerHandle;
 use gaugedesk_workspace::{ChatWorkspace, WhippleWorkspaceProvider, Workspace, WorkspaceProvider};
 use tokio::sync::broadcast;
 
@@ -92,11 +91,6 @@ pub struct Workbench {
     /// handles only: no Agent, project, placement, chat, or Inbox fact is
     /// appended for a preview (ADR 0143 §3).
     pub(crate) panel_previews: BTreeMap<String, crate::agent_release::ActivePanelPreview>,
-    /// One embedded WhippleScript tracker runtime per trust boundary (ADR 0075),
-    /// keyed by boundary id (`account::global` in v1). Spawned on demand and held
-    /// for the workbench's lifetime, mirroring `sessions`. Structural isolation:
-    /// each boundary gets its own store files under `<root>/trackers/<id>/`.
-    pub(crate) tracker_runtimes: BTreeMap<String, WhipTrackerHandle>,
     /// The trusted reproducible-build measurement allow-list (ATTEST-10).
     pub(crate) measurements: MeasurementStore,
     /// The sealed-key release service (ATTEST-5/-6).
@@ -393,7 +387,6 @@ impl Workbench {
             sessions: BTreeMap::new(),
             remote_sessions: BTreeMap::new(),
             panel_previews: BTreeMap::new(),
-            tracker_runtimes: BTreeMap::new(),
             measurements: MeasurementStore::new(),
             sealed_keys: LoopbackKeyReleaseService::new(),
             attestation_mode: AttestationMode::RealRequired,
@@ -456,32 +449,5 @@ impl Workbench {
     /// The provider that constructs/opens this instance's workspace.
     pub(crate) fn workspace_provider(&self, inst_id: &str) -> Arc<dyn WorkspaceProvider> {
         provider_for(&self.providers, inst_id)
-    }
-
-    /// Get (spawning on first use) the embedded whip tracker for `boundary_id`.
-    /// Lazy, mirroring the `sessions` harness map: the store files under
-    /// `<root>/trackers/<boundary_id>/` are created on first touch and the handle
-    /// is held for the workbench's lifetime. Structural isolation is the only
-    /// isolation (ADR 0075 §1); callers must pass a boundary the acting authority
-    /// owns.
-    pub(crate) fn tracker_for_boundary(
-        &mut self,
-        boundary_id: &str,
-    ) -> gaugedesk_tracker::TrackerResult<&mut WhipTrackerHandle> {
-        if !self.tracker_runtimes.contains_key(boundary_id) {
-            let handle = WhipTrackerHandle::open(&self.root, boundary_id)?;
-            self.tracker_runtimes.insert(boundary_id.to_owned(), handle);
-        }
-        Ok(self
-            .tracker_runtimes
-            .get_mut(boundary_id)
-            .expect("tracker just inserted"))
-    }
-
-    /// The v1 account-global onboarding tracker (ADR 0075 §2).
-    pub(crate) fn account_tracker(
-        &mut self,
-    ) -> gaugedesk_tracker::TrackerResult<&mut WhipTrackerHandle> {
-        self.tracker_for_boundary(ACCOUNT_GLOBAL_BOUNDARY)
     }
 }

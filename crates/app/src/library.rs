@@ -482,6 +482,12 @@ pub struct ChatRecord {
     /// before ADR 0141, which inherit nothing (their durable log began empty).
     #[serde(default)]
     pub forked_from_cut: Option<i64>,
+    /// The account that created this chat, when one was signed in: who an
+    /// agent's question with no named recipient goes to, and whose chat signals
+    /// are theirs (ADR 0113 §2, WHIP-4). Absent for a chat created with no
+    /// account, which belongs to the Home's owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// The record-shape schema version that wrote this record (DR-0054 Phase
     /// B). Absent on records predating the stamp = version 1, the implicit
     /// original shape. Readers fail closed on a version newer than
@@ -1703,6 +1709,7 @@ mod tests {
         };
         let chat = |lib: &mut Library, id: &str, inst: &str| {
             lib.apply_chat(ChatRecord {
+                owner: None,
                 schema: LIBRARY_RECORD_SCHEMA,
                 extra: Default::default(),
                 id: id.into(),
@@ -1775,6 +1782,7 @@ mod tests {
         });
         let chat = |lib: &mut Library, id: &str, inst: &str| {
             lib.apply_chat(ChatRecord {
+                owner: None,
                 schema: LIBRARY_RECORD_SCHEMA,
                 extra: Default::default(),
                 id: id.into(),
@@ -1802,6 +1810,7 @@ mod tests {
     fn fork_forest_nests_chats_by_forked_from() {
         let mut lib = Library::default();
         let chat = |id: &str, pos: i64, from: Option<&str>| ChatRecord {
+            owner: None,
             schema: LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: id.into(),
@@ -1894,6 +1903,7 @@ mod tests {
         let mut lib = Library::default();
         for (id, pos) in [("chat-b", 5), ("chat-a", 2)] {
             let c = ChatRecord {
+                owner: None,
                 schema: LIBRARY_RECORD_SCHEMA,
                 extra: Default::default(),
                 id: id.into(),
@@ -1969,6 +1979,7 @@ mod tests {
             ("chat-other", "inst-z", 7), // proj-2 — must not appear in proj-1's rollup
         ] {
             lib.apply_chat(ChatRecord {
+                owner: None,
                 schema: LIBRARY_RECORD_SCHEMA,
                 extra: Default::default(),
                 id: id.into(),

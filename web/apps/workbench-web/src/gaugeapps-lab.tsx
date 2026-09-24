@@ -924,7 +924,7 @@ export function GaugeAppsComposition(): JSX.Element {
         state={shell} titles={{ nav: "GaugeApps", chat: `${app().label} agent`, content: app().label, files: "Menu" }}
         headings={{ nav: false, chat: false }}
         taskBar={() => <TaskBar api={{
-            getTasks: async (): Promise<HumanTask[]> => [], getRoster: async () => [], assignWorkItem: async () => null,
+            getTasks: async (): Promise<HumanTask[]> => [],
         }} selected={selectedNavChat()} refreshKey={`${scopeId()}:${appId()}`} onSelect={openNavChat} />}
         nav={() => <FacetBrowser api={facetApi} selected={selectedNavChat()} onSelect={openNavChat}
             onOpenArchetypeSettings={(_id, name) => openLibraryAgent(project().id, name)}

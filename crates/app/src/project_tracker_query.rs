@@ -24,10 +24,63 @@ pub struct ProjectTrackerIssue {
     pub status: String,
     pub assigned_to: Option<String>,
     pub claimed_by: Option<String>,
+    /// When the current claim's lease runs out, if one is held (WHIP-4).
+    pub claim_expires_at: Option<String>,
+    /// Who closed it and what they reported, while it is closed: completion
+    /// attribution that survives the claim being released.
+    pub closed_by: Option<String>,
+    pub closing_summary: Option<String>,
     pub filed_by: Option<String>,
     pub labels: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The lease and closure one issue's own events establish.
+#[derive(Default)]
+struct IssueHistory {
+    lease: Option<(String, Option<String>)>,
+    closed: Option<(Option<String>, Option<String>)>,
+}
+
+/// Fold the tracker's event log into each issue's current lease and latest
+/// closure, keyed by the issue's permanent subject.
+fn issue_histories(
+    events: &[whipplescript_store::items::TrackerEvent],
+) -> BTreeMap<String, IssueHistory> {
+    let mut histories: BTreeMap<String, IssueHistory> = BTreeMap::new();
+    for event in events {
+        let Some(subject) = &event.issue_id else {
+            continue;
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&event.payload_json).unwrap_or_default();
+        let text = |name: &str| payload[name].as_str().map(str::to_owned);
+        let history = histories.entry(subject.clone()).or_default();
+        match event.kind.as_str() {
+            "claim.acquired" => {
+                history.lease = Some((event.event_id.clone(), text("expires_at")));
+            }
+            "claim.renewed" => {
+                if let Some((lease, expires)) = &mut history.lease {
+                    if text("lease_id").as_deref() == Some(lease.as_str()) {
+                        *expires = text("expires_at");
+                    }
+                }
+            }
+            "claim.released" | "claim.expired"
+                if history.lease.as_ref().map(|(lease, _)| lease.as_str())
+                    == text("lease_id").as_deref() =>
+            {
+                history.lease = None;
+            }
+            "issue.closed" => {
+                history.closed = Some((event.actor.clone(), text("summary")));
+            }
+            _ => {}
+        }
+    }
+    histories
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -193,6 +246,7 @@ impl Workbench {
                         .items
                         .list_items(Some(queue), None)
                         .and_then(|items| {
+                            let histories = issue_histories(&stores.runtime.items.export_events()?);
                             items
                                 .into_iter()
                                 .map(|item| {
@@ -205,6 +259,16 @@ impl Workbench {
                                                 "tracker issue has no permanent subject".into(),
                                             )
                                         })?;
+                                    let history = histories.get(&subject_id);
+                                    let claim_expires_at = item
+                                        .claimed_by
+                                        .as_ref()
+                                        .and(history.and_then(|h| h.lease.as_ref()))
+                                        .and_then(|(_, expires)| expires.clone());
+                                    let (closed_by, closing_summary) = history
+                                        .and_then(|h| h.closed.clone())
+                                        .filter(|_| item.status == "closed")
+                                        .unwrap_or_default();
                                     Ok(ProjectTrackerIssue {
                                         subject_id,
                                         id: item.id,
@@ -213,6 +277,9 @@ impl Workbench {
                                         status: item.status,
                                         assigned_to: item.assigned_to,
                                         claimed_by: item.claimed_by,
+                                        claim_expires_at,
+                                        closed_by,
+                                        closing_summary,
                                         filed_by: item.filed_by,
                                         labels: item.labels,
                                         created_at: item.created_at,

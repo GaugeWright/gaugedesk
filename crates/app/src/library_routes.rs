@@ -411,9 +411,24 @@ pub async fn search(
 /// approvals / follow-ups"). M0 sources it from our own merge lifecycle: a chat
 /// whose finished turn left a clean diff (`MergePhase::Clean`) is **awaiting the
 /// human's keep/reject** — that is a review task. Current-first (most recent).
-pub async fn get_tasks(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
-    Json(wb.task_queue_value()).into_response()
+///
+/// It is the signed-in person's queue: the actor comes from the authenticated
+/// request, and only tasks assigned to that actor are returned (WHIP-4).
+pub async fn get_tasks(
+    State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
+    authenticated: Option<axum::Extension<crate::identity::AuthenticatedActionContext>>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(context) = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Sign in to see your tasks" })),
+        )
+            .into_response();
+    };
+    Json(wb.task_queue_value(context.actor().as_str())).into_response()
 }
 
 /// Who exists and may be given work (`GATE-3f`).
@@ -424,48 +439,6 @@ pub async fn get_tasks(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
 pub async fn get_roster(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     Json(serde_json::json!({ "people": wb.roster() })).into_response()
-}
-
-#[derive(serde::Deserialize)]
-pub struct AssignWorkItem {
-    /// The tracker boundary the item lives in.
-    pub boundary_id: String,
-    /// An authority or display name from the roster. Absent or null clears the
-    /// assignment, which means "whoever has access".
-    #[serde(default)]
-    pub to: Option<String>,
-}
-
-/// Direct an open issue at someone, or clear it.
-///
-/// Advisory by design (see [`crate::roster`]): it records who *should* act and
-/// never restricts who may claim. An assignee who is away must not be able to
-/// strand work in a queue whose premise is that anyone with access can pick it
-/// up — exclusivity is what `claim` provides, and it is earned by taking the
-/// work rather than granted by being named.
-pub async fn assign_work_item(
-    State(wb): State<SharedWorkbench>,
-    Path(item_id): Path<String>,
-    Json(request): Json<AssignWorkItem>,
-) -> impl IntoResponse {
-    let mut wb = wb.lock_unpoisoned();
-    match wb.assign_work_item(&request.boundary_id, &item_id, request.to.as_deref()) {
-        Ok(assignee) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "item": item_id, "assigned_to": assignee })),
-        )
-            .into_response(),
-        Err(error @ crate::roster::AssignError::NotOnRoster { .. }) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )
-            .into_response(),
-    }
 }
 
 // ---- agents --------------------------------------------------------------
@@ -1358,9 +1331,13 @@ pub async fn create_chat_under_agent(
 pub async fn create_chat_under_instance(
     State(wb): State<SharedWorkbench>,
     Path((pid, iid)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    authenticated: Option<axum::Extension<crate::identity::AuthenticatedActionContext>>,
     Json(body): Json<CreateChat>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    let creator = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+        .map(|context| context.actor().as_str().to_owned());
     if wb.placement_project_id(&iid) != Some(pid.as_str()) {
         return (
             StatusCode::NOT_FOUND,
@@ -1379,7 +1356,12 @@ pub async fn create_chat_under_instance(
         .target_ids
         .unwrap_or_else(|| body.target_id.into_iter().collect());
     match create_chat_in(&mut wb, &iid, &body.title, &target_ids) {
-        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Ok(v) => {
+            if let (Some(creator), Some(chat)) = (&creator, v["id"].as_str()) {
+                wb.claim_chat_owner(chat, creator);
+            }
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
         Err(e) => {
             let status = if e == "no such instance" {
                 StatusCode::NOT_FOUND
@@ -1460,16 +1442,25 @@ pub struct ForkChatRequest {
 pub async fn fork_chat(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    authenticated: Option<axum::Extension<crate::identity::AuthenticatedActionContext>>,
     body: Option<Json<ForkChatRequest>>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    let creator = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+        .map(|context| context.actor().as_str().to_owned());
     let destination = body.map(|Json(body)| body.destination).unwrap_or_default();
     match wb.fork_chat_with_destination(&id, destination) {
-        Ok(forked) => (
+        Ok(forked) => {
+            if let Some(creator) = &creator {
+                wb.claim_chat_owner(&forked.id, creator);
+            }
+            (
             StatusCode::CREATED,
             Json(json!({ "id": forked.id, "title": forked.title, "forked_from": forked.forked_from, "forked_from_entry": forked.forked_from_entry, "admitted_home": forked.admitted_home })),
         )
-            .into_response(),
+            .into_response()
+        }
         Err(ForkChatError::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such chat" })),
@@ -1516,12 +1507,20 @@ pub async fn fork_chat(
 pub async fn fork_chat_at(
     State(wb): State<SharedWorkbench>,
     Path((id, entry_id)): Path<(String, i64)>,
+    headers: axum::http::HeaderMap,
+    authenticated: Option<axum::Extension<crate::identity::AuthenticatedActionContext>>,
     body: Option<Json<ForkChatRequest>>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    let creator = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+        .map(|context| context.actor().as_str().to_owned());
     let destination = body.map(|Json(body)| body.destination).unwrap_or_default();
     match wb.fork_chat_at_with_destination(&id, entry_id, destination) {
-        Ok(forked) => (
+        Ok(forked) => {
+            if let Some(creator) = &creator {
+                wb.claim_chat_owner(&forked.id, creator);
+            }
+            (
             StatusCode::CREATED,
             Json(json!({
                 "id": forked.id,
@@ -1531,7 +1530,8 @@ pub async fn fork_chat_at(
                 "admitted_home": forked.admitted_home,
             })),
         )
-            .into_response(),
+            .into_response()
+        }
         Err(ForkChatError::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such chat" })),
@@ -2428,6 +2428,7 @@ mod search_tests {
 
     fn chat(id: &str, title: &str, pos: i64) -> ChatRecord {
         ChatRecord {
+            owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: id.into(),

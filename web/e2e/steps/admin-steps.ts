@@ -56,41 +56,6 @@ Given("the authenticated enterprise tenant is reset", async ({ page, request }) 
     await page.context().clearCookies();
 });
 
-Given("the authenticated enterprise workbench has an assignable onboarding task", async ({ page, request }) => {
-    const reset = await request.post(`${enterpriseCP}/test/reset?assignable_task=true`, {
-        headers: mutationHeaders(),
-    });
-    if (!reset.ok()) {
-        throw new Error(`enterprise task seed failed: ${reset.status()} ${await reset.text()}`);
-    }
-    await page.context().addCookies([{
-        name: "gw_session",
-        value: ownerToken,
-        url: enterpriseCP,
-        httpOnly: true,
-        sameSite: "Lax",
-    }]);
-    const roster = page.waitForResponse((response) =>
-        response.request().method() === "GET"
-        && new URL(response.url()).pathname === "/roster"
-    );
-    const tasks = page.waitForResponse((response) =>
-        response.request().method() === "GET"
-        && new URL(response.url()).pathname === "/tasks"
-    );
-    await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}`);
-    expect((await roster).status()).toBe(200);
-    const taskResponse = await tasks;
-    expect(taskResponse.status()).toBe(200);
-    expect((await taskResponse.json()).tasks).toEqual(expect.arrayContaining([
-        expect.objectContaining({ kind: "issue", boundary: "account::global" }),
-    ]));
-    await expect(page.getByRole("combobox", {
-        name: "assign Assign this onboarding step",
-        exact: true,
-    })).toBeVisible();
-});
-
 Given("the authenticated enterprise workbench has a withheld context source", async ({ page, request }) => {
     const reset = await request.post(`${enterpriseCP}/test/reset?withheld_resource=true`, {
         headers: mutationHeaders(),

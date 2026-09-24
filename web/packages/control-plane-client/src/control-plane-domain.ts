@@ -527,27 +527,23 @@ export function isWorkspaceRecord(v: unknown): v is WorkspaceChange["record"] {
  *  has parked on a person (`screen`, ADR 0110 §7). */
 /** `review` is absent by design: ADR 0136 retired that ask with the per-change
  *  hold. A server that still sends it degrades to `reply` in {@link getTasks}. */
-export type TaskKind = "answer" | "repair" | "reply" | "issue" | "screen";
+export type TaskKind = "answer" | "repair" | "reply" | "screen";
 
-/** One item in the human task queue (the top bar). The kind is the **ask** —
- *  the verb the human is being asked to perform (ADR 0082 §2): `review` a clean
- *  merge (keep/reject), `answer` the agent's pending question, `repair` a merge
- *  conflict; `issue` tasks come from the account-global whip tracker
- *  (onboarding); `screen` inbound material a project's gate parked on a person.
- *  Note `id` is an {@link EngagementId} for chat asks but a whip work-item id
- *  (`WS-N`) for `issue` tasks — narrow on `kind` before treating it as an
- *  engagement. A `screen` task's `id` *is* an engagement, but the task belongs
- *  to `project` rather than to that chat. */
+/** One item in the signed-in person's chat-derived queue (the top bar). The
+ *  kind is the **ask** — the verb the person is being asked to perform (ADR
+ *  0082 §2): `answer` the agent's pending question, `repair` a merge conflict,
+ *  `reply` to a settled turn, or `screen` inbound material a project's gate
+ *  parked. `id` is the chat; a `screen` task belongs to `project` rather than
+ *  to that chat. Tracker issues arrive separately, through each project's
+ *  assigned-task read (WHIP-4). */
 export interface HumanTask {
     readonly id: string;
     readonly title: string;
     readonly agent: string;
     readonly kind: TaskKind;
-    /** The authority this task is assigned to — v1: the acting/owner authority.
-     *  Undefined = unassigned / visible to the boundary owner (ADR 0075 §4). */
+    /** The authority this task is assigned to: always the signed-in person,
+     *  since the Home returns only their own (WHIP-4). */
     readonly assignee?: string;
-    /** `issue` only: the tracker boundary required when assigning its item id. */
-    readonly boundary?: string;
     /** `screen` only: the project whose quarantine this counts. The task is
      *  project-scoped — `id` names the chat the index opens in, which is where a
      *  reviewer goes to look, not what the count belongs to. */

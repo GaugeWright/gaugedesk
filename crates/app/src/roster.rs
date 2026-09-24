@@ -35,35 +35,6 @@
 use crate::agent_question::Addressee;
 use crate::Workbench;
 
-/// Why work could not be directed at someone.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AssignError {
-    /// The named person is not on this roster. Carries the roster, so a refusal
-    /// is also the discovery path — an agent that guessed wrong learns who it
-    /// could have asked instead of only that it failed.
-    NotOnRoster {
-        requested: String,
-        roster: Vec<String>,
-    },
-    /// No such work item, or the tracker refused.
-    Tracker(String),
-}
-
-impl std::fmt::Display for AssignError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotOnRoster { requested, roster } => write!(
-                f,
-                "`{requested}` is not someone you can assign work to; available: {}",
-                roster.join(", ")
-            ),
-            Self::Tracker(detail) => write!(f, "{detail}"),
-        }
-    }
-}
-
-impl std::error::Error for AssignError {}
-
 impl Workbench {
     /// Resolve a name — an authority or a display name — to an authority.
     ///
@@ -77,43 +48,6 @@ impl Workbench {
             .into_iter()
             .find(|person| person.authority == requested || person.display == requested)
             .map(|person| person.authority)
-    }
-
-    /// Direct an open issue at someone, or clear it with `None`.
-    ///
-    /// The assignee is bound to a roster authority before it is stored, which is
-    /// what makes `assigned_to` a typed reference rather than the opaque string
-    /// WhippleScript keeps. Advisory by construction: nothing here consults the
-    /// assignee when someone claims.
-    pub fn assign_work_item(
-        &mut self,
-        boundary_id: &str,
-        item_id: &str,
-        to: Option<&str>,
-    ) -> Result<Option<String>, AssignError> {
-        let assignee = match to {
-            None => None,
-            Some(requested) => match self.resolve_on_roster(requested) {
-                Some(authority) => Some(authority),
-                None => {
-                    return Err(AssignError::NotOnRoster {
-                        requested: requested.to_owned(),
-                        roster: self
-                            .roster()
-                            .into_iter()
-                            .map(|person| person.display)
-                            .collect(),
-                    })
-                }
-            },
-        };
-        let tracker = self
-            .tracker_for_boundary(boundary_id)
-            .map_err(|error| AssignError::Tracker(format!("{error:?}")))?;
-        tracker
-            .assign_item(item_id, assignee.as_deref())
-            .map_err(|error| AssignError::Tracker(format!("{error:?}")))?;
-        Ok(assignee)
     }
 }
 
@@ -185,19 +119,5 @@ mod tests {
         // directory must leave `to` a free string the host still resolves.
         assert!(tool_choices(&[]).is_empty());
         assert!(tool_description(&[]).is_empty());
-    }
-
-    #[test]
-    fn a_refusal_names_who_could_have_been_asked() {
-        // The refusal is also the discovery path: an agent that guessed wrong
-        // learns the roster rather than only that it failed.
-        let error = AssignError::NotOnRoster {
-            requested: "someone-else".to_owned(),
-            roster: vec!["alex@example.com".to_owned(), "sam@example.com".to_owned()],
-        };
-        let message = error.to_string();
-        assert!(message.contains("someone-else"));
-        assert!(message.contains("alex@example.com"));
-        assert!(message.contains("sam@example.com"));
     }
 }

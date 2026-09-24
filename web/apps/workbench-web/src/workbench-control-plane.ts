@@ -937,6 +937,9 @@ export class WorkbenchControlPlane implements ControlPlane {
     async completeProjectTrackerIssue(project: ProjectId, queue: string, item: string, intent: workbenchClient.TrackerCompletionIntent) {
         return workbenchClient.completeProjectTrackerIssue(await this.projectTrackerTransport(project), project, queue, item, intent);
     }
+    async controlProjectTrackerIssue(project: ProjectId, queue: string, item: string, intent: workbenchClient.TrackerControlIntent) {
+        return workbenchClient.controlProjectTrackerIssue(await this.projectTrackerTransport(project), project, queue, item, intent);
+    }
 
     getTasks(): Promise<HumanTask[]> {
         return workbenchClient.getTasks(this.workbenchTransport());
@@ -946,9 +949,6 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.getRoster(this.workbenchTransport());
     }
 
-    assignWorkItem(boundary: string, item: string, to: string | null): Promise<string | null> {
-        return workbenchClient.assignWorkItem(this.workbenchTransport(), boundary, item, to);
-    }
 
     async softwareUpdatePolicy(): Promise<SoftwareUpdatePolicy | null> {
         try {

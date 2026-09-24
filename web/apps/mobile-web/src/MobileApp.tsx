@@ -1351,11 +1351,10 @@ function MobileSession(props: {
         setQueueOpen(false);
         void selectEngagement(id);
     }
-    // The badge tap jumps to the *current* (first) navigable task; a no-op on an
-    // empty queue. Onboarding `issue` tasks (ADR 0075) carry a whip work-item id,
-    // not an engagement, so they are skipped here — every other ask names a chat.
+    // The badge tap jumps to the *current* (first) task; a no-op on an empty
+    // queue. Every ask names a chat.
     function jumpToCurrentTask() {
-        const first = (tasks() ?? []).find((t) => t.kind !== "issue");
+        const first = (tasks() ?? [])[0];
         if (first) jumpToTask(first.id as EngagementId);
     }
 

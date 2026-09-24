@@ -412,15 +412,6 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.05em; color: var(--warn); }
 .task-tab .task-kind::before { content: ""; width: 6px; height: 6px; border-radius: 50%;
     background: var(--warn); flex: 0 0 auto; }
-/* Onboarding issue pills do not navigate, but their roster selector is the
-   assignment command surface. The accent-toned dot sets them apart from amber
-   review pills. */
-.task-tab.task-issue { cursor: default; }
-.task-tab.task-issue:hover { border-color: var(--edge); }
-.task-tab.task-issue .task-kind { color: var(--accent); }
-.task-tab.task-issue .task-kind::before { background: var(--accent); }
-.task-assignee { max-width: 170px; padding: 1px 4px; border: 1px solid var(--edge);
-    border-radius: 4px; background: var(--bg); color: var(--ink); font: inherit; }
 /* Ask tones (ADR 0082 §2): the verb chip's colour says what kind of decision the
    pill wants — review keeps the default amber; a pending agent question reads
    accent (conversational, not risky); a conflict reads bad (blocking). */
@@ -2101,9 +2092,6 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     padding: 10px 12px; background: none; border: none; border-bottom: 1px solid var(--edge);
     color: var(--ink); font-size: var(--fs-body); text-align: left; cursor: pointer; }
 .queue-sheet-item.current { background: color-mix(in srgb, var(--accent) 12%, transparent); }
-/* Onboarding issue rows (ADR 0075) are informational, not navigable. */
-.queue-sheet-issue { cursor: default; }
-.queue-sheet-issue .queue-item-kind { color: var(--accent); }
 .queue-item-current { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.05em;
     color: var(--accent); }
 .queue-item-kind { font-size: var(--fs-small); color: var(--muted); }
@@ -3148,3 +3136,5 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .whip-runs h3 { margin: 16px 0 6px; font-size: var(--fs-small); color: var(--muted); font-weight: normal; }
 .whip-runs .whip-runs-state { min-width: 90px; color: var(--ink); }
 .viewer-filename + .whip-run-control { margin-left: 8px; }
+.project-task-claim { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+.project-task-facts select { font: inherit; background: var(--bg); color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; padding: 2px 6px; }

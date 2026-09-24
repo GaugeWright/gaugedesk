@@ -158,10 +158,18 @@ async fn the_desktop_ui_reaches_native_and_legacy_routes_as_its_owner() {
         get(&app, &trackers, Some(&token)).await,
         axum::http::StatusCode::OK
     );
+    // The task bar is a person's queue, so it too needs the session (WHIP-4).
+    assert_eq!(
+        get(&app, "/tasks", None).await,
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(&app, "/tasks", Some(&token)).await,
+        axum::http::StatusCode::OK
+    );
     let whips = format!("/projects/{}/whips", crate::DEFAULT_PROJECT);
     for legacy in [
         "/workspace",
-        "/tasks",
         "/roster",
         "/fork-tree",
         "/chats",

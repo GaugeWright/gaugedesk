@@ -21,8 +21,8 @@
  * tracker's assigned-task read); it owns no truth.
  */
 
-import { createResource, createSignal, For, Show } from "solid-js";
-import type { EngagementId, HumanTask, RosterPerson } from "@gaugewright/control-plane-client";
+import { createResource, For, Show } from "solid-js";
+import type { EngagementId, HumanTask } from "@gaugewright/control-plane-client";
 import type { AssignedTrackerTask, AssignedTrackerTasks } from "./assigned-tracker-tasks";
 import { displayChatTitle } from "./chat-title";
 
@@ -60,9 +60,8 @@ function agentColor(agent: string | undefined): string | undefined {
 }
 
 export interface TaskQueueApi {
+    /** The signed-in person's chat-derived tasks (WHIP-4). */
     getTasks(): Promise<HumanTask[]>;
-    getRoster(): Promise<RosterPerson[]>;
-    assignWorkItem(boundary: string, item: string, to: string | null): Promise<string | null>;
 }
 
 export function TaskBar(props: {
@@ -82,15 +81,20 @@ export function TaskBar(props: {
         onOpen: (task: AssignedTrackerTask) => void;
     };
 }) {
-    const [tasks, { refetch: refetchTasks }] = createResource(
-        () => props.refreshKey,
-        () => props.api.getTasks(),
+    // A person's own queue: signed out there is none to show, and signed in a
+    // read that fails says so rather than drawing an empty queue.
+    const [taskRead] = createResource(
+        () => [props.refreshKey, !!props.assigned] as const,
+        async ([, signedIn]) => {
+            if (!signedIn) return [] as HumanTask[];
+            try {
+                return await props.api.getTasks();
+            } catch {
+                return null;
+            }
+        },
     );
-    const [roster] = createResource(
-        () => props.refreshKey,
-        () => props.api.getRoster(),
-    );
-    const [assigning, setAssigning] = createSignal<string | null>(null);
+    const tasks = () => taskRead() ?? [];
     const [assignedRead] = createResource(
         () => (props.assigned ? [props.refreshKey, props.assigned] as const : false),
         async ([, assigned]) => {
@@ -105,11 +109,12 @@ export function TaskBar(props: {
     const unreadable = () => {
         const read = assignedRead();
         if (read === undefined || !props.assigned) return [];
-        if (read === null) return [{ projectName: "your projects", queue: null }];
-        return read.unavailable;
+        const chats = taskRead() === null ? [{ projectName: "your chats", queue: null }] : [];
+        if (read === null) return [{ projectName: "your projects", queue: null }, ...chats];
+        return [...read.unavailable, ...chats];
     };
     const empty = () =>
-        (tasks() ?? []).length === 0 && assignedTasks().length === 0 && unreadable().length === 0;
+        tasks().length === 0 && assignedTasks().length === 0 && unreadable().length === 0;
 
     return (
         <div class="taskbar" data-testid="taskbar">
@@ -157,56 +162,8 @@ export function TaskBar(props: {
                         <span class="task-title">some tasks could not be read</span>
                     </span>
                 </Show>
-                <For each={tasks() ?? []}>
+                <For each={tasks()}>
                     {(t: HumanTask) => {
-                        // Onboarding issue (ADR 0075): its id is a whip work-item
-                        // id (`WS-N`), not an engagement, so it neither jumps to a
-                        // chat nor offers a keep — it's a first-run checklist pill.
-                        if (t.kind === "issue") {
-                            const title = () => displayChatTitle(t.title);
-                            const assign = async (to: string) => {
-                                if (!t.boundary) return;
-                                setAssigning(t.id);
-                                try {
-                                    await props.api.assignWorkItem(t.boundary, t.id, to || null);
-                                    await refetchTasks();
-                                } finally {
-                                    setAssigning(null);
-                                }
-                            };
-                            return (
-                                <span
-                                    class="task-tab task-issue"
-                                    data-task={t.id}
-                                    data-task-kind="issue"
-                                    role="listitem"
-                                    aria-label={`onboarding step: ${title()}`}
-                                    title={title()}
-                                >
-                                    <span class="task-kind">onboarding</span>
-                                    <span class="task-title">{title()}</span>
-                                    <Show when={t.boundary}>
-                                        <select
-                                            class="task-assignee"
-                                            data-task-assignee
-                                            aria-label={`assign ${title()}`}
-                                            value={t.assignee ?? ""}
-                                            disabled={assigning() === t.id}
-                                            onChange={(event) => void assign(event.currentTarget.value)}
-                                        >
-                                            <option value="">unassigned</option>
-                                            <For each={roster() ?? []}>
-                                                {(person) => (
-                                                    <option value={person.authority}>
-                                                        {person.display} ({person.role})
-                                                    </option>
-                                                )}
-                                            </For>
-                                        </select>
-                                    </Show>
-                                </span>
-                            );
-                        }
                         // Chat ask (review/answer/repair/reply/screen): id is an
                         // EngagementId (narrowed by kind). A `screen` task is
                         // project-scoped — its id names the chat the reviewer

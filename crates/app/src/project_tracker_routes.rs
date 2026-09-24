@@ -154,3 +154,62 @@ pub async fn complete_issue(
         ),
     }
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlBody {
+    subject_id: String,
+    control: crate::project_tracker::TrackerIssueControl,
+}
+
+/// `POST /projects/:project/trackers/:queue/issues/:item_id/control` — claim,
+/// renew, release or reassign one issue as the signed-in person (WHIP-4).
+/// Keyed by the caller's `Idempotency-Key`; a retry replays the same act.
+pub async fn control_issue(
+    State(wb): State<SharedWorkbench>,
+    Path((project, queue, item_id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+    Json(body): Json<ControlBody>,
+) -> Response {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(context) = context(&mut wb, &headers, authenticated) else {
+        return problem(StatusCode::UNAUTHORIZED, "Sign in to take or assign tasks");
+    };
+    let request_id = match crate::command_idempotency::caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    if wb
+        .read_project_tracker(&context, &project, &queue, TrackerPermission::Contribute)
+        .is_err()
+    {
+        return problem(
+            StatusCode::FORBIDDEN,
+            "Tracker contribution is not permitted",
+        );
+    }
+    let request = crate::project_tracker::ControlTrackerIssue {
+        project: project.clone(),
+        queue,
+        item_id,
+        subject_id: body.subject_id,
+        request_id,
+        control: body.control,
+    };
+    match wb.control_project_tracker_issue(&context, &request, ProjectWorkflowLimits::PRODUCT) {
+        Ok(result) => {
+            if result.executed_effect.is_some() || result.recovered_effect.is_some() {
+                wb.notify_library_changed("project_tracker", &project, "upsert");
+            }
+            Json(result).into_response()
+        }
+        Err(error) => {
+            tracing::info!(%error, "tracker control not confirmed");
+            problem(
+                StatusCode::CONFLICT,
+                "The task change could not be confirmed",
+            )
+        }
+    }
+}

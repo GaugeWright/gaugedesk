@@ -1159,6 +1159,7 @@ mod target_set_migration_tests {
             extra: Default::default(),
         });
         library.apply_chat(ChatRecord {
+            owner: None,
             id: "chat-1".to_owned(),
             op: RecordOp::Upsert,
             instance_id: "placement-1".to_owned(),
@@ -1281,6 +1282,7 @@ mod target_set_migration_tests {
             extra: Default::default(),
         });
         library.apply_chat(ChatRecord {
+            owner: None,
             id: "chat".into(),
             op: RecordOp::Upsert,
             instance_id: "placement".into(),
@@ -3429,6 +3431,20 @@ impl Workbench {
         Ok(())
     }
 
+    /// Record the signed-in account that created a chat as its owner, once
+    /// (WHIP-4). A chat that already has an owner keeps it.
+    pub(crate) fn claim_chat_owner(&mut self, chat_id: &str, account: &str) {
+        let Some(mut record) = self.library.chats.get(chat_id).cloned() else {
+            return;
+        };
+        if record.owner.is_some() || account.trim().is_empty() {
+            return;
+        }
+        record.owner = Some(account.to_owned());
+        record.op = RecordOp::Upsert;
+        self.write_chat_record(record);
+    }
+
     pub(crate) fn write_chat_record(&mut self, record: ChatRecord) {
         let id = record.id.clone();
         let op = Self::library_op_str(record.op);
@@ -4498,6 +4514,7 @@ impl Workbench {
             .clone()
             .ok_or_else(|| "work target has no exact standing basis".to_owned())?;
         let rec = ChatRecord {
+            owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: chat_id.clone(),
@@ -6490,6 +6507,7 @@ impl Workbench {
                 .unwrap_or(0),
         );
         let rec = ChatRecord {
+            owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: new_id.clone(),
@@ -7202,40 +7220,11 @@ impl Workbench {
     /// it assignment. Unassigned stays unassigned — a real state meaning
     /// "whoever has access" (`GATE-3f`), answered by the workspace backlog
     /// rather than by this bar.
-    pub(crate) fn task_queue_value(&self) -> serde_json::Value {
+    pub(crate) fn task_queue_value(&self, actor: &str) -> serde_json::Value {
         // Chats with an unanswered agent question (ADR 0113). The question is a
         // GaugeDesk record in the chat's own scope, so this is read per chat
         // below rather than from one tracker query.
-
-        // Account-global issues first. `list_items` returns them in filing
-        // order (WS-1, WS-2, …).
         let mut tasks: Vec<serde_json::Value> = Vec::new();
-        if let Some(tracker) = self
-            .tracker_runtimes
-            .get(crate::workbench_state::ACCOUNT_GLOBAL_BOUNDARY)
-        {
-            match tracker.list_items(Some(crate::onboarding::ONBOARDING_QUEUE), Some("open")) {
-                Ok(items) => {
-                    for item in items {
-                        // Legacy evidence of the retired checklist, not work.
-                        if crate::onboarding::is_retired_checklist_step(&item.metadata) {
-                            continue;
-                        }
-                        tasks.push(serde_json::json!({
-                            "id": item.id,
-                            "title": item.title,
-                            "agent": "",
-                            "kind": "issue",
-                            "assignee": item.assigned_to,
-                            "boundary": crate::workbench_state::ACCOUNT_GLOBAL_BOUNDARY,
-                        }));
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "task queue: could not list onboarding items");
-                }
-            }
-        }
 
         // Inbound items waiting on a person (ADR 0110 §7, ADR 0117 §5). Project-
         // scoped, which makes this the first task source that is not a chat's
@@ -7396,6 +7385,10 @@ impl Workbench {
         }
         chat_tasks.sort_by_key(|(position, _)| std::cmp::Reverse(*position));
         tasks.extend(chat_tasks.into_iter().map(|(_, task)| task));
+        // This person's queue: only what is assigned to the signed-in reader.
+        // The reader selects which assignments to show; it never becomes one
+        // (`navigation.md`, WHIP-4).
+        tasks.retain(|task| task["assignee"].as_str() == Some(actor));
 
         serde_json::json!({ "tasks": tasks })
     }

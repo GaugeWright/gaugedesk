@@ -187,6 +187,7 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
         forked_from: None,
         forked_from_entry: None,
         forked_from_cut: None,
+        owner: None,
     };
     store
         .append_record(
