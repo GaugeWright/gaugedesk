@@ -490,11 +490,27 @@ export class WorkbenchControlPlane implements ControlPlane {
      * refreshed whenever the account directory is re-read. */
     private async homePool(): Promise<HomePool<workbenchClient.WorkbenchTransport>> {
         if (this.pool) return this.pool;
-        const generation = this.credentialGeneration;
-        const routes = await this.homeRoutes();
-        if (generation !== this.credentialGeneration) {
+        // Routes resolved under one credential are never used under another.
+        // One change is not a change of person, though: a page that started
+        // with no bearer at all receiving its first one. After a reload that
+        // happens every time — discovery begins on the cookie at once and the
+        // first `/auth/refresh` lands in the middle of it — and refusing it
+        // showed "We couldn't load your Homes" on every hosted load
+        // (2026-09-24). That one transition resolves again; a bearer replaced
+        // by another still refuses, because work begun for one account must
+        // never be admitted under the next.
+        let routes: OpaqueHomeRoute[] | undefined;
+        for (let attempt = 0; attempt < 2 && routes === undefined; attempt += 1) {
+            const generation = this.credentialGeneration;
+            const rehydrating = this.bearer === null;
+            const resolved = await this.homeRoutes();
+            if (generation === this.credentialGeneration) routes = resolved;
+            else if (!rehydrating || this.credentialGeneration !== generation + 1) break;
+        }
+        if (routes === undefined) {
             throw new Error("Account session changed while resolving Home routes");
         }
+        if (this.pool) return this.pool;
         // The live carrier per relay-only Home. A tunnel is not reclaimed by
         // being forgotten: the Home stays spliced to a client that has gone and
         // never re-parks, so the *next* attempt to reach it waits for a splice

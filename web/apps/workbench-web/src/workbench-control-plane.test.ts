@@ -779,7 +779,7 @@ describe("a selected Home with no address (DESK-8, ADR 0134)", () => {
     /** The account's only Home is reachable through the relay, so its record in
      * the Home table carries no endpoint. Its reachability comes from the route
      * set instead, and the pool is what reads that. */
-    function relayOnlySelected(routeEndpoint: string | null) {
+    function relayOnlySelected(routeEndpoint: string | null, onRoutes?: () => void) {
         const worked: string[] = [];
         const admitted: string[] = [];
         vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -808,6 +808,7 @@ describe("a selected Home with no address (DESK-8, ADR 0134)", () => {
                 return new Response(null, { status: 404 });
             }
             if (url === "https://hub.example/account/home-routes") {
+                onRoutes?.();
                 return new Response(JSON.stringify({
                     routes: routeEndpoint
                         ? [{ project: "proj-r", home_id: "home:r", endpoint: routeEndpoint }]
@@ -850,6 +851,34 @@ describe("a selected Home with no address (DESK-8, ADR 0134)", () => {
         api.setCurrentProject("proj-r" as never);
         await api.getWorkspace();
         expect(admitted).toEqual(["r"]);
+    });
+
+    it("resolves again when the first refresh lands mid-resolution, rather than failing", async () => {
+        // After a reload the page has no in-memory bearer, Home discovery starts
+        // on the cookie at once, and the first `/auth/refresh` sets the bearer
+        // while the routes are still being read. Every hosted load hit this and
+        // showed "We couldn't load your Homes" (2026-09-24).
+        let refreshes = 0;
+        const holder: { api?: WorkbenchControlPlane } = {};
+        const { api } = relayOnlySelected("https://r.example", () => {
+            if (refreshes++ === 0) holder.api?.setBearer("refreshed-token");
+        });
+        holder.api = api;
+        api.setBearer(null); // a reload: the cookie survives, the bearer does not
+        await expect(api.bootstrapHome()).resolves.toMatchObject({ kind: "connected" });
+        expect(refreshes).toBe(2);
+    });
+
+    it("still refuses when one bearer is replaced by another mid-resolution", async () => {
+        // That is a change of person as far as this client can tell, and work
+        // begun for one account must never be admitted under the next.
+        const holder: { api?: WorkbenchControlPlane } = {};
+        const { api } = relayOnlySelected("https://r.example", () => {
+            holder.api?.setBearer("someone-else");
+        });
+        holder.api = api;
+        const state = await api.bootstrapHome().catch((error: unknown) => String(error));
+        expect(String(state)).toContain("Account session changed while resolving Home routes");
     });
 
     it("reports a Home that has published nothing as having no Home yet", async () => {

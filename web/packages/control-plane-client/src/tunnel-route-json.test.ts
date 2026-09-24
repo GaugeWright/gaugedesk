@@ -111,6 +111,27 @@ describe("routeJson over the tunnel (DESK-7)", () => {
         expect(tunnel.headers[0]).toEqual({ "idempotency-key": "idem-1" });
     });
 
+    it("mints a key for a mutating call that brought none, as the direct transport does", async () => {
+        // A Home refuses a command without one, and the first command a
+        // relay-only Home receives is its admission: `POST /home/admissions`
+        // with no options. Sending a key only when asked meant the tunnel could
+        // reach the Home and never be let in.
+        const tunnel = fakeTunnel([
+            { status: 200, body: "{}" }, { status: 200, body: "{}" }, { status: 200, body: "{}" },
+        ]);
+        const { socket } = fakeSocket();
+        const json = tunnelRouteJson({
+            open: async () => ({ tunnel, socket }), tick: async () => undefined });
+        await json("POST", "/home/admissions");
+        await json("DELETE", "/home/admissions");
+        await json("GET", "/home/admissions");
+        const [post, del, get] = tunnel.headers;
+        expect(post?.["idempotency-key"]).toMatch(/\S{8,}/);
+        expect(del?.["idempotency-key"]).toMatch(/\S{8,}/);
+        expect(del?.["idempotency-key"]).not.toBe(post?.["idempotency-key"]);
+        expect(get).toBeUndefined();
+    });
+
     it("sends no header block when there is nothing to say", async () => {
         const tunnel = fakeTunnel([{ status: 200, body: "{}" }]);
         const { socket } = fakeSocket();

@@ -14,7 +14,7 @@
  */
 
 import { TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
-import type { RouteJson, RouteOptions } from "./control-plane-transport";
+import { newIdempotencyKey, type RouteJson, type RouteOptions } from "./control-plane-transport";
 
 /** The `BrowserTunnel` facade, as a structural type so a test can stand one in
  * without loading wasm. Method names match the exported binding exactly. */
@@ -44,11 +44,20 @@ export interface TunnelSocket {
  * `Authorization`, so a tunnel that sent no headers could reach a box, claim it,
  * and then never use it. */
 function headersFor(bearer: (() => string | null) | undefined,
+                    method: string,
                     options?: RouteOptions): Record<string, string> | undefined {
     const headers: Record<string, string> = {};
     const token = bearer?.();
     if (token) headers.authorization = `Bearer ${token}`;
-    if (options?.idempotencyKey) headers["idempotency-key"] = options.idempotencyKey;
+    // Every mutating call carries a key, minted here when the caller brought
+    // none — exactly as `browserRouteJson` does. A Home refuses a command
+    // without one, and the first command any relay-only Home ever receives is
+    // the admission itself, so a tunnel that sent a key only when asked could
+    // reach a Home and never be let in (2026-09-24: `POST /home/admissions`
+    // answered 400 "missing Idempotency-Key header" over the relay).
+    const mutating = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+    const key = options?.idempotencyKey ?? (mutating ? newIdempotencyKey() : undefined);
+    if (key) headers["idempotency-key"] = key;
     return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
@@ -125,7 +134,7 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
             tunnel.sendRequest(
                 method, path,
                 body === undefined ? undefined : JSON.stringify(body),
-                headersFor(options.bearer, routeOptions),
+                headersFor(options.bearer, method, routeOptions),
             );
             const deadline = now() + timeoutMs;
             for (;;) {
