@@ -86,3 +86,145 @@ pub async fn start_shipped_tutorial(
         }
     }
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatWhipQuery {
+    path: String,
+}
+
+/// `GET /chats/:chat/whips/inputs?path=` — the inputs the kept version of a
+/// chat's `.whip` file declares, and the revision a Run would launch. Read
+/// under the authority that launch would need.
+pub async fn describe_chat_whip(
+    State(wb): State<SharedWorkbench>,
+    Path(chat): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ChatWhipQuery>,
+    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+) -> Response {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(context) = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+    else {
+        return problem(StatusCode::UNAUTHORIZED, "Sign in to run a workflow");
+    };
+    let source = match wb.chat_workflow_source(&chat, &query.path) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::info!(%chat, %error, "workflow source not resolved");
+            return problem(StatusCode::CONFLICT, "This file cannot be run from here");
+        }
+    };
+    match wb.describe_project_workflow(&context, &source, ProjectWorkflowLimits::PRODUCT) {
+        Ok(described) => Json(serde_json::json!({
+            "project": source.project,
+            "target": source.target,
+            "path": source.path,
+            "cut": source.cut,
+            "workflow": described["workflow"],
+            "inputs": described["inputs"],
+            // Who is asking, so a person input can default to them.
+            "actor": context.actor().as_str(),
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::info!(%chat, %error, "workflow not described");
+            problem(StatusCode::CONFLICT, "This workflow cannot be run")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatWhipRunsQuery {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// `GET /chats/:chat/whips/runs[?path=]` — the runs of this chat's `.whip`
+/// files, or of one of them, newest first: the Run button's status, a file's
+/// status dot and its Runs history. A run of a project's shared files shows to
+/// everyone with access to the project; a run of a person's own files only to
+/// whoever launched it (DR-0199).
+pub async fn list_chat_whip_runs(
+    State(wb): State<SharedWorkbench>,
+    Path(chat): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ChatWhipRunsQuery>,
+    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+) -> Response {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(context) = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+    else {
+        return problem(StatusCode::UNAUTHORIZED, "Sign in to see workflow runs");
+    };
+    match wb.chat_whip_runs(&context, &chat, query.path.as_deref()) {
+        Ok(runs) => Json(serde_json::json!({ "runs": runs })).into_response(),
+        Err(error) => {
+            tracing::info!(%chat, %error, "workflow runs not listed");
+            problem(
+                StatusCode::CONFLICT,
+                "This chat's workflow runs cannot be read",
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatWhipRun {
+    path: String,
+    cut: String,
+    #[serde(default)]
+    inputs: BTreeMap<String, serde_json::Value>,
+}
+
+/// `POST /chats/:chat/whips/run` — launch the kept version of a chat's
+/// `.whip` file at the revision it was described at. Keyed by the caller's
+/// `Idempotency-Key`; the Home steps what it launches.
+pub async fn run_chat_whip(
+    State(wb): State<SharedWorkbench>,
+    Path(chat): Path<String>,
+    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+    Json(body): Json<ChatWhipRun>,
+) -> Response {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(context) = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+    else {
+        return problem(StatusCode::UNAUTHORIZED, "Sign in to run a workflow");
+    };
+    let request_id = match crate::command_idempotency::caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let source = match wb.chat_workflow_source(&chat, &body.path) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::info!(%chat, %error, "workflow source not resolved");
+            return problem(StatusCode::CONFLICT, "This file cannot be run from here");
+        }
+    };
+    // A project workflow files into the project's `tasks` tracker, which a
+    // project created since the last wake may not have yet (DR-0199 §3).
+    if let Err(error) = wb.ensure_project_tasks_tracker(&source.project) {
+        tracing::warn!(%chat, %error, "project tasks tracker not ensured");
+    }
+    let request = ProjectWorkflowLaunch {
+        project: source.project,
+        target: source.target,
+        path: source.path,
+        // The revision the person saw described. The launch admits it only
+        // while it is still in Main's history.
+        cut: body.cut,
+        request_id,
+        inputs: body.inputs,
+    };
+    match wb.launch_project_workflow(&context, &request, ProjectWorkflowLimits::PRODUCT) {
+        Ok(invocation) => Json(invocation).into_response(),
+        Err(error) => {
+            tracing::info!(%chat, %error, "workflow launch refused");
+            problem(StatusCode::CONFLICT, "The workflow could not be launched")
+        }
+    }
+}

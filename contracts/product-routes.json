@@ -6980,6 +6980,114 @@
       }
     },
     {
+      "id": "home.chat.whip.inputs",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/chats/:chat/whips/inputs",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "chat-project-target-kept-workflow-source",
+      "capability": "read-kept-workflow-inputs",
+      "requestSchema": "http/path-chat+query-path",
+      "responseSchema": "rust:gaugedesk-app/project_workflow/ChatWorkflowSource+workflow_inputs",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-workflow.test.ts#describes a chat's whip at the kept revision, keeping unknown kinds runnable as JSON"
+        ],
+        "authority": [
+          "crates/app/src/project_workflow_chat_tests.rs#describing_needs_the_launch_authority"
+        ],
+        "journey": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_chat_whip_is_described_then_run_over_http"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_chat_file_resolves_to_its_target_and_the_kept_revision"
+        ]
+      }
+    },
+    {
+      "id": "home.chat.whip.run",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/chats/:chat/whips/run",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "chat-project-target-kept-workflow-source",
+      "capability": "launch-ordinary-folder-workflow",
+      "requestSchema": "rust:gaugedesk-app/project_workflow_routes/ChatWhipRun+Idempotency-Key",
+      "responseSchema": "rust:gaugedesk-app/project_workflow/ProjectWorkflowInvocation",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-workflow.test.ts#runs a chat's whip at the described revision under one request key"
+        ],
+        "authority": [
+          "crates/app/src/project_workflow_chat_tests.rs#describing_needs_the_launch_authority"
+        ],
+        "journey": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_chat_whip_is_described_then_run_over_http"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_chat_file_resolves_to_its_target_and_the_kept_revision"
+        ]
+      }
+    },
+    {
+      "id": "home.chat.whip.runs",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/chats/:chat/whips/runs",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "chat-project-target-kept-workflow-source",
+      "capability": "read-folder-workflow-runs",
+      "requestSchema": "http/path-chat+query-optional-path",
+      "responseSchema": "rust:gaugedesk-app/project_workflow/ChatWhipRun",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-workflow.test.ts#lists a chat's whip runs, optionally for one file"
+        ],
+        "authority": [
+          "crates/app/src/project_workflow_chat_tests.rs#runs_of_shared_files_show_to_the_project_and_of_own_files_to_their_launcher"
+        ],
+        "journey": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_chat_whip_is_described_then_run_over_http"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_chat_file_resolves_to_its_target_and_the_kept_revision"
+        ]
+      }
+    },
+    {
       "id": "home.navigation.tasks",
       "jurisdiction": "private-home",
       "transport": "http-json",

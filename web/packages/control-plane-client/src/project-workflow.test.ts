@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { launchProjectWorkflow, startShippedTutorial, type ProjectWorkflowLaunchIntent } from "./project-workflow";
+import { describeChatWhip, listChatWhipRuns, launchProjectWorkflow, runChatWhip, startShippedTutorial, type ProjectWorkflowLaunchIntent } from "./project-workflow";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 
 const intent: ProjectWorkflowLaunchIntent = { target: "target-personal", path: "tutorials/basics.whip", cut: "cut-1", inputs: { learner: { authority: "learner" } }, requestId: "basics-once" };
@@ -37,5 +37,45 @@ describe("project workflow launch client", () => {
         expect(await startShippedTutorial(transport, "basics")).toEqual({ project: "personal", workspace: "workspace-personal", instanceId: "workflow-root" });
         expect(requests).toEqual([["POST", "/tutorials/basics/start"]]);
         await expect(startShippedTutorial(transport, " ")).rejects.toThrow();
+    });
+    it("describes a chat's whip at the kept revision, keeping unknown kinds runnable as JSON", async () => {
+        const requests: unknown[] = [];
+        const transport: WorkbenchTransport = { base: "", json: async (...args) => {
+            requests.push(args);
+            return { project: "personal", target: "target-project-personal", path: "lessons/hello.whip", cut: "cut-9", workflow: "Greeting", inputs: [
+                { name: "learner", type: { kind: "object", name: "Learner", fields: [{ name: "authority", type: { kind: "string" } }] } },
+                { name: "mood", type: { kind: "enum", variants: ["Calm", "Busy"] } },
+                { name: "later", type: { kind: "something-new" } },
+            ] };
+        } };
+        const described = await describeChatWhip(transport, "chat 1", "lessons/hello.whip");
+        expect(requests).toEqual([["GET", "/chats/chat%201/whips/inputs?path=lessons%2Fhello.whip"]]);
+        expect(described.cut).toBe("cut-9");
+        expect(described.inputs.map((i) => i.type.kind)).toEqual(["object", "enum", "json"]);
+    });
+    it("runs a chat's whip at the described revision under one request key", async () => {
+        const requests: unknown[] = [];
+        const transport: WorkbenchTransport = { base: "", json: async (...args) => { requests.push(args); return launched; } };
+        await runChatWhip(transport, "chat-1", { path: "lessons/hello.whip", cut: "cut-9", inputs: { learner: { authority: "me" } }, requestId: "run-1" });
+        expect(requests).toEqual([["POST", "/chats/chat-1/whips/run", { path: "lessons/hello.whip", cut: "cut-9", inputs: { learner: { authority: "me" } } }, { idempotencyKey: "run-1" }]]);
+        await expect(runChatWhip(transport, "chat-1", { path: "p.whip", cut: "c", inputs: {}, requestId: " " })).rejects.toThrow();
+    });
+    it("lists a chat's whip runs, optionally for one file", async () => {
+        const requests: unknown[] = [];
+        const transport: WorkbenchTransport = { base: "", json: async (...args) => {
+            requests.push(args);
+            return { runs: [
+                { path: "targets/t-a/standup.whip", request_id: "r2", launched_by: "sam", by_you: false, state: "running", started_at: "2026-09-24T10:00:00Z", cut: "c2" },
+                { path: "targets/t-a/standup.whip", request_id: "r1", launched_by: "me", by_you: true, state: "paused-somehow", started_at: null, cut: "c1" },
+            ] };
+        } };
+        const runs = await listChatWhipRuns(transport, "chat 1", "targets/t-a/standup.whip");
+        const all = await listChatWhipRuns(transport, "chat 1");
+        expect(requests).toEqual([
+            ["GET", "/chats/chat%201/whips/runs?path=targets%2Ft-a%2Fstandup.whip"],
+            ["GET", "/chats/chat%201/whips/runs"],
+        ]);
+        expect(runs.map((r) => [r.state, r.byYou])).toEqual([["running", false], ["unknown", true]]);
+        expect(all).toHaveLength(2);
     });
 });

@@ -4959,6 +4959,26 @@
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::chat_workflow_source",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "self . targets . get (& target) . ok_or (\"file target is unavailable\") ? . current_main_cut ()",
+        "file": "crates/app/src/project_workflow_chat.rs"
+      },
+      "profile": "project-workflow-launch"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::describe_project_workflow",
+        "capability": "workflow_source",
+        "count": 1,
+        "expression": "self . targets . get (& source . target) . ok_or (\"file target is unavailable\") ? . workflow_source (& source . path , & source . cut , limits . source_bytes)",
+        "file": "crates/app/src/project_workflow_chat.rs"
+      },
+      "profile": "project-workflow-launch"
     }
   ]
 }

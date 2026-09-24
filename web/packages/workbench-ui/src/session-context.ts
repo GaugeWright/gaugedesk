@@ -16,6 +16,10 @@
  */
 import { createContext, useContext, type Accessor } from "solid-js";
 import {
+    type ChatWhipDescription,
+    type ProjectWorkflowLaunchResult,
+    type ChatWhipRunView,
+    type RosterPerson,
     type ProjectWhips,
     type EngagementId,
     type FileEntry,
@@ -40,6 +44,19 @@ export interface SessionApi {
      *  WhippleScript projects them. Optional: only a session standing in a
      *  project can answer, and a `.whip` file outside one has no instances. */
     listWhips?(project: string): Promise<ProjectWhips>;
+    /** What running this chat's `.whip` file would launch: the kept version
+     *  on its target's Main and the inputs it declares (WHIP-3). Optional:
+     *  only a session that can launch folder workflows answers. */
+    describeChatWhip?(id: EngagementId, path: string): Promise<ChatWhipDescription>;
+    /** Launch that kept version with typed inputs, under one request key. */
+    runChatWhip?(
+        id: EngagementId,
+        run: { path: string; cut: string; inputs: Record<string, unknown>; requestId: string },
+    ): Promise<ProjectWorkflowLaunchResult>;
+    /** The runs of this chat's `.whip` files, or of one of them, newest first. */
+    listChatWhipRuns?(id: EngagementId, path?: string): Promise<ChatWhipRunView[]>;
+    /** The Home's people, for choosing who a person input names. */
+    getRoster?(): Promise<RosterPerson[]>;
     /** The project's quarantine index — provenance only, never payload
      *  (ADR 0110 §7). Optional: only a session that can review inbound material
      *  serves it. */

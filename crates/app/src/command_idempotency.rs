@@ -146,6 +146,15 @@ fn shipped_tutorial_start_command(method: &Method, path: &str) -> bool {
         ["", "tutorials", name, "start"] if !name.is_empty())
 }
 
+// Running a chat's `.whip` file is the folder-whip launch under another
+// address, keyed the same way by the caller's header key.
+fn chat_whip_run_command(method: &Method, path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    method == Method::POST
+        && matches!(parts.as_slice(),
+        ["", "chats", chat, "whips", "run"] if !chat.is_empty())
+}
+
 // This exact typed command owns its receipted outbox and replay. Wrapping it in
 // the legacy HTTP claim would hide its admitted result behind a second status
 // and reject a safe replay before the command's current authority checks run.
@@ -217,6 +226,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         || native_tracker_command_path(request.uri().path())
         || native_workflow_launch_command(&method, request.uri().path())
         || shipped_tutorial_start_command(&method, request.uri().path())
+        || chat_whip_run_command(&method, request.uri().path())
         || native_file_save_command(&method, request.uri().path())
         || streamed_upload_path(&method, request.uri().path())
     {

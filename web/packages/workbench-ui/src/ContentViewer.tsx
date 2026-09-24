@@ -23,6 +23,7 @@ import { defaultContentMode, isSettledPhase, phaseLabel as phaseLabelFor, should
 import { readPolicyDiff } from "./policy-diff";
 import { isWhipProgram, tabsForPath, programForPath, programsFromV1} from "./whip-view";
 import { WhipInstancesView, WhipStructureView } from "./WhipViews";
+import { runsLaunched, WhipRunControl, WhipRunsView } from "./WhipRun";
 import { ImageFileView, MediaFileView, OpaqueFileView } from "./FileMediaView";
 import { readAsTextFailed, syntaxLanguageFor, viewerFileFor } from "./file-kind";
 
@@ -58,7 +59,13 @@ const ConflictFold = lazy(() => import("./ConflictFold").then((m) => ({ default:
 // seam for rendering one file type differently, but it replaces the body of
 // View with a single rendering; a program needs several views the reader
 // switches between, which is a tab-set question rather than a renderer one.
-type Mode = "view" | "edit" | "diff" | "structure" | "instances";
+/** The header names a file by its path inside its target; the
+ *  `targets/<id>/` prefix is plumbing, and the full path stays in the title. */
+export function displayPath(path: string): string {
+    return path.replace(/^targets\/[^/]+\//, "");
+}
+
+type Mode = "view" | "edit" | "diff" | "structure" | "instances" | "runs";
 
 export interface SpecialFileRenderer {
     readonly id: string;
@@ -477,10 +484,39 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         diff: "changes",
         structure: "structure",
         instances: "instances",
+        runs: "runs",
     };
     // Only a whip program offers the extra two, so every other file keeps the
     // three tabs it always had.
-    const tabs = createMemo(() => tabsForPath(file()) as Mode[]);
+    // Runs — this file's run history — joins them only where the session can
+    // launch a folder workflow; running itself is the header's Run button.
+    const runnable = () => isWhipProgram(file()) && !!session.api.runChatWhip && !!id();
+    const tabs = createMemo(() => {
+        const base = tabsForPath(file()) as Mode[];
+        return runnable() && session.api.listChatWhipRuns
+            ? [...base.slice(0, base.indexOf("instances") + 1), "runs" as Mode, ...base.slice(base.indexOf("instances") + 1)]
+            : base;
+    });
+    // This file's runs, newest first: the header's status and the Runs tab. A
+    // run is stepped by the Home, not by this client, so while one is running
+    // it is read again every few seconds until it settles.
+    const [runsTick, setRunsTick] = createSignal(0);
+    const [fileRuns] = createResource(
+        () => (runnable() && session.api.listChatWhipRuns ? [id()!, file()!, runsTick(), runsLaunched()] as const : null),
+        async ([chat, path]) => {
+            try {
+                return { ok: true as const, runs: await session.api.listChatWhipRuns!(chat, path) };
+            } catch {
+                return { ok: false as const, runs: [] };
+            }
+        },
+    );
+    createEffect(() => {
+        const runs = fileRuns()?.runs ?? [];
+        if (!runs.some((run) => run.state === "running")) return;
+        const timer = setTimeout(() => setRunsTick((n) => n + 1), 4000);
+        onCleanup(() => clearTimeout(timer));
+    });
     // Selecting a non-whip file while standing on a whip-only tab would leave
     // the viewer on a tab that is not in its own tab bar.
     createEffect(on(() => file(), () => {
@@ -530,13 +566,33 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                     </span>
                 ))}
                 <Show when={file() && mode() !== "edit"}>
-                    <span class="status viewer-filename" title={file() ?? ""}>{file()}</span>
+                    <span class="status viewer-filename" title={file() ?? ""}>{displayPath(file()!)}</span>
+                </Show>
+                <Show when={runnable() ? [id()!, file()!] as const : null} keyed>
+                    {([chat, path]) => (
+                        <WhipRunControl
+                            api={{
+                                describe: () => session.api.describeChatWhip!(chat, path),
+                                run: (run) => session.api.runChatWhip!(chat, run),
+                                roster: session.api.getRoster ? () => session.api.getRoster!() : undefined,
+                            }}
+                            runs={fileRuns()?.runs ?? []}
+                            onLaunched={() => setRunsTick((n) => n + 1)}
+                            onOpenRuns={() => setMode("runs")}
+                        />
+                    )}
                 </Show>
             </div>
 
             <Show when={mode() === "structure"}>
                 <div class="filebody">
                     <WhipStructureView structure={whipStructure()} />
+                </div>
+            </Show>
+
+            <Show when={mode() === "runs"}>
+                <div class="filebody">
+                    <WhipRunsView runs={fileRuns.loading && !fileRuns() ? undefined : fileRuns()?.runs} error={fileRuns()?.ok === false} />
                 </div>
             </Show>
 

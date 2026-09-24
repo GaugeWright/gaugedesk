@@ -21,10 +21,16 @@ use std::collections::BTreeMap;
 
 #[path = "project_workflow_authority.rs"]
 mod authority;
+#[path = "project_workflow_chat.rs"]
+mod chat;
 #[path = "project_workflow_launch.rs"]
 mod launch;
+#[path = "project_workflow_runs.rs"]
+mod runs;
 #[path = "project_workflow_supervisor.rs"]
 mod supervisor;
+pub use chat::ChatWorkflowSource;
+pub use runs::ChatWhipRun;
 pub(crate) use supervisor::project_hint;
 pub use supervisor::{
     supervise_project_workflows, ProjectWorkflowNotice, ProjectWorkflowOutcome,

@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 /// The event kind every product action admission is committed under. Launch
 /// scopes are the ones [`launch_scope_parts`] recognises.
-const ADMISSION_KIND: &str = "host_action_admission_v1";
+pub(super) const ADMISSION_KIND: &str = "host_action_admission_v1";
 
 /// Trusted host limits. No HTTP handler chooses them.
 #[derive(Clone, Copy)]

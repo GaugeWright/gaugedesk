@@ -81,7 +81,12 @@ impl Workbench {
                             })
                         || target.status != WorkTargetStatus::Available
                         || !target.capabilities.read
+                        // The launcher owns the source or is its party; or
+                        // the source is the project's Home-owned material,
+                        // which the Home runs for anyone with access to the
+                        // project, checked above (DR-0199 §2).
                         || (target.authority != context.actor().as_str()
+                            && target.authority != self.home_id().as_str()
                             && !target
                                 .parties
                                 .iter()

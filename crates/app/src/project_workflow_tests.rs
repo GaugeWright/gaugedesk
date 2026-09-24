@@ -463,3 +463,6 @@ mod tracker_routes;
 
 #[path = "project_workflow_route_tests.rs"]
 mod workflow_routes;
+
+#[path = "project_workflow_chat_tests.rs"]
+mod chat_runs;

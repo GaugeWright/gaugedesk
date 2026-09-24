@@ -207,6 +207,154 @@ pub fn program_structure(source: &str) -> Option<serde_json::Value> {
     Some(whipplescript::instance_view::structure(&snapshot, &ir_hash))
 }
 
+/// The inputs a workflow declares, as a form can draw them (WHIP-3's Run
+/// control). Each is `{name, type}`, where `type` is one of: a primitive
+/// (`string`, `int`, `float`, `bool`), a `literal` with its `value`, an `enum`
+/// with its `variants`, an `object` with its `fields` (a class resolved to its
+/// fields), an `optional` wrapping another, or `json` — everything else, which
+/// the form takes as a JSON value and the launch still validates. A pure
+/// function of the source: it reads nothing and grants nothing. `None` when the
+/// source does not compile.
+pub fn workflow_inputs(source: &str) -> Option<serde_json::Value> {
+    use whipplescript_parser::{IrPrimitiveType, IrSchema, IrType, IrWorkflowContractKind};
+    let ir = compile_whip_program(source).ir?;
+    fn describe(ty: &IrType, schemas: &[IrSchema], depth: usize) -> serde_json::Value {
+        use serde_json::json;
+        if depth > 8 {
+            return json!({ "kind": "json" });
+        }
+        match ty {
+            IrType::Primitive(IrPrimitiveType::String) => json!({ "kind": "string" }),
+            IrType::Primitive(IrPrimitiveType::Int) => json!({ "kind": "int" }),
+            IrType::Primitive(IrPrimitiveType::Float) => json!({ "kind": "float" }),
+            IrType::Primitive(IrPrimitiveType::Bool) => json!({ "kind": "bool" }),
+            IrType::LiteralString(value) => json!({ "kind": "literal", "value": value }),
+            IrType::Optional(inner) => {
+                json!({ "kind": "optional", "of": describe(inner, schemas, depth + 1) })
+            }
+            IrType::Object(fields) => object(fields, schemas, depth),
+            IrType::Ref(name) => match schemas.iter().find(|schema| match schema {
+                IrSchema::Class(class) => &class.name == name,
+                IrSchema::Enum(en) => &en.name == name,
+            }) {
+                Some(IrSchema::Class(class)) => {
+                    let mut value = object(&class.fields, schemas, depth);
+                    value["name"] = json!(class.name);
+                    value
+                }
+                Some(IrSchema::Enum(en)) => {
+                    json!({ "kind": "enum", "name": en.name, "variants": en.variants })
+                }
+                None => json!({ "kind": "json" }),
+            },
+            _ => json!({ "kind": "json" }),
+        }
+    }
+    fn object(
+        fields: &[whipplescript_parser::IrClassField],
+        schemas: &[IrSchema],
+        depth: usize,
+    ) -> serde_json::Value {
+        // A field present only under a discriminant is beyond a plain form.
+        if fields
+            .iter()
+            .any(|field| field.presence_condition.is_some())
+        {
+            return serde_json::json!({ "kind": "json" });
+        }
+        serde_json::json!({
+            "kind": "object",
+            "fields": fields
+                .iter()
+                .map(|field| serde_json::json!({
+                    "name": field.name,
+                    "type": describe(&field.ty, schemas, depth + 1),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+    Some(serde_json::json!({
+        "workflow": ir.workflow,
+        "inputs": ir
+            .workflow_contracts
+            .iter()
+            .filter(|contract| contract.kind == IrWorkflowContractKind::Input)
+            .map(|contract| serde_json::json!({
+                "name": contract.name,
+                "type": describe(&contract.ty, &ir.schemas, 0),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+#[cfg(test)]
+mod workflow_input_tests {
+    use super::workflow_inputs;
+    use serde_json::json;
+
+    #[test]
+    fn basics_asks_for_a_learner_with_an_authority() {
+        let inputs = workflow_inputs(include_str!("../../app/src/tutorials/basics.whip")).unwrap();
+        assert_eq!(
+            inputs,
+            json!({
+                "workflow": "Basics",
+                "inputs": [{
+                    "name": "learner",
+                    "type": {
+                        "kind": "object",
+                        "name": "Learner",
+                        "fields": [{ "name": "authority", "type": { "kind": "string" } }],
+                    },
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn primitives_enums_optionals_and_the_rest() {
+        let source = r#"workflow Shapes(n: int, ok: bool, mood: Mood, note: string?, tags: string[], box: Box) -> bool
+enum Mood {
+  Calm
+  Busy
+}
+class Box {
+  size int
+}
+rule go
+  when Box as b
+=> { complete result true }
+"#;
+        let inputs = workflow_inputs(source)
+            .unwrap_or_else(|| panic!("{:?}", super::compile_whip_program(source).diagnostics));
+        let kinds: Vec<_> = inputs["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|input| {
+                (
+                    input["name"].as_str().unwrap().to_owned(),
+                    input["type"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(kinds[0], ("n".into(), json!({ "kind": "int" })));
+        assert_eq!(kinds[1], ("ok".into(), json!({ "kind": "bool" })));
+        assert_eq!(kinds[2].1["kind"], "enum");
+        assert_eq!(kinds[2].1["variants"], json!(["Calm", "Busy"]));
+        assert_eq!(
+            kinds[3].1,
+            json!({ "kind": "optional", "of": { "kind": "string" } })
+        );
+        assert_eq!(kinds[4].1, json!({ "kind": "json" }));
+    }
+
+    #[test]
+    fn a_source_that_does_not_compile_describes_nothing() {
+        assert_eq!(workflow_inputs("workflow ("), None);
+    }
+}
+
 #[cfg(test)]
 mod instance_view_tests {
     use super::*;

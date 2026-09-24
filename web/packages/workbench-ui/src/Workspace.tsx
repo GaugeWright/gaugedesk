@@ -4,9 +4,11 @@
  * method resources are marked 🔒 (visibility ≠ access, `INV-10`).
  */
 
-import { createMemo, createResource, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js";
+import type { ChatWhipRunView } from "@gaugewright/control-plane-client";
 import { useSession } from "./session-context";
 import { LoadError } from "./LoadError";
+import { RunDot, runsLaunched } from "./WhipRun";
 
 // Config/plumbing artifacts (#6): dotfiles like `.agent-config.json` are
 // implementation, not the user's deliverable. Hidden from the Files list by
@@ -36,6 +38,28 @@ export function Workspace() {
     const allFiles = () => (tree() ?? []).filter((e) => !e.isDir);
     const files = () => (showInternal() ? allFiles() : allFiles().filter((e) => !isInternal(e.path, editChat())));
     const hiddenCount = createMemo(() => allFiles().filter((e) => isInternal(e.path, editChat())).length);
+    // A workflow file carries its latest run's status as a dot, so a folder
+    // shows what is running without opening each file. Read while a run is
+    // running, again every few seconds, since the Home steps it, not us.
+    const [runsTick, setRunsTick] = createSignal(0);
+    const [runs] = createResource(
+        () => {
+            const id = session.engagementId();
+            const hasWhip = allFiles().some((e) => e.path.endsWith(".whip"));
+            return id && hasWhip && session.api.listChatWhipRuns ? [id, runsTick(), runsLaunched()] as const : null;
+        },
+        ([id]) => session.api.listChatWhipRuns!(id).catch((): ChatWhipRunView[] => []),
+    );
+    const latest = createMemo(() => {
+        const byPath = new Map<string, ChatWhipRunView>();
+        for (const run of runs() ?? []) if (!byPath.has(run.path)) byPath.set(run.path, run);
+        return byPath;
+    });
+    createEffect(() => {
+        if (!(runs() ?? []).some((run) => run.state === "running")) return;
+        const timer = setTimeout(() => setRunsTick((n) => n + 1), 4000);
+        onCleanup(() => clearTimeout(timer));
+    });
 
     return (
         <Show when={!tree.error} fallback={<LoadError what="the files" onRetry={() => void refetch()} />}>
@@ -49,6 +73,9 @@ export function Workspace() {
                                 classList={{ active: session.selectedFile() === e.path, locked: isProtected(e.path) }}
                                 onClick={() => session.selectFile(e.path)}
                             >
+                                <Show when={latest().get(e.path)}>
+                                    {(run) => <RunDot state={run().state} />}
+                                </Show>
                                 {isProtected(e.path) ? "🔒 " : ""}
                                 {e.path}
                             </div>

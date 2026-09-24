@@ -3104,3 +3104,43 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .hljs-deletion, .hljs-formula { color: var(--bad); }
 .hljs-emphasis { font-style: italic; }
 .hljs-strong { font-weight: 600; }
+
+/* The Run tab on a .whip file (WHIP-3): the task completion form's look. */
+/* WHIP-3: running a .whip file. A Run button in the file header with the latest
+   run's status beside it, a small popover for inputs, a dot on the file row,
+   and the file's run history as its Runs tab. */
+.whip-run-control { position: relative; display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.whip-run-control .run-button, .whip-run-control .run-pill { display: inline-flex; align-items: center; gap: 6px;
+    height: 24px; padding: 0 9px; font-size: var(--fs-small); color: var(--ink); background: transparent;
+    border: 1px solid var(--edge); border-radius: 12px; cursor: pointer; }
+.whip-run-control .run-button { border-radius: 5px; }
+.whip-run-control .run-button:hover, .whip-run-control .run-pill:hover { border-color: var(--muted); }
+.whip-run-control .run-button:disabled { opacity: 0.6; cursor: progress; }
+.run-dot { display: inline-block; flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.run-dot[data-run-tone="active"] { background: var(--accent); animation: run-dot-pulse 1.4s ease-in-out infinite; }
+.run-dot[data-run-tone="ok"] { background: var(--gw-default-success); }
+.run-dot[data-run-tone="bad"] { background: var(--bad); }
+@keyframes run-dot-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .run-dot[data-run-tone="active"] { animation: none; } }
+.filetree .file .run-dot { margin-right: 6px; vertical-align: middle; }
+.whip-run-pop { position: absolute; top: calc(100% + 6px); right: 0; z-index: 61; width: 280px;
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 6px; padding: 12px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); font-size: var(--fs-ui); color: var(--ink); }
+.whip-run-pop p { margin: 0 0 8px; }
+.whip-run-pop .run-dot { margin-right: 4px; }
+.whip-run label { display: block; margin: 10px 0; font-size: var(--fs-small); color: var(--muted); }
+.whip-run input[type="text"], .whip-run select, .whip-run textarea { display: block; box-sizing: border-box; width: 100%; margin-top: 4px; padding: 5px 8px; background: var(--bg); color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; font: inherit; font-size: var(--fs-ui); }
+.whip-run textarea { min-height: 70px; font-family: var(--mono); }
+.whip-run .whip-run-inline { display: flex; align-items: center; gap: 6px; }
+.whip-run .whip-run-inline input { display: inline; width: auto; margin: 0; }
+.whip-run fieldset.whip-run-object { border: 1px solid var(--edge); border-radius: 4px; margin: 10px 0; padding: 4px 10px 6px; }
+.whip-run > .muted { font-size: var(--fs-small); margin: 8px 0; }
+.whip-run-error { color: var(--bad); font-size: var(--fs-small); }
+.whip-run-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+.whip-run-actions button { height: 26px; padding: 0 12px; font-size: var(--fs-small); background: transparent; color: var(--ink); border: 1px solid var(--edge); border-radius: 5px; cursor: pointer; }
+.whip-run-actions button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-contrast); }
+.whip-runs { padding: 12px 16px; }
+.whip-runs ol { list-style: none; margin: 0; padding: 0; }
+.whip-runs li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--edge); font-size: var(--fs-ui); }
+.whip-runs .whip-runs-state { min-width: 90px; color: var(--ink); }
+.viewer-filename + .whip-run-control { margin-left: 8px; }

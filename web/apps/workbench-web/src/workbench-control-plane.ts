@@ -1512,6 +1512,16 @@ export class WorkbenchControlPlane implements ControlPlane {
     listWhips(project: string) {
         return workbenchClient.projectWhips(this.workbenchTransport(), project);
     }
+    /** WHIP-3's Run control: what this chat's `.whip` file would launch. */
+    describeChatWhip(id: EngagementId, path: string) {
+        return workbenchClient.describeChatWhip(this.workbenchTransport(), id, path);
+    }
+    runChatWhip(id: EngagementId, run: { path: string; cut: string; inputs: Record<string, unknown>; requestId: string }) {
+        return workbenchClient.runChatWhip(this.workbenchTransport(), id, run);
+    }
+    listChatWhipRuns(id: EngagementId, path?: string) {
+        return workbenchClient.listChatWhipRuns(this.workbenchTransport(), id, path);
+    }
     listWhipCosts(project: string) {
         return workbenchClient.projectWhipCosts(this.workbenchTransport(), project);
     }

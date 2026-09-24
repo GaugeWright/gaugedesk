@@ -23,10 +23,10 @@ const OPERATION: &str = "workflow.launch";
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct SourceBinding {
-    target: String,
-    path: String,
-    cut: String,
+pub(super) struct SourceBinding {
+    pub(super) target: String,
+    pub(super) path: String,
+    pub(super) cut: String,
     content_hash: String,
 }
 
@@ -50,7 +50,7 @@ fn source_reference(command: &HostActionCommand) -> Result<ActionInput, String> 
         version_ref: version_ref.clone(),
     })
 }
-fn source_binding(command: &HostActionCommand) -> Result<SourceBinding, String> {
+pub(super) fn source_binding(command: &HostActionCommand) -> Result<SourceBinding, String> {
     serde_json::from_str(
         command
             .resources

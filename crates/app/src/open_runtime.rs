@@ -186,6 +186,11 @@ pub(crate) async fn supervise_home_reachability(
             Ok(_) => {}
             Err(error) => tracing::warn!("shipped tutorials not reconciled: {error}"),
         }
+        // Every project's Home-owned `tasks` tracker (DR-0199 §3); once each
+        // exists this is one read per project.
+        if let Err(error) = wb.lock_unpoisoned().ensure_project_tasks_trackers() {
+            tracing::warn!("project tasks trackers not ensured: {error}");
+        }
         // Read and release: this is a std mutex, and holding it across the wait
         // below would stop every request this Home serves.
         let publishes = wb.lock_unpoisoned().library_sync_active();

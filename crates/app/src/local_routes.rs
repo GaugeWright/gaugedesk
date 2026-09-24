@@ -77,6 +77,18 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             "/tutorials/{name}/start",
             post(crate::project_workflow_routes::start_shipped_tutorial),
         )
+        .route(
+            "/chats/{chat}/whips/inputs",
+            get(crate::project_workflow_routes::describe_chat_whip),
+        )
+        .route(
+            "/chats/{chat}/whips/run",
+            post(crate::project_workflow_routes::run_chat_whip),
+        )
+        .route(
+            "/chats/{chat}/whips/runs",
+            get(crate::project_workflow_routes::list_chat_whip_runs),
+        )
         .route("/roster", get(lr::get_roster))
         .route("/work-items/{item_id}/assign", post(lr::assign_work_item))
         .route("/search", get(lr::search))

@@ -23,6 +23,11 @@ use crate::{
 };
 
 const DEFINITION: &str = "project_tracker_v1";
+
+/// The queue of the tracker every project has, owned by the Home (DR-0199 §3).
+/// A workflow run from the project's Home-owned files files into it, and every
+/// member with current access to the project reads and contributes to it.
+pub const PROJECT_TASKS: &str = "tasks";
 const ACCESS_BASIS: &str = "project_tracker_access_basis_v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +83,10 @@ struct ProjectAuthority {
 
 struct Snapshot {
     authority: ProjectAuthority,
+    project: String,
+    /// The tracker is the project's own, owned by the Home: project access is
+    /// its access rule, and it carries no grants (DR-0199 §3).
+    home_owned: bool,
     registry: Registry,
     access: BTreeMap<String, AccessState>,
     prior_command: Option<String>,
@@ -345,8 +354,17 @@ fn capture(
                     "tracker access basis has no original command receipt",
                 ));
             }
+            let home_owned = registry
+                .tracker
+                .as_ref()
+                .is_some_and(|tracker| tracker.resource.resource.owner.as_str() == home.as_str());
+            if home_owned && !registry.bases.is_empty() {
+                return Err(refused("a project's Home tracker carries no access grants"));
+            }
             Ok(Snapshot {
                 authority,
+                project: project.to_owned(),
+                home_owned,
                 registry,
                 access,
                 prior_command,
@@ -414,6 +432,12 @@ fn commit(
 }
 
 fn permitted(snapshot: &Snapshot, recipient: &str, permission: TrackerPermission) -> bool {
+    if snapshot.home_owned {
+        return snapshot
+            .authority
+            .org
+            .can_access_project(recipient, &snapshot.project);
+    }
     snapshot.registry.bases.values().any(|grant| {
         grant.recipient == recipient
             && grant.permission == permission
@@ -532,6 +556,81 @@ impl Workbench {
         Ok(tracker)
     }
 
+    /// Ensure the project's Home-owned `tasks` tracker exists (DR-0199 §3).
+    /// It is declared by the Home, not by a person, so it carries no grants;
+    /// a project whose collaboration workspace does not exist yet gets it once
+    /// it does. Returns whether it was declared now.
+    pub fn ensure_project_tasks_tracker(&mut self, project: &str) -> Result<bool, String> {
+        let home = self.home_id().clone();
+        let Some(workspace) = self
+            .library
+            .project_collaboration_workspaces
+            .get(project)
+            .filter(|workspace| workspace.home_id == home && !workspace.workspace_id.is_empty())
+            .map(|workspace| workspace.workspace_id.clone())
+        else {
+            return Ok(false);
+        };
+        if self
+            .library
+            .projects
+            .get(project)
+            .is_none_or(|record| record.home_id != home)
+        {
+            return Ok(false);
+        }
+        let scope = registry_scope(project, PROJECT_TASKS).map_err(|e| format!("{e:?}"))?;
+        if registry(self.store_ref(), &scope)
+            .map_err(|e| format!("{e:?}"))?
+            .tracker
+            .is_some()
+        {
+            return Ok(false);
+        }
+        // Labelled as the project's files are, so what a workflow reads there
+        // may be filed here: text flows only to a tracker exactly as private.
+        let attributes = self
+            .library
+            .work_targets
+            .get(&crate::library_state::managed_project_target_id(project))
+            .map(|target| target.attributes.clone())
+            .unwrap_or_default();
+        let owner = Authority::from(home.as_str());
+        let handle = resource_handle(&workspace, PROJECT_TASKS).map_err(|e| format!("{e:?}"))?;
+        let tracker = ProjectTracker {
+            project_id: project.into(),
+            workspace_id: workspace,
+            queue: PROJECT_TASKS.into(),
+            resource: ResourceRecord::new(
+                Resource::input(
+                    ResourceId::new(&handle),
+                    ResourceKind::new("tracker"),
+                    owner.clone(),
+                ),
+                ContentLocator::Content { handle },
+                |_| owner.clone(),
+            )
+            .with_attributes(attributes),
+        };
+        self.store_mut()
+            .append_record(
+                &scope,
+                DEFINITION,
+                &encode(&tracker).map_err(|e| format!("{e:?}"))?,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(true)
+    }
+
+    /// Ensure every project of this Home has its `tasks` tracker.
+    pub fn ensure_project_tasks_trackers(&mut self) -> Result<(), String> {
+        let projects: Vec<String> = self.library.projects.keys().cloned().collect();
+        for project in projects {
+            self.ensure_project_tasks_tracker(&project)?;
+        }
+        Ok(())
+    }
+
     /// Request a fresh ordinary access basis. Terminal bases remain terminal;
     /// the returned reference identifies this request, not an access grant.
     pub fn request_project_tracker_access(
@@ -557,6 +656,11 @@ impl Workbench {
             .tracker
             .as_ref()
             .ok_or_else(|| refused("tracker is unavailable"))?;
+        if snapshot.home_owned {
+            return Err(refused(
+                "a project's Home tracker admits every project member without a request",
+            ));
+        }
         let actor = context.actor().as_str();
         if (actor != recipient && actor != tracker.resource.resource.owner.as_str())
             || !snapshot
@@ -777,12 +881,25 @@ impl Workbench {
             ));
         }
         check_policy(&snapshot, &tracker.resource, Action::Run)?;
-        let recipients = snapshot
-            .registry
-            .bases
-            .values()
-            .filter_map(|grant| {
-                let recipient = &grant.recipient;
+        let candidates: std::collections::BTreeSet<&String> = if snapshot.home_owned {
+            snapshot
+                .authority
+                .org
+                .members
+                .values()
+                .map(|member| &member.authority)
+                .collect()
+        } else {
+            snapshot
+                .registry
+                .bases
+                .values()
+                .map(|grant| &grant.recipient)
+                .collect()
+        };
+        let recipients = candidates
+            .into_iter()
+            .filter_map(|recipient| {
                 if !snapshot
                     .authority
                     .org
