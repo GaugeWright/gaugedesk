@@ -3722,7 +3722,13 @@ fn commit_incoming_handoff(
     consent: incoming_handoff::Consent,
 ) -> bool {
     match incoming_handoff::commit(guard, wire, consent) {
-        Ok(()) => true,
+        Ok(()) => {
+            // Folder whips launched on the origin arrive with the project; the
+            // Home's supervisor steps them from here under their launchers'
+            // standing (DR-0191). Wake it now rather than at the next sweep.
+            guard.hint_project_workflows(crate::project_workflow::project_hint(&wire.project));
+            true
+        }
         Err(error) => {
             tracing::warn!(?error, project = %wire.project, "handoff receiving admission failed");
             false

@@ -1538,6 +1538,9 @@ export class WorkbenchControlPlane implements ControlPlane {
     listChatWhipRuns(id: EngagementId, path?: string) {
         return workbenchClient.listChatWhipRuns(this.workbenchTransport(), id, path);
     }
+    stopChatWhip(id: EngagementId, stop: { path: string; launchedBy: string; requestId: string; key: string }) {
+        return workbenchClient.stopChatWhip(this.workbenchTransport(), id, stop);
+    }
     listWhipCosts(project: string) {
         return workbenchClient.projectWhipCosts(this.workbenchTransport(), project);
     }

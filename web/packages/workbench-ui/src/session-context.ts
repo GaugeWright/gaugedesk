@@ -55,6 +55,8 @@ export interface SessionApi {
     ): Promise<ProjectWorkflowLaunchResult>;
     /** The runs of this chat's `.whip` files, or of one of them, newest first. */
     listChatWhipRuns?(id: EngagementId, path?: string): Promise<ChatWhipRunView[]>;
+    /** Stop one run, under one request key. */
+    stopChatWhip?(id: EngagementId, stop: { path: string; launchedBy: string; requestId: string; key: string }): Promise<void>;
     /** The Home's people, for choosing who a person input names. */
     getRoster?(): Promise<RosterPerson[]>;
     /** The project's quarantine index — provenance only, never payload

@@ -7088,6 +7088,42 @@
       }
     },
     {
+      "id": "home.chat.whip.stop",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/chats/:chat/whips/stop",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "chat-project-target-kept-workflow-source",
+      "capability": "stop-folder-workflow-run",
+      "requestSchema": "rust:gaugedesk-app/project_workflow_routes/ChatWhipStop+Idempotency-Key",
+      "responseSchema": "rust:gaugedesk-app/project_workflow/ChatWhipRun",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-workflow.test.ts#stops one run under one request key"
+        ],
+        "authority": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_run_is_stopped_by_its_launcher_or_an_admin_and_its_tasks_stay"
+        ],
+        "journey": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_chat_whip_is_described_then_run_over_http"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_workflow_chat_tests.rs#a_chat_file_resolves_to_its_target_and_the_kept_revision"
+        ]
+      }
+    },
+    {
       "id": "home.navigation.tasks",
       "jurisdiction": "private-home",
       "transport": "http-json",

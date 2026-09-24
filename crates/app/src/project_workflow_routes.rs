@@ -172,6 +172,49 @@ pub async fn list_chat_whip_runs(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ChatWhipStop {
+    path: String,
+    launched_by: String,
+    request_id: String,
+}
+
+/// `POST /chats/:chat/whips/stop` — stop one run of a chat's `.whip` file.
+/// Its launcher or a Home owner/admin may; tasks it filed stay. Keyed by the
+/// caller's `Idempotency-Key`; stopping a finished run changes nothing.
+pub async fn stop_chat_whip(
+    State(wb): State<SharedWorkbench>,
+    Path(chat): Path<String>,
+    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+    Json(body): Json<ChatWhipStop>,
+) -> Response {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(context) = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+    else {
+        return problem(StatusCode::UNAUTHORIZED, "Sign in to stop a workflow");
+    };
+    let key = match crate::command_idempotency::caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    match wb.stop_chat_whip_run(
+        &context,
+        &chat,
+        &body.path,
+        &body.launched_by,
+        &body.request_id,
+        &key,
+    ) {
+        Ok(run) => Json(serde_json::json!({ "run": run })).into_response(),
+        Err(error) => {
+            tracing::info!(%chat, %error, "workflow run not stopped");
+            problem(StatusCode::CONFLICT, "This run could not be stopped")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatWhipRun {
     path: String,
     cut: String,

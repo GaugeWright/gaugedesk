@@ -324,6 +324,21 @@ fn runs_of_shared_files_show_to_the_project_and_of_own_files_to_their_launcher()
         mine[0].path
     );
     assert!(
+        mine[0].view.is_none(),
+        "a chat-wide list carries no histories"
+    );
+    let one = wb
+        .chat_whip_runs(&owner, &chat, Some("lessons/hello.whip"))
+        .unwrap();
+    let view = one[0]
+        .view
+        .as_ref()
+        .expect("one file's runs carry their firings");
+    assert!(
+        view.get("firings").is_some_and(serde_json::Value::is_array),
+        "{view}"
+    );
+    assert!(
         wb.chat_whip_runs(&colleague, &chat, None)
             .unwrap()
             .is_empty(),
@@ -351,4 +366,92 @@ fn runs_of_shared_files_show_to_the_project_and_of_own_files_to_their_launcher()
         "another file's runs are not this one's"
     );
     assert!(wb.chat_whip_runs(&outsider, &chat, None).is_err());
+}
+
+/// A run parked on a task it filed reads as waiting; its launcher or a Home
+/// admin may stop it, nobody else; the task it filed stays; and a stopped run
+/// is finished for the Home's own stepping too.
+#[test]
+fn a_run_is_stopped_by_its_launcher_or_an_admin_and_its_tasks_stay() {
+    let (_root, shared, owner, mut request) = fixture(&project_basics());
+    let chat = chat(&shared);
+    let mut wb = shared.lock_unpoisoned();
+    home_owned(&mut wb, &request.target);
+    wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    let person = member(&mut wb, "member-a", Some(DEFAULT_PROJECT));
+    let colleague = member(&mut wb, "member-b", Some(DEFAULT_PROJECT));
+    request.cut = wb
+        .chat_workflow_source(&chat, "lessons/hello.whip")
+        .unwrap()
+        .cut;
+    request.inputs = BTreeMap::from([(
+        "learner".into(),
+        serde_json::json!({ "authority": "member-a" }),
+    )]);
+    wb.launch_project_workflow(&person, &request, LIMITS)
+        .unwrap();
+    for _ in 0..3 {
+        wb.step_project_workflow(&person, &request.project, &request.request_id, LIMITS)
+            .unwrap();
+    }
+    let run = wb.chat_whip_runs(&person, &chat, None).unwrap().remove(0);
+    assert_eq!(run.state, "waiting", "parked until its task closes");
+    assert!(run.can_stop, "its launcher may stop it");
+    let seen = wb
+        .chat_whip_runs(&colleague, &chat, None)
+        .unwrap()
+        .remove(0);
+    assert!(!seen.can_stop, "a colleague sees it but may not stop it");
+    assert!(wb
+        .stop_chat_whip_run(
+            &colleague,
+            &chat,
+            "lessons/hello.whip",
+            "member-a",
+            &request.request_id,
+            "stop-1"
+        )
+        .is_err());
+    assert!(
+        wb.chat_whip_runs(&owner, &chat, None).unwrap()[0].can_stop,
+        "a Home owner may"
+    );
+
+    let stopped = wb
+        .stop_chat_whip_run(
+            &person,
+            &chat,
+            "lessons/hello.whip",
+            "member-a",
+            &request.request_id,
+            "stop-2",
+        )
+        .unwrap();
+    assert_eq!(stopped.state, "cancelled");
+    assert!(!stopped.can_stop);
+    let again = wb
+        .stop_chat_whip_run(
+            &person,
+            &chat,
+            "lessons/hello.whip",
+            "member-a",
+            &request.request_id,
+            "stop-3",
+        )
+        .unwrap();
+    assert_eq!(
+        again.state, "cancelled",
+        "stopping a finished run changes nothing"
+    );
+    let tasks = wb
+        .read_project_tracker_tasks(&person, DEFAULT_PROJECT, "tasks")
+        .unwrap();
+    assert_eq!(tasks.backlog.issues.len(), 1, "the task it filed stays");
+    let step = wb
+        .step_project_workflow(&person, &request.project, &request.request_id, LIMITS)
+        .unwrap();
+    assert_eq!(
+        step.snapshot.instance_status,
+        gaugedesk_whip_runtime::host_actions::action_result::ActionInstanceStatus::Cancelled
+    );
 }

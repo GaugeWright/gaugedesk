@@ -195,6 +195,18 @@ pub fn instance_views(store_path: &Path) -> io::Result<Vec<ProjectedInstance>> {
     Ok(projected)
 }
 
+/// One instance of an open runtime store, projected as [`instance_views`]
+/// projects each: what a folder run's history row expands to. `None` when the
+/// instance does not exist or cannot be read.
+pub fn instance_view_in(
+    store: &whipplescript_store::SqliteStore,
+    instance_id: &str,
+) -> Option<serde_json::Value> {
+    whipplescript::instance_view::load(store, instance_id, KERNEL_COERCION_FINGERPRINT)
+        .ok()
+        .flatten()
+}
+
 /// The structure of a program from its source, with no instance.
 ///
 /// `None` when the source does not compile: a Structure tab for a broken file

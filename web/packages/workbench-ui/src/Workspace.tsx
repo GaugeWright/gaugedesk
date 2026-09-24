@@ -56,8 +56,10 @@ export function Workspace() {
         return byPath;
     });
     createEffect(() => {
-        if (!(runs() ?? []).some((run) => run.state === "running")) return;
-        const timer = setTimeout(() => setRunsTick((n) => n + 1), 4000);
+        const delay = (runs() ?? []).some((run) => run.state === "running") ? 4000
+            : (runs() ?? []).some((run) => run.state === "waiting") ? 15000 : 0;
+        if (!delay) return;
+        const timer = setTimeout(() => setRunsTick((n) => n + 1), delay);
         onCleanup(() => clearTimeout(timer));
     });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeChatWhip, listChatWhipRuns, launchProjectWorkflow, runChatWhip, startShippedTutorial, type ProjectWorkflowLaunchIntent } from "./project-workflow";
+import { describeChatWhip, listChatWhipRuns, stopChatWhip, launchProjectWorkflow, runChatWhip, startShippedTutorial, type ProjectWorkflowLaunchIntent } from "./project-workflow";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 
 const intent: ProjectWorkflowLaunchIntent = { target: "target-personal", path: "tutorials/basics.whip", cut: "cut-1", inputs: { learner: { authority: "learner" } }, requestId: "basics-once" };
@@ -75,7 +75,14 @@ describe("project workflow launch client", () => {
             ["GET", "/chats/chat%201/whips/runs?path=targets%2Ft-a%2Fstandup.whip"],
             ["GET", "/chats/chat%201/whips/runs"],
         ]);
-        expect(runs.map((r) => [r.state, r.byYou])).toEqual([["running", false], ["unknown", true]]);
+        expect(runs.map((r) => [r.state, r.byYou, r.canStop])).toEqual([["running", false, false], ["unknown", true, false]]);
         expect(all).toHaveLength(2);
+    });
+    it("stops one run under one request key", async () => {
+        const requests: unknown[] = [];
+        const transport: WorkbenchTransport = { base: "", json: async (...args) => { requests.push(args); return { run: {} }; } };
+        await stopChatWhip(transport, "chat-1", { path: "targets/t-a/standup.whip", launchedBy: "sam", requestId: "r2", key: "stop-1" });
+        expect(requests).toEqual([["POST", "/chats/chat-1/whips/stop", { path: "targets/t-a/standup.whip", launched_by: "sam", request_id: "r2" }, { idempotencyKey: "stop-1" }]]);
+        await expect(stopChatWhip(transport, "chat-1", { path: "p.whip", launchedBy: "sam", requestId: "r2", key: " " })).rejects.toThrow();
     });
 });

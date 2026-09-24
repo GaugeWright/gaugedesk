@@ -538,3 +538,51 @@ fn revoked_contribution_grant_prevents_execution_after_admission() {
         .unwrap()
         .is_empty());
 }
+
+/// A project with a relocation in flight is paused for its workflows too
+/// (WHIP-3 relocation): neither a caller nor the Home's own supervisor may step
+/// a run while the handoff is pending, and the run resumes once it is not.
+#[test]
+fn a_pending_handoff_pauses_every_step_of_a_folder_run() {
+    use gaugedesk_core::handoff::HandoffEvent;
+    let (_root, shared, context, request) = fixture(include_str!("tutorials/basics.whip"));
+    let mut wb = shared.lock_unpoisoned();
+    declare(&mut wb, &context);
+    let invocation = wb
+        .launch_project_workflow(&context, &request, LIMITS)
+        .unwrap();
+    let scope = crate::federation::handoff_scope(DEFAULT_PROJECT);
+    wb.store_mut()
+        .append_record(
+            &scope,
+            "event",
+            &serde_json::to_string(&HandoffEvent::HandoffOffered).unwrap(),
+        )
+        .unwrap();
+    let refused = wb
+        .step_project_workflow(&context, &request.project, &request.request_id, LIMITS)
+        .unwrap_err();
+    assert!(refused.contains("pending handoff"), "{refused}");
+    let unattended = wb
+        .step_project_workflow_unattended(&invocation.product_scope, LIMITS)
+        .unwrap_err();
+    assert!(unattended.contains("pending handoff"), "{unattended}");
+    assert!(
+        stores(&wb, &invocation)
+            .runtime
+            .items
+            .list_items(Some("tutorials"), None)
+            .unwrap()
+            .is_empty(),
+        "nothing was filed while paused"
+    );
+
+    wb.store_mut()
+        .append_record(
+            &scope,
+            "event",
+            &serde_json::to_string(&HandoffEvent::HandoffAborted).unwrap(),
+        )
+        .unwrap();
+    assert!(step(&mut wb, &context, &request).executed_effect.is_some());
+}

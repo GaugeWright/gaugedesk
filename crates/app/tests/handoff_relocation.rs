@@ -1589,6 +1589,28 @@ async fn relocated_workstream_chat(protected: bool) {
     } else {
         None
     };
+    // The receiving Home's own supervisor, started before anything arrives and
+    // with a sweep too long to matter: only the wake a committed handoff sends
+    // can make it step the relocated run (DR-0191, WHIP-3 relocation). The
+    // launcher is a member there, so the run keeps its standing.
+    let (stop_supervisor, supervisor_shutdown) = tokio::sync::watch::channel(false);
+    let (notice_tx, mut notices) = tokio::sync::mpsc::channel(16);
+    let receiving_supervisor = launched.as_ref().map(|_| {
+        workflow_actor(&mut bob_wb.lock().unwrap());
+        tokio::spawn(
+            gaugedesk_app::project_workflow::supervise_project_workflows(
+                bob_wb.clone(),
+                gaugedesk_app::project_workflow::ProjectWorkflowSupervisorConfig {
+                    limits: launch_limits,
+                    discovery_page_size: std::num::NonZeroUsize::new(16).unwrap(),
+                    steps_per_wake: 8,
+                    sweep: Duration::from_secs(3600),
+                },
+                supervisor_shutdown,
+                notice_tx,
+            ),
+        )
+    });
     let workflow_scope = format!("project::{project_id}::workflow");
     let storage = source_workspace.native_workflow_storage();
     let mut workflow_stores = if protected {
@@ -1825,6 +1847,28 @@ async fn relocated_workstream_chat(protected: bool) {
         let binding = &library.project_collaboration_workspaces[&project_id];
         assert_eq!(binding.home_id, destination_home);
         assert_eq!(binding.workspace_id, workflow_workspace_id);
+    }
+    if let Some(original) = launched.as_ref() {
+        let finished = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(notice) = notices.recv().await {
+                if notice.scope == original.product_scope {
+                    if let gaugedesk_app::project_workflow::ProjectWorkflowOutcome::Finished(
+                        status,
+                    ) = notice.outcome
+                    {
+                        return status;
+                    }
+                }
+            }
+            String::from("supervisor stopped")
+        })
+        .await
+        .expect("the receiving Home stepped the relocated run on the handoff's wake");
+        assert_eq!(finished, "completed");
+        let _ = stop_supervisor.send(true);
+        if let Some(supervisor) = receiving_supervisor {
+            supervisor.await.unwrap().unwrap();
+        }
     }
     if let Some(original) = launched {
         let mut guard = bob_wb.lock().unwrap();

@@ -76,12 +76,18 @@ export interface ChatWhipRunView {
     launchedBy: string;
     /** Whether the signed-in person launched it. */
     byYou: boolean;
-    state: "running" | "completed" | "failed" | "cancelled" | "unknown";
+    /** `waiting` is running and parked until a task it filed is closed. */
+    state: "running" | "waiting" | "completed" | "failed" | "cancelled" | "unknown";
     startedAt: string | null;
     cut: string;
+    /** Whether the signed-in person may stop it (its launcher, or a Home admin). */
+    canStop: boolean;
+    /** Its firings as the instance projection draws them, when one file's runs
+     *  were asked for. */
+    view?: unknown;
 }
 
-const RUN_STATES = new Set(["running", "completed", "failed", "cancelled"]);
+const RUN_STATES = new Set(["running", "waiting", "completed", "failed", "cancelled"]);
 
 /** The runs of this chat's `.whip` files — or of one of them — newest first. */
 export async function listChatWhipRuns(transport: WorkbenchTransport, chat: string, path?: string): Promise<ChatWhipRunView[]> {
@@ -99,8 +105,23 @@ export async function listChatWhipRuns(transport: WorkbenchTransport, chat: stri
             state: state as ChatWhipRunView["state"],
             startedAt: typeof run.started_at === "string" ? run.started_at : null,
             cut: identity(run.cut),
+            canStop: run.can_stop === true,
+            ...(run.view !== undefined && run.view !== null ? { view: run.view } : {}),
         };
     });
+}
+
+/** Stop one run of a chat's `.whip` file, under one request key. Stopping a
+ *  run that already finished changes nothing. */
+export async function stopChatWhip(
+    transport: WorkbenchTransport,
+    chat: string,
+    stop: { path: string; launchedBy: string; requestId: string; key: string },
+): Promise<void> {
+    identity(stop.key);
+    await transport.json("POST", `/chats/${encodeURIComponent(chat)}/whips/stop`, {
+        path: stop.path, launched_by: stop.launchedBy, request_id: stop.requestId,
+    }, { idempotencyKey: stop.key });
 }
 
 function inputType(value: unknown, depth = 0): WorkflowInputType {

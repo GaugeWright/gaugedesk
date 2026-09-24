@@ -65,7 +65,7 @@ export function displayPath(path: string): string {
     return path.replace(/^targets\/[^/]+\//, "");
 }
 
-type Mode = "view" | "edit" | "diff" | "structure" | "instances" | "runs";
+type Mode = "view" | "edit" | "diff" | "structure" | "instances";
 
 export interface SpecialFileRenderer {
     readonly id: string;
@@ -483,20 +483,16 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         edit: "edit",
         diff: "changes",
         structure: "structure",
-        instances: "instances",
-        runs: "runs",
+        // One history of a program's runs: folder launches and whatever else
+        // ran it (the gate, a chat's package) — "instances" was the runtime's word.
+        instances: "runs",
     };
     // Only a whip program offers the extra two, so every other file keeps the
     // three tabs it always had.
-    // Runs — this file's run history — joins them only where the session can
-    // launch a folder workflow; running itself is the header's Run button.
+    // Running a folder workflow is the header's Run button; its history is
+    // the Runs tab every whip program already has.
     const runnable = () => isWhipProgram(file()) && !!session.api.runChatWhip && !!id();
-    const tabs = createMemo(() => {
-        const base = tabsForPath(file()) as Mode[];
-        return runnable() && session.api.listChatWhipRuns
-            ? [...base.slice(0, base.indexOf("instances") + 1), "runs" as Mode, ...base.slice(base.indexOf("instances") + 1)]
-            : base;
-    });
+    const tabs = createMemo(() => tabsForPath(file()) as Mode[]);
     // This file's runs, newest first: the header's status and the Runs tab. A
     // run is stepped by the Home, not by this client, so while one is running
     // it is read again every few seconds until it settles.
@@ -513,8 +509,12 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     );
     createEffect(() => {
         const runs = fileRuns()?.runs ?? [];
-        if (!runs.some((run) => run.state === "running")) return;
-        const timer = setTimeout(() => setRunsTick((n) => n + 1), 4000);
+        // A running run is re-read briskly; one parked on a task changes only
+        // when the task closes, so it is re-read gently.
+        const delay = runs.some((run) => run.state === "running") ? 4000
+            : runs.some((run) => run.state === "waiting") ? 15000 : 0;
+        if (!delay) return;
+        const timer = setTimeout(() => setRunsTick((n) => n + 1), delay);
         onCleanup(() => clearTimeout(timer));
     });
     // Selecting a non-whip file while standing on a whip-only tab would leave
@@ -575,10 +575,13 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                 describe: () => session.api.describeChatWhip!(chat, path),
                                 run: (run) => session.api.runChatWhip!(chat, run),
                                 roster: session.api.getRoster ? () => session.api.getRoster!() : undefined,
+                                stop: session.api.stopChatWhip
+                                    ? (run, key) => session.api.stopChatWhip!(chat, { path: run.path, launchedBy: run.launchedBy, requestId: run.requestId, key })
+                                    : undefined,
                             }}
                             runs={fileRuns()?.runs ?? []}
                             onLaunched={() => setRunsTick((n) => n + 1)}
-                            onOpenRuns={() => setMode("runs")}
+                            onOpenRuns={() => setMode("instances")}
                         />
                     )}
                 </Show>
@@ -590,18 +593,25 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                 </div>
             </Show>
 
-            <Show when={mode() === "runs"}>
-                <div class="filebody">
-                    <WhipRunsView runs={fileRuns.loading && !fileRuns() ? undefined : fileRuns()?.runs} error={fileRuns()?.ok === false} />
-                </div>
-            </Show>
-
             <Show when={mode() === "instances"}>
                 <div class="filebody">
-                    <WhipInstancesView
-                        instances={whipInstances()}
-                        unread={whipProgram()?.unread ?? null}
-                    />
+                    {/* Launches from the file's folder, when there are any. With
+                        none, the program view below carries the empty state, so
+                        a tab never says "nothing" twice. */}
+                    <Show when={runnable() && session.api.listChatWhipRuns && (fileRuns()?.ok === false || (fileRuns()?.runs.length ?? 0) > 0)}>
+                        <WhipRunsView
+                            runs={fileRuns()?.runs}
+                            error={fileRuns()?.ok === false}
+                        />
+                    </Show>
+                    {/* What else ran this program — the gate, a chat's package —
+                        read from its own runtime store. */}
+                    <Show when={(fileRuns()?.runs.length ?? 0) === 0 || whipInstances().length > 0 || whipProgram()?.unread}>
+                        <WhipInstancesView
+                            instances={whipInstances()}
+                            unread={whipProgram()?.unread ?? null}
+                        />
+                    </Show>
                 </div>
             </Show>
 

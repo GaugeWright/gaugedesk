@@ -3118,6 +3118,7 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .whip-run-control .run-button:disabled { opacity: 0.6; cursor: progress; }
 .run-dot { display: inline-block; flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 .run-dot[data-run-tone="active"] { background: var(--accent); animation: run-dot-pulse 1.4s ease-in-out infinite; }
+.run-dot[data-run-tone="wait"] { background: var(--warn); }
 .run-dot[data-run-tone="ok"] { background: var(--gw-default-success); }
 .run-dot[data-run-tone="bad"] { background: var(--bad); }
 @keyframes run-dot-pulse { 50% { opacity: 0.35; } }
@@ -3141,6 +3142,9 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .whip-run-actions button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-contrast); }
 .whip-runs { padding: 12px 16px; }
 .whip-runs ol { list-style: none; margin: 0; padding: 0; }
-.whip-runs li { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--edge); font-size: var(--fs-ui); }
+.whip-runs li { padding: 0; border-bottom: 1px solid var(--edge); font-size: var(--fs-ui); }
+.whip-runs .whip-runs-row { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 0; background: transparent; border: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.whip-runs .whip-runs-row:disabled { cursor: default; }
+.whip-runs h3 { margin: 16px 0 6px; font-size: var(--fs-small); color: var(--muted); font-weight: normal; }
 .whip-runs .whip-runs-state { min-width: 90px; color: var(--ink); }
 .viewer-filename + .whip-run-control { margin-left: 8px; }

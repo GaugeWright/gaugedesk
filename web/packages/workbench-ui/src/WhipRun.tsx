@@ -13,9 +13,12 @@
 import { createSignal, For, Match, onCleanup, onMount, Show, Switch, type JSX } from "solid-js";
 import type { ChatWhipDescription, ChatWhipRunView, ProjectWorkflowLaunchResult, RosterPerson, WorkflowInputType } from "@gaugewright/control-plane-client";
 import { initialDraft, parseDraft, type Draft } from "./whip-run-form";
+import { instanceViewFromV0 } from "./whip-view";
+import { WhipInstancesView } from "./WhipViews";
 
 export interface WhipRunApi {
     describe(): Promise<ChatWhipDescription>;
+    stop?(run: ChatWhipRunView, key: string): Promise<void>;
     run(run: { path: string; cut: string; inputs: Record<string, unknown>; requestId: string }): Promise<ProjectWorkflowLaunchResult>;
     roster?(): Promise<RosterPerson[]>;
 }
@@ -26,9 +29,10 @@ const [runsLaunched, setRunsLaunched] = createSignal(0);
 export { runsLaunched };
 
 /** A run's state in plain words, and the tone its dot is drawn in. */
-export function runStatus(state: ChatWhipRunView["state"]): { label: string; tone: "active" | "ok" | "bad" | "quiet" } {
+export function runStatus(state: ChatWhipRunView["state"]): { label: string; tone: "active" | "wait" | "ok" | "bad" | "quiet" } {
     switch (state) {
         case "running": return { label: "Running", tone: "active" };
+        case "waiting": return { label: "Waiting on a task", tone: "wait" };
         case "completed": return { label: "Finished", tone: "ok" };
         case "failed": return { label: "Failed", tone: "bad" };
         case "cancelled": return { label: "Stopped", tone: "quiet" };
@@ -211,6 +215,24 @@ export function WhipRunControl(props: {
         }
     };
 
+    // One key per intended stop, kept across a retry of the same stop.
+    let stopKey = newRequestId();
+    const stop = async (run: ChatWhipRunView) => {
+        setBusy(true);
+        setMessage(null);
+        try {
+            await props.api.stop!(run, stopKey);
+            stopKey = newRequestId();
+            setOpen(null);
+            setRunsLaunched((n) => n + 1);
+            props.onLaunched();
+        } catch {
+            setMessage("It didn’t stop. Stop again retries the same request.");
+        } finally {
+            setBusy(false);
+        }
+    };
+
     const start = async () => {
         if (open() === "form") return setOpen(null);
         setBusy(true);
@@ -276,7 +298,11 @@ export function WhipRunControl(props: {
                         <p class="muted">
                             Started {startedLabel(run().startedAt)} by {who(run(), people())}.
                         </p>
+                        <Show when={message()}>{(text) => <p class="whip-run-error" role="alert">{text()}</p>}</Show>
                         <div class="whip-run-actions">
+                            <Show when={run().canStop && props.api.stop}>
+                                <button type="button" disabled={busy()} onClick={() => void stop(run())}>Stop</button>
+                            </Show>
                             <button type="button" onClick={() => { setOpen(null); props.onOpenRuns(); }}>All runs</button>
                             <button type="button" class="primary" onClick={() => { setOpen(null); void start(); }}>Run again</button>
                         </div>
@@ -287,8 +313,11 @@ export function WhipRunControl(props: {
     );
 }
 
-/** The file's Runs tab: every run of it this person can see, newest first. */
-export function WhipRunsView(props: { runs: ChatWhipRunView[] | undefined; error?: boolean }): JSX.Element {
+/** The runs of a file launched from its folder, newest first; each opens to
+ *  its firings, drawn exactly as any program's instances are. */
+export function WhipRunsView(props: { runs: ChatWhipRunView[] | undefined; error?: boolean; emptyText?: string }): JSX.Element {
+    const [openRun, setOpenRun] = createSignal<string | null>(null);
+    const keyOf = (run: ChatWhipRunView) => `${run.launchedBy}\u0000${run.requestId}`;
     return (
         <div class="whip-runs" data-whip-runs>
             <Switch>
@@ -299,17 +328,24 @@ export function WhipRunsView(props: { runs: ChatWhipRunView[] | undefined; error
                     <p class="muted">Reading runs…</p>
                 </Match>
                 <Match when={props.runs!.length === 0}>
-                    <p class="muted">No runs yet. Use Run above to start one.</p>
+                    <p class="muted">{props.emptyText ?? "No runs yet. Use Run above to start one."}</p>
                 </Match>
                 <Match when={props.runs}>
                     {(runs) => (
                         <ol>
                             <For each={runs()}>{(run) => (
                                 <li data-run-status={run.state}>
-                                    <RunDot state={run.state} />
-                                    <span class="whip-runs-state">{runStatus(run.state).label}</span>
-                                    <span class="muted">{startedLabel(run.startedAt)}</span>
-                                    <span class="muted">{who(run, undefined)}</span>
+                                    <button type="button" class="whip-runs-row" aria-expanded={openRun() === keyOf(run)}
+                                        disabled={!run.view}
+                                        onClick={() => setOpenRun(openRun() === keyOf(run) ? null : keyOf(run))}>
+                                        <RunDot state={run.state} />
+                                        <span class="whip-runs-state">{runStatus(run.state).label}</span>
+                                        <span class="muted">{startedLabel(run.startedAt)}</span>
+                                        <span class="muted">{who(run, undefined)}</span>
+                                    </button>
+                                    <Show when={openRun() === keyOf(run) && run.view}>
+                                        {(view) => <WhipInstancesView instances={[instanceViewFromV0(view())]} />}
+                                    </Show>
                                 </li>
                             )}</For>
                         </ol>
