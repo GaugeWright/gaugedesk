@@ -84,14 +84,29 @@ export async function resolveHomeRoutes(
     };
 
     const hub = await hubRoutes(options.json);
-    if (!options.subject) return degraded("no signed-in subject to pin against");
     if (!directoryVerifierAvailable()) return degraded("this build registered no verifier");
 
     const projection = await accountDirectory(options.json);
     if (!projection) return degraded("the account has published no directory root");
 
+    // The caller's subject where it has one — a desktop reads it from the
+    // bearer's claims — and otherwise the one the hub names for this session.
+    // A browser authenticates by cookie and holds no bearer at all, so reading
+    // claims yields "" every time and this path was skipped on every desk
+    // session there has ever been. The projection is fetched first now, because
+    // it is what can answer.
+    //
+    // The hub naming the namespace is the same trust the claims path already
+    // placed in it — the hub issues the token those claims come from — and a
+    // wrong subject costs a pin under a namespace that grants nothing. What it
+    // must never be is the root key itself: namespacing a key's pin by that key
+    // means every substitution lands in a fresh namespace and no conflict can
+    // ever be detected.
+    const subject = options.subject || projection.subject;
+    if (!subject) return degraded("no signed-in subject to pin against");
+
     const seam = {
-        subject: options.subject,
+        subject,
         directoryOrigin: projection.origin || DIRECTORY_ORIGIN,
         verify: verifySignedPut,
         ...(options.storage ? { storage: options.storage } : {}),

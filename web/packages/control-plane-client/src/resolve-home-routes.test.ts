@@ -67,6 +67,48 @@ describe("resolving routes across both channels (DESK-5g)", () => {
         expect(routes.routes[0]?.relay?.homeFingerprint).toBe("ab".repeat(32));
     });
 
+    it("pins under the subject the hub names when the caller has no bearer", async () => {
+        // This is every browser. desk authenticates by cookie and never calls
+        // setBearer, so reading a subject from the bearer's claims yields "" on
+        // every session — and the signed path was skipped before it ever looked
+        // at the record. A relay-only Home is unreachable in that state, which
+        // is exactly what "cannot reach your Home" was.
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        const storage = memoryStorage();
+        const routes = await resolveHomeRoutes({
+            json: plane({
+                directory: {
+                    root_pubkey: ROOT,
+                    origin: "https://dir.example",
+                    subject: "person-1",
+                },
+            }),
+            subject: "",
+            storage,
+            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+        });
+        expect(routes.verified).toBe(true);
+        expect(routes.routes[0]?.relay?.homeFingerprint).toBe("ab".repeat(32));
+        // And it pinned under that person, not under "".
+        expect(storage.getItem("gw.root.person-1")).toBe(ROOT);
+    });
+
+    it("still degrades when neither the caller nor the hub names a subject", async () => {
+        // An older hub sends no subject. Pinning everyone under "" would compare
+        // one person's key against another's, so this stays degraded instead.
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        const reasons: string[] = [];
+        const routes = await resolveHomeRoutes({
+            json: plane({ directory: { root_pubkey: ROOT, origin: "https://dir.example" } }),
+            subject: "",
+            storage: memoryStorage(),
+            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            onDegraded: (reason) => reasons.push(reason),
+        });
+        expect(routes.verified).toBe(false);
+        expect(reasons).toContain("no signed-in subject to pin against");
+    });
+
     it("yields nothing at all for a relay-only route that arrives only from the hub", async () => {
         // The hub table is writable by anyone holding the person's session, so a
         // fingerprint arriving that way must never be honoured (ADR 0131 §3).

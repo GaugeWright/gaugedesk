@@ -132,6 +132,12 @@ export async function accountHomeRoutes(
 export interface AccountDirectory {
     readonly rootPubkey: string;
     readonly origin: string;
+    /**
+     * The person this session belongs to, as the hub sees it. It namespaces the
+     * root-key pin and nothing else, so a hub too old to send it simply leaves
+     * the caller where it already was.
+     */
+    readonly subject: string;
 }
 
 /**
@@ -157,11 +163,13 @@ export async function accountDirectory(json: RouteJson): Promise<AccountDirector
         // reason to fail an account that works without one.
         return null;
     }
-    const record = value as { root_pubkey?: unknown; origin?: unknown } | null;
+    const record = value as
+        { root_pubkey?: unknown; origin?: unknown; subject?: unknown } | null;
     const rootPubkey = typeof record?.root_pubkey === "string" ? record.root_pubkey.trim() : "";
     if (!rootPubkey) return null;
     const origin = typeof record?.origin === "string" ? record.origin.trim() : "";
-    return { rootPubkey, origin: origin.replace(/\/+$/, "") };
+    const subject = typeof record?.subject === "string" ? record.subject.trim() : "";
+    return { rootPubkey, origin: origin.replace(/\/+$/, ""), subject };
 }
 
 /**

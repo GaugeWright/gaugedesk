@@ -7,10 +7,28 @@ describe("the account directory projection (DESK-5f)", () => {
         const json = vi.fn(async () => ({
             root_pubkey: "ed25519:abc",
             origin: "https://directory.example/",
+            subject: "person-1",
         })) as unknown as RouteJson;
         await expect(accountDirectory(json)).resolves.toEqual({
             rootPubkey: "ed25519:abc",
             origin: "https://directory.example",
+            subject: "person-1",
+        });
+    });
+
+    it("carries no subject when the hub is too old to name one", async () => {
+        // A browser holds no bearer to read claims from, so the hub naming the
+        // session's person is the only way this page can namespace its pin. An
+        // older hub omits it, and the caller must be left exactly where it was
+        // rather than pinning everyone under "".
+        const json = vi.fn(async () => ({
+            root_pubkey: "ed25519:abc",
+            origin: "https://directory.example",
+        })) as unknown as RouteJson;
+        await expect(accountDirectory(json)).resolves.toEqual({
+            rootPubkey: "ed25519:abc",
+            origin: "https://directory.example",
+            subject: "",
         });
     });
 
@@ -37,7 +55,11 @@ describe("the account directory projection (DESK-5f)", () => {
         // The caller owns the canonical default; a client-side guess here would
         // silently disagree with the desktop's.
         const json = vi.fn(async () => ({ root_pubkey: "k" })) as unknown as RouteJson;
-        await expect(accountDirectory(json)).resolves.toEqual({ rootPubkey: "k", origin: "" });
+        await expect(accountDirectory(json)).resolves.toEqual({
+            rootPubkey: "k",
+            origin: "",
+            subject: "",
+        });
     });
 });
 

@@ -434,13 +434,21 @@ pub async fn get_account_directory(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    let bearer = net_http::bearer(&headers);
+    let scope = wb.account_scope_for(bearer);
+    // Who is asking, so a browser can namespace its root-key pin by person
+    // (ADR 0132 §5). A browser session here authenticates by cookie and holds
+    // no bearer to read claims from, so without this the pin has no namespace
+    // and the signed-directory path is skipped entirely — which is the state
+    // every desk session has actually been in.
+    let subject = wb.actor(bearer);
     match crate::account::Account::rebuild_in(wb.store_ref(), &scope) {
         Ok(account) => match account.directory {
             Some(record) => (
                 StatusCode::OK,
                 Json(json!({
                     "root_pubkey": record.root_pubkey,
+                    "subject": subject,
                     "origin": if record.origin.is_empty() {
                         crate::directory_sync::DIRECTORY_URL.to_owned()
                     } else {
