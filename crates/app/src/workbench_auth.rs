@@ -166,10 +166,65 @@ impl Workbench {
     /// OIDC. Both yield the same durable account/authority type; neither
     /// credential becomes the identity.
     pub fn authenticate_bearer(&self, token: &str) -> Option<gaugedesk_core::ids::AuthorityId> {
-        self.resolve_account_session(token)
-            .map(|(account_id, _)| account_id)
-            .map(gaugedesk_core::ids::AuthorityId::new)
-            .or_else(|| self.idp.as_ref().and_then(|idp| idp.authenticate(token)))
+        if let Some((account_id, _)) = self.resolve_account_session(token) {
+            return Some(gaugedesk_core::ids::AuthorityId::new(account_id));
+        }
+        let verified = self.idp.as_ref().and_then(|idp| idp.authenticate(token))?;
+        // A verified id-token whose provider identity is linked to an account IS
+        // that account (DR-0200). Returning the provider's own authority instead —
+        // the email — put the same person in two account scopes: the login
+        // callback resolves this identity through its link and mints a session
+        // for the account, while this path handed back the address, whose scope
+        // holds none of the account's Homes, directory or routes. desk carries
+        // the id-token on every request once `/auth/refresh` re-seats it, and a
+        // bearer outranks the cookie, so desk read the empty scope while the
+        // desktop and the cookie read the real one.
+        Some(
+            self.linked_account_for_verified_id_token(token)
+                .map(gaugedesk_core::ids::AuthorityId::new)
+                .unwrap_or(verified),
+        )
+    }
+
+    /// The account an **already verified** id-token's provider identity is linked
+    /// to, by exactly the judgement the login callback makes: an active
+    /// consumer-OIDC link for the exact connection, issuer and subject, onto an
+    /// account that holds a custodied root. The email is never consulted — an
+    /// address is not an identity, and an existing account with the same address
+    /// is never merged into (`an_existing_account_with_the_same_email_is_never_merged_into`).
+    ///
+    /// Only call this after the identity provider has verified `token`: the claims
+    /// are read without re-checking the signature, which is sound solely because
+    /// the caller has just checked it over these same bytes.
+    fn linked_account_for_verified_id_token(&self, token: &str) -> Option<String> {
+        use base64::Engine as _;
+        let payload = token.split('.').nth(1)?;
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload.trim_end_matches('='))
+                .ok()?,
+        )
+        .ok()?;
+        let issuer = claims.get("iss")?.as_str()?;
+        let subject = claims.get("sub")?.as_str()?;
+        let state = crate::account_auth::AccountAuth::rebuild(self.store_ref()).ok()?;
+        // The link names its connection, and the identifier it is stored under
+        // covers connection, issuer and subject together, so trying each consumer
+        // connection cannot match one identity to another's account.
+        crate::auth_oidc::CONSUMER_PROVIDERS
+            .iter()
+            .find_map(|provider| {
+                let link = state.active_external_subject(
+                    provider.connection_id,
+                    issuer,
+                    subject,
+                    crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+                )?;
+                state
+                    .roots
+                    .contains_key(&link.account_id)
+                    .then(|| link.account_id.clone())
+            })
     }
 
     /// Resolve an opaque account session and enforce its durable trusted-device
@@ -1767,5 +1822,174 @@ mod throttle_scope_tests {
             throttle_scope(&headers(&[("cf-connecting-ip", "not-an-ip")]), None, true),
             None,
         );
+    }
+}
+
+#[cfg(test)]
+mod id_token_bearer_tests {
+    //! A verified id-token resolves to the account its provider identity is
+    //! linked to (DR-0200), by the same judgement the login callback makes.
+    use crate::account_auth::{
+        append_facts, AccountAuthFact, AuthMethodStatus, CustodiedAccountRootRecord,
+        ExternalSubjectKind, ExternalSubjectRecord,
+    };
+    use crate::LockUnpoisoned;
+    use base64::Engine as _;
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::ids::AuthorityId;
+    use std::sync::Arc;
+
+    const GOOGLE: &str = "https://accounts.google.com";
+    const EMAIL: &str = "person@example.test";
+
+    fn google_connection() -> &'static str {
+        crate::auth_oidc::CONSUMER_PROVIDERS[0].connection_id
+    }
+
+    fn id_token(issuer: &str, subject: &str) -> String {
+        let part = |value: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+        };
+        format!(
+            "{}.{}.signature",
+            part(serde_json::json!({ "alg": "RS256" })),
+            part(serde_json::json!({ "iss": issuer, "sub": subject, "email": EMAIL })),
+        )
+    }
+
+    /// A Hub whose identity provider verifies exactly `verified` tokens, each to
+    /// the provider's own authority — the email — as the real one does.
+    fn hub(verified: &[&str]) -> (tempfile::TempDir, crate::SharedWorkbench) {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let idp = verified.iter().fold(
+            crate::identity::LoopbackIdentityProvider::new(),
+            |idp, token| {
+                idp.enroll(
+                    *token,
+                    AuthorityId::new(EMAIL),
+                    AuthorityAttributes::default(),
+                )
+            },
+        );
+        wb.lock_unpoisoned()
+            .set_identity_provider(Some(Arc::new(idp)));
+        (root, wb)
+    }
+
+    fn link(
+        wb: &crate::SharedWorkbench,
+        account: &str,
+        subject: &str,
+        status: AuthMethodStatus,
+        root: bool,
+    ) {
+        let mut record = ExternalSubjectRecord::new(
+            account,
+            google_connection(),
+            GOOGLE,
+            subject,
+            ExternalSubjectKind::ConsumerOidc,
+            1,
+        )
+        .unwrap();
+        record.status = status;
+        let mut facts = vec![AccountAuthFact::ExternalSubject(record)];
+        if root {
+            facts.push(AccountAuthFact::RootCustody(
+                CustodiedAccountRootRecord::new(account, "sealed-root", 1).unwrap(),
+            ));
+        }
+        append_facts(wb.lock_unpoisoned().store_mut(), &facts).unwrap();
+    }
+
+    fn who(wb: &crate::SharedWorkbench, token: &str) -> Option<String> {
+        wb.lock_unpoisoned()
+            .authenticate_bearer(token)
+            .map(|authority| authority.as_str().to_owned())
+    }
+
+    /// The case that sent desk to an empty scope: the person signed in with
+    /// Google, the callback resolved that identity through its link to their
+    /// account, and the id-token desk then carried resolved to the address.
+    #[test]
+    fn a_linked_identity_is_its_account_not_its_address() {
+        let token = id_token(GOOGLE, "google-subject-1");
+        let (_root, wb) = hub(&[&token]);
+        link(
+            &wb,
+            "account-root-key",
+            "google-subject-1",
+            AuthMethodStatus::Active,
+            true,
+        );
+        assert_eq!(who(&wb, &token).as_deref(), Some("account-root-key"));
+    }
+
+    #[test]
+    fn an_unlinked_identity_keeps_the_providers_authority() {
+        let token = id_token(GOOGLE, "google-subject-1");
+        let (_root, wb) = hub(&[&token]);
+        assert_eq!(who(&wb, &token).as_deref(), Some(EMAIL));
+    }
+
+    /// Claims are read without re-checking the signature, which is sound only
+    /// because the provider has just verified these bytes. A token it refuses
+    /// must never reach an account, however exactly its claims match a link.
+    #[test]
+    fn a_token_the_provider_refuses_reaches_no_account() {
+        let (_root, wb) = hub(&[]);
+        link(
+            &wb,
+            "account-root-key",
+            "google-subject-1",
+            AuthMethodStatus::Active,
+            true,
+        );
+        assert_eq!(who(&wb, &id_token(GOOGLE, "google-subject-1")), None);
+    }
+
+    #[test]
+    fn a_revoked_link_does_not_resolve() {
+        let token = id_token(GOOGLE, "google-subject-1");
+        let (_root, wb) = hub(&[&token]);
+        link(
+            &wb,
+            "account-root-key",
+            "google-subject-1",
+            AuthMethodStatus::Revoked,
+            true,
+        );
+        assert_eq!(who(&wb, &token).as_deref(), Some(EMAIL));
+    }
+
+    /// The same address on another subject is somebody else, and an existing
+    /// account with a matching email is never merged into.
+    #[test]
+    fn another_subject_with_the_same_address_is_not_this_account() {
+        let token = id_token(GOOGLE, "google-subject-2");
+        let (_root, wb) = hub(&[&token]);
+        link(
+            &wb,
+            "account-root-key",
+            "google-subject-1",
+            AuthMethodStatus::Active,
+            true,
+        );
+        assert_eq!(who(&wb, &token).as_deref(), Some(EMAIL));
+    }
+
+    #[test]
+    fn a_link_to_an_account_without_a_root_does_not_resolve() {
+        let token = id_token(GOOGLE, "google-subject-1");
+        let (_root, wb) = hub(&[&token]);
+        link(
+            &wb,
+            "account-root-key",
+            "google-subject-1",
+            AuthMethodStatus::Active,
+            false,
+        );
+        assert_eq!(who(&wb, &token).as_deref(), Some(EMAIL));
     }
 }
