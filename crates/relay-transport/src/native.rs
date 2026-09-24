@@ -6,6 +6,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,8 @@ use tokio::time::{sleep, timeout};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::wire;
@@ -47,6 +50,26 @@ const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
 /// the Durable Object and is never forwarded to the peer.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long a Home's crossing may carry nothing before the Home ends it and
+/// parks a fresh leg.
+///
+/// A route holds one pair, so a Home spliced to a client is unreachable to
+/// every other client until that crossing ends — and the Home cannot see its
+/// partner. The partner's keepalives are served by the relay's auto-response and
+/// never forwarded, and when the relay closes a silent partner it does not
+/// reliably close the Home's leg with it. On 2026-09-24 a Home stayed spliced to
+/// a browser that had gone, while desk's next attempt waited thirty seconds for
+/// a Home that was never going to park, and only a relaunch recovered it.
+///
+/// Carried bytes are the one signal that crosses the relay, so silence in both
+/// directions is what ends a crossing. The edge's own idle bound, because that
+/// is already how long the relay lets a pair go quiet before it acts: it closes
+/// a client leg that has not pinged by then, and a browser leg pings never, so
+/// no crossing the relay would have kept is ended here first. A live crossing is
+/// never this quiet — an event stream sends a keep-alive every fifteen seconds,
+/// and an HTTP client drops a pooled idle connection at ninety.
+const HOME_CROSSING_IDLE: Duration = Duration::from_secs(150);
+
 /// Ordered byte stream backed by bounded binary WebSocket frames. Closing or
 /// dropping it terminates the pump; no reconnect can silently join two TLS
 /// streams. Callers retry by establishing a fresh pinned-TLS session.
@@ -69,6 +92,16 @@ pub struct WebSocketByteStream {
     // An `Option` because a `JoinHandle` may be polled to completion only once;
     // dropping it still detaches, which is what an un-shut-down stream wants.
     pump: Option<tokio::task::JoinHandle<()>>,
+    // Set by the pump when it ended the leg for carrying nothing, so a Home can
+    // tell a crossing it closed on purpose from one that failed. Both end the
+    // same way at the byte level: the application side reads EOF.
+    went_idle: Arc<AtomicBool>,
+}
+
+impl WebSocketByteStream {
+    fn went_idle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.went_idle)
+    }
 }
 
 impl AsyncRead for WebSocketByteStream {
@@ -186,7 +219,7 @@ async fn dial_leg(
             });
         }
     };
-    websocket_stream_from_socket(socket, handshake, role.sends_keepalives())
+    websocket_stream_from_socket(socket, handshake, role)
         .await
         .map_err(|error| {
             // Pairing refusals arrive as close frames once the socket is up.
@@ -245,11 +278,16 @@ pub async fn connect_one_shot(
 async fn websocket_stream_from_socket<S>(
     mut socket: tokio_tungstenite::WebSocketStream<S>,
     handshake: [u8; WSS_HANDSHAKE_LEN],
-    keepalive: bool,
+    role: WebSocketRelayRole,
 ) -> std::io::Result<WebSocketByteStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let keepalive = role.sends_keepalives();
+    // Only the Home returns to waiting after a crossing, so only the Home is
+    // hurt by a crossing that never ends. A client that has gone quiet is the
+    // Home's problem to notice, not its own.
+    let idle = (role == WebSocketRelayRole::Home).then_some(HOME_CROSSING_IDLE);
     socket
         .send(Message::Binary(handshake.to_vec().into()))
         .await
@@ -268,6 +306,8 @@ where
     }
 
     let (application, mut pump_side) = tokio::io::duplex(WSS_STREAM_BUFFER_BYTES);
+    let went_idle = Arc::new(AtomicBool::new(false));
+    let pump_went_idle = Arc::clone(&went_idle);
     let pump = tokio::spawn(async move {
         let mut outgoing = vec![0u8; WSS_MAX_FRAME_BYTES - 1];
         let mut sent_fin = false;
@@ -280,6 +320,10 @@ where
         let mut teardown_deadline = None;
         // `None` for a one-shot crossing, which is bounded by its own expiry.
         let mut keepalive_at = keepalive.then(|| tokio::time::Instant::now() + KEEPALIVE_INTERVAL);
+        // Measured from pairing and pushed back by every carried frame in
+        // either direction. A keepalive does not count: it is between this leg
+        // and the relay, and says nothing about whether the partner is there.
+        let mut idle_at = idle.map(|bound| tokio::time::Instant::now() + bound);
         loop {
             if sent_fin && received_fin && fin_acknowledged {
                 let _ = socket.close(None).await;
@@ -314,7 +358,29 @@ where
                         break;
                     }
                 }
+                // The crossing has gone quiet. Closing the socket is what the
+                // relay acts on: it frees the route and closes the partner's leg
+                // too, if there is one left to close. After this side's `FIN`
+                // the teardown deadline governs instead.
+                () = async {
+                    match idle_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if !sent_fin => {
+                    pump_went_idle.store(true, Ordering::Release);
+                    let _ = socket
+                        .close(Some(CloseFrame {
+                            code: CloseCode::Normal,
+                            reason: "home crossing idle".into(),
+                        }))
+                        .await;
+                    break;
+                }
                 read = pump_side.read(&mut outgoing), if !sent_fin => {
+                    if let Some(bound) = idle {
+                        idle_at = Some(tokio::time::Instant::now() + bound);
+                    }
                     match read {
                         Ok(0) => {
                             sent_fin = true;
@@ -337,6 +403,9 @@ where
                 incoming = socket.next() => {
                     match incoming {
                         Some(Ok(Message::Binary(bytes))) if !bytes.is_empty() && bytes.len() <= WSS_MAX_FRAME_BYTES => {
+                            if let Some(bound) = idle {
+                                idle_at = Some(tokio::time::Instant::now() + bound);
+                            }
                             match bytes[0] {
                                 WSS_DATA if !received_fin => {
                                     if pump_side.write_all(&bytes[1..]).await.is_err() {
@@ -376,6 +445,7 @@ where
     Ok(WebSocketByteStream {
         stream: application,
         pump: Some(pump),
+        went_idle,
     })
 }
 
@@ -670,11 +740,23 @@ async fn park_home_leg(
 ) -> std::io::Result<()> {
     let acceptor = TlsAcceptor::from(Arc::new(identity.server_config()?));
     let broker = connect_home_stream(route).await?;
+    let went_idle = broker.went_idle();
     parked();
-    let mut tunnel = acceptor.accept(broker).await?;
-    let mut local = TcpStream::connect(local_control_plane).await?;
-    tokio::io::copy_bidirectional(&mut tunnel, &mut local).await?;
-    Ok(())
+    let crossing = async {
+        let mut tunnel = acceptor.accept(broker).await?;
+        let mut local = TcpStream::connect(local_control_plane).await?;
+        tokio::io::copy_bidirectional(&mut tunnel, &mut local).await?;
+        Ok(())
+    }
+    .await;
+    // A crossing the pump ended for silence reads as a truncated TLS stream,
+    // which is an error to rustls. It is the ordinary end of a crossing whose
+    // client has gone, so the caller parks again at once rather than backing
+    // off and reporting an outage that is not happening.
+    match crossing {
+        Err(_) if went_idle.load(Ordering::Acquire) => Ok(()),
+        crossing => crossing,
+    }
 }
 
 /// Replenish a Home availability leg after every completed tunnel. Failures use
@@ -1070,24 +1152,18 @@ mod tests {
         let websocket_url = format!("ws://{address}/v1/relay/{}", route.handle);
         let home_connect = async {
             let (socket, _) = connect_async(&websocket_url).await.unwrap();
-            let stream = websocket_stream_from_socket(
-                socket,
-                home_handshake,
-                WebSocketRelayRole::Home.sends_keepalives(),
-            )
-            .await
-            .unwrap();
+            let stream =
+                websocket_stream_from_socket(socket, home_handshake, WebSocketRelayRole::Home)
+                    .await
+                    .unwrap();
             stream
         };
         let client_connect = async {
             let (socket, _) = connect_async(&websocket_url).await.unwrap();
-            let stream = websocket_stream_from_socket(
-                socket,
-                client_handshake,
-                WebSocketRelayRole::Client.sends_keepalives(),
-            )
-            .await
-            .unwrap();
+            let stream =
+                websocket_stream_from_socket(socket, client_handshake, WebSocketRelayRole::Client)
+                    .await
+                    .unwrap();
             stream
         };
         let (home_stream, client_stream) = tokio::join!(home_connect, client_connect);
@@ -1658,6 +1734,146 @@ mod tests {
 
         supervised.abort();
         relay.abort();
+    }
+
+    /// A Home whose client has gone parks again, even when the relay never says
+    /// the client went.
+    ///
+    /// The relay here does what the edge's alarm does to a client leg that
+    /// promised keepalives and sent none: it drops that leg and leaves the
+    /// Home's open, answering nothing. The Home used to stay spliced to it for
+    /// as long as the process lived — still connected to the relay, never
+    /// waiting — so desk's next attempt found no Home and gave up after thirty
+    /// seconds (2026-09-24, GaugeDesk 0.4.21). Only a relaunch recovered it.
+    #[tokio::test]
+    async fn a_home_parks_again_when_its_client_leaves_without_a_word() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (leave_tx, leave_rx) = tokio::sync::oneshot::channel::<()>();
+        let (left_tx, left_rx) = tokio::sync::oneshot::channel::<()>();
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+        let relay = tokio::spawn(async move {
+            // Pair the first two legs, whichever order they arrive in.
+            let mut legs = Vec::new();
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(tcp).await.unwrap();
+                let handshake = socket.next().await.unwrap().unwrap().into_data();
+                legs.push((handshake[10], socket));
+            }
+            legs.sort_by_key(|(role, _)| *role);
+            let (_, mut client) = legs.pop().unwrap();
+            let (_, mut home) = legs.pop().unwrap();
+            for socket in [&mut home, &mut client] {
+                socket
+                    .send(Message::Binary(WSS_READY.to_vec().into()))
+                    .await
+                    .unwrap();
+            }
+            let mut leave_rx = leave_rx;
+            loop {
+                tokio::select! {
+                    _ = &mut leave_rx => break,
+                    message = home.next() => match message {
+                        Some(Ok(Message::Binary(bytes))) => {
+                            client.send(Message::Binary(bytes)).await.unwrap();
+                        }
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    },
+                    message = client.next() => match message {
+                        Some(Ok(Message::Binary(bytes))) => {
+                            home.send(Message::Binary(bytes)).await.unwrap();
+                        }
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    },
+                }
+            }
+            // The client's leg goes; the Home's is neither closed nor told.
+            drop(client);
+            left_tx.send(()).unwrap();
+            let held = tokio::spawn(async move { while let Some(Ok(_)) = home.next().await {} });
+            // Anything the Home dials next is what the test is waiting for.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(tcp).await.unwrap();
+            let handshake = socket.next().await.unwrap().unwrap().into_data();
+            arrived_tx.send(handshake[10]).unwrap();
+            held.abort();
+            std::future::pending::<()>().await;
+        });
+
+        // A control plane that accepts and then says nothing, which is what an
+        // idle keep-alive connection looks like from the Home.
+        let control_plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_plane_address = control_plane.local_addr().unwrap();
+        let accepting = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = control_plane.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(format!("ws://{address}"), identity.fingerprint());
+        let (_routes, route_reader) = tokio::sync::watch::channel(route.clone());
+        let (reports, mut report_reader) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = tokio::spawn(async move {
+            serve_home_supervised(route_reader, control_plane_address, identity, move |leg| {
+                let _ = reports.send(leg.map_err(|(epoch, error)| (epoch, error.to_string())));
+            })
+            .await
+        });
+
+        // A real client dials through the relay and runs the pinned handshake,
+        // so the Home is spliced to a genuine client leg when it disappears —
+        // possibly before the Home has read the client's last handshake flight,
+        // which is a crossing that must end just the same.
+        let client = timeout(Duration::from_secs(10), connect_client(&route))
+            .await
+            .expect("the client never reached the Home")
+            .expect("the pinned handshake through the relay failed");
+        leave_tx.send(()).unwrap();
+        left_rx.await.unwrap();
+
+        // From here the only things the Home can be waiting on are its own
+        // timers, so a paused clock can run them out. The ticker keeps each
+        // auto-advance to a second: a real socket that answers late in the
+        // Home's next dial must not jump the clock past the bound below.
+        tokio::time::pause();
+        let ticker = tokio::spawn(async {
+            loop {
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let role = timeout(HOME_CROSSING_IDLE * 3, arrived_rx.recv())
+            .await
+            .expect("the Home never parked again after its client left")
+            .unwrap();
+        assert_eq!(role, WebSocketRelayRole::Home as u8);
+        // Ending a crossing whose client has gone is ordinary, not an outage.
+        while let Ok(report) = report_reader.try_recv() {
+            assert!(
+                report.is_ok(),
+                "a departed client was reported as an outage: {report:?}"
+            );
+        }
+
+        drop(client);
+        ticker.abort();
+        supervised.abort();
+        accepting.abort();
+        relay.abort();
+    }
+
+    /// Ending a Home's quiet crossing must never beat the relay to it. The edge
+    /// closes a client leg that has not pinged for `IDLE_MILLIS` (150s), and a
+    /// browser leg never pings, so any shorter bound here would end browser
+    /// crossings the relay would have kept.
+    #[test]
+    fn a_home_does_not_end_a_crossing_before_the_edge_would() {
+        const EDGE_IDLE_MILLIS: u128 = 150_000;
+        assert!(HOME_CROSSING_IDLE.as_millis() >= EDGE_IDLE_MILLIS);
     }
 
     /// The client speaks often enough for the edge to believe it.
