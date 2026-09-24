@@ -336,3 +336,57 @@ mod tests;
 #[path = "file_action_product_result_inspection.rs"]
 mod inspection;
 pub use inspection::{EditorFileSavedResultObservation, ObservedEditorSavedProductResult};
+
+impl Workbench {
+    /// Whether `project` has an editor save that was granted dispatch but has
+    /// no written result yet. Editor saves stay on the Home that admitted them,
+    /// so a project does not start moving while one is outstanding (DR-0202;
+    /// DR-0201's pending-move rule, applied before the offer); a save whose grant was
+    /// revoked will never be written and does not count. A grant that cannot be
+    /// read is reported, not guessed past.
+    pub(crate) fn project_has_unwritten_editor_save(
+        &mut self,
+        project: &str,
+    ) -> Result<bool, String> {
+        let page = std::num::NonZeroUsize::new(256).expect("nonzero");
+        let mut after: Option<String> = None;
+        loop {
+            let grants = self
+                .store_ref()
+                .scope_ids_with_kind(
+                    crate::file_action_factory::dispatch_grant::GRANT_KIND,
+                    after.as_deref(),
+                    page,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            let Some(last) = grants.last().cloned() else {
+                return Ok(false);
+            };
+            for grant in grants {
+                let Some(command) = self.discover_editor_file_save_dispatch(&grant)? else {
+                    continue;
+                };
+                let Ok((_, owner, _)) =
+                    serde_json::from_str::<(String, String, String)>(&command.scope)
+                else {
+                    continue;
+                };
+                if owner != project {
+                    continue;
+                }
+                let instance = command
+                    .instance_ref()
+                    .map_err(|error| format!("{error:?}"))?;
+                if self
+                    .store_ref()
+                    .records(&instance, RESULT_KIND)
+                    .map_err(|error| format!("{error:?}"))?
+                    .is_empty()
+                {
+                    return Ok(true);
+                }
+            }
+            after = Some(last);
+        }
+    }
+}

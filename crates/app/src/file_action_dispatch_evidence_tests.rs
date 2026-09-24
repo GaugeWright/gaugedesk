@@ -402,3 +402,86 @@ fn historical_grant_causes_require_exact_signed_receipted_history_without_live_a
         )
         .is_err());
 }
+
+/// A project does not start moving while an editor save to it is granted but
+/// unwritten: the save's result is the only thing that releases it, and a
+/// revoked grant, which will never be written, does not hold it.
+#[test]
+fn an_unwritten_save_holds_its_project_until_its_result_or_revocation() {
+    let mut grant_ref = String::new();
+    let fixture = tests::saved_with_context(false, |wb, inputs, command, token| {
+        let context = wb.authenticate_action_context(token).unwrap();
+        grant_ref = wb
+            .authorize_editor_file_save_dispatch(&context, inputs, command, "execute-background")
+            .unwrap()
+            .grant_ref;
+        wb.load_editor_file_save_dispatch_authority(inputs, command, &grant_ref)
+            .unwrap()
+            .context
+    });
+    let tests::Saved {
+        dir: _dir,
+        wb: shared,
+        command,
+        inputs,
+        token,
+        admission,
+        runtime,
+        effect_id,
+        run_id,
+    } = fixture;
+    let (_, project, _): (String, String, String) = serde_json::from_str(&command.scope).unwrap();
+    let mut wb = shared.lock_unpoisoned();
+    assert!(wb.project_has_unwritten_editor_save(&project).unwrap());
+    assert!(!wb
+        .project_has_unwritten_editor_save("another-project")
+        .unwrap());
+
+    let attempt = EditorFileSaveAttempt {
+        effect_id: &effect_id,
+        run_id: &run_id,
+    };
+    let background = wb
+        .load_editor_file_save_dispatch_authority(&inputs, &command, &grant_ref)
+        .unwrap();
+    let mut owner = wb
+        .claim_editor_file_save_runtime(&background.context, &inputs, &command, &admission, runtime)
+        .unwrap();
+    wb.reconcile_editor_file_save_attempt(
+        &background.context,
+        &inputs,
+        &command,
+        &admission,
+        EditorFileSaveReconciliation {
+            request_id: "reconcile-background",
+            attempt,
+        },
+        &mut owner,
+    )
+    .unwrap()
+    .unwrap();
+    wb.admit_editor_file_save_result(
+        &background.context,
+        &inputs,
+        &command,
+        &admission,
+        attempt,
+        owner.runtime(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        !wb.project_has_unwritten_editor_save(&project).unwrap(),
+        "a written save no longer holds its project"
+    );
+
+    // A second save granted and then revoked before it was written.
+    let current = wb.authenticate_action_context(&token).unwrap();
+    let other = wb
+        .authorize_editor_file_save_dispatch(&current, &inputs, &command, "second-grant")
+        .unwrap()
+        .grant_ref;
+    wb.revoke_editor_file_save_dispatch(&current, &inputs, &command, &other)
+        .unwrap();
+    assert!(!wb.project_has_unwritten_editor_save(&project).unwrap());
+}

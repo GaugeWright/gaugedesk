@@ -2151,6 +2151,10 @@ pub(crate) fn require_project_writes_available(
     Ok(())
 }
 
+/// Why a project cannot start moving while a save to it is still being written.
+pub(crate) const UNWRITTEN_SAVE_BLOCKS_MOVE: &str =
+    "a save to this project is still being written; move it once the save finishes, or discard the save";
+
 /// What every writer says while a move of its project is pending (DR-0201 §3).
 pub(crate) const PAUSED_FOR_MOVE: &str = "project writes are paused for pending handoff";
 
@@ -4170,7 +4174,26 @@ async fn drive_relocate(
     // an offer between its durable preparation and its first send.
     let _in_flight = OfferInFlight::mark(peer.as_str(), project);
     let (log, content, credential_key, project_commands) = {
-        let guard = wb.lock_unpoisoned();
+        let mut guard = wb.lock_unpoisoned();
+        // An editor save stays on the Home that admitted it, so a project with
+        // one still being written does not start moving (DR-0202). Checked under the same
+        // lock the offer is captured under, so no save can slip in between.
+        match guard.project_has_unwritten_editor_save(project) {
+            Ok(false) => {}
+            Ok(true) => {
+                return (
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "error": UNWRITTEN_SAVE_BLOCKS_MOVE }),
+                )
+            }
+            Err(error) => {
+                tracing::warn!(%error, %project, "outstanding editor saves could not be read");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({ "error": "this project's pending saves could not be checked; try again" }),
+                );
+            }
+        }
         let workflow = match workflow_keys::prepare(&guard, project, peer.as_str(), &peer_key) {
             Ok(workflow) => workflow,
             Err(error) => {
