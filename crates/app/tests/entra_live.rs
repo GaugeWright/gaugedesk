@@ -237,7 +237,7 @@ fn a_real_entra_id_token_verifies_against_the_declared_template() {
 
 #[test]
 #[ignore = "needs a genuine Entra id-token; run via scripts/entra-oidc-check.sh"]
-fn the_pre_dr_0183_pin_and_a_foreign_tenant_both_refuse_a_real_token() {
+fn the_pre_dr_0189_pin_and_a_foreign_tenant_both_refuse_a_real_token() {
     let (Some(token), Some(client_id)) = (
         env_or_skip("ENTRA_ID_TOKEN"),
         env_or_skip("ENTRA_CLIENT_ID"),
