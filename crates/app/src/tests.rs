@@ -1911,7 +1911,7 @@ fn seeded_workbench() -> (tempfile::TempDir, SharedWorkbench) {
 
 /// A workbench seeded with only what a chat in the default placement needs —
 /// the Default archetype, the Personal project and its target, no other
-/// archetype, no onboarding tracker (`StartupSeed::lean`). For a test that
+/// archetype (`StartupSeed::lean`). For a test that
 /// never reads the archetype library or the tracker; a test that does, or
 /// that reopens its root, uses [`seeded_workbench`]. The full seed is most of
 /// what a fresh open costs, and it is file churn, which is what contends when
@@ -6236,8 +6236,7 @@ async fn a_clean_turn_queues_no_task() {
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"q1"}"#)).await;
 
-    // A fresh workbench seeds onboarding `issue` tasks (ADR 0075); this is about
-    // what a *turn* contributes.
+    // This is about what a *turn* contributes.
     let (s, before) = send(&app, "GET", "/tasks", None).await;
     assert_eq!(s, StatusCode::OK);
     assert!(!before.contains(r#""id":"q1""#), "no task yet: {before}");
@@ -6622,25 +6621,21 @@ async fn admitted_run_events_reach_the_live_stream() {
     assert!(phases[2].contains("Running"));
 }
 
-/// The onboarding checklist (ADR 0075 Phase 2/3) is seeded on a fresh workbench,
-/// surfaces as `issue` tasks in the unified `/tasks` projection, and advances
-/// when the matching app event fires — here, connecting an LLM credential closes
-/// the "credential" step end-to-end through the HTTP surface.
+/// The onboarding checklist (ADR 0075 Phase 2) is retired (DR-0185). A fresh
+/// workbench files none of it, even under the real runtime it used to seed
+/// under; and a root that already carries it keeps the items as evidence while
+/// the task bar leaves them out. Another issue in the same queue still shows,
+/// because the queue is where the account-global tracker files its work.
 #[tokio::test]
-async fn onboarding_checklist_appears_and_advances_on_credential() {
-    // Onboarding is gated off under the fake agent; pin the real runtime (and
-    // serialize against fake-agent tests) so the checklist actually seeds.
+async fn the_retired_onboarding_checklist_is_neither_filed_nor_shown() {
     let _real = crate::test_support::real_agent_env();
     let dir = tempfile::tempdir().unwrap();
-    let wb = crate::workbench_state::build_workbench(dir.path()).unwrap();
-    let app = open_control_plane(Arc::new(Mutex::new(wb)));
-
-    // The seeded onboarding steps show up as `issue` tasks, each with an assignee.
-    let (status, body) = send(&app, "GET", "/tasks", None).await;
-    assert_eq!(status, StatusCode::OK);
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let tasks = v["tasks"].as_array().unwrap();
-    let issue_titles = |v: &serde_json::Value| -> Vec<String> {
+    let wb = Arc::new(Mutex::new(
+        crate::workbench_state::build_workbench(dir.path()).unwrap(),
+    ));
+    let boundary = crate::workbench_state::ACCOUNT_GLOBAL_BOUNDARY;
+    let issue_titles = |body: &str| -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
         v["tasks"]
             .as_array()
             .unwrap()
@@ -6649,18 +6644,47 @@ async fn onboarding_checklist_appears_and_advances_on_credential() {
             .filter_map(|t| t["title"].as_str().map(str::to_owned))
             .collect()
     };
-    let titles = issue_titles(&v);
-    assert!(
-        titles.iter().any(|t| t == "Connect a model"),
-        "expected the credential onboarding step, got {titles:?}"
-    );
-    assert!(titles.iter().any(|t| t == "Create a project"));
-    assert!(
-        tasks.iter().all(|t| t["assignee"].is_string()),
-        "every task carries an assignee authority (ADR 0075 §4)"
+
+    {
+        let mut guard = wb.lock_unpoisoned();
+        let tracker = guard.tracker_for_boundary(boundary).expect("tracker opens");
+        assert!(
+            !tracker
+                .has_items(crate::onboarding::ONBOARDING_QUEUE)
+                .expect("has_items"),
+            "a fresh workbench files no checklist",
+        );
+        // What an older release left behind, and one ordinary issue beside it.
+        for (title, step) in [
+            ("Connect a model", "credential"),
+            ("Send your first message", "first_turn"),
+            ("Create a project", "project"),
+            ("Assign this onboarding step", "assignment-contract"),
+        ] {
+            tracker
+                .file_item(
+                    crate::onboarding::ONBOARDING_QUEUE,
+                    title,
+                    "",
+                    &[],
+                    &serde_json::json!({ "step": step }),
+                    Some("onboarding-system"),
+                )
+                .expect("the item files");
+        }
+    }
+
+    let app = open_control_plane(wb.clone());
+    let (status, body) = send(&app, "GET", "/tasks", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        issue_titles(&body),
+        vec!["Assign this onboarding step".to_owned()],
+        "only the ordinary issue is work: {body}",
     );
 
-    // Connecting a credential fires app.credential_connected, which closes the step.
+    // Linking a credential no longer touches the tracker; the legacy step
+    // stays open as it was, and stays out of the bar.
     let (status, _) = send(
         &app,
         "POST",
@@ -6669,18 +6693,13 @@ async fn onboarding_checklist_appears_and_advances_on_credential() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-
-    let (_, body) = send(&app, "GET", "/tasks", None).await;
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let titles = issue_titles(&v);
-    assert!(
-        !titles.iter().any(|t| t == "Connect a model"),
-        "the credential step should be closed after linking, got {titles:?}"
-    );
-    assert!(
-        titles.iter().any(|t| t == "Create a project"),
-        "unrelated onboarding steps stay open"
-    );
+    let open = wb
+        .lock_unpoisoned()
+        .tracker_for_boundary(boundary)
+        .expect("tracker opens")
+        .list_items(Some(crate::onboarding::ONBOARDING_QUEUE), Some("open"))
+        .expect("list_items");
+    assert_eq!(open.len(), 4, "legacy items are preserved, not rewritten");
 }
 
 /// Every project has a gate from creation, and it is review-by-hand.

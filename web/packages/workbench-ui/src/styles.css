@@ -335,6 +335,11 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .tasks { grid-column: 1 / -1; background: linear-gradient(90deg, var(--navy), var(--panel) 34%, var(--panel));
     border-bottom: 1px solid var(--edge); padding: 6px 12px; display: flex; align-items: center; gap: 10px; }
 .tasks > .taskbar { flex: 1; min-width: 0; }
+/* The desktop shell overlays the title bar on macOS (main.rs `OVERLAY_TITLE_BAR`) and
+   centres the traffic lights on this row, so the row starts after them. The lights
+   do not scale with the page zoom, so neither may the room made for them. */
+:root[data-titlebar="overlay"] .tasks { box-sizing: border-box;
+    padding-left: calc(86px / var(--shell-zoom, 1)); min-height: calc(37px / var(--shell-zoom, 1)); }
 /* Owner-side "pair a device" affordance (MOB-F5): a quiet right-aligned action. */
 .pair-ticket { display: block; font-family: var(--mono); font-size: var(--fs-body); background: var(--bg);
     border: 1px solid var(--edge); border-radius: 4px; padding: 8px 10px; margin-bottom: 10px;
@@ -2036,6 +2041,10 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     padding: 8px 6px; font-size: var(--fs-ui); cursor: pointer; }
 .carousel-seg.current { color: var(--ink); box-shadow: inset 0 -2px 0 var(--accent); }
 .carousel-seg.greyed { color: var(--edge); cursor: default; }
+/* A desktop window narrow enough for the carousel keeps the macOS traffic lights over
+   this row instead of a task bar; they get the same room here, in the panel colour. */
+:root[data-titlebar="overlay"] .carousel-toggle::before { content: ""; flex: 0 0 auto;
+    width: calc(86px / var(--shell-zoom, 1)); background: var(--panel); }
 .carousel-stage { display: flex; flex: 1; min-height: 0; }
 .carousel-pane { flex: 1; min-width: 0; overflow: auto; background: var(--panel);
     padding: 10px 12px; }

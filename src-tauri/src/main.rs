@@ -4,7 +4,8 @@
 //! **co-resident control plane** runs on loopback. The webview talks to it over
 //! **HTTP, not Tauri IPC** — so the exact same client works as a browser/web
 //! build and (later) against a remote. Tauri here is packaging + a window, not a
-//! second transport.
+//! second transport. The one exception is the credential the webview presents to
+//! that control plane (DR-0188), which must not be fetchable from loopback HTTP.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -44,6 +45,24 @@ fn external_open_allowed(url: &str) -> Result<(), String> {
     }
 }
 
+/// The co-resident control plane's workbench, once it is open. Held so the
+/// shell can hand the webview its Home session without that credential ever
+/// crossing loopback HTTP, where any local process could ask for it.
+static HOME: std::sync::OnceLock<gaugedesk_app::SharedWorkbench> = std::sync::OnceLock::new();
+
+/// The Home session for the signed-in owner, or `None` for the local posture:
+/// nobody signed in, the sign-in expired, or the account has no standing on
+/// this Home (DR-0188). The webview calls it after sign-in state changes and
+/// holds the answer in memory as its bearer.
+#[tauri::command]
+async fn home_session() -> Option<String> {
+    let wb = HOME.get()?.clone();
+    tauri::async_runtime::spawn_blocking(move || gaugedesk_app::desktop_session::home_session(&wb))
+        .await
+        .ok()
+        .flatten()
+}
+
 fn main() {
     // Must run before Tauri builds the webview: WebKitGTK reads the variable when
     // its web process starts, and nothing re-reads it afterwards.
@@ -57,7 +76,11 @@ fn main() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", value);
     }
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![restart_app, open_external])
+        .invoke_handler(tauri::generate_handler![
+            restart_app,
+            open_external,
+            home_session
+        ])
         // LOGIN-7: the system-browser opener behind `open_external`. Sign-in and
         // "manage in the Hub" leave through it; the webview itself cannot open
         // anything (its `window.open` is a silent no-op).
@@ -115,8 +138,15 @@ fn main() {
                             .build()
                             .expect("tokio runtime");
                         rt.block_on(async move {
-                            if let Err(e) = gaugedesk_app::open_api::open_serve(bind, &root).await
-                            {
+                            let served = match gaugedesk_app::open_api::open_prepare(&root) {
+                                Ok(wb) => {
+                                    let _ = HOME.set(wb.clone());
+                                    gaugedesk_app::open_api::open_serve_workbench(wb, bind, &root)
+                                        .await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            if let Err(e) = served {
                                 eprintln!("control plane exited: {e}");
                             }
                         });
@@ -149,6 +179,11 @@ fn main() {
             }
             // Browser-style zoom: Ctrl +/-/0 and Ctrl+wheel, remembered across restarts.
             window = window.initialization_script(ZOOM_HOTKEYS);
+            // The title bar is drawn over the page on macOS; tell the page so its task bar
+            // can make room for the traffic lights and carry the window drag.
+            if cfg!(target_os = "macos") {
+                window = window.initialization_script(OVERLAY_TITLE_BAR);
+            }
             window.build()?;
 
             // FED-7: an OS-delivered `gaugewright://` link arrives here — on cold start (the link
@@ -169,6 +204,25 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running gaugewright desktop");
 }
+
+/// Marks the document `data-titlebar="overlay"` for the page's stylesheet.
+///
+/// `tauri.conf.json` sets `titleBarStyle: Overlay` and `hiddenTitle`, so on macOS there
+/// is no title bar row: the traffic lights float over the top-left of the page and a
+/// title that only repeated the product name is gone. Every other platform ignores
+/// both settings and keeps its native frame, so the page has to be told which case it
+/// is in rather than guessing from a user agent. The shell's task bar is the row that
+/// replaces the title bar — it indents past the traffic lights (placed by
+/// `trafficLightPosition` to sit on its centre line) and is the window's drag handle.
+/// The lights are native and ignore the page zoom, so that indent and the bar's height
+/// are divided by the `--shell-zoom` that `ZOOM_HOTKEYS` publishes.
+///
+/// An initialization script runs before `<html>` exists, so the mark waits for it.
+const OVERLAY_TITLE_BAR: &str = r#"try {
+  var mark = function () { document.documentElement.dataset.titlebar = 'overlay'; };
+  if (document.documentElement) mark();
+  else document.addEventListener('readystatechange', mark, { once: true });
+} catch (e) {}"#;
 
 /// Browser-style zoom for the webview: Ctrl and `-`/`=`/`+`/`0`, Ctrl+wheel, and the
 /// chosen level remembered across restarts.
@@ -195,11 +249,21 @@ const ZOOM_HOTKEYS: &str = r#"try {
   var HUNDRED = 5;
   var index = HUNDRED;
 
+  // The level is also published as `--shell-zoom`, for chrome that must line up with
+  // something the zoom does not scale — the macOS traffic lights (`OVERLAY_TITLE_BAR`).
+  function publish() {
+    if (document.documentElement) {
+      document.documentElement.style.setProperty('--shell-zoom', String(LADDER[index]));
+    }
+  }
+  document.addEventListener('readystatechange', publish, { once: true });
+
   function apply(remember) {
     var value = LADDER[index];
     try {
       window.__TAURI_INTERNALS__.invoke('plugin:webview|set_webview_zoom', { value: value });
     } catch (e) {}
+    publish();
     if (remember) {
       try { window.localStorage.setItem(KEY, String(value)); } catch (e) {}
     }
@@ -362,7 +426,8 @@ fn deep_link_dispatch_script(url: &str) -> Option<String> {
 mod tests {
     use super::{
         cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv, external_open_allowed,
-        local_cp_bind, webkit_dmabuf_override, webview_org_cp_script, ZOOM_HOTKEYS,
+        local_cp_bind, webkit_dmabuf_override, webview_org_cp_script, OVERLAY_TITLE_BAR,
+        ZOOM_HOTKEYS,
     };
 
     #[test]
@@ -508,6 +573,17 @@ mod tests {
         // Storage can throw outright (WebKit refuses it in some contexts), and a
         // shell that fails to boot its window over a zoom preference is a bad trade.
         assert!(ZOOM_HOTKEYS.starts_with("try {") && ZOOM_HOTKEYS.ends_with("} catch (e) {}"));
+    }
+
+    #[test]
+    fn overlay_title_bar_names_what_the_stylesheet_reads() {
+        // workbench-ui's styles.css keys the task bar's traffic-light room on exactly
+        // these two names; renaming either here leaves the lights over the task bar.
+        assert!(OVERLAY_TITLE_BAR.contains("dataset.titlebar = 'overlay'"));
+        assert!(ZOOM_HOTKEYS.contains("setProperty('--shell-zoom'"));
+        // `<html>` does not exist yet when an initialization script runs.
+        assert!(OVERLAY_TITLE_BAR.contains("if (document.documentElement)"));
+        assert!(OVERLAY_TITLE_BAR.starts_with("try {") && OVERLAY_TITLE_BAR.ends_with("} catch (e) {}"));
     }
 
     #[test]

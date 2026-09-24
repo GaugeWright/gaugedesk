@@ -3013,12 +3013,6 @@ fn drive_persistent_turn(
             }
         }
     }
-    // Advance the onboarding checklist on a completed turn (ADR 0075 Phase 2).
-    // Idempotent: once the "first_turn" item is closed, later turns match nothing.
-    // Best-effort, under the lock we already hold; never affects the turn result.
-    if matches!(&result, Ok(r) if r.run_phase == RunPhase::Completed) {
-        g.advance_onboarding("first_turn", &serde_json::json!({ "chat": id }).to_string());
-    }
     result
 }
 

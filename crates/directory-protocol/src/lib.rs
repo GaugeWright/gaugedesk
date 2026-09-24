@@ -307,6 +307,32 @@ mod tests {
         assert!(decoded.entry.sealed_blob.is_empty());
     }
 
+    /// The retraction's bytes, pinned the way a publish's are — and for a
+    /// sharper reason. A publish's shape predates every deployed verifier; the
+    /// retraction's does not, so the hosted directory carries a *compiled* copy
+    /// of this contract that can be older than this crate. A verifier that does
+    /// not know a field does not reject the entry: serde drops it, re-serializes
+    /// without it, and reports a signature mismatch, which reaches a person as
+    /// `401 invalid root signature` — indistinguishable from a wrong key. That
+    /// is what production did to every retraction until it was redeployed on
+    /// 2026-09-23 (gaugewright-cloud#332).
+    ///
+    /// So these are not decorative bytes. They are the exact message a deployed
+    /// verifier must reproduce to admit a withdrawal, and changing them obliges
+    /// a redeploy before any client that signs the new shape can retract.
+    #[test]
+    fn a_retraction_has_canonical_bytes_too() {
+        let key = signer(7);
+        let root = key.public_key().as_str().to_string();
+        assert_eq!(
+            String::from_utf8(signing_bytes(&retraction_entry(root, 5)).unwrap()).unwrap(),
+            format!(
+                "{{\"generation\":5,\"directory\":{{\"root_pubkey\":\"{}\",\"device_pubkeys\":[],\"placement_pointers\":[],\"home_routes\":[]}},\"sealed_blob\":\"\",\"retracted\":true}}",
+                key.public_key()
+            ),
+        );
+    }
+
     #[test]
     fn flipping_the_retracted_flag_after_signing_fails_closed() {
         let key = signer(7);

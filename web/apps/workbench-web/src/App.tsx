@@ -17,6 +17,7 @@
 // build's wasm loaders for every host that renders `App`, not just the
 // standalone entry (see wasm-modules.ts).
 import "./wasm-modules";
+import { desktopHomeSession } from "./desktop-home-session";
 import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, onMount, Show, untrack, type Accessor, type JSX } from "solid-js";
 import {
     authority,
@@ -31,6 +32,7 @@ import {
     finishAccountRecovery,
     finishPasskeyAccountCreation,
     refreshHostedAccountSession,
+    setBearer,
     startSessionRefresh,
     reportedClientBuild,
     startAccountRecovery,
@@ -455,6 +457,24 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (linked === nativeAccountLinked) return;
         nativeAccountLinked = linked;
         void props.gaugeApps?.onNativeAccountSessionChanged?.(linked);
+    });
+    // Desktop: the shell hands this UI a Home session for its signed-in owner
+    // (DR-0188), asked again whenever the sign-in status is re-read so it
+    // follows sign-out, expiry and renewal. A browser build is never handed one.
+    let desktopSessionHeld = false;
+    createEffect(() => {
+        const status = hubSession();
+        if (status === undefined) return;
+        const linked = status?.linked === true && !status.expired;
+        void (linked ? desktopHomeSession() : Promise.resolve(null)).then((token) => {
+            if (token) {
+                desktopSessionHeld = true;
+                setBearer(token);
+            } else if (desktopSessionHeld) {
+                desktopSessionHeld = false;
+                setBearer(null);
+            }
+        });
     });
     const beginAccountAdmission = async (): Promise<void> => {
         if (oidcRedirectAvailable) {
@@ -2869,7 +2889,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             );
             return (
                 <Show when={noHomeState()}>
-                    <div class="homegate-scrim" data-home-setup>
+                    <div class="homegate-scrim" data-tauri-drag-region data-home-setup>
                         <Show
                             when={homes().length > 0}
                             fallback={
@@ -2986,7 +3006,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
         return (
             <Show when={noHomeState()}>
-                {(state) => <div class="homegate-scrim" data-home-setup>
+                {(state) => <div class="homegate-scrim" data-tauri-drag-region data-home-setup>
                     <section class="homegate-card" aria-labelledby="homegate-title">
                     <p class="homegate-kicker">Free account</p>
                     <h1 id="homegate-title">Choose where your projects run</h1>
@@ -3139,12 +3159,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     return (
         <>
             <Show when={homeState.loading}>
-                <div class="homegate-scrim" data-home-loading>
+                <div class="homegate-scrim" data-tauri-drag-region data-home-loading>
                     <section class="homegate-card"><p class="homegate-lede">Finding your Home…</p></section>
                 </div>
             </Show>
             <Show when={homeFailure()}>
-                <div class="homegate-scrim" data-home-error>
+                <div class="homegate-scrim" data-tauri-drag-region data-home-error>
                     <section class="homegate-card">
                         <Show
                             when={homeNeedsLogin()}
@@ -3192,7 +3212,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 <Show
                     when={modelSetupOpen()}
                     fallback={
-                        <div class="homegate-scrim" data-first-run-signin>
+                        <div class="homegate-scrim" data-tauri-drag-region data-first-run-signin>
                             <section class="homegate-card">
                                 {signInCard(
                                     <span class="signin__quiet">
@@ -3237,7 +3257,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     && !homeFailure()
                 }
             >
-                <div class="homegate-scrim" data-signin-overlay>
+                <div class="homegate-scrim" data-tauri-drag-region data-signin-overlay>
                     <section class="homegate-card">
                         {signInCard(
                             <span class="signin__quiet">

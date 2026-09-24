@@ -560,6 +560,27 @@ fn latest_session(wb: &SharedWorkbench) -> Option<SessionRecord> {
     Some(record)
 }
 
+/// Who is signed in on this computer, as far as its Home needs to know: the
+/// account, a digest identifying the Hub session that proves it (never the
+/// bearer), and when that session ends. For claiming this computer's Home
+/// (DR-0187) and for anything else bound to one sign-in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HubStanding {
+    pub person: String,
+    pub session: String,
+    pub expires_ms: i64,
+}
+
+pub(crate) fn hub_standing(wb: &SharedWorkbench) -> Option<HubStanding> {
+    let record = latest_session(wb)?;
+    let token = wb.lock_unpoisoned().unseal_account_secret(&record.sealed)?;
+    Some(HubStanding {
+        person: record.person,
+        session: crate::account_session::session_id(&token),
+        expires_ms: record.expires,
+    })
+}
+
 /// The current account bearer, unsealed — for core callers that present the
 /// person to the Hub (projections, opaque routes). Never crosses HTTP.
 pub fn hub_session_token(wb: &SharedWorkbench) -> Option<String> {
@@ -573,10 +594,17 @@ pub fn hub_session_token(wb: &SharedWorkbench) -> Option<String> {
 /// private; what a caller needs is the state, not the record.
 #[cfg(test)]
 pub(crate) fn store_session_for_test(wb: &SharedWorkbench) {
+    store_session_as_for_test(wb, "account-root");
+}
+
+/// [`store_session_for_test`] for a named account: a second person signing in
+/// on the same computer.
+#[cfg(test)]
+pub(crate) fn store_session_as_for_test(wb: &SharedWorkbench, person: &str) {
     store_session(
         wb,
         "opaque-account-session",
-        "account-root",
+        person,
         "alice@example.test",
         4_102_444_800_000,
         4_102_441_800_000,
@@ -897,6 +925,11 @@ pub async fn post_signin_callback(
                 Ok(false) => {}
                 Err(error) => tracing::warn!("first Home not attached: {error}"),
             }
+            // And the account that makes a computer its Home owns it
+            // (DR-0187). Reported, not propagated, for the same reason.
+            if let Err(error) = crate::home_owner::claim_if_never_claimed(&wb) {
+                tracing::warn!("Home owner not claimed: {error}");
+            }
             Json(status_json(Some(&record), true)).into_response()
         }
         Err(message) => {
@@ -989,6 +1022,8 @@ pub async fn get_signin_reach(State(wb): State<SharedWorkbench>) -> impl IntoRes
 /// `POST /account/hub-session/logout` — append the signed-out tombstone.
 /// Idempotent: signing out while signed out is already the desired state.
 pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    // The UI's Home session ends with the sign-in behind it (DR-0188).
+    crate::desktop_session::revoke(&wb);
     if latest_session(&wb).is_none() {
         return StatusCode::NO_CONTENT.into_response();
     }

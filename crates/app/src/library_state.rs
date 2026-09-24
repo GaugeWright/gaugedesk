@@ -7143,8 +7143,9 @@ impl Workbench {
         snippet.replace('\n', " ")
     }
 
-    /// The unified task-bar projection (ADR 0075 §3/§5): onboarding checklist
-    /// `issue` tasks from the account-global whip tracker, followed by the
+    /// The unified task-bar projection (ADR 0075 §3/§5): open `issue` tasks
+    /// from the account-global whip tracker, less the retired onboarding
+    /// checklist (DR-0185), followed by the
     /// existing clean-merge `review` tasks. It owns no truth — it joins the whip
     /// issue (content) with its admitted assignment. Every tracker task carries
     /// its boundary because an item id is only meaningful inside that tracker;
@@ -7165,8 +7166,8 @@ impl Workbench {
         // GaugeDesk record in the chat's own scope, so this is read per chat
         // below rather than from one tracker query.
 
-        // Onboarding issues first — the active first-run guidance. `list_items`
-        // returns them in filing order (WS-1, WS-2, …), which is checklist order.
+        // Account-global issues first. `list_items` returns them in filing
+        // order (WS-1, WS-2, …).
         let mut tasks: Vec<serde_json::Value> = Vec::new();
         if let Some(tracker) = self
             .tracker_runtimes
@@ -7175,6 +7176,10 @@ impl Workbench {
             match tracker.list_items(Some(crate::onboarding::ONBOARDING_QUEUE), Some("open")) {
                 Ok(items) => {
                     for item in items {
+                        // Legacy evidence of the retired checklist, not work.
+                        if crate::onboarding::is_retired_checklist_step(&item.metadata) {
+                            continue;
+                        }
                         tasks.push(serde_json::json!({
                             "id": item.id,
                             "title": item.title,

@@ -997,10 +997,6 @@ pub fn create_named_project(
             return Err(error);
         }
     };
-    if created {
-        // Advance the onboarding checklist once; an operation replay is inert.
-        wb.advance_onboarding("project", &json!({ "project": id }).to_string());
-    }
     Ok(json!({
         "id": id,
         "name": name,

@@ -1,5 +1,6 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import solid from "vite-plugin-solid";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const appRoot = fileURLToPath(new URL(".", import.meta.url));
@@ -56,12 +57,31 @@ const controlPlanePrefixes = [
 const proxy = Object.fromEntries(
     controlPlanePrefixes.map((prefix) => [prefix, controlPlane]),
 );
+// The browser tab shows the same icon as the desktop app. /favicon.ico is the
+// path clients ask for when they do not read the page's <link rel="icon">, and
+// without a file there the hosted origin answers it with the SPA fallback.
+const favicon = readFileSync(
+    fileURLToPath(new URL("../../../../src-tauri/icons/icon.ico", import.meta.url)),
+);
+const faviconPlugin: Plugin = {
+    name: "gaugedesk-favicon",
+    configureServer(server) {
+        server.middlewares.use("/favicon.ico", (_req, res) => {
+            res.setHeader("Content-Type", "image/x-icon");
+            res.end(favicon);
+        });
+    },
+    generateBundle() {
+        this.emitFile({ type: "asset", fileName: "favicon.ico", source: favicon });
+    },
+};
+
 const underFabric = process.env.GAUGEDESK_DEV_FABRIC === "1";
 const fabricPort = Number(process.env.GAUGEDESK_DEV_PORT ?? "7443");
 
 export default defineConfig({
     root: appRoot,
-    plugins: [solid()],
+    plugins: [solid(), faviconPlugin],
     // Shared workbench packages live outside this workspace. Force one Solid
     // runtime so a signal created by the enterprise host updates shared panels.
     resolve: { dedupe: ["solid-js"] },

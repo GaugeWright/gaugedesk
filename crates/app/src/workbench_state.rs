@@ -129,6 +129,9 @@ pub struct Workbench {
     pub(crate) home_admissions: crate::home_admission::HomeAdmissionStore,
     /// The identity adapter that authenticates bearer credentials.
     pub(crate) idp: Option<Arc<dyn identity::IdentityProvider + Send + Sync>>,
+    /// The Home session this process last handed its desktop UI (DR-0188).
+    /// Process memory only: a restart mints another.
+    pub(crate) desktop_ui_session: Option<crate::desktop_session::DesktopUiSession>,
     /// Opaque Hub sessions authenticate a durable GaugeDesk account before any
     /// organization-specific membership decision.
     pub(crate) account_sessions: Arc<crate::account_session::AccountSessionStore>,
@@ -220,34 +223,29 @@ pub(crate) struct StartupSeed {
     /// The builtin archetypes to seed. The Default archetype must be among
     /// them: the Personal project's default placement is an instance of it.
     archetypes: &'static [crate::app_support::BuiltinArchetype],
-    /// Whether to stand up and seed the account-global onboarding tracker.
-    onboarding: bool,
 }
 
 impl StartupSeed {
-    /// Every builtin archetype and the onboarding tracker: what a user's root
-    /// gets, and what every non-test opener above uses.
+    /// Every builtin archetype: what a user's root gets, and what every non-test opener above uses.
     pub(crate) fn production() -> Self {
         Self {
             archetypes: crate::app_support::builtin_archetypes(),
-            onboarding: true,
         }
     }
 
     /// Only what a test workbench needs to host a chat in the default
-    /// placement: the Default archetype, the Personal project and its target,
-    /// and no onboarding tracker. Each archetype is its own WhippleScript
-    /// workspace on disk — a SQLite branch store, a seeded mainline, a probe
-    /// engagement created and discarded for its basis — and the tracker is
-    /// another store, so a full seed is most of what a fresh open costs. The
-    /// file-action tests open a fresh root each, 172 of them, and none reads
-    /// an archetype or the tracker; this is the difference between a fixture
+    /// placement: the Default archetype, the Personal project and its target.
+    /// Each archetype is its own WhippleScript workspace on disk — a SQLite
+    /// branch store, a seeded mainline, a probe engagement created and
+    /// discarded for its basis — so a full seed is most of what a fresh open
+    /// costs. The file-action tests open a fresh root each, 172 of them, and
+    /// none reads an archetype; this is the difference between a fixture
     /// that builds what the test uses and one that builds the product.
     ///
     /// A root opened lean is a valid root: a later production open finds the
     /// other archetypes missing and seeds them, exactly as it does for a root
     /// from a release that predates them. A test that reads the archetype
-    /// library or the onboarding tracker opens the workbench the ordinary way.
+    /// library opens the workbench the ordinary way.
     #[cfg(test)]
     pub(crate) fn lean() -> Self {
         let builtins = crate::app_support::builtin_archetypes();
@@ -257,7 +255,6 @@ impl StartupSeed {
             .expect("the Default archetype is built in");
         Self {
             archetypes: &builtins[default..=default],
-            onboarding: false,
         }
     }
 }
@@ -368,12 +365,6 @@ fn build_workbench_with_content_keywrap_for_home(
     // device that joined another root) from its at-rest wrap, so restarts keep opening
     // the sealed account state. No-op on a holder / seed-recovered device (none stored).
     wb.restore_recovered_account_key();
-    // Stand up + seed the account-global onboarding tracker (ADR 0075). Runs
-    // after the root is applied so the tracker's store files resolve under it;
-    // best-effort, so a tracker failure never aborts workbench startup.
-    if seed.onboarding {
-        wb.ensure_onboarding_seeded();
-    }
     federation::activate_configured_federation(&mut wb)?;
     // Enterprise SSO activation (`ID-3`) moved with the ee band (`gaugedesk-ee`,
     // SPLIT-1): the ee/hosted compositions call `activate_configured_idp` right
@@ -413,6 +404,7 @@ impl Workbench {
             hosted_home_mode: false,
             home_admissions: crate::home_admission::HomeAdmissionStore::new(),
             idp: None,
+            desktop_ui_session: None,
             account_sessions: Arc::new(crate::account_session::AccountSessionStore::new()),
             audit_sink: None,
             audit_signer: None,

@@ -15,8 +15,23 @@ pub fn open_control_plane_root() -> std::path::PathBuf {
 
 /// Bootstrap and serve the open local control plane on `addr`.
 pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<()> {
+    open_serve_workbench(open_prepare(root)?, addr, root).await
+}
+
+/// Open the workbench [`open_serve`] would serve, so an in-process caller — the
+/// desktop shell — can hold it beside the server (DR-0188).
+pub fn open_prepare(root: &std::path::Path) -> std::io::Result<crate::SharedWorkbench> {
     let wb = open_workbench(root)?;
     federation::respawn_restored_receivers(&wb);
+    Ok(wb)
+}
+
+/// Serve a workbench from [`open_prepare`] on `addr`.
+pub async fn open_serve_workbench(
+    wb: crate::SharedWorkbench,
+    addr: &str,
+    root: &std::path::Path,
+) -> std::io::Result<()> {
     {
         let guard = wb.lock_unpoisoned();
         println!(
@@ -116,6 +131,15 @@ pub(crate) async fn supervise_home_reachability(
             ),
             Ok(false) => {}
             Err(error) => tracing::warn!("first Home not attached: {error}"),
+        }
+        // Claimed from state for the same reason (DR-0187 §4). Asked on every
+        // wake; after the first claim it is one read that changes nothing.
+        match crate::home_owner::claim_if_never_claimed(&wb) {
+            Ok(crate::home_owner::HomeClaim::Owner(account)) => {
+                eprintln!("[home-owner] {account} owns this Home")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!("Home owner not claimed: {error}"),
         }
         // Read and release: this is a std mutex, and holding it across the wait
         // below would stop every request this Home serves.

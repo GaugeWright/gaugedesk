@@ -11,6 +11,9 @@ theme:
   # The masthead is the GaugeWright signature, drawn as gaugewright.com draws it.
   # It replaces Material's default logo icon through overrides/partials/logo.html.
   custom_dir: overrides
+  # The tab icon is the ring mark tools/docs-theme.mjs already renders here for
+  # the masthead, rather than Material's default book.
+  favicon: assets/mark-clear-64.png
   # Brand fonts are self-hosted from docs/assets/brand.css. Disabling Material's
   # loader avoids requesting Commit Mono from Google Fonts, where it is absent.
   font: false

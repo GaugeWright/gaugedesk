@@ -39,6 +39,7 @@ pub mod console_routes;
 pub mod content_vault;
 pub mod crypto_erasure;
 pub mod deployment_pricing;
+pub mod desktop_session;
 pub mod device_enroll;
 pub mod device_enroll_drive;
 pub mod directory_sync;
@@ -65,6 +66,7 @@ pub mod home;
 pub mod home_admission;
 pub mod home_backup;
 pub mod home_invitation;
+pub mod home_owner;
 pub mod home_reachability;
 pub mod home_routes;
 pub mod identity;
@@ -144,7 +146,7 @@ pub use gaugedesk_whip_runtime::{
     PolicyAdmissionError, PolicyEpoch, WhipHarnessFactory,
 };
 pub use open_route_stack::{open_control_plane, open_control_plane_with_native_saves};
-pub use open_runtime::{open_control_plane_root, open_serve};
+pub use open_runtime::{open_control_plane_root, open_prepare, open_serve, open_serve_workbench};
 // The test-only reset route is this alias's only consumer (DR-0054 Phase A).
 #[cfg(debug_assertions)]
 pub(crate) use workbench_state::build_workbench;

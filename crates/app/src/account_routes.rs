@@ -1714,9 +1714,6 @@ pub async fn post_credential(
         Ok(reference) => reference,
         Err(e) => return err_response(e),
     };
-    // Advance the onboarding checklist (ADR 0075 Phase 2). Best-effort — the
-    // credential is already saved; the provider name is not a secret.
-    wb.advance_onboarding("credential", &json!({ "provider": provider }).to_string());
     (
         StatusCode::OK,
         Json(json!({

@@ -256,7 +256,9 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
             ref={props.state.observeShell}
             style={{ "grid-template-columns": props.state.columns() }}
         >
-            <Show when={props.taskBar}>{(taskBar) => <footer class="tasks">{taskBar()()}</footer>}</Show>
+            {/* The task bar stands in for the window's title bar where the desktop shell
+                overlays it (macOS), so it is the drag handle; its controls still click. */}
+            <Show when={props.taskBar}>{(taskBar) => <footer class="tasks" data-tauri-drag-region="deep">{taskBar()()}</footer>}</Show>
             <CollapsiblePanel
                 cls="nav"
                 fold="left"

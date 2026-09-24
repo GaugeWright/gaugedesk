@@ -80,7 +80,9 @@ export function Carousel(props: CarouselProps): JSX.Element {
 
     return (
         <div class="carousel" data-pane={props.state.current}>
-            <div class="carousel-toggle" role="tablist" aria-label="panes">
+            {/* A narrow desktop window has no task bar, so this row is the drag handle
+                beside the macOS traffic lights (see `.tasks` in styles.css). */}
+            <div class="carousel-toggle" role="tablist" aria-label="panes" data-tauri-drag-region="deep">
                 {segments().map((seg) => {
                     // The Chat tab is always actionable when the host supplies
                     // `onNewChat`: navigate to the open chat if there is one, else

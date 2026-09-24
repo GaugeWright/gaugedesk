@@ -110,7 +110,6 @@ fn store_credential_in(
             execution_classes,
         )
         .map_err(|error| format!("could not store Codex OAuth credential: {error:?}"))?;
-    workbench.advance_onboarding("credential", &json!({ "provider": PROVIDER }).to_string());
     Ok(())
 }
 
