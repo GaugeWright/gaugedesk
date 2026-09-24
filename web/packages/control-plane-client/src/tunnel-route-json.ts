@@ -90,7 +90,10 @@ class TunnelClosed extends Error {}
  * Dropping the reference is therefore not a way to close this.
  */
 export type TunnelRoute = RouteJson & {
-    /** Hang up: close the carrier and refuse further calls. Idempotent. */
+    /** Hang up: close the carrier and refuse further calls. Idempotent.
+     *
+     * The only thing that refuses further calls. A carrier that closes on its
+     * own is reopened by the next call. */
     close(): void;
 };
 
@@ -105,16 +108,28 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
     const now = options.now ?? Date.now;
     const tick = options.tick ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
     let live: { tunnel: TunnelFacade; socket: TunnelSocket } | null = null;
-    let closed = false;
+    // Only the caller hangs a route up for good. A carrier that closes under it
+    // — the Home ending an idle crossing, the relay closing a leg — takes the
+    // session with it, not the route: the next call opens a fresh one, exactly
+    // as the first call did. Refusing forever instead left a live pool entry
+    // answering "the Home tunnel closed" to every call until something else
+    // happened to evict it.
+    let hungUp = false;
     let queue: Promise<unknown> = Promise.resolve();
 
     async function ensure(): Promise<{ tunnel: TunnelFacade; socket: TunnelSocket }> {
         if (live) return live;
         const opened = await options.open();
+        if (hungUp) {
+            // Hung up while this was opening: nothing will ever close it.
+            opened.socket.close();
+            throw new TunnelClosed("the Home tunnel closed");
+        }
         opened.socket.onFrame((frame) => opened.tunnel.receiveFrame(frame));
         opened.socket.onClose(() => {
-            closed = true;
-            live = null;
+            // Only its own session. A late close from a carrier already
+            // replaced must not orphan the one that replaced it.
+            if (live === opened) live = null;
         });
         live = opened;
         return opened;
@@ -129,8 +144,9 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
         // One at a time: the tunnel carries a single stream, so interleaving two
         // requests would splice their frames together.
         const run = queue.then(async () => {
-            if (closed) throw new Error("the Home tunnel closed");
-            const { tunnel, socket } = await ensure();
+            if (hungUp) throw new TunnelClosed("the Home tunnel closed");
+            const session = await ensure();
+            const { tunnel, socket } = session;
             tunnel.sendRequest(
                 method, path,
                 body === undefined ? undefined : JSON.stringify(body),
@@ -161,7 +177,10 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
                     }
                     return text ? (JSON.parse(text) as unknown) : {};
                 }
-                if (closed) throw new TunnelClosed("the Home tunnel closed mid-request");
+                // Not retried on a fresh session: the request may already have
+                // reached the Home, and only the caller knows whether sending it
+                // twice is safe.
+                if (live !== session) throw new TunnelClosed("the Home tunnel closed mid-request");
                 if (now() > deadline) {
                     throw new Error(`${method} ${path}: the Home tunnel timed out`);
                 }
@@ -174,13 +193,50 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
         return run;
     }, {
         close() {
-            closed = true;
+            hungUp = true;
             const open = live;
             live = null;
             open?.socket.close();
         },
     });
     return route;
+}
+
+/** Copy a view into its own buffer: frames come out of wasm memory, and a
+ * `WebSocket` will not accept a view over it. */
+function copyOut(frame: Uint8Array): ArrayBuffer {
+    const copy = new Uint8Array(frame.length);
+    copy.set(frame);
+    return copy.buffer;
+}
+
+/** The liveness exchange, as `relay-transport`'s `WSS_KEEPALIVE_REQUEST` and
+ * `WSS_KEEPALIVE_RESPONSE` spell it. Text, because the relay answers it from
+ * its Durable Object auto-response: it never wakes the object and is never
+ * forwarded to the Home. */
+export const TUNNEL_KEEPALIVE_REQUEST = "GWRPING";
+export const TUNNEL_KEEPALIVE_RESPONSE = "GWRPONG";
+
+/**
+ * How often the browser's leg tells the relay it is alive — the native pump's
+ * `KEEPALIVE_INTERVAL`.
+ *
+ * The client handshake sets the keepalive flag, and a Home sets it too, so the
+ * relay judges the pair on its silence: it closes a leg whose last keepalive is
+ * older than its idle bound, 150s at the edge, with 1008 "relay keepalive
+ * missed". Carried data does not count. Until this was sent, every browser
+ * tunnel to a Home was closed 150s after pairing, in use or not.
+ *
+ * Five fit inside the bound. A hidden tab's timers may be held to one run a
+ * minute, which still lands two.
+ */
+export const TUNNEL_KEEPALIVE_INTERVAL_MS = 30_000;
+
+/** The pieces of the browser a [`browserTunnelSocket`] uses, so a test can
+ * drive one without a relay. */
+export interface BrowserTunnelSocketSeams {
+    readonly WebSocket?: new (url: string) => WebSocket;
+    readonly keepaliveMs?: number;
 }
 
 /**
@@ -193,45 +249,67 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
  *
  * Frames that arrive before the caller attaches a handler are buffered rather
  * than dropped: the relay's `READY` can land before the first `onFrame`, and
- * losing it would stall a handshake that had actually succeeded.
+ * losing it would stall a handshake that had actually succeeded. A close that
+ * lands before `onClose` is kept the same way, or the route would hold a dead
+ * carrier as live.
+ *
+ * It keeps the handshake's keepalive promise for as long as it is open,
+ * whether or not anything is being carried.
  */
-/** Copy a view into its own buffer: frames come out of wasm memory, and a
- * `WebSocket` will not accept a view over it. */
-function copyOut(frame: Uint8Array): ArrayBuffer {
-    const copy = new Uint8Array(frame.length);
-    copy.set(frame);
-    return copy.buffer;
-}
-
-export function browserTunnelSocket(url: string, handshake: Uint8Array): Promise<TunnelSocket> {
+export function browserTunnelSocket(
+    url: string,
+    handshake: Uint8Array,
+    seams: BrowserTunnelSocketSeams = {},
+): Promise<TunnelSocket> {
+    const Socket = seams.WebSocket ?? WebSocket;
+    const keepaliveMs = seams.keepaliveMs ?? TUNNEL_KEEPALIVE_INTERVAL_MS;
     return new Promise((resolve, reject) => {
-        const socket = new WebSocket(url);
+        const socket = new Socket(url);
         socket.binaryType = "arraybuffer";
         let onFrame: ((frame: Uint8Array) => void) | null = null;
         let onClose: (() => void) | null = null;
+        let isClosed = false;
+        let keepalive: ReturnType<typeof setInterval> | undefined;
         const pending: Uint8Array[] = [];
 
         socket.onmessage = (event: MessageEvent) => {
+            // Binary only. The relay's text `GWRPONG` answers our keepalive and
+            // carries nothing for the tunnel.
             if (!(event.data instanceof ArrayBuffer)) return;
             const frame = new Uint8Array(event.data);
             if (onFrame) onFrame(frame);
             else pending.push(frame);
         };
-        socket.onclose = () => onClose?.();
+        socket.onclose = () => {
+            isClosed = true;
+            clearInterval(keepalive);
+            keepalive = undefined;
+            onClose?.();
+        };
         socket.onerror = () => reject(new Error(`the Home tunnel could not open: ${url}`));
         socket.onopen = () => {
             // The fabric's frame first, before any tunnel bytes. Copied into a
             // plain ArrayBuffer because a wasm view is backed by shared memory,
             // which `send` will not take.
             socket.send(copyOut(handshake));
+            keepalive = setInterval(() => {
+                if (socket.readyState === socket.OPEN) socket.send(TUNNEL_KEEPALIVE_REQUEST);
+            }, keepaliveMs);
             resolve({
                 send: (frame) => socket.send(copyOut(frame)),
-                close: () => socket.close(),
+                close: () => {
+                    clearInterval(keepalive);
+                    keepalive = undefined;
+                    socket.close();
+                },
                 onFrame: (handler) => {
                     onFrame = handler;
                     while (pending.length > 0) handler(pending.shift()!);
                 },
-                onClose: (handler) => { onClose = handler; },
+                onClose: (handler) => {
+                    onClose = handler;
+                    if (isClosed) handler();
+                },
             });
         };
     });

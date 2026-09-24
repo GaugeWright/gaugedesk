@@ -26,9 +26,9 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::wire;
 use crate::wire::{
     invalid_data, one_shot_websocket_route, other, websocket_handshake, CertFingerprint,
-    OneShotLeg, RouteProof, WebSocketRelayRole, WebSocketRelayRoute, PIN_SNI, TOKEN_LEN, WSS_DATA,
-    WSS_FIN, WSS_FIN_ACK, WSS_HANDSHAKE_LEN, WSS_KEEPALIVE_REQUEST, WSS_KEEPALIVE_RESPONSE,
-    WSS_MAX_FRAME_BYTES, WSS_READY, WSS_STREAM_BUFFER_BYTES,
+    OneShotLeg, RouteProof, WebSocketRelayRole, WebSocketRelayRoute, PIN_SNI, RELAY_WAIT_EXPIRED,
+    TOKEN_LEN, WSS_DATA, WSS_FIN, WSS_FIN_ACK, WSS_HANDSHAKE_LEN, WSS_KEEPALIVE_REQUEST,
+    WSS_KEEPALIVE_RESPONSE, WSS_MAX_FRAME_BYTES, WSS_READY, WSS_STREAM_BUFFER_BYTES,
 };
 
 /// Type-erased ordered byte stream used by the enrollment/federation shells.
@@ -63,11 +63,13 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 ///
 /// Carried bytes are the one signal that crosses the relay, so silence in both
 /// directions is what ends a crossing. The edge's own idle bound, because that
-/// is already how long the relay lets a pair go quiet before it acts: it closes
-/// a client leg that has not pinged by then, and a browser leg pings never, so
-/// no crossing the relay would have kept is ended here first. A live crossing is
-/// never this quiet — an event stream sends a keep-alive every fifteen seconds,
-/// and an HTTP client drops a pooled idle connection at ninety.
+/// is already how long the relay lets a client go quiet before it acts: it
+/// closes a client leg that has not pinged by then, so a client that died is
+/// gone from the relay no later than it is gone from here. A browser client
+/// pings but, idle, carries nothing, so its crossing does end here — and its
+/// route opens a fresh one on the next call rather than refusing it. A live
+/// crossing is never this quiet — an event stream sends a keep-alive every
+/// fifteen seconds, and an HTTP client drops a pooled idle connection at ninety.
 const HOME_CROSSING_IDLE: Duration = Duration::from_secs(150);
 
 /// Ordered byte stream backed by bounded binary WebSocket frames. Closing or
@@ -154,6 +156,30 @@ impl AsyncWrite for WebSocketByteStream {
         this.pump = None;
         std::task::Poll::Ready(Ok(()))
     }
+}
+
+/// The relay admitted this leg, held it for its whole wait, and closed it
+/// because no partner came.
+///
+/// Carried inside the `io::Error` so the Home's loop can tell it from a failure
+/// without matching rendered text. A one-shot leg still sees it as an error —
+/// for a rendezvous, nobody joining *is* the failure — and reads the same words
+/// it always did.
+#[derive(Debug)]
+struct WaitExpired;
+
+impl std::fmt::Display for WaitExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "relay refused pairing: {RELAY_WAIT_EXPIRED}")
+    }
+}
+
+impl std::error::Error for WaitExpired {}
+
+fn is_wait_expired(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<WaitExpired>())
 }
 
 /// A dial that failed, and whether waiting could change the answer.
@@ -299,6 +325,14 @@ where
         .map_err(|error| other(format!("read relay pairing: {error}")))?;
     match ready {
         Message::Binary(bytes) if bytes.as_ref() == WSS_READY => {}
+        Message::Close(Some(frame))
+            if frame.code == CloseCode::Policy && frame.reason == RELAY_WAIT_EXPIRED =>
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                WaitExpired,
+            ));
+        }
         Message::Close(Some(frame)) => {
             return Err(other(format!("relay refused pairing: {}", frame.reason)));
         }
@@ -705,6 +739,10 @@ async fn connect_home_stream(route: &RelayRoute) -> std::io::Result<WebSocketByt
         connect_websocket_stream(&websocket_route(route, false), WebSocketRelayRole::Home).await;
     match (ordinary, route.previous_proof) {
         (Ok(stream), _) => Ok(stream),
+        // The relay took the ordinary proof and waited on it, so there is
+        // nothing for the previous one to fix — dialling it would only park a
+        // second leg for another whole wait before the caller heard anything.
+        (Err(error), _) if is_wait_expired(&error) => Err(error),
         (Err(_), Some(_)) => {
             connect_websocket_stream(&websocket_route(route, true), WebSocketRelayRole::Home).await
         }
@@ -714,6 +752,10 @@ async fn connect_home_stream(route: &RelayRoute) -> std::io::Result<WebSocketByt
 
 /// Park one Home availability leg, accept one pinned TLS client through the
 /// blind broker, and proxy it to the co-resident control plane.
+///
+/// Also `Ok` when no client came: the relay closes a leg that has waited its
+/// whole wait unpaired, and that is the ordinary life of a Home nobody is
+/// opening, so the caller parks again rather than backing off.
 pub async fn serve_home_once(
     route: &RelayRoute,
     local_control_plane: SocketAddr,
@@ -722,13 +764,24 @@ pub async fn serve_home_once(
     park_home_leg(route, local_control_plane, identity, || {}).await
 }
 
-/// [`serve_home_once`], telling the caller the moment the leg is *parked*
-/// rather than only when the crossing it went on to accept has finished.
+/// [`serve_home_once`], telling the caller once the leg is known to have been
+/// *parked* rather than only when the crossing it went on to accept has
+/// finished.
 ///
-/// The supervisor needs that distinction to say a Home has come back. A parked
-/// leg then waits for as long as nobody opens this computer, so a recovery
-/// read off the return value would arrive hours late or never — which is the
-/// silence this reporting exists to end.
+/// The supervisor needs that distinction to say a Home has come back. A
+/// crossing can last as long as its client stays, so a recovery read off the
+/// return value would arrive hours late — which is the silence this reporting
+/// exists to end.
+///
+/// The relay says nothing when it admits a leg; it answers only when a partner
+/// arrives (`READY`) or when its wait runs out with none (a policy close,
+/// `relay wait expired`, after thirty seconds). Both prove the leg was admitted
+/// and waiting, so `parked` fires on whichever comes first, and an idle Home
+/// that recovered from an outage says so within one wait. The second is not a
+/// failure: an idle Home meets it every thirty seconds, and it returns `Ok` so
+/// the caller parks the next leg at once. Reading it as an outage left the
+/// route empty for up to ten seconds of backoff in every forty and printed an
+/// unreachable Home that was not (2026-09-24).
 ///
 /// The acceptor is built before the leg parks, so an identity that cannot
 /// serve fails without first announcing the Home as reachable.
@@ -739,7 +792,14 @@ async fn park_home_leg(
     parked: impl FnOnce(),
 ) -> std::io::Result<()> {
     let acceptor = TlsAcceptor::from(Arc::new(identity.server_config()?));
-    let broker = connect_home_stream(route).await?;
+    let broker = match connect_home_stream(route).await {
+        Ok(broker) => broker,
+        Err(error) if is_wait_expired(&error) => {
+            parked();
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let went_idle = broker.went_idle();
     parked();
     let crossing = async {
@@ -794,7 +854,9 @@ pub async fn serve_home_forever(
 /// scroll past it. The reporter is therefore called on *transitions* only — the
 /// first failure after the leg was parked, again whenever the reason text
 /// changes under an outage that is still running, and once when a leg parks
-/// again — so one outage costs one line in and one line out (DR-0184).
+/// again — so one outage costs one line in and one line out (DR-0184). A wait
+/// the relay ended because nobody came is none of these: it is how an idle Home
+/// spends its time, and the next leg parks at once with nothing reported.
 ///
 /// It is a callback rather than a log line because this crate also builds for
 /// `wasm32` and carries no logging facade; the caller owns the words.
@@ -1736,6 +1798,153 @@ mod tests {
         relay.abort();
     }
 
+    /// Admit a leg, read its handshake, and close it the way the edge's alarm
+    /// closes a leg nobody joined. Returns the handshake's flags byte.
+    async fn expire_one_wait(listener: &TcpListener) -> u8 {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(tcp).await.unwrap();
+        let handshake = socket.next().await.unwrap().unwrap().into_data();
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: RELAY_WAIT_EXPIRED.into(),
+            })))
+            .await
+            .unwrap();
+        // Let the Home's close reply arrive, as a real socket would.
+        while let Some(Ok(_)) = socket.next().await {}
+        handshake[11]
+    }
+
+    /// A wait the relay ended because nobody came is not an outage.
+    ///
+    /// The edge closes an unpaired leg after thirty seconds with the policy
+    /// code every refusal uses. The supervisor read that as a failure: it
+    /// printed "cannot park a leg … desk cannot open this computer" about an
+    /// idle Home that was perfectly reachable, and backed off up to ten seconds
+    /// before parking again, so the route sat empty for a quarter of every
+    /// minute (2026-09-24). The earlier test never saw it because its relay
+    /// sends `READY` at once.
+    ///
+    /// What is asserted is no report at all, and that the next leg arrives
+    /// without backoff: eight expiries under the old doubling cost 12.7s of
+    /// sleep before the ninth dial, so a five-second bound cannot be met by a
+    /// loop that is still backing off. The route carries a previous proof, so
+    /// the test also pins that an expiry is not answered by re-dialling under
+    /// it — that proof was never the problem.
+    #[tokio::test]
+    async fn an_expired_wait_is_not_an_outage_and_the_next_leg_parks_at_once() {
+        const EXPIRIES: usize = 8;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (dialled_tx, mut dialled_rx) = tokio::sync::mpsc::unbounded_channel();
+        let relay = tokio::spawn(async move {
+            for _ in 0..EXPIRIES {
+                dialled_tx.send(expire_one_wait(&listener).await).unwrap();
+            }
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(tcp).await.unwrap();
+            let handshake = socket.next().await.unwrap().unwrap().into_data();
+            dialled_tx.send(handshake[11]).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let identity = TlsIdentity::generate().unwrap();
+        let mut route = durable_test_route(format!("ws://{address}"), identity.fingerprint());
+        route.previous_proof = Some(RouteProof::new([6; 32]));
+        let (_routes, route_reader) = tokio::sync::watch::channel(route);
+        let control_plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_plane_address = control_plane.local_addr().unwrap();
+        let (reports, mut report_reader) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = tokio::spawn(async move {
+            serve_home_supervised(route_reader, control_plane_address, identity, move |leg| {
+                let _ = reports.send(leg.map_err(|(epoch, error)| (epoch, error.to_string())));
+            })
+            .await
+        });
+
+        let redialled = timeout(Duration::from_secs(5), async {
+            let mut flags = Vec::new();
+            for _ in 0..=EXPIRIES {
+                flags.push(dialled_rx.recv().await.unwrap());
+            }
+            flags
+        })
+        .await
+        .expect("the supervisor backed off after an expired wait instead of parking again");
+        assert!(
+            redialled.iter().all(|flags| flags & 1 == 0),
+            "an expired wait was answered by re-dialling under the previous proof",
+        );
+        assert!(
+            report_reader.try_recv().is_err(),
+            "an idle Home's expired wait was reported",
+        );
+
+        supervised.abort();
+        relay.abort();
+    }
+
+    /// An expired wait after an outage is the recovery.
+    ///
+    /// The relay only closes a leg for waiting if it admitted the leg, so the
+    /// expiry is proof the Home was parked. Waiting for `READY` instead meant an
+    /// idle Home that recovered never said so: every later attempt ended in an
+    /// expiry, which was reported as a *new* outage because its words differed.
+    #[tokio::test]
+    async fn an_expired_wait_after_an_outage_reports_the_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = tcp.read(&mut request).await;
+            tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            tcp.shutdown().await.unwrap();
+            expire_one_wait(&listener).await;
+            expire_one_wait(&listener).await;
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(tcp).await.unwrap();
+            let _ = socket.next().await;
+            std::future::pending::<()>().await;
+        });
+
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(format!("ws://{address}"), identity.fingerprint());
+        let (_routes, route_reader) = tokio::sync::watch::channel(route);
+        let control_plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_plane_address = control_plane.local_addr().unwrap();
+        let (reports, mut report_reader) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = tokio::spawn(async move {
+            serve_home_supervised(route_reader, control_plane_address, identity, move |leg| {
+                let _ = reports.send(leg.map_err(|(epoch, error)| (epoch, error.to_string())));
+            })
+            .await
+        });
+
+        let first = timeout(Duration::from_secs(10), report_reader.recv())
+            .await
+            .expect("the outage was not reported")
+            .unwrap();
+        first.expect_err("the first report is the outage");
+        let second = timeout(Duration::from_secs(10), report_reader.recv())
+            .await
+            .expect("an idle Home that recovered never said so")
+            .unwrap();
+        assert_eq!(second.expect("the second report is the recovery"), 1);
+        // The second expiry, and the leg after it, say nothing more.
+        sleep(Duration::from_millis(500)).await;
+        assert!(
+            report_reader.try_recv().is_err(),
+            "one outage is one report in and one report out",
+        );
+
+        supervised.abort();
+        relay.abort();
+    }
+
     /// A Home whose client has gone parks again, even when the relay never says
     /// the client went.
     ///
@@ -1866,10 +2075,11 @@ mod tests {
         relay.abort();
     }
 
-    /// Ending a Home's quiet crossing must never beat the relay to it. The edge
-    /// closes a client leg that has not pinged for `IDLE_MILLIS` (150s), and a
-    /// browser leg never pings, so any shorter bound here would end browser
-    /// crossings the relay would have kept.
+    /// Ending a Home's quiet crossing must never beat the relay to a client
+    /// that has died. The edge closes a client leg that has not pinged for
+    /// `IDLE_MILLIS` (150s); a shorter bound here would end crossings whose
+    /// client is merely quiet sooner than the edge ends one whose client is
+    /// gone.
     #[test]
     fn a_home_does_not_end_a_crossing_before_the_edge_would() {
         const EDGE_IDLE_MILLIS: u128 = 150_000;

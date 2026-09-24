@@ -223,7 +223,8 @@ async fn accept_leg(stream: TcpStream, state: Arc<Mutex<RelayState>>) -> std::io
                             })
                         };
                         if let Some(mut pending) = stale {
-                            let _ = refuse(&mut pending.socket, "relay wait expired").await;
+                            let _ =
+                                refuse(&mut pending.socket, crate::wire::RELAY_WAIT_EXPIRED).await;
                         }
                     });
                     None

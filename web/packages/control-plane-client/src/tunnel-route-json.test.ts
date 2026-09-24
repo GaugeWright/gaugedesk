@@ -1,6 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
-import { tunnelRouteJson, type TunnelFacade, type TunnelSocket } from "./tunnel-route-json";
+import {
+    browserTunnelSocket,
+    TUNNEL_KEEPALIVE_INTERVAL_MS,
+    TUNNEL_KEEPALIVE_REQUEST,
+    TUNNEL_KEEPALIVE_RESPONSE,
+    tunnelRouteJson,
+    type TunnelFacade,
+    type TunnelSocket,
+} from "./tunnel-route-json";
 
 /** A tunnel that answers after `afterPumps` pumps, so the loop's polling is
  * exercised rather than short-circuited. */
@@ -229,5 +237,227 @@ describe("routeJson over the tunnel (DESK-7)", () => {
         const json = build(tunnel, socket);
         await expect(json("GET", "/a")).rejects.toThrow(/500/);
         await expect(json("GET", "/b")).resolves.toEqual({ ok: true });
+    });
+});
+
+describe("a carrier that closes under the route (DESK-7)", () => {
+    /** Opens a fresh fake carrier per call and remembers each, so a test can
+     * close one the way the relay or the Home would. */
+    function reopening(replies: Array<{ status: number; body: string }>, afterPumps = 2) {
+        const tunnel = fakeTunnel(replies, afterPumps);
+        const carriers: Array<ReturnType<typeof fakeSocket>> = [];
+        const json = tunnelRouteJson({
+            open: async () => {
+                const carrier = fakeSocket();
+                carriers.push(carrier);
+                return { tunnel, socket: carrier.socket };
+            },
+            tick: async () => undefined,
+        });
+        return { json, tunnel, carriers };
+    }
+
+    it("reopens on the next call after the carrier closed while idle", async () => {
+        // The relay closes a leg that broke its keepalive promise, and a Home
+        // ends a crossing that has carried nothing for its idle bound. Either
+        // way the route used to set a permanent flag, and every later call on
+        // it answered "the Home tunnel closed" until the pool happened to
+        // rebuild it.
+        const { json, carriers } = reopening([
+            { status: 200, body: '{"n":1}' },
+            { status: 200, body: '{"n":2}' },
+        ]);
+        await expect(json("GET", "/a")).resolves.toEqual({ n: 1 });
+        carriers[0]!.drop();
+        await expect(json("GET", "/b")).resolves.toEqual({ n: 2 });
+        expect(carriers).toHaveLength(2);
+        expect(carriers[1]!.frames.length).toBeGreaterThan(0);
+    });
+
+    it("keeps using a carrier that has not closed", async () => {
+        const { json, carriers } = reopening([
+            { status: 200, body: "{}" }, { status: 200, body: "{}" },
+        ]);
+        await json("GET", "/a");
+        await json("GET", "/b");
+        expect(carriers).toHaveLength(1);
+    });
+
+    it("fails a request whose carrier closes under it, and does not resend it", async () => {
+        // The request may already have reached the Home; only the caller knows
+        // whether it is safe to send twice. The next call still reopens.
+        const { json, tunnel, carriers } = reopening([
+            { status: 200, body: '{"ok":true}' },
+        ], 1_000);
+        let pumps = 0;
+        const original = tunnel.pollStatus;
+        tunnel.pollStatus = () => {
+            pumps += 1;
+            if (pumps === 3) carriers[0]!.drop();
+            return original();
+        };
+        await expect(json("POST", "/commands", { a: 1 })).rejects.toThrow(/closed mid-request/);
+        expect(tunnel.sent).toEqual(['POST /commands {"a":1}']);
+        tunnel.pollStatus = () => 200;
+        await expect(json("GET", "/workspace")).resolves.toEqual({ ok: true });
+        expect(carriers).toHaveLength(2);
+    });
+
+    it("ignores a late close from a carrier it has already replaced", async () => {
+        const replies = [
+            { status: 200, body: "{}" }, { status: 200, body: "{}" }, { status: 200, body: "{}" },
+        ];
+        const { json, carriers } = reopening(replies);
+        await json("GET", "/a");
+        const first = carriers[0]!;
+        first.drop();
+        await json("GET", "/b");
+        // The first carrier's close arrives again, late. It must not orphan the
+        // second, which would open a third and leave the second spliced to a
+        // Home that never re-parks.
+        first.drop();
+        await json("GET", "/c");
+        expect(carriers).toHaveLength(2);
+    });
+
+    it("still refuses for good once the caller hangs up", async () => {
+        const { json, carriers } = reopening([{ status: 200, body: "{}" }]);
+        await json("GET", "/a");
+        json.close();
+        await expect(json("GET", "/b")).rejects.toThrow(/closed/);
+        expect(carriers).toHaveLength(1);
+    });
+
+    it("closes a carrier that finished opening after the caller hung up", async () => {
+        const tunnel = fakeTunnel([{ status: 200, body: "{}" }]);
+        let closes = 0;
+        let release: () => void = () => {};
+        const opened = new Promise<void>((resolve) => { release = resolve; });
+        const json = tunnelRouteJson({
+            open: async () => {
+                await opened;
+                return { tunnel, socket: { ...fakeSocket().socket, close: () => { closes += 1; } } };
+            },
+            tick: async () => undefined,
+        });
+        const call = json("GET", "/a");
+        await Promise.resolve();
+        json.close();
+        release();
+        await expect(call).rejects.toThrow(/closed/);
+        expect(closes).toBe(1);
+    });
+});
+
+/** A `WebSocket` with nothing behind it: it records what is sent, and a test
+ * plays the relay by calling its handlers. */
+class StubWebSocket {
+    static last: StubWebSocket | null = null;
+    readonly OPEN = 1;
+    readyState = 0;
+    binaryType = "blob";
+    readonly sent: Array<string | ArrayBuffer> = [];
+    onopen: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    onmessage: ((event: { data: unknown }) => void) | null = null;
+
+    constructor(readonly url: string) {
+        StubWebSocket.last = this;
+    }
+    send(data: string | ArrayBuffer) { this.sent.push(data); }
+    close() { this.drop(); }
+
+    open() {
+        this.readyState = 1;
+        this.onopen?.();
+    }
+    drop() {
+        if (this.readyState === 3) return;
+        this.readyState = 3;
+        this.onclose?.();
+    }
+    pings() { return this.sent.filter((data) => data === TUNNEL_KEEPALIVE_REQUEST).length; }
+}
+
+async function openStub(keepaliveMs?: number) {
+    const opening = browserTunnelSocket("wss://relay.test/v1/relay/h", new Uint8Array([9]), {
+        WebSocket: StubWebSocket as unknown as new (url: string) => WebSocket,
+        ...(keepaliveMs === undefined ? {} : { keepaliveMs }),
+    });
+    const stub = StubWebSocket.last!;
+    stub.open();
+    return { socket: await opening, stub };
+}
+
+describe("the browser carrier's keepalive (DESK-7)", () => {
+    afterEach(() => { vi.useRealTimers(); });
+
+    it("keeps the handshake's promise: a GWRPING every interval while open", async () => {
+        // The client handshake sets the keepalive flag, so the relay judges this
+        // leg on its silence and closes it 150s after the last ping — carried
+        // data does not count. Nothing in the browser sent one, so every
+        // browser tunnel to a Home was closed 150s after pairing, in use or not.
+        vi.useFakeTimers();
+        const { stub } = await openStub();
+        expect(stub.sent).toHaveLength(1); // the handshake, and nothing else yet
+        vi.advanceTimersByTime(TUNNEL_KEEPALIVE_INTERVAL_MS - 1);
+        expect(stub.pings()).toBe(0);
+        vi.advanceTimersByTime(1);
+        expect(stub.pings()).toBe(1);
+        vi.advanceTimersByTime(4 * TUNNEL_KEEPALIVE_INTERVAL_MS);
+        expect(stub.pings()).toBe(5);
+    });
+
+    it("pings whether or not anything is being carried", async () => {
+        vi.useFakeTimers();
+        const { socket, stub } = await openStub(1_000);
+        socket.send(new Uint8Array([1, 2, 3]));
+        vi.advanceTimersByTime(3_000);
+        expect(stub.pings()).toBe(3);
+    });
+
+    it("stops pinging once the socket closes, from either end", async () => {
+        vi.useFakeTimers();
+        const ours = await openStub(1_000);
+        ours.socket.close();
+        vi.advanceTimersByTime(5_000);
+        expect(ours.stub.pings()).toBe(0);
+
+        const theirs = await openStub(1_000);
+        vi.advanceTimersByTime(1_000);
+        theirs.stub.drop();
+        vi.advanceTimersByTime(5_000);
+        expect(theirs.stub.pings()).toBe(1);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("ignores the relay's GWRPONG and delivers only binary frames", async () => {
+        const { socket, stub } = await openStub();
+        const frames: number[][] = [];
+        socket.onFrame((frame) => frames.push([...frame]));
+        stub.onmessage?.({ data: TUNNEL_KEEPALIVE_RESPONSE });
+        stub.onmessage?.({ data: new Uint8Array([7, 8]).buffer });
+        expect(frames).toEqual([[7, 8]]);
+    });
+
+    it("reports a close that landed before anyone was listening", async () => {
+        // Otherwise the route would hold a dead carrier as live and wait out
+        // every call's deadline on it.
+        const { socket, stub } = await openStub();
+        stub.drop();
+        let closed = 0;
+        socket.onClose(() => { closed += 1; });
+        expect(closed).toBe(1);
+    });
+
+    it("leaves room inside the edge's idle bound for missed pings", () => {
+        // gaugewright-cloud's relay closes a keepalive-judged leg whose last
+        // ping is older than IDLE_MILLIS. The native pump holds itself to the
+        // same bound in `the_keepalive_interval_leaves_room_for_missed_pings`.
+        const EDGE_IDLE_MILLIS = 150_000;
+        expect(TUNNEL_KEEPALIVE_INTERVAL_MS * 5).toBeLessThanOrEqual(EDGE_IDLE_MILLIS);
+        // A hidden tab's timers may run once a minute; two must still land.
+        expect(Math.max(TUNNEL_KEEPALIVE_INTERVAL_MS, 60_000) * 2).toBeLessThan(EDGE_IDLE_MILLIS);
     });
 });

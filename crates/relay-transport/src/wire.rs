@@ -45,6 +45,11 @@ pub const WSS_KEEPALIVE_REQUEST: &str = "GWRPING";
 pub const WSS_KEEPALIVE_RESPONSE: &str = "GWRPONG";
 pub(crate) const WSS_HANDSHAKE_MAGIC: [u8; 8] = *b"GWRWSS1\n";
 pub(crate) const WSS_READY: [u8; 8] = *b"GWRREADY";
+/// The close reason the relay gives a leg it admitted and then held for its
+/// whole wait (`WAIT_MILLIS`, 30s at the edge) without a partner arriving. It
+/// comes with the same policy code as a refusal, so the reason is the only thing
+/// that tells "nobody came" from "you may not park here".
+pub const RELAY_WAIT_EXPIRED: &str = "relay wait expired";
 pub(crate) const WSS_DATA: u8 = 0;
 pub(crate) const WSS_FIN: u8 = 1;
 pub(crate) const WSS_FIN_ACK: u8 = 2;
