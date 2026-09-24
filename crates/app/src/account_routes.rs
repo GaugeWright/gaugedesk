@@ -813,56 +813,20 @@ pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> imp
     if !active {
         return (StatusCode::CONFLICT, "library sync is not active").into_response();
     }
-    let head_base = base.clone();
-    let head = tokio::task::spawn_blocking(move || {
-        crate::directory_sync::fetch(&crate::net_http::HttpClient::new(), &head_base, &root)
-    })
-    .await;
-    let (generation, head) = match head {
-        Ok(Ok(Some(record))) => match record.entry.generation.checked_add(1) {
-            Some(generation) => (generation, Some(record)),
-            None => {
-                return (StatusCode::CONFLICT, "directory generation is exhausted").into_response()
-            }
-        },
-        Ok(Ok(None)) => (1, None),
-        Ok(Err(error)) => return (StatusCode::BAD_GATEWAY, error).into_response(),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "directory head task panicked",
-            )
-                .into_response()
-        }
+    let published = {
+        let wb = wb.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::directory_sync::publish_current(&wb, &base, &root)
+        })
+        .await
     };
-    // Read the head before overwriting it (ADR 0154 §6). The record is a
-    // snapshot of the routes it owns, so a publish written blind lets the
-    // least-informed device erase what a better-informed one published — and the
-    // generation fence makes that durable rather than transient. A retracted head
-    // states nothing about routing, so there is nothing there to reconcile against.
-    let reconciled = match head {
-        Some(record) if !record.entry.retracted => {
-            wb.lock_unpoisoned().library_sync_reconcile_routes(&record)
-        }
-        _ => crate::directory_sync::RouteReconcile::default(),
-    };
-    if let Some(reason) = reconciled.declined {
-        eprintln!("[library-sync] published without reconciling against the head: {reason}");
-    }
-    let put = wb.lock_unpoisoned().library_sync_signed_put(generation);
-    let Some(put) = put else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "directory publish could not be signed",
-        )
-            .into_response();
-    };
-    let published = tokio::task::spawn_blocking(move || {
-        crate::directory_sync::publish(&crate::net_http::HttpClient::new(), &base, &put)
-    })
-    .await;
     match published {
-        Ok(Ok(())) => {
+        Ok(Ok(published)) => {
+            if let Some(reason) = published.declined {
+                eprintln!(
+                    "[library-sync] published without reconciling against the head: {reason}"
+                );
+            }
             // Only now, and in this order (DESK-5f, ADR 0133 §2). The projection
             // tells a browser where to look; announcing it before the record
             // exists would point every reader at a 404 and make a working
@@ -876,7 +840,7 @@ pub async fn post_library_sync_publish(State(wb): State<SharedWorkbench>) -> imp
                 Json(json!({
                     "published": true,
                     "announced": announced,
-                    "retracted_routes": reconciled.retracted,
+                    "retracted_routes": published.retracted_routes,
                 })),
             )
                 .into_response()

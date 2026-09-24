@@ -148,6 +148,14 @@ run_contracts() {
     gate_section carries-agent-guide
     gate_section carries-agent-guide-checker
 
+    # The same edge for the brand tokens and the checker that verifies them.
+    # The checker seals its own body (GaugeWright#282), so an EDIT to it
+    # already fails the brand-tokens section; only this says whether it is the
+    # CURRENT one, which a correctly sealed older copy is not.
+    echo "== brand tokens, as an edge =="
+    gate_section carries-brand-tokens
+    gate_section carries-brand-tokens-checker
+
     # This script's own composition. `all` running every section and reporting
     # the failures together is a property with no line number — it shows only in
     # what a failing run still manages to say — and reverting it leaves every

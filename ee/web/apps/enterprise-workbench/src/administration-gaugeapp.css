@@ -745,15 +745,18 @@
 .organization-popover button { width: 100%; background: transparent; border: 1px solid transparent; border-radius: 2px; text-align: left; }
 .organization-popover button:hover,
 .organization-popover button.active { background: color-mix(in srgb, var(--edge) 58%, transparent); border-color: var(--edge); }
-.organization-create-trigger { margin-top: 4px; border-top-color: var(--edge) !important; color: var(--accent) !important; }
+.organization-create-trigger { margin-top: 5px; border-top-color: var(--edge) !important; color: var(--accent) !important; }
 .organization-create { display: grid; gap: 6px; margin-top: 5px; padding: 9px; border: 1px solid var(--edge); background: color-mix(in srgb, var(--panel) 72%, var(--bg)); }
 .organization-create label { color: var(--muted); font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
 .organization-create input { box-sizing: border-box; width: 100%; min-width: 0; }
 .organization-create p { margin: 0; color: var(--danger, #e88); font-size: var(--fs-small); }
 .organization-create > div { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .organization-create > div button { text-align: center; border-color: var(--edge); }
-.organization-work { padding: 6px 8px; }
-.organization-menu-choices { display: grid; gap: 2px; padding: 5px 0; border-top: 1px solid var(--edge); border-bottom: 1px solid var(--edge); }
+/* A separator belongs to the row above it, so a section that is not rendered
+   takes its rule with it instead of leaving a stray line, and the rule between
+   the memberships and creation is drawn once rather than by both. */
+.organization-work { margin-bottom: 5px; padding: 6px 8px; border-bottom-color: var(--edge) !important; }
+.organization-menu-choices { display: grid; gap: 2px; }
 .organization-menu-choices button { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 8px; align-items: center; padding: 5px 7px; }
 .organization-menu-choices button > span:last-child { display: grid; }
 .organization-menu-branch { display: grid; gap: 1px; padding-top: 6px; }

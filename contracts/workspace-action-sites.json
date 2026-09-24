@@ -814,11 +814,11 @@
     },
     {
       "site": {
-        "callable": "post_library_sync_publish",
+        "callable": "publish_current",
         "capability": "publish",
         "count": 1,
-        "expression": "crate :: directory_sync :: publish (& crate :: net_http :: HttpClient :: new () , & base , & put)",
-        "file": "crates/app/src/account_routes.rs"
+        "expression": "publish (& http , base , & put)",
+        "file": "crates/app/src/directory_sync.rs"
       },
       "profile": "publication-review"
     },

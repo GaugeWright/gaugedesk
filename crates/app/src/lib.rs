@@ -55,6 +55,7 @@ pub mod file_action_factory;
 pub mod file_action_policy;
 pub mod file_action_routes;
 pub mod file_action_submission_routes;
+pub mod first_home;
 pub mod gate;
 pub mod gate_service;
 pub mod gaugeapp_agent;

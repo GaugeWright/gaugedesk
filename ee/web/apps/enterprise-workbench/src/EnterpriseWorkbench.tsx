@@ -137,6 +137,8 @@ function OrganizationSelector(props: {
     onSelect: (id: string) => void;
     onCreate: (displayName: string) => Promise<void>;
     onOpen: (app: GaugeAppKind, page: string) => void;
+    /** True while a GaugeApp or proposal surface is covering ordinary work. */
+    surfaceOpen: boolean;
     onWork: () => void;
 }): JSX.Element {
     const [open, setOpen] = createSignal(false);
@@ -205,7 +207,7 @@ function OrganizationSelector(props: {
     return <div class="organization-anchor" ref={anchor}>
         <button type="button" class="organization-trigger" aria-haspopup="menu" aria-expanded={open()} onClick={() => setOpen((value) => !value)}>
             <span class="organization-mark" aria-hidden="true">{selected() ? icon(selected()!) : "◇"}</span>
-            <span><small>Organization</small><strong>{selected()?.display_name ?? "Choose organization"}</strong></span>
+            <span><small>{selected()?.personal ? "Account" : "Organization"}</small><strong>{selected()?.display_name ?? "Choose organization"}</strong></span>
             <span aria-hidden="true">⌃</span>
         </button>
         <Show when={open()}>
@@ -214,7 +216,9 @@ function OrganizationSelector(props: {
             <div class="organization-popover" role="menu" style={{
                 "max-height": `${menuHeight()}px`, left: `${menuPosition().left}px`, bottom: `${menuPosition().bottom}px`,
             }}>
-                <button type="button" class="organization-work" onClick={() => { setOpen(false); props.onWork(); }}>Work</button>
+                <Show when={props.surfaceOpen}>
+                    <button type="button" class="organization-work" onClick={() => { setOpen(false); props.onWork(); }}>Back to work</button>
+                </Show>
                 <div class="organization-menu-choices">
                     <For each={props.memberships}>{(membership) => <button
                         type="button"
@@ -222,7 +226,11 @@ function OrganizationSelector(props: {
                         onClick={() => props.onSelect(membership.id)}
                     >
                         <span class="organization-mark" aria-hidden="true">{icon(membership)}</span>
-                        <span><strong>{membership.display_name}</strong><small>{membership.personal ? "Personal" : membership.role}</small></span>
+                        {/* The role line says what this scope is to you. A personal
+                            tenant is named "Personal" by the account authority, so
+                            repeating it there says nothing twice. */}
+                        <span><strong>{membership.display_name}</strong>
+                            <Show when={!membership.personal}><small>{membership.role}</small></Show></span>
                     </button>}</For>
                 </div>
                 <Show when={!creating()} fallback={<form class="organization-create" onSubmit={(event) => void submitCreate(event)}>
@@ -464,8 +472,11 @@ export function EnterpriseWorkbench(): JSX.Element {
         return value?.managed === true ? value.policy : undefined;
     };
 
+    // Ordinary work is underneath whenever a GaugeApp or a proposal is showing;
+    // that is also the only state from which returning to it means anything.
+    const surfaceOpen = () => Boolean(proposalAccess() || activeController()?.session());
     const gaugeApps: WorkbenchGaugeApps = {
-        active: () => Boolean(proposalAccess() || activeController()?.session()),
+        active: surfaceOpen,
         accountIdentity: () => gaugeAppMenuIdentity(
             account.session.error ? undefined : account.session(), accountIndex(),
         ),
@@ -492,6 +503,7 @@ export function EnterpriseWorkbench(): JSX.Element {
                 writeManagementLocation(null, undefined, created.id);
             }}
             onOpen={openGaugeApp}
+            surfaceOpen={surfaceOpen()}
             onWork={closeSurface}
         />,
         chat: (controls) => proposalAccess()

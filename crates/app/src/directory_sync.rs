@@ -585,6 +585,66 @@ fn republishable(record: &crate::account::HomeRouteRecord) -> bool {
 /// disables account sync because an environment variable was omitted.
 pub const DIRECTORY_URL: &str = "https://directory.gaugewright.com";
 
+/// What one publish of the account's current state did.
+pub struct Published {
+    /// The generation the record now sits at.
+    pub generation: u64,
+    /// Routes the head held that this device knows are gone (ADR 0154 §6).
+    pub retracted_routes: usize,
+    /// Why the head could not be reconciled against, when it could not be.
+    pub declined: Option<&'static str>,
+}
+
+/// Publish the account's current state to the blind directory: read the
+/// generation head, reconcile the routes it holds against this device's, sign
+/// the successor under the lock, and PUT it.
+///
+/// Blocking, and shared by the two callers that need it — the route a person
+/// drives, and DR-0183's reconcile — because the *order* matters and stating it
+/// twice is how the two get out of step. A caller announces the root to the
+/// authority only after this returns `Ok`: the announcement tells a browser
+/// where to look, and announcing first points every reader at a 404 and makes a
+/// working account look broken (DESK-5f, ADR 0133 §2).
+pub fn publish_current(
+    wb: &crate::SharedWorkbench,
+    base: &str,
+    root: &str,
+) -> Result<Published, String> {
+    use crate::LockUnpoisoned;
+    let http = crate::net_http::HttpClient::new();
+    let head = fetch(&http, base, root)?;
+    let generation = match &head {
+        Some(record) => record
+            .entry
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "directory generation is exhausted".to_owned())?,
+        None => 1,
+    };
+    // Read the head before overwriting it (ADR 0154 §6). The record is a
+    // snapshot of the routes it owns, so a publish written blind lets the
+    // least-informed device erase what a better-informed one published — and the
+    // generation fence makes that durable rather than transient. A retracted
+    // head states nothing about routing, so there is nothing to reconcile
+    // against.
+    let reconciled = match &head {
+        Some(record) if !record.entry.retracted => {
+            wb.lock_unpoisoned().library_sync_reconcile_routes(record)
+        }
+        _ => RouteReconcile::default(),
+    };
+    let put = wb
+        .lock_unpoisoned()
+        .library_sync_signed_put(generation)
+        .ok_or_else(|| "directory publish could not be signed".to_owned())?;
+    publish(&http, base, &put)?;
+    Ok(Published {
+        generation,
+        retracted_routes: reconciled.retracted,
+        declined: reconciled.declined,
+    })
+}
+
 pub fn directory_url_from_env() -> String {
     gaugedesk_env::var("DIRECTORY_URL")
         .filter(|s| !s.trim().is_empty())

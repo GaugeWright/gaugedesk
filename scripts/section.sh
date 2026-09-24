@@ -63,7 +63,7 @@ carries() {
 
 case "${1:-}" in
   agent-guide)             if carries scripts/check-agent-guide.mjs "the agent guide check"; then node scripts/check-agent-guide.mjs; fi ;;
-  carries-agent-guide|carries-agent-guide-checker)
+  carries-agent-guide|carries-agent-guide-checker|carries-brand-tokens|carries-brand-tokens-checker)
     # The cross-repository edge (GaugeWright DR-0124 stage 4). In a workspace
     # the bar builds the `carries` target and never reaches here; reaching here
     # means there is no `gaugewright` cell to compare against.

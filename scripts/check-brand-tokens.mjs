@@ -9,6 +9,13 @@
 // can run it without access to the private company repository. Whether that
 // digest is still the current one is checked from GaugeWright, which owns it.
 //
+// The file also carries a digest of its own body, because everything above is
+// a promise the consuming gate could not otherwise keep: widening the skip list
+// or loosening a regex here is a silent pass in a file whose header says a local
+// edit fails the gate. It is a seal, not a lock — anyone editing deliberately
+// can re-seal it, and tools/palette.mjs is what proves this is still the current
+// body — but drift does not re-seal itself.
+//
 // It also sweeps the source trees for a re-introduced copy of a brand value.
 // The digest alone would not have caught the failure that prompted this: the
 // vendored file was fine, and a *second* declaration elsewhere was what
@@ -18,8 +25,18 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 const EXPECTED_DIGEST = "181317932e20bf8414ea53e4a35e62c9fe9b8504e3b7ba26e7c3a039c84d4dff";
+// A digest of the whole rendered region, where EXPECTED_DIGEST covers only the
+// declarations inside the `:root, :host` block. The gap between the two was
+// real: the hex sweep skips the entire region, so a `:root { … }` written after
+// the closing brace and before the end marker satisfied the declarations digest,
+// escaped the sweep, and repainted the surface.
+const REGION_DIGEST = "11b88306966cbe895de213bde90d3f0ca623abd63e1a24ddc23508ac2c8bca71";
+// A digest of this file with the 64 characters below blanked, so it can describe
+// the body it sits in. Written by tools/palette.mjs at render time.
+const SELF_DIGEST = "9339523034cfc8704597ac3c34624a4623911f16a0dd3d424a215842b87e8c14";
 const TOKENS_PATH = "web/packages/workbench-ui/src/brand-tokens.css";
 const SCAN_ROOTS = ["web/packages","web/apps","web/lab","ee/web"];
 // "file" — TOKENS_PATH is wholly generated. "block" — the tokens are a rendered
@@ -37,15 +54,21 @@ const MARK_DIGEST = "7fcd1d156b29b9ad25b14bd44d5f8c0b4d35774bffd3594b6ac9308b8ca
 const BLOCK_BEGIN = "/* BEGIN GAUGEWRIGHT BRAND TOKENS";
 const BLOCK_END = "/* END GAUGEWRIGHT BRAND TOKENS */";
 
-// Build output, dependencies, and vendored fonts are not authored source; a
-// value found there came from a build, not from someone typing it.
+// Build output and dependencies are not authored source; a value found there
+// came from a build, not from someone typing it.
+//
+// `assets` is deliberately not here. It was skipped by name, under a comment
+// describing fonts and images, but a static site keeps authored scripts there
+// too and loads them on public pages — so a brand value hardcoded in one escaped
+// the sweep entirely. Fonts and images were never read anyway: SOURCE_EXTENSIONS
+// decides what is opened, and .woff2 and .png are not in it, which is why
+// skipping the directory bought nothing and cost the scripts.
 const SKIP_DIRECTORIES = new Set([
   "node_modules",
   "dist",
   "dist-embed",
   "dist-static-edge",
   "target",
-  "assets",
   ".git",
 ]);
 const SOURCE_EXTENSIONS = new Set([".css", ".ts", ".tsx", ".js", ".jsx", ".html", ".svelte"]);
@@ -67,6 +90,26 @@ const readSource = (file) => fs.readFileSync(file, "utf8").replace(/\r\n/gu, "\n
 const root = path.resolve(process.argv[2] ?? process.cwd());
 const failures = [];
 const fail = (message) => failures.push(message);
+
+// --- this file ---------------------------------------------------------------
+
+// Blanking the digest before hashing is what lets the digest describe the body
+// it sits in; tools/palette.mjs blanks the same span, at the same place, before
+// writing the value here.
+{
+  const self = readSource(fileURLToPath(import.meta.url));
+  const blanked = self.replace(SELF_DIGEST, "0".repeat(64));
+  const actual = crypto.createHash("sha256").update(blanked, "utf8").digest("hex");
+  if (actual !== SELF_DIGEST) {
+    fail(
+      `this checker has been edited (sha256:${actual.slice(0, 12)}…, expected `
+      + `sha256:${SELF_DIGEST.slice(0, 12)}…). Everything it reports is a claim about `
+      + "a body that is no longer the rendered one — a widened skip list or a loosened "
+      + "pattern here passes silently. It is owned by the GaugeWright repository; "
+      + "change it there and re-render with `node tools/palette.mjs --write`.",
+    );
+  }
+}
 
 // --- the vendored tokens ----------------------------------------------------
 
@@ -133,6 +176,12 @@ if (!fs.existsSync(tokensFile)) {
     const actual = crypto.createHash("sha256").update(declarations, "utf8").digest("hex");
     const declared = /sha256:([0-9a-f]{64})/u.exec(tokens)?.[1];
 
+    // `tokens` is exactly the rendered region: the whole file in file mode, the
+    // marker pair inclusive in block mode. Reported only once — a changed
+    // declaration changes the region too, and two failures for one edit is
+    // noise — so this names what the declarations digest cannot see.
+    const region = crypto.createHash("sha256").update(tokens, "utf8").digest("hex");
+
     if (actual !== EXPECTED_DIGEST) {
       fail(
         `${TOKENS_PATH} is stale or locally edited (sha256:${actual.slice(0, 12)}…, `
@@ -141,6 +190,15 @@ if (!fs.existsSync(tokensFile)) {
       );
     } else if (declared !== actual) {
       fail(`${TOKENS_PATH} carries sha256:${declared?.slice(0, 12)}…, which does not match its own body.`);
+    } else if (region !== REGION_DIGEST) {
+      fail(
+        `${TOKENS_PATH} carries the rendered declarations inside a rendered region that `
+          + `has been edited (sha256:${region.slice(0, 12)}…, expected `
+          + `sha256:${REGION_DIGEST.slice(0, 12)}…). The whole region is owned by the `
+          + "GaugeWright repository, including anything written after the closing brace — "
+          + "which the hex sweep below also skips, so a rule there reaches the screen "
+          + "unread. Re-render it there rather than editing it here.",
+      );
     }
 
     for (const [, value] of declarations.matchAll(/^\s*--[\w-]+:\s*(#[0-9a-fA-F]{3,8})\s*;/gmu)) {

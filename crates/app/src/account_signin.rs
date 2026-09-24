@@ -568,6 +568,23 @@ pub fn hub_session_token(wb: &SharedWorkbench) -> Option<String> {
     workbench.unseal_account_secret(&record.sealed)
 }
 
+/// Seed a stored Hub session, so a test in another module can start from a
+/// computer that is already signed in. The record type is private and stays
+/// private; what a caller needs is the state, not the record.
+#[cfg(test)]
+pub(crate) fn store_session_for_test(wb: &SharedWorkbench) {
+    store_session(
+        wb,
+        "opaque-account-session",
+        "account-root",
+        "alice@example.test",
+        4_102_444_800_000,
+        4_102_441_800_000,
+        "native-abc123",
+    )
+    .expect("store session");
+}
+
 /// The actor bound to the sealed Hub session. Project-owned organization model
 /// selection uses this beside the unsealed bearer so a local loopback identity
 /// cannot be mistaken for the remote organization member it is acting for.
@@ -864,7 +881,24 @@ pub async fn post_signin_callback(
         session.refresh_after,
         &session.device,
     ) {
-        Ok(record) => Json(status_json(Some(&record), true)).into_response(),
+        Ok(record) => {
+            // Signing in on a computer makes it that person's first Home
+            // (DR-0183). Publication is a facility and reachability follows it,
+            // so this is what lets a leg park at all; the registration itself
+            // happens where the locator exists, in `first_home::reconcile`.
+            //
+            // Reported and not propagated: a person who has just signed in
+            // successfully should not be told sign-in failed because the
+            // machine could not also become a Home.
+            match crate::first_home::attach_library_sync(&wb) {
+                Ok(true) => eprintln!(
+                    "[first-home] library sync attached; this computer is now publishing its reachability"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!("first Home not attached: {error}"),
+            }
+            Json(status_json(Some(&record), true)).into_response()
+        }
         Err(message) => {
             tracing::warn!("hub-session seal failed: {message}");
             (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()

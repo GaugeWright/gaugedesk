@@ -106,6 +106,17 @@ pub(crate) async fn supervise_home_reachability(
         .subscribe();
     let mut parked: Option<ParkedLeg> = None;
     loop {
+        // A computer already signed in when DR-0183 shipped never crosses the
+        // sign-in transition again, so the attach that transition performs is
+        // also asked from state here — `first_home::attach_if_never_offered`
+        // says why, and why it is not simply "not active".
+        match crate::first_home::attach_if_never_offered(&wb, &root) {
+            Ok(true) => eprintln!(
+                "[first-home] library sync attached; this computer is now publishing its reachability"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!("first Home not attached: {error}"),
+        }
         // Read and release: this is a std mutex, and holding it across the wait
         // below would stop every request this Home serves.
         let publishes = wb.lock_unpoisoned().library_sync_active();
@@ -186,6 +197,8 @@ fn start_home_relay(
     // should say so before the first client ever resolves a project.
     let parked = config.relay_route(&identity)?;
     crate::home_reachability::republish(wb, &parked);
+    // And tell the account where this Home is, so desk can open it (DR-0183).
+    crate::first_home::reconcile(wb, &parked);
     let (routes, route_reader) = tokio::sync::watch::channel(parked);
     let current = routes.subscribe();
     let rotation_identity = identity.clone();
@@ -208,6 +221,10 @@ fn start_home_relay(
                 // make it.
                 Ok(route) => {
                     crate::home_reachability::republish(&rotation_workbench, &route);
+                    // A published locator whose proof has rotated is a Home desk
+                    // cannot reach, so the authority is told at the same moment
+                    // the routes are re-authored (DR-0183 §4).
+                    crate::first_home::reconcile(&rotation_workbench, &route);
                     if routes.send(route).is_err() {
                         return;
                     }
