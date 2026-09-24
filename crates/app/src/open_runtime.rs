@@ -235,9 +235,27 @@ fn start_home_relay(
         }
     });
     let availability = tokio::spawn(async move {
-        if let Err(error) =
-            gaugedesk_relay_transport::serve_home_supervised(route_reader, local, identity).await
-        {
+        // A leg that cannot park leaves this computer unreachable while the app
+        // looks entirely healthy — the state DR-0183 exists to end. The loop
+        // reports the transitions, so this says the cause once per outage and
+        // once again when it clears, rather than never or every ten seconds
+        // (DR-0184).
+        let outcome = gaugedesk_relay_transport::serve_home_supervised(
+            route_reader,
+            local,
+            identity,
+            |leg| match leg {
+                Ok(epoch) => eprintln!(
+                    "[home-relay] leg parked at epoch {epoch} — this computer is reachable again"
+                ),
+                Err((epoch, error)) => eprintln!(
+                    "[home-relay] cannot park a leg at epoch {epoch}, so desk cannot open this \
+                     computer; retrying: {error}"
+                ),
+            },
+        )
+        .await;
+        if let Err(error) = outcome {
             eprintln!("[home-relay] availability loop stopped: {error}");
         }
     });

@@ -649,10 +649,29 @@ pub async fn serve_home_once(
     local_control_plane: SocketAddr,
     identity: &TlsIdentity,
 ) -> std::io::Result<()> {
+    park_home_leg(route, local_control_plane, identity, || {}).await
+}
+
+/// [`serve_home_once`], telling the caller the moment the leg is *parked*
+/// rather than only when the crossing it went on to accept has finished.
+///
+/// The supervisor needs that distinction to say a Home has come back. A parked
+/// leg then waits for as long as nobody opens this computer, so a recovery
+/// read off the return value would arrive hours late or never — which is the
+/// silence this reporting exists to end.
+///
+/// The acceptor is built before the leg parks, so an identity that cannot
+/// serve fails without first announcing the Home as reachable.
+async fn park_home_leg(
+    route: &RelayRoute,
+    local_control_plane: SocketAddr,
+    identity: &TlsIdentity,
+    parked: impl FnOnce(),
+) -> std::io::Result<()> {
+    let acceptor = TlsAcceptor::from(Arc::new(identity.server_config()?));
     let broker = connect_home_stream(route).await?;
-    let mut tunnel = TlsAcceptor::from(Arc::new(identity.server_config()?))
-        .accept(broker)
-        .await?;
+    parked();
+    let mut tunnel = acceptor.accept(broker).await?;
     let mut local = TcpStream::connect(local_control_plane).await?;
     tokio::io::copy_bidirectional(&mut tunnel, &mut local).await?;
     Ok(())
@@ -685,27 +704,62 @@ pub async fn serve_home_forever(
 /// latest route, and a rotation while a leg is parked interrupts that leg so the
 /// next attempt uses the new proof. Republishing the rotated locator is the
 /// caller's job, because only the caller knows the account it publishes under.
+///
+/// `report` is how the outage stops being silent. A leg that cannot park makes
+/// this Home unreachable, and the loop retries that forever, so neither
+/// swallowing the error nor printing it on every attempt is any use: the first
+/// says nothing, the second says it every ten seconds and teaches the reader to
+/// scroll past it. The reporter is therefore called on *transitions* only — the
+/// first failure after the leg was parked, again whenever the reason text
+/// changes under an outage that is still running, and once when a leg parks
+/// again — so one outage costs one line in and one line out (DR-0184).
+///
+/// It is a callback rather than a log line because this crate also builds for
+/// `wasm32` and carries no logging facade; the caller owns the words.
 pub async fn serve_home_supervised(
     mut routes: tokio::sync::watch::Receiver<RelayRoute>,
     local_control_plane: SocketAddr,
     identity: TlsIdentity,
+    mut report: impl FnMut(Result<u64, (u64, std::io::Error)>),
 ) -> std::io::Result<()> {
     let mut delay = Duration::from_millis(100);
+    // The reason the outage in progress was reported under, or `None` while the
+    // leg is parked. Both the "say it once" and the "say it again if the reason
+    // changed" halves read this.
+    let mut reported: Option<String> = None;
     loop {
         let route = routes.borrow_and_update().clone();
-        let outcome = tokio::select! {
-            served = serve_home_once(&route, local_control_plane, &identity) => Some(served),
-            // A rotation supersedes the parked leg: its proof is already stale.
-            changed = routes.changed() => {
-                if changed.is_err() {
-                    return Ok(());
+        let epoch = route.epoch;
+        let outcome = {
+            // Reborrowed for the length of the select so the match below can
+            // have them back.
+            let reported = &mut reported;
+            let report = &mut report;
+            let parked = move || {
+                if reported.take().is_some() {
+                    report(Ok(epoch));
                 }
-                None
+            };
+            tokio::select! {
+                served = park_home_leg(&route, local_control_plane, &identity, parked)
+                    => Some(served),
+                // A rotation supersedes the parked leg: its proof is already stale.
+                changed = routes.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                    None
+                }
             }
         };
         match outcome {
             Some(Ok(())) | None => delay = Duration::from_millis(100),
-            Some(Err(_)) => {
+            Some(Err(error)) => {
+                let reason = error.to_string();
+                if reported.as_deref() != Some(reason.as_str()) {
+                    report(Err((epoch, error)));
+                    reported = Some(reason);
+                }
                 sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(10));
             }
@@ -1508,6 +1562,101 @@ mod tests {
         assert_eq!(&echoed, b"still here");
 
         leg.shutdown().await.unwrap();
+        relay.abort();
+    }
+
+    /// A leg that cannot park states its cause once, and states its recovery
+    /// once.
+    ///
+    /// The bug this pins: the supervisor discarded every attempt's error, so a
+    /// Home that could not reach the relay retried every ten seconds forever
+    /// with nothing whatever in the log, and the only way to establish it was
+    /// `lsof` against the running process. Reporting every attempt instead
+    /// would be no better — an unreadable line repeated until the reader
+    /// learns to scroll past it — so what is asserted here is the count.
+    #[tokio::test]
+    async fn a_leg_that_cannot_park_reports_its_cause_once_and_its_recovery_once() {
+        // Refuses the WebSocket handshake by dropping the accepted socket,
+        // until it has refused enough attempts to prove one report covered
+        // them all; then behaves like a relay and lets the leg park.
+        const REFUSALS: usize = 3;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (refused_tx, mut refused_rx) = tokio::sync::mpsc::unbounded_channel();
+        let relay = tokio::spawn(async move {
+            for _ in 0..REFUSALS {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                // A refusal the upgrade names, rather than a dropped socket:
+                // the reason text has to be the *same* text on every attempt
+                // for "said once" to mean anything, and a reset races between
+                // "connection reset" and an EOF mid-handshake.
+                let mut request = [0u8; 1024];
+                let _ = tcp.read(&mut request).await;
+                tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                tcp.shutdown().await.unwrap();
+                refused_tx.send(()).unwrap();
+            }
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(tcp).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Binary(WSS_READY.to_vec().into()))
+                .await
+                .unwrap();
+            // Parked, waiting for a client that never comes — which is exactly
+            // the state a recovery report must not wait on.
+            std::future::pending::<()>().await;
+        });
+
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(format!("ws://{address}"), identity.fingerprint());
+        let (_routes, route_reader) = tokio::sync::watch::channel(route);
+        let control_plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_plane_address = control_plane.local_addr().unwrap();
+        let (reports, mut report_reader) = tokio::sync::mpsc::unbounded_channel();
+        let supervised = tokio::spawn(async move {
+            serve_home_supervised(route_reader, control_plane_address, identity, move |leg| {
+                reports
+                    .send(leg.map_err(|(epoch, error)| (epoch, error.to_string())))
+                    .unwrap();
+            })
+            .await
+        });
+
+        let first = timeout(Duration::from_secs(10), report_reader.recv())
+            .await
+            .expect("the supervisor said nothing about a Home it cannot park")
+            .unwrap();
+        let (epoch, reason) = first.expect_err("the first report is the failure");
+        assert_eq!(epoch, 1, "a report names the epoch the leg failed on");
+        assert!(!reason.is_empty(), "a report carries the cause");
+
+        // Every remaining refusal fails for the same reason, and none of them
+        // is reported again.
+        for _ in 0..REFUSALS {
+            timeout(Duration::from_secs(10), refused_rx.recv())
+                .await
+                .expect("the supervisor stopped retrying")
+                .unwrap();
+        }
+
+        let second = timeout(Duration::from_secs(10), report_reader.recv())
+            .await
+            .expect("the supervisor said nothing when the leg parked again")
+            .unwrap();
+        assert_eq!(
+            second.expect("the second report is the recovery"),
+            1,
+            "recovery names the epoch the leg parked on",
+        );
+        assert!(
+            report_reader.try_recv().is_err(),
+            "one outage is one report in and one report out",
+        );
+
+        supervised.abort();
         relay.abort();
     }
 

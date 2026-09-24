@@ -261,6 +261,13 @@ run_contracts() {
     # whether a runner's failing vendor index reddens a healthy tree, and
     # tolerating one must not tolerate a package that never installed.
 
+    # How the release lands its own version bump. Nothing invoked release.sh
+    # from any gate, so its routing was unguarded: a catch-all merge arm fired
+    # on mergeStateStatus=UNKNOWN — what GitHub answers while it is still
+    # computing, i.e. the first poll — and a bump that was supposed to wait for
+    # ten required checks would have merged before one had reported.
+    bash scripts/release-routing.test.sh
+
     # The archive one layer up: that a built package is what the archive will
     # accept, that the indexes and signatures an `apt-get update` reads are the
     # ones these scripts write, and that tampered metadata is refused. It ran
