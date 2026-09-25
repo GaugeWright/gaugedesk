@@ -57,18 +57,18 @@ export function phaseLabel(
     }
 }
 
-/** When a newly-selected file should drop the viewer into View. A pending change
+/** When a newly-selected file should drop the viewer onto its file surface. A pending change
  *  up for review surfaces as a "Clean" merge phase — we keep the user on that
  *  active "needs review" diff (round-7 #3) rather than yanking them to View; any
- *  other phase (no pending review) drops into View as a normal file pick. */
+ *  other phase (no pending review) opens the selected file as normal. */
 export function shouldShowViewOnSelect(phase: MergePhase | null): boolean {
     return phase !== "Clean";
 }
 
-/** The surface a chat should *open* on. The file **View** is the resting default;
+/** The surface a chat should *open* on. The file is the resting default;
  *  the **Changes** (diff) review surface leads only when a review is actually open
  *  — a finished turn awaiting keep/discard, which surfaces as a "Clean" merge
- *  phase. Re-evaluated per chat, so a chat with nothing to review opens on View
+ *  phase. Re-evaluated per chat, so a chat with nothing to review opens on its file
  *  instead of inheriting the previous chat's Changes tab. */
 export function defaultContentMode(phase: MergePhase | null): "view" | "diff" {
     return phase === "Clean" ? "diff" : "view";

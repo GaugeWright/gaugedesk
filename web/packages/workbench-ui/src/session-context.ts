@@ -106,6 +106,8 @@ export interface SessionApi {
         baseCut: string,
     ): Promise<MergePreviewResult>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
+    /** Recorded create/rename/delete commands for the chat's admitted worktree. */
+    manageFile?(id: EngagementId, command: import("@gaugewright/control-plane-client").FileManagerCommand): Promise<void>;
     /** Audience chat index, present only on a public/audience control plane. */
     embedMyChats?(): Promise<{ chat: string; title: string }[]>;
     /** Whether this scoped public session has an authenticated audience. */

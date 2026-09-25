@@ -14,7 +14,9 @@ Feature: Round 4 — ownership-safe editing, legible diffs, and one canonical ch
     Given the workbench is open
     When I create an edit chat under the archetype "Default"
     And I select the file ".whipple/draft/persona.md" in the workspace
-    And I open the "edit" tab
+    Then the content viewer offers the "view" tab
+    And the content viewer offers the "edit" tab
+    When I open the "edit" tab
     And I replace the editor content with "You are a concise research assistant."
     And I save the file
 

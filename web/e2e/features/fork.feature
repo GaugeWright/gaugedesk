@@ -6,7 +6,7 @@ Feature: Fork (ADR 0035/0038/0141)
   chat — worktree, agent memory, and (ADR 0141) the durable transcript up to the fork
   point, inherited by lineage rather than copied.
 
-  Scenario: forking an archetype creates an independent copy in the Library
+  Scenario: forking an archetype creates an independent copy in the Workshop
     Given the workbench is open
     When I create an archetype named "forkable"
     Then I see the archetype "forkable"

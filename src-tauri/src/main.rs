@@ -9,8 +9,20 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_deep_link::DeepLinkExt;
+
+const BACKGROUND_ARG: &str = "--background";
+
+fn show_workbench(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
 
 /// The signed updater installs files but deliberately does not decide when to
 /// restart. The workbench invokes this only after an admitted update finishes.
@@ -90,13 +102,20 @@ fn main() {
         // launches a second instance whose argv carries the URL — focus the existing window and
         // forward that URL into it. macOS delivers to the running instance via `on_open_url`.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.set_focus();
+            let link = deep_link_from_argv(&argv);
+            // An autostart registration may race a running copy. Its background
+            // launch must not pop the workbench open; a person launch or link does.
+            if !argv.iter().any(|arg| arg == BACKGROUND_ARG) || link.is_some() {
+                show_workbench(app);
             }
-            if let Some(url) = deep_link_from_argv(&argv) {
+            if let Some(url) = link {
                 forward_deep_link(app, &url);
             }
         }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![BACKGROUND_ARG]),
+        ))
         // Native OS folder picker for "add files" (the webview opens a real
         // folder browser; the chosen absolute path is ingested over HTTP).
         .plugin(tauri_plugin_dialog::init())
@@ -107,7 +126,54 @@ fn main() {
         // FED-7: register the `gaugewright://` scheme (schemes declared in tauri.conf.json
         // `plugins.deep-link`), so the OS routes invite links to this app.
         .plugin(tauri_plugin_deep_link::init())
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
+            let open_item = MenuItem::with_id(app, "open", "Open GaugeDesk", true, None::<&str>)?;
+            let startup = CheckMenuItem::with_id(
+                app,
+                "start-at-login",
+                "Start at login",
+                true,
+                app.autolaunch().is_enabled().unwrap_or(false),
+                None::<&str>,
+            )?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit GaugeDesk", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_item, &startup, &quit_item])?;
+            let mut tray = TrayIconBuilder::new()
+                .tooltip("GaugeDesk is running")
+                .menu(&menu)
+                .on_menu_event(move |app, event| match event.id().as_ref() {
+                    "open" => show_workbench(app),
+                    "quit" => app.exit(0),
+                    "start-at-login" => {
+                        let manager = app.autolaunch();
+                        let wanted = startup.is_checked().unwrap_or(false);
+                        let result = if wanted {
+                            manager.enable()
+                        } else {
+                            manager.disable()
+                        };
+                        if let Err(error) = result {
+                            eprintln!("could not change Start at login: {error}");
+                            if let Ok(enabled) = manager.is_enabled() {
+                                let _ = startup.set_checked(enabled);
+                            }
+                        }
+                    }
+                    _ => {}
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
+
             // Spawn-vs-connect (DEPLOY-5): the **solo** shell spawns a co-resident control
             // plane; an **enterprise** deployment that names an org control plane
             // (`GAUGEDESK_ORG_CP`) skips the spawn — the webview connects to that org CP
@@ -201,6 +267,9 @@ fn main() {
             if cfg!(target_os = "macos") {
                 window = window.initialization_script(OVERLAY_TITLE_BAR);
             }
+            if std::env::args().any(|arg| arg == BACKGROUND_ARG) {
+                window = window.visible(false);
+            }
             window.build()?;
 
             // FED-7: an OS-delivered `gaugewright://` link arrives here — on cold start (the link
@@ -210,6 +279,7 @@ fn main() {
             {
                 let handle = app.handle().clone();
                 app.deep_link().on_open_url(move |event| {
+                    show_workbench(&handle);
                     for url in event.urls() {
                         forward_deep_link(&handle, url.as_str());
                     }
@@ -218,8 +288,20 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running gaugewright desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building gaugewright desktop")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = event
+            {
+                show_workbench(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 /// Marks the document `data-titlebar="overlay"` for the page's stylesheet.

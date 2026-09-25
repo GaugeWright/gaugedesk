@@ -1543,6 +1543,18 @@ export async function getTree(transport: WorkbenchTransport, id: EngagementId): 
     return o.files.map((f) => ({ path: f.path, isDir: f.is_dir }));
 }
 
+export type FileManagerCommand =
+    | { readonly action: "create_file" | "create_folder" | "delete"; readonly path: string }
+    | { readonly action: "rename"; readonly path: string; readonly to: string };
+
+export async function manageFile(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    command: FileManagerCommand,
+): Promise<void> {
+    await transport.json("POST", `/chats/${id}/files/command`, command);
+}
+
 export async function getFile(
     transport: WorkbenchTransport,
     id: EngagementId,

@@ -31,6 +31,7 @@ export type IconName =
     | "edit"
     | "remove"
     | "grip"
+    | "menu"
     | "chevron"
     | "more"
     | "filter"
@@ -190,6 +191,13 @@ const PATHS: Record<IconName, () => JSX.Element> = {
 
     /* --- menus -------------------------------------------------------------- */
 
+    menu: () => (
+        <>
+            <path d="M4 6h16" />
+            <path d="M4 12h16" />
+            <path d="M4 18h16" />
+        </>
+    ),
     // A small downward chevron — this text is a menu, not a label.
     chevron: () => (
         <path d="m6 9 6 6 6-6" />

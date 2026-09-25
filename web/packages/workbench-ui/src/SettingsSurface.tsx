@@ -878,7 +878,7 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
 
                             <Show when={props.model.devices.librarySync !== null}>
                             <section class="admin-section" data-library-sync>
-                                <h4>Library sync</h4>
+                                <h4>Workshop sync</h4>
                                 <div class="settings-row">
                                     <span class="settings-row-main">
                                         <span class="settings-row-name">

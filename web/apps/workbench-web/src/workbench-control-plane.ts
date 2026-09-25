@@ -1570,6 +1570,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.getTree(this.workbenchTransport(), id);
     }
 
+    manageFile(id: EngagementId, command: workbenchClient.FileManagerCommand): Promise<void> {
+        return workbenchClient.manageFile(this.workbenchTransport(), id, command);
+    }
+
     getFile(id: EngagementId, path: string): Promise<string> {
         return workbenchClient.getFile(this.workbenchTransport(), id, path);
     }

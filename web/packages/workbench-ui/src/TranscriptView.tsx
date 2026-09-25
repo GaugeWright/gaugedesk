@@ -370,7 +370,7 @@ export function TranscriptView(props: {
     );
     return (
         <>
-        <For each={segments()} fallback={props.fallback ?? <div class="status">no activity yet</div>}>
+        <For each={segments()} fallback={props.fallback}>
             {(seg, index) => (
                 <>
                     <Show

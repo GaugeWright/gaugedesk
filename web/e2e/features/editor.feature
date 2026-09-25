@@ -12,13 +12,13 @@ Feature: File editor
     And I open the "edit" tab
     And I replace the editor content with "edited by the human"
     And I save the file
-    And I open the "view" tab
-    Then the file view shows "edited by the human"
+    Then the file editor shows "edited by the human"
 
-  Scenario: view a worktree file
+  Scenario: a plain text file opens directly in Edit
     Given a new engagement
     When I task the agent with "make a note"
     Then the run phase is "Completed"
     When I select the file "agent-note.txt" in the workspace
-    And I open the "view" tab
-    Then the file view shows "agent-note"
+    Then the content viewer is on the "edit" tab
+    And the "view" tab is absent
+    And the file editor shows "agent-note"

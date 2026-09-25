@@ -4,8 +4,8 @@
  * reads) and assert on rendered projections — never on internal state.
  *
  * The model (ADR 0035/0036): the nav is **project-first**, facets
- * **Recent | Projects | Library** (default Projects). An **archetype** is the
- * reusable method (Library); a **placement** is an archetype installed on a
+ * **Recent | Projects | Workshop** (default Projects). An **archetype** is the
+ * reusable method (Workshop); a **placement** is an archetype installed on a
  * **project** (Projects) — what you chat with to do work. A chat's **kind** is
  * its ROOT, fixed at creation: rooted on an archetype ⇒ an *edit* chat; rooted on
  * a placement ⇒ a *work* chat. There is no mode toggle. The default "Personal"
@@ -21,6 +21,11 @@ import { aliceCP } from "../ports.mjs";
 import { mutationHeaders } from "./idempotency";
 
 const { Given, When, Then, Before, After } = createBdd();
+
+async function openChatOption(page: Page, option: "Filters" | "History" | "Context sources") {
+    await page.locator("[data-chat-options-trigger]").click();
+    await page.getByRole("menuitem", { name: option, exact: true }).click();
+}
 
 // Per-scenario clean slate. The whole suite shares ONE control plane, run serially,
 // so without this the append-only store accumulates every prior scenario's projects,
@@ -210,7 +215,7 @@ When("I select every target and start the chat", async ({ page, request }) => {
 });
 
 Then("the chat shows both selected targets", async ({ page }) => {
-    await expect(page.locator("[data-chat-targets='2']")).toBeVisible();
+    await expect(page.locator("[data-chat].active [data-chat-target-count='2']")).toBeVisible();
 });
 
 Then("Files shows two target partitions", async ({ page }) => {
@@ -552,7 +557,7 @@ Then("no {string} tool line is shown", async ({ page }, category: string) => {
 });
 
 When("I hide {string} tool calls from the chat log", async ({ page }, category: string) => {
-    await page.locator("[data-transcript-filter]").click();
+    await openChatOption(page, "Filters");
     await page.locator(`[data-filter-visible="${category}"]`).uncheck();
     // Dismiss the popover so the log is unobstructed for the following assertions.
     await page.locator(".popover-catcher").click();
@@ -563,7 +568,7 @@ Then("the chat log does not show {string}", async ({ page }, text: string) => {
 });
 
 When("I save the filter as default", async ({ page }) => {
-    await page.locator("[data-transcript-filter]").click();
+    await openChatOption(page, "Filters");
     await page.locator("[data-filter-save]").click();
     // The button acknowledges the persist before we dismiss the menu.
     await expect(page.locator("[data-filter-save]")).toHaveText(/Saved/);
@@ -575,11 +580,9 @@ When("I click the tool target {string}", async ({ page }, target: string) => {
 });
 
 Then("the content viewer shows {string}", async ({ page }, file: string) => {
-    // Selecting a file only auto-switches to View when there's no pending review;
-    // after a turn the viewer defaults to Changes (round-7 #3), so open View
-    // explicitly rather than racing on whether the merge phase has loaded.
-    await page.locator('[data-viewer-tabs] .tab[data-tab="view"]').click();
-    await expect(page.locator("[data-file-view]")).toBeVisible();
+    // A text file has no duplicate View; inspect the editor after a review.
+    await page.locator('[data-viewer-tabs] .tab[data-tab="edit"]').click();
+    await expect(page.locator("[data-file-edit]")).toBeVisible();
     await expect(page.locator(".panel.content", { hasText: file })).toBeVisible();
 });
 
@@ -662,7 +665,7 @@ Then("the archetype {string} is hidden", async ({ page }, name: string) => {
 
 // ---- the archetype / project library (facet browser CRUD) ----
 
-// Archetypes live in the Library facet.
+// Archetypes live in the Workshop facet.
 Then("I see the archetype {string}", async ({ page }, name: string) => {
     await expect(
         page.locator("[data-archetype] .node-label", { hasText: new RegExp(`^${name}$`) }),
@@ -674,7 +677,7 @@ Then("I see the project {string}", async ({ page }, name: string) => {
 });
 
 When("I create an archetype named {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page.getByText("+ agent", { exact: true }).click();
     await page.locator(".inline-edit").fill(name);
     await page.locator(".inline-edit").press("Enter");
@@ -684,14 +687,14 @@ When("I create an archetype named {string}", async ({ page }, name: string) => {
 });
 
 When("I create a Panel agent named {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page.getByText("+ agent", { exact: true }).click();
     await page.getByRole("button", { name: "Panel agent", exact: true }).click();
     await page.locator(".inline-edit").fill(name);
     await page.locator(".inline-edit").press("Enter");
 });
 
-Then("the Panel agent {string} is in the Library", async ({ page }, name: string) => {
+Then("the Panel agent {string} is in the Workshop", async ({ page }, name: string) => {
     const row = page.locator("[data-archetype]", { hasText: name });
     await expect(row.locator(".node-label", { hasText: new RegExp(`^${name}$`) })).toBeVisible();
     await expect(row.locator(".cfg-badge", { hasText: "Panel agent" })).toBeVisible();
@@ -700,15 +703,15 @@ Then("the Panel agent {string} is in the Library", async ({ page }, name: string
 // Opening a Panel agent is one movement across the panes (PANEL-12): its edit
 // chat in Chat, the agent itself — contract and Preview — in Content.
 When("I open the Panel agent {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page.locator("[data-archetype]", { hasText: name }).locator(".tree-node.archetype").click();
 });
 
-Then("the Panel agent is open as the Library draft", async ({ page }) => {
+Then("the Panel agent is open as the Workshop draft", async ({ page }) => {
     const surface = page.locator("[data-panel-agent-surface]");
     await expect(surface).toBeVisible();
     await expect(surface).toHaveAttribute("data-panel-agent-scope", "draft");
-    await expect(surface.getByText("Library draft", { exact: true })).toBeVisible();
+    await expect(surface.getByText("Workshop draft", { exact: true })).toBeVisible();
     await expect(surface.locator("[data-panel-public-profile]")).toBeVisible();
     await expect(surface.getByText(/Disposable public session/)).toBeVisible();
 });
@@ -793,7 +796,7 @@ When("I create a project named {string}", async ({ page }, name: string) => {
 
 // An EDIT chat is rooted on an archetype — opened from its right-click menu ("edit").
 When("I add an edit chat under the archetype {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
@@ -1017,7 +1020,7 @@ Then("the archetype {string} is gone", async ({ page }, name: string) => {
 });
 
 When("I delete the archetype {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
@@ -1068,13 +1071,13 @@ Then("the placement in project {string} shows it is customized", async ({ page }
 
 // Fork lineage (ADR 0038): the fork carries a "forked from <source>" line.
 Then("an archetype is forked from {string}", async ({ page }, source: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await expect(page.locator(".fork-lineage", { hasText: `forked from ${source}` })).toBeVisible();
 });
 
 // Pull the source's improvements into the fork (the archetype carrying that lineage).
 When("I pull updates into the fork of {string}", async ({ page }, source: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { has: page.locator(".fork-lineage", { hasText: `forked from ${source}` }) })
         .locator(".tree-node.archetype")
@@ -1097,15 +1100,15 @@ Then("the project {string} hides its placements", async ({ page }, name: string)
 });
 
 // C1 many-to-many: placing one archetype on N projects must REUSE it, not clone it —
-// so the Library still lists a single archetype after two placements.
-Then("the Library lists {int} archetype", async ({ page }, n: number) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+// so the Workshop still lists a single archetype after two placements.
+Then("the Workshop lists {int} archetype", async ({ page }, n: number) => {
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await expect(page.locator("[data-archetype]")).toHaveCount(n);
 });
 
 Then("the project {string} shows its placements", async ({ page }, name: string) => {
-    // The placement may have been made from the *Library* side (the reverse "place
-    // on a project…" flow leaves you on Library); the project tree lives under the
+    // The placement may have been made from the *Workshop* side (the reverse "place
+    // on a project…" flow leaves you on Workshop); the project tree lives under the
     // Projects facet, so pivot there before reading it.
     await page.locator(".facet", { hasText: "Projects" }).click();
     await ensureArchetypeLens(page, name);
@@ -1114,7 +1117,7 @@ Then("the project {string} shows its placements", async ({ page }, name: string)
 
 // Fork (ADR 0035/0038).
 When("I fork the archetype {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
@@ -1124,7 +1127,7 @@ When("I fork the archetype {string}", async ({ page }, name: string) => {
 });
 
 Then("I see a forked copy of the archetype {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await expect(page.locator("[data-archetype] .node-label", { hasText: `${name} (fork)` }).first()).toBeVisible();
 });
 
@@ -1168,7 +1171,7 @@ Then("the fork point marker is visible", async ({ page }) => {
 
 // An edit chat is created under an archetype, via its context menu.
 When("I create an edit chat under the archetype {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
@@ -1183,10 +1186,9 @@ When("I create an edit chat under the archetype {string}", async ({ page }, name
 // The chat's kind (its root) is shown read-only, with no toggle and no composer
 // caption. It is anchored on the header's status gem rather than the context slot:
 // the gem's glyph *is* the kind and it is present for every selected chat, while
-// the context slot names the project and is deliberately empty in the Personal
-// project, which names nothing a reader does not already know.
+// Chat kind remains visible in the selected navigation row.
 Then("the chat pane kind is {string}", async ({ page }, kind: string) => {
-    await expect(page.locator(`.chat-heading .status-gem[data-kind="${kind}"]`)).toBeVisible();
+    await expect(page.locator(`[data-chat].active .status-gem[data-kind="${kind}"]`)).toBeVisible();
 });
 
 Then("an edit chat is marked in the nav", async ({ page }) => {
@@ -1231,6 +1233,14 @@ Then("the file view shows {string}", async ({ page }, text: string) => {
     await expect(page.locator("[data-file-view]")).toContainText(text);
 });
 
+Then("the file editor shows {string}", async ({ page }, text: string) => {
+    await expect(page.locator("[data-file-edit]")).toHaveValue(new RegExp(text));
+});
+
+Then("the {string} tab is absent", async ({ page }, tab: string) => {
+    await expect(page.locator(`[data-viewer-tabs] .tab[data-tab="${tab}"]`)).toHaveCount(0);
+});
+
 When("I open the {string} tab", async ({ page }, tab: string) => {
     // The visible label may be plain language ("changes" for the diff), so match
     // the stable data-tab mode value the feature passes (view/edit/diff).
@@ -1244,7 +1254,7 @@ Then("the diff shows {string}", async ({ page }, text: string) => {
 // ---- the review/audit shelf (an overlay surface) ----
 
 When("I open the audit shelf", async ({ page }) => {
-    await page.getByRole("button", { name: "History", exact: true }).click();
+    await openChatOption(page, "History");
     // In the user-facing build the Activity list is the only thing in the drawer
     // (no tabs); the tab only exists under dev mode. Click it only if present.
     const auditTab = page.locator('.shelf-drawer .tab[data-tab="audit"]');
@@ -1268,9 +1278,9 @@ Then("the audit timeline shows {string}", async ({ page }, text: string) => {
 // ---- archetype settings (config) ----
 
 When("I open the config editor", async ({ page }) => {
-    // Settings live on the archetype now (ADR 0035): Library → right-click the
+    // Settings live on the archetype now (ADR 0035): Workshop → right-click the
     // default archetype → settings.
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page.locator("[data-archetype] .tree-node.archetype").first().click({ button: "right" });
     await page.locator(".menu-item", { hasText: /^settings$/ }).click();
     await expect(page.locator("[data-config-editor]")).toBeVisible();
@@ -1319,7 +1329,8 @@ When("I reload as the desktop app and add the repository plugin folder", async (
         });
     }, { selectedPath: pluginPath });
     await page.reload();
-    const addFiles = page.getByRole("button", { name: "Add files" });
+    await page.getByRole("button", { name: "Files menu" }).click();
+    const addFiles = page.getByRole("menuitem", { name: "Import folder…" });
     await expect(addFiles).toBeVisible();
     const responsePromise = page.waitForResponse((response) => {
         const url = new URL(response.url());
@@ -1715,14 +1726,10 @@ Then("the run pane is labelled {string}", async ({ page }, label) => {
     await expect(page.locator(".panel.run > .panel-heading")).toContainText(label);
 });
 Then("the content pane is labelled {string}", async ({ page }, label) => {
-    await expect(page.locator(".panel.content .panel-body > h2")).toContainText(label);
+    await expect(page.locator(".panel.content [data-content-title]")).toContainText(label);
 });
 Then("the run pane has no caption row", async ({ page }) => {
     await expect(page.locator(".panel.run > .panel-heading")).toHaveCount(0);
-});
-Then("the content pane shows the viewer tabs in place of its caption", async ({ page }) => {
-    await expect(page.locator(".panel.content .panel-body > h2")).toHaveCount(0);
-    await expect(page.locator(".panel.content .tabs .tab").first()).toBeVisible();
 });
 Then("the workspace pane is labelled {string}", async ({ page }, label) => {
     await expect(page.locator(".panel.workspace .panel-body > h2")).toContainText(label);
@@ -1866,8 +1873,8 @@ Then("the agent is idle", async ({ page }) => {
 
 // ---- round-1: on-ramps & plain language ----
 
-// The chat-status badge (#4): a real coloured pill whose visible text is plain.
-Then("the chat status badge reads {string}", async ({ page }, label: string) => {
+// The chat lane retains a screen-reader status as its visible header goes away.
+Then("the chat run state reads {string}", async ({ page }, label: string) => {
     await expect(page.getByTestId("run-phase")).toContainText(label);
 });
 
@@ -1893,26 +1900,24 @@ When("I choose the first method in the picker", async ({ page }) => {
     await pickFirstMethod(page);
 });
 
-// Use an archetype with no placement (ADR 0045): from the Library, its menu opens a
+// Use an archetype with no placement (ADR 0045): from the Workshop, its menu opens a
 // work chat in the hidden Personal project directly — no place picker.
 When("I use the archetype {string} from its menu", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
         .click({ button: "right" });
     // The label lives in `.menu-item-label`; the `.menu-item` text also carries the
     // hint, so anchor on the label span (the click bubbles to the item).
-    // The Library menu label is "test" (run the method to try it out) — same action
+    // The Workshop menu label is "test" (run the method to try it out) — same action
     // as the old "use": opens a work chat in the hidden Personal project.
     await page.locator(".menu-item-label", { hasText: /^test$/ }).click();
 });
 
 Then("a work chat opens", async ({ page }) => {
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
-    // This opens into the hidden Personal project, whose context slot is empty by
-    // design, so the kind is read from the gem — the element that carries it.
-    await expect(page.locator('.chat-heading .status-gem[data-kind="work"]')).toBeVisible();
+    await expect(page.locator('[data-chat].active .status-gem[data-kind="work"]')).toBeVisible();
 });
 
 // ---- auto-titling a new chat (#4, round 2) ----
@@ -1935,7 +1940,7 @@ Then("I can stash messages before running", async ({ page }) => {
 // An archetype's settings open from its right-click menu (the empty-state hint
 // link was removed — settings/edit now live in the context menu).
 When("I click the settings link on the method {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
@@ -2097,13 +2102,13 @@ Then("the review offers no internal-file toggle", async ({ page }) => {
     await expect(page.locator("[data-diff-internal-toggle]")).toHaveCount(0);
 });
 
-// The chat header leads with the chat's own name (#6) so two chats under one
-// method are distinguishable.
-Then("the chat header shows the title {string}", async ({ page }, title: string) => {
-    await expect(page.locator("[data-chat-title]")).toContainText(title);
+// The selected navigation row carries the chat's own name, distinguishing two
+// chats under one method.
+Then("the selected chat row shows the title {string}", async ({ page }, title: string) => {
+    await expect(page.locator("[data-chat].active .leaf-title")).toContainText(title);
 });
 
-// Rename the currently-open chat from its nav row. The header reads a library
+// Rename the currently-open chat from its nav row. The context reads a library
 // projection, so it must reflect this live off the workspace event stream.
 When("I rename the open chat to {string}", async ({ page }, name: string) => {
     await page.locator("[data-chat].active").click({ button: "right" });
@@ -2186,16 +2191,16 @@ Then("the matched text {string} is highlighted in the results", async ({ page },
 // The create affordance is hidden while a search is active so it can't read as a
 // stray hit (#6 round-9).
 Then("I can create a new method", async ({ page }) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await expect(page.getByText("+ archetype", { exact: true })).toBeVisible();
 });
 Then("I cannot create a new method", async ({ page }) => {
     await expect(page.getByText("+ archetype", { exact: true })).toHaveCount(0);
 });
 
-// Open the context menu on a named archetype (Library facet).
+// Open the context menu on a named archetype (Workshop facet).
 When("I open the context menu on the archetype {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
@@ -2222,7 +2227,7 @@ Then("the composer placeholder does not mention {string}", async ({ page }, word
 
 // Rename selects the existing name so it can be typed straight over (#smaller r9).
 When("I start renaming the archetype {string}", async ({ page }, name: string) => {
-    await page.locator(".facet", { hasText: "Library" }).click();
+    await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
@@ -2243,12 +2248,12 @@ Then("the rename field has the existing name selected", async ({ page }) => {
 
 // ---- round 10: honest improve vocabulary, legible status, clearer review chrome ----
 
-// #4 — the per-chat status was a 10px grey whisper; it must read at a legible size.
-Then("the status badge text is at least {int}px", async ({ page }, px: number) => {
-    const size = await page
-        .getByTestId("run-phase")
-        .evaluate((el) => parseFloat(getComputedStyle(el as HTMLElement).fontSize));
-    expect(size).toBeGreaterThanOrEqual(px);
+// The top strip now exposes secondary actions through one menu control.
+Then("the chat lane has one options button", async ({ page }) => {
+    await expect(page.locator("[data-chat-options-trigger]")).toBeVisible();
+    await expect(page.locator(".chat-toolbar button")).toHaveCount(2);
+    await page.locator("[data-chat-options-trigger]").click();
+    await expect(page.locator("[data-chat-options-menu] [role=menuitem]")).toHaveCount(3);
 });
 
 // #6 — the hidden-config disclosure must not read like the changed-file count that
@@ -2269,7 +2274,7 @@ Then("the internal-file toggle reveals the hidden config files", async ({ page }
 // ---- RF-E1 / O-1: context-sources panel -----------------------------------
 
 When("I open the context sources panel", async ({ page }) => {
-    await page.locator("[data-open-sources]").click();
+    await openChatOption(page, "Context sources");
     await expect(page.locator("[data-context-overlay]")).toBeVisible();
 });
 
@@ -2297,7 +2302,7 @@ Given("a withheld context source", async ({ page, request }) => {
         throw new Error(`access resource seed failed: ${response.status()} ${await response.text()}`);
     }
     await page.goto("/?chat=access-contract");
-    await page.locator("[data-open-sources]").click();
+    await openChatOption(page, "Context sources");
     await expect(page.locator('[data-context-source="withheld-context"]')).toHaveAttribute(
         "data-availability",
         "pending",
@@ -2344,7 +2349,7 @@ When("I task the agent and let the turn settle", async ({ page }) => {
 });
 
 When("I open the outputs catalog", async ({ page }) => {
-    await page.getByRole("button", { name: "History", exact: true }).click();
+    await openChatOption(page, "History");
     await page.locator('.shelf-drawer .tab[data-tab="outputs"]').click();
     await expect(page.locator("[data-output-catalog]")).toBeVisible();
 });
@@ -2380,7 +2385,7 @@ Given("a desktop chat with a source-approved output", async ({ page, request }) 
         });
     }, { selectedPath: exportDestination });
     await page.goto("/?chat=export-contract");
-    await page.getByRole("button", { name: "History", exact: true }).click();
+    await openChatOption(page, "History");
     await page.locator('.shelf-drawer .tab[data-tab="outputs"]').click();
     await expect(page.locator('[data-output="out-export-contract"]')).toBeVisible();
     await expect(page.locator('[data-save-output="out-export-contract"]')).toBeVisible();

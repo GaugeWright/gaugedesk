@@ -17,6 +17,7 @@ Feature: A whip program's Structure and Instances views
     When I select the file "gates/inbound.whip" in the workspace
     Then the content viewer offers the "structure" tab
     And the content viewer offers the "instances" tab
+    And the content viewer does not offer the "view" tab
     When I select the file "agent-note.txt" in the workspace
     Then the content viewer does not offer the "structure" tab
     And the content viewer does not offer the "instances" tab

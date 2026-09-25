@@ -1,11 +1,11 @@
 /**
  * The facet browser (`navigation.md` B2, ADR 0035/0036): the nav is
- * **project-first** — facets **Recent | Projects | Library**, defaulting to
+ * **project-first** — facets **Recent | Projects | Workshop**, defaulting to
  * Projects. It renders a projection (`GET /workspace`) and submits commands; it
  * never owns truth (`INV-5`).
  *
  * The model (ADR 0035): an **archetype** is the reusable, named behaviour shown
- * in the Library (the UI calls it an "Agent" throughout); a
+ * in the Workshop (the UI calls it an "Agent" throughout); a
  * **placement** is an archetype installed on a **project** (Projects) — what you
  * chat with to do work. A chat's **kind** is its ROOT, fixed at creation: rooted
  * on an archetype ⇒ an **edit** chat; rooted on a placement ⇒ a **work** chat.
@@ -104,7 +104,7 @@ function projectBlastRadius(p: { placements: { chats: unknown[] }[] }): string |
 const FACETS: { id: Facet; label: string }[] = [
     { id: "recent", label: "Recent" },
     { id: "projects", label: "Projects" },
-    { id: "library", label: "Library" },
+    { id: "library", label: "Workshop" },
 ];
 
 export interface FacetBrowserApi {
@@ -408,9 +408,8 @@ export function FacetBrowser(props: {
             else next.add(id);
             return next;
         });
-    // inline editor: creating or renaming a named node.
+    // inline editor: creating or renaming a named tree node.
     const [editing, setEditing] = createSignal<
-        | { kind: "new-archetype" }
         | { kind: "new-project" }
         | { kind: "rename-archetype"; id: ArchetypeId }
         | { kind: "rename-project"; id: ProjectId }
@@ -468,7 +467,11 @@ export function FacetBrowser(props: {
         document.removeEventListener("pointerup", finishPointerDrag);
     });
     const [editText, setEditText] = createSignal("");
+    const [newAgentOpen, setNewAgentOpen] = createSignal(false);
+    const [newAgentName, setNewAgentName] = createSignal("");
     const [newAgentKind, setNewAgentKind] = createSignal<AgentKind>("work");
+    const [creatingAgent, setCreatingAgent] = createSignal(false);
+    const [createAgentError, setCreateAgentError] = createSignal("");
 
     // The "add a method" picker (#1): from a project, choose *which* archetype to
     // install on it, rather than the app silently placing an arbitrary one. (The
@@ -577,17 +580,64 @@ export function FacetBrowser(props: {
         setEditing(kind);
     }
 
+    function openCreateAgent() {
+        setEditing(null);
+        setNewAgentName("");
+        setNewAgentKind("work");
+        setCreateAgentError("");
+        setNewAgentOpen(true);
+    }
+
+    async function submitNewAgent(event: SubmitEvent) {
+        event.preventDefault();
+        const name = newAgentName().trim();
+        if (!name || creatingAgent()) return;
+        const kind = newAgentKind();
+        setCreatingAgent(true);
+        setCreateAgentError("");
+        try {
+            await props.api.createArchetype(name, kind);
+        } catch (error) {
+            setCreateAgentError(error instanceof Rejected ? error.reason : String(error));
+            setCreatingAgent(false);
+            return;
+        }
+        setNewAgentOpen(false);
+        setCreatingAgent(false);
+        props.onStatus(`${kind === "panel" ? "Panel agent" : "Agent"} "${name}" created`);
+        if (!props.deltaSync) {
+            try {
+                await refetch();
+            } catch (error) {
+                props.onStatus(`Agent created, but Workshop could not refresh: ${String(error)}`);
+            }
+        }
+    }
+
+    function createAgentKeyDown(event: KeyboardEvent & { currentTarget: HTMLFormElement }) {
+        if (event.key === "Escape" && !creatingAgent()) {
+            event.preventDefault();
+            setNewAgentOpen(false);
+        }
+        if (event.key !== "Tab") return;
+        const controls = [...event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled)")];
+        const first = controls[0];
+        const last = controls.at(-1);
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first?.focus();
+        }
+    }
+
     async function commitEdit() {
         const e = editing();
         const text = editText().trim();
         setEditing(null);
         if (!e || !text) return;
         switch (e.kind) {
-            case "new-archetype":
-                return withRefresh(
-                    () => props.api.createArchetype(text, newAgentKind()),
-                    `${newAgentKind() === "panel" ? "Panel agent" : "Agent"} "${text}" created`,
-                );
             case "new-project":
                 return withRefresh(() => props.api.createProject(text), `project "${text}" created`);
             case "rename-archetype":
@@ -887,14 +937,7 @@ export function FacetBrowser(props: {
             placeholder={placeholder}
             value={editText()}
             onInput={(ev) => setEditText(ev.currentTarget.value)}
-            onBlur={() => {
-                // Creating an Agent includes a kind selector beside this input.
-                // Moving focus to that selector is still part of the same form,
-                // not an implicit submit/cancel. Agent creation is therefore
-                // confirmed explicitly with Enter; ordinary renames and the
-                // single-field create rows keep the familiar blur-to-commit.
-                if (editing()?.kind !== "new-archetype") void commitEdit();
-            }}
+            onBlur={() => void commitEdit()}
             onClick={(ev) => ev.stopPropagation()}
             onKeyDown={(ev) => {
                 if (ev.key === "Enter") commitEdit();
@@ -1129,7 +1172,7 @@ export function FacetBrowser(props: {
         </div>
     );
 
-    // A Library archetype row's menu (shared by right-click and the ⋯ button).
+    // A Workshop archetype row's menu (shared by right-click and the ⋯ button).
     type ArchetypeNode = Workspace["archetypes"][number];
     const archetypeMenuItems = (a: ArchetypeNode): MenuState["items"] => [
         ...(a.kind === "work"
@@ -1169,7 +1212,7 @@ export function FacetBrowser(props: {
         return chatGroups(rows.map(({ chat }) => chat), projectWorkstreams);
     };
 
-    // The structural chat-leaf renderer for Projects and Library.
+    // The structural chat-leaf renderer for Projects and Workshop.
     // One element ⇒ one behavior: select+focus on click, the same rename/delete
     // context menu, the same active styling + kind badge. `meta` is an optional
     // right-aligned lineage label when a rooted tree needs one.
@@ -2035,19 +2078,10 @@ export function FacetBrowser(props: {
                             <Show when={!searching()}>
                             {/* No facet-level "+ workstream" here: a workstream is a shared line
                                 over one archetype's edit chats, so it lives per-archetype (below),
-                                not at the Library root where there's no single target. */}
+                                not at the Workshop root where there's no single target. */}
                             <div class="action-row" data-actions="library">
-                                {createBtn("+ agent", () => { setNewAgentKind("work"); startEdit({ kind: "new-archetype" }); }, { title: "Create an Agent or Panel agent" })}
+                                {createBtn("+ agent", openCreateAgent, { title: "Create an Agent or Panel agent" })}
                             </div>
-                            </Show>
-                            <Show when={editing()?.kind === "new-archetype"}>
-                                <div class="tree-leaf">
-                                    <div class="deployment-actions">
-                                        <button type="button" classList={{ active: newAgentKind() === "work" }} onMouseDown={(event) => event.preventDefault()} onClick={() => setNewAgentKind("work")}>Agent</button>
-                                        <button type="button" classList={{ active: newAgentKind() === "panel" }} onMouseDown={(event) => event.preventDefault()} onClick={() => setNewAgentKind("panel")}>Panel agent</button>
-                                    </div>
-                                    {renameInput(`name this ${newAgentKind() === "panel" ? "Panel agent" : "Agent"}, then Enter`)}
-                                </div>
                             </Show>
                             <For
                                 each={t().archetypes.filter((a) => archetypeVisible(a, query(), contentHits()))}
@@ -2107,7 +2141,7 @@ export function FacetBrowser(props: {
                                                 ↰ forked from {a.forkedFromName ?? "another method"}
                                             </div>
                                         </Show>
-                                        {/* Library is where you EDIT and TEST a method: edit is the row's
+                                        {/* Workshop is where you EDIT and TEST a method: edit is the row's
                                             primary action; test and the shared-line create live in the row
                                             menu (ADR 0112) — several edit chats can be open at once, and
                                             the merge model keeps them in sync. */}
@@ -2122,6 +2156,58 @@ export function FacetBrowser(props: {
 
                     </>
                 )}
+            </Show>
+
+            <Show when={newAgentOpen()}>
+                <div class="modal-overlay" data-create-agent onClick={() => { if (!creatingAgent()) setNewAgentOpen(false); }}>
+                    <form
+                        class="modal create-agent-dialog"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="create-agent-title"
+                        onClick={(event) => event.stopPropagation()}
+                        onKeyDown={createAgentKeyDown}
+                        onSubmit={(event) => void submitNewAgent(event)}
+                    >
+                        <div class="modal-head">
+                            <div>
+                                <span class="create-agent-eyebrow">Workshop</span>
+                                <h3 id="create-agent-title">Create an agent</h3>
+                            </div>
+                            <button type="button" class="create-agent-close" aria-label="Close" disabled={creatingAgent()} onClick={() => setNewAgentOpen(false)}>×</button>
+                        </div>
+                        <p class="create-agent-intro">Choose where this agent will work. You can shape its behavior after creating it.</p>
+                        <div class="create-agent-kinds" role="group" aria-label="Agent type">
+                            <button type="button" class="create-agent-kind" classList={{ selected: newAgentKind() === "work" }} aria-pressed={newAgentKind() === "work"} disabled={creatingAgent()} onClick={() => setNewAgentKind("work")}>
+                                <strong>Agent</strong>
+                                <span>Works with you in project chats</span>
+                            </button>
+                            <button type="button" class="create-agent-kind" classList={{ selected: newAgentKind() === "panel" }} aria-pressed={newAgentKind() === "panel"} disabled={creatingAgent()} onClick={() => setNewAgentKind("panel")}>
+                                <strong>Panel agent</strong>
+                                <span>Runs in an embeddable panel</span>
+                            </button>
+                        </div>
+                        <label class="create-agent-name">
+                            <span>Name</span>
+                            <input
+                                ref={(element) => queueMicrotask(() => element.focus())}
+                                value={newAgentName()}
+                                onInput={(event) => { setNewAgentName(event.currentTarget.value); setCreateAgentError(""); }}
+                                placeholder="Give this agent a name"
+                                autocomplete="off"
+                                disabled={creatingAgent()}
+                                required
+                            />
+                        </label>
+                        <Show when={createAgentError()}><p class="create-agent-error" role="alert">{createAgentError()}</p></Show>
+                        <div class="create-agent-actions">
+                            <button type="button" disabled={creatingAgent()} onClick={() => setNewAgentOpen(false)}>Cancel</button>
+                            <button type="submit" class="create-agent-submit" disabled={!newAgentName().trim() || creatingAgent()}>
+                                {creatingAgent() ? "Creating…" : `Create ${newAgentKind() === "panel" ? "Panel agent" : "agent"}`}
+                            </button>
+                        </div>
+                    </form>
+                </div>
             </Show>
             </Show>
 
@@ -2288,7 +2374,7 @@ export function FacetBrowser(props: {
                                                 each={(tree()?.archetypes ?? []).filter((a) =>
                                                     a.name.toLowerCase().includes(pickerQuery().trim().toLowerCase()),
                                                 )}
-                                                fallback={<div class="status">No Agents yet — create one in the Library first.</div>}
+                                                fallback={<div class="status">No Agents yet — create one in the Workshop first.</div>}
                                             >
                                                 {(a) => (
                                                     <button
@@ -2301,13 +2387,13 @@ export function FacetBrowser(props: {
                                                     </button>
                                                 )}
                                             </For>
-                                            {/* Empty-library escape hatch: jump to the Library to
+                                            {/* Empty-library escape hatch: jump to the Workshop to
                                                 define a new Agent, so the picker is never a dead end. */}
                                             <button
                                                 type="button"
                                                 class="picker-row picker-create"
                                                 data-picker-create
-                                                onClick={() => { setPicker(null); setFacet("library"); startEdit({ kind: "new-archetype" }); }}
+                                                onClick={() => { setPicker(null); setFacet("library"); openCreateAgent(); }}
                                             >
                                                 + create a new Agent
                                             </button>

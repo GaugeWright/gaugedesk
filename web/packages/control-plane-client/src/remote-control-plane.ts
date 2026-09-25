@@ -52,6 +52,7 @@ export interface ControlPlane {
         action: MergeAction,
     ): Promise<MergeState>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
+    manageFile?(id: EngagementId, command: workbench.FileManagerCommand): Promise<void>;
     getFile(id: EngagementId, path: string): Promise<string>;
     /** `getFile` plus the cut the read serves (SUB-6 §12) — the base a
      *  cut-carrying save sends back. */
@@ -361,6 +362,10 @@ export class RemoteControlPlane implements ControlPlane {
 
     getTree(id: EngagementId) {
         return workbench.getTree(this.transport(), id);
+    }
+
+    manageFile(id: EngagementId, command: workbench.FileManagerCommand) {
+        return workbench.manageFile(this.transport(), id, command);
     }
 
     async getFile(id: EngagementId, path: string) {

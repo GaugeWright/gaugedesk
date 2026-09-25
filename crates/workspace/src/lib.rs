@@ -2106,6 +2106,70 @@ impl Engagement {
         std::fs::write(path, content).map_err(WorkspaceError::io)
     }
 
+    /// Human file-manager commands refuse symlinks and occupied destinations.
+    /// The ordinary editor's overwrite route has a different, base-carrying
+    /// contract; creation and rename must never silently replace work.
+    pub fn create_file_if_absent(&self, relative: &str) -> Result<()> {
+        self.ensure_projection()?;
+        self.ensure_selected_path(relative)?;
+        let path = safe_manage_path(&self.path, relative)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map(|_| ())
+            .map_err(WorkspaceError::io)
+    }
+
+    /// Git records files, not empty directories. A hidden tracked marker keeps
+    /// a user-created folder present after a projection is rematerialized.
+    pub fn create_folder(&self, relative: &str) -> Result<()> {
+        self.ensure_projection()?;
+        self.ensure_selected_path(relative)?;
+        let path = safe_manage_path(&self.path, relative)?;
+        std::fs::create_dir(&path).map_err(WorkspaceError::io)?;
+        let marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.join(".gaugedesk-folder"))
+            .map(|_| ())
+            .map_err(WorkspaceError::io);
+        if marker.is_err() {
+            let _ = std::fs::remove_dir(path);
+        }
+        marker
+    }
+
+    pub fn rename_entry(&self, from: &str, to: &str) -> Result<()> {
+        self.ensure_projection()?;
+        self.ensure_selected_path(from)?;
+        self.ensure_selected_path(to)?;
+        let source = safe_manage_path(&self.path, from)?;
+        let destination = safe_manage_path(&self.path, to)?;
+        if source.parent() != destination.parent() {
+            return Err(WorkspaceError::msg("rename must stay in the same folder"));
+        }
+        std::fs::symlink_metadata(&source).map_err(WorkspaceError::io)?;
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) => return Err(WorkspaceError::msg("destination already exists")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorkspaceError::io(error)),
+        }
+        std::fs::rename(source, destination).map_err(WorkspaceError::io)
+    }
+
+    pub fn delete_entry(&self, relative: &str) -> Result<()> {
+        self.ensure_projection()?;
+        self.ensure_selected_path(relative)?;
+        let path = safe_manage_path(&self.path, relative)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(WorkspaceError::io)?;
+        if metadata.is_dir() {
+            std::fs::remove_dir_all(path).map_err(WorkspaceError::io)
+        } else {
+            std::fs::remove_file(path).map_err(WorkspaceError::io)
+        }
+    }
+
     /// Place an already-written file at `relative`, consuming `source`.
     ///
     /// A streamed upload never holds its bytes in memory — they went to a
@@ -3281,6 +3345,18 @@ pub trait ChatWorkspace: Send {
         Ok(None)
     }
     fn write_file(&self, rel: &str, content: &str) -> Result<()>;
+    fn create_file_if_absent(&self, _rel: &str) -> Result<()> {
+        Err(WorkspaceError::msg("this workspace cannot create files"))
+    }
+    fn create_folder(&self, _rel: &str) -> Result<()> {
+        Err(WorkspaceError::msg("this workspace cannot create folders"))
+    }
+    fn rename_entry(&self, _from: &str, _to: &str) -> Result<()> {
+        Err(WorkspaceError::msg("this workspace cannot rename entries"))
+    }
+    fn delete_entry(&self, _rel: &str) -> Result<()> {
+        Err(WorkspaceError::msg("this workspace cannot delete entries"))
+    }
     /// Write exact bytes for an admitted target effect.
     fn write_file_bytes(&self, rel: &str, content: &[u8]) -> Result<()> {
         let body = std::str::from_utf8(content)
@@ -3621,6 +3697,18 @@ impl ChatWorkspace for Engagement {
     fn write_file(&self, relative: &str, content: &str) -> Result<()> {
         self.write_file(relative, content)
     }
+    fn create_file_if_absent(&self, relative: &str) -> Result<()> {
+        Engagement::create_file_if_absent(self, relative)
+    }
+    fn create_folder(&self, relative: &str) -> Result<()> {
+        Engagement::create_folder(self, relative)
+    }
+    fn rename_entry(&self, from: &str, to: &str) -> Result<()> {
+        Engagement::rename_entry(self, from, to)
+    }
+    fn delete_entry(&self, relative: &str) -> Result<()> {
+        Engagement::delete_entry(self, relative)
+    }
     fn write_file_bytes(&self, relative: &str, content: &[u8]) -> Result<()> {
         self.ensure_projection()?;
         self.ensure_selected_path(relative)?;
@@ -3767,6 +3855,34 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(root.join(path))
 }
 
+fn safe_manage_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    if relative.is_empty()
+        || relative.contains('\\')
+        || relative.chars().any(char::is_control)
+        || relative
+            .split('/')
+            .any(|part| matches!(part, "" | ".git" | ".gaugedesk-folder"))
+    {
+        return Err(WorkspaceError::msg("file-manager path is reserved"));
+    }
+    let path = safe_path(root, relative)?;
+    let mut cursor = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(WorkspaceError::msg(
+                    "file-manager paths cannot follow symlinks",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorkspaceError::io(error)),
+        }
+    }
+    Ok(path)
+}
+
 fn walk_tree(root: &Path, directory: &Path, result: &mut Vec<FileEntry>) -> std::io::Result<()> {
     if !directory.exists() {
         return Ok(());
@@ -3832,6 +3948,33 @@ mod tests {
         )
         .expect("init");
         (directory, instance)
+    }
+
+    #[test]
+    fn file_manager_refuses_symlink_traversal_and_occupied_names() {
+        let (directory, instance) = instance();
+        let chat = instance.create_engagement("file-manager").expect("chat");
+        chat.create_folder("notes").expect("folder");
+        chat.create_file_if_absent("notes/todo.md").expect("file");
+        assert!(chat.create_file_if_absent("notes/todo.md").is_err());
+        assert!(chat
+            .rename_entry("notes/todo.md", "notes/.gaugedesk-folder")
+            .is_err());
+        assert!(chat
+            .tree()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.path == "notes/.gaugedesk-folder"));
+        chat.commit_turn("create notes").expect("record folder");
+
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, chat.path().join("link")).unwrap();
+            assert!(chat.create_file_if_absent("link/escape.md").is_err());
+            assert!(!outside.join("escape.md").exists());
+        }
     }
 
     /// DR-0192: a product-maintained target's head is exactly what the release

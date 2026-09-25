@@ -9,8 +9,9 @@
 //! account-owner half — the reusable, testable base the hub wraps.
 
 use axum::{
+    body::Bytes,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
@@ -144,6 +145,22 @@ pub async fn post_tenant(
     headers: HeaderMap,
     Json(body): Json<CreateTenantBody>,
 ) -> impl IntoResponse {
+    // The desktop keeps the signed-in account session sealed here. Its picker
+    // reads memberships from the Hub's Account Settings projection, so a new
+    // organization must be created by that same authority. Preserve the
+    // request's idempotency key when forwarding it.
+    if net_http::bearer(&headers).is_none()
+        && crate::account_signin::hub_session_actor(&wb).is_some()
+    {
+        return crate::account_signin::proxy_account_authority(
+            &wb,
+            Method::POST,
+            "/account/tenants".to_owned(),
+            headers,
+            Bytes::from(json!({ "display_name": body.display_name }).to_string()),
+        )
+        .await;
+    }
     let display_name = body.display_name.trim();
     if display_name.is_empty() {
         return (

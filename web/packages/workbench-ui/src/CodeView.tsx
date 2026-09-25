@@ -12,11 +12,11 @@
  * reached through `lazy()`, so nothing here is fetched until someone opens a
  * file we have a language for.
  *
- * Highlighting is presentation only. It never changes a byte, and the Edit tab
- * still shows the file exactly as it is on disk.
+ * Highlighting is presentation only. It never changes a byte; the Edit tab
+ * keeps a native textarea over this rendering for input, selection and undo.
  */
 
-import { createMemo } from "solid-js";
+import { createMemo, Show } from "solid-js";
 import hljs from "highlight.js/lib/core";
 
 import bash from "highlight.js/lib/languages/bash";
@@ -56,6 +56,7 @@ import swift from "highlight.js/lib/languages/swift";
 import typescript from "highlight.js/lib/languages/typescript";
 import xml from "highlight.js/lib/languages/xml";
 import yaml from "highlight.js/lib/languages/yaml";
+import whipplescript from "./whipplescript-grammar";
 
 /** Every grammar `syntaxLanguageFor` can name. A language missing here would
  *  leave its files plain rather than break them, which is why that map and
@@ -64,7 +65,7 @@ const GRAMMARS: Readonly<Record<string, Parameters<typeof hljs.registerLanguage>
     bash, c, cpp, csharp, css, d, dart, diff, dockerfile, elixir, go, graphql,
     groovy, haskell, ini, java, javascript, json, kotlin, less, lua, makefile,
     objectivec, perl, php, powershell, python, r, ruby, rust, scala, scss, sql,
-    swift, typescript, xml, yaml,
+    swift, typescript, whipplescript, xml, yaml,
 };
 
 for (const [name, grammar] of Object.entries(GRAMMARS)) hljs.registerLanguage(name, grammar);
@@ -75,9 +76,16 @@ for (const [name, grammar] of Object.entries(GRAMMARS)) hljs.registerLanguage(na
  *  line anyway. Such a file still renders, just plainly. */
 const MAX_HIGHLIGHTED_CHARACTERS = 400_000;
 
-export function CodeView(props: { readonly text: string; readonly language: string }) {
+export function CodeView(props: {
+    readonly text: string;
+    readonly language: string;
+    readonly editor?: boolean;
+    readonly onReady?: (element: HTMLPreElement) => void;
+}) {
     const html = createMemo(() => {
-        if (props.text.length > MAX_HIGHLIGHTED_CHARACTERS) return null;
+        // The editor re-highlights on each keystroke. Keep that synchronous
+        // work much smaller than the one-off read in View.
+        if (props.text.length > (props.editor ? 20_000 : MAX_HIGHLIGHTED_CHARACTERS)) return null;
         if (!hljs.getLanguage(props.language)) return null;
         try {
             return hljs.highlight(props.text, {
@@ -91,12 +99,12 @@ export function CodeView(props: { readonly text: string; readonly language: stri
         }
     });
     return (
-        <pre class="filebody" data-file-view data-file-language={props.language}>
-            {/* innerHTML is safe by construction: highlight.js escapes the
-                source it is given and emits only its own `<span>` markup. */}
-            <code class="hljs" innerHTML={html() ?? undefined}>
-                {html() === null ? props.text : undefined}
-            </code>
+        <pre class="filebody" data-file-view={props.editor ? undefined : ""} data-file-language={props.language} ref={(element) => props.onReady?.(element)}>
+            <Show when={html()} fallback={<code class="hljs">{props.text}</code>}>
+                {/* innerHTML is safe by construction: highlight.js escapes the
+                    source it is given and emits only its own `<span>` markup. */}
+                {(markup) => <code class="hljs" innerHTML={markup()} />}
+            </Show>
         </pre>
     );
 }

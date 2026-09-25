@@ -1,13 +1,13 @@
 @transport
 Feature: The archetype & project library
 
-  As a user I browse and manage archetypes (the Library of methods), projects,
+  As a user I browse and manage archetypes (the Workshop of methods), projects,
   placements, and chats from the project-first facet browser (ADR 0035/0036) —
   created via affordances, edited via right-click context menus.
 
   Scenario: a fresh workbench seeds a default archetype
     Given the workbench is open
-    When I switch to the "Library" facet
+    When I switch to the "Workshop" facet
     Then I see the archetype "Default"
 
   Scenario: create an archetype and open an edit chat under it
@@ -33,7 +33,7 @@ Feature: The archetype & project library
     And I place an archetype on the project "beta-site"
     Then the project "alpha-site" shows its placements
     And the project "beta-site" shows its placements
-    And the Library lists 3 archetype
+    And the Workshop lists 3 archetype
 
   Scenario: delete an archetype via its context menu
     Given the workbench is open

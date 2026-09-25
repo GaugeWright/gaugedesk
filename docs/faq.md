@@ -12,6 +12,15 @@ The desktop workbench supports local build, run, and review. See
 [Product status](reference/status.md) for hosted, team, enterprise, mobile, and
 website capabilities.
 
+## Will my work keep running when I close GaugeDesk?
+
+Closing the desktop window leaves its local Project Host running. Reopen
+GaugeDesk from the system tray or menu bar. Choose **Quit GaugeDesk** there to
+stop it. **Start at login** in that menu is optional and off by default; when
+enabled, GaugeDesk starts without opening a window. Local work cannot run while
+the computer sleeps, its user session is logged out, it is shut down, or
+GaugeDesk has been quit.
+
 ## Why was an action denied?
 
 The run lacked permission for a file, tool, network route, or output. Inspect

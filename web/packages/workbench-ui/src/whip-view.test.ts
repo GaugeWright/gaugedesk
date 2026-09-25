@@ -22,8 +22,7 @@ import {
 
 describe("tabsForPath", () => {
     it("gives a whip program the two extra views, in reading order", () => {
-        expect(tabsForPath("gates/inbound.whip")).toEqual([
-            "view",
+        expect(tabsForPath("gates/inbound.whip", { view: false, edit: true })).toEqual([
             "structure",
             "instances",
             "edit",
@@ -31,11 +30,13 @@ describe("tabsForPath", () => {
         ]);
     });
 
-    it("leaves every other file with the three tabs it always had", () => {
-        expect(tabsForPath("README.md")).toEqual(["view", "edit", "diff"]);
-        expect(tabsForPath(null)).toEqual(["view", "edit", "diff"]);
-        // A file merely mentioning the extension is not a program.
-        expect(tabsForPath("notes/about-whip-files.md")).toEqual(["view", "edit", "diff"]);
+    it("only offers the supported file actions", () => {
+        expect(tabsForPath("README.md", { view: true, edit: true })).toEqual(["view", "edit", "diff"]);
+        expect(tabsForPath("notes.txt", { view: false, edit: true })).toEqual(["edit", "diff"]);
+        expect(tabsForPath("image.png", { view: true, edit: false })).toEqual(["view", "diff"]);
+        expect(tabsForPath("bundle.zip", { view: false, edit: false })).toEqual(["diff"]);
+        expect(tabsForPath(null, { view: false, edit: false })).toEqual(["view", "diff"]);
+        expect(tabsForPath("notes/about-whip-files.md", { view: true, edit: true })).toEqual(["view", "edit", "diff"]);
     });
 });
 

@@ -169,7 +169,7 @@ export interface SettingsPanelProps {
     /** Hosted billing owns managed-plan writes; those compositions project the plan
      *  and usage but must not offer the local editor. */
     readonly managedInferenceEditable?: boolean;
-    /** Library sync needs the sovereign root key the co-resident desktop holds. */
+    /** Workshop sync needs the sovereign root key the co-resident desktop holds. */
     readonly librarySyncAvailable?: boolean;
     /** Where the account and its organizations are actually administered. Absent →
      *  the room does not point at a Hub this composition cannot reach. */
@@ -606,19 +606,19 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                 pairParty: () => props.onPairParty(),
                 revokeDevice: (id) => void act(`revoke ${id}`, () => props.api.accountRevokeDevice(id)),
                 disconnectParty: (authority) => void act(`disconnect ${authority}`, () => props.api.revokePeer(authority)),
-                setLibrarySync: (on) => void act(on ? "turn on library sync" : "turn off library sync", async () => {
+                setLibrarySync: (on) => void act(on ? "turn on Workshop sync" : "turn off Workshop sync", async () => {
                     if (!on) {
                         const facility = librarySyncFacility();
                         if (facility) await props.api.accountDetachFacility(facility.id);
-                        return "library sync off";
+                        return "Workshop sync off";
                     }
                     await props.api.accountAttachFacility({
                         id: "library-sync",
                         kind: "library_sync",
-                        displayName: "Library sync",
+                        displayName: "Workshop sync",
                     });
                     await props.api.accountPublishLibrarySync();
-                    return "library sync on, and published ✓";
+                    return "Workshop sync on, and published ✓";
                 }),
                 publishLibrary: () => void act("publish", async () => {
                     await props.api.accountPublishLibrarySync();

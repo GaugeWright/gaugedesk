@@ -10,9 +10,9 @@ Feature: Multi-turn conversation
     And I task the agent with "second task"
     Then the run phase is "Completed"
     When I select the file "agent-note.txt" in the workspace
-    And I open the "view" tab
-    Then the file view shows "first task"
-    And the file view shows "second task"
+    And I open the "edit" tab
+    Then the file editor shows "first task"
+    And the file editor shows "second task"
 
   @live-provider
   Scenario: the conversation remembers across turns

@@ -1,5 +1,5 @@
 /**
- * Step(s) for the content viewer's default surface (View unless a review is open).
+ * Step(s) for the content viewer's empty top row.
  * Kept in its own file so it composes with the shared steps without editing them.
  */
 import { expect } from "@playwright/test";
@@ -7,6 +7,8 @@ import { createBdd } from "playwright-bdd";
 
 const { Then } = createBdd();
 
-Then("the content viewer is on the {string} tab", async ({ page }, tab: string) => {
-    await expect(page.locator(`[data-viewer-tabs] .tab[data-tab="${tab}"]`)).toHaveClass(/\bactive\b/);
+Then("the content header says only CONTENT", async ({ page }) => {
+    await expect(page.locator(".panel.content [data-content-title]")).toHaveText("Content");
+    await expect(page.locator(".panel.content [data-viewer-tabs] .tab")).toHaveCount(0);
+    await expect(page.locator(".panel.content")).not.toContainText("Pick a file");
 });

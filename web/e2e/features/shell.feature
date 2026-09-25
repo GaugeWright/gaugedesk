@@ -5,11 +5,11 @@ Feature: The workbench shell
   so I can orient myself across projects, the library of archetypes, and every
   chat (ADR 0035/0036).
 
-  Scenario: the facet browser pivots by Recent, Projects, and Library
+  Scenario: the facet browser pivots by Recent, Projects, and Workshop
     Given the workbench is open
     Then the facet "Projects" is active
     And the facet "Recent" is present
-    And the facet "Library" is present
+    And the facet "Workshop" is present
 
   Scenario: Recent is a flat chat lens with explicit lineage
     Given the workbench is open
@@ -34,7 +34,7 @@ Feature: The workbench shell
     When I clear the facet search
     Then I see the archetype "Default"
 
-  Scenario: captions are empty-state placeholders, replaced by the working rows
+  Scenario: pane labels give way to content modes when content is available
     Given the workbench is open
     Then the browse pane opens with the facet tabs and no caption
     And the run pane is labelled "Chat"
@@ -42,7 +42,7 @@ Feature: The workbench shell
     And the workspace pane is labelled "Files"
     When I start a new chat in Personal
     Then the run pane has no caption row
-    And the content pane shows the viewer tabs in place of its caption
+    And the content header says only CONTENT
     And the workspace pane is labelled "Files"
 
   Scenario: only Content and Files fold from their left edge

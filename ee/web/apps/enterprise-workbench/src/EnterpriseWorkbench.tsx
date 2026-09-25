@@ -132,6 +132,7 @@ function writeManagementLocation(app: GaugeAppKind | null, page?: string, tenant
 function OrganizationSelector(props: {
     memberships: readonly Membership[];
     selected: string | null;
+    canCreate: boolean;
     administration?: GaugeAppWorkspaceController;
     commercial?: GaugeAppWorkspaceController;
     onSelect: (id: string) => void;
@@ -242,7 +243,8 @@ function OrganizationSelector(props: {
                         <button type="button" onClick={cancelCreate} disabled={submitting()}>Cancel</button>
                     </div>
                 </form>}>
-                    <button type="button" class="organization-create-trigger" onClick={() => setCreating(true)}>New organization</button>
+                    <button type="button" class="organization-create-trigger" disabled={!props.canCreate}
+                        onClick={() => setCreating(true)}>{props.canCreate ? "New organization" : "Sign in to create an organization"}</button>
                 </Show>
                 {pageButtons(props.administration, "administration")}
                 {pageButtons(props.commercial, "commercial-operations")}
@@ -297,6 +299,7 @@ export function EnterpriseWorkbench(): JSX.Element {
         },
         onAccountErased: () => {
             setBearer(null);
+            setCreatedMembership(null);
             setTenant(null);
             setActiveApp(null);
             setProposalAccess(null);
@@ -338,10 +341,11 @@ export function EnterpriseWorkbench(): JSX.Element {
     const [accountIndex, { refetch: refetchAccountIndex }] = createGaugeAppResource(account.session,
         (session) => JSON.stringify([session.actor, session.id, session.generation]),
         (session) => api.readGaugeAppPage(session, "account"));
+    const [createdMembership, setCreatedMembership] = createSignal<Membership | null>(null);
     const memberships = createMemo<readonly Membership[]>(() => {
         const model = record(accountIndex()?.model);
         const values = Array.isArray(model?.memberships) ? model.memberships : [];
-        return values.flatMap((value) => {
+        const listed = values.flatMap((value) => {
             const membership = record(value);
             return membership && typeof membership.id === "string"
                 ? [{
@@ -353,6 +357,22 @@ export function EnterpriseWorkbench(): JSX.Element {
                 }]
                 : [];
         });
+        const created = createdMembership();
+        return created && !listed.some((membership) => membership.id === created.id)
+            ? [...listed, created]
+            : listed;
+    });
+    createEffect(() => {
+        const created = createdMembership();
+        if (!account.session()) {
+            if (created) setCreatedMembership(null);
+            return;
+        }
+        const model = record(accountIndex()?.model);
+        if (created && Array.isArray(model?.memberships)
+            && model.memberships.some((value) => record(value)?.id === created.id)) {
+            setCreatedMembership(null);
+        }
     });
     createEffect(() => {
         if (tenant() || memberships().length === 0) return;
@@ -377,6 +397,7 @@ export function EnterpriseWorkbench(): JSX.Element {
             if (activeApp() === "administration") writeManagementLocation("administration", page, tenant());
         },
         onOrganizationDeleted: () => {
+            setCreatedMembership(null);
             const personal = memberships().find((membership) => membership.personal);
             const nextTenant = personal?.id ?? null;
             setTenant(nextTenant);
@@ -498,6 +519,7 @@ export function EnterpriseWorkbench(): JSX.Element {
         organizationSelector: () => <OrganizationSelector
             memberships={memberships()}
             selected={tenant()}
+            canCreate={Boolean(account.session())}
             administration={administration.admitted() ? administration : undefined}
             commercial={commercial.admitted() ? commercial : undefined}
             onSelect={(id) => {
@@ -507,10 +529,17 @@ export function EnterpriseWorkbench(): JSX.Element {
             }}
             onCreate={async (displayName) => {
                 const created = await api.createOrganization(displayName);
-                await refetchAccountIndex();
+                setCreatedMembership({
+                    id: created.id,
+                    display_name: created.displayName,
+                    role: created.role,
+                    personal: created.personal,
+                    provider_commercial: created.providerCommercial,
+                });
                 setTenant(created.id);
                 closeGaugeApp();
                 writeManagementLocation(null, undefined, created.id);
+                void refetchAccountIndex().catch(() => undefined);
             }}
             onOpen={openGaugeApp}
             surfaceOpen={surfaceOpen()}
@@ -549,7 +578,10 @@ export function EnterpriseWorkbench(): JSX.Element {
         },
         close: closeSurface,
         onNativeAccountSessionChanged: async (linked) => {
-            if (!linked) closeSurface();
+            if (!linked) {
+                closeSurface();
+                setCreatedMembership(null);
+            }
             // The boolean is only a wake-up signal. Session, page grants,
             // identity, memberships, and chat all come back through the local
             // control plane's sealed account-authority proxy.

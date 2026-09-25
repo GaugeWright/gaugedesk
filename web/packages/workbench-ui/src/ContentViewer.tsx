@@ -1,6 +1,7 @@
 /**
  * The content viewer/editor (3rd column, `navigation.md`): renders the selected
- * worktree file, or the turn's diff. Toggle above the area: **View · Edit · Diff**.
+ * worktree file, or the turn's diff. Its top row offers only modes the selected
+ * file and chat can use; without content it simply names the pane.
  *
  * The **Edit** tab is a full-panel editor with the **save** button top-right
  * (`Ctrl/Cmd+S` also saves). Editing undo/redo is the textarea's native, in-buffer
@@ -25,7 +26,7 @@ import { isWhipProgram, tabsForPath, programForPath, programsFromV1} from "./whi
 import { WhipInstancesView, WhipStructureView } from "./WhipViews";
 import { runsLaunched, WhipRunControl, WhipRunsView } from "./WhipRun";
 import { ImageFileView, MediaFileView, OpaqueFileView } from "./FileMediaView";
-import { readAsTextFailed, syntaxLanguageFor, viewerFileFor } from "./file-kind";
+import { hasRenderedFileView, isMarkdownPath, readAsTextFailed, syntaxLanguageFor, viewerFileFor } from "./file-kind";
 
 // The diff viewer pulls in @git-diff-view (+ highlight.js/lowlight, ~350 KB).
 // Load that chunk only when the Diff tab is first opened, not on app boot.
@@ -34,7 +35,6 @@ const DiffView = lazy(() => import("./DiffView").then((m) => ({ default: m.DiffV
 // Markdown rendering (micromark + GFM, ~30 KB) loads only when a .md file is
 // first viewed — same deferral pattern as the diff chunk.
 const MarkdownView = lazy(() => import("./MarkdownView").then((m) => ({ default: m.MarkdownView })));
-const isMarkdownPath = (path: string) => /\.(md|markdown)$/i.test(path);
 
 // pdf.js's renderer (~400 KB) loads only when a PDF is first opened — the same
 // deferral as the diff and markdown chunks. The composer's attachment path
@@ -103,7 +103,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     const chatKind = () => session.chatKind();
     const methodName = () => session.methodName();
 
-    // Open on the file View by default; the Changes (diff) review surface leads only
+    // Open on the file surface by default; the Changes (diff) review surface leads only
     // when this chat has a review open (a "Clean" merge phase awaiting keep/discard).
     const [mode, setMode] = createSignal<Mode>(defaultContentMode(mergePhase() ?? null));
     // The cut this viewer's content was read at (SUB-6 §12): the addressable
@@ -189,7 +189,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         return d !== null && d !== (content() ?? "");
     });
 
-    // The default surface (the request): open on the file View, and show the
+    // The default surface (the request): open on the file, and show the
     // Changes (diff) review surface only while a review is open — a "Clean" merge
     // phase, i.e. a finished turn awaiting keep/discard. Re-applied whenever the
     // chat OR its review-state changes (keyed on both, so it's never stale), so a
@@ -213,19 +213,19 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                 // tab. We do NOT switch on a transition into "Rejected" (discard/conflict):
                 // the merge-review bar (its discarded/conflict copy + repair affordance)
                 // lives on the Changes tab, so staying put shows the honest outcome on the
-                // tab they acted from (round3/round5/merge-conflict). View stays a manual pick.
+                // tab they acted from (round3/round5/merge-conflict). A file surface stays a manual pick.
                 if (phase === "Clean") setMode("diff");
             },
         ),
     );
 
-    // Selecting a file switches the viewer to View — UNLESS there's a pending
+    // Selecting a file switches the viewer to its file surface — UNLESS there's a pending
     // change to review (round-7 #3). When a turn just modified one file, App
     // auto-selects it so View is populated rather than showing a "pick a file"
     // hint; but the default review surface is Changes, so we must not yank the
     // user off an active "needs review" diff onto View just because the file
     // became selected. A user-initiated pick (no pending review, or a different
-    // file) still drops them into View as before.
+    // file) still drops them onto that file as before.
     createEffect(
         on(
             editorContext,
@@ -331,12 +331,13 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     // `crates/boundary` (CONFIG_PATH) — a cross-language copy, kept in sync by hand.
     const fileEditable = () => {
         const path = file();
-        if (!path || path === ".agent-config.json" || path.startsWith(".whipple/versions/")) return false;
+        if (!path || path === ".agent-config.json" || path.startsWith(".whipple/versions/")
+            || path.startsWith(".gaugedesk-runtime/")) return false;
         // The editor is a text buffer, and a save writes text. A picture, a
         // PDF or a recording is viewable here and not editable here — but a
         // spreadsheet export is text that happens to be drawn as a grid, and
         // rendering it better must not cost anyone the ability to edit it.
-        if (!readsAsText()) return false;
+        if (!readsAsText() || content.error || (content() !== undefined && readAsTextFailed(content() ?? ""))) return false;
         if (path.startsWith(".whipple/")) {
             return chatKind() === "edit" && (
                 path.startsWith(".whipple/draft/") ||
@@ -449,6 +450,14 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         }
     }
 
+    let editorText: HTMLTextAreaElement | undefined;
+    let editorHighlight: HTMLPreElement | undefined;
+    function syncEditorHighlight() {
+        if (!editorText || !editorHighlight) return;
+        editorHighlight.scrollTop = editorText.scrollTop;
+        editorHighlight.scrollLeft = editorText.scrollLeft;
+    }
+
     const phase = () => mergePhase() ?? "Idle";
 
     // The merge phase is a property of the *engagement* (the turn's diff), not of
@@ -487,12 +496,24 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         // ran it (the gate, a chat's package) — "instances" was the runtime's word.
         instances: "runs",
     };
-    // Only a whip program offers the extra two, so every other file keeps the
-    // three tabs it always had.
-    // Running a folder workflow is the header's Run button; its history is
-    // the Runs tab every whip program already has.
+    // Only offer a file surface when its renderer or editor can serve it.
+    // Changes appears when a diff or review state exists, including without
+    // a selected file. With no available mode, the header names the pane.
     const runnable = () => isWhipProgram(file()) && !!session.api.runChatWhip && !!id();
-    const tabs = createMemo(() => tabsForPath(file()) as Mode[]);
+    const hasChanges = createMemo(() => diffHasFiles(diff()));
+    const hasReview = () => hasChanges() || (mergePhase() != null && mergePhase() !== "Idle");
+    const hasView = () => {
+        const path = file();
+        return !!path && (!!specialRenderer() ||
+            (hasRenderedFileView(path) && (!rendersFromBytes() || !!session.api.getFileBytes)));
+    };
+    const tabs = createMemo<Mode[]>(() => {
+        const path = file();
+        if (!path) return hasReview() ? ["diff"] : [];
+        return (tabsForPath(path, { view: hasView(), edit: fileEditable() }) as Mode[])
+            .filter((tab) => tab !== "diff" || hasReview());
+    });
+    const fileMode = (): Mode => hasView() || !file() ? "view" : fileEditable() ? "edit" : "view";
     // This file's runs, newest first: the header's status and the Runs tab. A
     // run is stepped by the Home, not by this client, so while one is running
     // it is read again every few seconds until it settles.
@@ -517,10 +538,17 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         const timer = setTimeout(() => setRunsTick((n) => n + 1), delay);
         onCleanup(() => clearTimeout(timer));
     });
-    // Selecting a non-whip file while standing on a whip-only tab would leave
-    // the viewer on a tab that is not in its own tab bar.
-    createEffect(on(() => file(), () => {
-        if (!tabs().includes(mode())) setMode("view");
+    // A selected source file opens in its editor; a rendered file opens in View.
+    // Files with neither action still show their read-only content or format
+    // card. An unavailable Changes mode returns to the file surface.
+    createEffect(on(() => [file(), tabs()] as const, ([path], previous) => {
+        if (path && previous?.[0] !== path && shouldShowViewOnSelect(mergePhase() ?? null)) {
+            setMode(fileMode());
+        } else if (!tabs().includes(mode()) && mode() !== "view") {
+            setMode(fileMode());
+        } else if (mode() === "view" && !hasView() && fileEditable() && mergePhase() !== "Clean") {
+            setMode("edit");
+        }
     }));
     // The project's whip programs, read through WhippleScript's own instance
     // projection. Keyed on the project rather than the chat: instances belong
@@ -552,22 +580,21 @@ export function ContentViewer(props: ContentViewerProps = {}) {
     // must both hinge on this — otherwise the panel says "Review what changed, then:
     // [keep][discard]" over an empty "no changes" body (round-11 #3). When there's
     // nothing to review we show a single honest empty state and no merge controls.
-    const hasChanges = createMemo(() => diffHasFiles(diff()));
     const [confirmKeep, setConfirmKeep] = createSignal(false);
     // Reset the confirm gate whenever a different change comes up for review.
     createEffect(on(() => diff(), () => setConfirmKeep(false)));
 
     return (
         <div class="viewer">
-            <div class="tabs" data-viewer-tabs>
+            <div class="tabs content-mode-tabs" data-viewer-tabs>
+                <Show when={tabs().length === 0}>
+                    <span class="content-empty-title" data-content-title>Content</span>
+                </Show>
                 {tabs().map((m) => (
                     <span class="tab" classList={{ active: mode() === m }} data-tab={m} onClick={() => setMode(m)}>
                         {tabLabel[m]}
                     </span>
                 ))}
-                <Show when={file() && mode() !== "edit"}>
-                    <span class="status viewer-filename" title={file() ?? ""}>{displayPath(file()!)}</span>
-                </Show>
                 <Show when={runnable() ? [id()!, file()!] as const : null} keyed>
                     {([chat, path]) => (
                         <WhipRunControl
@@ -616,7 +643,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
             </Show>
 
             <Show when={mode() === "view"}>
-                <Show when={file()} fallback={<div class="status">Pick a file from the Files panel on the right to view it.</div>}>
+                <Show when={file()}>
                     {/* Honest View after a discard (#1 round-5). Discarding *isolates*
                         the work — it does NOT erase it from this chat's private copy
                         (the backend's Reject keeps the engagement's files, only holding
@@ -640,6 +667,9 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                             when={specialRenderer()}
                             fallback={
                                 <Switch fallback={<pre class="filebody" data-file-view>{content() ?? ""}</pre>}>
+                                            <Match when={content.error}>
+                                                <div class="status">This file couldn't be opened.</div>
+                                            </Match>
                                             {/* A file we know is not text: name the format
                                                 rather than paint its bytes as characters. */}
                                             <Match when={viewerFile().kind === "opaque"}>
@@ -755,11 +785,11 @@ export function ContentViewer(props: ContentViewerProps = {}) {
             </Show>
 
             <Show when={mode() === "edit"}>
-                <Show when={file()} fallback={<div class="status">Pick a file from the Files panel on the right to edit it.</div>}>
+                <Show when={file()}>
                     <Show
                         when={fileEditable()}
                         fallback={<div class="status" data-file-readonly>{viewerFile().kind !== "text"
-                            ? "This file isn't text, so there's nothing here to edit. The View tab shows it."
+                            ? "This file can't be edited as text here."
                             : session.readOnlyFileReason?.(file() ?? "") ?? "This file is read-only here. Edit only the package draft in an edit chat; change runtime selection through Settings."}</div>}
                     >
                       <Show
@@ -797,20 +827,36 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                                 <button class="save" data-file-save disabled={!dirty()} onClick={save}>save</button>
                             </div>
                         </div>
-                        <textarea
-                            class="editor-text"
-                            data-file-edit
-                            aria-label={`Edit ${file()}`}
-                            spellcheck={false}
-                            disabled={content.loading || !!content.error}
-                            value={text()}
-                            onInput={(e) => {
-                                setDraft(e.currentTarget.value);
-                                // A fresh edit invalidates the lingering "saved" note.
-                                setMsg("");
-                            }}
-                            onKeyDown={onKeyDown}
-                        />
+                        <div class="editor-input" classList={{ "editor-input-code": !!syntaxLanguage() && !readAsTextFailed(text()) }}>
+                            <Show when={!readAsTextFailed(text()) && syntaxLanguage()}>
+                                {(language) => (
+                                    <Suspense fallback={<pre class="filebody" ref={(element) => { editorHighlight = element; syncEditorHighlight(); }}>{text()}</pre>}>
+                                        <CodeView
+                                            text={text()}
+                                            language={language()}
+                                            editor
+                                            onReady={(element) => { editorHighlight = element; syncEditorHighlight(); }}
+                                        />
+                                    </Suspense>
+                                )}
+                            </Show>
+                            <textarea
+                                class="editor-text"
+                                data-file-edit
+                                aria-label={`Edit ${file()}`}
+                                spellcheck={false}
+                                disabled={content.loading || !!content.error}
+                                value={text()}
+                                ref={editorText}
+                                onInput={(e) => {
+                                    setDraft(e.currentTarget.value);
+                                    // A fresh edit invalidates the lingering "saved" note.
+                                    setMsg("");
+                                }}
+                                onScroll={syncEditorHighlight}
+                                onKeyDown={onKeyDown}
+                            />
+                        </div>
                       </div>
                       </Show>
                     </Show>

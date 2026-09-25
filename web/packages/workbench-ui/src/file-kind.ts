@@ -1,5 +1,5 @@
 /**
- * What the {@link ContentViewer}'s View tab should do with the selected file.
+ * How the {@link ContentViewer} should open the selected file.
  *
  * The viewer began as a text pane, and a worktree is not a text store: a turn
  * that produces a screenshot, a scanned invoice, or a report PDF leaves a file
@@ -14,7 +14,7 @@
  * A file whose extension says nothing stays text, exactly as before.
  */
 
-/** How the View tab renders a file. `opaque` is the honest refusal: the file
+/** How the file surface handles a file. `opaque` is the honest refusal: the file
  *  is real, the viewer can say what it is and how big, and no more. */
 export type ViewerFileKind = "text" | "image" | "pdf" | "office" | "media" | "table" | "opaque";
 
@@ -141,7 +141,7 @@ export function fileExtension(path: string): string {
     return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
 }
 
-/** How the View tab should open this path. */
+/** How the viewer should open this path. */
 export function viewerFileFor(path: string): ViewerFile {
     const extension = fileExtension(path);
     if (extension === "pdf") return { kind: "pdf", mediaType: "application/pdf" };
@@ -156,6 +156,18 @@ export function viewerFileFor(path: string): ViewerFile {
     const opaque = OPAQUE_TYPES[extension];
     if (opaque) return { kind: "opaque", mediaType: opaque };
     return { kind: "text", mediaType: "text/plain" };
+}
+
+export function isMarkdownPath(path: string): boolean {
+    return /\.(md|markdown)$/i.test(path);
+}
+
+/** A View tab is for a distinct rendering of the file, not another copy of its
+ * source. Syntax colouring alone leaves a code file in its source form. */
+export function hasRenderedFileView(path: string): boolean {
+    if (isMarkdownPath(path)) return true;
+    const kind = viewerFileFor(path).kind;
+    return kind !== "text" && kind !== "opaque";
 }
 
 /** True when a file the viewer read as text plainly is not text.
@@ -207,7 +219,7 @@ const SYNTAX_LANGUAGES: Readonly<Record<string, string>> = {
     mm: "objectivec", patch: "diff", php: "php", pl: "perl", ps1: "powershell",
     py: "python", pyi: "python", r: "r", rb: "ruby", rs: "rust", sass: "scss",
     scala: "scala", scss: "scss", sh: "bash", sql: "sql", svelte: "xml",
-    swift: "swift", toml: "ini", ts: "typescript",
+    swift: "swift", toml: "ini", ts: "typescript", whip: "whipplescript",
     tsx: "typescript", vue: "xml", xml: "xml", yaml: "yaml", yml: "yaml",
     zsh: "bash",
 };

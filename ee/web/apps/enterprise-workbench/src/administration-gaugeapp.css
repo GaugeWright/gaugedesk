@@ -186,9 +186,6 @@
 .gaugeapp-row:first-child { border-top: 0; }
 .gaugeapp-empty,
 .gaugeapp-loading { color: var(--muted); padding: 14px; }
-.gaugeapp-chat-actions button { width: auto; min-width: 44px; padding: 3px 7px;
-    color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 2px; }
-.gaugeapp-chat-actions button:not(:disabled):hover { color: var(--ink); border-color: var(--edge); }
 .gaugeapp-chat-clear { display: flex; align-items: center; justify-content: space-between; gap: 8px;
     padding: 6px 10px; color: var(--muted); background: color-mix(in srgb, var(--danger, #e88) 7%, var(--panel));
     border-bottom: 1px solid color-mix(in srgb, var(--danger, #e88) 42%, var(--edge)); font-size: var(--fs-small); }

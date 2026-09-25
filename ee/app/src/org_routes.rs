@@ -696,7 +696,10 @@ pub async fn enterprise_auth(
     // desktop updater can discover the policy that blocked its current build.
     // Tenant membership admission above is the complete authority check.
     let enforce_software = path != "/admin/software-policy";
+    // Creating an organization belongs to the same sealed Hub account as the
+    // picker membership projection, even when this desktop selected a Home.
     let native_account_path = path.starts_with("/gaugeapps/account-settings/")
+        || (path == "/account/tenants" && method == axum::http::Method::POST)
         || matches!(
             path.as_str(),
             "/auth/account/authorization/start"

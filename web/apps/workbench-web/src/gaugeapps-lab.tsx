@@ -707,16 +707,12 @@ export function GaugeAppsComposition(): JSX.Element {
     const [scopeMenuOpen, setScopeMenuOpen] = createSignal(false);
     const [detailPage, setDetailPage] = createSignal<DetailPageRequest | null>(null);
     const [selectedNavChat, setSelectedNavChat] = createSignal<EngagementId | null>(LAB_ENGAGEMENT);
-    const [networkOverrides, setNetworkOverrides] = createSignal<Readonly<Record<string, boolean>>>({});
     const scope = createMemo(() => SCOPES.find((candidate) => candidate.id === scopeId())!);
     const app = createMemo(() => availableApps(scope()).find((candidate) => candidate.id === appId()) ?? availableApps(scope())[0]!);
     const projects = createMemo(() => PROJECTS_BY_SCOPE[scopeId()]);
     const project = createMemo(() => projects().find((candidate) => candidate.id === projectId()) ?? projects()[0]!);
     const workspace = createMemo(() => fixtureWorkspace(scope(), projects()));
     const facetApi = fixtureFacetApi(workspace);
-    const projectNetworkIsolated = createMemo(() => networkOverrides()[project().id]
-        ?? workspace().projects.find((candidate) => candidate.id === project().id)?.networkIsolated
-        ?? false);
     const appScopeLabel = createMemo(() => {
         const base = app().id === "project" ? `${scope().label} · ${project().name}` : scope().label;
         return detailPage() ? `${base} · ${detailNavigationLabel(detailPage()!)}` : base;
@@ -840,7 +836,7 @@ export function GaugeAppsComposition(): JSX.Element {
         setProjectId(nextProject);
         navigateTo("project", "Project Placements", {
             action: "manage", title,
-            description: `Library Agent available to configure as a placement in ${projects().find((candidate) => candidate.id === nextProject)?.name ?? project().name}.`,
+            description: `Workshop Agent available to configure as a placement in ${projects().find((candidate) => candidate.id === nextProject)?.name ?? project().name}.`,
             kind: "work Agent", meta: "library",
         });
     };
@@ -938,15 +934,6 @@ export function GaugeAppsComposition(): JSX.Element {
             onStatus={() => undefined}
             refreshKey={scopeId()} />}
         navFooter={() => <div class="nav-footer gaugeapp-account-footer">
-            <div class="network-bar" classList={{ isolated: projectNetworkIsolated() }}><div class="network-bar-status">
-                <button type="button" class="network-bar-toggle" data-testid="network-toggle"
-                    title={projectNetworkIsolated()
-                        ? `“${project().name}” is network-isolated. Click to open egress.`
-                        : `“${project().name}” has open network egress. Click to isolate.`}
-                    onClick={() => setNetworkOverrides((current) => ({ ...current, [project().id]: !projectNetworkIsolated() }))}>
-                    <span class="network-bar-dot" />{projectNetworkIsolated() ? "Network · isolated" : "Network · open"}
-                </button>
-            </div></div>
             <div class="gaugeapp-scope-bar"><ScopePicker scope={scope()} items={organizationItems()} open={scopeMenuOpen()}
                 onToggle={() => { setAccountMenuOpen(false); setScopeMenuOpen(!scopeMenuOpen()); }}
                 onClose={() => setScopeMenuOpen(false)}
@@ -960,8 +947,7 @@ export function GaugeAppsComposition(): JSX.Element {
             open={accountMenuOpen()}
             onToggle={() => { setScopeMenuOpen(false); setAccountMenuOpen(!accountMenuOpen()); }}
         /></div></div>}
-        chat={() => <><ChatPaneHeader title={`${app().label} agent`} context={appScopeLabel()}
-            contextKind="work" kind="work" statusLabel="Prototype" mobile={shell.isMobile()}
+        chat={() => <><ChatPaneHeader statusLabel="Prototype" mobile={shell.isMobile()}
             onCollapse={() => shell.setCollapsed("chat", true)} />
             <ChatPanel session={session} bare composerPlaceholder={`ask the ${app().label.toLowerCase()} agent…`}
                 composerInputRef={(element) => (composerInput = element)} /></>}
@@ -1970,10 +1956,10 @@ function ListingEditor(props: { detail: DetailPageRequest; archetypes: Workspace
     return <>
         <button type="button" class="gaugeapp-back-link" onClick={props.onBack}>← Products</button>
         <PageHeader eyebrow={`Commercial Operations / ${editing ? "Edit product" : "New product"}`} title={editing ? existingProduct!.name : "New product"}
-            description={editing ? "Change the commercial defaults used for future proposals." : "Choose an Agent from Library, add the commercial defaults, and create the product."} />
+            description={editing ? "Change the commercial defaults used for future proposals." : "Choose an Agent from Workshop, add the commercial defaults, and create the product."} />
         <DashboardGrid surface>
         <section class="admin-section gaugeapp-form-card">
-            <SectionHeading title="Agent" meta={editing ? "Library · fixed for this product" : "Library"}
+            <SectionHeading title="Agent" meta={editing ? "Workshop · fixed for this product" : "Workshop"}
                 action={!editing && agentId() && !choosingAgent() ? "change" : undefined} onAction={() => setChoosingAgent(true)} />
             <Show when={hasAgent() && !choosingAgent()} fallback={<LibraryArchetypePicker archetypes={props.archetypes} selectedId={agentId()} onChoose={changeAgent} />}>
                 <SelectedLibraryArchetype archetype={props.archetypes.find((candidate) => candidate.name === agent().name)!} agent={agent()} />
@@ -2041,7 +2027,7 @@ function LibraryArchetypePicker(props: { archetypes: Workspace["archetypes"]; se
         .filter((row) => row.agent || row.product)
         .filter((row) => `${row.archetype.name} ${row.archetype.kind}`.toLowerCase().includes(query().trim().toLowerCase())));
     return <div class="gaugeapp-library-picker">
-        <input type="search" aria-label="Search Library" placeholder="Search Library…" value={query()} onInput={(event) => setQuery(event.currentTarget.value)} />
+        <input type="search" aria-label="Search Workshop" placeholder="Search Workshop…" value={query()} onInput={(event) => setQuery(event.currentTarget.value)} />
         <div class="gaugeapp-library-list"><For each={rows()}>{({ archetype, agent, product }) => {
             const record = () => agent ?? product!;
             return <button type="button" class="gaugeapp-library-row" classList={{ active: props.selectedId === agent?.id }} disabled={Boolean(product) || !agent}
@@ -2141,7 +2127,7 @@ function ProductDetailView(props: {
         </article>
 
         <section class="admin-section gaugeapp-product-terms"><SectionHeading title="Commercial terms" />
-            <Definition label="Library Agent" value={`${agent().name} · ${agent().agentVersion}`} note={`${agent().kind} · ${agent().salesRevision}`} />
+            <Definition label="Workshop Agent" value={`${agent().name} · ${agent().agentVersion}`} note={`${agent().kind} · ${agent().salesRevision}`} />
             <Definition label="Price" value={agent().pricing} />
             <Definition label="Delivery" value={agent().delivery} />
             <Definition label="Release" value={agent().versionPolicy} />
@@ -2788,7 +2774,7 @@ function detailBlueprint(detail: DetailPageRequest, scope: ScopeFixture, project
         ],
         sections: [
             { title: "Agent placement", fields: [
-                { label: "Agent", value: "Choose from admitted library" },
+                { label: "Agent", value: "Choose from Workshop" },
                 { label: "Placement kind", value: "Work Agent" },
                 { label: "Pinned version", value: "Current admitted version" },
                 { label: "Eligible work target", value: "None" },
@@ -3353,7 +3339,7 @@ function detailBlueprint(detail: DetailPageRequest, scope: ScopeFixture, project
                 ],
                 sections: [
                     { title: "Product", rows: [
-                        { label: "Source", value: `${agent.name} · ${agent.agentVersion}`, note: `${agent.kind} in Library` },
+                        { label: "Source", value: `${agent.name} · ${agent.agentVersion}`, note: `${agent.kind} in Workshop` },
                         { label: "Commercial details", value: agent.salesRevision, note: agent.summary },
                         { label: "Price", value: agent.pricing },
                         { label: "Delivery", value: agent.delivery, note: agent.versionPolicy },

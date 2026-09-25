@@ -335,6 +335,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/chats/{id}/diff", get(er::engagement_diff))
         .route("/chats/{id}/tree", get(er::get_tree))
         .route("/chats/{id}/file", get(er::get_file).put(er::put_file))
+        .route(
+            "/chats/{id}/files/command",
+            post(er::post_file_manager_command),
+        )
         .route("/chats/{id}/merge-preview", post(er::post_merge_preview))
         .route("/chats/{id}/transcript", get(er::get_transcript))
         .route("/chats/{id}/context-usage", get(er::get_context_usage))

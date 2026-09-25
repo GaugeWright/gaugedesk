@@ -5,7 +5,7 @@
  * Chat, the agent itself in Content. Two decisions live here rather than in
  * the tree or the app, so a UI rewrite cannot quietly change them: which edit
  * chat opens, and what a placement pinned to a frozen version may do compared
- * with the Library draft.
+ * with the Workshop draft.
  */
 
 import type { PlacementNode } from "@gaugewright/control-plane-client";
@@ -32,7 +32,7 @@ export interface PanelAgentSurfacePlan {
     readonly deployLabel: string;
 }
 
-/** The surface for a Library draft, or for a placement pinned to a version. */
+/** The surface for a Workshop draft, or for a placement pinned to a version. */
 export function panelAgentSurfacePlan(
     placement: Pick<PlacementNode, "version" | "deployments"> | null | undefined,
     projectName?: string,
@@ -40,7 +40,7 @@ export function panelAgentSurfacePlan(
     if (!placement) {
         return {
             scope: "draft",
-            subtitle: "Library draft",
+            subtitle: "Workshop draft",
             contractEditable: true,
             actions: ["publish"],
             deployLabel: "",

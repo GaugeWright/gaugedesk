@@ -246,7 +246,7 @@ function AgentsAndPlacements(props: ProjectSettingsProps): JSX.Element {
     const [pendingRemoval, setPendingRemoval] = createSignal("");
     const addAgent = async () => {
         const chosen = available().find((candidate) => candidate.id === agent());
-        if (!chosen) throw new Error("Choose an Agent from the Library.");
+        if (!chosen) throw new Error("Choose an Agent from the Workshop.");
         const recipient = chosen.kind === "panel" && chosen.panelProfile?.collection
             ? await props.api.ensureCollectionRecipient?.(`${props.project.id}-${chosen.id}`)
             : undefined;
@@ -268,7 +268,7 @@ function AgentsAndPlacements(props: ProjectSettingsProps): JSX.Element {
     };
     return <>
         <section class="project-settings-section">
-            <ProjectPageHeader title="Placed Agents" description="Each placement pins an Agent from the Library to this project." />
+            <ProjectPageHeader title="Placed Agents" description="Each placement pins an Agent from the Workshop to this project." />
             <div class="project-settings-rows">
                 <For each={placements()} fallback={<p class="project-settings-empty">No Agents have been placed in this project.</p>}>
                     {(placement) => <div class="project-settings-row project-settings-agent-row">
@@ -295,7 +295,7 @@ function AgentsAndPlacements(props: ProjectSettingsProps): JSX.Element {
             </div>
         </section>
         <section class="project-settings-section">
-            <ProjectPageHeader title="Add from Library" description="Place an existing Agent archetype in this project." />
+            <ProjectPageHeader title="Add from Workshop" description="Place an existing Agent archetype in this project." />
             <div class="project-settings-form project-settings-add-agent">
                 <label><span>Agent</span><select value={agent()} onChange={(event) => setAgent(event.currentTarget.value)}><option value="">Choose Agent</option><For each={available()}>{(candidate) => <option value={candidate.id}>{candidate.name} · {candidate.kind === "panel" ? "Panel agent" : "Agent"}</option>}</For></select></label>
                 <button type="button" disabled={!!busy() || !agent()} onClick={() => void run("add", addAgent, "Agent placed.")}>Add</button>

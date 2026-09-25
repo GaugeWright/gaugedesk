@@ -273,6 +273,38 @@
     },
     {
       "declaration": {
+        "name": "create_file_if_absent",
+        "owner": "ChatWorkspace",
+        "signature": "fn create_file_if_absent (& self , _rel : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "create_folder",
+        "owner": "ChatWorkspace",
+        "signature": "fn create_folder (& self , _rel : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "delete_entry",
+        "owner": "ChatWorkspace",
+        "signature": "fn delete_entry (& self , _rel : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "rename_entry",
+        "owner": "ChatWorkspace",
+        "signature": "fn rename_entry (& self , _from : & str , _to : & str) -> Result < () >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "archive_workstream",
         "owner": "Workspace",
         "signature": "fn archive_workstream (& self , _workstream_id : & str) -> Result < Vec < String > >"
@@ -4919,6 +4951,126 @@
         "file": "crates/app/src/project_tracker_control.rs"
       },
       "profile": "project-tracker-completion"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_file_manager_command",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "eng . commit_turn (& format ! (\"{} {source}\" , command . verb ()))",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_file_manager_command",
+        "capability": "create_file_if_absent",
+        "count": 1,
+        "expression": "eng . create_file_if_absent (& workspace_source)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_file_manager_command",
+        "capability": "create_folder",
+        "count": 1,
+        "expression": "eng . create_folder (& workspace_source)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_file_manager_command",
+        "capability": "delete_entry",
+        "count": 1,
+        "expression": "eng . delete_entry (& workspace_source)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_file_manager_command",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (chat_id , event)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_file_manager_command",
+        "capability": "rename_entry",
+        "count": 1,
+        "expression": "eng . rename_entry (& workspace_source , workspace_destination . as_deref () . unwrap_or_default () ,)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::apply_file_manager_command",
+        "capability": "tree",
+        "count": 1,
+        "expression": "eng . tree ()",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::create_file_if_absent",
+        "capability": "create_file_if_absent",
+        "count": 1,
+        "expression": "Engagement :: create_file_if_absent (self , relative)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::create_folder",
+        "capability": "create_folder",
+        "count": 1,
+        "expression": "Engagement :: create_folder (self , relative)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::delete_entry",
+        "capability": "delete_entry",
+        "count": 1,
+        "expression": "Engagement :: delete_entry (self , relative)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::rename_entry",
+        "capability": "rename_entry",
+        "count": 1,
+        "expression": "Engagement :: rename_entry (self , from , to)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Engagement::delete_entry",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (path)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
     }
   ]
 }

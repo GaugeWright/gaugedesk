@@ -4,7 +4,7 @@
  * These pin the two decisions the opened surface rests on: opening shows the
  * latest edit chat rather than creating one on every click, and a placement
  * pinned to a frozen version shows its contract and deploys it, while only the
- * Library draft is edited and published.
+ * Workshop draft is edited and published.
  */
 
 import { describe, expect, it } from "vitest";
@@ -19,10 +19,10 @@ describe("opening a Panel agent", () => {
         expect(editChatToOpen([])).toBeNull();
     });
 
-    it("edits and publishes the Library draft", () => {
+    it("edits and publishes the Workshop draft", () => {
         const plan = panelAgentSurfacePlan(null);
         expect(plan.scope).toBe("draft");
-        expect(plan.subtitle).toBe("Library draft");
+        expect(plan.subtitle).toBe("Workshop draft");
         expect(plan.contractEditable).toBe(true);
         expect(plan.actions).toEqual(["publish"]);
     });

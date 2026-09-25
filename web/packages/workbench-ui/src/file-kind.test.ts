@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import {
     describeSize,
     fileExtension,
+    hasRenderedFileView,
     readAsTextFailed,
     syntaxLanguageFor,
     viewerFileFor,
@@ -63,6 +64,20 @@ describe("viewerFileFor", () => {
     it("leaves everything else as text, exactly as before", () => {
         for (const path of ["main.rs", "notes.md", "Makefile", ".gitignore", "a.b.unknown"]) {
             expect(viewerFileFor(path).kind).toBe("text");
+        }
+    });
+});
+
+describe("hasRenderedFileView", () => {
+    it("keeps View for documents and media with a distinct rendering", () => {
+        for (const path of ["README.md", "notes.markdown", "table.csv", "image.png", "report.pdf", "report.docx", "clip.mp4"]) {
+            expect(hasRenderedFileView(path)).toBe(true);
+        }
+    });
+
+    it("omits View for source text, syntax-coloured code, and opaque files", () => {
+        for (const path of ["notes.txt", "main.rs", "config.json", "Makefile", "archive.zip", "old.doc"]) {
+            expect(hasRenderedFileView(path)).toBe(false);
         }
     });
 });
@@ -143,6 +158,7 @@ describe("syntaxLanguageFor", () => {
         expect(syntaxLanguageFor("crates/app/src/main.rs")).toBe("rust");
         expect(syntaxLanguageFor("web/src/App.tsx")).toBe("typescript");
         expect(syntaxLanguageFor("scripts/check.SH")).toBe("bash");
+        expect(syntaxLanguageFor("workflows/triage.whip")).toBe("whipplescript");
     });
 
     it("settles from the whole name when there is no extension", () => {

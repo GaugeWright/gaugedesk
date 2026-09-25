@@ -1,6 +1,6 @@
 /**
  * A Panel agent's Preview (ADR 0143 §3, PANEL-3, PANEL-12): the real
- * public-session release of the Library draft or a placement's pinned version,
+ * public-session release of the Workshop draft or a placement's pinned version,
  * run disposably. It lives inside the opened Panel agent, mounted but idle
  * until the owner starts it, because starting spends real funding. Unmounting
  * revokes a running session.
@@ -119,7 +119,7 @@ export function PanelAgentPreview(props: {
 
     return <section class="admin-section panel-agent-preview" data-panel-preview aria-label={`Preview ${props.agent.name}`}>
         <h3>Preview</h3>
-        <div class="muted">Disposable public session · {props.project ? `${props.project.name} pinned placement` : "Library draft"}</div>
+        <div class="muted">Disposable public session · {props.project ? `${props.project.name} pinned placement` : "Workshop draft"}</div>
         <div class="settings-hint warn">Preview runs the real public-session release. Its workspace and output expire, never enter Personal or a project Inbox, and admit no production collection recipient.</div>
         <Show when={profile()} fallback={<p class="error">This Panel agent has no public profile.</p>}>
             <Show when={!preview()}><div class="settings-form"><h4>Preview funding</h4>

@@ -2986,6 +2986,100 @@ async fn context_upload_ingests_files_into_the_engagement() {
     );
 }
 
+#[tokio::test]
+async fn file_manager_commands_record_create_rename_and_delete_without_clobbering() {
+    let (_directory, wb) = lean_workbench();
+    let app = open_control_plane(wb);
+    let (status, body) = send(&app, "POST", "/chats", Some(r#"{"id":"files-chat"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED, "chat: {body}");
+
+    let command = |action: &str| format!("/chats/files-chat/files/command?{action}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &command("folder"),
+        Some(r#"{"action":"create_folder","path":"notes"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "folder: {body}");
+    let (_, tree) = send(&app, "GET", "/chats/files-chat/tree", None).await;
+    assert!(
+        tree.contains("notes/.gaugedesk-folder"),
+        "empty folder survives in history: {tree}"
+    );
+
+    let create = r#"{"action":"create_file","path":"notes/todo.md"}"#;
+    let (status, body) = send(&app, "POST", &command("file"), Some(create)).await;
+    assert_eq!(status, StatusCode::OK, "file: {body}");
+    let (status, duplicate) = send(&app, "POST", &command("duplicate"), Some(create)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "create must not overwrite");
+    assert!(
+        duplicate.contains("File exists"),
+        "the client can show the refusal: {duplicate}"
+    );
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &command("rename"),
+        Some(r#"{"action":"rename","path":"notes/todo.md","to":"notes/done.md"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rename: {body}");
+    let (_, tree) = send(&app, "GET", "/chats/files-chat/tree", None).await;
+    assert!(
+        tree.contains("notes/done.md") && !tree.contains("notes/todo.md"),
+        "{tree}"
+    );
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &command("delete"),
+        Some(r#"{"action":"delete","path":"notes"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delete: {body}");
+    let (_, tree) = send(&app, "GET", "/chats/files-chat/tree", None).await;
+    assert!(
+        !tree.contains("notes/done.md") && !tree.contains("notes/.gaugedesk-folder"),
+        "{tree}"
+    );
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &command("escape"),
+        Some(r#"{"action":"create_file","path":"../escape.txt"}"#),
+    )
+    .await;
+    assert!(!status.is_success(), "an invalid path must be refused");
+    let (status, _) = send(
+        &app,
+        "POST",
+        &command("protected"),
+        Some(r#"{"action":"delete","path":".whipple"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "package files keep their own authoring surface"
+    );
+    let (status, _) = send(
+        &app,
+        "POST",
+        &command("config"),
+        Some(r#"{"action":"delete","path":"targets/example/.agent-config.json"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "agent configuration keeps its own editor"
+    );
+}
+
 /// A person uploading a recording gets the recording, byte for byte.
 ///
 /// The bytes here are deliberately not valid UTF-8. Before the upload path

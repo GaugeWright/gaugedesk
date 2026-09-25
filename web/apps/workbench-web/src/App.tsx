@@ -78,6 +78,8 @@ import {
     BASIC_COMPOSER_CAPABILITIES,
     ChatPanel,
     ChatPaneHeader,
+    ChatOptionsMenu,
+    FilesHeader,
     changedUserFiles,
     chatIdFromSearch,
     ContentViewer,
@@ -89,7 +91,6 @@ import {
     deriveFreshness,
     gemState,
     type GemState,
-    displayChatTitle,
     emptyTranscript as empty,
     EngagementPane,
     Environment,
@@ -108,7 +109,6 @@ import {
     fromSnapshot,
     type ImageRef,
     ComposerModelBar,
-    Icon,
     initialFreshness,
     isPlaceholderTitle,
     loadTranscriptFilterPrefs as loadPrefs,
@@ -156,7 +156,6 @@ import {
     type FreshnessState,
     type Session,
     type Transcript,
-    TranscriptFilterMenu,
     Workspace,
     WorkbenchShell,
     createWorkbenchShellState,
@@ -669,7 +668,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // UX-8: the fork-tree panel (chat fork lineage); holds the chat that opened it.
     const [forkTreeFor, setForkTreeFor] = createSignal<EngagementId | null>(null);
     const [deployment, setDeployment] = createSignal<DeploymentSelection | null>(null);
-    // The opened Panel agent (navigation.md Library, PANEL-12): it takes the
+    // The opened Panel agent (navigation.md Workshop, PANEL-12): it takes the
     // Content pane the way project settings do, while its edit chat is in Chat.
     // With a placement it is pinned to that placement's frozen version.
     const [openedPanelAgent, setOpenedPanelAgent] = createSignal<{
@@ -1084,12 +1083,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // fixed at creation: rooted on an archetype ⇒ `edit`, on a placement ⇒ `work`.
     // We resolve it (and the displayed lineage) from the workspace projection: for
     // a work chat the lineage is `archetype · project`; for an edit chat it is
-    // `archetype · Library`.
-    // The open chat's header facts (title, lineage, kind, project) are a **library
-    // projection**, so they must track the workspace event stream — not just the
-    // selection. Keying on `navTick` too means a rename (or any library change to
-    // this chat, incl. from another client) re-resolves the header live, the same
-    // way the nav does. Guarded so no selection ⇒ no fetch.
+    // `archetype · Workshop`.
+    // Chat context comes from the workspace projection, so it tracks renames and
+    // other changes to the selected chat. Keying on `navTick` re-resolves it after
+    // navigation updates. Guarded so no selection means no fetch.
     const [chatInfo, { refetch: refetchChatInfo }] = createResource(
         () => (selected() ? ([selected()!, navTick()] as const) : false),
         async ([id]) => {
@@ -1127,14 +1124,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         basis: targets.map((target) => target.basis).join(" · "),
                         candidate: c.candidateRevision,
                         acts: c.availableActs,
-                        // The project this chat lives in drives the network-egress
-                        // bar (RF-B3): only a project-rooted (work) chat has one.
+                        // Only a project-rooted work chat has a project here.
                         project: { id: p.id, name: p.name, networkIsolated: p.networkIsolated },
                     };
                 }
             }
         }
-        // Edit chats live under an archetype → lineage is archetype · Library.
+        // Edit chats live under an archetype → lineage is archetype · Workshop.
         for (const a of ws.archetypes) {
             const c = a.chats.find((c) => c.id === id);
             if (c) {
@@ -1144,7 +1140,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 }));
                 return {
                     kind: c.kind,
-                    lineage: `${a.name} · Library`,
+                    lineage: `${a.name} · Workshop`,
                     // An edit chat's context is the method it edits.
                     context: a.name,
                     conflict: c.conflict,
@@ -1188,37 +1184,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     );
     const chatKind = () => chatInfo()?.kind ?? "work";
     const lineage = () => chatInfo()?.lineage ?? "";
-    // The chat's own name for the header (round-6 #6): two chats under one method
-    // share a lineage (`Email helper · Marketing`), so the header must show the
-    // chat's title to tell them apart. Reuse the shared placeholder rule so a
-    // still-unnamed chat reads "Untitled" rather than the raw "new chat" token.
-    const chatTitle = () => displayChatTitle(chatInfo()?.title ?? "");
-    // What this chat belongs to, for the header's context slot. The Personal project
-    // is the catch-all, so it names nothing; `lineage` itself is left alone because
-    // `methodName` still parses the method out of it for the composer caption.
-    const headerContext = () => chatInfo()?.context ?? "";
-    // The line's sync state in words. `basis === candidate` means the line holds no
-    // work this chat has not landed — which is what "up to date" says. Deliberately
-    // not a count: the projection carries two revisions, not a distance between them,
-    // and inventing "2 ahead" from data that cannot support it would be a lie.
-    const workstreamState = () => {
-        const info = chatInfo();
-        if (!info?.workstream) return "";
-        if (!info.basis || !info.candidate) return "";
-        return info.basis === info.candidate ? "up to date" : "changes pending";
-    };
     // Fork lineage (#3): the source this chat was copied from (from the "(fork)"
     // suffix), so the empty state can explain what a fork is and what carried over.
     const forkOf = () => forkSource(chatInfo()?.title ?? "");
     // The method name driving this chat (round-6 #6): the lineage is
-    // `method · project` (work) or `method · Library` (edit), so the part before
+    // `method · project` (work) or `method · Workshop` (edit), so the part before
     // the "·" is the method — used to name it in the composer caption instead of
     // the hardcoded "assistant".
     const methodName = () => (lineage().split("·")[0] ?? "").trim();
 
-    // The project the open chat lives in (RF-B3): drives the bottom-left network
-    // bar. Only a project-rooted work chat has one — an edit chat or the hidden
-    // Personal default resolves to `null`, so the bar reads-only there.
+    // Only a project-rooted work chat has a project here; an edit chat or the
+    // hidden Personal default resolves to `null`.
     const currentProject = () => chatInfo()?.project ?? null;
 
     // Declared after `currentProject` on purpose: `createResource` evaluates
@@ -1257,19 +1233,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             ?? (projectHome()?.id === routedProject() ? routedProject() : null);
         api.setCurrentProject((requested ?? currentProject()?.id ?? null) as ProjectId | null);
     });
-    const [networkBusy, setNetworkBusy] = createSignal(false);
-    async function toggleNetworkIsolated() {
-        const p = currentProject();
-        if (!p || networkBusy()) return;
-        setNetworkBusy(true);
-        try {
-            await api.setProjectNetworkIsolated(p.id, !p.networkIsolated);
-            await refetchChatInfo();
-        } finally {
-            setNetworkBusy(false);
-        }
-    }
-
     // Auto-title (#4): a brand-new chat is created with a generic placeholder
     // ("new chat", "edit chat", …). The first thing the user types is the obvious
     // title, so on the first message of a still-unnamed, still-empty chat we adopt
@@ -1404,6 +1367,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         saveDefaultComposerMode(filterStorage, mode);
     };
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
+    const [fileCreateRequest, setFileCreateRequest] = createSignal<{
+        chat: EngagementId;
+        kind: "file" | "folder";
+        nonce: number;
+    } | null>(null);
     // The inbound queue the content pane is showing (ADR 0110 §7). The queue is
     // the *project's*; the chat is only where a reviewer acts from — so both are
     // held, and the surface closes when you navigate away from that chat rather
@@ -1424,7 +1392,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }),
     });
     const [showShelf, setShowShelf] = createSignal(false);
-    // "Add files"/"Add a file" in the browser open native OS pickers via these hidden
+    // Browser imports open native OS pickers via these hidden
     // inputs; their contents are uploaded (UX-14 / UX-1 / ENTSEC-5). The desktop shell
     // takes the native-path route instead (see addFiles/addFile).
     let addFolderInput: HTMLInputElement | undefined;
@@ -1905,7 +1873,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
     }
 
-    // "add files": in the desktop shell, open the native OS folder picker (which
+    // Folder import: in the desktop shell, open the native OS folder picker (which
     // returns a real path the backend ingests by copying recursively); in the
     // browser, open the native folder picker and upload the files' contents.
     async function addFiles() {
@@ -1922,7 +1890,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (typeof dir === "string") await ingestPath(dir);
     }
 
-    // "add a file" (UX-1): single-file native picker. Desktop ingests the path; the
+    // File import (UX-1): single-file native picker. Desktop ingests the path; the
     // browser opens the native file picker and uploads the file's contents.
     async function addFile() {
         if (!isTauri()) {
@@ -2041,77 +2009,42 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         />
     );
 
-    // The network-egress bar (RF-B3), pinned bottom-left of the nav column. It
-    // reflects the open chat's project posture: open (the app default — the agent
-    // can reach the model, and with no per-host proxy yet, any host) or isolated
-    // (fail-closed). Clicking toggles it for that project. With no project-rooted
-    // chat open (an edit chat / the Personal default) there's nothing to manage, so
-    // it shows a muted, read-only hint.
     const navFooter = () => (
         <div class="nav-footer">
-        <div class="network-bar" classList={{ isolated: !!currentProject()?.networkIsolated }}>
-            <div class="network-bar-status">
-                <Show
-                    when={currentProject()}
-                    fallback={
-                        <span class="network-bar-label" title="Open a project's work chat to manage its network egress.">
-                            <span class="network-bar-dot" /> Network · open
-                        </span>
-                    }
-                >
-                    {(p) => (
-                        <button
-                            type="button"
-                            class="network-bar-toggle"
-                            data-testid="network-toggle"
-                            disabled={networkBusy()}
-                            title={
-                                p().networkIsolated
-                                    ? `“${p().name}” is network-isolated — the agent can't reach the model. Click to open egress.`
-                                    : `“${p().name}” has open network egress — the agent can reach any host. Click to isolate (fail-closed).`
-                            }
-                            onClick={toggleNetworkIsolated}
-                        >
-                            <span class="network-bar-dot" />
-                            {p().networkIsolated ? "Network · isolated" : "Network · open"}
+            <Show when={desktopUpdate() && desktopUpdate()?.kind !== "current"}>
+                <div class="update-status">
+                    {/* The build reports itself in the account menu. An available
+                        update or failed check is actionable and stays visible. */}
+                    <Show when={desktopUpdate()?.kind === "available"}>
+                        <button class="desktop-update" data-desktop-update type="button" onClick={() => void installDesktopUpdate()}>
+                            Update to v{desktopUpdate()?.version}
                         </button>
-                    )}
-                </Show>
-                {/* The build reports itself in the account menu, not here: a version that
-                    never changes does not earn permanent space beside the network state.
-                    An *available update* is different — that is news, and stays. */}
-                <Show when={desktopUpdate()?.kind === "available"}>
-                    <button class="desktop-update" data-desktop-update type="button" onClick={() => void installDesktopUpdate()}>
-                        Update to v{desktopUpdate()?.version}
-                    </button>
-                </Show>
-                <Show when={desktopUpdate()?.kind === "checking" || desktopUpdate()?.kind === "installing"}>
-                    <span class="network-version" data-update-state>{desktopUpdate()?.kind === "installing" ? "Installing update…" : "Checking for updates…"}</span>
-                </Show>
-                <Show when={desktopUpdate()?.kind === "restricted"}>
-                    <span class="network-version" data-update-restricted title="The available stable release is outside this organization's allowed release channels.">
-                        Update v{desktopUpdate()?.version} is managed by your organization
-                    </span>
-                </Show>
-                {/* A check that could not complete states that much and no more. It
-                    carries the retry because the alternative is asking someone to
-                    restart the client to re-run a check they cannot see. */}
-                <Show when={desktopUpdate()?.kind === "error"}>
-                    <button
-                        class="network-version update-retry"
-                        data-update-error
-                        type="button"
-                        title="The update service could not be reached, so whether a newer release exists is unknown. Click to check again."
-                        onClick={() => void checkDesktopUpdate()}
-                    >
-                        Update check unavailable
-                    </button>
-                </Show>
-            </div>
-        </div>
-        {/* The account menu sits at the very foot of the column, on its own row: the
-            trigger *is* the identity, so it needs the full width the network strip beside
-            it would not have left it. */}
+                    </Show>
+                    <Show when={desktopUpdate()?.kind === "checking" || desktopUpdate()?.kind === "installing"}>
+                        <span class="update-label" data-update-state>{desktopUpdate()?.kind === "installing" ? "Installing update…" : "Checking for updates…"}</span>
+                    </Show>
+                    <Show when={desktopUpdate()?.kind === "restricted"}>
+                        <span class="update-label" data-update-restricted title="The available stable release is outside this organization's allowed release channels.">
+                            Update v{desktopUpdate()?.version} is managed by your organization
+                        </span>
+                    </Show>
+                    {/* A check that could not complete states that much and no more. It
+                        carries the retry because the alternative is asking someone to
+                        restart the client to re-run a check they cannot see. */}
+                    <Show when={desktopUpdate()?.kind === "error"}>
+                        <button
+                            class="update-label update-retry"
+                            data-update-error
+                            type="button"
+                            title="The update service could not be reached, so whether a newer release exists is unknown. Click to check again."
+                            onClick={() => void checkDesktopUpdate()}
+                        >
+                            Update check unavailable
+                        </button>
+                    </Show>
+                </div>
+            </Show>
+        {/* The account menu sits at the foot of the column on its own row. */}
         <Show when={props.gaugeApps}>
             {(gaugeApps) => <div class="organization-bar">{gaugeApps().organizationSelector()}</div>}
         </Show>
@@ -2436,14 +2369,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     const contentPane = () => (
         <>
-            {/* The CONTENT caption is the pane's empty-state placeholder: with a chat
-                open the viewer's own tab strip is the top row and restating "Content"
-                above it says nothing the tabs don't. Same doctrine as the chat pane's
-                caption below (headings on the shell). */}
-            <Show when={selected()} keyed fallback={<>
-                <h2>Content</h2>
-                <div class="status">Open a chat, then pick a file to read it — and review changes — here.</div>
-            </>}>
+            <Show when={selected()} keyed fallback={
+                <div class="viewer"><div class="tabs content-mode-tabs" data-viewer-tabs>
+                    <span class="content-empty-title" data-content-title>Content</span>
+                </div></div>
+            }>
                 {(id) => (
                     <SessionProvider value={desktopEnvironment.openSession(id).session}>
                         {/* The review surface takes the pane rather than a fourth tab
@@ -2508,35 +2438,27 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     const filesPane = () => (
         <>
-            <h2>
-                Files
-                <Show when={selected()}>
-                    {/* Durable context upload lives here (UX-14), not the chat
-                        composer: a folder or single file is copied into this chat's
-                        workspace and persists. The composer's paperclip is the
-                        separate, message-scoped attach. */}
-                    <span class="header-actions">
-                        <button
-                            class="icon-btn"
-                            aria-label="Add files"
-                            title="Add a folder of files for the agent to work with (copied into this chat's workspace)"
-                            onClick={addFiles}
-                        >
-                            <Icon name="add-folder" />
-                        </button>
-                        <button
-                            class="icon-btn"
-                            aria-label="Add a file"
-                            title="Add a single file for the agent to work with (copied into this chat's workspace)"
-                            onClick={addFile}
-                        >
-                            <Icon name="add-files" />
-                        </button>
-                    </span>
-                </Show>
-            </h2>
-            {/* Hidden native pickers behind the header's "Add files"/"Add a file"
-                buttons (browser build). `webkitdirectory` (set via ref — it isn't a
+            {/* Durable context upload lives here (UX-14), not in the composer.
+                The menu keeps the folder and single-file actions together. */}
+            <FilesHeader
+                canAdd={selected() !== null}
+                canCreate={!!selected() && !!api.manageFile && (
+                    chatInfo()?.kind === "edit"
+                    || !!chatInfo()?.targets.some((target) => target.participation === "writable" && target.capabilityCeiling.propose)
+                )}
+                onCreateFile={() => {
+                    const chat = selected();
+                    if (chat) setFileCreateRequest({ chat, kind: "file", nonce: Date.now() });
+                }}
+                onCreateFolder={() => {
+                    const chat = selected();
+                    if (chat) setFileCreateRequest({ chat, kind: "folder", nonce: Date.now() });
+                }}
+                onAddFiles={addFiles}
+                onAddFile={addFile}
+            />
+            {/* Hidden native pickers behind the menu's import actions
+                actions (browser build). `webkitdirectory` (set via ref — it isn't a
                 typed JSX attribute) makes the first a folder picker; the second is a
                 single-file picker. Selected files' contents are uploaded (ENTSEC-5).
                 Kept outside `.composer` so composer input steps don't match them. */}
@@ -2561,18 +2483,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={selected()} keyed fallback={<div class="status">Each chat's working files are listed here.</div>}>
                 {(id) => (
                     <SessionProvider value={desktopEnvironment.openSession(id).session}>
-                        <Show when={(chatInfo()?.targets?.length ?? 0) > 0}>
-                            <div class="target-partitions" data-target-partitions>
-                                <For each={chatInfo()!.targets}>
-                                    {(target) => (
-                                        <span class="target-partition" data-target-id={target.targetId}>
-                                            {target.name} · {target.participation} · {target.root}
-                                        </span>
-                                    )}
-                                </For>
-                            </div>
-                        </Show>
-                        <Workspace />
+                        <Workspace
+                            roots={chatInfo()?.targets.map((target) => ({
+                                path: target.root,
+                                name: target.name,
+                                writable: target.participation === "writable" && target.capabilityCeiling.propose,
+                            }))}
+                            creationRequest={fileCreateRequest()}
+                            onCreationHandled={() => setFileCreateRequest(null)}
+                            onChanged={(message) => {
+                                setStatus(message);
+                                void Promise.all([refetchDiff(), refetchMerge()]);
+                            }}
+                        />
                     </SessionProvider>
                 )}
             </Show>
@@ -2582,56 +2505,25 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const chatPane = () => (
         <>
             <ChatPaneHeader
-                title={selected() ? chatTitle() : undefined}
-                kind={selected() ? chatKind() : undefined}
-                tone={selected() ? runToneOf(selected()) : undefined}
-                conflict={selected() ? chatConflict() : undefined}
+                branch={selected() ? chatInfo()?.workstream : undefined}
+                kind={selected() ? chatInfo()?.kind : undefined}
                 statusLabel={selected() ? STATE_LABEL[chatState()] : undefined}
                 statusPhase={selected() ? phase() : undefined}
-                context={selected() ? headerContext() : undefined}
-                contextKind={selected() ? chatKind() : undefined}
-                workstream={selected() ? chatInfo()?.workstream : undefined}
-                workstreamState={selected() ? workstreamState() : undefined}
-                targets={selected() ? chatInfo()?.targets : undefined}
-                connection={selected() ? freshnessStatus() : undefined}
                 mobile={workbenchShell.isMobile()}
                 onCollapse={() => workbenchShell.setCollapsed("chat", true)}
-                actions={
+                menu={
                     <Show when={selected()}>
-                        <span class="header-actions">
-                        <TranscriptFilterMenu
+                        <ChatOptionsMenu
                             prefs={filterPrefs()}
-                            onChange={setFilterPrefs}
-                            onSaveDefault={saveFilterDefault}
+                            onFilterChange={setFilterPrefs}
+                            onSaveFilterDefault={saveFilterDefault}
+                            onHistory={() => setShowShelf(true)}
+                            onSources={() => setShowSources(true)}
                         />
-                        <button
-                            class="icon-btn"
-                            data-open-sources
-                            aria-label="Sources"
-                            title="See the context this chat is working with — attached files and its Agent"
-                            onClick={() => setShowSources(true)}
-                        >
-                            <Icon name="sources" />
-                        </button>
-                        <button
-                            class="icon-btn"
-                            aria-label="History"
-                            title="A timeline of everything that's happened in this chat, plus the review surface"
-                            onClick={() => setShowShelf(true)}
-                        >
-                            <Icon name="history" />
-                        </button>
-                        </span>
                     </Show>
                 }
             />
             <Show when={selected()}>
-                {/* WS-H: the chat header carries no permanent "private draft" caption
-                    and no manual pull/discard buttons — a chat targets one shared line
-                    (default mainline = workstream of one) and co-rooted sync is greedy
-                    and automatic (WS-D). Keep/discard is the review surface (Changes
-                    tab); shared-line status surfaces only when named/shared or in
-                    conflict (WS-H b,c). The header is quiet by default. */}
                 <Show when={pendingApprovals().length > 0}>
                     <div class="approval-notice" data-pending-approvals role="status">
                         <strong>Waiting for your approval</strong>
@@ -2906,6 +2798,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         worktreeRev: status,
         selectedFile,
         selectFile: (path) => setSelectedFile(path),
+        canEditFile: (path) => {
+            // A work chat can inspect a read-only target but must not offer an
+            // editor for it. The target-set projection carries both membership
+            // and its capability ceiling; package authoring keeps its existing
+            // separate draft rules in ContentViewer.
+            if (chatKind() === "edit" || !path.startsWith("targets/")) return true;
+            const target = chatInfo()?.targets.find((member) =>
+                path === member.root || path.startsWith(`${member.root}/`));
+            return target?.participation === "writable" && target.capabilityCeiling.propose;
+        },
+        readOnlyFileReason: (path) => path.startsWith("targets/")
+            ? "This chat can read this target but cannot edit it."
+            : "This file is generated or protected and cannot be edited here.",
         reviewingProject,
         reviewProject: (project) => setReviewingProject(project),
         diff: () => diff() ?? "",

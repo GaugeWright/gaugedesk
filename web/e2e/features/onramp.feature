@@ -17,4 +17,4 @@ Feature: On-ramps and plain language (round 1)
 
   Scenario: an open chat shows a plain-language status badge
     Given a new engagement
-    Then the chat status badge reads "Ready"
+    Then the chat run state reads "Ready"

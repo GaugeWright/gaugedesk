@@ -1,12 +1,12 @@
 @transport
-Feature: Panel agents belong to the Library and deploy through projects
+Feature: Panel agents belong to the Workshop and deploy through projects
 
   Scenario: author, preview, place, and reach deployment custody
     Given the workbench is open
     When I create a Panel agent named "Public intake"
-    Then the Panel agent "Public intake" is in the Library
+    Then the Panel agent "Public intake" is in the Workshop
     When I open the Panel agent "Public intake"
-    Then the Panel agent is open as the Library draft
+    Then the Panel agent is open as the Workshop draft
     And the preview says it writes no production Inbox data
     And the preview offers a real disposable Session
     When I close the opened Panel agent

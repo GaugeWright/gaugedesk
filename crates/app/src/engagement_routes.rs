@@ -623,6 +623,98 @@ impl Workbench {
         Some(result)
     }
 
+    fn apply_file_manager_command(
+        &mut self,
+        chat_id: &str,
+        command: &FileManagerCommand,
+    ) -> Result<(), (StatusCode, String)> {
+        if self.chat_project_moving(chat_id) {
+            return Err((
+                StatusCode::CONFLICT,
+                "project handoff is in progress".into(),
+            ));
+        }
+        let source = command.path();
+        let file_manager_protected = |path: &str| {
+            path == "targets"
+                || path == ".whipple"
+                || gaugedesk_boundary::is_method_surface_path(path)
+                || gaugedesk_boundary::is_control_surface_path(path)
+                || path.starts_with("builder_only/")
+                || path.contains("/builder_only/")
+                || path.split('/').any(|part| part == ".agent-config.json")
+        };
+        if file_manager_protected(source)
+            || matches!(command, FileManagerCommand::Rename { to, .. } if file_manager_protected(to))
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "protected files are managed through their owning surface".into(),
+            ));
+        }
+        let workspace_source = self.engagement_workspace_path(chat_id, source);
+        let workspace_destination = match command {
+            FileManagerCommand::Rename { to, .. } => {
+                Some(self.engagement_workspace_path(chat_id, to))
+            }
+            _ => None,
+        };
+        let authorize = |path: &str| {
+            self.authorize_file_edit(chat_id, path)
+                .map_err(|reason| (StatusCode::FORBIDDEN, reason.to_owned()))
+        };
+        authorize(source)?;
+        if let FileManagerCommand::Rename { to, .. } = command {
+            authorize(to)?;
+        }
+        let eng = self
+            .engagements
+            .get(chat_id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "no such chat".to_owned()))?;
+        if matches!(
+            command,
+            FileManagerCommand::Rename { .. } | FileManagerCommand::Delete { .. }
+        ) {
+            let prefix = format!("{workspace_source}/");
+            let descendants = eng
+                .tree()
+                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+            for entry in descendants
+                .into_iter()
+                .filter(|entry| entry.path.starts_with(&prefix))
+            {
+                authorize(&entry.path)?;
+                if let Some(destination) = &workspace_destination {
+                    let suffix = &entry.path[workspace_source.len()..];
+                    authorize(&format!("{destination}{suffix}"))?;
+                }
+            }
+        }
+        match command {
+            FileManagerCommand::CreateFile { .. } => eng.create_file_if_absent(&workspace_source),
+            FileManagerCommand::CreateFolder { .. } => eng.create_folder(&workspace_source),
+            FileManagerCommand::Rename { .. } => eng.rename_entry(
+                &workspace_source,
+                workspace_destination.as_deref().unwrap_or_default(),
+            ),
+            FileManagerCommand::Delete { .. } => eng.delete_entry(&workspace_source),
+        }
+        .and_then(|_| {
+            eng.commit_turn(&format!("{} {source}", command.verb()))
+                .map(|_| ())
+        })
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        let event = ServerEvent::Admitted {
+            kind: "edit".into(),
+            text: format!("{} {source}", command.verb()),
+        };
+        let _ = self
+            .store_mut()
+            .append_record(chat_id, "transcript", &event.to_json());
+        self.publish(chat_id, event);
+        Ok(())
+    }
+
     /// Base-carrying editor save (SUB-6): the merge engine is whip's
     /// token-level three-way; this layer commits accepted outcomes and
     /// records the evidence. A merged save says so in the conversation
@@ -1241,6 +1333,49 @@ pub(crate) async fn get_tree(
 #[derive(Deserialize)]
 pub(crate) struct FileQuery {
     path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub(crate) enum FileManagerCommand {
+    CreateFile { path: String },
+    CreateFolder { path: String },
+    Rename { path: String, to: String },
+    Delete { path: String },
+}
+
+impl FileManagerCommand {
+    fn path(&self) -> &str {
+        match self {
+            Self::CreateFile { path }
+            | Self::CreateFolder { path }
+            | Self::Rename { path, .. }
+            | Self::Delete { path } => path,
+        }
+    }
+
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::CreateFile { .. } => "created file",
+            Self::CreateFolder { .. } => "created folder",
+            Self::Rename { .. } => "renamed",
+            Self::Delete { .. } => "deleted",
+        }
+    }
+}
+
+pub(crate) async fn post_file_manager_command(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(command): Json<FileManagerCommand>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    match wb.apply_file_manager_command(&id, &command) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "updated": true }))).into_response(),
+        Err((status, reason)) => {
+            (status, Json(serde_json::json!({ "error": reason }))).into_response()
+        }
+    }
 }
 
 /// The largest file this read serves. A worktree holds whatever the work put

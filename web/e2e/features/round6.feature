@@ -32,14 +32,14 @@ Feature: Round 6 — plain-language history, a keep guard, and consistent archet
     Then the changed-files review hides the internal settings file
     And the review offers no internal-file toggle
 
-  Scenario: the chat header shows the chat's own name
+  Scenario: the selected chat row shows the chat's own name
     Given a new engagement
     When I task the agent with "draft a tagline for spring"
-    Then the chat header shows the title "draft a tagline for spring"
+    Then the selected chat row shows the title "draft a tagline for spring"
 
-  Scenario: renaming a chat updates the open chat header live (event-driven)
+  Scenario: renaming a chat updates its selected row live (event-driven)
     Given a new engagement
     When I task the agent with "draft a tagline for spring"
-    Then the chat header shows the title "draft a tagline for spring"
+    Then the selected chat row shows the title "draft a tagline for spring"
     When I rename the open chat to "Spring campaign"
-    Then the chat header shows the title "Spring campaign"
+    Then the selected chat row shows the title "Spring campaign"

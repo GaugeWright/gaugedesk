@@ -1,10 +1,10 @@
 /**
- * The opened Panel agent (`experience/navigation.md` Library, PANEL-12).
+ * The opened Panel agent (`experience/navigation.md` Workshop, PANEL-12).
  *
  * Selecting a Panel agent puts its edit chat in the Chat pane and this surface
  * in the Content pane, the way project settings take that pane. It hosts the
  * two things developing a Panel agent is made of, side by side: the public
- * contract, edited in place while it is the Library draft, and Preview, the
+ * contract, edited in place while it is the Workshop draft, and Preview, the
  * real disposable public session, mounted but not started.
  *
  * A placement pinned to a frozen version opens the same surface. Its contract
@@ -148,7 +148,7 @@ export function PanelAgentSurface(props: {
             <section class="project-settings-section" data-panel-agent-contract>
                 <Show when={plan().contractEditable} fallback={<div class="admin-section">
                     <h3>Frozen public contract</h3>
-                    <p class="settings-hint">This is the pinned version. To change it, edit the Panel agent in the Library, publish a new version, and upgrade the placement.</p>
+                    <p class="settings-hint">This is the pinned version. To change it, edit the Panel agent in the Workshop, publish a new version, and upgrade the placement.</p>
                     <Show when={frozen()} fallback={<p class="status">This placement has no frozen public profile.</p>}>{(profile) => contractRows(profile())}</Show>
                 </div>}>
                     <Show when={draft()} fallback={<div class="admin-section"><h3>Public contract</h3>

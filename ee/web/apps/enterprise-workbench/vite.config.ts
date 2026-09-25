@@ -57,11 +57,11 @@ const controlPlanePrefixes = [
 const proxy = Object.fromEntries(
     controlPlanePrefixes.map((prefix) => [prefix, controlPlane]),
 );
-// The browser tab shows the same icon as the desktop app. /favicon.ico is the
-// path clients ask for when they do not read the page's <link rel="icon">, and
-// without a file there the hosted origin answers it with the SPA fallback.
+// Browser tabs use the transparent ring mark. The desktop app icon has a dark
+// tile, which does not belong in a browser tab. /favicon.ico also serves clients
+// that do not read the page's <link rel="icon">.
 const favicon = readFileSync(
-    fileURLToPath(new URL("../../../../src-tauri/icons/icon.ico", import.meta.url)),
+    fileURLToPath(new URL("./favicon.ico", import.meta.url)),
 );
 const faviconPlugin: Plugin = {
     name: "gaugedesk-favicon",

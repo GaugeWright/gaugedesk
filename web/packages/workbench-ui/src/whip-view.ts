@@ -499,12 +499,19 @@ export function tableName(rule: { readonly name: string }): string {
     return rule.name.startsWith("table_") ? rule.name.slice("table_".length) : rule.name;
 }
 
-/** Which of the five tabs a `.whip` file offers, in order. A non-whip file keeps
- *  the three it always had. */
-export function tabsForPath(path: string | null | undefined): readonly string[] {
-    return isWhipProgram(path)
-        ? ["view", "structure", "instances", "edit", "diff"]
-        : ["view", "edit", "diff"];
+/** Only offer file actions that have a usable surface. A whip program also has
+ *  its structure and run history, independently of its source editor. */
+export function tabsForPath(
+    path: string | null | undefined,
+    capabilities: { readonly view: boolean; readonly edit: boolean },
+): readonly string[] {
+    if (!path) return ["view", "diff"];
+    return [
+        ...(capabilities.view ? ["view"] : []),
+        ...(isWhipProgram(path) ? ["structure", "instances"] : []),
+        ...(capabilities.edit ? ["edit"] : []),
+        "diff",
+    ];
 }
 
 /** One running program in a project, for the Project Home rollup. */

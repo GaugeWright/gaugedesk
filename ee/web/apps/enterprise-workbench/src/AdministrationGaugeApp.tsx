@@ -56,6 +56,9 @@ import { ModelProvidersPage } from "./ModelProvidersPage";
 import {
     ChatPaneHeader,
     ChatPanel,
+    ContextMenu,
+    Icon,
+    type MenuState,
     createGaugeAppResource,
     createGaugeAppOperations,
     createGaugeAppUpdateChannel,
@@ -98,6 +101,25 @@ import {
 } from "./account-device-link";
 import "./administration-gaugeapp.css";
 import { AvatarFileError, avatarInitials, avatarUploadImage } from "./account-avatar-upload";
+
+function GaugeAppChatMenu(props: { busy: boolean; hasMessages: boolean; onClear: () => void }) {
+    const [menu, setMenu] = createSignal<MenuState | null>(null);
+    return <div class="chat-options-anchor">
+        <Show when={props.hasMessages}>
+            <button type="button" class="chat-options-trigger" aria-label="Management chat menu"
+                title="Management chat menu" aria-haspopup="menu" disabled={props.busy}
+                onClick={(event) => {
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    window.setTimeout(() => setMenu({ x: rect.left, y: rect.bottom, items: [
+                        { label: "Clear chat", run: props.onClear },
+                    ] }), 0);
+                }}>
+                <Icon name="menu" />
+            </button>
+        </Show>
+        <ContextMenu menu={menu()} onClose={() => setMenu(null)} />
+    </div>;
+}
 import { Notice, SectionHeading } from "./gaugeapp-design";
 
 const PAGE_LABELS: Readonly<Record<string, string>> = {
@@ -3947,18 +3969,16 @@ export function createGaugeAppWorkspace(options: {
     const chat = (controls: { readonly mobile: boolean; readonly onCollapse: () => void }) => <Show keyed when={sessionOperations.identity()}><Show when={chatSession()} fallback={<p class="gaugeapp-loading">Opening {APP_LABELS[options.app]}…</p>}>
             {(active) => <>
                 <ChatPaneHeader
-                    title={`${APP_LABELS[options.app]} agent`}
-                    context={session()?.scope.id}
-                    contextKind="management"
+                    branch={APP_LABELS[options.app]}
                     kind="management"
                     statusLabel={busy() ? "Working" : "Ready"}
                     mobile={controls.mobile}
                     onCollapse={controls.onCollapse}
-                    actions={<Show when={(messages()?.messages.length ?? 0) > 0}>
-                        <span class="header-actions gaugeapp-chat-actions">
-                            <button type="button" disabled={busy()} onClick={() => setConfirmingClear(true)}>Clear</button>
-                        </span>
-                    </Show>}
+                    menu={<GaugeAppChatMenu
+                        busy={busy()}
+                        hasMessages={(messages()?.messages.length ?? 0) > 0}
+                        onClear={() => setConfirmingClear(true)}
+                    />}
                 />
                 <Show when={confirmingClear()}>
                     <div class="gaugeapp-chat-clear" role="alert">
