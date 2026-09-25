@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ids::{
     AuthorityId, ObservationId, ScopeId, SecretHandleId, VaultBackingVersionId, VaultCandidateId,
-    VaultCredentialId, VaultDispatchId, VaultOperationId, VaultSubjectId, VaultTargetId,
+    VaultCredentialId, VaultDispatchId, VaultIntakeMarkerId, VaultOperationId, VaultSubjectId,
+    VaultTargetId,
 };
 use crate::{Lifecycle, Rejection};
 
@@ -129,6 +130,9 @@ pub struct State {
     pub status: Status,
     pub storage_name: Option<SecretHandleId>,
     pub candidates: BTreeMap<VaultCandidateId, Candidate>,
+    /// Retained through cleanup so an ambiguous write always reconciles under
+    /// the marker durably bound to its original candidate before the PUT.
+    pub intake_markers: BTreeMap<VaultCandidateId, VaultIntakeMarkerId>,
     pub current: Option<VaultCandidateId>,
     /// Retained after cleanup so a provider version cannot be rebound to a
     /// different candidate through replay or a later intake.
@@ -153,7 +157,7 @@ impl State {
 }
 
 /// Supplied by an authenticating shell, never accepted from a browser field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Capability {
     Manage,
     IntakeReceipt,
@@ -166,7 +170,7 @@ pub enum Capability {
     ConfirmFinalUse,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Command {
     pub binding: Binding,
     pub capability: Capability,
@@ -175,13 +179,14 @@ pub struct Command {
     pub operation: Operation,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Operation {
     Create {
         storage_name: SecretHandleId,
     },
     BeginCandidate {
         id: VaultCandidateId,
+        marker: VaultIntakeMarkerId,
         deadline: u64,
     },
     RecordStored {
@@ -240,6 +245,7 @@ pub enum Change {
     },
     CandidateBegun {
         id: VaultCandidateId,
+        marker: VaultIntakeMarkerId,
         deadline: u64,
     },
     CandidateStored {
@@ -284,6 +290,14 @@ fn refuse(reason: &'static str) -> Result<Vec<Event>, Rejection> {
     Err(Rejection { reason })
 }
 
+fn canonical_intake_marker(marker: &VaultIntakeMarkerId) -> bool {
+    let bytes = marker.as_str().as_bytes();
+    bytes.len() == 32
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
 pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> {
     if state.revision != command.expected_revision {
         return refuse("GaugeVault: stale revision");
@@ -304,13 +318,22 @@ pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> 
         {
             Change::Created { storage_name }
         }
-        Operation::BeginCandidate { id, deadline }
-            if command.capability == Capability::Manage
-                && matches!(state.status, Status::Pending | Status::Active)
-                && deadline > command.now
-                && !state.candidates.contains_key(&id) =>
+        Operation::BeginCandidate {
+            id,
+            marker,
+            deadline,
+        } if command.capability == Capability::Manage
+            && matches!(state.status, Status::Pending | Status::Active)
+            && deadline > command.now
+            && !state.candidates.contains_key(&id)
+            && canonical_intake_marker(&marker)
+            && !state.intake_markers.values().any(|used| used == &marker) =>
         {
-            Change::CandidateBegun { id, deadline }
+            Change::CandidateBegun {
+                id,
+                marker,
+                deadline,
+            }
         }
         Operation::RecordStored { id, reference }
             if command.capability == Capability::IntakeReceipt
@@ -491,7 +514,12 @@ pub fn evolve(state: &State, event: Event) -> State {
             next.storage_name = Some(storage_name);
             next.status = Status::Pending;
         }
-        Change::CandidateBegun { id, deadline } => {
+        Change::CandidateBegun {
+            id,
+            marker,
+            deadline,
+        } => {
+            next.intake_markers.insert(id.clone(), marker);
             next.candidates
                 .insert(id, Candidate::AwaitingStore { deadline });
         }
@@ -617,6 +645,10 @@ impl Lifecycle for State {
 mod tests {
     use super::*;
 
+    fn marker(number: u8) -> VaultIntakeMarkerId {
+        VaultIntakeMarkerId::from(format!("{number:032x}"))
+    }
+
     fn binding() -> Binding {
         Binding {
             authority: AuthorityId::from("hub"),
@@ -655,6 +687,7 @@ mod tests {
             2,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
+                marker: marker(1),
                 deadline: 20,
             },
         );
@@ -691,6 +724,7 @@ mod tests {
             5,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
+                marker: marker(2),
                 deadline: 30,
             },
         );
@@ -726,6 +760,81 @@ mod tests {
     }
 
     #[test]
+    fn intake_marker_survives_event_replay_and_candidate_cleanup() {
+        let mut state = State::default();
+        apply(
+            &mut state,
+            Capability::Manage,
+            1,
+            Operation::Create {
+                storage_name: SecretHandleId::from("opaque-name"),
+            },
+        );
+        let event = decide(
+            &state,
+            Command {
+                binding: binding(),
+                capability: Capability::Manage,
+                expected_revision: state.revision,
+                now: 2,
+                operation: Operation::BeginCandidate {
+                    id: VaultCandidateId::from("candidate-1"),
+                    marker: marker(1),
+                    deadline: 20,
+                },
+            },
+        )
+        .unwrap()
+        .remove(0);
+        let mut serialized = Vec::new();
+        ciborium::into_writer(&event, &mut serialized).unwrap();
+        let replayed = ciborium::from_reader(serialized.as_slice()).unwrap();
+        state = evolve(&state, replayed);
+        assert_eq!(
+            state.intake_markers[&VaultCandidateId::from("candidate-1")],
+            marker(1)
+        );
+        apply(
+            &mut state,
+            Capability::Manage,
+            3,
+            Operation::CancelCandidate {
+                id: VaultCandidateId::from("candidate-1"),
+            },
+        );
+        apply(
+            &mut state,
+            Capability::ConfirmCleanup,
+            4,
+            Operation::RecordCleaned {
+                id: VaultCandidateId::from("candidate-1"),
+                evidence: ObservationId::from("no-backed-version"),
+            },
+        );
+        assert_eq!(
+            state.intake_markers[&VaultCandidateId::from("candidate-1")],
+            marker(1)
+        );
+        for reused in [marker(1), VaultIntakeMarkerId::from("invalid-marker")] {
+            assert!(decide(
+                &state,
+                Command {
+                    binding: binding(),
+                    capability: Capability::Manage,
+                    expected_revision: state.revision,
+                    now: 5,
+                    operation: Operation::BeginCandidate {
+                        id: VaultCandidateId::from("candidate-2"),
+                        marker: reused,
+                        deadline: 20,
+                    },
+                },
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn revocation_and_erasure_are_terminal_for_resolution() {
         let mut state = active();
         let before_revoke = state.clone();
@@ -738,6 +847,7 @@ mod tests {
             now: 6,
             operation: Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
+                marker: marker(2),
                 deadline: 30,
             },
         };
@@ -781,6 +891,7 @@ mod tests {
             2,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
+                marker: marker(1),
                 deadline: 5,
             },
         );
@@ -830,6 +941,7 @@ mod tests {
             2,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
+                marker: marker(1),
                 deadline: 10,
             },
         );
@@ -939,6 +1051,7 @@ mod tests {
             5,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
+                marker: marker(2),
                 deadline: 10,
             },
         );
@@ -974,6 +1087,7 @@ mod tests {
             12,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-3"),
+                marker: marker(3),
                 deadline: 20,
             },
         );
@@ -1066,6 +1180,7 @@ mod tests {
             6,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
+                marker: marker(2),
                 deadline: 20,
             },
         );

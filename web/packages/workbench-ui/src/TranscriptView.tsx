@@ -27,6 +27,20 @@ import {
 } from "./transcript-filter";
 import { friendlyToolVerb, toolTargetOpensViewer } from "./tool-verb";
 import { isBoilerplateResult, partitionedToolTarget, toolDetail, toolHeaderTarget } from "./tool-detail";
+import type { ChoiceCard, ChoiceSelection } from "@gaugewright/control-plane-client";
+import { ChoiceCardView } from "./ChoiceCardView";
+
+function cardIdFromTool(line: TranscriptLine): string | null {
+    if (line.tool?.name !== "ask_choices" || !line.tool.result) return null;
+    try {
+        const parsed: unknown = JSON.parse(line.tool.result);
+        if (parsed && typeof parsed === "object") {
+            if ("card_id" in parsed && typeof parsed.card_id === "string") return parsed.card_id;
+            if ("external_call_id" in parsed && typeof parsed.external_call_id === "string") return parsed.external_call_id;
+        }
+    } catch { /* A failed tool result remains an ordinary tool line. */ }
+    return null;
+}
 
 // Markdown and its GFM parser load only when conversational prose is present;
 // the empty panel and tool/status-only transcripts keep the initial bundle lean.
@@ -188,13 +202,17 @@ function LineView(props: {
     /** Fired by the action on a `code: "no_credential"` error line — opens settings. */
     onResolveCredential?: () => void;
     onFork?: (entryId: number, origin?: string) => void;
+    choiceCards?: readonly ChoiceCard[];
+    onAnswerChoice?: (cardId: string, selections: ChoiceSelection[]) => Promise<void>;
 }): JSX.Element {
     // A model-credential refusal (LLM-1) carries a machine-readable code: render the
     // reason *with* an action into settings, so the user can act from the chat log
     // instead of being left with dead text.
     const isCredentialError = () =>
         props.line.kind === "error" && props.line.code === "no_credential" && !!props.onResolveCredential;
+    const choiceCard = () => props.choiceCards?.find((card) => card.id === cardIdFromTool(props.line));
     return (
+        <Show when={choiceCard() && props.onAnswerChoice} fallback={
         <Show
             when={props.line.kind === "tool" && props.line.tool}
             fallback={
@@ -251,6 +269,12 @@ function LineView(props: {
         >
             <ToolLineView line={props.line} onOpen={props.onOpen} defaultOpen={toolExpanded(props.line, props.prefs)} />
         </Show>
+        }>
+            <ChoiceCardView
+                card={choiceCard()!}
+                onAnswer={(selections) => props.onAnswerChoice!(choiceCard()!.id, selections)}
+            />
+        </Show>
     );
 }
 
@@ -273,6 +297,8 @@ function TurnView(props: {
     onOpen: (path: string) => void;
     onResolveCredential?: () => void;
     onFork?: (entryId: number, origin?: string) => void;
+    choiceCards?: readonly ChoiceCard[];
+    onAnswerChoice?: (cardId: string, selections: ChoiceSelection[]) => Promise<void>;
 }): JSX.Element {
     const [collapsed, setCollapsed] = createSignal(false);
     return (
@@ -299,6 +325,8 @@ function TurnView(props: {
                                 prefs={props.prefs}
                                 onResolveCredential={props.onResolveCredential}
                                 onFork={props.onFork}
+                                choiceCards={props.choiceCards}
+                                onAnswerChoice={props.onAnswerChoice}
                             />
                         )}
                     </For>
@@ -324,6 +352,8 @@ export function TranscriptView(props: {
     onResolveCredential?: () => void;
     /** Owner-only exact point fork. Omit in audience environments. */
     onFork?: (entryId: number, origin?: string) => void;
+    choiceCards?: readonly ChoiceCard[];
+    onAnswerChoice?: (cardId: string, selections: ChoiceSelection[]) => Promise<void>;
 }): JSX.Element {
     const prefs = () => props.prefs ?? defaultPrefs;
     const agentName = () => displayAgentName(props.agentName);
@@ -334,7 +364,7 @@ export function TranscriptView(props: {
     // turn and a turn settling leaves every earlier row's DOM untouched —
     // instead of tearing down and rebuilding the entire transcript.
     const lines = createMemo<readonly TranscriptLine[]>(
-        (prev) => reconcileLines(prev, props.lines.filter((l) => lineVisible(l, prefs()))),
+        (prev) => reconcileLines(prev, props.lines.filter((l) => cardIdFromTool(l) !== null || lineVisible(l, prefs()))),
         [],
     );
     const segments = createMemo<TranscriptSegment[]>(
@@ -386,6 +416,8 @@ export function TranscriptView(props: {
                             onOpen={props.onOpen}
                             onResolveCredential={props.onResolveCredential}
                             onFork={props.onFork}
+                            choiceCards={props.choiceCards}
+                            onAnswerChoice={props.onAnswerChoice}
                         />
                     ) : (
                         <LineView
@@ -395,6 +427,8 @@ export function TranscriptView(props: {
                             prefs={prefs()}
                             onResolveCredential={props.onResolveCredential}
                             onFork={props.onFork}
+                            choiceCards={props.choiceCards}
+                            onAnswerChoice={props.onAnswerChoice}
                         />
                     )}
                 </>

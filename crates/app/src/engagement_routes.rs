@@ -1425,6 +1425,187 @@ pub(crate) async fn get_transcript(
     }
 }
 
+pub(crate) async fn get_choice_cards(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    if !wb.library.chats.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "no such chat").into_response();
+    }
+    match crate::choice_prompt::list(wb.store_ref(), &id) {
+        Ok(cards) => (StatusCode::OK, Json(cards)).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response(),
+    }
+}
+
+pub(crate) async fn post_choice_answer(
+    State(wb): State<SharedWorkbench>,
+    Path((id, card_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
+    authenticated: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
+    Json(body): Json<crate::choice_prompt::AnswerRequest>,
+) -> impl IntoResponse {
+    let actor = actor.map(|axum::extract::Extension(actor)| actor.0);
+    let authenticated = authenticated.map(|axum::extract::Extension(context)| context);
+    let (card, inserted, context, respondent) = {
+        let mut g = wb.lock_unpoisoned();
+        let Some(context) = g.engagement_task_context(&id) else {
+            return (StatusCode::NOT_FOUND, "no such chat").into_response();
+        };
+        if context.mode != ChatMode::Use {
+            return (StatusCode::FORBIDDEN, "choice answers require a work chat").into_response();
+        }
+        let respondent = actor
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| g.authority().clone());
+        if !g
+            .roster()
+            .iter()
+            .any(|person| person.authority == respondent.as_str())
+        {
+            return (StatusCode::FORBIDDEN, "respondent has no chat standing").into_response();
+        }
+        let Some(existing) = (match crate::choice_prompt::get(g.store_ref(), &id, &card_id) {
+            Ok(card) => card,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response();
+            }
+        }) else {
+            return (StatusCode::NOT_FOUND, "choice card not found").into_response();
+        };
+        if existing.recipient != respondent.as_str() {
+            return (
+                StatusCode::FORBIDDEN,
+                "choice card belongs to another recipient",
+            )
+                .into_response();
+        }
+        let result =
+            crate::choice_prompt::answer(g.store_mut(), &id, &card_id, respondent.as_str(), &body);
+        let (card, inserted) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let status = if error.contains("already answered") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return (status, error).into_response();
+            }
+        };
+        g.notify_library_changed("question", &id, "upsert");
+        (card, inserted, context, respondent)
+    };
+    if !inserted
+        && card
+            .continuation
+            .as_ref()
+            .is_some_and(|state| state.status == "completed")
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"card": card, "replayed": true})),
+        )
+            .into_response();
+    }
+    if !inserted
+        && card
+            .continuation
+            .as_ref()
+            .is_some_and(|state| state.status == "refused")
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"card": card, "continuation_error": card.continuation.as_ref().and_then(|state| state.error.clone())})),
+        )
+            .into_response();
+    }
+    let account_bearer = crate::net_http::bearer(&headers).map(str::to_owned);
+    let (account_scope, tenant_scope) = {
+        let g = wb.lock_unpoisoned();
+        (
+            g.account_scope_for(account_bearer.as_deref()),
+            crate::workbench_auth::req_scope(&headers),
+        )
+    };
+    let wb2 = wb.clone();
+    let id2 = id.clone();
+    let prompt = crate::choice_prompt::continuation_text(&card);
+    let command_id = format!("choice-answer:{}", card.id);
+    let outcome = tokio::task::spawn_blocking(move || {
+        engine::run_engagement_turn(
+            &wb2,
+            &id2,
+            &context.worktree,
+            &context.sender,
+            engine::EngagementTurnInput {
+                task: &prompt,
+                images: &[],
+                mode: context.mode,
+                authenticated_actor: Some(&respondent),
+                authenticated_context: authenticated.as_ref(),
+                contribution_by: None,
+                account_scope: &account_scope,
+                tenant_scope: &tenant_scope,
+                account_bearer: account_bearer.as_deref(),
+                runtime_command_id: Some(&command_id),
+                harness_factory: None,
+            },
+        )
+    })
+    .await;
+    let (status, continuation_status, error) = match &outcome {
+        Ok(Ok(_)) => (StatusCode::OK, "completed", None),
+        Ok(Err(error)) => (
+            task_failure_status(error),
+            if matches!(error, engine::EngineError::Admit(_)) {
+                "refused"
+            } else {
+                "pending"
+            },
+            Some(error.to_string()),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pending",
+            Some("turn panicked".to_owned()),
+        ),
+    };
+    {
+        let mut g = wb.lock_unpoisoned();
+        if let Err(error) = crate::choice_prompt::record_continuation(
+            g.store_mut(),
+            &id,
+            &card.id,
+            continuation_status,
+            error.as_deref(),
+        ) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        }
+        g.notify_library_changed("question", &id, "upsert");
+    }
+    match outcome {
+        Ok(Ok(result)) => (
+            status,
+            Json(serde_json::json!({"card": card, "turn": result})),
+        )
+            .into_response(),
+        Ok(Err(error)) => (
+            task_failure_status(&error),
+            Json(serde_json::json!({"card": card, "continuation_error": error.to_string()})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"card": card, "continuation_error": "turn panicked"})),
+        )
+            .into_response(),
+    }
+}
+
 /// The chat's context-window reading for the composer's meter. `null` until a
 /// turn on a reporting runtime settles.
 pub(crate) async fn get_context_usage(

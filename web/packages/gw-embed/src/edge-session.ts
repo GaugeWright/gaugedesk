@@ -5,6 +5,8 @@ import {
     type MergeAction,
     type MergeState,
     type StreamEvent,
+    type ChoiceCard,
+    type ChoiceSelection,
 } from "@gaugewright/control-plane-client";
 
 import type {
@@ -28,6 +30,11 @@ interface EdgeState {
     readonly files: { path: string }[];
     readonly queue?: EmbedQueuedTurn[];
     readonly active_turn?: { readonly activity?: string };
+    readonly external_calls?: {
+        readonly id: string;
+        readonly name: string;
+        readonly arguments_json: string;
+    }[];
 }
 
 type PendingTurn = {
@@ -782,7 +789,42 @@ export class EdgeSessionApi implements EmbedSessionApi {
     async getTranscript(_id: EngagementId): Promise<StreamEvent[]> {
         await this.refreshState();
         await this.connect();
-        return this.snapshot?.transcript ?? [];
+        const transcript = this.snapshot?.transcript ?? [];
+        const existing = new Set(transcript.flatMap((event) =>
+            event.type === "toolresult" ? [event.call_id] : []));
+        const restored = (this.snapshot?.external_calls ?? [])
+            .filter((call) => call.name === "ask_choices" && !existing.has(call.id))
+            .flatMap((call): StreamEvent[] => [
+                { type: "tool", tool: call.name, mediated: true, call_id: call.id, args: call.arguments_json },
+                { type: "toolresult", call_id: call.id, ok: true, result: JSON.stringify({ external_call_id: call.id }) },
+            ]);
+        return [...transcript, ...restored];
+    }
+
+    async getChoiceCards(_id: EngagementId): Promise<ChoiceCard[]> {
+        const response = await fetch(
+            `${this.deploymentBase}/sessions/${encodeURIComponent(this.sessionId)}/choice-cards`,
+            { headers: this.projectionHeaders(), credentials: "omit", cache: "no-store" },
+        );
+        if (!response.ok) throw new Error(`read choice cards: ${response.status}`);
+        return await response.json() as ChoiceCard[];
+    }
+
+    async answerChoiceCard(_id: EngagementId, cardId: string, selections: ChoiceSelection[]): Promise<void> {
+        const response = await fetch(
+            `${this.deploymentBase}/sessions/${encodeURIComponent(this.sessionId)}/choice-cards/${encodeURIComponent(cardId)}/answer`,
+            {
+                method: "POST",
+                headers: { ...this.projectionHeaders(), "content-type": "application/json" },
+                credentials: "omit",
+                body: JSON.stringify({ selections }),
+            },
+        );
+        if (!response.ok) {
+            const body = await response.json().catch(() => ({})) as { error?: string };
+            throw new Error(body.error ?? `answer rejected (${response.status})`);
+        }
+        await this.refreshState();
     }
 
     getUsage(): EdgeUsage | null {

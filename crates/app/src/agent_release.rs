@@ -562,6 +562,9 @@ struct PackageManifestPaths {
     project_context: Option<String>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
+    // The runtime validates authored tools; the publisher reads only package paths.
+    #[serde(default, rename = "external_tools")]
+    _external_tools: Vec<serde_json::Value>,
     max_steps: usize,
 }
 

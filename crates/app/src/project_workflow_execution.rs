@@ -354,7 +354,7 @@ impl Workbench {
         )?;
         let mut recipients = BTreeMap::new();
         for (queue, tracker) in &prepared.trackers {
-            let (current, readers, basis) = self
+            let (current, readers, _, basis) = self
                 .prepare_project_tracker_recipients(context, project, queue)
                 .map_err(debug_error)?;
             if &current != tracker {

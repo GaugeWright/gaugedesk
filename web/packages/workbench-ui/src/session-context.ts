@@ -30,6 +30,8 @@ import {
     type RegionResolution,
     type SaveBase,
     type SaveFileResult,
+    type ChoiceCard,
+    type ChoiceSelection,
 } from "@gaugewright/control-plane-client";
 import { type Transcript } from "./transcript";
 import { type ImageRef } from "./attachments";
@@ -39,6 +41,8 @@ import {
 } from "./session-composer-controller";
 
 export interface SessionApi {
+    getChoiceCards?(id: EngagementId): Promise<ChoiceCard[]>;
+    answerChoiceCard?(id: EngagementId, cardId: string, selections: ChoiceSelection[]): Promise<void>;
     getFile(id: EngagementId, path: string): Promise<string>;
     /** The project's whip programs with their structure and instances, as
      *  WhippleScript projects them. Optional: only a session standing in a

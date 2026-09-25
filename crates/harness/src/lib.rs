@@ -266,6 +266,12 @@ pub struct WorkspaceTargetBinding {
 /// registered before the turn blocked.
 pub type InterruptHandle = Arc<dyn Fn() + Send + Sync>;
 
+/// Product implementation of a package-declared external tool. The first
+/// argument is the durable turn/call identity; a successful return is the
+/// tool's receipt and must follow persistence of its effect.
+pub type ExternalToolHandler =
+    Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<String, String> + Send + Sync>;
+
 /// The seam between the admission shell and any agent runtime (ADR 0031): drive one
 /// turn → a neutral [`TurnOutcome`]. Pi is one adapter ([`PiProcess`]); Codex /
 /// Claude Code are future adapters — each only implements this trait.
@@ -284,6 +290,7 @@ pub trait Harness: Send {
     /// Bind the Home's current, authenticated project-task filing operation for
     /// this turn. The adapter never derives tracker authority from a package.
     fn bind_task_filer(&mut self, _filer: Option<Arc<dyn TaskFiler>>) {}
+    fn bind_external_tool_handler(&mut self, _handler: Option<ExternalToolHandler>) {}
 
     /// Deliver `prompt` (+ any native `images` for this turn), mediate every tool
     /// call through `gate`, stream each [`Observation`] to `sink`, and return the
@@ -325,7 +332,18 @@ pub trait Harness: Send {
 /// A product-authorized operation that returns a tracker issue id only after
 /// the issue has committed. Each call id is stable within its turn.
 pub trait TaskFiler: Send + Sync {
-    fn file_task(&self, call_id: &str, content: &str) -> Result<String, String>;
+    fn file_task(
+        &self,
+        call_id: &str,
+        content: &str,
+        assigned_to: Option<&str>,
+    ) -> Result<String, String>;
+
+    /// Current project readers the model may assign to. Filing checks again at
+    /// use, since this projection may change during a turn.
+    fn assignable_recipients(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// A [`Harness`] that runs in a *different* trust authority, reached over the

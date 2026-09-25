@@ -1644,6 +1644,7 @@ impl WhipHarnessFactory {
             turn_sequence: 0,
             next_command_id: None,
             task_filer: None,
+            external_tool_handler: None,
             cancellation: Arc::new(Mutex::new(None)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             pursuing_cancel: Arc::new(AtomicBool::new(false)),
@@ -1844,6 +1845,7 @@ struct WhipHarness {
     turn_sequence: u64,
     next_command_id: Option<String>,
     task_filer: Option<Arc<dyn TaskFiler>>,
+    external_tool_handler: Option<gaugedesk_harness::ExternalToolHandler>,
     cancellation: Arc<Mutex<Option<HostCancellationHandle>>>,
     /// That a cancellation has been asked for, held separately from the handle
     /// that performs it. The handle exists only from `install_cancellation` to
@@ -1872,6 +1874,12 @@ impl Harness for WhipHarness {
     fn bind_task_filer(&mut self, filer: Option<Arc<dyn TaskFiler>>) {
         self.task_filer = filer;
     }
+    fn bind_external_tool_handler(
+        &mut self,
+        handler: Option<gaugedesk_harness::ExternalToolHandler>,
+    ) {
+        self.external_tool_handler = handler;
+    }
 
     fn run_turn(
         &mut self,
@@ -1890,11 +1898,14 @@ impl Harness for WhipHarness {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        let command = self.new_turn_command(prompt, images, nonce, admitted_command_id);
         let resources = TurnResources {
             workspace: &self.workspace,
             images,
             task_filer: self.task_filer.as_deref(),
             asked: std::cell::RefCell::new(Vec::new()),
+            external_tool_handler: self.external_tool_handler.as_ref(),
+            command_id: command.command_id.clone(),
             live: std::cell::RefCell::new(sink),
             streamed: std::cell::Cell::new(false),
         };
@@ -1904,19 +1915,25 @@ impl Harness for WhipHarness {
         // `HostRuntimeError::Incomplete` rather than a resumable state. Every
         // turn is an ordinary turn; an agent that needs a person files a task
         // and the answer arrives as the next turn's context.
-        let command = self.new_turn_command(prompt, images, nonce, admitted_command_id);
         self.install_cancellation(&command);
+        let package = ProjectTaskPackage {
+            inner: &self.package,
+            recipients: self
+                .task_filer
+                .as_ref()
+                .map_or_else(Vec::new, |filer| filer.assignable_recipients()),
+        };
         let execution = match &self.organization_model_broker {
             Some(broker) => self.runtime.run_turn_with_driver(
                 &command,
-                &self.package,
+                &package,
                 &self.provider,
                 &resources,
                 &OrganizationModelHostDriver(broker),
             ),
             None => self
                 .runtime
-                .run_turn(&command, &self.package, &self.provider, &resources),
+                .run_turn(&command, &package, &self.provider, &resources),
         }
         .map_err(turn_failure);
         self.clear_cancellation();
@@ -2272,6 +2289,49 @@ struct StaticPackage {
 struct StaticPackages {
     current: AuthoredAgentPackage,
     previous: StaticPackage,
+}
+
+/// Refine the native tracker tool with this turn's project recipients. The
+/// authored package still decides whether `tracker.file` exists at all; this
+/// host projection only tells the model who this Home currently permits.
+struct ProjectTaskPackage<'a> {
+    inner: &'a AuthoredAgentPackage,
+    recipients: Vec<(String, String)>,
+}
+
+impl PackageResolver for ProjectTaskPackage<'_> {
+    fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
+        let mut package = self.inner.resolve_package(version_ref)?;
+        describe_task_recipients(&mut package.tools, &self.recipients);
+        Ok(package)
+    }
+}
+
+fn describe_task_recipients(
+    tools: &mut [whipplescript_kernel::harness_loop::ToolSpec],
+    recipients: &[(String, String)],
+) {
+    let Some(tool) = tools.iter_mut().find(|tool| tool.name == "add_todo") else {
+        return;
+    };
+    let people = recipients
+        .iter()
+        .map(|(authority, display)| format!("{authority} = {display}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut assignee = serde_json::json!({
+        "type": "string",
+        "description": format!(
+            "Assign to an eligible person by authority. Omit for the person asking. Eligible people: {people}"
+        )
+    });
+    if !recipients.is_empty() {
+        assignee["enum"] = serde_json::json!(recipients
+            .iter()
+            .map(|(authority, _)| authority)
+            .collect::<Vec<_>>());
+    }
+    tool.input_schema["properties"]["assigned_to"] = assignee;
 }
 
 // Historical OS-command realization retained outside the compiled surface for
@@ -2816,6 +2876,8 @@ struct TurnResources<'a> {
     /// `execute_tool` takes `&self`; the engine drains these once the turn
     /// settles, since it holds the store across the run (ADR 0113).
     asked: std::cell::RefCell<Vec<gaugedesk_harness::AskedQuestion>>,
+    external_tool_handler: Option<&'a gaugedesk_harness::ExternalToolHandler>,
+    command_id: String,
     /// The engine's observation sink, held for the duration of the blocking
     /// `run_turn` call so WhippleScript's `observe_text_delta` can project
     /// answer text live — the native counterpart of the DO harness's stream
@@ -2884,8 +2946,26 @@ impl ResourceResolver for TurnResources<'_> {
             let filer = self
                 .task_filer
                 .ok_or("project task filing is unavailable")?;
-            let id = filer.file_task(&call.id, content)?;
+            let assigned_to = call
+                .arguments
+                .get("assigned_to")
+                .map(|value| value.as_str().ok_or("task assignee must be a person id"))
+                .transpose()?;
+            let id = filer.file_task(&call.id, content, assigned_to)?;
             return Ok(serde_json::json!({"id": id}).to_string());
+        }
+        if call.name == "ask_choices" {
+            if !admitted_resources
+                .iter()
+                .any(|resource| resource.kind == QUESTION_RESOURCE)
+            {
+                return Err("turn has no admitted question capability".to_owned());
+            }
+            let handler = self.external_tool_handler.as_ref().ok_or_else(|| {
+                "this placement has no implementation for `ask_choices`".to_owned()
+            })?;
+            let call_key = format!("{}/{}", self.command_id, call.id);
+            return handler(&call_key, &call.name, &call.arguments);
         }
         if call.name == "ask" {
             if !admitted_resources
@@ -3257,13 +3337,19 @@ mod tests {
     #[test]
     fn add_todo_requires_an_admitted_tracker_and_returns_the_committed_id() {
         use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
-        struct Filed(std::sync::Mutex<Vec<(String, String)>>);
+        struct Filed(std::sync::Mutex<Vec<(String, String, Option<String>)>>);
         impl gaugedesk_harness::TaskFiler for Filed {
-            fn file_task(&self, call_id: &str, content: &str) -> Result<String, String> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((call_id.into(), content.into()));
+            fn file_task(
+                &self,
+                call_id: &str,
+                content: &str,
+                assigned_to: Option<&str>,
+            ) -> Result<String, String> {
+                self.0.lock().unwrap().push((
+                    call_id.into(),
+                    content.into(),
+                    assigned_to.map(str::to_owned),
+                ));
                 Ok("issue-123".into())
             }
         }
@@ -3276,6 +3362,8 @@ mod tests {
             images: &[],
             task_filer: Some(&filer),
             asked: std::cell::RefCell::new(Vec::new()),
+            external_tool_handler: None,
+            command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
         };
@@ -3298,7 +3386,76 @@ mod tests {
         );
         assert_eq!(
             *filer.0.lock().unwrap(),
-            vec![("call-1".into(), "Test task".into())]
+            vec![("call-1".into(), "Test task".into(), None)]
+        );
+        let assigned = super::ToolCall {
+            id: "call-2".into(),
+            name: "add_todo".into(),
+            arguments: serde_json::json!({"content":"Colleague task", "assigned_to":"member-b"}),
+        };
+        assert_eq!(
+            resources
+                .execute_tool(
+                    &[super::ResourceRef {
+                        handle: "tasks".into(),
+                        kind: "tracker".into(),
+                        selector: None,
+                        writable: Some(true),
+                    }],
+                    &assigned
+                )
+                .unwrap(),
+            serde_json::json!({"id":"issue-123"}).to_string()
+        );
+        assert_eq!(
+            filer.0.lock().unwrap()[1],
+            (
+                "call-2".into(),
+                "Colleague task".into(),
+                Some("member-b".into())
+            )
+        );
+        let invalid = super::ToolCall {
+            id: "call-3".into(),
+            name: "add_todo".into(),
+            arguments: serde_json::json!({"content":"Invalid task", "assigned_to":42}),
+        };
+        assert!(resources
+            .execute_tool(
+                &[super::ResourceRef {
+                    handle: "tasks".into(),
+                    kind: "tracker".into(),
+                    selector: None,
+                    writable: Some(true),
+                }],
+                &invalid
+            )
+            .is_err());
+        assert_eq!(filer.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn task_tool_offers_only_current_project_recipients() {
+        let mut tools = vec![whipplescript_kernel::host_package::tracker_add_todo_spec()];
+        super::describe_task_recipients(
+            &mut tools,
+            &[
+                ("member-a".into(), "Alex".into()),
+                ("member-b".into(), "Blair".into()),
+            ],
+        );
+        let assigned = &tools[0].input_schema["properties"]["assigned_to"];
+        assert_eq!(
+            assigned["enum"],
+            serde_json::json!(["member-a", "member-b"])
+        );
+        assert!(assigned["description"]
+            .as_str()
+            .unwrap()
+            .contains("member-b = Blair"));
+        assert_eq!(
+            tools[0].input_schema["required"],
+            serde_json::json!(["content"])
         );
     }
 
@@ -3425,6 +3582,8 @@ mod tests {
                 images: &[],
                 task_filer: None,
                 asked: std::cell::RefCell::new(Vec::new()),
+                external_tool_handler: None,
+                command_id: "test-turn".to_owned(),
                 live: std::cell::RefCell::new(&mut sink),
                 streamed: std::cell::Cell::new(false),
             };
@@ -4329,7 +4488,12 @@ workflow Method {
             .any(|resource| resource.handle == "tasks"));
         struct AdmittedTask;
         impl gaugedesk_harness::TaskFiler for AdmittedTask {
-            fn file_task(&self, _call_id: &str, _content: &str) -> Result<String, String> {
+            fn file_task(
+                &self,
+                _call_id: &str,
+                _content: &str,
+                _assigned_to: Option<&str>,
+            ) -> Result<String, String> {
                 Ok("issue-1".to_owned())
             }
         }

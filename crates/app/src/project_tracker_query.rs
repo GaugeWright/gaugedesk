@@ -129,6 +129,7 @@ impl Workbench {
         chat_id: &str,
         operation_id: &str,
         content: &str,
+        assigned_to: Option<&str>,
     ) -> Result<String, String> {
         let content = content.trim();
         if content.is_empty()
@@ -141,14 +142,34 @@ impl Workbench {
         if self.library_project_of_chat(chat_id).as_deref() != Some(project) {
             return Err("task chat no longer belongs to this project".to_owned());
         }
-        let (tracker, basis) = self
-            .prepare_project_tracker_read(
+        let (tracker, recipients, choices, basis) = self
+            .prepare_project_tracker_recipients(
                 context,
                 project,
                 crate::project_tracker::PROJECT_TASKS,
-                TrackerPermission::Contribute,
             )
             .map_err(query_error)?;
+        let recipient = match assigned_to.map(str::trim) {
+            None | Some("me" | "myself") => context.actor().as_str().to_owned(),
+            Some("") => return Err("task assignee is empty".to_owned()),
+            Some(requested) if recipients.contains(requested) => requested.to_owned(),
+            Some(requested) => {
+                let mut matches = choices
+                    .iter()
+                    .filter(|(_, display)| display.as_str() == requested);
+                let recipient = matches
+                    .next()
+                    .ok_or("task assignee is not an eligible project recipient")?
+                    .0;
+                if matches.next().is_some() {
+                    return Err("task assignee is ambiguous".to_owned());
+                }
+                recipient.clone()
+            }
+        };
+        if !recipients.contains(&recipient) {
+            return Err("task assignee cannot currently read this project tracker".to_owned());
+        }
         crate::federation::require_project_writes_available(self.store_ref(), project)
             .map_err(query_error)?;
         let key = self.workflow_key(project, &tracker.workspace_id, true)?;
@@ -171,7 +192,7 @@ impl Workbench {
             body: body.to_owned(),
             labels: Vec::new(),
             metadata: serde_json::json!({"source": "agent"}),
-            assigned_to: Some(context.actor().as_str().to_owned()),
+            assigned_to: Some(recipient),
         };
         let mut writer = self.store_ref().sibling().map_err(query_error)?;
         let item_id = writer

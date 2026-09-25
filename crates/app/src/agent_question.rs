@@ -128,8 +128,8 @@ impl Workbench {
     /// standing, so asking them would be a question nobody receives.
     ///
     /// This is *the* roster (`GATE-3f`), not the ask path's private one — the
-    /// assign path resolves against the same list, so the two can never disagree
-    /// about who exists. See [`crate::roster`].
+    /// question path resolves against the same list. Project tracker assignment
+    /// uses the narrower project recipient list. See [`crate::roster`].
     pub fn roster(&self) -> Vec<Addressee> {
         let mut people: BTreeMap<String, Addressee> = BTreeMap::new();
         let acting = self.authority().as_str().to_owned();

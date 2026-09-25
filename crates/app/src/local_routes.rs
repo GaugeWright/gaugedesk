@@ -345,6 +345,11 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         )
         .route("/chats/{id}/merge-preview", post(er::post_merge_preview))
         .route("/chats/{id}/transcript", get(er::get_transcript))
+        .route("/chats/{id}/choice-cards", get(er::get_choice_cards))
+        .route(
+            "/chats/{id}/choice-cards/{card_id}/answer",
+            post(er::post_choice_answer),
+        )
         .route("/chats/{id}/context-usage", get(er::get_context_usage))
         .route("/chats/{id}/audit", get(er::get_audit))
         .route("/chats/{id}/events", get(er::engagement_events))

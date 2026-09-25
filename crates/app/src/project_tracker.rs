@@ -2,7 +2,7 @@
 //! trackers. This module owns no issues, assignments, runtime, or scheduler.
 //! The public methods are admission-shell operations; no route is activated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gaugedesk_core::{
     abac::{Action, AuthorityAttributes, Policy, ResourceAttributes},
@@ -38,6 +38,13 @@ pub struct ProjectTracker {
     pub queue: String,
     pub resource: ResourceRecord,
 }
+
+type PreparedTrackerRecipients = (
+    ProjectTracker,
+    BTreeSet<String>,
+    BTreeMap<String, String>,
+    DispatchReadBasis,
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -852,14 +859,7 @@ impl Workbench {
         context: &AuthenticatedActionContext,
         project: &str,
         queue: &str,
-    ) -> Result<
-        (
-            ProjectTracker,
-            std::collections::BTreeSet<String>,
-            DispatchReadBasis,
-        ),
-        AdmitError,
-    > {
+    ) -> Result<PreparedTrackerRecipients, AdmitError> {
         let (snapshot, basis) = capture(
             self.store_ref(),
             self.home_id(),
@@ -901,7 +901,7 @@ impl Workbench {
                 .map(|grant| &grant.recipient)
                 .collect()
         };
-        let recipients = candidates
+        let choices: std::collections::BTreeMap<String, String> = candidates
             .into_iter()
             .filter_map(|recipient| {
                 if !snapshot
@@ -929,10 +929,19 @@ impl Workbench {
                     Action::Access,
                 )
                 .ok()
-                .map(|_| recipient.clone())
+                .map(|_| {
+                    let display = snapshot
+                        .authority
+                        .org
+                        .member_by_authority(recipient)
+                        .filter(|member| !member.email.is_empty())
+                        .map_or_else(|| recipient.clone(), |member| member.email.clone());
+                    (recipient.clone(), display)
+                })
             })
             .collect();
-        Ok((tracker.clone(), recipients, basis))
+        let recipients = choices.keys().cloned().collect();
+        Ok((tracker.clone(), recipients, choices, basis))
     }
 }
 

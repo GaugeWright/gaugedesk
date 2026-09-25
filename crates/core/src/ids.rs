@@ -175,6 +175,11 @@ id_newtype!(
     VaultCandidateId
 );
 id_newtype!(
+    /// Random marker persisted before one GaugeVault intake write and stored
+    /// with its Azure version for metadata-only reconciliation.
+    VaultIntakeMarkerId
+);
+id_newtype!(
     /// The exact provider-issued backing version returned to trusted intake.
     VaultBackingVersionId
 );

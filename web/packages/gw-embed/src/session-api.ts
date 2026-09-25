@@ -5,6 +5,8 @@ import type {
     MergeAction,
     MergeState,
     StreamEvent,
+    ChoiceCard,
+    ChoiceSelection,
 } from "@gaugewright/control-plane-client";
 
 export interface EdgeUsage {
@@ -29,6 +31,8 @@ export type { TurnActivity, TurnObservation } from "@gaugewright/workbench-ui/se
 
 /** Narrow transport consumed by the shared panel Session projection. */
 export interface EmbedSessionApi {
+    getChoiceCards?(id: EngagementId): Promise<ChoiceCard[]>;
+    answerChoiceCard?(id: EngagementId, cardId: string, selections: ChoiceSelection[]): Promise<void>;
     getTranscript(id: EngagementId): Promise<StreamEvent[]>;
     subscribe(id: EngagementId, onEvent: (ev: StreamEvent) => void, onOpen?: () => void): () => void;
     engagementDiff(id: EngagementId): Promise<string>;

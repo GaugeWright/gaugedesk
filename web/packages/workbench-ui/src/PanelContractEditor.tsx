@@ -89,7 +89,7 @@ export function PanelContractEditor(props: {
 
         <fieldset class="settings-field"><legend class="settings-label">Public abilities</legend>
             <p class="status">The deployed agent receives only this subset of its authored package abilities.</p>
-            <For each={(["workspace.read", "workspace.write", "command.run"] as AgentAbility[])}>{(ability) =>
+            <For each={(["workspace.read", "workspace.write", "command.run", "question.ask"] as AgentAbility[])}>{(ability) =>
                 <label class="settings-checkbox"><input type="checkbox" checked={props.profile.public_abilities.includes(ability)}
                     onChange={(event) => togglePublicAbility(ability, event.currentTarget.checked)} /> {ability}</label>}
             </For>

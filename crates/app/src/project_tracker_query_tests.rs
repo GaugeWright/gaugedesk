@@ -16,6 +16,7 @@ fn agent_task_tool_files_a_real_personal_issue_once_under_current_authority() {
             "chat-one",
             "chat:one:call:one",
             "Test task\nVerify the app works",
+            None,
         )
         .expect("first task initializes protected tracker and commits");
     assert!(matches!(
@@ -30,6 +31,7 @@ fn agent_task_tool_files_a_real_personal_issue_once_under_current_authority() {
             "chat-one",
             "chat:one:call:one",
             "Test task\nVerify the app works",
+            None,
         )
         .unwrap(),
         id
@@ -41,6 +43,7 @@ fn agent_task_tool_files_a_real_personal_issue_once_under_current_authority() {
             "chat-one",
             "chat:one:call:one",
             "A different task",
+            None,
         )
         .is_err(),
         "one tool call cannot acquire a different meaning"
@@ -67,6 +70,7 @@ fn agent_task_tool_files_a_real_personal_issue_once_under_current_authority() {
             "chat-one",
             "chat:two:call:one",
             "Forbidden task",
+            None,
         )
         .is_err());
     assert_eq!(

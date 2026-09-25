@@ -480,8 +480,8 @@ pub async fn get_tasks(
 /// Who exists and may be given work (`GATE-3f`).
 ///
 /// A read-only projection of `Active` memberships (`INV-5`, `INV-20`): the same
-/// list the `ask` tool offers an agent and the same one an assignment resolves
-/// against, so no surface can believe in a person another does not.
+/// list the `ask` tool offers an agent. Project tracker assignment checks the
+/// project's current readers separately.
 pub async fn get_roster(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     Json(serde_json::json!({ "people": wb.roster() })).into_response()

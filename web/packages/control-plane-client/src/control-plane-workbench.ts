@@ -1518,6 +1518,52 @@ export async function getTranscript(
     return (await transport.json("GET", `/chats/${id}/transcript`)) as StreamEvent[];
 }
 
+export interface ChoiceOption {
+    readonly id: string;
+    readonly label: string;
+    readonly description: string;
+}
+
+export interface ChoiceQuestion {
+    readonly id: string;
+    readonly prompt: string;
+    readonly options: ChoiceOption[];
+    readonly multiple: boolean;
+    readonly recommended_option_id: string | null;
+}
+
+export interface ChoiceSelection {
+    readonly question_id: string;
+    readonly option_ids: string[];
+    readonly other: string | null;
+}
+
+export interface ChoiceCard {
+    readonly id: string;
+    readonly conversation_id: string;
+    readonly recipient: string;
+    readonly blocking: boolean;
+    readonly questions: ChoiceQuestion[];
+    readonly answer: { readonly selections: ChoiceSelection[]; readonly answered_by: string } | null;
+    readonly continuation?: { readonly status: "pending" | "refused" | "completed"; readonly error: string | null } | null;
+}
+
+export async function getChoiceCards(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+): Promise<ChoiceCard[]> {
+    return (await transport.json("GET", `/chats/${id}/choice-cards`)) as ChoiceCard[];
+}
+
+export async function answerChoiceCard(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    cardId: string,
+    selections: ChoiceSelection[],
+): Promise<void> {
+    await transport.json("POST", `/chats/${id}/choice-cards/${encodeURIComponent(cardId)}/answer`, { selections });
+}
+
 /** The chat's latest settled context-window reading (the composer's meter):
  *  the runtime's own compaction-trigger number against the window of the model
  *  that read it. `null` until a turn on a reporting runtime settles — the

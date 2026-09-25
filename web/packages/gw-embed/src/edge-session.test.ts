@@ -44,6 +44,41 @@ afterEach(() => {
 });
 
 describe("EdgeSessionApi", () => {
+    it("restores a durable choice card anchor after reconnect", async () => {
+        const sockets: FakeWebSocket[] = [];
+        const snapshot = {
+            session_id: "sess_0123456789abcdef0123456789abcdef",
+            release_id: `sha256:${"a".repeat(64)}`,
+            cursor: 4,
+            transcript: [{ type: "user", text: "hello" }],
+            files: [],
+            external_calls: [{ id: "turn%2Fcall", name: "ask_choices", arguments_json: '{"questions":[]}' }],
+        };
+        vi.stubGlobal("fetch", vi.fn(async () => Response.json(snapshot)));
+        vi.stubGlobal("WebSocket", class extends FakeWebSocket {
+            constructor(url: string) { super(url); sockets.push(this); }
+        });
+        const api = new EdgeSessionApi(
+            "https://panels.gaugewright.com/d/theory-a",
+            snapshot.session_id as EngagementId,
+            "resume-capability",
+            "connection-capability",
+            Date.now() + 15 * 60 * 1000,
+            null,
+            false,
+        );
+        const reading = api.getTranscript(snapshot.session_id as EngagementId);
+        await vi.waitFor(() => expect(sockets).toHaveLength(1));
+        sockets[0]!.emit("open");
+        sockets[0]!.emit("message", { data: JSON.stringify({ type: "session_ready", snapshot }) });
+        expect(await reading).toEqual([
+            { type: "user", text: "hello" },
+            { type: "tool", tool: "ask_choices", mediated: true, call_id: "turn%2Fcall", args: '{"questions":[]}' },
+            { type: "toolresult", call_id: "turn%2Fcall", ok: true, result: '{"external_call_id":"turn%2Fcall"}' },
+        ]);
+        api.dispose();
+    });
+
     it("disposes a bootstrapped client that fails before host adoption", async () => {
         vi.useFakeTimers();
         const sockets: FakeWebSocket[] = [];

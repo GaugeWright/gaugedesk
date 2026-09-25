@@ -3033,7 +3033,12 @@ struct CurrentProjectTaskFiler {
 }
 
 impl TaskFiler for CurrentProjectTaskFiler {
-    fn file_task(&self, call_id: &str, content: &str) -> Result<String, String> {
+    fn file_task(
+        &self,
+        call_id: &str,
+        content: &str,
+        assigned_to: Option<&str>,
+    ) -> Result<String, String> {
         if call_id.trim().is_empty() {
             return Err("task tool call has no identity".to_owned());
         }
@@ -3048,7 +3053,23 @@ impl TaskFiler for CurrentProjectTaskFiler {
             &self.chat_id,
             &operation,
             content,
+            assigned_to,
         )
+    }
+
+    fn assignable_recipients(&self) -> Vec<(String, String)> {
+        let g = self.wb.lock_unpoisoned();
+        if g.library_project_of_chat(&self.chat_id).as_deref() != Some(self.project_id.as_str()) {
+            return Vec::new();
+        }
+        let Ok((_, _, choices, _)) = g.prepare_project_tracker_recipients(
+            &self.context,
+            &self.project_id,
+            crate::project_tracker::PROJECT_TASKS,
+        ) else {
+            return Vec::new();
+        };
+        choices.into_iter().collect()
     }
 }
 
@@ -3171,6 +3192,44 @@ fn drive_persistent_turn(
                 _ => None,
             };
         harness.bind_task_filer(task_filer);
+        let external_tool_handler = if spec.mode == gaugedesk_harness::ChatMode::Use {
+            let workbench = Arc::clone(wb);
+            let conversation_id = id.to_owned();
+            Some(Arc::new(
+                move |call_key: &str, name: &str, arguments: &serde_json::Value| {
+                    if name != "ask_choices" {
+                        return Err(format!("unknown external tool `{name}`"));
+                    }
+                    let request: crate::choice_prompt::ChoiceRequest =
+                        serde_json::from_value(arguments.clone())
+                            .map_err(|error| error.to_string())?;
+                    let mut workbench = workbench.lock_unpoisoned();
+                    let recipient = match request.to.as_deref() {
+                        None => workbench.default_addressee(&conversation_id),
+                        Some(requested) => workbench
+                            .roster()
+                            .into_iter()
+                            .find(|person| {
+                                person.authority == requested || person.display == requested
+                            })
+                            .map(|person| person.authority)
+                            .ok_or_else(|| format!("unknown question recipient `{requested}`"))?,
+                    };
+                    let card = crate::choice_prompt::ask(
+                        workbench.store_mut(),
+                        &conversation_id,
+                        call_key,
+                        &recipient,
+                        &request,
+                    )?;
+                    workbench.notify_library_changed("question", &conversation_id, "upsert");
+                    Ok(serde_json::json!({"asked": true, "card_id": card.id, "note": "The answer will arrive in a later turn."}).to_string())
+                },
+            ) as gaugedesk_harness::ExternalToolHandler)
+        } else {
+            None
+        };
+        harness.bind_external_tool_handler(external_tool_handler);
         // Publish this turn's interrupt handle so a concurrent Stop can terminate it
         // out-of-band (unblocking `recv`). A harness with nothing to interrupt binds
         // nothing — the claim taken in `run_engagement_turn` is what records that a

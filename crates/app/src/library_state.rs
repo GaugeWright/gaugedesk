@@ -104,7 +104,12 @@ fn validate_panel_profile(
     {
         return Err(format!("unsupported public panel `{panel}`"));
     }
-    let supported_abilities = ["workspace.read", "workspace.write", "command.run"];
+    let supported_abilities = [
+        "workspace.read",
+        "workspace.write",
+        "command.run",
+        "question.ask",
+    ];
     for ability in &profile.public_abilities {
         if !supported_abilities.contains(&ability.as_str()) {
             return Err(format!("unsupported public ability `{ability}`"));
@@ -4568,11 +4573,17 @@ impl Workbench {
         if visible_agent {
             std::fs::create_dir_all(agent_mount.join("skills"))
                 .map_err(|error| error.to_string())?;
-            for (name, source) in [
-                ("AGENTS.md", package_root.join("AGENTS.md")),
-                ("HUMANS.md", package_root.join("HUMANS.md")),
-            ] {
-                std::fs::copy(source, agent_mount.join(name)).map_err(|error| error.to_string())?;
+            std::fs::copy(
+                package_root.join("AGENTS.md"),
+                agent_mount.join("AGENTS.md"),
+            )
+            .map_err(|error| error.to_string())?;
+            // The Default Agent migration preserves older packages that have no
+            // human guide; its new AGENTS.md must still mount for existing chats.
+            let humans = package_root.join("HUMANS.md");
+            if humans.exists() {
+                std::fs::copy(humans, agent_mount.join("HUMANS.md"))
+                    .map_err(|error| error.to_string())?;
             }
             if !package.system_prompt_document().is_empty() {
                 std::fs::write(
@@ -5275,11 +5286,13 @@ impl Workbench {
                 "workspace.write".to_owned(),
             ],
         ];
-        admitted.extend(admitted.clone().into_iter().map(|mut abilities| {
-            abilities.push("tracker.file".to_owned());
-            abilities.sort();
-            abilities
-        }));
+        for optional in ["tracker.file", "question.ask"] {
+            admitted.extend(admitted.clone().into_iter().map(|mut abilities| {
+                abilities.push(optional.to_owned());
+                abilities.sort();
+                abilities
+            }));
+        }
         if !admitted.contains(&abilities) {
             return Err("abilities must match one GaugeDesk ability preset".to_owned());
         }
@@ -7981,6 +7994,10 @@ impl Workbench {
                         !crate::agent_question::open_questions(&self.store, &chat.id)
                             .unwrap_or_default()
                             .is_empty()
+                            || crate::choice_prompt::list(&self.store, &chat.id)
+                                .unwrap_or_default()
+                                .iter()
+                                .any(|card| card.answer.is_none())
                     }
                     Signal::Conflict => matches!(&merge, Some(m)
                         if m.phase == gaugedesk_core::merge::MergePhase::Rejected
@@ -8017,6 +8034,16 @@ impl Workbench {
                 crate::agent_question::open_questions(&self.store, &chat.id)
                     .ok()
                     .and_then(|open| open.into_iter().next().map(|q| q.recipient))
+                    .or_else(|| {
+                        crate::choice_prompt::list(&self.store, &chat.id)
+                            .ok()
+                            .and_then(|cards| {
+                                cards
+                                    .into_iter()
+                                    .find(|card| card.answer.is_none())
+                                    .map(|card| card.recipient)
+                            })
+                    })
                     .unwrap_or_else(|| self.default_addressee(&chat.id))
             } else {
                 self.default_addressee(&chat.id)
@@ -8025,7 +8052,11 @@ impl Workbench {
             // stronger presentation and suppresses *automatic* continuation — it is
             // never a lock on the person's own chat, who may always type.
             let blocking = raised_signal == crate::attention::Signal::Question
-                && crate::agent_question::is_blocked(&self.store, &chat.id);
+                && (crate::agent_question::is_blocked(&self.store, &chat.id)
+                    || crate::choice_prompt::list(&self.store, &chat.id)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|card| card.answer.is_none() && card.blocking));
             let agent = self
                 .library
                 .instances

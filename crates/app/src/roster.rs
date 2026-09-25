@@ -2,9 +2,9 @@
 //!
 //! Removing `askHuman` (WhippleScript DR-0050) moved the choice of *who* from the
 //! runtime to the agent, and nothing in GaugeDesk let an agent make that choice:
-//! the org directory knew the answer and no agent-facing surface exposed it. This
-//! is the join. One roster, read by both paths that need a person — asking a
-//! question (ADR 0113) and directing an issue at someone.
+//! the org directory knew the answer and no agent-facing surface exposed it.
+//! This account roster serves questions (ADR 0113); project tracker assignment
+//! narrows its choices to current readers of that project's tracker.
 //!
 //! **Derived, never authored.** A roster row is a projection of an `Active`
 //! membership (`INV-5`). An invited or deprovisioned member carries no standing
@@ -38,8 +38,7 @@ use crate::Workbench;
 impl Workbench {
     /// Resolve a name — an authority or a display name — to an authority.
     ///
-    /// Shared by the ask path and the assign path so the two can never disagree
-    /// about who exists. Accepting the display name matters: an agent writes what
+    /// Accepting the display name matters: an agent writes what
     /// it saw, and refusing `alex@example.com` because the row is keyed by an
     /// opaque authority would be a distinction only the implementation cares
     /// about.

@@ -26,6 +26,7 @@ import {
     useSession,
 } from "./session-context";
 import { liveToolVerb } from "./tool-verb";
+import { type ChoiceCard, type ChoiceSelection } from "@gaugewright/control-plane-client";
 
 /** One label per live-turn state, keyed by the shared vocabulary so a state
  *  added to `TURN_ACTIVITIES` cannot compile without a phrase to show for it.
@@ -256,6 +257,30 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
     // hosts pass a leaf while normal panel mounts consume SessionProvider.
     const ambient = props.session ? undefined : useSession();
     const session = () => props.session ?? ambient!;
+    const [choiceCards, setChoiceCards] = createSignal<ChoiceCard[]>([]);
+    const loadChoiceCards = async (id: NonNullable<ReturnType<Session["engagementId"]>>) => {
+        const read = session().api.getChoiceCards;
+        if (read) setChoiceCards(await read(id));
+    };
+    createEffect(on(() => [
+        session().engagementId(),
+        session().transcript().lines.filter((line) => line.tool?.name === "ask_choices")
+            .map((line) => line.tool?.result ?? "").join("|"),
+        session().busy(),
+    ] as const, ([id]) => {
+        setChoiceCards([]);
+        if (id) void loadChoiceCards(id).catch(() => undefined);
+    }));
+    const answerChoice = async (cardId: string, selections: ChoiceSelection[]) => {
+        const id = session().engagementId();
+        const submit = session().api.answerChoiceCard;
+        if (!id || !submit) throw new Error("This conversation cannot accept an answer.");
+        try {
+            await submit(id, cardId, selections);
+        } finally {
+            await loadChoiceCards(id);
+        }
+    };
     const lines = (): readonly TranscriptLine[] => {
         const opening = props.openingMessage?.trim();
         const transcript = session().transcript().lines;
@@ -305,6 +330,8 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                         prefs={props.prefs}
                         onResolveCredential={props.onResolveCredential}
                         onFork={session().forkAt}
+                        choiceCards={choiceCards()}
+                        onAnswerChoice={session().api.answerChoiceCard ? answerChoice : undefined}
                     />
                     <TurnActivity session={session()} agentName={props.agentName} />
                     {props.transcriptTail}

@@ -195,7 +195,7 @@ export interface ArchetypeNode {
     readonly workstreams: WorkstreamNode[];
 }
 export type AgentKind = "work" | "panel";
-export type AgentAbility = "workspace.read" | "workspace.write" | "command.run" | "tracker.file";
+export type AgentAbility = "workspace.read" | "workspace.write" | "command.run" | "tracker.file" | "question.ask";
 
 export interface PublicDeploymentBindingSummary {
     readonly id: string;

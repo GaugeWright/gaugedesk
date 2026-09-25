@@ -248,6 +248,128 @@ fn a_projects_home_owned_files_run_and_file_into_its_tasks_tracker() {
         .is_err());
 }
 
+#[test]
+fn agent_filing_assigns_an_eligible_colleague_in_the_chat_project() {
+    let (_root, shared, _owner, _request) = fixture(ECHO);
+    let chat = chat(&shared);
+    let mut wb = shared.lock_unpoisoned();
+    wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    let requester = member(&mut wb, "member-a", Some(DEFAULT_PROJECT));
+    let colleague = member(&mut wb, "member-b", Some(DEFAULT_PROJECT));
+    let outsider = member(&mut wb, "member-c", None);
+    member(&mut wb, "member-d", Some(DEFAULT_PROJECT));
+    let mut inactive_record = crate::org::Org::rebuild(wb.store_ref())
+        .unwrap()
+        .member_by_authority("member-d")
+        .unwrap()
+        .clone();
+    inactive_record.status = crate::org::MembershipStatus::Deprovisioned;
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&inactive_record).unwrap(),
+        )
+        .unwrap();
+    let mut colleague_record = crate::org::Org::rebuild(wb.store_ref())
+        .unwrap()
+        .member_by_authority("member-b")
+        .unwrap()
+        .clone();
+    colleague_record.email = "blair@example.com".into();
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&colleague_record).unwrap(),
+        )
+        .unwrap();
+    let (_, recipients, choices, _) = wb
+        .prepare_project_tracker_recipients(&requester, DEFAULT_PROJECT, "tasks")
+        .unwrap();
+    assert!(recipients.contains("member-b"));
+    assert_eq!(choices["member-b"], "blair@example.com");
+    assert!(!choices.contains_key("member-c"));
+    assert!(!choices.contains_key("member-d"));
+
+    let id = wb
+        .file_agent_project_task(
+            &requester,
+            DEFAULT_PROJECT,
+            &chat,
+            "turn:call:colleague",
+            "Review the proposal",
+            Some("blair@example.com"),
+        )
+        .expect("current project reader may receive a task");
+    let assigned = wb
+        .read_project_tracker_tasks(&colleague, DEFAULT_PROJECT, "tasks")
+        .unwrap();
+    assert_eq!(assigned.backlog.issues.len(), 1);
+    assert_eq!(assigned.backlog.issues[0].id, id);
+    assert_eq!(
+        assigned.backlog.issues[0].assigned_to.as_deref(),
+        Some("member-b")
+    );
+    assert!(wb
+        .read_project_tracker_tasks(&requester, DEFAULT_PROJECT, "tasks")
+        .unwrap()
+        .backlog
+        .issues
+        .is_empty());
+    assert!(wb
+        .file_agent_project_task(
+            &requester,
+            DEFAULT_PROJECT,
+            &chat,
+            "turn:call:outsider",
+            "Private task",
+            Some("member-c"),
+        )
+        .is_err());
+    assert!(wb
+        .file_agent_project_task(
+            &requester,
+            DEFAULT_PROJECT,
+            &chat,
+            "turn:call:unknown",
+            "Unknown task",
+            Some("unknown-person"),
+        )
+        .is_err());
+    assert!(wb
+        .file_agent_project_task(
+            &requester,
+            DEFAULT_PROJECT,
+            &chat,
+            "turn:call:inactive",
+            "Inactive task",
+            Some("member-d"),
+        )
+        .is_err());
+    assert!(
+        wb.file_agent_project_task(
+            &requester,
+            DEFAULT_PROJECT,
+            &chat,
+            "turn:call:colleague",
+            "Review the proposal",
+            Some("member-a"),
+        )
+        .is_err(),
+        "one call cannot silently reassign its prior issue"
+    );
+    assert!(wb
+        .read_project_tracker_backlog(&requester, DEFAULT_PROJECT, "tasks")
+        .unwrap()
+        .issues
+        .iter()
+        .all(|issue| issue.id == id));
+    assert!(wb
+        .read_project_tracker_backlog(&outsider, DEFAULT_PROJECT, "tasks")
+        .is_err());
+}
+
 /// The project's tracker is the Home's: nobody declares over it, and nobody
 /// requests or grants access to it — project access is its only rule.
 #[test]

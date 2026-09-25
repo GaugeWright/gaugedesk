@@ -1101,6 +1101,21 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 /* A tool line is only clickable when it has additive detail to reveal; a file
    write ("Wrote X ✓") is a tight, non-expandable one-liner. */
 .tool-head { display: flex; align-items: center; gap: 6px; cursor: default; }
+.choice-card { margin: 12px 0; padding: 16px; border: 1px solid var(--border, #7776); border-radius: 12px; background: var(--surface, transparent); }
+.choice-card-heading { font-weight: 650; margin-bottom: 12px; }
+.choice-question { border: 0; padding: 0; margin: 0 0 16px; min-width: 0; }
+.choice-question legend { font-weight: 600; margin-bottom: 8px; }
+.choice-option { display: flex; align-items: flex-start; gap: 8px; padding: 8px; border: 1px solid var(--border, #7776); border-radius: 8px; margin: 5px 0; cursor: pointer; }
+.choice-option.recommended { border-color: var(--accent, #718de3); }
+.choice-option span { display: flex; flex-direction: column; flex: 1; }
+.choice-option small { opacity: .72; }
+.choice-option em { font-size: .75rem; font-style: normal; opacity: .8; }
+.choice-other { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; }
+.choice-other textarea { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; }
+.choice-card button { margin-top: 4px; }
+.choice-card button:disabled { opacity: .5; cursor: default; }
+.choice-answer, .choice-attribution { opacity: .8; }
+.choice-error { color: var(--danger, #b42318); }
 .tool-head.expandable { cursor: pointer; }
 .tool-caret { opacity: 0.6; width: 0.9em; flex: 0 0 auto; }
 .tool-name { font-weight: 400; flex: 0 0 auto; }

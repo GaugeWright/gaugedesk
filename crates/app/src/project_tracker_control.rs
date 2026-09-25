@@ -327,7 +327,7 @@ impl Workbench {
         {
             // Assignment never grants access: the recipient must already read
             // this tracker, as the Home's roster and grants say now.
-            let (_, recipients, _) = self
+            let (_, recipients, _, _) = self
                 .prepare_project_tracker_recipients(context, &request.project, &request.queue)
                 .map_err(debug_error)?;
             if !recipients.contains(recipient) {

@@ -50,6 +50,9 @@ pub use scope_key::{PreparedScopeKey, PreparedScopeTransfer, ScopeKeyCapsule};
 pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     // The durable conversation transcript (the client's own words).
     "transcript",
+    "choice-card",
+    "choice-answer",
+    "choice-continuation",
     // GaugeApp management conversations and their generation pointer. The
     // transcript has an independent per-thread key; the pointer lives under
     // its owning account/tenant key so parent erasure reaches both layers.
@@ -883,6 +886,9 @@ mod tests {
             "placement_policy",
             "security",
             "software_policy",
+            "choice-card",
+            "choice-answer",
+            "choice-continuation",
             "archetype_approval",
             "setting",
             "device",

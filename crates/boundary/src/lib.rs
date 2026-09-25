@@ -95,6 +95,7 @@ pub mod definition {
         pub workspace_write: bool,
         pub command_run: bool,
         pub tracker_file: bool,
+        pub question_ask: bool,
     }
 
     impl Default for PackageCapabilities {
@@ -104,6 +105,7 @@ pub mod definition {
                 workspace_write: true,
                 command_run: true,
                 tracker_file: false,
+                question_ask: true,
             }
         }
     }
@@ -123,16 +125,17 @@ pub mod definition {
             if self.tracker_file {
                 names.push("tracker.file");
             }
+            if self.question_ask {
+                names.push("question.ask");
+            }
             names
         }
     }
 
-    pub fn package_paths(root: &str) -> [(String, &'static str); 3] {
-        [
-            (format!("{root}/{MANIFEST_FILE}"), DEFAULT_MANIFEST),
-            (format!("{root}/{SOURCE_FILE}"), DEFAULT_METHOD_SOURCE),
-            (format!("{root}/{PERSONA_FILE}"), ""),
-        ]
+    const CHOICE_TOOL: &str = r#"{"name":"ask_choices","capability":"question.ask","description":"Ask the person one to three short questions. The answer arrives in a later turn; stop if you need it before continuing.","input_schema":{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"object","properties":{"prompt":{"type":"string","minLength":1,"maxLength":300},"options":{"type":"array","minItems":2,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string","minLength":1,"maxLength":80},"description":{"type":"string","minLength":1,"maxLength":240}},"required":["label","description"]}},"multiple":{"type":"boolean"},"recommended":{"type":"integer","minimum":0,"maximum":3}},"required":["prompt"]}},"to":{"type":"string","description":"Recipient; omit for the chat owner."},"blocking":{"type":"boolean"}},"required":["questions"],"additionalProperties":false}}"#;
+
+    pub fn package_paths(root: &str) -> Vec<(String, String)> {
+        package_documents(root, "", PackageCapabilities::default())
     }
 
     pub fn version_root(version: u64) -> String {
@@ -151,7 +154,8 @@ pub mod definition {
             .collect::<Vec<_>>()
             .join(", ");
         let manifest = format!(
-            "{{\n  \"schema\": \"whipplescript.agent_package.v0\",\n  \"source\": \"method.whip\",\n  \"workflow\": \"GaugeDeskMethod\",\n  \"agent\": \"assistant\",\n  \"system_prompt\": \"persona.md\",\n  \"capabilities\": [{json_names}],\n  \"agent_abilities\": [{json_names}],\n  \"max_steps\": 32\n}}\n"
+            "{{\n  \"schema\": \"whipplescript.agent_package.v0\",\n  \"source\": \"method.whip\",\n  \"workflow\": \"GaugeDeskMethod\",\n  \"agent\": \"assistant\",\n  \"system_prompt\": \"persona.md\",\n  \"capabilities\": [{json_names}],\n  \"agent_abilities\": [{json_names}],\n  \"external_tools\": {external_tools},\n  \"max_steps\": 32\n}}\n",
+            external_tools = if capabilities.question_ask { format!("[{CHOICE_TOOL}]") } else { "[]".to_owned() },
         );
         let capability_list = format!("[{}]", json_names);
         let mut resources = String::new();
@@ -381,6 +385,7 @@ impl AgentConfig {
             workspace_write,
             command_run: admits(&["bash", "command"]),
             tracker_file: false,
+            question_ask: admits(&["ask_choices", "ask"]),
         }
     }
 }
@@ -688,6 +693,36 @@ mod tests {
                 "{path} is on a known surface"
             );
         }
+    }
+
+    #[test]
+    fn authored_package_includes_choice_tool_only_with_question_ability() {
+        let with = definition::package_documents(
+            "method",
+            "persona",
+            definition::PackageCapabilities::default(),
+        );
+        let manifest = with
+            .iter()
+            .find(|(path, _)| path.ends_with("package.json"))
+            .unwrap();
+        assert!(manifest.1.contains("\"name\":\"ask_choices\""));
+        assert!(manifest.1.contains("\"question.ask\""));
+
+        let without = definition::package_documents(
+            "method",
+            "persona",
+            definition::PackageCapabilities {
+                question_ask: false,
+                ..definition::PackageCapabilities::default()
+            },
+        );
+        let manifest = without
+            .iter()
+            .find(|(path, _)| path.ends_with("package.json"))
+            .unwrap();
+        assert!(manifest.1.contains("\"external_tools\": []"));
+        assert!(!manifest.1.contains("question.ask"));
     }
 
     use proptest::prelude::*;

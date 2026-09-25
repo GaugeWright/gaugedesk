@@ -34,6 +34,8 @@ export interface ControlPlane {
     createEngagement(id?: EngagementId): Promise<Engagement>;
     deleteChat(id: EngagementId): Promise<void>;
     getTranscript(id: EngagementId): Promise<StreamEvent[]>;
+    getChoiceCards?(id: EngagementId): Promise<workbench.ChoiceCard[]>;
+    answerChoiceCard?(id: EngagementId, cardId: string, selections: workbench.ChoiceSelection[]): Promise<void>;
     subscribe(
         id: EngagementId,
         onEvent: (event: StreamEvent) => void,
@@ -326,6 +328,14 @@ export class RemoteControlPlane implements ControlPlane {
 
     getTranscript(id: EngagementId) {
         return workbench.getTranscript(this.transport(), id);
+    }
+
+    getChoiceCards(id: EngagementId) {
+        return workbench.getChoiceCards(this.transport(), id);
+    }
+
+    answerChoiceCard(id: EngagementId, cardId: string, selections: workbench.ChoiceSelection[]) {
+        return workbench.answerChoiceCard(this.transport(), id, cardId, selections);
     }
 
     subscribe(

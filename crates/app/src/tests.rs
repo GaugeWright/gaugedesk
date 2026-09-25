@@ -2024,6 +2024,7 @@ fn startup_persists_the_agent_ability_hard_cutover_and_reconciles_frozen_refs() 
                 "workspace.write".to_owned(),
                 "command.run".to_owned(),
                 "tracker.file".to_owned(),
+                "question.ask".to_owned(),
             ]
         );
         let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
@@ -2199,15 +2200,15 @@ fn existing_default_agent_gets_a_new_task_capable_version_without_rewriting_v1()
         let engagement_id = library::gen_id("pre-task-default");
         let edit = workspace.create_engagement(&engagement_id).unwrap();
         let definition = app_support::default_agent_definition();
-        for (path, body) in definition.seed_files() {
+        let old_capabilities = gaugedesk_boundary::definition::PackageCapabilities {
+            question_ask: false,
+            ..Default::default()
+        };
+        for (path, body) in definition.seed_files_with_capabilities(old_capabilities) {
             edit.write_file(&path, &body).unwrap();
         }
-        let discipline = discipline::default_manifest(
-            gaugedesk_boundary::definition::PackageCapabilities::default()
-                .names()
-                .into_iter()
-                .map(str::to_owned),
-        );
+        let discipline =
+            discipline::default_manifest(old_capabilities.names().into_iter().map(str::to_owned));
         for root in [
             ".whipple/discipline/draft",
             ".whipple/discipline/versions/1",
@@ -2291,21 +2292,19 @@ fn legacy_default_package_migrates_to_a_task_capable_agent_file_version() {
         let workspace = guard.targets.get(&target_id).unwrap();
         let engagement_id = library::gen_id("pre-agent-files-default");
         let edit = workspace.create_engagement(&engagement_id).unwrap();
+        let old_capabilities = PackageCapabilities {
+            question_ask: false,
+            ..Default::default()
+        };
         for root in [".whipple/draft", ".whipple/versions/1"] {
-            for (path, body) in package_documents(
-                root,
-                "Legacy Default persona",
-                PackageCapabilities::default(),
-            ) {
+            for (path, body) in package_documents(root, "Legacy Default persona", old_capabilities)
+            {
                 edit.write_file(&path, &body).unwrap();
             }
+            edit.remove_file(&format!("{root}/HUMANS.md")).unwrap();
         }
-        let discipline = discipline::default_manifest(
-            PackageCapabilities::default()
-                .names()
-                .into_iter()
-                .map(str::to_owned),
-        );
+        let discipline =
+            discipline::default_manifest(old_capabilities.names().into_iter().map(str::to_owned));
         for root in [
             ".whipple/discipline/draft",
             ".whipple/discipline/versions/1",
@@ -2333,6 +2332,11 @@ fn legacy_default_package_migrates_to_a_task_capable_agent_file_version() {
         agent.versions.get_mut(&1).unwrap().discipline_ref = old_discipline.reference;
         guard.write_agent_record(agent);
     }
+    let chat_id = wb
+        .lock_unpoisoned()
+        .create_default_engagement("legacy-task-chat".into(), "Legacy task chat".into())
+        .unwrap_or_else(|_| panic!("create pre-migration work chat"))
+        .id;
     drop(wb);
 
     let reopened = open_workbench(dir.path()).expect("legacy Default publishes task ability");
@@ -2361,6 +2365,13 @@ fn legacy_default_package_migrates_to_a_task_capable_agent_file_version() {
         std::fs::read_to_string(root.join(".whipple/versions/2/AGENTS.md")).unwrap(),
         ""
     );
+    assert!(!root.join(".whipple/versions/2/HUMANS.md").exists());
+    guard
+        .refresh_chat_discipline_mount(&chat_id)
+        .expect("an existing chat can mount a package without optional HUMANS.md");
+    let paths = guard.engagement_tree(&chat_id).unwrap().unwrap();
+    assert!(paths.iter().any(|entry| entry.path == "agent/AGENTS.md"));
+    assert!(!paths.iter().any(|entry| entry.path == "agent/HUMANS.md"));
 }
 
 #[test]
@@ -4261,7 +4272,7 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
             &serde_json::json!({
                 "schema": "gaugedesk.discipline.v1",
                 "skills": ["skill://review"],
-                "capabilities": ["workspace.read", "workspace.write", "command.run", "tracker.file"],
+                "capabilities": ["workspace.read", "workspace.write", "command.run", "tracker.file", "question.ask"],
                 "assets": [{"path": "checks/verify.sh", "treatment": "managed"}],
                 "target_rules": ["requires README.md"]
             })
@@ -5342,6 +5353,7 @@ async fn archetype_abilities_update_only_the_draft_manifest() {
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["abilities"],
         serde_json::json!([
             "command.run",
+            "question.ask",
             "tracker.file",
             "workspace.read",
             "workspace.write"
