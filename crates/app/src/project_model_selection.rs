@@ -451,6 +451,21 @@ fn account_identity(
     headers: &HeaderMap,
     actor: Option<AuthenticatedActor>,
 ) -> Result<(String, String), SelectionError> {
+    // A relay request carries a Home session for its admitted actor. The
+    // window may have selected another retained account in the meantime; that
+    // selection must never supply the relay actor's Hub eligibility or funding.
+    if let Some(local_actor) = net_http::bearer(headers).and_then(|token| {
+        wb.lock_unpoisoned()
+            .authenticate_action_context(token)
+            .map(|context| context.actor().as_str().to_owned())
+    }) {
+        if let Some(bearer) = crate::account_signin::hub_session_token_for(wb, &local_actor) {
+            return Ok((bearer, local_actor));
+        }
+        if crate::account_signin::hub_session_actor(wb).is_some() {
+            return Err(SelectionError::Unauthorized);
+        }
+    }
     if let (Some(bearer), Some(person)) = (
         crate::account_signin::hub_session_token(wb),
         crate::account_signin::hub_session_actor(wb),
@@ -557,6 +572,23 @@ pub async fn delete_selection(
 mod tests {
     use super::*;
     use crate::{library::Library, open_workbench};
+
+    #[test]
+    fn relay_actor_uses_its_own_retained_hub_identity_after_window_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let wb = open_workbench(dir.path()).unwrap();
+        crate::account_signin::store_session_for_test(&wb);
+        crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+        let home_token = crate::desktop_session::relay_session(&wb, "account-root").unwrap();
+        crate::account_signin::store_session_as_for_test(&wb, "another-account");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {home_token}").parse().unwrap(),
+        );
+        let (_, actor) = account_identity(&wb, &headers, None).unwrap();
+        assert_eq!(actor, "account-root");
+    }
 
     fn fixture(
         wb: &Workbench,

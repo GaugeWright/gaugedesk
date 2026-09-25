@@ -1,14 +1,14 @@
 /**
  * One canonical chat title, everywhere (#4 round-4). A brand-new chat is created
- * with a generic placeholder ("new chat", "edit chat", …) and renamed from its
- * first message. Until then we must NOT show the raw placeholder — it leaks the
+ * with a generic placeholder ("new chat", "edit chat", …) and named by the
+ * server after its first turn. Until then we must NOT show the raw placeholder — it leaks the
  * same "new chat" string into three surfaces (tree, chat header, TASKS pill) that
  * round 3 only de-placeholdered in the nav. This module is the single source of
  * truth for both "is this a placeholder?" and "what do we show instead?", so the
  * tree, All-chats, the chat-lane header, and the TASKS bar all agree.
  */
 
-/** The generic titles a chat carries before its first message renames it. */
+/** The generic titles a chat carries before automatic or manual naming. */
 export const PLACEHOLDER_TITLES = new Set([
     "new chat",
     "edit chat",
@@ -44,14 +44,4 @@ export function displayChatTitle(
 export function untitledTag(id: string | null | undefined): string {
     const s = String(id ?? "").replace(/^chat[-:]/i, "");
     return s.slice(-4).toUpperCase();
-}
-
-/**
- * Derive a chat title from its first user message (auto-title, #4): collapse
- * whitespace to a single line and cap the length, appending an ellipsis when it
- * was truncated. Returns "" for an empty/whitespace-only prompt (caller skips).
- */
-export function titleFromPrompt(prompt: string): string {
-    const oneLine = prompt.trim().replace(/\s+/g, " ");
-    return oneLine.length > 48 ? `${oneLine.slice(0, 47).trimEnd()}…` : oneLine;
 }

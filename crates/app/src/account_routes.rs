@@ -151,6 +151,18 @@ pub fn runtime_credential_routes() -> Router<SharedWorkbench> {
             get(crate::account_signin::get_signin_status),
         )
         .route(
+            "/account/hub-sessions",
+            get(crate::account_signin::get_signin_accounts),
+        )
+        .route(
+            "/account/hub-session/select",
+            post(crate::account_signin::post_signin_select),
+        )
+        .route(
+            "/account/hub-session/select-local",
+            post(crate::account_signin::post_signin_select_local),
+        )
+        .route(
             "/account/hub-session/start",
             post(crate::account_signin::post_signin_start),
         )

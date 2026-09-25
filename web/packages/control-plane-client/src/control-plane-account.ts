@@ -654,6 +654,11 @@ export async function xaiGrokLoginCancel(json: RouteJson): Promise<void> {
 export interface HubSessionStatus {
     available: boolean;
     linked: boolean;
+    /** Explicit signed-out access to this computer's co-resident Home. */
+    local: boolean;
+    /** A prior Home owner exists, so the window must choose an account or
+     * explicitly enter local mode before showing that Home's workspace. */
+    localChoiceRequired: boolean;
     person: string | null;
     /** Human-recognizable label projected by the Hub from the verified sign-in
      *  assertion. `person` is the independent GaugeDesk account id; an external
@@ -671,6 +676,8 @@ function hubSessionStatusFrom(value: unknown): HubSessionStatus {
     return {
         available: Boolean(o?.available),
         linked: Boolean(o?.linked),
+        local: o?.local === true,
+        localChoiceRequired: o?.local_choice_required === true,
         person,
         label: typeof o?.label === "string" && o.label ? o.label : person,
         expires: typeof o?.expires === "number" ? o.expires : null,
@@ -681,6 +688,59 @@ function hubSessionStatusFrom(value: unknown): HubSessionStatus {
 
 export async function hubSessionStatus(json: RouteJson): Promise<HubSessionStatus> {
     return hubSessionStatusFrom(await json("GET", "/account/hub-session"));
+}
+
+/** Native roster is a non-secret projection. Retaining a session does not
+ * select it or grant standing at this computer's Home. */
+export interface HubSessionAccount {
+    readonly person: string;
+    readonly label: string;
+    readonly expired: boolean;
+}
+
+export interface HubSessionAccounts {
+    readonly selected: string | null;
+    readonly accounts: readonly HubSessionAccount[];
+}
+
+export async function hubSessionAccounts(json: RouteJson): Promise<HubSessionAccounts> {
+    const raw = await json("GET", "/account/hub-sessions") as Record<string, unknown> | null;
+    const accounts = Array.isArray(raw?.accounts) ? raw.accounts.flatMap((value) => {
+        const account = value as Record<string, unknown> | null;
+        if (typeof account?.person !== "string" || !account.person) return [];
+        return [{
+            person: account.person,
+            label: typeof account.label === "string" && account.label
+                ? account.label : account.person,
+            expired: account.expired === true,
+        }];
+    }) : [];
+    return {
+        selected: typeof raw?.selected === "string" && raw.selected ? raw.selected : null,
+        accounts,
+    };
+}
+
+/** Select only a retained account; the control plane independently checks its
+ * sealed, unexpired session and revokes the previous local Home admission. */
+export async function hubSessionSelect(
+    json: RouteJson,
+    person: string,
+): Promise<HubSessionStatus> {
+    if (!person) throw new Error("Select an account");
+    const status = hubSessionStatusFrom(
+        await json("POST", "/account/hub-session/select", { person }),
+    );
+    if (!status.linked || status.person !== person || status.expired) {
+        throw new Error("The selected account session is unavailable");
+    }
+    return status;
+}
+
+export async function hubSessionSelectLocal(json: RouteJson): Promise<HubSessionStatus> {
+    const status = hubSessionStatusFrom(await json("POST", "/account/hub-session/select-local", {}));
+    if (!status.local || status.linked) throw new Error("Local workbench mode was not selected");
+    return status;
 }
 
 /** Begin the native handoff: the control plane mints and holds the verifier and
@@ -720,13 +780,14 @@ export async function hubSessionCallback(
 export interface HubSessionReach {
     person: string;
     device: string;
+    selectedHome: HomeId | null;
     homes: AccountHome[];
     routes: OpaqueHomeRoute[];
 }
 
 export async function hubSessionReach(json: RouteJson): Promise<HubSessionReach> {
     const o = (await json("GET", "/account/hub-session/reach")) as Record<string, unknown> | null;
-    const homesEnvelope = (o?.homes ?? null) as { homes?: unknown } | null;
+    const homesEnvelope = (o?.homes ?? null) as { homes?: unknown; selected_home?: unknown } | null;
     const rawHomes = Array.isArray(homesEnvelope?.homes) ? homesEnvelope.homes : [];
     const homes = rawHomes.flatMap((home) => {
         const h = home as Record<string, unknown> | null;
@@ -746,9 +807,23 @@ export async function hubSessionReach(json: RouteJson): Promise<HubSessionReach>
     } catch {
         // A partial Hub answer (or none) yields an empty reach, not an error.
     }
+    // The desktop broker independently verified the root-signed directory and
+    // pinned its account root before projecting these routes. Only this field
+    // may carry a relay pin; the Hub's writable route table remains unsigned.
+    try {
+        const merged = new Map(routes.map((route) => [route.project, route]));
+        for (const route of parseOpaqueHomeRoutes(o?.signed_routes ?? { routes: [] }, "signed")) {
+            merged.set(route.project, route);
+        }
+        routes = [...merged.values()];
+    } catch {
+        // A malformed signed projection degrades to the direct Hub routes.
+    }
     return {
         person: typeof o?.person === "string" ? o.person : "",
         device: typeof o?.device === "string" ? o.device : "",
+        selectedHome: typeof homesEnvelope?.selected_home === "string"
+            ? homesEnvelope.selected_home as HomeId : null,
         homes,
         routes,
     };

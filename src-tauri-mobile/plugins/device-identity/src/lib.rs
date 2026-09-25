@@ -42,6 +42,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::remove_machine_credential,
             commands::store_account_session,
             commands::get_account_session,
+            commands::select_account_session,
             commands::clear_account_session
         ])
         .setup(|app, api| {

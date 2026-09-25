@@ -88,7 +88,15 @@ pub fn attach_if_never_offered(
     // Taken before the guard: reading the session locks the workbench itself.
     // No session is the ordinary state of a fresh install, not a failure, and
     // leaves the marker unwritten so that signing in later is still the moment.
-    if crate::account_signin::hub_session_actor(wb).is_none() {
+    let selected = crate::account_signin::hub_session_actor(wb);
+    if selected.is_some() {
+        // An upgraded desktop may already be signed in before the one-time
+        // owner claim existed. Establish its owner before deciding whether
+        // this selected account may offer the Home.
+        crate::home_owner::claim_if_never_claimed(wb)?;
+    }
+    let owner = wb.lock_unpoisoned().home_owner_account();
+    if selected.is_none() || selected != owner {
         return Ok(false);
     }
     let marker = root.join(OFFERED_MARKER);
@@ -127,7 +135,10 @@ fn standing(
     // No session means nobody has signed in on this computer, which is not a
     // failure: it is the ordinary state of a fresh install, and the reconcile
     // simply has nothing to say yet.
-    let bearer = crate::account_signin::hub_session_token(wb)?;
+    let guard = wb.lock_unpoisoned();
+    let owner = guard.home_owner_account()?;
+    drop(guard);
+    let bearer = crate::account_signin::hub_session_token_for(wb, &owner)?;
     let guard = wb.lock_unpoisoned();
     Some(Standing {
         hub,
@@ -319,6 +330,19 @@ pub fn reconcile(wb: &SharedWorkbench, route: &gaugedesk_relay_transport::RelayR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_selected_account_does_not_offer_the_owners_home() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        crate::account_signin::store_session_for_test(&wb);
+        crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+        crate::account_signin::store_session_as_for_test(&wb, "another-account");
+
+        assert!(!attach_if_never_offered(&wb, root.path()).unwrap());
+        assert!(!wb.lock_unpoisoned().library_sync_active());
+        assert!(!root.path().join(OFFERED_MARKER).exists());
+    }
 
     /// The facility is what publication and reachability follow, so "signing in
     /// makes this computer your Home" is false unless signing in attaches it.

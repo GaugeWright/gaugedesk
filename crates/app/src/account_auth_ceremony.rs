@@ -1397,6 +1397,7 @@ async fn post_registration_start(
 async fn post_registration_finish(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
     Json(body): Json<FinishRegistrationRequest>,
 ) -> Response {
     let runtime = match runtime(&auth) {
@@ -1411,7 +1412,7 @@ async fn post_registration_finish(
         unix_now(),
     );
     adopt_signup_picture(&wb, &result);
-    registration_response(result, &auth)
+    registration_response_with_wallet(result, &auth, &wb, &headers)
 }
 
 /// What the signup page may read about a parked provider ticket.
@@ -1647,7 +1648,7 @@ async fn post_consumer_signup_email_complete(
         runtime.create_account_from_verified_provider(&mut guard, &email, context, unix_now())
     };
     adopt_signup_picture(&wb, &outcome);
-    registration_response(outcome, &auth)
+    registration_response_with_wallet(outcome, &auth, &wb, &headers)
 }
 
 /// Create the account from the provider identity alone (DR-0177).
@@ -1723,7 +1724,7 @@ async fn post_consumer_signup_complete(
         runtime.create_account_from_verified_provider(&mut guard, &attested, context, unix_now())
     };
     adopt_signup_picture(&wb, &outcome);
-    registration_response(outcome, &auth)
+    registration_response_with_wallet(outcome, &auth, &wb, &headers)
 }
 
 /// A provider signup's picture becomes the new account's first avatar. Only
@@ -1772,6 +1773,7 @@ async fn post_authentication_start(
 async fn post_authentication_finish(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
     Json(body): Json<FinishAuthenticationRequest>,
 ) -> Response {
     let runtime = match runtime(&auth) {
@@ -1784,7 +1786,7 @@ async fn post_authentication_finish(
         &body.credential,
         unix_now(),
     );
-    session_response(result)
+    session_response_with_wallet(result, &wb, &headers)
 }
 
 async fn post_recovery_start(
@@ -1836,6 +1838,7 @@ async fn post_recovery_start(
 async fn post_recovery_finish(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
     Json(body): Json<FinishRecoveryRequest>,
 ) -> Response {
     let runtime = match runtime(&auth) {
@@ -1849,7 +1852,7 @@ async fn post_recovery_finish(
         &body.recovery_code,
         unix_now(),
     );
-    session_response(result)
+    session_response_with_wallet(result, &wb, &headers)
 }
 
 fn authenticated_account(wb: &crate::Workbench, headers: &HeaderMap) -> Option<String> {
@@ -1968,6 +1971,71 @@ async fn post_authorization_finish(
 /// codes: they exist in plaintext for the length of this response and nowhere
 /// else, because the store holds salted hashes. A client that drops them cannot
 /// ask again — it has to mint a new batch, which invalidates these.
+fn registration_response_with_wallet(
+    result: Result<RegistrationOutcome, CeremonyError>,
+    auth: &AuthShellState,
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+) -> Response {
+    let wallet_entry = result.as_ref().ok().and_then(|outcome| {
+        let native = outcome
+            .consumer_signup
+            .as_ref()
+            .is_some_and(|signup| signup.native_return.is_some());
+        (!native).then(|| {
+            (
+                outcome.account_id.clone(),
+                outcome
+                    .consumer_signup
+                    .as_ref()
+                    .map(|signup| signup.label.clone())
+                    .unwrap_or_else(|| outcome.account_id.clone()),
+                outcome.session.clone(),
+            )
+        })
+    });
+    let mut response = registration_response(result, auth);
+    if let Some((person, label, token)) = wallet_entry {
+        let label = if label == person {
+            crate::browser_wallet::account_label(&wb.lock_unpoisoned(), &person)
+        } else {
+            label
+        };
+        if let Ok(wallet) = crate::browser_wallet::retain_login(
+            &mut wb.lock_unpoisoned(),
+            headers,
+            &person,
+            &label,
+            &token,
+        ) {
+            crate::browser_wallet::append_wallet_cookie(&mut response, Some(&wallet));
+        }
+    }
+    response
+}
+
+fn session_response_with_wallet(
+    result: Result<(String, String), CeremonyError>,
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+) -> Response {
+    let wallet_entry = result.as_ref().ok().cloned();
+    let mut response = session_response(result);
+    if let Some((person, token)) = wallet_entry {
+        let label = crate::browser_wallet::account_label(&wb.lock_unpoisoned(), &person);
+        if let Ok(wallet) = crate::browser_wallet::retain_login(
+            &mut wb.lock_unpoisoned(),
+            headers,
+            &person,
+            &label,
+            &token,
+        ) {
+            crate::browser_wallet::append_wallet_cookie(&mut response, Some(&wallet));
+        }
+    }
+    response
+}
+
 fn registration_response(
     result: Result<RegistrationOutcome, CeremonyError>,
     auth: &AuthShellState,

@@ -3,7 +3,7 @@ use tauri::{command, AppHandle, Runtime};
 use crate::{
     AccountSessionResponse, ChallengeSignature, DeviceIdentity, DeviceIdentityExt,
     LaunchUrlResponse, MachineCredentialRegistryResponse, MachineCredentialResponse,
-    RemoveMachineCredentialRequest, Result, SignChallengeRequest, StoreAccountSessionRequest,
+    RemoveMachineCredentialRequest, Result, SelectAccountSessionRequest, SignChallengeRequest, StoreAccountSessionRequest,
     StoreMachineCredentialRequest,
 };
 
@@ -77,6 +77,14 @@ pub(crate) async fn get_account_session<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<AccountSessionResponse> {
     app.device_identity().get_account_session().await
+}
+
+#[command]
+pub(crate) async fn select_account_session<R: Runtime>(
+    app: AppHandle<R>,
+    payload: SelectAccountSessionRequest,
+) -> Result<AccountSessionResponse> {
+    app.device_identity().select_account_session(payload).await
 }
 
 #[command]

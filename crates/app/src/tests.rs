@@ -2613,6 +2613,7 @@ async fn attached_target_response_matches_the_workspace_projection() {
             error: None,
             guarantee_outcomes: Vec::new(),
             usage_observation: None,
+            auto_title: None,
         };
         assert!(guard.record_target_change_set(chat_id, &invalid).is_err());
         let after = guard

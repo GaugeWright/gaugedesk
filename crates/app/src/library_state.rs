@@ -6668,6 +6668,19 @@ impl Workbench {
         Some(updated)
     }
 
+    /// Set a generated name only while this chat still has its creation
+    /// placeholder. A concurrent human rename wins, including while a model
+    /// response is in flight.
+    pub(crate) fn auto_title_chat_record(&mut self, id: &str, title: String) -> Option<ChatRecord> {
+        let existing = self.library.chats.get(id).cloned()?;
+        if !crate::chat_title::is_system_title(&existing.title) {
+            return None;
+        }
+        let updated = ChatRecord { title, ..existing };
+        self.write_chat_record(updated.clone());
+        Some(updated)
+    }
+
     /// The nav-badge flag for a chat — the **badge** attention surface
     /// (ADR 0082 §3): a signal the operator muted shows no dot either; `queue`
     /// and `badge` both keep it (the task bar is the only thing `badge` drops).
@@ -7849,5 +7862,34 @@ mod engagement_removal_tests {
             orphan_worktree.is_dir(),
             "an unrecorded line was decided about"
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_title_tests {
+    use crate::{app_support::DEFAULT_PLACEMENT, LockUnpoisoned};
+
+    #[test]
+    fn generated_title_is_durable_and_never_replaces_a_human_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let id = {
+            let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+            let mut workbench = shared.lock_unpoisoned();
+            let chat = workbench
+                .create_chat_in_instance(DEFAULT_PLACEMENT, "new chat")
+                .unwrap();
+            let id = chat["id"].as_str().unwrap().to_owned();
+            assert!(workbench
+                .auto_title_chat_record(&id, "Fix login expiry".into())
+                .is_some());
+            workbench.rename_chat_record(&id, "Authentication repair".into());
+            assert!(workbench
+                .auto_title_chat_record(&id, "Late model output".into())
+                .is_none());
+            id
+        };
+        let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+        let workbench = shared.lock_unpoisoned();
+        assert_eq!(workbench.library.chats[&id].title, "Authentication repair");
     }
 }

@@ -45,8 +45,20 @@ class RemoveMachineCredentialArgs {
 
 @InvokeArg
 class StoreAccountSessionArgs {
+    lateinit var account: String
     lateinit var idToken: String
 }
+
+@InvokeArg
+class SelectAccountSessionArgs {
+    lateinit var account: String
+}
+
+private data class AccountSessions(
+    var selected: String?,
+    val sessions: MutableMap<String, String>,
+    val legacy: String? = null,
+)
 
 @TauriPlugin
 class DeviceIdentityPlugin(private val activity: Activity) : Plugin(activity) {
@@ -238,18 +250,23 @@ class DeviceIdentityPlugin(private val activity: Activity) : Plugin(activity) {
             .put("grantId", args.grantId)
             .put("credential", args.credential)
 
-    private fun saveAccountSession(idToken: String?) {
+    private fun saveAccountSessions(state: AccountSessions) {
         val prefs = activity.getSharedPreferences(preferences, Activity.MODE_PRIVATE)
-        if (idToken == null) {
+        if (state.sessions.isEmpty()) {
             prefs.edit()
                 .remove(accountSessionIvKey)
                 .remove(accountSessionCiphertextKey)
                 .commit()
             return
         }
-        require(idToken.isNotBlank()) { "account session token is empty" }
+        val accounts = JSONArray()
+        state.sessions.toSortedMap().forEach { (account, token) ->
+            accounts.put(JSONObject().put("account", account).put("idToken", token))
+        }
         val plaintext = JSONObject()
-            .put("idToken", idToken)
+            .put("version", 1)
+            .put("selected", state.selected ?: JSONObject.NULL)
+            .put("accounts", accounts)
             .toString()
             .toByteArray(StandardCharsets.UTF_8)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
@@ -264,12 +281,46 @@ class DeviceIdentityPlugin(private val activity: Activity) : Plugin(activity) {
         ) { "could not commit the account session" }
     }
 
-    private fun accountSession(): String? {
+    private fun accountSessions(): AccountSessions {
         val prefs = activity.getSharedPreferences(preferences, Activity.MODE_PRIVATE)
-        val encodedIv = prefs.getString(accountSessionIvKey, null) ?: return null
+        val encodedIv = prefs.getString(accountSessionIvKey, null)
+            ?: return AccountSessions(null, mutableMapOf())
         val encodedCiphertext =
-            prefs.getString(accountSessionCiphertextKey, null) ?: return null
-        return decodeCredential(encodedIv, encodedCiphertext).getString("idToken")
+            prefs.getString(accountSessionCiphertextKey, null)
+                ?: return AccountSessions(null, mutableMapOf())
+        val root = decodeCredential(encodedIv, encodedCiphertext)
+        if (!root.has("version")) {
+            return AccountSessions(null, mutableMapOf(), root.getString("idToken"))
+        }
+        require(root.getInt("version") == 1) { "unsupported account session registry version" }
+        val accounts = root.getJSONArray("accounts")
+        val sessions = mutableMapOf<String, String>()
+        for (index in 0 until accounts.length()) {
+            val entry = accounts.getJSONObject(index)
+            val account = entry.getString("account")
+            val token = entry.getString("idToken")
+            require(account.isNotBlank() && token.isNotBlank() && !sessions.containsKey(account)) {
+                "account session registry is inconsistent"
+            }
+            sessions[account] = token
+        }
+        val selected = if (root.isNull("selected")) null else root.getString("selected")
+        require(selected == null || sessions.containsKey(selected)) {
+            "selected account session is missing"
+        }
+        return AccountSessions(selected, sessions)
+    }
+
+    private fun accountSessionResponse(state: AccountSessions): JSObject {
+        val accounts = JSONArray()
+        state.sessions.toSortedMap().keys.forEach { account ->
+            accounts.put(JSONObject().put("account", account))
+        }
+        return JSObject().apply {
+            put("idToken", state.selected?.let(state.sessions::get) ?: state.legacy ?: JSONObject.NULL)
+            put("selected", state.selected ?: JSONObject.NULL)
+            put("accounts", accounts)
+        }
     }
 
     @Synchronized
@@ -428,7 +479,15 @@ class DeviceIdentityPlugin(private val activity: Activity) : Plugin(activity) {
     fun storeAccountSession(invoke: Invoke) {
         try {
             val args = invoke.parseArgs(StoreAccountSessionArgs::class.java)
-            saveAccountSession(args.idToken)
+            require(args.account.isNotBlank()) { "account id is empty" }
+            require(args.idToken.isNotBlank()) { "account session token is empty" }
+            val state = accountSessions()
+            require(state.legacy == null || state.legacy == args.idToken) {
+                "identify or remove the previous account session before adding another"
+            }
+            state.sessions[args.account] = args.idToken
+            state.selected = args.account
+            saveAccountSessions(state)
             invoke.resolve()
         } catch (error: Exception) {
             invoke.reject("could not store the account session: ${error.message}")
@@ -439,11 +498,7 @@ class DeviceIdentityPlugin(private val activity: Activity) : Plugin(activity) {
     @Synchronized
     fun getAccountSession(invoke: Invoke) {
         try {
-            invoke.resolve(
-                JSObject().apply {
-                    put("idToken", accountSession() ?: JSONObject.NULL)
-                },
-            )
+            invoke.resolve(accountSessionResponse(accountSessions()))
         } catch (error: Exception) {
             invoke.reject("could not open the account session: ${error.message}")
         }
@@ -453,10 +508,28 @@ class DeviceIdentityPlugin(private val activity: Activity) : Plugin(activity) {
     @Synchronized
     fun clearAccountSession(invoke: Invoke) {
         try {
-            saveAccountSession(null)
+            val state = accountSessions()
+            state.selected?.let(state.sessions::remove)
+            state.selected = null
+            saveAccountSessions(state)
             invoke.resolve()
         } catch (error: Exception) {
             invoke.reject("could not clear the account session: ${error.message}")
+        }
+    }
+
+    @Command
+    @Synchronized
+    fun selectAccountSession(invoke: Invoke) {
+        try {
+            val args = invoke.parseArgs(SelectAccountSessionArgs::class.java)
+            val state = accountSessions()
+            require(state.sessions.containsKey(args.account)) { "account is not retained" }
+            state.selected = args.account
+            saveAccountSessions(state)
+            invoke.resolve(accountSessionResponse(state))
+        } catch (error: Exception) {
+            invoke.reject("could not select the account session: ${error.message}")
         }
     }
 }

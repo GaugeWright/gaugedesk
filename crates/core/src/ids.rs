@@ -166,6 +166,18 @@ id_newtype!(
     /// One chargeable provider attempt, including any bounded unknown outcome.
     ModelAttemptId
 );
+id_newtype!(
+    /// A GaugeVault credential, whose reference alone grants no material access.
+    VaultCredentialId
+);
+id_newtype!(
+    /// One GaugeVault intake candidate, independent of Azure's version string.
+    VaultCandidateId
+);
+id_newtype!(
+    /// The exact provider-issued backing version returned to trusted intake.
+    VaultBackingVersionId
+);
 
 #[cfg(test)]
 mod tests {

@@ -21,7 +21,8 @@ Feature: Choosing what to place, and quieter power controls (round 2)
     When I use the archetype "Default" from its menu
     Then a work chat opens
 
-  Scenario: a new chat is titled from its first message
+  @chat-title
+  Scenario: a new chat gets a fallback title when no model is configured
     Given a new engagement
     When I task the agent with "draft a spring campaign tagline"
     Then a chat titled "draft a spring campaign tagline" appears in the nav

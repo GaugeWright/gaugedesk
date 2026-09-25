@@ -17,12 +17,15 @@
 // build's wasm loaders for every host that renders `App`, not just the
 // standalone entry (see wasm-modules.ts).
 import "./wasm-modules";
+import { accountSelectionSync } from "./account-selection-sync";
 import { desktopHomeSession } from "./desktop-home-session";
 import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, onMount, Show, untrack, type Accessor, type JSX } from "solid-js";
 import {
     authority,
     bearer,
     beginLogin,
+    browserAccounts,
+    selectBrowserAccount,
     claimConsumerSignup,
     clientRequestId,
     consumeAccountSignupTicket,
@@ -110,7 +113,6 @@ import {
     type ImageRef,
     ComposerModelBar,
     initialFreshness,
-    isPlaceholderTitle,
     loadTranscriptFilterPrefs as loadPrefs,
     type ComposerMode,
     modelAcceptsImages,
@@ -151,7 +153,6 @@ import {
     TaskBar,
     readAssignedTrackerTasks,
     thinkingLevelsFor,
-    titleFromPrompt,
     type ChatRunTone,
     type FreshnessState,
     type Session,
@@ -342,7 +343,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         // sealed custody as well as any hosted browser session before the
         // shell is rebuilt signed out.
         if (hubSession()?.linked === true) await api.hubSessionSignOut();
+        await api.closeAccountConnections();
         await endSession(controlPlaneBase());
+        browserSelectionSync?.publish(null);
         await props.gaugeApps?.onNativeAccountSessionChanged?.(false);
         // A reload drops every memory-only Home admission and authenticated projection along
         // with the now-expired account cookie, returning the shell to Home discovery/login.
@@ -472,6 +475,55 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [hubSession, { refetch: refetchHubSession }] = createResource(() =>
         api.hubSessionStatus().catch(() => null),
     );
+    const [retainedAccounts] = createResource(
+        // A signed-out selection still leaves other sessions retained. Read
+        // their non-secret roster so the person can choose one without another
+        // browser sign-in. The status load, not a live selection, enables it.
+        () => isTauri()
+            ? (hubSession() !== undefined ? (hubSession()?.person ?? "signed-out") : null)
+            : "browser",
+        () => (isTauri() ? api.hubSessionAccounts() : browserAccounts(controlPlaneBase()))
+            .catch(() => null),
+    );
+    let browserSelectionReloading = false;
+    const browserSelectionSync = isTauri() ? null : accountSelectionSync(
+        window,
+        () => retainedAccounts()?.selected,
+        () => {
+            browserSelectionReloading = true;
+            setBearer(null);
+            void api.closeAccountConnections();
+            window.location.replace("/");
+        },
+    );
+    createEffect(() => {
+        if (isTauri() || browserSelectionReloading) return;
+        const roster = retainedAccounts();
+        if (roster) browserSelectionSync?.publish(roster.selected);
+    });
+    onCleanup(() => browserSelectionSync?.close());
+    const [switchingAccount, setSwitchingAccount] = createSignal(false);
+    const [accountSwitchError, setAccountSwitchError] = createSignal("");
+    const changeAccount = async (select: () => Promise<unknown>, person?: string) => {
+        if (switchingAccount()) return;
+        setSwitchingAccount(true);
+        setAccountSwitchError("");
+        try {
+            await api.closeAccountConnections();
+            await select();
+            if (person) browserSelectionSync?.publish(person);
+            // Tear down streams, drafts, admissions, and every projection from
+            // the previous account before opening the selected one's Home.
+            window.location.replace("/");
+        } catch (error) {
+            setAccountSwitchError(error instanceof Error ? error.message : String(error));
+            setSwitchingAccount(false);
+        }
+    };
+    const switchAccount = (person: string) => changeAccount(() => isTauri()
+        ? api.hubSessionSelect(person)
+        : selectBrowserAccount(controlPlaneBase(), person), person);
+    const switchLocal = () => changeAccount(() => api.hubSessionSelectLocal());
     // Native GaugeApps can race the first account admission against the local
     // session-status read. Wake the integration whenever server truth changes
     // from unlinked to linked, including when GaugeDesk starts already signed
@@ -489,11 +541,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // (DR-0188), asked again whenever the sign-in status is re-read so it
     // follows sign-out, expiry and renewal. A browser build is never handed one.
     let desktopSessionHeld = false;
+    let desktopSessionRead = 0;
     createEffect(() => {
         const status = hubSession();
         if (status === undefined) return;
+        const read = ++desktopSessionRead;
         const linked = status?.linked === true && !status.expired;
         void (linked ? desktopHomeSession() : Promise.resolve(null)).then((token) => {
+            if (read !== desktopSessionRead) return;
             if (token) {
                 desktopSessionHeld = true;
                 setBearer(token);
@@ -501,11 +556,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 desktopSessionHeld = false;
                 setBearer(null);
             }
+            if (api.setNativeRemote(linked && !token)) void refetchHome();
         });
     });
     const beginAccountAdmission = async (provider?: string): Promise<void> => {
         if (oidcRedirectAvailable) {
-            beginLogin(controlPlaneBase(), provider);
+            beginLogin(controlPlaneBase(), provider, (retainedAccounts()?.accounts.length ?? 0) > 0);
             return;
         }
         // Desktop: the control plane mints and holds the verifier and returns the
@@ -564,8 +620,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 setSignInReturnError("");
                 void api
                     .hubSessionCallback(handoffCode)
-                    .then(() => refetchHubSession())
-                    .then(() => refreshAfterSignIn())
+                    .then(() => window.location.replace("/"))
                     .catch((error: unknown) => {
                         // The person finished in the browser and came back to a
                         // card that had not moved. Say so, on the card, where
@@ -1233,34 +1288,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             ?? (projectHome()?.id === routedProject() ? routedProject() : null);
         api.setCurrentProject((requested ?? currentProject()?.id ?? null) as ProjectId | null);
     });
-    // Auto-title (#4): a brand-new chat is created with a generic placeholder
-    // ("new chat", "edit chat", …). The first thing the user types is the obvious
-    // title, so on the first message of a still-unnamed, still-empty chat we adopt
-    // a trimmed version of it — All chats stops filling with identical "new chat"
-    // rows. We only ever overwrite a known placeholder, never a user-chosen name.
-    // (PLACEHOLDER_TITLES / isPlaceholderTitle / titleFromPrompt are shared with the
-    // nav + task bar via state/chat-title.)
-    async function maybeAutoTitle(id: EngagementId, prompt: string) {
-        const current = (chatInfo()?.title ?? "").trim();
-        // "First message" must be judged from the DURABLE snapshot, not the live
-        // transcript: runPrompt echoes the user's line into `live` optimistically
-        // (round-7 #6) *before* calling this, so transcript().lines is already 1.
-        // Reading the snapshot (admitted records only) keeps the first-turn check
-        // honest — otherwise auto-title never fires and chats stay "Untitled".
-        const isFirst = snapshot().lines.length === 0;
-        if (!isFirst || !isPlaceholderTitle(current)) return;
-        const title = titleFromPrompt(prompt);
-        if (!title) return;
-        try {
-            await api.renameChat(id, title);
-            // The header title comes from chatInfo (keyed on `selected`, which didn't
-            // change), so refetch it or the header keeps showing the old placeholder.
-            await refetchChatInfo();
-        } catch {
-            /* titling is best-effort; a failed rename must never block the turn */
-        }
-    }
-
     // The transcript is a projection of durable truth: a **snapshot** of admitted
     // records (refetched per engagement, survives reloads) concatenated with the
     // **live** SSE reduction of the in-progress turn. No client-only history.
@@ -1671,8 +1698,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setPendingSend({ id, rid, text: prompt, baselineLines: snapshot().lines.length });
             setLive((t) => reduce(t, { type: "user", text: prompt }));
         }
-        // Adopt the first message as the chat's title before the transcript fills.
-        await maybeAutoTitle(id, prompt);
         setPendingApprovals([]); // a fresh turn clears the prior turn's pending approvals
         try {
             const res = (await api.runTask(id, prompt, images, composedId)) as {
@@ -2049,6 +2074,27 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             {(gaugeApps) => <div class="organization-bar">{gaugeApps().organizationSelector()}</div>}
         </Show>
         <div class="account-bar">
+            <Show when={(retainedAccounts()?.accounts.length ?? 0) > 0}>
+                <div class="account-switcher" aria-label="Accounts on this GaugeDesk">
+                    <For each={retainedAccounts()?.accounts ?? []}>
+                        {(account) => <button
+                            type="button"
+                            disabled={switchingAccount() || account.expired || account.person === retainedAccounts()?.selected}
+                            aria-current={account.person === retainedAccounts()?.selected ? "true" : undefined}
+                            onClick={() => void switchAccount(account.person)}
+                        >{account.label}{account.expired ? " · Sign in again" : ""}</button>}
+                    </For>
+                    <button type="button" disabled={switchingAccount()}
+                        onClick={() => setSignInOpen(true)}>Add account</button>
+                    <Show when={isTauri() && !hubSession()?.local}>
+                        <button type="button" disabled={switchingAccount()}
+                            onClick={() => void switchLocal()}>Use this computer locally</button>
+                    </Show>
+                    <Show when={accountSwitchError()}>
+                        <p role="alert">{accountSwitchError()}</p>
+                    </Show>
+                </div>
+            </Show>
             <SettingsMenu
                 api={api}
                 placementPolicy={props.placementPolicy}
@@ -2243,6 +2289,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 },
             }}
         />
+    );
+
+    const retainedBrowserChoices = (): JSX.Element => (
+        <Show when={!isTauri() && retainedAccounts()?.accounts.some((account) =>
+            !account.expired && account.person !== retainedAccounts()?.selected)}>
+            <div class="account-switcher" aria-label="Other accounts on this GaugeDesk">
+                <For each={retainedAccounts()?.accounts.filter((account) =>
+                    !account.expired && account.person !== retainedAccounts()?.selected) ?? []}>
+                    {(account) => <button type="button" disabled={switchingAccount()}
+                        onClick={() => void switchAccount(account.person)}>{account.label}</button>}
+                </For>
+                <Show when={accountSwitchError()}><p role="alert">{accountSwitchError()}</p></Show>
+            </div>
+        </Show>
     );
 
     const composerModelToolbar = (stacked?: boolean) => (
@@ -2929,7 +2989,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setGateSignOutBusy(false);
         }
     };
-    const signedInNote = (): JSX.Element => (
+    const signedInNote = (): JSX.Element => (<>
         <p class="homegate-auth-note homegate-signed-in" data-home-signed-in>
             {menuIdentity()
                 ? <>Signed in as {menuIdentity()?.email ?? menuIdentity()?.name}.</>
@@ -2948,7 +3008,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 <span class="homegate-error" role="alert">{gateSignOutError()}</span>
             </Show>
         </p>
-    );
+        {retainedBrowserChoices()}
+    </>);
     const HomeSetup = () => {
         // A person with a valid account and no Home yet is an ordinary starting
         // state, not an error (`experience/desk.md`). It gets one page whose single
@@ -3296,6 +3357,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 </Show>
                             }
                         >
+                            {retainedBrowserChoices()}
                             {signInCard()}
                         </Show>
                         <Show when={!homeNeedsLogin() && !homeRelayClosed()}>
@@ -3340,6 +3402,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     fallback={
                         <div class="homegate-scrim" data-tauri-drag-region data-first-run-signin>
                             <section class="homegate-card">
+                                {retainedBrowserChoices()}
                                 {signInCard(
                                     <span class="signin__quiet">
                                         No sign up necessary.{" "}
@@ -3425,7 +3488,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </section>
                 </div>
             </Show>
-            <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"}>
+            <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"
+                && (!isTauri() || (hubSession() !== undefined && !hubSession()?.localChoiceRequired))}>
                 <WorkbenchShell
                     state={workbenchShell}
                     titles={props.gaugeApps?.active() ? {
@@ -3522,6 +3586,27 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         ? props.gaugeApps.onNewChat()
                         : void startNewChat()}
                 />
+            </Show>
+            <Show when={isTauri() && hubSession()?.localChoiceRequired && !signInOpen()}>
+                <div class="homegate-scrim" data-tauri-drag-region data-account-choice>
+                    <section class="homegate-card" aria-labelledby="account-choice-title">
+                        <div class="homegate-card-inner">
+                            <p class="homegate-kicker">Choose a workbench</p>
+                            <h1 id="account-choice-title">Which account would you like to use?</h1>
+                            <p class="homegate-lede">This computer also has a local Home. Choose an account to open its work, or explicitly use this computer locally.</p>
+                            <For each={retainedAccounts()?.accounts.filter((account) => !account.expired) ?? []}>
+                                {(account) => <button type="button" class="homegate-home"
+                                    disabled={switchingAccount()}
+                                    onClick={() => void switchAccount(account.person)}>{account.label}</button>}
+                            </For>
+                            <button type="button" class="homegate-home" disabled={switchingAccount()}
+                                onClick={() => void switchLocal()}>Use this computer locally</button>
+                            <button type="button" class="homegate-link" disabled={switchingAccount()}
+                                onClick={() => setSignInOpen(true)}>Add account</button>
+                            <Show when={accountSwitchError()}><p role="alert">{accountSwitchError()}</p></Show>
+                        </div>
+                    </section>
+                </div>
             </Show>
         </>
     );

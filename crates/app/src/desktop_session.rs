@@ -58,19 +58,21 @@ pub fn home_session(wb: &SharedWorkbench) -> Option<String> {
 }
 
 /// The Home session a relay crossing is served under once the Hub has said
-/// its bearer is `account`'s (DR-0206): the same session the UI would get,
-/// minted only while this computer is signed in as exactly that account.
+/// its bearer is `account`'s (DR-0206): a session for that exact retained
+/// sign-in, independent of which account the window currently selects.
 ///
-/// Signed in as someone else, or not at all, it is `None`, and the crossing is
-/// refused. The Home acts for a remote caller only as the person signed in at
-/// it, so a sign-out here ends remote access too.
+/// Without that account's retained sign-in or Home membership it is `None`,
+/// and the crossing is refused. Signing that account out ends its remote access.
 pub(crate) fn relay_session(wb: &SharedWorkbench, account: &str) -> Option<String> {
     session_for(wb, Slot::Relay, Some(account))
 }
 
 fn session_for(wb: &SharedWorkbench, which: Slot, account: Option<&str>) -> Option<String> {
     // Read before the guard: this locks the workbench itself.
-    let hub = crate::account_signin::hub_standing(wb);
+    let hub = match account {
+        Some(person) => crate::account_signin::hub_standing_for(wb, person),
+        None => crate::account_signin::hub_standing(wb),
+    };
     let now = now_ms();
     let Some(hub) = hub
         .filter(|hub| hub.expires_ms > now)

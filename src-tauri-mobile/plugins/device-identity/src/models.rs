@@ -67,11 +67,24 @@ pub struct RemoveMachineCredentialRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreAccountSessionRequest {
+    pub account: String,
     pub id_token: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SelectAccountSessionRequest {
+    pub account: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RetainedAccount {
+    pub account: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountSessionResponse {
     pub id_token: Option<String>,
+    pub selected: Option<String>,
+    pub accounts: Vec<RetainedAccount>,
 }

@@ -8,6 +8,94 @@ import { WorkbenchControlPlane } from "./workbench-control-plane";
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("selected desktop account outside the local Home", () => {
+    it("serves work through the sealed broker and reuses one Home admission", async () => {
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        const calls: Array<[string, RequestInit | undefined]> = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            calls.push([url, init]);
+            if (url === "http://127.0.0.1:4919/account/hub-session/reach") {
+                return new Response(JSON.stringify({
+                    person: "account:b", device: "device:desk",
+                    homes: { homes: [{ id: "home:b", kind: "registered", endpoint: "https://b.example" }],
+                        selected_home: "home:b" },
+                    routes: { routes: [{ project: "project:b", home_id: "home:b",
+                        endpoint: "https://b.example" }] },
+                }));
+            }
+            if (url === "http://127.0.0.1:4919/account/hub-session/home/home%3Ab/home/admissions"
+                && init?.method === "DELETE") return new Response(null, { status: 204 });
+            if (url === "http://127.0.0.1:4919/account/hub-session/home/home%3Ab/home/admissions") {
+                return new Response(JSON.stringify({ home: "home:b", admission: "admission:b" }),
+                    { status: 201 });
+            }
+            if (url === "http://127.0.0.1:4919/account/hub-session/home/home%3Ab/workspace") {
+                return new Response(JSON.stringify({ archetypes: [], projects: [], recent: [],
+                    workstreams: [], work_targets: [], personal_placement: null }));
+            }
+            if (url === "http://127.0.0.1:4919/account/hub-session/home/home%3Ab/account/settings") {
+                return new Response(JSON.stringify({ settings: { theme: "account:b" } }));
+            }
+            throw new Error(`work escaped the selected account broker: ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        api.setNativeRemote(true);
+        await expect(api.bootstrapHome()).resolves.toMatchObject({ kind: "connected",
+            home: { id: "home:b" } });
+        api.setCurrentProject("project:b" as never);
+        await api.getWorkspace();
+        await expect(api.accountSettings()).resolves.toEqual({ theme: "account:b" });
+        expect(calls.filter(([url, init]) => url.endsWith("/home/admissions")
+            && init?.method === "POST")).toHaveLength(1);
+        const work = calls.find(([url]) => url.endsWith("/workspace"));
+        const headers = new Headers(work?.[1]?.headers);
+        expect(headers.get("x-gaugewright-home-admission")).toBe("admission:b");
+        expect(headers.has("authorization")).toBe(false);
+        await api.closeAccountConnections();
+        expect(calls.some(([url, init]) => url.endsWith("/home/admissions")
+            && init?.method === "DELETE")).toBe(true);
+    });
+
+    it("opens a relay-only selected Home through the native broker", async () => {
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        const calls: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            calls.push(url);
+            if (url.endsWith("/account/hub-session/reach")) {
+                return new Response(JSON.stringify({
+                    person: "account:b", device: "device:desk",
+                    homes: { homes: [{ id: "home:b", kind: "registered", endpoint: "" }],
+                        selected_home: "home:b" },
+                    routes: { routes: [] },
+                    signed_routes: { routes: [{ project: "project:b", home_id: "home:b", relay: {
+                        endpoint: "wss://relay.example.test", handle: "a".repeat(43),
+                        proof: "b".repeat(43), route_epoch: 1,
+                        home_fingerprint: "ab".repeat(32),
+                    } }] },
+                }));
+            }
+            if (url.endsWith("/home/admissions")) {
+                return new Response(JSON.stringify({ home: "home:b", admission: "admission:b" }),
+                    { status: 201 });
+            }
+            if (url.endsWith("/workspace")) {
+                return new Response(JSON.stringify({ archetypes: [], projects: [], recent: [],
+                    workstreams: [], work_targets: [], personal_placement: null }));
+            }
+            throw new Error(`work escaped the native broker: ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        api.setNativeRemote(true);
+        await expect(api.bootstrapHome()).resolves.toMatchObject({ kind: "connected",
+            home: { id: "home:b" } });
+        api.setCurrentProject("project:b" as never);
+        await api.getWorkspace();
+        expect(calls.some((url) => url.endsWith("/home/home%3Ab/workspace"))).toBe(true);
+    });
+});
+
 describe("hosted Home bootstrap", () => {
     it("keeps account discovery on the Hub and sends work only to the admitted selected Home", async () => {
         const calls: Array<[string, RequestInit | undefined]> = [];

@@ -27,6 +27,7 @@ pub mod federated_delivery;
 pub mod federated_envelope;
 pub mod federation;
 pub mod freshness;
+pub mod gaugevault;
 pub mod handoff;
 pub mod host_action_admission;
 pub mod ids;

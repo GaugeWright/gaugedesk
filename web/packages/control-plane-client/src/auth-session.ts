@@ -159,7 +159,7 @@ export function consumeAccountSignupTicket(): string | null {
  * origin with the token in the fragment (the deployment points
  * `GAUGEDESK_OIDC_POST_LOGIN_URL` at this client).
  */
-export function beginLogin(controlPlaneBase: string, provider?: string): void {
+export function beginLogin(controlPlaneBase: string, provider?: string, chooseAccount = false): void {
     if (typeof window === "undefined") return;
     // Which consumer entrance was pressed (DR-0189 §1). Omitted means the
     // deployment's first one, which is what every caller meant before there was
@@ -167,8 +167,37 @@ export function beginLogin(controlPlaneBase: string, provider?: string): void {
     // keeps the literal path on it: `check-client-calls.mjs` reads the demand
     // side of this route out of that literal, and a base assigned to a variable
     // first is a route the check can no longer see anybody asking for.
-    const query = provider ? `?provider=${encodeURIComponent(provider)}` : "";
+    const params = new URLSearchParams();
+    if (provider) params.set("provider", provider);
+    if (chooseAccount) params.set("select_account", "1");
+    const query = params.size ? `?${params}` : "";
     window.location.href = `${controlPlaneBase.replace(/\/+$/, "")}/auth/login${query}`;
+}
+
+export interface BrowserAccountRoster {
+    readonly selected: string | null;
+    readonly accounts: readonly { readonly person: string; readonly label: string; readonly expired: boolean }[];
+}
+
+/** The browser keeps only a rotating opaque HttpOnly handle; this projection
+ * contains no retained session credential. */
+export async function browserAccounts(controlPlaneBase: string): Promise<BrowserAccountRoster> {
+    const request = browserRouteRequest(controlPlaneBase.replace(/\/+$/, ""));
+    const response = await request("/auth/browser-accounts", { credentials: "include" });
+    if (!response.ok) throw new Error(`Could not read accounts (${response.status}).`);
+    return response.json() as Promise<BrowserAccountRoster>;
+}
+
+export async function selectBrowserAccount(controlPlaneBase: string, person: string): Promise<void> {
+    const request = browserRouteRequest(controlPlaneBase.replace(/\/+$/, ""));
+    const response = await request("/auth/browser-accounts/select", {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json", "idempotency-key": newIdempotencyKey() },
+        body: JSON.stringify({ person }),
+    });
+    if (!response.ok) throw new Error(`Could not select account (${response.status}).`);
+    setBearer(null);
 }
 
 export interface AccountRecoveryChallenge {

@@ -180,9 +180,13 @@ export class WorkbenchControlPlane implements ControlPlane {
     private readonly request: RouteRequest;
     private readonly events: RouteEventStream;
     private readonly splitHomes: boolean;
+    private readonly nativeShell: boolean;
+    private nativeRemote = false;
     private readonly homeDialTimeoutMs: number;
     private readonly workTransport: workbenchClient.WorkbenchTransport;
+    private readonly localWorkTransport: workbenchClient.WorkbenchTransport;
     private homeTransport: Promise<workbenchClient.WorkbenchTransport> | null = null;
+    private selectedDirectJson: RouteJson | null = null;
     /** Several Homes at once, resolved per project (DESK-3). There is no
      * selected Home here: whichever project is open decides which Home serves,
      * and a Home that fails degrades only the projects routed to it. */
@@ -195,6 +199,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         options: { readonly splitHomes?: boolean; readonly homeDialTimeoutMs?: number } = {},
     ) {
         this.splitHomes = options.splitHomes ?? import.meta.env?.VITE_HOME_SPLIT === "true";
+        this.nativeShell = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
         this.homeDialTimeoutMs = options.homeDialTimeoutMs ?? HOME_DIAL_TIMEOUT_MS;
         const auth = {
             bearer: () => this.bearer,
@@ -218,7 +223,13 @@ export class WorkbenchControlPlane implements ControlPlane {
                 }
             },
         });
-        this.workTransport = this.splitHomes
+        this.localWorkTransport = {
+            base: this.base,
+            json: this.route,
+            request: this.request,
+            events: this.events,
+        };
+        this.workTransport = this.splitHomes || this.nativeShell
             ? {
                   base: "",
                   json: (...args) => this.withHomeAdmissionRetry((transport) => transport.json(...args)),
@@ -248,12 +259,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                       };
                   },
               }
-            : {
-                  base: this.base,
-                  json: this.route,
-                  request: this.request,
-                  events: this.events,
-              };
+            : this.localWorkTransport;
     }
 
     /** Retry only the pre-effect expired-admission refusal, once, and only while
@@ -294,6 +300,38 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.homeTransport = null;
     }
 
+    /** The shell proves local Home standing separately from Hub sign-in. A
+     * selected visitor uses its own Home over the sealed desktop broker. */
+    setNativeRemote(remote: boolean): boolean {
+        if (!this.nativeShell || this.nativeRemote === remote) return false;
+        this.nativeRemote = remote;
+        this.credentialGeneration++;
+        this.homeAdmission = null;
+        this.homeTransport = null;
+        this.selectedDirectJson = null;
+        void this.pool?.closeAll().catch(() => undefined);
+        this.pool = null;
+        for (const reconnect of this.restartWorkStreams) reconnect();
+        return true;
+    }
+
+    async closeAccountConnections(): Promise<void> {
+        this.credentialGeneration++;
+        this.homeTransport = null;
+        const selected = this.selectedDirectJson;
+        this.selectedDirectJson = null;
+        const pool = this.pool;
+        this.pool = null;
+        await Promise.allSettled([
+            selected?.("DELETE", "/home/admissions"),
+            pool?.closeAll(),
+        ]);
+    }
+
+    private usesRemoteHome(): boolean {
+        return this.splitHomes || this.nativeRemote;
+    }
+
     setBearer(token: string | null): void {
         if (this.bearer !== token) {
             this.credentialGeneration++;
@@ -330,7 +368,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     private async connectNativeFileHome(home: string): Promise<workbenchClient.NativeSaveHome> {
-        if (!this.splitHomes) {
+        if (!this.usesRemoteHome()) {
             // A retained binding must not follow a later admission header to
             // another Home at the same local or reverse-proxy origin.
             const bearer = this.bearer;
@@ -349,12 +387,15 @@ export class WorkbenchControlPlane implements ControlPlane {
         }
         // Registered Homes may have an endpoint before publishing project
         // routes. Resolve this exact id; the account's selected Home is unused.
-        const state = await accountClient.accountHomes(this.route);
+        const state = this.nativeRemote
+            ? await accountClient.hubSessionReach(this.route)
+            : await accountClient.accountHomes(this.route);
         const original = state.homes.find((candidate) => candidate.id === home);
         if (!original?.endpoint) throw new UnroutedHomeError(`No route reaches original Home ${home}`);
-        const bearer = this.bearer;
+        const bearer = this.nativeRemote ? null : this.bearer;
         let admission: string | null = null;
-        const json = browserRouteJson(original.endpoint, {
+        const endpoint = this.nativeRemote ? this.nativeHomeBase(original.id) : original.endpoint;
+        const json = browserRouteJson(endpoint, {
             bearer: () => bearer, homeAdmission: () => admission,
         });
         const admitted = await json("POST", "/home/admissions") as { home?: unknown; admission?: unknown };
@@ -366,7 +407,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             throw new Error(`Native save Home identity mismatch: expected ${home}`);
         }
         admission = admitted.admission;
-        return { home, transport: { base: original.endpoint, json } };
+        return { home, transport: { base: endpoint, json } };
     }
 
     /**
@@ -400,6 +441,7 @@ export class WorkbenchControlPlane implements ControlPlane {
      * through here, so provenance and pinning cannot diverge between call sites.
      */
     private async homeRoutes(): Promise<OpaqueHomeRoute[]> {
+        if (this.nativeRemote) return (await accountClient.hubSessionReach(this.route)).routes;
         const resolved = await accountClient.resolveHomeRoutes({
             json: this.route,
             subject: this.subject(),
@@ -439,7 +481,9 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     private routeJson(): RouteJson {
-        return this.route;
+        return this.nativeRemote
+            ? (...args) => this.requireHomeTransport().then((transport) => transport.json(...args))
+            : this.route;
     }
 
     private workbenchTransport(): workbenchClient.WorkbenchTransport {
@@ -447,7 +491,11 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     private async runtimeAccountJson(): Promise<RouteJson> {
-        return this.splitHomes ? (await this.requireHomeTransport()).json : this.route;
+        return this.usesRemoteHome() ? (await this.requireHomeTransport()).json : this.route;
+    }
+
+    private async desktopSessionJson(): Promise<RouteJson> {
+        return this.nativeShell ? this.route : this.runtimeAccountJson();
     }
 
     /** Open a project, so subsequent work resolves to *its* Home. Passing null
@@ -469,7 +517,7 @@ export class WorkbenchControlPlane implements ControlPlane {
      * falls back to the account's selected Home, which is what accounts whose
      * Homes have not yet authored routes still rely on (DESK-5a). */
     private requireHomeTransport(): Promise<workbenchClient.WorkbenchTransport> {
-        if (!this.splitHomes) return Promise.resolve(this.workTransport);
+        if (!this.usesRemoteHome()) return Promise.resolve(this.localWorkTransport);
         const project = this.currentProject;
         if (project) {
             this.homeTransport ??= this.connectRoutedProject(project).catch((error) => {
@@ -509,7 +557,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         // A relay-only route is not dialable without a tunnel module. That is
         // an absence of a usable route, not a broken connection, so it reads as
         // one and the account's selected Home serves instead.
-        if (!route.endpoint && !(route.relay && tunnelAvailable())) {
+        if (!route.endpoint && !(route.relay && (this.nativeRemote || tunnelAvailable()))) {
             throw new Error(`no granted Home route for project ${project}`);
         }
         const connection = await pool.connectProject(project);
@@ -548,13 +596,16 @@ export class WorkbenchControlPlane implements ControlPlane {
         const tunnels = new Map<HomeId, TunnelRoute>();
         this.pool = new HomePool<workbenchClient.WorkbenchTransport>(
             routes,
-            () => this.bearer,
+            () => this.nativeRemote ? "selected desktop session" : this.bearer,
             {
                 // A Home with no endpoint is reachable only through the relay.
                 // Serve it over the tunnel when this build registered a module;
                 // otherwise fall through, so a build without one behaves exactly
                 // as it did rather than failing in a new way (DESK-7).
                 routeJson: (endpoint, auth, route) => {
+                    if (this.nativeRemote) {
+                        return browserRouteJson(endpoint, { homeAdmission: auth.homeAdmission });
+                    }
                     const relay = route.relay;
                     if (route.endpoint || !relay || !tunnelAvailable()) {
                         return browserRouteJson(endpoint, auth);
@@ -584,6 +635,15 @@ export class WorkbenchControlPlane implements ControlPlane {
                     tunnels.delete(homeId);
                 },
                 client: (context) => {
+                    if (this.nativeRemote) {
+                        const admission = { homeAdmission: context.homeAdmission };
+                        return {
+                            base: context.endpoint,
+                            json: context.routeJson,
+                            request: browserRouteRequest(context.endpoint, admission),
+                            events: browserRouteEventStream(context.endpoint, admission),
+                        };
+                    }
                     const auth = {
                         bearer: context.bearer,
                         homeAdmission: context.homeAdmission,
@@ -610,14 +670,53 @@ export class WorkbenchControlPlane implements ControlPlane {
                 // outstanding ones the moment it lands. Re-reading once turns
                 // that into a reconnect instead of an unreachable Home.
                 refreshRoutes: () => this.homeRoutes(),
+                ...(this.nativeRemote ? {
+                    resolveEndpoint: async (route: OpaqueHomeRoute) => this.nativeHomeBase(route.homeId),
+                } : {}),
             },
         );
         return this.pool;
     }
 
+    private nativeHomeBase(home: HomeId): string {
+        return `${this.base.replace(/\/+$/, "")}/account/hub-session/home/${encodeURIComponent(home)}`;
+    }
+
     /** The Home that answers work not scoped to a project — the chat list, the
      * workspace, the account's own view of itself. */
     private async connectSelectedHome(): Promise<workbenchClient.WorkbenchTransport> {
+        if (this.nativeRemote) {
+            const generation = this.credentialGeneration;
+            const reach = await accountClient.hubSessionReach(this.route);
+            const selected = reach.homes.find((home) => home.id === reach.selectedHome);
+            if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
+            if (reach.routes.some((route) => route.homeId === selected.id && (route.endpoint || route.relay))) {
+                return (await (await this.homePool()).connectHome(selected.id)).api;
+            }
+            if (!selected.endpoint) throw new UnroutedHomeError(`No direct endpoint reaches Home ${selected.id}`);
+            const endpoint = this.nativeHomeBase(selected.id);
+            let admission: string | null = null;
+            const auth = { homeAdmission: () => admission };
+            const json = browserRouteJson(endpoint, auth);
+            const result = await json("POST", "/home/admissions") as {
+                home?: unknown; admission?: unknown;
+            };
+            if (result.home !== selected.id || typeof result.admission !== "string") {
+                throw new Error(`Selected Home identity mismatch: expected ${selected.id}`);
+            }
+            admission = result.admission;
+            if (generation !== this.credentialGeneration || !this.nativeRemote) {
+                await json("DELETE", "/home/admissions").catch(() => undefined);
+                throw new Error("Account selection changed during Home admission");
+            }
+            this.selectedDirectJson = json;
+            return {
+                base: endpoint,
+                json,
+                request: browserRouteRequest(endpoint, auth),
+                events: browserRouteEventStream(endpoint, auth),
+            };
+        }
         const state = await accountClient.accountHomes(this.route);
         const selected = state.homes.find((home) => home.id === state.selectedHome);
         if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
@@ -657,10 +756,12 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async bootstrapHome(): Promise<HomeBootstrapState> {
-        if (!this.splitHomes) return { kind: "direct" };
+        if (!this.usesRemoteHome()) return { kind: "direct" };
         try {
             await withinHomeDialTimeout(this.requireHomeTransport(), this.homeDialTimeoutMs);
-            const state = await accountClient.accountHomes(this.route);
+            const state = this.nativeRemote
+                ? await accountClient.hubSessionReach(this.route)
+                : await accountClient.accountHomes(this.route);
             const home = state.homes.find((item) => item.id === state.selectedHome);
             if (!home) throw new NoSelectedHomeError("No reachable Home is selected");
             return { kind: "connected", home };
@@ -695,6 +796,11 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     private async noHomeServing(): Promise<HomeBootstrapState & { kind: "none" }> {
+        if (this.nativeRemote) {
+            const reach = await accountClient.hubSessionReach(this.route);
+            return { kind: "none", homes: reach.homes, routes: reach.routes,
+                selectedHome: reach.selectedHome };
+        }
         const [state, routes] = await Promise.all([
             accountClient.accountHomes(this.route),
             this.homeRoutes(),
@@ -949,7 +1055,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     private async projectTrackerTransport(project: ProjectId): Promise<workbenchClient.WorkbenchTransport> {
-        if (!this.splitHomes) return this.workTransport;
+        if (!this.usesRemoteHome()) return this.localWorkTransport;
         try {
             return await this.connectRoutedProject(project);
         } catch (error) {
@@ -1191,7 +1297,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     async publishDeployment(input: PublicDeploymentInput): Promise<PublicDeploymentOutcome> {
         let admitted = input;
         if (
-            this.splitHomes
+            this.usesRemoteHome()
             && input.funding.kind === "managed"
             && !input.funding.entitlement
         ) {
@@ -1209,7 +1315,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     async startPanelPreview(input: PanelPreviewInput): Promise<PanelPreviewOutcome> {
         let admitted = input;
         if (
-            this.splitHomes
+            this.usesRemoteHome()
             && input.funding.kind === "managed"
             && !input.funding.entitlement
         ) {
@@ -1843,7 +1949,9 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     accountTenants(): Promise<accountClient.AccountTenant[]> {
-        return accountClient.accountTenants(this.routeJson());
+        return this.nativeRemote
+            ? accountClient.hubSessionTenants(this.route)
+            : accountClient.accountTenants(this.routeJson());
     }
 
     accountSignInMethod(): Promise<accountClient.AccountSignInMethod> {
@@ -2054,26 +2162,34 @@ export class WorkbenchControlPlane implements ControlPlane {
     // plane custodies the session; the client sees only the login URL, the
     // one-time code, and non-secret status.
     hubSessionStatus(): Promise<accountClient.HubSessionStatus> {
-        return this.runtimeAccountJson().then((json) => accountClient.hubSessionStatus(json));
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionStatus(json));
+    }
+
+    hubSessionAccounts(): Promise<accountClient.HubSessionAccounts> {
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionAccounts(json));
+    }
+
+    hubSessionSelect(person: string): Promise<accountClient.HubSessionStatus> {
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionSelect(json, person));
+    }
+
+    hubSessionSelectLocal(): Promise<accountClient.HubSessionStatus> {
+        return accountClient.hubSessionSelectLocal(this.route);
     }
 
     hubSessionStart(provider?: string): Promise<{ url: string; webReturn: boolean }> {
-        return this.runtimeAccountJson().then((json) =>
-            accountClient.hubSessionStart(json, provider),
-        );
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionStart(json, provider));
     }
 
     hubSessionCallback(code: string): Promise<accountClient.HubSessionStatus> {
-        return this.runtimeAccountJson().then((json) =>
-            accountClient.hubSessionCallback(json, code),
-        );
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionCallback(json, code));
     }
 
     hubSessionSignOut(): Promise<void> {
-        return this.runtimeAccountJson().then((json) => accountClient.hubSessionSignOut(json));
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionSignOut(json));
     }
 
     hubSessionReach(): Promise<accountClient.HubSessionReach> {
-        return this.runtimeAccountJson().then((json) => accountClient.hubSessionReach(json));
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionReach(json));
     }
 }

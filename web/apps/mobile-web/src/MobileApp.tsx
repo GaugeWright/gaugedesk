@@ -45,7 +45,6 @@ import {
 import {
     bridgeGrantId,
     clientRequestId,
-    decodeSubject,
     type BridgeGrant,
     type EngagementId,
     type LocalState,
@@ -114,6 +113,7 @@ import {
     loadMobileRuntime,
     machineCredentialIsRejected,
     MOBILE_ACCOUNT_BASE,
+    MOBILE_AUTH_VERIFIER_KEY,
     onMobileAuthCallback,
     onMobileTargetReference,
     redeemMobileAccountHandoff,
@@ -179,6 +179,7 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
     const [runtime, runtimeActions] = createResource(() => loadMobileRuntime());
     const [accessMode, setAccessMode] = createSignal<"account" | "direct" | null>(null);
     const [accountToken, setAccountToken] = createSignal<string | null>(null);
+    const [accountId, setAccountId] = createSignal<string | null>(null);
     const [accountError, setAccountError] = createSignal<string | null>(null);
     const [pendingTarget, setPendingTarget] =
         createSignal<MobileTargetReference | null>(null);
@@ -223,10 +224,13 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
                     void loaded.clearAccountToken();
                 }
                 setAccountError("Your session expired. Sign in again to reconnect.");
-            } else {
+            } else if (loaded.accountId) {
+                setAccountId(loaded.accountId);
                 setAccountToken(token);
                 void props.gaugeApps?.onMobileAccountToken?.(token);
                 setAccessMode("account");
+            } else {
+                setAccountError("The account session could not be identified. Connect and sign in again.");
             }
         }
         if (loaded.pendingAccountCode) void completeAccountHandoff(loaded.pendingAccountCode, loaded);
@@ -238,19 +242,8 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
             setMachineEndpoint(loaded.pendingInvitation.endpoint);
             setAccessMode("direct");
         }
-        // Only while signed out. A signed-in person reaches the access page by
-        // asking to pair a Project Host; jumping them straight into the saved
-        // one's direct session — which has no account controls — would put the
-        // page they asked for, and the way back to their projects, out of reach.
-        if (
-            loaded.native
-            && accessMode() === null
-            && accountToken() === null
-            && loaded.credentials.length > 0
-        ) {
-            setMachineEndpoint(loaded.endpoint);
-            setAccessMode("direct");
-        }
+        // A saved direct grant is offered on the access page. Selecting or
+        // signing out of an account never silently opens that grant instead.
         // The standalone projection harness still enters direct pairing for
         // its machine-protocol tests. The actual GaugeDesk composition has an
         // account authority, so its first page must preserve Sign in as the
@@ -268,11 +261,26 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
     });
 
     function completeAccountHandoff(code: string, loaded: MobileRuntime) {
+        // Android can report the original Activity URL again after the reload
+        // that fences an account switch. The verifier is consumed by the first
+        // redemption; an old code with no verifier is no longer a handoff.
+        try {
+            if (!window.localStorage.getItem(MOBILE_AUTH_VERIFIER_KEY)) return;
+        } catch {
+            // Let redemption report that device storage is unavailable.
+        }
         if (redeemingAccountCode === code) return;
         redeemingAccountCode = code;
         void redeemMobileAccountHandoff(MOBILE_ACCOUNT_BASE, code)
             .then(async (token) => {
                 await loaded.storeAccountToken(token);
+                if (loaded.native) {
+                    accountSignedOut = true;
+                    setAccountToken(null);
+                    setAccessMode(null);
+                    window.location.reload();
+                    return;
+                }
                 accountSignedOut = false;
                 setAccountToken(token);
                 await props.gaugeApps?.onMobileAccountToken?.(token);
@@ -283,6 +291,36 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
             .finally(() => {
                 redeemingAccountCode = null;
             });
+    }
+
+    async function switchAccount(account: string) {
+        const loaded = runtime();
+        if (!loaded) return;
+        const previous = accountToken();
+        accountSignedOut = true;
+        setAccountToken(null);
+        setAccessMode(null);
+        try {
+            await loaded.selectAccount(account);
+            window.location.reload();
+        } catch (error) {
+            accountSignedOut = false;
+            setAccountToken(previous);
+            setAccessMode(previous ? "account" : null);
+            setAccountError(String(error));
+        }
+    }
+
+    async function removeUnidentifiedAccount() {
+        const loaded = runtime();
+        if (!loaded) return;
+        try {
+            await loaded.clearAccountToken();
+            setAccountError(null);
+            await runtimeActions.refetch();
+        } catch (error) {
+            setAccountError(String(error));
+        }
     }
 
     createEffect(() => {
@@ -386,7 +424,7 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
     }
 
     function accessPage(loaded: MobileRuntime): JSX.Element {
-        const signedIn = () => accountToken() !== null;
+        const signedIn = () => accountToken() !== null && accountId() !== null;
         return (
             <div class="mobile-pairing-stage mobile-account-entry">
                 <Show
@@ -419,6 +457,23 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
                                     }}
                                 >
                                     sign in
+                                </button>
+                            </Show>
+                            <Show when={loaded.native && loaded.retainedAccounts.length > 0}>
+                                <div class="mobile-saved-machines" data-mobile-retained-accounts>
+                                    <div class="status">Accounts on this phone</div>
+                                    <For each={loaded.retainedAccounts}>
+                                        {(account) => <button
+                                            type="button"
+                                            class="mobile-account-recent"
+                                            onClick={() => void switchAccount(account)}
+                                        >{account}</button>}
+                                    </For>
+                                </div>
+                            </Show>
+                            <Show when={loaded.native && loaded.accountToken && !loaded.accountId}>
+                                <button type="button" onClick={() => void removeUnidentifiedAccount()}>
+                                    remove the unidentified account session
                                 </button>
                             </Show>
                             <Show when={accountError()}>
@@ -563,10 +618,10 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
             >
                 {(loaded) => (
                     <Show
-                        when={accessMode() === "account" && accountToken()}
+                        when={accessMode() === "account" && accountToken() && accountId()}
                         fallback={
                             <Show
-                                when={machineEndpoint()}
+                                when={accessMode() === "direct" ? machineEndpoint() : null}
                                 fallback={accessPage(loaded())}
                             >
                                 {(endpoint) => (
@@ -600,14 +655,19 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
                         <MobileAccountShell
                             runtime={loaded()}
                             token={accountToken()!}
+                            accountId={accountId()!}
                             pendingTarget={pendingTarget()}
                             onTargetConsumed={() => setPendingTarget(null)}
                             onToken={setAccountToken}
                             onSignOut={() => {
                                 accountSignedOut = true;
+                                setAccountId(null);
                                 setAccountToken(null);
                                 setAccessMode(null);
+                                void runtimeActions.refetch();
                             }}
+                            onSwitchAccount={switchAccount}
+                            onAddAccount={() => beginMobileAccountLogin(MOBILE_ACCOUNT_BASE)}
                             onPairMachine={() => setAccessMode(null)}
                             gaugeApps={props.gaugeApps}
                         />
@@ -634,14 +694,17 @@ interface MobileProjectSummary {
 function MobileAccountShell(props: {
     readonly runtime: MobileRuntime;
     readonly token: string;
+    readonly accountId: string;
     readonly pendingTarget: MobileTargetReference | null;
     readonly onTargetConsumed: () => void;
     readonly onToken: (token: string) => void;
     readonly onSignOut: () => void;
+    readonly onSwitchAccount: (account: string) => Promise<void>;
+    readonly onAddAccount: () => Promise<void>;
     readonly onPairMachine: () => void;
     readonly gaugeApps?: MobileGaugeApps;
 }): JSX.Element {
-    const owner = decodeSubject(props.token) ?? "account:unresolved";
+    const owner = props.accountId;
     let deviceStorage: Storage | null = null;
     try {
         deviceStorage = window.localStorage;
@@ -883,7 +946,7 @@ function MobileAccountShell(props: {
                 MOBILE_ACCOUNT_BASE,
                 props.token,
             );
-            await props.runtime.storeAccountToken(token);
+            await props.runtime.storeAccountToken(token, props.accountId);
             props.onToken(token);
             await props.gaugeApps?.onMobileAccountToken?.(token);
         } finally {
@@ -933,6 +996,18 @@ function MobileAccountShell(props: {
                 <div class="mobile-project-browser" data-pane="nav">
                     <header class="mobile-project-browser-head">
                         <h1>Projects</h1>
+                        <Show when={props.runtime.native}>
+                            <details class="mobile-account-switcher" data-mobile-account-switcher>
+                                <summary title={props.accountId}>Account {props.accountId.slice(0, 16)}</summary>
+                                <div class="mobile-account-switcher-menu">
+                                    <div class="status">Current: {props.accountId}</div>
+                                    <For each={props.runtime.retainedAccounts.filter((account) => account !== props.accountId)}>
+                                        {(account) => <button type="button" onClick={() => void props.onSwitchAccount(account)}>{account}</button>}
+                                    </For>
+                                    <button type="button" onClick={() => void props.onAddAccount()}>add account</button>
+                                </div>
+                            </details>
+                        </Show>
                         <button type="button" onClick={() => void signOut()}>
                             sign out
                         </button>

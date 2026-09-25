@@ -597,6 +597,24 @@ impl OrganizationModelBrokerConfig {
         &self,
         request: &sansio_types::HttpRequest,
     ) -> Result<sansio_types::HttpResponse, sansio_types::TransportError> {
+        self.fetch_with_timeout(request, Duration::from_secs(130))
+    }
+
+    /// The same admitted organization-model route for a bounded metadata
+    /// request. Naming a chat must not hold up an otherwise completed turn for
+    /// the full agent-turn deadline.
+    pub fn fetch_for_title(
+        &self,
+        request: &sansio_types::HttpRequest,
+    ) -> Result<sansio_types::HttpResponse, sansio_types::TransportError> {
+        self.fetch_with_timeout(request, Duration::from_secs(20))
+    }
+
+    fn fetch_with_timeout(
+        &self,
+        request: &sansio_types::HttpRequest,
+        timeout: Duration,
+    ) -> Result<sansio_types::HttpResponse, sansio_types::TransportError> {
         // A provider body can be close to WhippleScript's 32 MiB response
         // limit before JSON string escaping. Leave room for the escaped body
         // and the small signed-attempt envelope without silently reducing the
@@ -619,7 +637,7 @@ impl OrganizationModelBrokerConfig {
         }
         let agent = ureq::AgentBuilder::new()
             .redirects(0)
-            .timeout(Duration::from_secs(130))
+            .timeout(timeout)
             .build();
         let prepared = post_json_value(
             &agent,

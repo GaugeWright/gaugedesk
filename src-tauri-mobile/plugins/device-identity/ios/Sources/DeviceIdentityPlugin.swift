@@ -20,7 +20,12 @@ final class RemoveMachineCredentialArgs: Decodable {
 }
 
 final class StoreAccountSessionArgs: Decodable {
+    let account: String
     let idToken: String
+}
+
+final class SelectAccountSessionArgs: Decodable {
+    let account: String
 }
 
 private struct StoredMachineCredentialRegistry: Codable, Equatable {
@@ -45,8 +50,25 @@ private struct StoredAccountSession: Codable, Equatable {
     let idToken: String
 }
 
+private struct RetainedAccountSession: Codable, Equatable {
+    let account: String
+    let idToken: String
+}
+
+private struct StoredAccountSessionRegistry: Codable, Equatable {
+    let version: Int
+    var selected: String?
+    var accounts: [RetainedAccountSession]
+}
+
+private struct RetainedAccount: Encodable {
+    let account: String
+}
+
 private struct AccountSessionResponse: Encodable {
     let idToken: String?
+    let selected: String?
+    let accounts: [RetainedAccount]
 }
 
 enum DeviceIdentityError: LocalizedError {
@@ -645,13 +667,25 @@ final class DeviceIdentityPlugin: Plugin {
     @objc public func storeAccountSession(_ invoke: Invoke) throws {
         do {
             let args = try invoke.parseArgs(StoreAccountSessionArgs.self)
-            guard !args.idToken.isEmpty else {
+            guard !args.account.isEmpty, !args.idToken.isEmpty else {
                 throw DeviceIdentityError.keyCreation(
-                    "account session token is empty"
+                    "account id or session token is empty"
                 )
             }
+            if let data = try readAccountSessionData(),
+               let legacy = try? JSONDecoder().decode(StoredAccountSession.self, from: data),
+               legacy.idToken != args.idToken {
+                throw DeviceIdentityError.keyCreation(
+                    "identify or remove the previous account session before adding another"
+                )
+            }
+            var registry = try accountSessionRegistry()
+            registry.accounts.removeAll { $0.account == args.account }
+            registry.accounts.append(RetainedAccountSession(account: args.account, idToken: args.idToken))
+            registry.accounts.sort { $0.account < $1.account }
+            registry.selected = args.account
             try writeAccountSessionData(
-                JSONEncoder().encode(StoredAccountSession(idToken: args.idToken))
+                JSONEncoder().encode(registry)
             )
             invoke.resolve()
         } catch {
@@ -665,10 +699,16 @@ final class DeviceIdentityPlugin: Plugin {
 
     @objc public func getAccountSession(_ invoke: Invoke) throws {
         do {
-            let session = try readAccountSessionData().map {
-                try JSONDecoder().decode(StoredAccountSession.self, from: $0)
+            let data = try readAccountSessionData()
+            if let data, let registry = try? JSONDecoder().decode(StoredAccountSessionRegistry.self, from: data) {
+                try validateAccountSessionRegistry(registry)
+                invoke.resolve(accountSessionResponse(registry))
+            } else if let data {
+                let legacy = try JSONDecoder().decode(StoredAccountSession.self, from: data)
+                invoke.resolve(AccountSessionResponse(idToken: legacy.idToken, selected: nil, accounts: []))
+            } else {
+                invoke.resolve(AccountSessionResponse(idToken: nil, selected: nil, accounts: []))
             }
-            invoke.resolve(AccountSessionResponse(idToken: session?.idToken))
         } catch {
             reject(
                 invoke,
@@ -680,7 +720,12 @@ final class DeviceIdentityPlugin: Plugin {
 
     @objc public func clearAccountSession(_ invoke: Invoke) throws {
         do {
-            try writeAccountSessionData(nil)
+            var registry = try accountSessionRegistry()
+            if let selected = registry.selected {
+                registry.accounts.removeAll { $0.account == selected }
+            }
+            registry.selected = nil
+            try writeAccountSessionData(registry.accounts.isEmpty ? nil : JSONEncoder().encode(registry))
             invoke.resolve()
         } catch {
             reject(
@@ -688,6 +733,56 @@ final class DeviceIdentityPlugin: Plugin {
                 operation: "could not clear the account session",
                 error: error
             )
+        }
+    }
+
+    @objc public func selectAccountSession(_ invoke: Invoke) throws {
+        do {
+            let args = try invoke.parseArgs(SelectAccountSessionArgs.self)
+            var registry = try accountSessionRegistry()
+            guard registry.accounts.contains(where: { $0.account == args.account }) else {
+                throw DeviceIdentityError.keyCreation("account is not retained")
+            }
+            registry.selected = args.account
+            try writeAccountSessionData(JSONEncoder().encode(registry))
+            invoke.resolve(accountSessionResponse(registry))
+        } catch {
+            reject(invoke, operation: "could not select the account session", error: error)
+        }
+    }
+
+    private func accountSessionRegistry() throws -> StoredAccountSessionRegistry {
+        guard let data = try readAccountSessionData() else {
+            return StoredAccountSessionRegistry(version: 1, selected: nil, accounts: [])
+        }
+        if let registry = try? JSONDecoder().decode(StoredAccountSessionRegistry.self, from: data) {
+            try validateAccountSessionRegistry(registry)
+            return registry
+        }
+        // The old singleton has no authenticated account id. The web client
+        // asks the Hub for it before its next store; no guessed identity enters
+        // this registry.
+        _ = try JSONDecoder().decode(StoredAccountSession.self, from: data)
+        return StoredAccountSessionRegistry(version: 1, selected: nil, accounts: [])
+    }
+
+    private func accountSessionResponse(_ registry: StoredAccountSessionRegistry) -> AccountSessionResponse {
+        AccountSessionResponse(
+            idToken: registry.accounts.first(where: { $0.account == registry.selected })?.idToken,
+            selected: registry.selected,
+            accounts: registry.accounts.map { RetainedAccount(account: $0.account) }
+        )
+    }
+
+    private func validateAccountSessionRegistry(_ registry: StoredAccountSessionRegistry) throws {
+        guard registry.version == 1 else {
+            throw DeviceIdentityError.keyCreation("unsupported account session registry version")
+        }
+        let ids = registry.accounts.map(\.account)
+        guard Set(ids).count == ids.count,
+              !registry.accounts.contains(where: { $0.account.isEmpty || $0.idToken.isEmpty }),
+              registry.selected.map(ids.contains) ?? true else {
+            throw DeviceIdentityError.keyCreation("account session registry is inconsistent")
         }
     }
 }

@@ -687,6 +687,8 @@ enum PendingSamlPurpose {
         context: gaugedesk_app::auth_oidc::PendingEnterpriseLogin,
         native_return: Option<String>,
         native_handoff_challenge: Option<String>,
+        browser_wallet: Option<gaugedesk_app::secret::Secret>,
+        browser_session: Option<gaugedesk_app::secret::Secret>,
     },
 }
 
@@ -816,6 +818,8 @@ impl SamlBrowserState {
             public_base,
             native_return,
             native_handoff_challenge,
+            browser_wallet,
+            browser_session,
         } = request;
         self.begin(
             &connection,
@@ -823,6 +827,8 @@ impl SamlBrowserState {
                 context: login_context,
                 native_return,
                 native_handoff_challenge,
+                browser_wallet,
+                browser_session,
             },
             &public_base,
             sp_entity_id,
@@ -986,6 +992,7 @@ async fn complete_saml_browser_test(
     State(workbench): State<SharedWorkbench>,
     Extension(state): Extension<SamlBrowserState>,
     Extension(auth): Extension<gaugedesk_app::auth_oidc::AuthShellState>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<SamlAcsForm>,
 ) -> Response {
     if form.saml_response.len() > SAML_RESPONSE_LIMIT_BYTES {
@@ -1062,6 +1069,8 @@ async fn complete_saml_browser_test(
             context,
             native_return,
             native_handoff_challenge,
+            browser_wallet,
+            browser_session,
         } => {
             let corporate_identity = gaugedesk_app::auth_oidc::VerifiedEnterpriseIdentity {
                 authority: identity.authority,
@@ -1101,8 +1110,22 @@ async fn complete_saml_browser_test(
                 .unwrap_or_else(|| resolution.account_id.clone());
             let session_ceiling = gaugedesk_app::account::session_now_ms()
                 .saturating_add(gaugedesk_app::account::SESSION_ABSOLUTE_LIFETIME_MS);
+            let mut initiating_headers = headers;
+            let mut cookies = Vec::new();
+            if let Some(wallet) = browser_wallet {
+                cookies.push(format!("gw_account_wallet={}", wallet.expose()));
+            }
+            if let Some(session) = browser_session {
+                cookies.push(format!("gw_session={}", session.expose()));
+            }
+            if !cookies.is_empty() {
+                if let Ok(cookie) = cookies.join("; ").parse() {
+                    initiating_headers.insert(axum::http::header::COOKIE, cookie);
+                }
+            }
             auth.deliver_enterprise_login(
                 &workbench,
+                &initiating_headers,
                 gaugedesk_app::auth_oidc::EnterpriseLoginDelivery {
                     login_context: context,
                     resolution,
@@ -1254,12 +1277,16 @@ mod tests {
                     public_base: "https://desk.example.test".into(),
                     native_return: Some("gaugewright://auth/callback".into()),
                     native_handoff_challenge: Some("challenge".into()),
+                    browser_wallet: Some(gaugedesk_app::secret::Secret::new("wallet-secret")),
+                    browser_session: Some(gaugedesk_app::secret::Secret::new("session-secret")),
                 },
                 "https://desk.example.test/saml/metadata",
                 "https://desk.example.test/auth/saml/acs",
             )
             .unwrap();
         let relay = launch.launch_url.split("state=").nth(1).unwrap();
+        assert!(!launch.launch_url.contains("wallet-secret"));
+        assert!(!launch.launch_url.contains("session-secret"));
         let entry = state.take(relay, Instant::now()).unwrap();
         assert_eq!(entry.mapping.email_attribute.as_deref(), Some("mail"));
         assert!(matches!(
@@ -1268,6 +1295,7 @@ mod tests {
                 context: ref actual,
                 native_return: Some(ref return_to),
                 native_handoff_challenge: Some(ref challenge),
+                ..
             } if actual == &context
                 && return_to == "gaugewright://auth/callback"
                 && challenge == "challenge"

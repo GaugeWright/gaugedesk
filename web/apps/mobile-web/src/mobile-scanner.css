@@ -141,6 +141,46 @@ html.mobile-scanner-active #root,
     font-weight: 400;
 }
 
+.mobile-account-switcher {
+    position: relative;
+    min-width: 0;
+    margin-left: auto;
+    font: 500 var(--fs-small)/1.2 var(--font-chrome);
+}
+
+.mobile-account-switcher summary {
+    overflow: hidden;
+    max-width: 180px;
+    padding: 8px 4px;
+    color: var(--ink);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.mobile-account-switcher-menu {
+    position: absolute;
+    z-index: 5;
+    right: 0;
+    display: grid;
+    gap: 4px;
+    min-width: 220px;
+    max-width: min(90vw, 360px);
+    padding: 8px;
+    border: 1px solid var(--edge);
+    background: var(--panel);
+    box-shadow: 0 8px 22px color-mix(in srgb, var(--ink) 16%, transparent);
+}
+
+.mobile-account-switcher-menu .status {
+    overflow-wrap: anywhere;
+}
+
+.mobile-account-switcher-menu button {
+    overflow-wrap: anywhere;
+    text-align: left;
+}
+
 .mobile-project-browser-body {
     flex: 1;
     min-height: 0;

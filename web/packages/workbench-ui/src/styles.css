@@ -398,8 +398,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
    count sits beside the title rather than replacing it: the project says where,
    the number says how much. */
 /* An opted-in reply ping (ATTN-2) is cadence, not a decision — muted tone. */
-/* Cap the title: a chat auto-titled from its first message is a whole sentence;
-   the queue must stay scannable, so each title is one ellipsised line. */
+/* Keep the queue scannable even when a person gives a chat a long name. */
 .task-tab .task-title { max-width: 200px; min-width: 0; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
 .task-tab .task-agent { color: var(--muted); font-size: var(--fs-small); flex: 0 0 auto; }
@@ -588,6 +587,11 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* The account row, flush to the very bottom corner of the column. */
 .organization-bar { padding: 5px 8px 0; border-top: 1px solid var(--edge); }
 .account-bar { padding: 5px 8px 6px; border-top: 1px solid var(--edge); }
+.account-switcher { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 0 6px; }
+.account-switcher button { border: 1px solid var(--edge); border-radius: 5px; background: transparent; color: inherit; padding: 4px 7px; cursor: pointer; }
+.account-switcher button[aria-current="true"] { font-weight: 700; }
+.account-switcher button:disabled { cursor: default; opacity: .65; }
+.account-switcher p { flex-basis: 100%; margin: 2px 0; color: var(--danger, #a33); }
 .organization-bar + .account-bar { border-top: 0; }
 .update-label { color: var(--muted); padding: 0 4px; font-size: var(--fs-label); line-height: 1.35; }
 .desktop-update { margin: 1px 4px 0; padding: 1px 4px; border: 1px solid var(--accent);

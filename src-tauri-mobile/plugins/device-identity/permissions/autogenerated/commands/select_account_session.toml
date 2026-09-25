@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-select-account-session"
+description = "Enables the select_account_session command without any pre-configured scope."
+commands.allow = ["select_account_session"]
+
+[[permission]]
+identifier = "deny-select-account-session"
+description = "Denies the select_account_session command without any pre-configured scope."
+commands.deny = ["select_account_session"]

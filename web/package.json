@@ -27,6 +27,7 @@
     "e2e": "node e2e/run.mjs",
     "e2e:live": "GW_E2E_LIVE=1 node e2e/run.mjs",
     "e2e:account-recovery": "GW_E2E_COMPOSITION=enterprise GW_E2E_ACCOUNT_ENTRY=1 node e2e/run.mjs",
+    "e2e:retained-browser-accounts": "node e2e/retained-browser-accounts.mjs",
     "e2e:enterprise": "GW_E2E_COMPOSITION=enterprise node e2e/run.mjs"
   },
   "dependencies": {

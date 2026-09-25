@@ -5,6 +5,7 @@ import {
     deviceId,
     exchangeMobileAccountHandoff,
     publicKey,
+    browserRouteJson,
     type DeviceIdentity,
     type HomeId,
     type OpaqueHomeRoute,
@@ -28,6 +29,8 @@ export interface MobileRuntime {
     readonly selfApprovePairing: boolean;
     readonly credentials: readonly MachineCredential[];
     readonly accountToken: string | null;
+    readonly accountId: string | null;
+    readonly retainedAccounts: readonly string[];
     readonly pendingAccountCode: string | null;
     readonly pendingTarget: MobileTargetReference | null;
     readonly pendingInvitation: MachineControllerInvitation | null;
@@ -35,8 +38,9 @@ export interface MobileRuntime {
     storeCredential(credential: MachineCredential): Promise<void>;
     removeCredential(machine: string): Promise<void>;
     clearCredentials(): Promise<void>;
-    storeAccountToken(idToken: string): Promise<void>;
+    storeAccountToken(idToken: string, expectedAccount?: string): Promise<void>;
     clearAccountToken(): Promise<void>;
+    selectAccount(account: string): Promise<void>;
 }
 
 interface NativeDeviceIdentity {
@@ -77,6 +81,17 @@ interface NativeLaunchUrlResponse {
 
 interface NativeAccountSessionResponse {
     readonly idToken: string | null;
+    readonly selected?: string | null;
+    readonly accounts?: readonly { readonly account: string }[];
+}
+
+async function accountForToken(token: string): Promise<string> {
+    const json = browserRouteJson(MOBILE_ACCOUNT_BASE, { bearer: () => token });
+    const answer = await json("GET", "/account/identity") as { account?: unknown };
+    if (typeof answer.account !== "string" || !answer.account) {
+        throw new Error("The account authority did not identify this session");
+    }
+    return answer.account;
 }
 
 const NATIVE_CALL_TIMEOUT_MS = 15_000;
@@ -465,6 +480,8 @@ export async function loadMobileRuntime(
             selfApprovePairing: true,
             credentials: [],
             accountToken: null,
+            accountId: null,
+            retainedAccounts: [],
             pendingAccountCode: null,
             pendingTarget: null,
             pendingInvitation: null,
@@ -476,6 +493,7 @@ export async function loadMobileRuntime(
             clearCredentials: async () => undefined,
             storeAccountToken: async () => undefined,
             clearAccountToken: async () => undefined,
+            selectAccount: async () => undefined,
         };
     }
 
@@ -507,6 +525,29 @@ export async function loadMobileRuntime(
         ),
     ]);
     const credentials = parseMachineCredentialRegistry(stored);
+    let storedAccountId = storedAccount.selected ?? null;
+    let retainedAccounts = (storedAccount.accounts ?? [])
+        .map((entry) => entry.account)
+        .filter((account) => typeof account === "string" && account.length > 0);
+    if (storedAccount.idToken && !storedAccountId) {
+        // The old one-token vault carried no account id. Ask the authority
+        // before migrating it; an opaque bearer cannot be indexed by decoding
+        // an unverified JWT claim or by guessing from cached work.
+        try {
+            storedAccountId = await accountForToken(storedAccount.idToken);
+            await boundedNativeCall(
+                "Migrating the account session",
+                call("plugin:gaugedesk-device-identity|store_account_session", {
+                    payload: { account: storedAccountId, idToken: storedAccount.idToken },
+                }),
+            );
+            retainedAccounts = [storedAccountId];
+        } catch {
+            // The direct Machine path still opens while the account authority
+            // is offline. Protected account work waits for exact identity.
+            storedAccountId = null;
+        }
+    }
     const [currentLinks, nativeLaunch] = await Promise.all([
         getCurrent().catch(() => null),
         boundedNativeCall(
@@ -543,6 +584,8 @@ export async function loadMobileRuntime(
         selfApprovePairing: false,
         credentials,
         accountToken: storedAccount.idToken,
+        accountId: storedAccountId,
+        retainedAccounts,
         pendingAccountCode,
         pendingTarget,
         pendingInvitation,
@@ -583,12 +626,16 @@ export async function loadMobileRuntime(
                 call("plugin:gaugedesk-device-identity|clear_machine_credential"),
             );
         },
-        storeAccountToken: async (idToken) => {
+        storeAccountToken: async (idToken, expectedAccount) => {
+            const account = await accountForToken(idToken);
+            if (expectedAccount && account !== expectedAccount) {
+                throw new Error("The renewed session belongs to a different account");
+            }
             await boundedNativeCall(
                 "Saving the account session",
                 call(
                     "plugin:gaugedesk-device-identity|store_account_session",
-                    { payload: { idToken } },
+                    { payload: { account, idToken } },
                 ),
             );
         },
@@ -597,6 +644,18 @@ export async function loadMobileRuntime(
                 "Clearing the account session",
                 call("plugin:gaugedesk-device-identity|clear_account_session"),
             );
+        },
+        selectAccount: async (account) => {
+            const answer = await boundedNativeCall(
+                "Selecting the account",
+                call<NativeAccountSessionResponse>(
+                    "plugin:gaugedesk-device-identity|select_account_session",
+                    { payload: { account } },
+                ),
+            );
+            if (answer.selected !== account || !answer.idToken) {
+                throw new Error("The selected account session is unavailable");
+            }
         },
     };
 }

@@ -255,19 +255,33 @@ describe("mobile runtime enrollment", () => {
                 return { version: 1, credentials };
             }
             if (command.endsWith("get_account_session")) {
-                return { idToken: "header.payload.signature" };
+                return {
+                    idToken: "opaque-account-session",
+                    selected: "account:one",
+                    accounts: [{ account: "account:one" }, { account: "account:two" }],
+                };
             }
             if (command.endsWith("get_launch_url")) return { url: null };
             if (command.endsWith("clear_account_session")) return null;
+            if (command.endsWith("select_account_session")) {
+                return { idToken: "other-session", selected: "account:two", accounts: [] };
+            }
             throw new Error(`unexpected command: ${command}`);
         });
 
         const runtime = await loadMobileRuntime(call as never);
+        expect(runtime.accountId).toBe("account:one");
+        expect(runtime.retainedAccounts).toEqual(["account:one", "account:two"]);
+        await runtime.selectAccount("account:two");
         await runtime.clearAccountToken();
 
         expect(runtime.credentials).toEqual(credentials);
         expect(call).toHaveBeenCalledWith(
             "plugin:gaugedesk-device-identity|clear_account_session",
+        );
+        expect(call).toHaveBeenCalledWith(
+            "plugin:gaugedesk-device-identity|select_account_session",
+            { payload: { account: "account:two" } },
         );
         expect(
             call.mock.calls.some(([command]) =>
@@ -275,6 +289,97 @@ describe("mobile runtime enrollment", () => {
                 || String(command).includes("clear_machine_credential"),
             ),
         ).toBe(false);
+    });
+
+    it("migrates a legacy opaque token only after the Hub identifies its account", async () => {
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        vi.stubGlobal("localStorage", { getItem: () => null });
+        vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+            expect(new Headers(init.headers).get("authorization"))
+                .toBe("Bearer legacy-opaque-session");
+            return new Response(JSON.stringify({ account: "account:original" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            });
+        }));
+        const call = vi.fn(async (command: string) => {
+            if (command.endsWith("get_identity")) {
+                return { id: "device:native", publicKey: "02abcdef", algorithm: "ES256" };
+            }
+            if (command.endsWith("list_machine_credentials")) {
+                return { version: 1, credentials: [] };
+            }
+            if (command.endsWith("get_account_session")) {
+                return { idToken: "legacy-opaque-session" };
+            }
+            if (command.endsWith("get_launch_url")) return { url: null };
+            if (command.endsWith("store_account_session")) return null;
+            throw new Error(`unexpected command: ${command}`);
+        });
+
+        const runtime = await loadMobileRuntime(call as never);
+        expect(runtime.accountId).toBe("account:original");
+        expect(runtime.retainedAccounts).toEqual(["account:original"]);
+        expect(call).toHaveBeenCalledWith(
+            "plugin:gaugedesk-device-identity|store_account_session",
+            { payload: { account: "account:original", idToken: "legacy-opaque-session" } },
+        );
+    });
+
+    it("refuses a renewed token for a different selected account before saving it", async () => {
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        vi.stubGlobal("localStorage", { getItem: () => null });
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(
+            JSON.stringify({ account: "account:two" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+        )));
+        const call = vi.fn(async (command: string) => {
+            if (command.endsWith("get_identity")) {
+                return { id: "device:native", publicKey: "02abcdef", algorithm: "ES256" };
+            }
+            if (command.endsWith("list_machine_credentials")) {
+                return { version: 1, credentials: [] };
+            }
+            if (command.endsWith("get_account_session")) {
+                return { idToken: "session-one", selected: "account:one", accounts: [{ account: "account:one" }] };
+            }
+            if (command.endsWith("get_launch_url")) return { url: null };
+            throw new Error(`unexpected command: ${command}`);
+        });
+        const runtime = await loadMobileRuntime(call as never);
+        await expect(runtime.storeAccountToken("session-two", "account:one"))
+            .rejects.toThrow("different account");
+        expect(call.mock.calls.some(([command]) =>
+            String(command).endsWith("store_account_session"))).toBe(false);
+    });
+
+    it("keeps an unidentified legacy session out of protected account caches", async () => {
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        vi.stubGlobal("localStorage", { getItem: () => null });
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(
+            JSON.stringify({ error: "this bearer is not recognised" }),
+            { status: 401, headers: { "content-type": "application/json" } },
+        )));
+        const call = vi.fn(async (command: string) => {
+            if (command.endsWith("get_identity")) {
+                return { id: "device:native", publicKey: "02abcdef", algorithm: "ES256" };
+            }
+            if (command.endsWith("list_machine_credentials")) {
+                return { version: 1, credentials: [] };
+            }
+            if (command.endsWith("get_account_session")) {
+                return { idToken: "unidentified-legacy-session" };
+            }
+            if (command.endsWith("get_launch_url")) return { url: null };
+            throw new Error(`unexpected command: ${command}`);
+        });
+
+        const runtime = await loadMobileRuntime(call as never);
+        expect(runtime.accountToken).toBe("unidentified-legacy-session");
+        expect(runtime.accountId).toBeNull();
+        expect(runtime.retainedAccounts).toEqual([]);
+        expect(call.mock.calls.some(([command]) =>
+            String(command).endsWith("store_account_session"))).toBe(false);
     });
 
     it("bounds native bridge calls instead of leaving the app loading forever", async () => {

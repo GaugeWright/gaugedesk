@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
-import { accountDevices, accountDirectory, parseAccountDevice } from "./control-plane-account";
+import { accountDevices, accountDirectory, hubSessionSelectLocal, parseAccountDevice } from "./control-plane-account";
 import type { RouteJson } from "./control-plane-transport";
+
+describe("explicit local desktop posture", () => {
+    it("requires the server to confirm local mode before returning to the owner Home", async () => {
+        const selected = vi.fn(async () => ({ available: true, linked: false, local: true })) as unknown as RouteJson;
+        await expect(hubSessionSelectLocal(selected)).resolves.toMatchObject({
+            linked: false, local: true, localChoiceRequired: false,
+        });
+        expect(selected).toHaveBeenCalledWith("POST", "/account/hub-session/select-local", {});
+        const refused = vi.fn(async () => ({ available: true, linked: false })) as unknown as RouteJson;
+        await expect(hubSessionSelectLocal(refused)).rejects.toThrow("not selected");
+    });
+});
 
 describe("the account directory projection (DESK-5f)", () => {
     it("reads which root signs the record and where it lives", async () => {

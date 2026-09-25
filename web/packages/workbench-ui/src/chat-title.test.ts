@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { displayChatTitle, isPlaceholderTitle, PLACEHOLDER_TITLES, titleFromPrompt, untitledTag } from "./chat-title";
+import { displayChatTitle, isPlaceholderTitle, PLACEHOLDER_TITLES, untitledTag } from "./chat-title";
 
 describe("chat-title", () => {
     it("recognises every system placeholder, case-insensitively", () => {
@@ -55,34 +55,5 @@ describe("untitledTag (stable per-chat disambiguator, round-11 #6)", () => {
     it("tolerates a missing id and the chat:/chat- prefixes", () => {
         expect(untitledTag(null)).toBe("");
         expect(untitledTag("chat:abcd")).toBe("ABCD");
-    });
-});
-
-describe("titleFromPrompt (auto-title from the first message, #4)", () => {
-    it("collapses whitespace to a single trimmed line", () => {
-        expect(titleFromPrompt("  draft   a\n tagline  ")).toBe("draft a tagline");
-    });
-
-    it("returns empty for a blank prompt (caller skips titling)", () => {
-        expect(titleFromPrompt("")).toBe("");
-        expect(titleFromPrompt("   \n  ")).toBe("");
-    });
-
-    it("keeps a short prompt verbatim", () => {
-        expect(titleFromPrompt("draft a spring campaign tagline")).toBe("draft a spring campaign tagline");
-    });
-
-    it("truncates a long prompt to 48 chars with an ellipsis", () => {
-        const long = "a".repeat(60);
-        const out = titleFromPrompt(long);
-        expect(out.endsWith("…")).toBe(true);
-        expect([...out].length).toBe(48); // 47 chars + the ellipsis
-    });
-
-    it("trims trailing space before the ellipsis when the cut lands on a space", () => {
-        const prompt = `${"word ".repeat(20)}`; // many short words
-        const out = titleFromPrompt(prompt);
-        expect(out).not.toMatch(/ …$/);
-        expect(out.endsWith("…")).toBe(true);
     });
 });

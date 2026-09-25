@@ -86,6 +86,10 @@ export function accountTokenExpiresWithin(
     windowSeconds: number,
     nowSeconds = Date.now() / 1_000,
 ): boolean {
+    // Native Hub account sessions are opaque. No client claim describes their
+    // expiry; the Hub and each Home reject them when revoked or expired. Do
+    // not erase one on startup merely because it is not a JWT.
+    if (token.split(".").length !== 3) return false;
     try {
         const payload = token.split(".")[1];
         if (!payload) return true;

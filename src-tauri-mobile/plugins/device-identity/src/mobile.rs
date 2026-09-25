@@ -7,7 +7,7 @@ use tauri::{
 use crate::{
     AccountSessionResponse, ChallengeSignature, DeviceIdentity, LaunchUrlResponse,
     MachineCredentialRegistryResponse, MachineCredentialResponse, RemoveMachineCredentialRequest,
-    SignChallengeRequest, StoreAccountSessionRequest, StoreMachineCredentialRequest,
+    SelectAccountSessionRequest, SignChallengeRequest, StoreAccountSessionRequest, StoreMachineCredentialRequest,
 };
 
 #[cfg(target_os = "ios")]
@@ -110,6 +110,16 @@ impl<R: Runtime> DeviceIdentityPlugin<R> {
     pub async fn get_account_session(&self) -> crate::Result<AccountSessionResponse> {
         self.0
             .run_mobile_plugin_async("getAccountSession", ())
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn select_account_session(
+        &self,
+        payload: SelectAccountSessionRequest,
+    ) -> crate::Result<AccountSessionResponse> {
+        self.0
+            .run_mobile_plugin_async("selectAccountSession", payload)
             .await
             .map_err(Into::into)
     }

@@ -6,6 +6,9 @@ import { describe, expect, it } from "vitest";
 import {
     handoffCodeFromPaste,
     hubSessionCallback,
+    hubSessionAccounts,
+    hubSessionReach,
+    hubSessionSelect,
     hubSessionStart,
     hubSessionStatus,
     parseNativeHandoffCode,
@@ -88,6 +91,8 @@ describe("hub session wrappers", () => {
         expect(status).toEqual({
             available: true,
             linked: true,
+            local: false,
+            localChoiceRequired: false,
             person: "alice",
             // No label from an older control plane: the subject stands in.
             label: "alice",
@@ -101,6 +106,8 @@ describe("hub session wrappers", () => {
         expect(empty).toEqual({
             available: false,
             linked: false,
+            local: false,
+            localChoiceRequired: false,
             person: null,
             label: null,
             expires: null,
@@ -151,5 +158,55 @@ describe("hub session wrappers", () => {
         await hubSessionCallback(jsonReturning({ linked: true, available: true }, calls), "c0de");
         expect(calls[0].path).toBe("/account/hub-session/callback");
         expect(calls[0].body).toEqual({ code: "c0de" });
+    });
+
+    it("lists retained accounts without credentials and selects an exact live session", async () => {
+        const calls: Array<{ path: string; body?: unknown }> = [];
+        const roster = await hubSessionAccounts(jsonReturning({
+            selected: "alice",
+            accounts: [
+                { person: "alice", label: "Alice", expired: false },
+                { person: "bob", expired: true },
+            ],
+        }, calls));
+        expect(roster).toEqual({
+            selected: "alice",
+            accounts: [
+                { person: "alice", label: "Alice", expired: false },
+                { person: "bob", label: "bob", expired: true },
+            ],
+        });
+        expect(calls[0]).toEqual({ path: "/account/hub-sessions", body: undefined });
+
+        const selected = await hubSessionSelect(jsonReturning({
+            available: true, linked: true, person: "bob", expired: false,
+        }, calls), "bob");
+        expect(selected.person).toBe("bob");
+        expect(calls[1]).toEqual({ path: "/account/hub-session/select", body: { person: "bob" } });
+        await expect(hubSessionSelect(jsonReturning({ linked: true, person: "alice" }, []), "bob"))
+            .rejects.toThrow("unavailable");
+    });
+
+    it("uses only verified native routes for relay pins", async () => {
+        const relay = {
+            endpoint: "wss://relay.example.test",
+            handle: "a".repeat(43),
+            proof: "b".repeat(43),
+            route_epoch: 1,
+            home_fingerprint: "ab".repeat(32),
+        };
+        const reach = await hubSessionReach(jsonReturning({
+            person: "alice",
+            homes: { homes: [] },
+            routes: { routes: [
+                { project: "direct", home_id: "home:one", endpoint: "https://home.example.test" },
+                { project: "unsigned", home_id: "home:two", relay },
+            ] },
+            signed_routes: { routes: [
+                { project: "signed", home_id: "home:three", relay },
+            ] },
+        }, []));
+        expect(reach.routes.map((route) => route.project)).toEqual(["direct", "signed"]);
+        expect(reach.routes[1]?.relay?.homeFingerprint).toBe("ab".repeat(32));
     });
 });

@@ -5,6 +5,12 @@ const COMMANDS: &[&str] = &[
     "store_machine_credential",
     "get_machine_credential",
     "clear_machine_credential",
+    "list_machine_credentials",
+    "remove_machine_credential",
+    "store_account_session",
+    "get_account_session",
+    "select_account_session",
+    "clear_account_session",
 ];
 
 fn main() {

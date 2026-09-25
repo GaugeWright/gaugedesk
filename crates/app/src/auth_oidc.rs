@@ -168,6 +168,11 @@ pub struct EnterpriseSamlStartRequest {
     pub public_base: String,
     pub native_return: Option<String>,
     pub native_handoff_challenge: Option<String>,
+    /// Captured on the initiating request. A cross-site SAML POST cannot carry
+    /// SameSite=Lax cookies back to the ACS, so the RelayState keeps this
+    /// browser's prior account choice server-side until assertion verification.
+    pub browser_wallet: Option<crate::secret::Secret>,
+    pub browser_session: Option<crate::secret::Secret>,
 }
 
 /// Enterprise-owned SAML protocol launcher registered into the shared account
@@ -501,6 +506,11 @@ pub fn auth_routes(state: AuthShellState) -> axum::Router<SharedWorkbench> {
         // Safe current-session projection for the Account menu. This is not a
         // linked-method or recovery/custody declaration.
         .route("/auth/session", get(get_session))
+        .route("/auth/browser-accounts", get(get_browser_accounts))
+        .route(
+            "/auth/browser-accounts/select",
+            post(post_browser_account_select),
+        )
         // Session refresh (ADR 0077): a still-valid session mints a fresh id-token
         // cookie from the stored refresh token, so a hosted session outlives the
         // ~1h id-token without re-login.
@@ -805,6 +815,7 @@ impl AuthShellState {
     pub fn deliver_enterprise_login(
         &self,
         wb: &SharedWorkbench,
+        headers: &HeaderMap,
         delivery: EnterpriseLoginDelivery,
     ) -> axum::response::Response {
         let EnterpriseLoginDelivery {
@@ -887,7 +898,19 @@ impl AuthShellState {
                 .filter(|url| !url.trim().is_empty())
                 .unwrap_or_else(|| "/".to_owned());
             let mut response = Redirect::to(&post_login).into_response();
+            let wallet = crate::browser_wallet::retain_login(
+                &mut wb.lock_unpoisoned(),
+                headers,
+                &account_id,
+                &display_label,
+                &token,
+            );
+            let wallet = match wallet {
+                Ok(wallet) => wallet,
+                Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+            };
             append_session_cookies(&mut response, &token);
+            crate::browser_wallet::append_wallet_cookie(&mut response, Some(&wallet));
             return response;
         }
 
@@ -2171,6 +2194,49 @@ pub async fn get_session(
         .into_response()
 }
 
+/// The browser receives labels and an account choice only; retained session
+/// credentials remain sealed in the Hub and never enter JavaScript.
+pub async fn get_browser_accounts(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !web_account_mode() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match crate::browser_wallet::roster(&wb.lock_unpoisoned(), &headers) {
+        Ok(roster) => Json(roster).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct BrowserAccountSelection {
+    person: String,
+}
+
+/// Select one retained browser session. The normal account cookie remains the
+/// sole authority on all project, agent, and Home routes.
+pub async fn post_browser_account_select(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    Json(selection): Json<BrowserAccountSelection>,
+) -> impl IntoResponse {
+    if !web_account_mode() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let selected =
+        crate::browser_wallet::select(&mut wb.lock_unpoisoned(), &headers, &selection.person);
+    match selected {
+        Ok((token, wallet)) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            append_session_cookies(&mut response, &token);
+            crate::browser_wallet::append_wallet_cookie(&mut response, Some(&wallet));
+            response
+        }
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
+
 /// The shared web-account session cookie (`ADR 0077`) carrying an opaque account session or a
 /// verified legacy OIDC id-token (either credential is accepted by `net_http::bearer`). Pure;
 /// the env wrapper is [`session_cookie_header`]. `domain` (e.g. `.gaugewright.com`) makes one sign-in
@@ -2474,6 +2540,10 @@ async fn begin_enterprise_browser_login(
                 public_base: request_public_base(headers),
                 native_return,
                 native_handoff_challenge,
+                browser_wallet: crate::browser_wallet::wallet_cookie(headers)
+                    .map(crate::secret::Secret::new),
+                browser_session: crate::net_http::session_cookie(headers)
+                    .map(crate::secret::Secret::new),
             };
             match auth.begin_enterprise_saml(request) {
                 Ok(url) => Redirect::to(&url).into_response(),
@@ -2596,7 +2666,9 @@ pub async fn get_login(
     {
         let bearer = crate::net_http::bearer(&headers).map(str::to_string);
         let actor = wb.lock_unpoisoned().actor(bearer.as_deref());
-        if login_ceremony_skippable(web_account_mode(), native_return.is_some(), &actor) {
+        if query.select_account.as_deref() != Some("1")
+            && login_ceremony_skippable(web_account_mode(), native_return.is_some(), &actor)
+        {
             let post_login = gaugedesk_env::var("OIDC_POST_LOGIN_URL")
                 .filter(|u| !u.trim().is_empty())
                 .unwrap_or_else(|| "/".to_string());
@@ -4061,6 +4133,7 @@ pub async fn get_callback(
                     .unwrap_or_else(|| now_ms.saturating_add(60 * 60 * 1000));
                 return auth.deliver_enterprise_login(
                     &wb,
+                    &headers,
                     EnterpriseLoginDelivery {
                         login_context: context.clone(),
                         resolution,
@@ -4311,7 +4384,23 @@ pub async fn get_callback(
             .unwrap_or_else(|| "/".to_string());
         let mut resp = Redirect::to(&post_login).into_response();
         if let Some(token) = &account_session_token {
+            let wallet = {
+                let mut guard = wb.lock_unpoisoned();
+                let label = id_token_display_label(&id_token).unwrap_or_else(|| account_id.clone());
+                crate::browser_wallet::retain_login(
+                    &mut guard,
+                    &headers,
+                    &account_id,
+                    &label,
+                    token,
+                )
+            };
+            let wallet = match wallet {
+                Ok(wallet) => wallet,
+                Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+            };
             append_session_cookies(&mut resp, token);
+            crate::browser_wallet::append_wallet_cookie(&mut resp, Some(&wallet));
         }
         return resp;
     }
@@ -4758,7 +4847,29 @@ pub async fn post_logout(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let bearer = crate::net_http::bearer(&headers).map(str::to_string);
+    // Logout is cookie scoped. A stale JavaScript bearer must never revoke a
+    // different account than the one this browser has selected.
+    let bearer = crate::net_http::session_cookie(&headers)
+        .or_else(|| crate::net_http::bearer(&headers))
+        .map(str::to_string);
+    let mut wallet_after_logout = None;
+    if web_account_mode() {
+        let mut guard = wb.lock_unpoisoned();
+        if crate::browser_wallet::wallet_cookie(&headers).is_some() {
+            if let Some(person) = bearer
+                .as_deref()
+                .and_then(|token| guard.resolve_account_session(token))
+                .map(|(id, _)| id)
+            {
+                match crate::browser_wallet::forget(&mut guard, &headers, &person) {
+                    Ok((wallet, _)) => wallet_after_logout = Some(wallet),
+                    Err(error) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+                    }
+                }
+            }
+        }
+    }
     if let Some(token) = &bearer {
         let mut g = wb.lock_unpoisoned();
         // Resolve the caller's person and this session's id BEFORE revoking, so the
@@ -4796,6 +4907,9 @@ pub async fn post_logout(
             resp.headers_mut()
                 .append(axum::http::header::SET_COOKIE, cookie);
         }
+    }
+    if let Some(wallet) = wallet_after_logout {
+        crate::browser_wallet::append_wallet_cookie(&mut resp, wallet.as_deref());
     }
     resp
 }
@@ -5677,6 +5791,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         let auth = AuthShellState::new();
         let response = auth.deliver_enterprise_login(
             &shared,
+            &HeaderMap::new(),
             EnterpriseLoginDelivery {
                 login_context: PendingEnterpriseLogin {
                     store_scope: "org::organization:acme".into(),

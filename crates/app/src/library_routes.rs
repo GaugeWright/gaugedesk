@@ -1606,6 +1606,13 @@ pub async fn rename_chat(
     Path(id): Path<String>,
     Json(body): Json<RenameChat>,
 ) -> impl IntoResponse {
+    if crate::chat_title::is_system_title(&body.title) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "choose a title other than the system placeholder" })),
+        )
+            .into_response();
+    }
     let mut wb = wb.lock_unpoisoned();
     let Some(updated) = wb.rename_chat_record(&id, body.title) else {
         return (

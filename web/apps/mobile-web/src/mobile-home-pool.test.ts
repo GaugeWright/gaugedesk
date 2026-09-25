@@ -230,10 +230,11 @@ describe("mobile account refresh timing", () => {
         return `header.${encoded}.signature`;
     };
 
-    it("refreshes before expiry and rejects malformed expiry as stale", () => {
+    it("refreshes JWTs before expiry and leaves opaque Hub expiry to the server", () => {
         expect(accountTokenExpiresWithin(token(2_000), 300, 1_800)).toBe(true);
         expect(accountTokenExpiresWithin(token(2_000), 100, 1_800)).toBe(false);
-        expect(accountTokenExpiresWithin("not-a-token", 100, 1_800)).toBe(true);
+        expect(accountTokenExpiresWithin("opaque-hub-session", 100, 1_800)).toBe(false);
+        expect(accountTokenExpiresWithin("header.!!!.signature", 100, 1_800)).toBe(true);
     });
 });
 

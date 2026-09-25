@@ -152,6 +152,7 @@ export class HomePool<Api> {
     private routes = new Map<ProjectId, OpaqueHomeRoute>();
     private readonly connections = new Map<HomeId, MutableHomeConnection<Api>>();
     private readonly pending = new Map<HomeId, Promise<MutableHomeConnection<Api>>>();
+    private epoch = 0;
     private readonly maxConnections: number;
     private readonly idleMs: number;
     private readonly now: () => number;
@@ -330,6 +331,9 @@ export class HomePool<Api> {
     }
 
     async closeAll(): Promise<void> {
+        // An admission already in flight must never repopulate a pool being
+        // discarded for another selected account.
+        this.epoch++;
         await Promise.all(
             [...this.connections.keys()].map((homeId) => this.disconnect(homeId)),
         );
@@ -337,6 +341,7 @@ export class HomePool<Api> {
     }
 
     private async admit(route: OpaqueHomeRoute): Promise<MutableHomeConnection<Api>> {
+        const epoch = this.epoch;
         // Fast path stays synchronous when the bearer is present (the common case):
         // only a missing bearer waits for the reload rehydration, so admission timing
         // is unchanged for an already-signed-in caller.
@@ -350,6 +355,7 @@ export class HomePool<Api> {
         };
         const routeKey = opaqueHomeRouteKey(route);
         const endpoint = await this.resolveEndpoint(route);
+        if (epoch !== this.epoch) throw new Error("Home connection closed during admission");
         const json = this.makeRouteJson(endpoint, auth, route);
         const result = (await json("POST", "/home/admissions")) as {
             home?: unknown;
@@ -365,6 +371,10 @@ export class HomePool<Api> {
             throw new Error(`Home identity mismatch: expected ${route.homeId}`);
         }
         admission = result.admission;
+        if (epoch !== this.epoch) {
+            await json("DELETE", "/home/admissions").catch(() => undefined);
+            throw new Error("Home connection closed during admission");
+        }
         const current = this.routes.get(route.project);
         if (
             !current

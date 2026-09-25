@@ -2,6 +2,61 @@
 
 use crate::{federation, open_control_plane, open_workbench, LockUnpoisoned};
 
+/// The window's loopback port is an operator channel for local work, but an
+/// account selected in that window cannot inherit the co-resident Home owner's
+/// operator authority. The relay uses its own listener and its own admission.
+pub(crate) fn desktop_operator_plane(wb: crate::SharedWorkbench) -> axum::Router {
+    let home_broker = axum::Router::new()
+        .route(
+            "/account/hub-session/home/{home}/{*path}",
+            axum::routing::any(crate::account_signin::proxy_selected_home),
+        )
+        .with_state(wb.clone());
+    open_control_plane(wb.clone())
+        .merge(home_broker)
+        .layer(axum::Extension(crate::account_signin::DesktopOperatorPlane))
+        .layer(axum::middleware::from_fn_with_state(
+            wb,
+            selected_account_guard,
+        ))
+}
+
+async fn selected_account_guard(
+    axum::extract::State(wb): axum::extract::State<crate::SharedWorkbench>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = request.uri().path();
+    // Sign-in and the hosted Account Settings proxy use only the selected
+    // account's sealed Hub session. No Home data or local credential is served
+    // through these exact surfaces.
+    if request.method() == axum::http::Method::OPTIONS
+        || path == "/health"
+        || path.starts_with("/account/hub-session")
+        || path.starts_with("/gaugeapps/account-settings/")
+        || path.starts_with("/auth/")
+    {
+        return next.run(request).await;
+    }
+    let selected = crate::account_signin::live_hub_session_actor(&wb);
+    let owner = wb.lock_unpoisoned().home_owner_account();
+    if (selected.is_some() && selected != owner)
+        || (owner.is_some()
+            && selected.is_none()
+            && !crate::account_signin::local_operator_selected(&wb))
+    {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "the selected account has no admission to this local Home"
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 /// Resolve the directory the open control plane roots its decision and workspace stores in.
 pub fn open_control_plane_root() -> std::path::PathBuf {
     if let Some(root) = gaugedesk_env::var_os("ROOT") {
@@ -63,7 +118,7 @@ pub async fn open_serve_workbench(
     // header is preferred when present.
     axum::serve(
         listener,
-        open_control_plane(wb).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        desktop_operator_plane(wb).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
 }

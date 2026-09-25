@@ -24,16 +24,17 @@ use std::io::Read as _;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, State};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio_stream::StreamExt;
 
 use crate::account::ACCOUNT_SCOPE;
 use crate::net_http::HttpClient;
@@ -44,6 +45,10 @@ use crate::{LockUnpoisoned, SharedWorkbench};
 /// HttpOnly cookie or explicit bearer instead.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeAccountPlane;
+
+/// The local window's operator listener, distinct from a hosted Home or Hub.
+#[derive(Clone, Copy, Debug)]
+pub struct DesktopOperatorPlane;
 
 /// Exact native aliases for the hosted Account Settings GaugeApp. The browser
 /// calls the ordinary product paths; this co-resident boundary attaches the
@@ -110,9 +115,19 @@ pub fn gaugeapp_proxy_routes() -> Router<SharedWorkbench> {
         )
 }
 
-/// Latest-wins record family holding the sealed Hub session in the account scope.
+/// Legacy single-session record, read until the first additional sign-in or
+/// selection migrates it. Never reinterpret its fixed id as an account id.
 const RECORD_KIND: &str = "hub-session";
 const RECORD_ID: &str = "session";
+/// One sealed session per person. A tombstone clears only that person's local
+/// session; selecting another account cannot overwrite its credential.
+const ACCOUNT_SESSION_KIND: &str = "hub-session-account";
+/// The selected account is separate from session custody. Empty means that no
+/// retained account is active, including after signing out of the selected one.
+const SELECTED_KIND: &str = "hub-session-selected";
+const SELECTED_ID: &str = "selected";
+const LOCAL_SELECTION: &str = "@local";
+const DIRECTORY_ROOT_PIN_KIND: &str = "hub_directory_root_pin";
 /// Latest-wins record family holding the one in-flight sign-in's sealed PKCE
 /// verifier, so it survives the restart that the browser leg invites (DR-0198).
 const RECORD_KIND_PENDING: &str = "hub-signin-pending";
@@ -154,6 +169,23 @@ struct AccountAuthorityResponse {
     content_type: Option<String>,
     cache_control: Option<String>,
     reader: Box<dyn std::io::Read + Send + Sync + 'static>,
+}
+
+struct RelayCarrierReader {
+    inner: Box<dyn std::io::Read + Send + Sync + 'static>,
+    carrier: tokio::task::AbortHandle,
+}
+
+impl std::io::Read for RelayCarrierReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+impl Drop for RelayCarrierReader {
+    fn drop(&mut self) {
+        self.carrier.abort();
+    }
 }
 
 fn open_account_authority_request(
@@ -226,6 +258,7 @@ pub async fn proxy_account_authority(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let revision = selected_revision(wb);
     let Some(hub) = hub_base() else {
         return (
             StatusCode::CONFLICT,
@@ -233,21 +266,32 @@ pub async fn proxy_account_authority(
         )
             .into_response();
     };
-    let Some(bearer) = hub_session_token(wb) else {
+    let Some(record) = latest_session(wb).filter(|record| record.expires > now_ms()) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "sign in to access Account Settings" })),
         )
             .into_response();
     };
+    let fence = SelectionFence::new(wb, record.person, revision);
+    let Some(bearer) = hub_session_token(wb).filter(|_| fence.is_current()) else {
+        return StatusCode::CONFLICT.into_response();
+    };
     let url = format!("{hub}{path_and_query}");
     let forwarded = forwarded_account_headers(&headers);
     let method_name = method.as_str().to_owned();
+    let dispatch_fence = fence.clone();
     let response = tokio::task::spawn_blocking(move || {
+        if !dispatch_fence.is_current() {
+            return Err("account selection changed before dispatch".to_string());
+        }
         open_account_authority_request(&method_name, &url, &bearer, &forwarded, &body)
     })
     .await;
-    let mut response = match response {
+    if !fence.is_current() {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let response = match response {
         Ok(Ok(response)) => response,
         Ok(Err(message)) => {
             return (StatusCode::BAD_GATEWAY, Json(json!({ "error": message }))).into_response()
@@ -260,12 +304,46 @@ pub async fn proxy_account_authority(
                 .into_response()
         }
     };
+    finish_proxy_response(response, false, Some(fence)).await
+}
+
+#[derive(Clone)]
+struct SelectionFence {
+    wb: SharedWorkbench,
+    person: String,
+    revision: usize,
+}
+
+impl SelectionFence {
+    fn new(wb: &SharedWorkbench, person: String, revision: usize) -> Self {
+        Self {
+            wb: wb.clone(),
+            person,
+            revision,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        selected_revision(&self.wb) == self.revision
+            && live_hub_session_actor(&self.wb).as_deref() == Some(self.person.as_str())
+    }
+}
+
+async fn finish_proxy_response(
+    mut response: AccountAuthorityResponse,
+    stream_all: bool,
+    fence: Option<SelectionFence>,
+) -> Response {
+    if fence.as_ref().is_some_and(|fence| !fence.is_current()) {
+        return StatusCode::CONFLICT.into_response();
+    }
     let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = response.content_type.take();
     let cache_control = response.cache_control.take();
-    let stream = content_type
-        .as_deref()
-        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let stream = stream_all
+        || content_type
+            .as_deref()
+            .is_some_and(|value| value.starts_with("text/event-stream"));
     let body = if stream {
         let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
         tokio::task::spawn_blocking(move || {
@@ -289,9 +367,11 @@ pub async fn proxy_account_authority(
                 }
             }
         });
-        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+        let stream = tokio_stream::wrappers::ReceiverStream::new(receiver)
+            .take_while(move |_| fence.as_ref().is_none_or(SelectionFence::is_current));
+        Body::from_stream(stream)
     } else {
-        match tokio::task::spawn_blocking(move || {
+        let bytes = match tokio::task::spawn_blocking(move || {
             let mut bytes = Vec::new();
             response
                 .reader
@@ -301,7 +381,7 @@ pub async fn proxy_account_authority(
         })
         .await
         {
-            Ok(Ok(bytes)) if bytes.len() <= 8 * 1024 * 1024 => Body::from(bytes),
+            Ok(Ok(bytes)) if bytes.len() <= 8 * 1024 * 1024 => bytes,
             _ => {
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -309,7 +389,11 @@ pub async fn proxy_account_authority(
                 )
                     .into_response()
             }
+        };
+        if fence.as_ref().is_some_and(|fence| !fence.is_current()) {
+            return StatusCode::CONFLICT.into_response();
         }
+        Body::from(bytes)
     };
     let mut builder = Response::builder().status(status);
     if let Some(value) = content_type.as_deref() {
@@ -339,6 +423,416 @@ async fn proxy_account_gaugeapp(
         .map(|value| value.as_str().to_owned())
         .unwrap_or_else(|| uri.path().to_owned());
     proxy_account_authority(&wb, method, path, headers, body).await
+}
+
+#[derive(Deserialize)]
+pub struct HomeProxyPath {
+    home: String,
+    path: String,
+}
+
+/// A co-resident desktop's selected account reaches one of its admitted
+/// Homes through this local broker. The webview names only a Home id and work
+/// path. The broker resolves the endpoint from the selected account's Hub
+/// projection and presents its sealed bearer. The webview keeps only the
+/// Home's short-lived admission in memory, as the browser Home pool does; the
+/// Home requires both that admission and the selected bearer on every work
+/// request. The Hub bearer never reaches the UI.
+pub async fn proxy_selected_home(
+    State(wb): State<SharedWorkbench>,
+    Path(route): Path<HomeProxyPath>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if crate::auth_oidc::web_account_mode() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let revision = selected_revision(&wb);
+    let Some(hub) = hub_base() else {
+        return (StatusCode::CONFLICT, "account sign-in is not configured").into_response();
+    };
+    let Some(record) = latest_session(&wb).filter(|record| record.expires > now_ms()) else {
+        return (StatusCode::UNAUTHORIZED, "sign in to reach a Home").into_response();
+    };
+    let Some(bearer) = hub_session_token(&wb) else {
+        return (StatusCode::UNAUTHORIZED, "sign in to reach a Home").into_response();
+    };
+    let raw_path = uri.path();
+    let prefix = "/account/hub-session/home/";
+    let Some((_, suffix)) = raw_path
+        .strip_prefix(prefix)
+        .and_then(|tail| tail.split_once('/'))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if route.home.is_empty()
+        || route.path.is_empty()
+        || suffix.starts_with('/')
+        || route.path.starts_with("auth/")
+        || route.path.starts_with("account/hub-session/")
+        || route
+            .path
+            .split('/')
+            .any(|segment| matches!(segment, "." | ".."))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let target_path = match uri.query() {
+        Some(query) => format!("/{suffix}?{query}"),
+        None => format!("/{suffix}"),
+    };
+    let mut forwarded = forwarded_account_headers(&headers);
+    if let Some(admission) = headers
+        .get(crate::home_admission::HOME_ADMISSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| crate::home_admission::HomeAdmissionToken::parse(value).is_some())
+    {
+        forwarded.push((
+            crate::home_admission::HOME_ADMISSION_HEADER.to_string(),
+            admission.to_string(),
+        ));
+    }
+    let home = route.home;
+    let method_name = method.as_str().to_owned();
+    let request = HomeProxyRequest {
+        hub,
+        bearer,
+        home,
+        target_path,
+        method: method_name,
+        headers: forwarded,
+        body,
+        selected_person: record.person,
+        selected_revision: revision,
+    };
+    let fence = SelectionFence {
+        wb: wb.clone(),
+        person: request.selected_person.clone(),
+        revision,
+    };
+    let resolver_wb = wb.clone();
+    let resolver_hub = request.hub.clone();
+    let cache_hub = request.hub.clone();
+    let resolver_bearer = request.bearer.clone();
+    let resolver_home = request.home.clone();
+    let resolver_person = request.selected_person.clone();
+    let transport = tokio::task::spawn_blocking(move || {
+        selected_home_transport(
+            &resolver_wb,
+            &resolver_hub,
+            &resolver_bearer,
+            &resolver_home,
+            &resolver_person,
+        )
+    })
+    .await;
+    let transport = match transport {
+        Ok(Ok(transport)) => transport,
+        Ok(Err(error)) => {
+            return (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response()
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if !fence.is_current() {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let (endpoint, carrier) = match transport {
+        SelectedHomeTransport::Direct(endpoint) => (endpoint, None),
+        SelectedHomeTransport::Relay(route) => {
+            match gaugedesk_relay_transport::bind_client_loopback(route).await {
+                Ok((address, carrier)) => {
+                    (format!("http://{address}"), Some(carrier.abort_handle()))
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({ "error": format!("could not open Home relay: {error}") })),
+                    )
+                        .into_response()
+                }
+            }
+        }
+    };
+    let result =
+        tokio::task::spawn_blocking(move || open_selected_home_request_at(&wb, request, &endpoint))
+            .await;
+    if !fence.is_current() {
+        if let Some(carrier) = carrier {
+            carrier.abort();
+        }
+        return StatusCode::CONFLICT.into_response();
+    }
+    match result {
+        Ok(Ok(mut response)) => {
+            if let Some(carrier) = carrier {
+                response.reader = Box::new(RelayCarrierReader {
+                    inner: response.reader,
+                    carrier,
+                });
+            }
+            finish_proxy_response(response, true, Some(fence)).await
+        }
+        Ok(Err(message)) => {
+            let stale_relay =
+                carrier.is_some() && message.starts_with("account authority transport:");
+            let message = if stale_relay {
+                invalidate_signed_route_cache(&fence.wb, &cache_hub, &fence.person);
+                format!("stale Home relay route: {message}")
+            } else {
+                message
+            };
+            if let Some(carrier) = carrier {
+                carrier.abort();
+            }
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": message }))).into_response()
+        }
+        Err(_) => {
+            if let Some(carrier) = carrier {
+                carrier.abort();
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, "Home broker task failed").into_response()
+        }
+    }
+}
+
+struct HomeProxyRequest {
+    hub: String,
+    bearer: String,
+    home: String,
+    target_path: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+    selected_person: String,
+    selected_revision: usize,
+}
+
+#[cfg(test)]
+fn open_selected_home_request(
+    wb: &SharedWorkbench,
+    request: HomeProxyRequest,
+) -> Result<AccountAuthorityResponse, String> {
+    let endpoint = selected_home_endpoint(&request.hub, &request.bearer, &request.home)?;
+    open_selected_home_request_at(wb, request, &endpoint)
+}
+
+fn open_selected_home_request_at(
+    wb: &SharedWorkbench,
+    request: HomeProxyRequest,
+    endpoint: &str,
+) -> Result<AccountAuthorityResponse, String> {
+    let target = url::Url::parse(&format!("{endpoint}{}", request.target_path))
+        .map_err(|_| "the Home work path is invalid")?;
+    let base = url::Url::parse(endpoint).map_err(|_| "the Home endpoint is invalid")?;
+    if target.origin() != base.origin()
+        || target.path().starts_with("/auth/")
+        || target.path().starts_with("/account/hub-session/")
+    {
+        return Err("the path is not a Home work route".to_string());
+    }
+    // A switch or sign-out while discovery was in flight cannot dispatch this
+    // command under the old principal after the new one opens.
+    if selected_revision(wb) != request.selected_revision
+        || hub_session_actor(wb).as_deref() != Some(request.selected_person.as_str())
+    {
+        return Err("account selection changed while opening the Home".to_string());
+    }
+    if target.path() == "/home/admissions" && request.method == "POST" {
+        let admission = admit_selected_home(endpoint, &request.bearer, &request.home)?;
+        let body = json!({ "home": request.home, "admission": admission }).to_string();
+        return Ok(AccountAuthorityResponse {
+            status: StatusCode::CREATED.as_u16(),
+            content_type: Some("application/json".to_string()),
+            cache_control: Some("no-store".to_string()),
+            reader: Box::new(std::io::Cursor::new(body.into_bytes())),
+        });
+    }
+    if !request.headers.iter().any(|(name, value)| {
+        name == crate::home_admission::HOME_ADMISSION_HEADER
+            && crate::home_admission::HomeAdmissionToken::parse(value).is_some()
+    }) {
+        return Err("present the selected Home admission".to_string());
+    }
+    open_account_authority_request(
+        &request.method,
+        target.as_str(),
+        &request.bearer,
+        &request.headers,
+        &request.body,
+    )
+}
+
+fn selected_revision(wb: &SharedWorkbench) -> usize {
+    wb.lock_unpoisoned()
+        .store_ref()
+        .records(ACCOUNT_SCOPE, SELECTED_KIND)
+        .map_or(0, |records| records.len())
+}
+
+fn selected_home_endpoint(hub: &str, bearer: &str, home: &str) -> Result<String, String> {
+    let response =
+        open_account_authority_request("GET", &format!("{hub}/account/homes"), bearer, &[], &[])?;
+    let homes = small_json_response(response, "account Homes")?;
+    let registered = homes
+        .get("homes")
+        .and_then(Value::as_array)
+        .and_then(|homes| homes.iter().find(|entry| entry["id"] == home))
+        .and_then(|entry| entry.get("endpoint"))
+        .and_then(Value::as_str)
+        .filter(|endpoint| !endpoint.is_empty());
+    // A project invitation may admit this account to someone else's Home
+    // without registering that Home in its own account-home list. The Hub's
+    // project route is still only discovery; the target Home must admit the
+    // bearer separately before any work request is served.
+    let routed = if registered.is_none() {
+        let response = open_account_authority_request(
+            "GET",
+            &format!("{hub}/account/home-routes"),
+            bearer,
+            &[],
+            &[],
+        )?;
+        let routes = small_json_response(response, "account Home routes")?;
+        let endpoints: std::collections::HashSet<&str> = routes
+            .get("routes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|route| route["home_id"] == home)
+            .filter_map(|route| route.get("endpoint").and_then(Value::as_str))
+            .filter(|endpoint| !endpoint.is_empty())
+            .collect();
+        if endpoints.len() > 1 {
+            return Err("the selected account has conflicting routes to that Home".to_string());
+        }
+        endpoints.into_iter().next().map(str::to_owned)
+    } else {
+        None
+    };
+    let endpoint = registered
+        .or(routed.as_deref())
+        .ok_or_else(|| "the selected account has no direct route to that Home".to_string())?;
+    validated_home_endpoint(endpoint)
+}
+
+fn validated_home_endpoint(endpoint: &str) -> Result<String, String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let parsed = url::Url::parse(endpoint).map_err(|_| "the Home endpoint is invalid")?;
+    if !crate::account_routes::secure_home_endpoint(endpoint)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("the Home endpoint is not a secure origin".to_string());
+    }
+    Ok(endpoint.to_string())
+}
+
+enum SelectedHomeTransport {
+    Direct(String),
+    Relay(gaugedesk_relay_transport::RelayRoute),
+}
+
+#[derive(PartialEq, Eq)]
+enum SignedHomeTransport {
+    Direct(String),
+    Relay(crate::home::OpaqueRelayLocator),
+}
+
+fn selected_home_transport(
+    wb: &SharedWorkbench,
+    hub: &str,
+    bearer: &str,
+    home: &str,
+    person: &str,
+) -> Result<SelectedHomeTransport, String> {
+    let signed = match selected_signed_routes(wb, hub, bearer, person) {
+        Ok(routes) => {
+            let mut selected = None;
+            for route in routes
+                .into_iter()
+                .filter(|route| route.home_id.as_str() == home)
+            {
+                let candidate = if !route.endpoint.is_empty() {
+                    SignedHomeTransport::Direct(validated_home_endpoint(&route.endpoint)?)
+                } else if let Some(relay) = route.relay {
+                    SignedHomeTransport::Relay(relay)
+                } else {
+                    continue;
+                };
+                if selected.as_ref().is_some_and(|prior| prior != &candidate) {
+                    return Err("the signed account routes disagree about that Home".to_string());
+                }
+                selected = Some(candidate);
+            }
+            selected
+        }
+        Err(error) => {
+            tracing::warn!("selected account's signed Home routes unavailable: {error}");
+            None
+        }
+    };
+    match signed {
+        Some(SignedHomeTransport::Direct(endpoint)) => Ok(SelectedHomeTransport::Direct(endpoint)),
+        Some(SignedHomeTransport::Relay(relay)) => {
+            let fingerprint: [u8; 32] = hex::decode(&relay.home_fingerprint)
+                .map_err(|_| "the signed Home certificate pin is invalid".to_string())?
+                .try_into()
+                .map_err(|_| "the signed Home certificate pin is invalid".to_string())?;
+            let route = gaugedesk_relay_transport::RelayRoute {
+                endpoint: relay.endpoint,
+                handle: relay.handle,
+                epoch: relay.route_epoch,
+                proof: gaugedesk_relay_transport::RouteProof::from_base64url(&relay.proof)
+                    .map_err(|error| format!("invalid signed relay proof: {error}"))?,
+                previous_proof: None,
+                home_fingerprint: fingerprint,
+            };
+            route.validate().map_err(|error| error.to_string())?;
+            Ok(SelectedHomeTransport::Relay(route))
+        }
+        None => selected_home_endpoint(hub, bearer, home).map(SelectedHomeTransport::Direct),
+    }
+}
+
+fn admit_selected_home(endpoint: &str, bearer: &str, home: &str) -> Result<String, String> {
+    let response = open_account_authority_request(
+        "POST",
+        &format!("{endpoint}/home/admissions"),
+        bearer,
+        &[],
+        &[],
+    )?;
+    let admitted = small_json_response(response, "Home admission")?;
+    if admitted.get("home").and_then(Value::as_str) != Some(home) {
+        return Err("the Home admitted a different identity".to_string());
+    }
+    admitted
+        .get("admission")
+        .and_then(Value::as_str)
+        .filter(|admission| !admission.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "the Home returned no admission".to_string())
+}
+
+fn small_json_response(response: AccountAuthorityResponse, what: &str) -> Result<Value, String> {
+    if !(200..300).contains(&response.status) {
+        return Err(format!("{what} refused with HTTP {}", response.status));
+    }
+    let mut bytes = Vec::new();
+    response
+        .reader
+        .take(256 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| format!("could not read {what}"))?;
+    if bytes.len() > 256 * 1024 {
+        return Err(format!("{what} is too large"));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| format!("{what} is malformed"))
 }
 
 /// Mint a fresh Hub entitlement through the desktop's sealed account session.
@@ -457,6 +951,8 @@ struct PendingRecord {
     /// the Hub decides what it honours.
     #[serde(default)]
     provider: String,
+    #[serde(default)]
+    selection_revision: usize,
 }
 
 fn write_pending(wb: &SharedWorkbench, record: &PendingRecord) -> Result<(), String> {
@@ -486,7 +982,7 @@ fn latest_pending(wb: &SharedWorkbench) -> Option<PendingRecord> {
 /// Why a stored sign-in could not be used, kept apart from "there was none" so
 /// the person is told which of the two happened.
 enum PendingOutcome {
-    Ready(String),
+    Ready(String, usize),
     Expired,
     None,
 }
@@ -502,6 +998,7 @@ fn take_pending(wb: &SharedWorkbench) -> PendingOutcome {
         sealed: String::new(),
         started_ms: record.started_ms,
         provider: record.provider.clone(),
+        selection_revision: record.selection_revision,
     };
     if let Err(error) = write_pending(wb, &cleared) {
         // Refuse rather than redeem what could be redeemed twice.
@@ -512,7 +1009,7 @@ fn take_pending(wb: &SharedWorkbench) -> PendingOutcome {
         return PendingOutcome::Expired;
     }
     match wb.lock_unpoisoned().unseal_account_secret(&record.sealed) {
-        Some(verifier) => PendingOutcome::Ready(verifier),
+        Some(verifier) => PendingOutcome::Ready(verifier, record.selection_revision),
         // Sealed under a key this workbench no longer holds: the attempt is
         // unusable, and it is not the same fact as never having started one.
         None => PendingOutcome::Expired,
@@ -629,24 +1126,126 @@ struct SessionRecord {
     label: String,
 }
 
-fn write_session(wb: &SharedWorkbench, record: &SessionRecord) -> Result<(), String> {
-    wb.lock_unpoisoned()
-        .write_account_record_in(ACCOUNT_SCOPE, RECORD_KIND, RECORD_ID, record)
-        .map_err(|error| format!("could not store the Hub session: {error:?}"))
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+struct SelectedRecord {
+    id: String,
+    person: String,
 }
 
-fn latest_session(wb: &SharedWorkbench) -> Option<SessionRecord> {
+fn selected_person(wb: &SharedWorkbench) -> Option<String> {
+    let workbench = wb.lock_unpoisoned();
+    let rows = workbench
+        .store_ref()
+        .records(ACCOUNT_SCOPE, SELECTED_KIND)
+        .ok()?;
+    serde_json::from_str::<SelectedRecord>(rows.last()?)
+        .ok()
+        .map(|record| record.person)
+}
+
+fn write_selected(wb: &SharedWorkbench, person: &str) -> Result<(), String> {
+    wb.lock_unpoisoned()
+        .write_account_record_in(
+            ACCOUNT_SCOPE,
+            SELECTED_KIND,
+            SELECTED_ID,
+            &SelectedRecord {
+                id: SELECTED_ID.to_string(),
+                person: person.to_string(),
+            },
+        )
+        .map_err(|error| format!("could not select the account: {error:?}"))
+}
+
+fn write_selected_if_revision(
+    wb: &SharedWorkbench,
+    person: &str,
+    expected_revision: usize,
+) -> Result<bool, String> {
+    let mut workbench = wb.lock_unpoisoned();
+    let current = workbench
+        .store_ref()
+        .records(ACCOUNT_SCOPE, SELECTED_KIND)
+        .map_err(|error| format!("could not inspect account selection: {error:?}"))?
+        .len();
+    if current != expected_revision {
+        return Ok(false);
+    }
+    workbench
+        .write_account_record_in(
+            ACCOUNT_SCOPE,
+            SELECTED_KIND,
+            SELECTED_ID,
+            &SelectedRecord {
+                id: SELECTED_ID.to_string(),
+                person: person.to_string(),
+            },
+        )
+        .map_err(|error| format!("could not select the account: {error:?}"))?;
+    Ok(true)
+}
+
+fn legacy_session(wb: &SharedWorkbench) -> Option<SessionRecord> {
     let workbench = wb.lock_unpoisoned();
     let rows = workbench
         .store_ref()
         .records(ACCOUNT_SCOPE, RECORD_KIND)
         .ok()?;
-    let last = rows.last()?;
-    let record: SessionRecord = serde_json::from_str(last).ok()?;
-    if record.sealed.is_empty() {
-        return None;
+    let record: SessionRecord = serde_json::from_str(rows.last()?).ok()?;
+    (record.id == RECORD_ID && !record.sealed.is_empty()).then_some(record)
+}
+
+fn retained_sessions(wb: &SharedWorkbench) -> std::collections::BTreeMap<String, SessionRecord> {
+    let mut sessions = std::collections::BTreeMap::new();
+    if let Some(legacy) = legacy_session(wb) {
+        sessions.insert(legacy.person.clone(), legacy);
     }
-    Some(record)
+    let workbench = wb.lock_unpoisoned();
+    if let Ok(rows) = workbench
+        .store_ref()
+        .records(ACCOUNT_SCOPE, ACCOUNT_SESSION_KIND)
+    {
+        for row in rows {
+            if let Ok(record) = serde_json::from_str::<SessionRecord>(&row) {
+                // The id is the exact account id, not a display label. A
+                // malformed row cannot install a session for a different one.
+                if record.id == record.person && !record.person.is_empty() {
+                    if record.sealed.is_empty() {
+                        sessions.remove(&record.person);
+                    } else {
+                        sessions.insert(record.person.clone(), record);
+                    }
+                }
+            }
+        }
+    }
+    sessions
+}
+
+fn write_session_kind(
+    wb: &SharedWorkbench,
+    kind: &str,
+    record: &SessionRecord,
+) -> Result<(), String> {
+    wb.lock_unpoisoned()
+        .write_account_record_in(ACCOUNT_SCOPE, kind, &record.id, record)
+        .map_err(|error| format!("could not store the Hub session: {error:?}"))
+}
+
+fn write_session(wb: &SharedWorkbench, record: &SessionRecord) -> Result<(), String> {
+    write_session_kind(wb, ACCOUNT_SESSION_KIND, record)
+}
+
+fn write_legacy_session(wb: &SharedWorkbench, record: &SessionRecord) -> Result<(), String> {
+    write_session_kind(wb, RECORD_KIND, record)
+}
+
+fn latest_session(wb: &SharedWorkbench) -> Option<SessionRecord> {
+    match selected_person(wb) {
+        Some(person) if !person.is_empty() => retained_sessions(wb).remove(&person),
+        Some(_) => None,
+        None => legacy_session(wb),
+    }
 }
 
 /// Who is signed in on this computer, as far as its Home needs to know: the
@@ -661,13 +1260,31 @@ pub(crate) struct HubStanding {
 }
 
 pub(crate) fn hub_standing(wb: &SharedWorkbench) -> Option<HubStanding> {
-    let record = latest_session(wb)?;
+    standing_from_record(wb, latest_session(wb)?)
+}
+
+/// The Home's owner may remain signed in while another account is selected
+/// in the window. Selection never lends the owner's Home standing to another
+/// account or shuts down the owner's relay while that sign-in remains valid.
+pub(crate) fn hub_standing_for(wb: &SharedWorkbench, person: &str) -> Option<HubStanding> {
+    standing_from_record(wb, retained_sessions(wb).remove(person)?)
+}
+
+fn standing_from_record(wb: &SharedWorkbench, record: SessionRecord) -> Option<HubStanding> {
     let token = wb.lock_unpoisoned().unseal_account_secret(&record.sealed)?;
     Some(HubStanding {
         person: record.person,
         session: crate::account_session::session_id(&token),
         expires_ms: record.expires,
     })
+}
+
+pub(crate) fn hub_session_token_for(wb: &SharedWorkbench, person: &str) -> Option<String> {
+    let record = retained_sessions(wb).remove(person)?;
+    if record.expires <= now_ms() {
+        return None;
+    }
+    wb.lock_unpoisoned().unseal_account_secret(&record.sealed)
 }
 
 /// The current account bearer, unsealed — for core callers that present the
@@ -709,6 +1326,17 @@ pub fn hub_session_actor(wb: &SharedWorkbench) -> Option<String> {
     latest_session(wb).map(|record| record.person)
 }
 
+pub(crate) fn live_hub_session_actor(wb: &SharedWorkbench) -> Option<String> {
+    latest_session(wb)
+        .filter(|record| record.expires > now_ms())
+        .map(|record| record.person)
+}
+
+pub(crate) fn local_operator_selected(wb: &SharedWorkbench) -> bool {
+    selected_person(wb).as_deref() == Some(LOCAL_SELECTION)
+}
+
+#[cfg(test)]
 fn store_session(
     wb: &SharedWorkbench,
     account_session: &str,
@@ -718,23 +1346,55 @@ fn store_session(
     refresh_after: i64,
     device: &str,
 ) -> Result<SessionRecord, String> {
-    let sealed = {
-        let workbench = wb.lock_unpoisoned();
-        workbench
-            .seal_account_secret(account_session)
-            .ok_or_else(|| "could not seal the Hub session".to_string())?
-    };
-    let record = SessionRecord {
-        id: RECORD_ID.to_string(),
-        sealed,
+    let session = RedeemedHubSession {
+        account_session: account_session.to_string(),
         person: person.to_string(),
+        label: label.to_string(),
         expires,
         refresh_after,
         device: device.to_string(),
-        label: label.to_string(),
+    };
+    store_session_with_selection(wb, &session, None).map(|(record, _)| record)
+}
+
+fn store_session_with_selection(
+    wb: &SharedWorkbench,
+    session: &RedeemedHubSession,
+    expected_revision: Option<usize>,
+) -> Result<(SessionRecord, bool), String> {
+    // Promote the old single session before selecting another account. Both
+    // writes are append-only; if a later write fails the old selection remains
+    // readable and the next attempt can finish the migration.
+    if selected_person(wb).is_none() {
+        if let Some(mut legacy) = legacy_session(wb) {
+            legacy.id = legacy.person.clone();
+            write_session(wb, &legacy)?;
+        }
+    }
+    let sealed = {
+        let workbench = wb.lock_unpoisoned();
+        workbench
+            .seal_account_secret(&session.account_session)
+            .ok_or_else(|| "could not seal the Hub session".to_string())?
+    };
+    let record = SessionRecord {
+        id: session.person.clone(),
+        sealed,
+        person: session.person.clone(),
+        expires: session.expires,
+        refresh_after: session.refresh_after,
+        device: session.device.clone(),
+        label: session.label.clone(),
     };
     write_session(wb, &record)?;
-    Ok(record)
+    let selected = match expected_revision {
+        Some(revision) => write_selected_if_revision(wb, &session.person, revision)?,
+        None => {
+            write_selected(wb, &session.person)?;
+            true
+        }
+    };
+    Ok((record, selected))
 }
 
 /// Redeem the deep-linked single-use code at the Hub. Blocking (ureq) — run off
@@ -907,6 +1567,22 @@ fn status_json(record: Option<&SessionRecord>, available: bool) -> Value {
     }
 }
 
+fn desktop_status_json(
+    wb: &SharedWorkbench,
+    record: Option<&SessionRecord>,
+    available: bool,
+) -> Value {
+    let mut status = status_json(record, available);
+    if local_operator_selected(wb) {
+        status["local"] = Value::Bool(true);
+    } else if wb.lock_unpoisoned().home_owner_account().is_some()
+        && record.is_none_or(|record| record.expires <= now_ms())
+    {
+        status["local_choice_required"] = Value::Bool(true);
+    }
+    status
+}
+
 /// `POST /account/hub-session/start` — mint the verifier, hold it here, and
 /// return the Hub login URL for the client to open in the system browser.
 #[derive(Deserialize, Default)]
@@ -950,6 +1626,7 @@ pub async fn post_signin_start(
         sealed,
         started_ms: now_ms(),
         provider: body.provider.clone().unwrap_or_default(),
+        selection_revision: selected_revision(&wb),
     };
     if let Err(message) = write_pending(&wb, &record) {
         return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
@@ -986,8 +1663,8 @@ pub async fn post_signin_callback(
     // Single-use take, like the Hub's own state store: a second callback (or a
     // replay) finds the tombstone. Unlike the Hub's, this one is at rest, so a
     // restart during the browser leg no longer discards it (DR-0198).
-    let verifier = match take_pending(&wb) {
-        PendingOutcome::Ready(verifier) => verifier,
+    let (verifier, selection_revision) = match take_pending(&wb) {
+        PendingOutcome::Ready(verifier, revision) => (verifier, revision),
         PendingOutcome::Expired => {
             tracing::warn!("hub-session callback refused: the sign-in attempt expired");
             return (
@@ -1018,38 +1695,13 @@ pub async fn post_signin_callback(
             return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in task panicked").into_response();
         }
     };
-    match store_session(
-        &wb,
-        &session.account_session,
-        &session.person,
-        &session.label,
-        session.expires,
-        session.refresh_after,
-        &session.device,
-    ) {
-        Ok(record) => {
-            // Signing in on a computer makes it that person's first Home
-            // (DR-0183). Publication is a facility and reachability follows it,
-            // so this is what lets a leg park at all; the registration itself
-            // happens where the locator exists, in `first_home::reconcile`.
-            //
-            // Reported and not propagated: a person who has just signed in
-            // successfully should not be told sign-in failed because the
-            // machine could not also become a Home.
-            match crate::first_home::attach_library_sync(&wb) {
-                Ok(true) => eprintln!(
-                    "[first-home] library sync attached; this computer is now publishing its reachability"
-                ),
-                Ok(false) => {}
-                Err(error) => tracing::warn!("first Home not attached: {error}"),
-            }
-            // And the account that makes a computer its Home owns it
-            // (DR-0187). Reported, not propagated, for the same reason.
-            if let Err(error) = crate::home_owner::claim_if_never_claimed(&wb) {
-                tracing::warn!("Home owner not claimed: {error}");
-            }
-            if let Err(error) = wb.lock_unpoisoned().ensure_shipped_tutorials() {
-                tracing::warn!("shipped tutorials not reconciled: {error}");
+    match store_session_with_selection(&wb, &session, Some(selection_revision)) {
+        Ok((record, selected)) => {
+            // A switch during the browser leg retains the arriving session
+            // without replacing the account the person chose in the meantime.
+            if selected {
+                crate::desktop_session::revoke(&wb);
+                reconcile_first_home_after_signin(&wb, &record.person);
             }
             Json(status_json(Some(&record), true)).into_response()
         }
@@ -1060,34 +1712,156 @@ pub async fn post_signin_callback(
     }
 }
 
+/// A successful handoff may claim a fresh computer. Once claimed, only its
+/// owner may trigger local Home setup; another retained account belongs at its
+/// own admitted Home even though it used this computer to sign in.
+fn reconcile_first_home_after_signin(wb: &SharedWorkbench, person: &str) {
+    // Reported rather than propagated: a Home setup failure must not turn a
+    // successful Hub sign-in into an apparent authentication failure.
+    if let Err(error) = crate::home_owner::claim_if_never_claimed(wb) {
+        tracing::warn!("Home owner not claimed: {error}");
+    }
+    if wb.lock_unpoisoned().home_owner_account().as_deref() != Some(person) {
+        return;
+    }
+    match crate::first_home::attach_library_sync(wb) {
+        Ok(true) => eprintln!(
+            "[first-home] library sync attached; this computer is now publishing its reachability"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!("first Home not attached: {error}"),
+    }
+    if let Err(error) = wb.lock_unpoisoned().ensure_shipped_tutorials() {
+        tracing::warn!("shipped tutorials not reconciled: {error}");
+    }
+}
+
 /// `GET /account/hub-session` — non-secret status. A session inside the
 /// provider-renewal window is refreshed here, proactively: the account surfaces
 /// poll this route, so an open desktop keeps the Hub-held provider grant current
 /// without ever receiving an external token.
 pub async fn get_signin_status(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
     let available = hub_base().is_some();
+    let revision = selected_revision(&wb);
     let Some(record) = latest_session(&wb) else {
-        return Json(status_json(None, available)).into_response();
+        return Json(desktop_status_json(&wb, None, available)).into_response();
     };
+    let fence = SelectionFence::new(&wb, record.person.clone(), revision);
     let current_ms = now_ms();
     let due = record.refresh_after > 0
         && record.refresh_after <= current_ms.saturating_add(REFRESH_SKEW_MS);
     if available && due {
         if let (Some(hub), Some(bearer)) = (hub_base(), hub_session_token(&wb)) {
+            if !fence.is_current() {
+                return Json(desktop_status_json(
+                    &wb,
+                    latest_session(&wb).as_ref(),
+                    available,
+                ))
+                .into_response();
+            }
             let refreshed =
                 tokio::task::spawn_blocking(move || refresh_at_hub(&hub, &bearer)).await;
             if let Ok(Ok(refresh_after)) = refreshed {
+                if !fence.is_current() {
+                    return Json(desktop_status_json(
+                        &wb,
+                        latest_session(&wb).as_ref(),
+                        available,
+                    ))
+                    .into_response();
+                }
                 let mut updated = record.clone();
                 updated.refresh_after = refresh_after;
-                if write_session(&wb, &updated).is_ok() {
-                    return Json(status_json(Some(&updated), available)).into_response();
+                if (if selected_person(&wb).is_none() {
+                    write_legacy_session(&wb, &updated)
+                } else {
+                    write_session(&wb, &updated)
+                })
+                .is_ok()
+                {
+                    return Json(desktop_status_json(
+                        &wb,
+                        latest_session(&wb).as_ref(),
+                        available,
+                    ))
+                    .into_response();
                 }
             }
             // A failed refresh is not an error surface: the projection below
             // simply shows the real (soon-to-expire) state.
         }
     }
-    Json(status_json(Some(&record), available)).into_response()
+    Json(desktop_status_json(
+        &wb,
+        latest_session(&wb).as_ref(),
+        available,
+    ))
+    .into_response()
+}
+
+/// Non-secret retained account roster for the native selector. Expired
+/// accounts remain visible so the person can understand why they need to sign
+/// in again; they cannot be selected until renewed by a fresh handoff.
+pub async fn get_signin_accounts(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    let selected = latest_session(&wb).map(|record| record.person);
+    let accounts: Vec<Value> = retained_sessions(&wb)
+        .into_values()
+        .map(|record| {
+            json!({
+                "person": record.person,
+                "label": if record.label.is_empty() { &record.person } else { &record.label },
+                "expired": record.expires <= now_ms(),
+            })
+        })
+        .collect();
+    Json(json!({ "selected": selected, "accounts": accounts }))
+}
+
+#[derive(Deserialize)]
+pub struct SelectAccount {
+    person: String,
+}
+
+/// Selection changes no Hub session and grants no Home standing. The exact
+/// retained, unexpired account must exist; a client-provided label or route
+/// cannot install a principal here.
+pub async fn post_signin_select(
+    State(wb): State<SharedWorkbench>,
+    Json(request): Json<SelectAccount>,
+) -> impl IntoResponse {
+    let Some(record) = retained_sessions(&wb).remove(&request.person) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "that account is not retained on this device",
+        )
+            .into_response();
+    };
+    if record.expires <= now_ms() {
+        return (StatusCode::UNAUTHORIZED, "sign in to that account again").into_response();
+    }
+    if let Err(message) = write_selected(&wb, &record.person) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+    }
+    crate::desktop_session::revoke(&wb);
+    reconcile_first_home_after_signin(&wb, &record.person);
+    Json(status_json(Some(&record), hub_base().is_some())).into_response()
+}
+
+/// Enter the co-resident Home's signed-out operator posture by an explicit
+/// selection. This is a local mode, never a retained account or a Hub session.
+pub async fn post_signin_select_local(
+    State(wb): State<SharedWorkbench>,
+    desktop: Option<Extension<DesktopOperatorPlane>>,
+) -> impl IntoResponse {
+    if desktop.is_none() || crate::auth_oidc::web_account_mode() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Err(message) = write_selected(&wb, LOCAL_SELECTION) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+    }
+    crate::desktop_session::revoke(&wb);
+    Json(desktop_status_json(&wb, None, hub_base().is_some())).into_response()
 }
 
 /// Fetch one Hub account projection with the sealed bearer. Blocking — run off
@@ -1102,12 +1876,182 @@ fn fetch_hub_projection(http: &HttpClient, hub: &str, path: &str, bearer: &str) 
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct PinnedDirectoryRoot {
+    id: String,
+    root_pubkey: String,
+}
+
+/// The Hub identifies the root at first sight. Retain that public key by
+/// account so a later Hub response cannot substitute a different certificate
+/// pin inside an otherwise valid self-signed directory record.
+fn pin_directory_root(wb: &SharedWorkbench, person: &str, root: &str) -> Result<(), String> {
+    let mut guard = wb.lock_unpoisoned();
+    let pinned = guard
+        .store_ref()
+        .records(ACCOUNT_SCOPE, DIRECTORY_ROOT_PIN_KIND)
+        .map_err(|error| format!("{error:?}"))?
+        .into_iter()
+        .rev()
+        .filter_map(|value| serde_json::from_str::<PinnedDirectoryRoot>(&value).ok())
+        .find(|pin| pin.id == person);
+    if let Some(pin) = pinned {
+        return if pin.root_pubkey == root {
+            Ok(())
+        } else {
+            Err("the selected account's pinned directory root changed".to_string())
+        };
+    }
+    let pin = serde_json::to_string(&PinnedDirectoryRoot {
+        id: person.to_string(),
+        root_pubkey: root.to_string(),
+    })
+    .map_err(|error| error.to_string())?;
+    guard
+        .store_mut()
+        .append_record(ACCOUNT_SCOPE, DIRECTORY_ROOT_PIN_KIND, &pin)
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// Native routing uses the same root-signed directory as the browser. The Hub
+/// table may supply direct HTTPS endpoints, but cannot supply a relay TLS pin.
+type SignedRouteCacheKey = (std::path::PathBuf, String, String);
+
+struct CachedSignedRoutes {
+    checked_at: std::time::Instant,
+    result: Result<Vec<crate::home::OpaqueHomeRoute>, String>,
+}
+
+fn signed_route_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<SignedRouteCacheKey, CachedSignedRoutes>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<SignedRouteCacheKey, CachedSignedRoutes>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn signed_route_cache_key(wb: &SharedWorkbench, hub: &str, person: &str) -> SignedRouteCacheKey {
+    (
+        wb.lock_unpoisoned().root_path().to_path_buf(),
+        hub.to_string(),
+        person.to_string(),
+    )
+}
+
+fn invalidate_signed_route_cache(wb: &SharedWorkbench, hub: &str, person: &str) {
+    let key = signed_route_cache_key(wb, hub, person);
+    signed_route_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key);
+}
+
+fn selected_signed_routes(
+    wb: &SharedWorkbench,
+    hub: &str,
+    bearer: &str,
+    person: &str,
+) -> Result<Vec<crate::home::OpaqueHomeRoute>, String> {
+    let key = signed_route_cache_key(wb, hub, person);
+    let now = std::time::Instant::now();
+    if let Some(cached) = signed_route_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        let lifetime = if cached.result.is_ok() {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(5)
+        };
+        if now.duration_since(cached.checked_at) < lifetime {
+            return cached.result.clone();
+        }
+    }
+    let result = selected_signed_routes_uncached(wb, hub, bearer, person);
+    let checked_at = std::time::Instant::now();
+    let mut cache = signed_route_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(newer) = cache.get(&key).filter(|cached| cached.checked_at > now) {
+        return newer.result.clone();
+    }
+    cache
+        .retain(|_, cached| checked_at.duration_since(cached.checked_at) < Duration::from_secs(60));
+    cache.insert(
+        key,
+        CachedSignedRoutes {
+            checked_at,
+            result: result.clone(),
+        },
+    );
+    result
+}
+
+fn selected_signed_routes_uncached(
+    wb: &SharedWorkbench,
+    hub: &str,
+    bearer: &str,
+    person: &str,
+) -> Result<Vec<crate::home::OpaqueHomeRoute>, String> {
+    let http = HttpClient::new();
+    let projection = fetch_hub_projection(&http, hub, "/account/directory", bearer);
+    let Some(root) = projection.get("root_pubkey").and_then(Value::as_str) else {
+        return Ok(Vec::new());
+    };
+    if root.is_empty()
+        || projection
+            .get("subject")
+            .and_then(Value::as_str)
+            .is_some_and(|subject| subject != person)
+    {
+        return Err("the selected account's directory projection mismatched".to_string());
+    }
+    pin_directory_root(wb, person, root)?;
+    let origin = projection
+        .get("origin")
+        .and_then(Value::as_str)
+        .filter(|origin| !origin.is_empty())
+        .unwrap_or(crate::directory_sync::DIRECTORY_URL);
+    let parsed = url::Url::parse(origin).map_err(|_| "invalid directory origin".to_string())?;
+    if !crate::account_routes::secure_home_endpoint(origin)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("invalid directory origin".to_string());
+    }
+    let Some(record) = crate::directory_sync::fetch(&http, origin, root)? else {
+        return Ok(Vec::new());
+    };
+    if record.entry.retracted {
+        return Ok(Vec::new());
+    }
+    match crate::directory_sync::route_trust(&record, root) {
+        crate::directory_sync::RouteTrust::Signed => Ok(record
+            .entry
+            .directory
+            .home_routes
+            .into_iter()
+            .filter(|route| !route.endpoint.is_empty() || route.relay.is_some())
+            .collect()),
+        declined => Err(declined
+            .declined()
+            .unwrap_or("directory route declined")
+            .to_string()),
+    }
+}
+
 /// `GET /account/hub-session/reach` — what the signed-in account can reach
 /// (the ADR 0114 composition): the person, their registered Homes, and the
 /// opaque project-to-Home routes, fetched from the Hub with the sealed bearer.
 /// The bearer never rides this route; reach carries only what the Hub itself
 /// projects as non-secret. 409 unconfigured, 401 signed out.
 pub async fn get_signin_reach(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+    let revision = selected_revision(&wb);
     let Some(hub) = hub_base() else {
         return (
             StatusCode::CONFLICT,
@@ -1118,24 +2062,39 @@ pub async fn get_signin_reach(State(wb): State<SharedWorkbench>) -> impl IntoRes
     let Some(record) = latest_session(&wb) else {
         return (StatusCode::UNAUTHORIZED, "sign in to read account reach").into_response();
     };
+    let fence = SelectionFence::new(&wb, record.person.clone(), revision);
     let Some(bearer) = hub_session_token(&wb) else {
         return (StatusCode::UNAUTHORIZED, "sign in to read account reach").into_response();
     };
+    if !fence.is_current() {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let signed_wb = wb.clone();
+    let signed_person = record.person.clone();
     let fetched = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
         let homes = fetch_hub_projection(&http, &hub, "/account/homes", &bearer);
         let routes = fetch_hub_projection(&http, &hub, "/account/home-routes", &bearer);
-        (homes, routes)
+        let signed_routes = selected_signed_routes(&signed_wb, &hub, &bearer, &signed_person)
+            .unwrap_or_else(|error| {
+                tracing::warn!("selected account's signed Home routes unavailable: {error}");
+                Vec::new()
+            });
+        (homes, routes, signed_routes)
     })
     .await;
-    let Ok((homes, routes)) = fetched else {
+    let Ok((homes, routes, signed_routes)) = fetched else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "reach task panicked").into_response();
     };
+    if !fence.is_current() {
+        return StatusCode::CONFLICT.into_response();
+    }
     Json(json!({
         "person": record.person,
         "device": record.device,
         "homes": homes,
         "routes": routes,
+        "signed_routes": { "routes": signed_routes },
     }))
     .into_response()
 }
@@ -1145,20 +2104,27 @@ pub async fn get_signin_reach(State(wb): State<SharedWorkbench>) -> impl IntoRes
 pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
     // The UI's Home session ends with the sign-in behind it (DR-0188).
     crate::desktop_session::revoke(&wb);
-    if latest_session(&wb).is_none() {
+    let Some(active) = latest_session(&wb) else {
         return StatusCode::NO_CONTENT.into_response();
-    }
+    };
     let cleared = SessionRecord {
-        id: RECORD_ID.to_string(),
+        id: active.id.clone(),
         sealed: String::new(),
-        person: String::new(),
+        person: active.person,
         expires: 0,
         refresh_after: 0,
         device: String::new(),
         label: String::new(),
     };
-    match write_session(&wb, &cleared) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match if selected_person(&wb).is_none() {
+        write_legacy_session(&wb, &cleared)
+    } else {
+        write_session(&wb, &cleared)
+    } {
+        Ok(()) => match write_selected(&wb, "") {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+        },
         Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
     }
 }
@@ -1290,23 +2256,612 @@ mod tests {
             "status never carries token material"
         );
 
-        // Logout tombstones; a second logout finds nothing and stays 204-shaped.
+        // Logout tombstones this account and clears selection.
         let cleared = SessionRecord {
-            id: RECORD_ID.to_string(),
+            id: record.id.clone(),
             sealed: String::new(),
-            person: String::new(),
+            person: record.person.clone(),
             expires: 0,
             refresh_after: 0,
             device: String::new(),
             label: String::new(),
         };
         write_session(&wb, &cleared).unwrap();
+        write_selected(&wb, "").unwrap();
         assert!(latest_session(&wb).is_none());
         assert!(hub_session_token(&wb).is_none());
         assert_eq!(
             status_json(None, true),
             json!({ "available": true, "linked": false })
         );
+    }
+
+    #[test]
+    fn two_account_sessions_remain_separate_through_switch_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        {
+            let wb = crate::open_workbench(root.path()).unwrap();
+            store_session(
+                &wb,
+                "alice-token",
+                "alice",
+                "Alice",
+                4_102_444_800_000,
+                0,
+                "a",
+            )
+            .unwrap();
+            store_session(&wb, "bob-token", "bob", "Bob", 4_102_444_800_000, 0, "b").unwrap();
+            assert_eq!(hub_session_actor(&wb).as_deref(), Some("bob"));
+            assert_eq!(hub_session_token(&wb).as_deref(), Some("bob-token"));
+            assert_eq!(retained_sessions(&wb).len(), 2);
+        }
+        let wb = crate::open_workbench(root.path()).unwrap();
+        assert_eq!(hub_session_actor(&wb).as_deref(), Some("bob"));
+        write_selected(&wb, "alice").unwrap();
+        assert_eq!(hub_session_token(&wb).as_deref(), Some("alice-token"));
+        let alice = latest_session(&wb).unwrap();
+        write_session(
+            &wb,
+            &SessionRecord {
+                sealed: String::new(),
+                ..alice
+            },
+        )
+        .unwrap();
+        write_selected(&wb, "").unwrap();
+        assert!(hub_session_token(&wb).is_none());
+        assert_eq!(retained_sessions(&wb).len(), 1);
+        write_selected(&wb, "bob").unwrap();
+        assert_eq!(hub_session_token(&wb).as_deref(), Some("bob-token"));
+    }
+
+    #[tokio::test]
+    async fn selected_account_stream_drops_buffered_bytes_after_a_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session(
+            &wb,
+            "alice-token",
+            "alice",
+            "Alice",
+            4_102_444_800_000,
+            0,
+            "a",
+        )
+        .unwrap();
+        let fence = SelectionFence::new(&wb, "alice".to_string(), selected_revision(&wb));
+        let response = finish_proxy_response(
+            AccountAuthorityResponse {
+                status: 200,
+                content_type: Some("text/event-stream".to_string()),
+                cache_control: None,
+                reader: Box::new(std::io::Cursor::new(b"alice-only".to_vec())),
+            },
+            true,
+            Some(fence),
+        )
+        .await;
+        write_selected(&wb, LOCAL_SELECTION).unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            bytes.is_empty(),
+            "the prior account's queued stream is fenced"
+        );
+    }
+
+    #[test]
+    fn directory_root_pin_is_separate_for_each_retained_account_and_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        {
+            let wb = crate::open_workbench(root.path()).unwrap();
+            pin_directory_root(&wb, "alice", "root-a").unwrap();
+            pin_directory_root(&wb, "bob", "root-b").unwrap();
+        }
+        let wb = crate::open_workbench(root.path()).unwrap();
+        pin_directory_root(&wb, "alice", "root-a").unwrap();
+        pin_directory_root(&wb, "bob", "root-b").unwrap();
+        assert!(pin_directory_root(&wb, "alice", "root-b")
+            .unwrap_err()
+            .contains("changed"));
+    }
+
+    #[tokio::test]
+    async fn signed_relay_route_overrides_unsigned_hub_home_endpoint() {
+        use base64::Engine as _;
+
+        let signer = gaugedesk_core::signature::SigningKey::from_seed(&[7u8; 32]).unwrap();
+        let route = crate::home::OpaqueHomeRoute {
+            project: "shared-project".to_string(),
+            home_id: gaugedesk_core::ids::HomeId::new("home:shared"),
+            endpoint: String::new(),
+            relay: Some(crate::home::OpaqueRelayLocator {
+                endpoint: "wss://relay.example.test".to_string(),
+                handle: URL_SAFE_NO_PAD.encode([1u8; 32]),
+                proof: URL_SAFE_NO_PAD.encode([2u8; 32]),
+                route_epoch: 1,
+                home_fingerprint: "ab".repeat(32),
+            }),
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+        };
+        let signed = crate::directory_sync::signed_put(
+            &signer,
+            [3u8; 32],
+            &crate::account::Account::default(),
+            1,
+            Vec::new(),
+            vec![route],
+        )
+        .unwrap();
+        let root_key = signed.entry.directory.root_pubkey.clone();
+        let signed_body = serde_json::to_string(&signed).unwrap();
+        let directory_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_reads = directory_reads.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let projection_hub = hub.clone();
+        let router = axum::Router::new()
+            .route(
+                "/account/homes",
+                axum::routing::get(|| async {
+                    Json(json!({ "homes": [{
+                        "id": "home:shared",
+                        "endpoint": "https://unsigned-home.example.test",
+                    }] }))
+                }),
+            )
+            .route(
+                "/account/home-routes",
+                axum::routing::get(|| async { Json(json!({ "routes": [] })) }),
+            )
+            .route(
+                "/account/directory",
+                axum::routing::get(move || {
+                    let root_key = root_key.clone();
+                    let origin = projection_hub.clone();
+                    async move {
+                        Json(json!({
+                            "root_pubkey": root_key,
+                            "subject": "bob",
+                            "origin": origin,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/directory/{root}",
+                axum::routing::get(move || {
+                    let signed_body = signed_body.clone();
+                    counted_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { signed_body }
+                }),
+            );
+        let service = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let checked_wb = wb.clone();
+        let checked_hub = hub.clone();
+        let transport = tokio::task::spawn_blocking(move || {
+            selected_home_transport(&checked_wb, &checked_hub, "bob-token", "home:shared", "bob")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let SelectedHomeTransport::Relay(route) = transport else {
+            panic!("the unsigned Hub table must not supply a relay pin");
+        };
+        assert_eq!(route.home_fingerprint, [0xabu8; 32]);
+        assert_eq!(
+            route.proof.to_base64url(),
+            URL_SAFE_NO_PAD.encode([2u8; 32])
+        );
+        let checked_wb = wb.clone();
+        let checked_hub = hub.clone();
+        tokio::task::spawn_blocking(move || {
+            selected_home_transport(&checked_wb, &checked_hub, "bob-token", "home:shared", "bob")
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            directory_reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the verified route is reused across this account's work requests"
+        );
+        service.abort();
+    }
+
+    #[tokio::test]
+    async fn selected_home_broker_carries_its_sealed_bearer_through_native_relay() {
+        use base64::Engine as _;
+        use gaugedesk_relay_transport::test_relay::TestRelay;
+
+        let relay = TestRelay::bind().await.unwrap();
+        let identity = gaugedesk_relay_transport::TlsIdentity::generate().unwrap();
+        let route = gaugedesk_relay_transport::RelayRoute {
+            endpoint: relay.endpoint().to_string(),
+            handle: URL_SAFE_NO_PAD.encode([4u8; 32]),
+            epoch: 1,
+            proof: gaugedesk_relay_transport::RouteProof::new([5u8; 32]),
+            previous_proof: None,
+            home_fingerprint: identity.fingerprint(),
+        };
+        let home_router = axum::Router::new().route(
+            "/home/admissions",
+            axum::routing::post(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers.get("authorization").unwrap(),
+                    "Bearer opaque-account-session"
+                );
+                Json(json!({ "home": "home:bob", "admission": "a".repeat(64) }))
+            }),
+        );
+        let home_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let home_address = home_listener.local_addr().unwrap();
+        let home_http = tokio::spawn(async move {
+            axum::serve(home_listener, home_router).await.unwrap();
+        });
+        let home_leg = tokio::spawn(gaugedesk_relay_transport::serve_home_forever(
+            route.clone(),
+            home_address,
+            identity,
+        ));
+        let (address, client_leg) = gaugedesk_relay_transport::bind_client_loopback(route)
+            .await
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session_as_for_test(&wb, "bob");
+        let request = HomeProxyRequest {
+            hub: String::new(),
+            bearer: hub_session_token(&wb).unwrap(),
+            home: "home:bob".to_string(),
+            target_path: "/home/admissions".to_string(),
+            method: "POST".to_string(),
+            headers: Vec::new(),
+            body: Bytes::new(),
+            selected_person: "bob".to_string(),
+            selected_revision: selected_revision(&wb),
+        };
+        let response = tokio::task::spawn_blocking(move || {
+            open_selected_home_request_at(&wb, request, &format!("http://{address}"))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, 201);
+        client_leg.abort();
+        home_leg.abort();
+        home_http.abort();
+    }
+
+    #[tokio::test]
+    async fn selected_home_broker_uses_only_the_accounts_routed_home_and_its_admission() {
+        let admission_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_admissions = admission_calls.clone();
+        let home_router = axum::Router::new()
+            .route(
+                "/home/admissions",
+                axum::routing::post(move |headers: HeaderMap| {
+                    let count_admissions = count_admissions.clone();
+                    async move {
+                        count_admissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        assert_eq!(
+                            headers.get("authorization").unwrap(),
+                            "Bearer opaque-account-session"
+                        );
+                        Json(json!({ "home": "home:bob", "admission": "a".repeat(64) }))
+                    }
+                }),
+            )
+            .route(
+                "/workspace",
+                axum::routing::get(|headers: HeaderMap| async move {
+                    assert_eq!(
+                        headers.get("authorization").unwrap(),
+                        "Bearer opaque-account-session"
+                    );
+                    assert_eq!(
+                        headers
+                            .get(crate::home_admission::HOME_ADMISSION_HEADER)
+                            .unwrap(),
+                        "a".repeat(64).as_str()
+                    );
+                    Json(json!({ "actor": "bob" }))
+                }),
+            );
+        let home_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let home_endpoint = format!("http://{}", home_listener.local_addr().unwrap());
+        let home_task = tokio::spawn(async move {
+            axum::serve(home_listener, home_router).await.unwrap();
+        });
+
+        let hub_router = axum::Router::new()
+            .route(
+                "/account/homes",
+                axum::routing::get(
+                    |State(endpoint): State<String>, headers: HeaderMap| async move {
+                        assert_eq!(
+                            headers.get("authorization").unwrap(),
+                            "Bearer opaque-account-session"
+                        );
+                        Json(json!({ "homes": [{ "id": "home:bob", "endpoint": endpoint }] }))
+                    },
+                ),
+            )
+            .route(
+                "/account/home-routes",
+                axum::routing::get(
+                    |State(endpoint): State<String>, headers: HeaderMap| async move {
+                        assert_eq!(
+                            headers.get("authorization").unwrap(),
+                            "Bearer opaque-account-session"
+                        );
+                        Json(json!({ "routes": [{
+                            "project": "shared-project",
+                            "home_id": "home:shared",
+                            "endpoint": endpoint,
+                        }] }))
+                    },
+                ),
+            )
+            .with_state(home_endpoint);
+        let hub_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", hub_listener.local_addr().unwrap());
+        let hub_task = tokio::spawn(async move {
+            axum::serve(hub_listener, hub_router).await.unwrap();
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session_as_for_test(&wb, "bob");
+        let admission_request = HomeProxyRequest {
+            hub: hub.clone(),
+            bearer: hub_session_token(&wb).unwrap(),
+            home: "home:bob".into(),
+            target_path: "/home/admissions".into(),
+            method: "POST".into(),
+            headers: vec![],
+            body: Bytes::new(),
+            selected_person: "bob".into(),
+            selected_revision: selected_revision(&wb),
+        };
+        let wb_for_request = wb.clone();
+        let admitted = tokio::task::spawn_blocking(move || -> Result<(u16, String), String> {
+            let mut response = open_selected_home_request(&wb_for_request, admission_request)?;
+            let mut body = String::new();
+            response
+                .reader
+                .read_to_string(&mut body)
+                .map_err(|e| e.to_string())?;
+            Ok((response.status, body))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(admitted.0, 201);
+        let admission = serde_json::from_str::<Value>(&admitted.1).unwrap()["admission"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(admission, "a".repeat(64));
+
+        let request = HomeProxyRequest {
+            hub: hub.clone(),
+            bearer: hub_session_token(&wb).unwrap(),
+            home: "home:bob".into(),
+            target_path: "/workspace".into(),
+            method: "GET".into(),
+            headers: vec![(
+                crate::home_admission::HOME_ADMISSION_HEADER.into(),
+                admission.clone(),
+            )],
+            body: Bytes::new(),
+            selected_person: "bob".into(),
+            selected_revision: selected_revision(&wb),
+        };
+        let wb_for_request = wb.clone();
+        let served = tokio::task::spawn_blocking(move || -> Result<(u16, String), String> {
+            let mut response = open_selected_home_request(&wb_for_request, request)?;
+            let mut body = String::new();
+            response
+                .reader
+                .read_to_string(&mut body)
+                .map_err(|e| e.to_string())?;
+            Ok((response.status, body))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(served.0, 200);
+        assert_eq!(
+            serde_json::from_str::<Value>(&served.1).unwrap()["actor"],
+            "bob"
+        );
+        let second = HomeProxyRequest {
+            hub: hub.clone(),
+            bearer: hub_session_token(&wb).unwrap(),
+            home: "home:bob".into(),
+            target_path: "/workspace".into(),
+            method: "GET".into(),
+            headers: vec![(
+                crate::home_admission::HOME_ADMISSION_HEADER.into(),
+                admission.clone(),
+            )],
+            body: Bytes::new(),
+            selected_person: "bob".into(),
+            selected_revision: selected_revision(&wb),
+        };
+        let wb_for_second = wb.clone();
+        let second_status = tokio::task::spawn_blocking(move || {
+            open_selected_home_request(&wb_for_second, second)
+                .unwrap()
+                .status
+        })
+        .await
+        .unwrap();
+        assert_eq!(second_status, 200);
+        assert_eq!(admission_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let stale = HomeProxyRequest {
+            hub: hub.clone(),
+            bearer: hub_session_token(&wb).unwrap(),
+            home: "home:bob".into(),
+            target_path: "/workspace".into(),
+            method: "GET".into(),
+            headers: vec![(
+                crate::home_admission::HOME_ADMISSION_HEADER.into(),
+                admission,
+            )],
+            body: Bytes::new(),
+            selected_person: "bob".into(),
+            selected_revision: selected_revision(&wb),
+        };
+        write_selected(&wb, "bob").unwrap();
+        let wb_for_stale = wb.clone();
+        let refusal = tokio::task::spawn_blocking(move || {
+            open_selected_home_request(&wb_for_stale, stale)
+                .err()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(refusal.contains("selection changed"));
+
+        let hub_for_shared = hub.clone();
+        let shared = tokio::task::spawn_blocking(move || {
+            selected_home_endpoint(&hub_for_shared, "opaque-account-session", "home:shared")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(shared.starts_with("http://127.0.0.1:"));
+
+        let refused = tokio::task::spawn_blocking(move || {
+            selected_home_endpoint(&hub, "opaque-account-session", "home:alice")
+        })
+        .await
+        .unwrap();
+        assert!(refused.unwrap_err().contains("no direct route"));
+        home_task.abort();
+        hub_task.abort();
+    }
+
+    #[test]
+    fn second_account_signin_does_not_write_the_first_accounts_home() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session_as_for_test(&wb, "alice");
+        crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+        assert_eq!(
+            wb.lock_unpoisoned().home_owner_account().as_deref(),
+            Some("alice")
+        );
+        assert!(!wb
+            .lock_unpoisoned()
+            .library
+            .work_targets
+            .contains_key(crate::shipped_tutorials::TUTORIALS_TARGET,));
+
+        store_session_as_for_test(&wb, "bob");
+        reconcile_first_home_after_signin(&wb, "bob");
+        let guard = wb.lock_unpoisoned();
+        assert_eq!(guard.home_owner_account().as_deref(), Some("alice"));
+        assert!(!guard.library_sync_active());
+        assert!(!guard
+            .library
+            .work_targets
+            .contains_key(crate::shipped_tutorials::TUTORIALS_TARGET,));
+    }
+
+    #[test]
+    fn old_single_session_migrates_when_a_second_account_signs_in() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let sealed = wb
+            .lock_unpoisoned()
+            .seal_account_secret("old-token")
+            .unwrap();
+        write_legacy_session(
+            &wb,
+            &SessionRecord {
+                id: RECORD_ID.to_string(),
+                sealed,
+                person: "old".to_string(),
+                expires: 4_102_444_800_000,
+                refresh_after: 0,
+                device: String::new(),
+                label: "Old".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(hub_session_token(&wb).as_deref(), Some("old-token"));
+        store_session(&wb, "new-token", "new", "New", 4_102_444_800_000, 0, "n").unwrap();
+        assert_eq!(retained_sessions(&wb).len(), 2);
+        write_selected(&wb, "old").unwrap();
+        assert_eq!(hub_session_token(&wb).as_deref(), Some("old-token"));
+    }
+
+    #[tokio::test]
+    async fn selection_route_refuses_unretained_and_expired_accounts() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session(
+            &wb,
+            "alice-token",
+            "alice",
+            "Alice",
+            4_102_444_800_000,
+            0,
+            "a",
+        )
+        .unwrap();
+        store_session(&wb, "expired-token", "expired", "Expired", 1, 0, "e").unwrap();
+
+        let absent = post_signin_select(
+            State(wb.clone()),
+            Json(SelectAccount {
+                person: "stranger".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+        let expired = post_signin_select(
+            State(wb.clone()),
+            Json(SelectAccount {
+                person: "expired".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(hub_session_actor(&wb).as_deref(), Some("expired"));
+
+        let selected = post_signin_select(
+            State(wb.clone()),
+            Json(SelectAccount {
+                person: "alice".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(selected.status(), StatusCode::OK);
+        assert_eq!(hub_session_token(&wb).as_deref(), Some("alice-token"));
+
+        let roster = get_signin_accounts(State(wb)).await.into_response();
+        let bytes = axum::body::to_bytes(roster.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["selected"], "alice");
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 2);
+        assert!(!body.to_string().contains("alice-token"));
+        assert!(!body.to_string().contains("expired-token"));
     }
 
     #[test]
@@ -1338,6 +2893,7 @@ mod tests {
                 sealed,
                 started_ms,
                 provider: "google".to_string(),
+                selection_revision: selected_revision(wb),
             },
         )
         .expect("store the attempt");
@@ -1355,7 +2911,7 @@ mod tests {
         // lands. A second workbench over the same root is that restart.
         let wb = crate::open_workbench(root.path()).unwrap();
         match take_pending(&wb) {
-            PendingOutcome::Ready(taken) => assert_eq!(taken, verifier),
+            PendingOutcome::Ready(taken, _) => assert_eq!(taken, verifier),
             _ => panic!("the attempt did not survive the restart"),
         }
     }
@@ -1372,11 +2928,61 @@ mod tests {
     }
 
     #[test]
+    fn returning_sign_in_keeps_an_account_selected_during_the_browser_leg() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session(
+            &wb,
+            "alice-token",
+            "alice",
+            "Alice",
+            4_102_444_800_000,
+            0,
+            "a",
+        )
+        .unwrap();
+        let started_revision = selected_revision(&wb);
+        store_session(&wb, "bob-token", "bob", "Bob", 4_102_444_800_000, 0, "b").unwrap();
+        let (_, selected) = store_session_with_selection(
+            &wb,
+            &RedeemedHubSession {
+                account_session: "carol-token".to_string(),
+                person: "carol".to_string(),
+                label: "Carol".to_string(),
+                expires: 4_102_444_800_000,
+                refresh_after: 0,
+                device: "c".to_string(),
+            },
+            Some(started_revision),
+        )
+        .unwrap();
+        assert!(!selected);
+        assert_eq!(hub_session_actor(&wb).as_deref(), Some("bob"));
+        assert!(retained_sessions(&wb).contains_key("carol"));
+        let current_revision = selected_revision(&wb);
+        let (_, selected) = store_session_with_selection(
+            &wb,
+            &RedeemedHubSession {
+                account_session: "dana-token".to_string(),
+                person: "dana".to_string(),
+                label: "Dana".to_string(),
+                expires: 4_102_444_800_000,
+                refresh_after: 0,
+                device: "d".to_string(),
+            },
+            Some(current_revision),
+        )
+        .unwrap();
+        assert!(selected);
+        assert_eq!(hub_session_actor(&wb).as_deref(), Some("dana"));
+    }
+
+    #[test]
     fn redeeming_is_single_use() {
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
         start_pending(&wb, &new_verifier(), now_ms());
-        assert!(matches!(take_pending(&wb), PendingOutcome::Ready(_)));
+        assert!(matches!(take_pending(&wb), PendingOutcome::Ready(_, _)));
         // A replay, or a second deep link, finds the tombstone.
         assert!(matches!(take_pending(&wb), PendingOutcome::None));
         assert!(latest_pending(&wb).is_none());
@@ -1405,7 +3011,7 @@ mod tests {
         start_pending(&wb, &first, now_ms());
         start_pending(&wb, &second, now_ms());
         match take_pending(&wb) {
-            PendingOutcome::Ready(taken) => assert_eq!(taken, second, "latest wins"),
+            PendingOutcome::Ready(taken, _) => assert_eq!(taken, second, "latest wins"),
             _ => panic!("the second attempt should be redeemable"),
         }
     }

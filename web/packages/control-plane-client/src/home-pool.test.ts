@@ -106,6 +106,30 @@ describe("a stale route epoch is re-read once (ADR 0131 §5)", () => {
 });
 
 describe("closing a connection releases the transport that held it", () => {
+    it("refuses a late admission after the account closes the pool", async () => {
+        let finishAdmission!: (value: { home: string; admission: string }) => void;
+        const admission = new Promise<{ home: string; admission: string }>((resolve) => {
+            finishAdmission = resolve;
+        });
+        const calls: string[] = [];
+        const instance = new HomePool<{ endpoint: string }>(routes("A".repeat(43)), () => "token", {
+            client: (context) => ({ endpoint: context.endpoint }),
+            resolveEndpoint: async () => "https://home.example",
+            routeJson: (() => (async (method: string) => {
+                calls.push(method);
+                return method === "POST" ? admission : {};
+            })) as never,
+        });
+        const opening = instance.connectProject("proj" as ProjectId);
+        await Promise.resolve();
+        await Promise.resolve();
+        await instance.closeAll();
+        finishAdmission({ home: "home:a", admission: "old-account-admission" });
+        await expect(opening).rejects.toThrow("Home connection closed during admission");
+        expect(instance.snapshot()).toHaveLength(0);
+        expect(calls).toEqual(["POST", "DELETE"]);
+    });
+
     /** A pool that records every transport it is asked to build, and every Home
      * it is asked to hang up. */
     function lifecyclePool() {

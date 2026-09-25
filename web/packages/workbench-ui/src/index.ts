@@ -77,7 +77,7 @@ export { gutterGesture, peekNeighbours, PANE_LABEL, tapGesture, toggleSegments }
 export type { GutterEdge, PeekNeighbours, ToggleSegment } from "./carousel-view";
 export { PANE_ORDER, paneDepth } from "./mobile-layout";
 export type { CarouselGesture, CarouselState, PaneKind, PaneVisibility, Selection } from "./mobile-layout";
-export { displayChatTitle, isPlaceholderTitle, titleFromPrompt, untitledTag } from "./chat-title";
+export { displayChatTitle, isPlaceholderTitle, untitledTag } from "./chat-title";
 export { runDotTitle } from "./chat-run-state";
 export type { ChatRunTone } from "./chat-run-state";
 export { changedUserFiles, diffHasFiles } from "./changed-files";

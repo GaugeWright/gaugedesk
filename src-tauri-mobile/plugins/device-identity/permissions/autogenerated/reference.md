@@ -1,6 +1,6 @@
 ## Default Permission
 
-Use the native device identity, launch URL, and Machine credential vault.
+Use the native device identity, launch URL, Machine credential vault, and selected account session vault.
 
 #### This default permission set includes the following:
 
@@ -14,6 +14,7 @@ Use the native device identity, launch URL, and Machine credential vault.
 - `allow-remove-machine-credential`
 - `allow-store-account-session`
 - `allow-get-account-session`
+- `allow-select-account-session`
 - `allow-clear-account-session`
 
 ## Permission Table
@@ -229,6 +230,32 @@ Enables the remove_machine_credential command without any pre-configured scope.
 <td>
 
 Denies the remove_machine_credential command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`gaugedesk-device-identity:allow-select-account-session`
+
+</td>
+<td>
+
+Enables the select_account_session command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`gaugedesk-device-identity:deny-select-account-session`
+
+</td>
+<td>
+
+Denies the select_account_session command without any pre-configured scope.
 
 </td>
 </tr>

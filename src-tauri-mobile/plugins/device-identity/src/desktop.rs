@@ -4,7 +4,7 @@ use tauri::{plugin::PluginApi, AppHandle, Runtime};
 use crate::{
     AccountSessionResponse, ChallengeSignature, DeviceIdentity, LaunchUrlResponse,
     MachineCredentialRegistryResponse, MachineCredentialResponse, RemoveMachineCredentialRequest,
-    SignChallengeRequest, StoreAccountSessionRequest, StoreMachineCredentialRequest,
+    SelectAccountSessionRequest, SignChallengeRequest, StoreAccountSessionRequest, StoreMachineCredentialRequest,
 };
 
 pub fn init<R: Runtime, C: DeserializeOwned>(
@@ -68,6 +68,13 @@ impl<R: Runtime> DeviceIdentityPlugin<R> {
     }
 
     pub async fn get_account_session(&self) -> crate::Result<AccountSessionResponse> {
+        Err(crate::Error::UnsupportedPlatform)
+    }
+
+    pub async fn select_account_session(
+        &self,
+        _payload: SelectAccountSessionRequest,
+    ) -> crate::Result<AccountSessionResponse> {
         Err(crate::Error::UnsupportedPlatform)
     }
 

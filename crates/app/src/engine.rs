@@ -748,6 +748,16 @@ pub struct TaskResult {
     /// task response; callers receive only their normal turn projection.
     #[serde(skip)]
     pub usage_observation: Option<gaugedesk_harness::ModelUsage>,
+    /// Ephemeral metadata work returned through the turn claim boundary. It is
+    /// never part of the task response or durable transcript.
+    #[serde(skip)]
+    pub(crate) auto_title: Option<AutoTitleIntent>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AutoTitleIntent {
+    prompt: String,
+    model: Option<crate::chat_title::TitleModelContext>,
 }
 
 #[derive(Debug)]
@@ -1255,6 +1265,7 @@ fn run_task_streaming_billed<G: EgressGate>(
         pending_approvals: outcome.pending_approvals,
         asked_questions: Vec::new(),
         error: outcome.error,
+        auto_title: None,
     })
 }
 
@@ -1552,6 +1563,7 @@ fn record_precheck_failure(
         error: Some(reason),
         guarantee_outcomes: Vec::new(),
         usage_observation: None,
+        auto_title: None,
     })
 }
 
@@ -1711,10 +1723,58 @@ pub fn run_engagement_turn(
     sender: &broadcast::Sender<ServerEvent>,
     input: EngagementTurnInput<'_>,
 ) -> Result<TaskResult, EngineError> {
-    let Some(_claim) = claim_turn(id) else {
+    let Some(claim) = claim_turn(id) else {
         return Err(EngineError::AlreadyRunning);
     };
-    run_claimed_engagement_turn(wb, id, worktree, sender, input)
+    let mut result = run_claimed_engagement_turn(wb, id, worktree, sender, input)?;
+    drop(claim);
+    if let Some(intent) = result.auto_title.take() {
+        if result.run_phase == RunPhase::Completed && intent.model.is_some() {
+            let workbench = wb.clone();
+            let chat = id.to_owned();
+            let assistant = result.assistant_text.clone();
+            // A metadata request cannot extend the user's completed turn or
+            // keep its Stop claim alive. The library wakeup refreshes every
+            // client when this bounded call settles.
+            std::thread::spawn(move || {
+                let can_call_model =
+                    {
+                        let guard = workbench.lock_unpoisoned();
+                        intent.model.as_ref().is_some_and(|context| {
+                            guard.library.chats.get(&chat).is_some_and(|record| {
+                                crate::chat_title::is_system_title(&record.title)
+                            }) && context.personal_selection.as_ref().is_none_or(
+                                |(actor, class)| {
+                                    context.credential.as_ref().is_some_and(|credential| {
+                                        guard.credential_ref_for_chat_in_class(
+                                            &chat,
+                                            &context.descriptor.provider_name,
+                                            actor,
+                                            *class,
+                                        ) == credential.credential_ref()
+                                    })
+                                },
+                            )
+                        })
+                    };
+                let title = intent
+                    .model
+                    .as_ref()
+                    .filter(|_| can_call_model)
+                    .and_then(|context| {
+                        crate::chat_title::generate_title(context, &intent.prompt, &assistant).ok()
+                    })
+                    .unwrap_or_else(|| crate::chat_title::fallback_title(&intent.prompt));
+                workbench
+                    .lock_unpoisoned()
+                    .auto_title_chat_record(&chat, title);
+            });
+        } else {
+            wb.lock_unpoisoned()
+                .auto_title_chat_record(id, crate::chat_title::fallback_title(&intent.prompt));
+        }
+    }
+    Ok(result)
 }
 
 /// The turn itself, with this chat's claim already held.
@@ -1755,6 +1815,27 @@ fn run_claimed_engagement_turn(
             .map(Ok)
             .unwrap_or_else(|| g.effective_agent_config_for_chat(id))?;
         AgentConfig::from_json(&json).unwrap_or_default()
+    };
+    let should_auto_title = {
+        let guard = wb.lock_unpoisoned();
+        guard
+            .library
+            .chats
+            .get(id)
+            .is_some_and(|chat| crate::chat_title::is_system_title(&chat.title))
+            && guard
+                .store_ref()
+                .records(id, "transcript")
+                .is_ok_and(|rows| {
+                    !rows.iter().any(|row| {
+                        serde_json::from_str::<serde_json::Value>(row)
+                            .ok()
+                            .is_some_and(|event| {
+                                event.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("user")
+                            })
+                    })
+                })
     };
     stop_checkpoint(id)?;
     let gate = MembraneGate::new(&config, default_external_tools()).with_mode(mode);
@@ -1819,6 +1900,7 @@ fn run_claimed_engagement_turn(
         || (harness_factory.is_none() && gaugedesk_env::var("FAKE_AGENT").is_some());
     let mut organization_selection = None;
     let mut organization_selection_error = None;
+    let mut title_broker = None;
     let mut whip_factory = whip_factory;
     if !scripted {
         let selected = {
@@ -1901,12 +1983,14 @@ fn run_claimed_engagement_turn(
                         .and_then(|broker| {
                             whip_factory
                                 .clone()
-                                .with_organization_model_broker(broker)
+                                .with_organization_model_broker(broker.clone())
+                                .map(|factory| (factory, broker))
                                 .map_err(|error| error.to_string())
                         });
                     match configured {
-                        Ok(factory) => {
+                        Ok((factory, broker)) => {
                             whip_factory = factory;
+                            title_broker = Some(broker);
                             organization_selection = Some((project, selection));
                         }
                         Err(reason) => organization_selection_error = Some(reason),
@@ -1927,7 +2011,8 @@ fn run_claimed_engagement_turn(
     // exact same turn loop (membrane + reducers unchanged); its pre-turn side
     // effects — the `[slow]` hold and the note append — run here, in the
     // blocking pool BEFORE any lock is taken (see `ScriptedFakeFactory::pre_turn`).
-    let result = if factory.kind() == ScriptedFakeFactory::KIND {
+    let mut title_model = None;
+    let mut result = if factory.kind() == ScriptedFakeFactory::KIND {
         // The hold is the fake's whole duration and it runs before any harness
         // exists, so bind it as this turn's interrupt handle for as long as it
         // lasts. Without this the one moment a fake turn is interruptible is the
@@ -2444,7 +2529,7 @@ fn run_claimed_engagement_turn(
             // model name can't silently resolve to an unauthenticated provider. Resolved
             // once above for the fail-closed credential check.
             provider: Some(provider),
-            model: Some(provider_descriptor.model),
+            model: Some(provider_descriptor.model.clone()),
             // openai-generic's configured endpoint (ADR 0083); None for fixed-host
             // providers, which resolve their compile-time endpoint in the runtime.
             base_url: base_url_override,
@@ -2463,6 +2548,24 @@ fn run_claimed_engagement_turn(
             // needs the directory, and the turn deliberately holds no lock.
             roster: roster_for_spec,
         };
+        // Keep the exact provider selected for the turn. Naming is metadata,
+        // so it may use this capability only after the governed turn settles.
+        // Managed usage requires its own reservation and the hosted organization
+        // broker is remote; both retain the first-message fallback for now.
+        if should_auto_title
+            && managed_billing_scope.is_none()
+            && (organization_selection.is_none() || title_broker.is_some())
+        {
+            title_model = Some(crate::chat_title::TitleModelContext {
+                descriptor: provider_descriptor.clone(),
+                credential: spec.credential_capability.clone(),
+                organization_broker: title_broker.clone(),
+                personal_selection: organization_selection
+                    .is_none()
+                    .then(|| (actor.as_str().to_owned(), effective_execution_class)),
+                chat_id: id.to_owned(),
+            });
+        }
         let outcome = drive_persistent_turn(
             wb,
             id,
@@ -2559,6 +2662,10 @@ fn run_claimed_engagement_turn(
     let _ = sender.send(ServerEvent::Admitted {
         kind: "run".into(),
         text: format!("run → {:?}", result.run_phase),
+    });
+    result.auto_title = should_auto_title.then(|| AutoTitleIntent {
+        prompt: task.to_owned(),
+        model: title_model,
     });
     Ok(result)
 }

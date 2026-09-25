@@ -391,6 +391,18 @@
           "markdownDescription": "Denies the remove_machine_credential command without any pre-configured scope."
         },
         {
+          "description": "Enables the select_account_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-select-account-session",
+          "markdownDescription": "Enables the select_account_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the select_account_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-select-account-session",
+          "markdownDescription": "Denies the select_account_session command without any pre-configured scope."
+        },
+        {
           "description": "Enables the sign_challenge command without any pre-configured scope.",
           "type": "string",
           "const": "allow-sign-challenge",
@@ -427,10 +439,10 @@
           "markdownDescription": "Denies the store_machine_credential command without any pre-configured scope."
         },
         {
-          "description": "Use the native device identity, launch URL, and Machine credential vault.\n#### This default permission set includes:\n\n- `allow-get-identity`\n- `allow-get-launch-url`\n- `allow-sign-challenge`\n- `allow-store-machine-credential`\n- `allow-get-machine-credential`\n- `allow-clear-machine-credential`\n- `allow-list-machine-credentials`\n- `allow-remove-machine-credential`\n- `allow-store-account-session`\n- `allow-get-account-session`\n- `allow-clear-account-session`",
+          "description": "Use the native device identity, launch URL, Machine credential vault, and selected account session vault.\n#### This default permission set includes:\n\n- `allow-get-identity`\n- `allow-get-launch-url`\n- `allow-sign-challenge`\n- `allow-store-machine-credential`\n- `allow-get-machine-credential`\n- `allow-clear-machine-credential`\n- `allow-list-machine-credentials`\n- `allow-remove-machine-credential`\n- `allow-store-account-session`\n- `allow-get-account-session`\n- `allow-select-account-session`\n- `allow-clear-account-session`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Use the native device identity, launch URL, and Machine credential vault.\n#### This default permission set includes:\n\n- `allow-get-identity`\n- `allow-get-launch-url`\n- `allow-sign-challenge`\n- `allow-store-machine-credential`\n- `allow-get-machine-credential`\n- `allow-clear-machine-credential`\n- `allow-list-machine-credentials`\n- `allow-remove-machine-credential`\n- `allow-store-account-session`\n- `allow-get-account-session`\n- `allow-clear-account-session`"
+          "markdownDescription": "Use the native device identity, launch URL, Machine credential vault, and selected account session vault.\n#### This default permission set includes:\n\n- `allow-get-identity`\n- `allow-get-launch-url`\n- `allow-sign-challenge`\n- `allow-store-machine-credential`\n- `allow-get-machine-credential`\n- `allow-clear-machine-credential`\n- `allow-list-machine-credentials`\n- `allow-remove-machine-credential`\n- `allow-store-account-session`\n- `allow-get-account-session`\n- `allow-select-account-session`\n- `allow-clear-account-session`"
         }
       ]
     }

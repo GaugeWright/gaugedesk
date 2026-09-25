@@ -1134,7 +1134,7 @@ pub(crate) async fn create_engagement(
         .map(|context| context.actor().as_str().to_owned());
     // An explicit embedding id keeps its raw value as the title; a minted id gets
     // the "new chat" placeholder so the nav renders it as "Untitled" until the first
-    // message auto-titles it (state/chat-title) — never the raw `chat-…` token.
+    // completed turn names it through the engine — never the raw `chat-…` token.
     let (id, title) = match body.id {
         Some(id) => (id.clone(), id),
         None => (crate::library::gen_id("chat"), "new chat".to_string()),
