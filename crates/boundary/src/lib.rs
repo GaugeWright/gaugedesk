@@ -61,13 +61,19 @@ pub fn is_write_tool(tool: &str) -> bool {
 /// bytes into the immutable version reference. GaugeDesk owns who may edit,
 /// publish, install, and select that reference.
 pub mod definition {
+    pub const AUTHORING_ROOT: &str = "agent";
+    pub const AGENTS_FILE: &str = "AGENTS.md";
+    pub const HUMANS_FILE: &str = "HUMANS.md";
+    pub const SYSTEM_FILE: &str = "SYSTEM.md";
     pub const PACKAGE_ROOT: &str = ".whipple";
     pub const DRAFT_ROOT: &str = ".whipple/draft";
     pub const VERSIONS_ROOT: &str = ".whipple/versions";
     pub const DISCIPLINE_VERSIONS_ROOT: &str = ".whipple/discipline/versions";
     pub const MANIFEST_FILE: &str = "package.json";
     pub const SOURCE_FILE: &str = "method.whip";
+    pub const GENERATED_CHAT_SOURCE_FILE: &str = "__gaugedesk_default_chat.whip";
     pub const PERSONA_FILE: &str = "persona.md";
+    pub const HUMAN_GUIDE: &str = "# Agent files\n\nAGENTS.md contains the standing instructions the Agent receives at the start of a fresh turn. Edit it to change how this Agent works.\n\nPut reusable skills in skills/<name>/SKILL.md, with a name and description in the skill frontmatter. Descriptions are discoverable at turn start; full instructions are read when needed. SYSTEM.md is optional and adds expert-authored system instructions. Other files are references until a workflow explicitly uses them.\n\nPublishing freezes these files. A work chat or Panel session uses that pinned version; draft edits do not change a running placement. Each run has its own artifacts/ for results people should find and work/ for notes and intermediate files. These are separate from attached work targets.\n\nThe .whipple/ folder contains generated packages and frozen versions. It is available in the advanced file view.\n";
     /// GaugeDesk-owned provider/model/thinking selection. Authentication and
     /// credentials never enter the authored package.
     pub const CONFIG_PATH: &str = ".agent-config.json";
@@ -88,6 +94,7 @@ pub mod definition {
         pub workspace_read: bool,
         pub workspace_write: bool,
         pub command_run: bool,
+        pub tracker_file: bool,
     }
 
     impl Default for PackageCapabilities {
@@ -96,6 +103,7 @@ pub mod definition {
                 workspace_read: true,
                 workspace_write: true,
                 command_run: true,
+                tracker_file: false,
             }
         }
     }
@@ -111,6 +119,9 @@ pub mod definition {
             }
             if self.command_run {
                 names.push("command.run");
+            }
+            if self.tracker_file {
+                names.push("tracker.file");
             }
             names
         }
@@ -143,36 +154,51 @@ pub mod definition {
             "{{\n  \"schema\": \"whipplescript.agent_package.v0\",\n  \"source\": \"method.whip\",\n  \"workflow\": \"GaugeDeskMethod\",\n  \"agent\": \"assistant\",\n  \"system_prompt\": \"persona.md\",\n  \"capabilities\": [{json_names}],\n  \"agent_abilities\": [{json_names}],\n  \"max_steps\": 32\n}}\n"
         );
         let capability_list = format!("[{}]", json_names);
-        let requires = if names.is_empty() {
-            String::new()
-        } else {
-            format!(" requires {capability_list}")
-        };
         let mut resources = String::new();
-        let mut grants = String::new();
         if capabilities.workspace_read {
             resources.push_str("file store project {\n  root \".\"\n  allow read [\"**\"]\n");
             if capabilities.workspace_write {
                 resources.push_str("  allow write [\"**\"]\n");
             }
             resources.push_str("}\n\n");
-            grants.push_str("\n      with access to project {\n        read [\"**\"]\n");
-            if capabilities.workspace_write {
-                grants.push_str("        write [\"**\"]\n");
-            }
-            grants.push_str("      }");
-        }
-        if capabilities.command_run {
-            grants.push_str("\n      with access to command {\n        run\n      }");
         }
         let source = format!(
-            "{resources}workflow GaugeDeskMethod {{\n  agent assistant {{\n    provider owned\n    profile \"repo-writer\"\n    capacity 1\n    capabilities {capability_list}\n  }}\n\n  rule converse\n    when started\n  => {{\n    tell assistant{requires}{grants}\n      \"Run the selected GaugeDesk method.\"\n  }}\n}}\n"
+            "{resources}workflow GaugeDeskMethod {{\n  agent assistant {{\n    provider owned\n    profile \"repo-writer\"\n    capacity 1\n    capabilities {capability_list}\n  }}\n}}\n"
         );
         vec![
             (format!("{root}/{MANIFEST_FILE}"), manifest),
             (format!("{root}/{SOURCE_FILE}"), source),
             (format!("{root}/{PERSONA_FILE}"), persona.to_owned()),
         ]
+    }
+
+    /// Derive the package used by a new Agent from its visible entry point.
+    /// The generated WhippleScript source is a chat wrapper, not a named
+    /// authored method; explicit workflow bindings may replace it later.
+    pub fn package_documents_v1(
+        root: &str,
+        agents: &str,
+        system: &str,
+        capabilities: PackageCapabilities,
+    ) -> Vec<(String, String)> {
+        let mut files = package_documents(root, system, capabilities);
+        let manifest = files
+            .iter_mut()
+            .find(|(path, _)| path == &format!("{root}/{MANIFEST_FILE}"))
+            .expect("generated manifest");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&manifest.1).expect("generated manifest is JSON");
+        value["schema"] = serde_json::json!("whipplescript.agent_package.v1");
+        value["project_context"] = serde_json::json!(AGENTS_FILE);
+        value["source"] = serde_json::json!(GENERATED_CHAT_SOURCE_FILE);
+        manifest.1 = format!("{}\n", serde_json::to_string_pretty(&value).expect("JSON"));
+        let source = files
+            .iter_mut()
+            .find(|(path, _)| path == &format!("{root}/{SOURCE_FILE}"))
+            .expect("generated source");
+        source.0 = format!("{root}/{GENERATED_CHAT_SOURCE_FILE}");
+        files.push((format!("{root}/{AGENTS_FILE}"), agents.to_owned()));
+        files
     }
 
     pub const DEFAULT_METHOD_SOURCE: &str = r#"file store project {
@@ -187,20 +213,6 @@ workflow GaugeDeskMethod {
     profile "repo-writer"
     capacity 1
     capabilities ["workspace.read", "workspace.write", "command.run"]
-  }
-
-  rule converse
-    when started
-  => {
-    tell assistant requires ["workspace.read", "workspace.write", "command.run"]
-      with access to project {
-        read ["**"]
-        write ["**"]
-      }
-      with access to command {
-        run
-      }
-      "Run the selected GaugeDesk method."
   }
 }
 "#;
@@ -239,14 +251,28 @@ workflow GaugeDeskMethod {
     impl AgentDefinition {
         /// The one layout choke point for fresh archetype package source.
         pub fn seed_files(&self) -> Vec<(String, String)> {
-            let persona = format!("{}\n\n{}", self.system.trim(), self.instructions.trim());
-            let mut files = Vec::new();
+            self.seed_files_with_capabilities(PackageCapabilities::default())
+        }
+
+        pub fn seed_files_with_capabilities(
+            &self,
+            capabilities: PackageCapabilities,
+        ) -> Vec<(String, String)> {
+            let agents = format!("{}\n\n{}", self.system.trim(), self.instructions.trim());
+            let mut files = vec![
+                (format!("{AUTHORING_ROOT}/{AGENTS_FILE}"), agents.clone()),
+                (
+                    format!("{AUTHORING_ROOT}/{HUMANS_FILE}"),
+                    HUMAN_GUIDE.to_owned(),
+                ),
+                (
+                    format!("{AUTHORING_ROOT}/skills/.gaugedesk-folder"),
+                    String::new(),
+                ),
+            ];
             for root in [DRAFT_ROOT.to_owned(), version_root(1)] {
-                files.extend(package_documents(
-                    &root,
-                    &persona,
-                    PackageCapabilities::default(),
-                ));
+                files.extend(package_documents_v1(&root, &agents, "", capabilities));
+                files.push((format!("{root}/{HUMANS_FILE}"), HUMAN_GUIDE.to_owned()));
             }
             if let Some(config) = &self.config {
                 files.push((CONFIG_PATH.to_string(), config.clone()));
@@ -325,7 +351,7 @@ impl AgentConfig {
         for retired in ["policy", "tools"] {
             if object.contains_key(retired) {
                 return Err(format!(
-                    "`{retired}` is package-owned; edit `.whipple/draft/package.json` and `method.whip`"
+                    "`{retired}` is package-owned; edit `.whipple/draft/package.json` and its selected WhippleScript source"
                 ));
             }
         }
@@ -354,6 +380,7 @@ impl AgentConfig {
             workspace_read: admits(&["read"]) || workspace_write,
             workspace_write,
             command_run: admits(&["bash", "command"]),
+            tracker_file: false,
         }
     }
 }
@@ -604,7 +631,15 @@ mod tests {
             config: None,
         };
         let seeded = def.seed_files();
-        assert_eq!(seeded.len(), 6);
+        assert_eq!(seeded.len(), 13);
+        assert!(seeded
+            .iter()
+            .any(|(path, body)| { path == "agent/AGENTS.md" && body == "persona\n\nconventions" }));
+        assert!(seeded.iter().any(|(path, _)| path == "agent/HUMANS.md"));
+        assert!(seeded
+            .iter()
+            .any(|(path, _)| path == "agent/skills/.gaugedesk-folder"));
+        assert!(!seeded.iter().any(|(path, _)| path == "agent/SYSTEM.md"));
         for root in [
             definition::DRAFT_ROOT.to_owned(),
             definition::version_root(1),
@@ -614,9 +649,25 @@ mod tests {
                 .any(|(path, _)| path == &format!("{root}/package.json")));
             assert!(seeded
                 .iter()
-                .any(|(path, _)| path == &format!("{root}/method.whip")));
+                .any(|(path, _)| path
+                    == &format!("{root}/{}", definition::GENERATED_CHAT_SOURCE_FILE)));
             assert!(seeded.iter().any(|(path, body)| {
-                path == &format!("{root}/persona.md") && body == "persona\n\nconventions"
+                path == &format!("{root}/{}", definition::GENERATED_CHAT_SOURCE_FILE)
+                    && !body.contains("Run the selected GaugeDesk method")
+                    && !body.contains("when started")
+            }));
+            assert!(seeded
+                .iter()
+                .any(|(path, body)| { path == &format!("{root}/persona.md") && body.is_empty() }));
+            assert!(seeded.iter().any(|(path, body)| {
+                path == &format!("{root}/AGENTS.md") && body == "persona\n\nconventions"
+            }));
+            assert!(seeded
+                .iter()
+                .any(|(path, _)| path == &format!("{root}/HUMANS.md")));
+            assert!(seeded.iter().any(|(path, body)| {
+                path == &format!("{root}/package.json")
+                    && body.contains("whipplescript.agent_package.v1")
             }));
         }
 
@@ -628,11 +679,13 @@ mod tests {
             with_config.seed_files().last(),
             Some(&(".agent-config.json".to_string(), "{}".to_string()))
         );
-        // every seeded file is either package-owned or GaugeDesk control.
+        // Every seeded file is authored, package-owned, or GaugeDesk control.
         for (path, _) in with_config.seed_files() {
             assert!(
-                is_method_surface_path(&path) || is_control_surface_path(&path),
-                "{path} is on a protected surface"
+                path.starts_with("agent/")
+                    || is_method_surface_path(&path)
+                    || is_control_surface_path(&path),
+                "{path} is on a known surface"
             );
         }
     }

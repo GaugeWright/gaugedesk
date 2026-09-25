@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeChatWhip, listChatWhipRuns, stopChatWhip, launchProjectWorkflow, runChatWhip, startShippedTutorial, type ProjectWorkflowLaunchIntent } from "./project-workflow";
+import { describeChatWhip, getShippedTutorial, listChatWhipRuns, stopChatWhip, launchProjectWorkflow, runChatWhip, startShippedTutorial, type ProjectWorkflowLaunchIntent } from "./project-workflow";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 
 const intent: ProjectWorkflowLaunchIntent = { target: "target-personal", path: "tutorials/basics.whip", cut: "cut-1", inputs: { learner: { authority: "learner" } }, requestId: "basics-once" };
@@ -37,6 +37,15 @@ describe("project workflow launch client", () => {
         expect(await startShippedTutorial(transport, "basics")).toEqual({ project: "personal", workspace: "workspace-personal", instanceId: "workflow-root" });
         expect(requests).toEqual([["POST", "/tutorials/basics/start"]]);
         await expect(startShippedTutorial(transport, " ")).rejects.toThrow();
+    });
+    it("reads installed tutorial source and status by name without a local file path", async () => {
+        const requests: unknown[] = [];
+        const transport: WorkbenchTransport = { base: "", json: async (...args) => {
+            requests.push(args);
+            return { project: "tutorials-abc", run_project: "tutorials-abc", publisher: "GaugeWright", file: "basics.whip", source: "workflow Basics()", status: "ready", open_tasks: 0 };
+        } };
+        expect(await getShippedTutorial(transport, "basics")).toMatchObject({ project: "tutorials-abc", file: "basics.whip", status: "ready" });
+        expect(requests).toEqual([["GET", "/tutorials/basics"]]);
     });
     it("describes a chat's whip at the kept revision, keeping unknown kinds runnable as JSON", async () => {
         const requests: unknown[] = [];

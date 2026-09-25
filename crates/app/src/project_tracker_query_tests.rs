@@ -2,6 +2,83 @@ use super::*;
 use crate::project_tracker::{CompleteTrackerIssue, TrackerAccessDecision, TrackerPermission};
 
 #[test]
+fn agent_task_tool_files_a_real_personal_issue_once_under_current_authority() {
+    let (_root, shared, context, _request) = fixture(ECHO);
+    let mut wb = shared.lock_unpoisoned();
+    wb.create_default_engagement("chat-one".into(), "Task chat".into())
+        .unwrap_or_else(|_| panic!("task chat in Personal"));
+    wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    let mut changes = wb.sender(crate::library::LIBRARY_SCOPE).subscribe();
+    let id = wb
+        .file_agent_project_task(
+            &context,
+            DEFAULT_PROJECT,
+            "chat-one",
+            "chat:one:call:one",
+            "Test task\nVerify the app works",
+        )
+        .expect("first task initializes protected tracker and commits");
+    assert!(matches!(
+        changes.try_recv(),
+        Ok(crate::stream::ServerEvent::WorkspaceChanged { record, id, .. })
+            if record == "project_tracker" && id == DEFAULT_PROJECT
+    ));
+    assert_eq!(
+        wb.file_agent_project_task(
+            &context,
+            DEFAULT_PROJECT,
+            "chat-one",
+            "chat:one:call:one",
+            "Test task\nVerify the app works",
+        )
+        .unwrap(),
+        id
+    );
+    assert!(
+        wb.file_agent_project_task(
+            &context,
+            DEFAULT_PROJECT,
+            "chat-one",
+            "chat:one:call:one",
+            "A different task",
+        )
+        .is_err(),
+        "one tool call cannot acquire a different meaning"
+    );
+    let tasks = wb
+        .read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tasks")
+        .unwrap();
+    assert_eq!(tasks.backlog.issues.len(), 1);
+    assert_eq!(tasks.backlog.issues[0].id, id);
+    assert_eq!(tasks.backlog.issues[0].title, "Test task");
+    assert_eq!(tasks.backlog.issues[0].body, "Verify the app works");
+    assert_eq!(
+        tasks.backlog.issues[0].filed_by.as_deref(),
+        Some(LOCAL_AUTHORITY)
+    );
+    let outsider_token = wb
+        .mint_account_session("outsider", "passkey", 3600)
+        .unwrap();
+    let outsider = wb.authenticate_action_context(&outsider_token).unwrap();
+    assert!(wb
+        .file_agent_project_task(
+            &outsider,
+            DEFAULT_PROJECT,
+            "chat-one",
+            "chat:two:call:one",
+            "Forbidden task",
+        )
+        .is_err());
+    assert_eq!(
+        wb.read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tasks")
+            .unwrap()
+            .issues
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
     let (_root, shared, context, invocation, request) = completion::setup();
     let mut wb = shared.lock_unpoisoned();

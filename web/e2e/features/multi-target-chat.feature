@@ -26,6 +26,7 @@ Feature: One chat spans several work targets
     Given a project with two eligible work targets
     And two placements have chats in one project workstream
     Then the project workstream groups both chats
+    And Agent view shows each chat under its own Agent
     When I promote collaboration and start a later target settlement
     Then promotion and settlement are projected separately with recovery actions
 

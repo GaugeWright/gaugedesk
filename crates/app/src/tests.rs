@@ -1976,18 +1976,15 @@ fn startup_persists_the_agent_ability_hard_cutover_and_reconciles_frozen_refs() 
             )
             .unwrap();
 
-            let source_path = format!("{package_root}/method.whip");
+            let source_path = format!(
+                "{package_root}/{}",
+                gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
+            );
             let source = edit
                 .read_file(&source_path)
                 .unwrap()
-                .replace(
-                    "\"command.run\"]",
-                    "\"command.run\", \"human.ask\"]",
-                )
-                .replace(
-                    "\n      \"Run the selected GaugeDesk method.\"",
-                    "\n      with access to human {\n        ask\n      }\n      \"Run the selected GaugeDesk method.\"",
-                );
+                .replace("\"command.run\"]", "\"command.run\", \"human.ask\"]")
+                + "\n// preserve this legacy source note\n";
             edit.write_file(&source_path, &source).unwrap();
         }
         for discipline_root in [
@@ -2026,6 +2023,7 @@ fn startup_persists_the_agent_ability_hard_cutover_and_reconciles_frozen_refs() 
                 "workspace.read".to_owned(),
                 "workspace.write".to_owned(),
                 "command.run".to_owned(),
+                "tracker.file".to_owned(),
             ]
         );
         let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
@@ -2034,7 +2032,10 @@ fn startup_persists_the_agent_ability_hard_cutover_and_reconciles_frozen_refs() 
         let read = workspace.create_engagement(&engagement_id).unwrap();
         for root in [".whipple/draft", ".whipple/versions/1"] {
             assert!(!read
-                .read_file(&format!("{root}/method.whip"))
+                .read_file(&format!(
+                    "{root}/{}",
+                    gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
+                ))
                 .unwrap()
                 .contains("human.ask"));
         }
@@ -2051,6 +2052,358 @@ fn startup_persists_the_agent_ability_hard_cutover_and_reconciles_frozen_refs() 
         reopened.lock_unpoisoned().library.agents[DEFAULT_AGENT].versions[&1].package_ref,
         migrated_ref
     );
+}
+
+#[test]
+fn legacy_draft_becomes_visible_agent_files_without_rewriting_published_versions() {
+    let (dir, wb) = seeded_workbench();
+    let frozen_ref = {
+        let guard = wb.lock_unpoisoned();
+        let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let edit_id = library::gen_id("legacy-agent-files");
+        let edit = workspace.create_engagement(&edit_id).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&edit.read_file(".whipple/draft/package.json").unwrap()).unwrap();
+        manifest["schema"] = serde_json::json!("whipplescript.agent_package.v0");
+        manifest.as_object_mut().unwrap().remove("project_context");
+        manifest["source"] = serde_json::json!("method.whip");
+        edit.write_file(
+            ".whipple/draft/package.json",
+            &format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()),
+        )
+        .unwrap();
+        edit.write_file(".whipple/draft/persona.md", "Original system role")
+            .unwrap();
+        let source = edit
+            .read_file(&format!(
+                ".whipple/draft/{}",
+                gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
+            ))
+            .unwrap();
+        edit.write_file(
+            ".whipple/draft/method.whip",
+            &format!("{source}\n// Authored legacy workflow\n"),
+        )
+        .unwrap();
+        edit.commit_turn("restore legacy Agent draft").unwrap();
+        assert_eq!(
+            edit.merge_into_main().unwrap(),
+            gaugedesk_workspace::MergeOutcome::Clean
+        );
+        workspace.remove_engagement(&edit_id).unwrap();
+        guard.library.agents[DEFAULT_AGENT].versions[&1]
+            .package_ref
+            .clone()
+    };
+    drop(wb);
+
+    let migrated = open_workbench(dir.path()).expect("migrate legacy Agent draft");
+    {
+        let guard = migrated.lock_unpoisoned();
+        assert_eq!(
+            guard.library.agents[DEFAULT_AGENT].versions[&1].package_ref,
+            frozen_ref
+        );
+        let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let read_id = library::gen_id("read-agent-files");
+        let read = workspace.create_engagement(&read_id).unwrap();
+        assert_eq!(read.read_file("agent/AGENTS.md").unwrap(), "");
+        assert_eq!(
+            read.read_file("agent/SYSTEM.md").unwrap(),
+            "Original system role"
+        );
+        assert!(read
+            .read_file("agent/HUMANS.md")
+            .unwrap()
+            .contains("AGENTS.md"));
+        assert!(read
+            .read_file("agent/method.whip")
+            .unwrap()
+            .contains("Authored legacy workflow"));
+        let manifest: serde_json::Value =
+            serde_json::from_str(&read.read_file(".whipple/draft/package.json").unwrap()).unwrap();
+        assert_eq!(manifest["schema"], "whipplescript.agent_package.v1");
+        assert_eq!(manifest["project_context"], "AGENTS.md");
+        workspace.remove_engagement(&read_id).unwrap();
+    }
+    drop(migrated);
+    let reopened = open_workbench(dir.path()).expect("migration is idempotent");
+    assert_eq!(
+        reopened.lock_unpoisoned().library.agents[DEFAULT_AGENT].versions[&1].package_ref,
+        frozen_ref
+    );
+}
+
+#[test]
+fn legacy_default_source_migrates_without_creating_a_visible_method() {
+    let (dir, wb) = seeded_workbench();
+    {
+        let guard = wb.lock_unpoisoned();
+        let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let edit_id = library::gen_id("legacy-default-source");
+        let edit = workspace.create_engagement(&edit_id).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&edit.read_file(".whipple/draft/package.json").unwrap()).unwrap();
+        manifest["schema"] = serde_json::json!("whipplescript.agent_package.v0");
+        manifest["source"] = serde_json::json!("method.whip");
+        manifest.as_object_mut().unwrap().remove("project_context");
+        edit.write_file(
+            ".whipple/draft/package.json",
+            &format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()),
+        )
+        .unwrap();
+        edit.write_file(
+            ".whipple/draft/method.whip",
+            gaugedesk_boundary::definition::DEFAULT_METHOD_SOURCE,
+        )
+        .unwrap();
+        edit.commit_turn("restore default v0 source").unwrap();
+        assert_eq!(
+            edit.merge_into_main().unwrap(),
+            gaugedesk_workspace::MergeOutcome::Clean
+        );
+        workspace.remove_engagement(&edit_id).unwrap();
+    }
+    drop(wb);
+
+    let migrated = open_workbench(dir.path()).unwrap();
+    let guard = migrated.lock_unpoisoned();
+    let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
+    let workspace = guard.targets.get(&target_id).unwrap();
+    let read_id = library::gen_id("read-migrated-default");
+    let read = workspace.create_engagement(&read_id).unwrap();
+    assert!(!read
+        .tree()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.path == "agent/method.whip"));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&read.read_file(".whipple/draft/package.json").unwrap()).unwrap();
+    assert_eq!(
+        manifest["source"],
+        gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
+    );
+    workspace.remove_engagement(&read_id).unwrap();
+}
+
+#[test]
+fn existing_default_agent_gets_a_new_task_capable_version_without_rewriting_v1() {
+    let (dir, wb) = seeded_workbench();
+    let old_ref = {
+        let mut guard = wb.lock_unpoisoned();
+        let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let engagement_id = library::gen_id("pre-task-default");
+        let edit = workspace.create_engagement(&engagement_id).unwrap();
+        let definition = app_support::default_agent_definition();
+        for (path, body) in definition.seed_files() {
+            edit.write_file(&path, &body).unwrap();
+        }
+        let discipline = discipline::default_manifest(
+            gaugedesk_boundary::definition::PackageCapabilities::default()
+                .names()
+                .into_iter()
+                .map(str::to_owned),
+        );
+        for root in [
+            ".whipple/discipline/draft",
+            ".whipple/discipline/versions/1",
+        ] {
+            edit.write_file(&format!("{root}/discipline.json"), &discipline)
+                .unwrap();
+        }
+        edit.commit_turn("restore pre-task Default package")
+            .unwrap();
+        assert_eq!(
+            edit.merge_into_main().unwrap(),
+            gaugedesk_workspace::MergeOutcome::Clean
+        );
+        workspace.remove_engagement(&engagement_id).unwrap();
+        let published = dir.path().join("targets").join(&target_id).join("repo");
+        let old = gaugedesk_whip_runtime::AuthoredAgentPackage::load(
+            published.join(".whipple/versions/1"),
+        )
+        .unwrap();
+        let old_discipline = discipline::load(
+            &published.join(".whipple/discipline/versions/1"),
+            old.capabilities().iter().cloned(),
+        )
+        .unwrap();
+        let mut agent = guard.library.agents[DEFAULT_AGENT].clone();
+        agent.versions.get_mut(&1).unwrap().package_ref = old.version_ref().to_owned();
+        agent.versions.get_mut(&1).unwrap().discipline_ref = old_discipline.reference;
+        guard.write_agent_record(agent);
+        old.version_ref().to_owned()
+    };
+    drop(wb);
+
+    let migrated = open_workbench(dir.path()).expect("old Default publishes version 2");
+    let version_2_ref = {
+        let guard = migrated.lock_unpoisoned();
+        let agent = &guard.library.agents[DEFAULT_AGENT];
+        assert_eq!(agent.current_version, 2);
+        assert_eq!(agent.versions[&1].package_ref, old_ref);
+        assert_eq!(guard.library.instances[DEFAULT_PLACEMENT].version, 2);
+        let root = dir
+            .path()
+            .join("targets")
+            .join(library_state::authoring_target_id(DEFAULT_AGENT))
+            .join("repo");
+        let v2 =
+            gaugedesk_whip_runtime::AuthoredAgentPackage::load(root.join(".whipple/versions/2"))
+                .unwrap();
+        assert!(v2
+            .resolve(v2.version_ref())
+            .unwrap()
+            .tools
+            .iter()
+            .any(|tool| tool.name == "add_todo"));
+        let draft: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(".whipple/draft/package.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(draft["agent_abilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|ability| ability == "tracker.file"));
+        v2.version_ref().to_owned()
+    };
+    drop(migrated);
+    let reopened = open_workbench(dir.path()).expect("migration is stable on reopen");
+    assert_eq!(
+        reopened.lock_unpoisoned().library.agents[DEFAULT_AGENT].versions[&2].package_ref,
+        version_2_ref
+    );
+}
+
+#[test]
+fn legacy_default_package_migrates_to_a_task_capable_agent_file_version() {
+    use gaugedesk_boundary::definition::{package_documents, PackageCapabilities};
+
+    let (dir, wb) = seeded_workbench();
+    {
+        let mut guard = wb.lock_unpoisoned();
+        let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let engagement_id = library::gen_id("pre-agent-files-default");
+        let edit = workspace.create_engagement(&engagement_id).unwrap();
+        for root in [".whipple/draft", ".whipple/versions/1"] {
+            for (path, body) in package_documents(
+                root,
+                "Legacy Default persona",
+                PackageCapabilities::default(),
+            ) {
+                edit.write_file(&path, &body).unwrap();
+            }
+        }
+        let discipline = discipline::default_manifest(
+            PackageCapabilities::default()
+                .names()
+                .into_iter()
+                .map(str::to_owned),
+        );
+        for root in [
+            ".whipple/discipline/draft",
+            ".whipple/discipline/versions/1",
+        ] {
+            edit.write_file(&format!("{root}/discipline.json"), &discipline)
+                .unwrap();
+        }
+        edit.commit_turn("restore legacy Default package").unwrap();
+        assert_eq!(
+            edit.merge_into_main().unwrap(),
+            gaugedesk_workspace::MergeOutcome::Clean
+        );
+        workspace.remove_engagement(&engagement_id).unwrap();
+        let root = dir.path().join("targets").join(&target_id).join("repo");
+        let old =
+            gaugedesk_whip_runtime::AuthoredAgentPackage::load(root.join(".whipple/versions/1"))
+                .unwrap();
+        let old_discipline = discipline::load(
+            &root.join(".whipple/discipline/versions/1"),
+            old.capabilities().iter().cloned(),
+        )
+        .unwrap();
+        let mut agent = guard.library.agents[DEFAULT_AGENT].clone();
+        agent.versions.get_mut(&1).unwrap().package_ref = old.version_ref().to_owned();
+        agent.versions.get_mut(&1).unwrap().discipline_ref = old_discipline.reference;
+        guard.write_agent_record(agent);
+    }
+    drop(wb);
+
+    let reopened = open_workbench(dir.path()).expect("legacy Default publishes task ability");
+    let guard = reopened.lock_unpoisoned();
+    assert_eq!(guard.library.agents[DEFAULT_AGENT].current_version, 2);
+    let root = dir
+        .path()
+        .join("targets")
+        .join(library_state::authoring_target_id(DEFAULT_AGENT))
+        .join("repo");
+    let version =
+        gaugedesk_whip_runtime::AuthoredAgentPackage::load(root.join(".whipple/versions/2"))
+            .unwrap();
+    assert!(version
+        .resolve(version.version_ref())
+        .unwrap()
+        .tools
+        .iter()
+        .any(|tool| tool.name == "add_todo"));
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".whipple/versions/2/package.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["schema"], "whipplescript.agent_package.v1");
+    assert_eq!(
+        std::fs::read_to_string(root.join(".whipple/versions/2/AGENTS.md")).unwrap(),
+        ""
+    );
+}
+
+#[test]
+fn task_ability_setting_updates_a_custom_agents_draft_package() {
+    let (dir, wb) = seeded_workbench();
+    let mut guard = wb.lock_unpoisoned();
+    let id = app_support::SOFTWARE_ENGINEER_AGENT;
+    let mut abilities = guard.archetype_abilities(id).unwrap();
+    assert!(!abilities.contains(&"tracker.file".to_owned()));
+    abilities.push("tracker.file".to_owned());
+    guard.set_archetype_abilities(id, abilities).unwrap();
+    assert!(guard
+        .archetype_abilities(id)
+        .unwrap()
+        .contains(&"tracker.file".to_owned()));
+
+    let root = dir
+        .path()
+        .join("targets")
+        .join(library_state::authoring_target_id(id))
+        .join("repo");
+    let draft = gaugedesk_whip_runtime::AuthoredAgentPackage::load(root.join(".whipple/draft"))
+        .expect("settings wrote a valid authored draft");
+    assert!(draft
+        .resolve(draft.version_ref())
+        .unwrap()
+        .tools
+        .iter()
+        .any(|tool| tool.name == "add_todo"));
+    discipline::load(
+        &root.join(".whipple/discipline/draft"),
+        draft.capabilities().iter().cloned(),
+    )
+    .expect("discipline agrees with the new package registry");
+    let frozen =
+        gaugedesk_whip_runtime::AuthoredAgentPackage::load(root.join(".whipple/versions/1"))
+            .unwrap();
+    assert!(!frozen
+        .resolve(frozen.version_ref())
+        .unwrap()
+        .tools
+        .iter()
+        .any(|tool| tool.name == "add_todo"));
 }
 
 #[test]
@@ -3457,8 +3810,17 @@ async fn workspace_seeds_built_in_archetypes_and_official_office_skills() {
     )
     .unwrap();
     assert_eq!(office_manifest["skills"].as_array().unwrap().len(), 4);
+    let office_package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(
+        d.path()
+            .join("targets")
+            .join(library_state::authoring_target_id(
+                app_support::OFFICE_WORKER_AGENT,
+            ))
+            .join("repo/.whipple/versions/1"),
+    )
+    .unwrap();
     let office_bundle =
-        discipline::load(&office_root, package.capabilities().iter().cloned()).unwrap();
+        discipline::load(&office_root, office_package.capabilities().iter().cloned()).unwrap();
     for skill in official_skills::catalog() {
         assert!(office_manifest["skills"]
             .as_array()
@@ -3864,8 +4226,21 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
         let workspace = guard.targets.get(&target_id).expect("authoring workspace");
         let id = library::gen_id("test-edit");
         let edit = workspace.create_engagement(&id).expect("edit engagement");
-        edit.write_file(".whipple/draft/persona.md", body)
-            .expect("edit persona");
+        edit.write_file("agent/SYSTEM.md", body)
+            .expect("edit optional system instructions");
+        edit.write_file("agent/reference.md", "Pinned reference\n")
+            .expect("edit Agent reference");
+        edit.write_file("agent/secondary.whip", "workflow Secondary {}\n")
+            .expect("edit unbound workflow");
+        edit.write_file("agent/third.whip", "workflow Third {}\n")
+            .expect("edit another unbound workflow");
+        edit.write_file("agent/method.whip", "workflow UnboundMethod {}\n")
+            .expect("edit unbound method-named workflow");
+        edit.write_file(
+            "agent/skills/triage/SKILL.md",
+            "---\nname: triage\ndescription: Inspect reports\n---\nRead the report.\n",
+        )
+        .expect("edit Agent skill");
         edit.commit_turn("edit package draft")
             .expect("commit draft");
         assert_eq!(
@@ -3886,7 +4261,7 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
             &serde_json::json!({
                 "schema": "gaugedesk.discipline.v1",
                 "skills": ["skill://review"],
-                "capabilities": ["workspace.read", "workspace.write", "command.run"],
+                "capabilities": ["workspace.read", "workspace.write", "command.run", "tracker.file"],
                 "assets": [{"path": "checks/verify.sh", "treatment": "managed"}],
                 "target_rules": ["requires README.md"]
             })
@@ -3934,6 +4309,22 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
         std::fs::read_to_string(frozen_discipline.join("checks/verify.sh")).unwrap(),
         "#!/bin/sh\nexit 0\n"
     );
+    assert_eq!(
+        std::fs::read_to_string(frozen_discipline.join("agent-files/reference.md")).unwrap(),
+        "Pinned reference\n"
+    );
+    assert!(frozen_discipline
+        .join("agent-files/secondary.whip")
+        .is_file());
+    assert!(frozen_discipline.join("agent-files/third.whip").is_file());
+    assert!(frozen_discipline.join("agent-files/method.whip").is_file());
+    assert!(!frozen_root.join("method.whip").exists());
+    assert!(frozen_root
+        .join(gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE)
+        .is_file());
+    assert!(frozen_discipline
+        .join("agent-skills/triage/SKILL.md")
+        .is_file());
     let discipline_ref =
         crate::discipline::load(&frozen_discipline, frozen.capabilities().iter().cloned())
             .unwrap()
@@ -3966,10 +4357,30 @@ async fn publish_atomically_freezes_package_and_discipline_without_copying_them_
     )
     .await;
     assert_eq!(status, StatusCode::OK, "upgrade: {body}");
-    let guard = wb.lock_unpoisoned();
+    let mut guard = wb.lock_unpoisoned();
     assert_eq!(
         guard.library.instances[DEFAULT_PLACEMENT].version, 2,
         "the placement pins the immutable authoring-target package"
+    );
+    let chat = guard
+        .create_default_engagement("pinned-agent-files".into(), "Pinned Agent files".into())
+        .unwrap_or_else(|_| panic!("create work chat"));
+    let paths = guard.engagement_tree(&chat.id).unwrap().unwrap();
+    assert!(paths.iter().any(|entry| entry.path == "agent/reference.md"));
+    assert!(paths
+        .iter()
+        .any(|entry| entry.path == "agent/secondary.whip"));
+    assert!(paths.iter().any(|entry| entry.path == "agent/third.whip"));
+    assert!(paths.iter().any(|entry| entry.path == "agent/method.whip"));
+    assert!(paths
+        .iter()
+        .any(|entry| entry.path == "agent/skills/triage/SKILL.md"));
+    assert_eq!(
+        guard
+            .read_engagement_file(&chat.id, "agent/reference.md")
+            .unwrap()
+            .unwrap(),
+        "Pinned reference\n"
     );
     let project_target = library_state::managed_project_target_id(DEFAULT_PROJECT);
     let acts = guard.target_acts(&project_target).unwrap();
@@ -4887,7 +5298,11 @@ async fn archetype_abilities_update_only_the_draft_manifest() {
         workspace.remove_engagement(&id).expect("remove engagement");
         body
     };
-    let source_before = read_draft(".whipple/draft/method.whip");
+    let source_path = format!(
+        ".whipple/draft/{}",
+        gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
+    );
+    let source_before = read_draft(&source_path);
     let app = open_control_plane(wb.clone());
 
     let (status, body) = send(
@@ -4910,7 +5325,7 @@ async fn archetype_abilities_update_only_the_draft_manifest() {
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["abilities"],
         serde_json::json!([])
     );
-    assert_eq!(read_draft(".whipple/draft/method.whip"), source_before);
+    assert_eq!(read_draft(&source_path), source_before);
     let manifest: serde_json::Value =
         serde_json::from_str(&read_draft(".whipple/draft/package.json")).unwrap();
     assert_eq!(manifest["agent_abilities"], serde_json::json!([]));
@@ -4925,7 +5340,12 @@ async fn archetype_abilities_update_only_the_draft_manifest() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["abilities"],
-        serde_json::json!(["command.run", "workspace.read", "workspace.write"]),
+        serde_json::json!([
+            "command.run",
+            "tracker.file",
+            "workspace.read",
+            "workspace.write"
+        ]),
         "the deployment surface must report the immutable published version, not the draft"
     );
 }

@@ -3,7 +3,7 @@
 //! A desktop Home's own directory starts empty, and every native action admits
 //! its actor from that directory, so without this the person whose Home it is
 //! could use none of them. A Cloud Home is provisioned with its tenant's owner;
-//! a desktop Home is claimed once, by the account that signs in on it.
+//! a desktop Home is claimed once, by an explicit act after account sign-in.
 //!
 //! The claim is a durable record beside the membership it grants, written in
 //! one transaction. The question it answers is "has this Home ever been
@@ -34,7 +34,7 @@ pub(crate) struct HomeOwnerClaim {
 /// What [`claim_if_never_claimed`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HomeClaim {
-    /// Nobody is signed in: the claim waits for the sign-in that makes it.
+    /// Nobody is signed in: the explicit claim waits for account selection.
     NotSignedIn,
     /// This Home was claimed before; nothing changed.
     AlreadyClaimed,
@@ -45,10 +45,61 @@ pub enum HomeClaim {
     Owner(String),
 }
 
-/// Claim this Home for the signed-in account, once (DR-0187 §1–§4). Asked on
-/// sign-in and on every reachability wake, because a computer signed in before
-/// this shipped never signs in again.
+/// Whether the selected account can claim this computer. A previous claim is
+/// never reopened merely because its owner later lost their membership.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HomeClaimState {
+    Available { projects: usize },
+    Claimed { owner: String },
+    Governed,
+}
+
+pub fn claim_state(wb: &SharedWorkbench) -> Result<HomeClaimState, String> {
+    let guard = wb.lock_unpoisoned();
+    let store = guard.store_ref();
+    let err = |error: gaugedesk_store::AdmitError| format!("home owner claim: {error:?}");
+    let claims = store.records(ORG_SCOPE, CLAIM_KIND).map_err(err)?;
+    if let Some(raw) = claims.first() {
+        return Ok(match serde_json::from_str::<HomeOwnerClaim>(raw) {
+            Ok(HomeOwnerClaim {
+                account: Some(owner),
+                ..
+            }) => HomeClaimState::Claimed { owner },
+            _ => HomeClaimState::Governed,
+        });
+    }
+    if guard.hosted_home_mode()
+        || guard.idp.is_some()
+        || Org::rebuild(store)
+            .map_err(err)?
+            .active_count_with_role("owner")
+            > 0
+    {
+        return Ok(HomeClaimState::Governed);
+    }
+    let projects = guard
+        .library
+        .projects
+        .values()
+        .filter(|project| &project.home_id == guard.home_id())
+        .count();
+    Ok(HomeClaimState::Available { projects })
+}
+
+/// Claim this Home for the signed-in account, once. Only the explicit desktop
+/// claim route calls this in production (DR-0219).
 pub fn claim_if_never_claimed(wb: &SharedWorkbench) -> Result<HomeClaim, String> {
+    claim_selected(wb, None)
+}
+
+/// The production claim route passes the account the Hub just authenticated.
+/// A selection changed during that network check cannot claim for the new
+/// account on the old account's proof.
+pub fn claim_verified_selected(wb: &SharedWorkbench, verified: &str) -> Result<HomeClaim, String> {
+    claim_selected(wb, Some(verified))
+}
+
+fn claim_selected(wb: &SharedWorkbench, verified: Option<&str>) -> Result<HomeClaim, String> {
     // Taken before the guard: reading the session locks the workbench itself.
     let Some(crate::account_signin::HubStanding {
         person: account,
@@ -58,9 +109,18 @@ pub fn claim_if_never_claimed(wb: &SharedWorkbench) -> Result<HomeClaim, String>
     else {
         return Ok(HomeClaim::NotSignedIn);
     };
+    if verified.is_some_and(|expected| expected != account) {
+        return Ok(HomeClaim::NotSignedIn);
+    }
+    if crate::account_signin::live_hub_session_actor(wb).as_deref() != Some(account.as_str()) {
+        return Ok(HomeClaim::NotSignedIn);
+    }
     let mut guard = wb.lock_unpoisoned();
     let store = guard.store_ref();
     let err = |error: gaugedesk_store::AdmitError| format!("home owner claim: {error:?}");
+    if crate::account_signin::selected_person_in_store(store).as_deref() != Some(account.as_str()) {
+        return Ok(HomeClaim::NotSignedIn);
+    }
     if !store
         .records(ORG_SCOPE, CLAIM_KIND)
         .map_err(err)?
@@ -77,6 +137,12 @@ pub fn claim_if_never_claimed(wb: &SharedWorkbench) -> Result<HomeClaim, String>
             .map_err(err)?
             .active_count_with_role("owner")
             > 0;
+    // The explicit claim refuses an already governed Home without modifying
+    // its history. The older helper preserves the original marker behavior
+    // for existing migration and unit-test callers.
+    if governed && verified.is_some() {
+        return Ok(HomeClaim::Governed);
+    }
     let claim = HomeOwnerClaim {
         account: (!governed).then(|| account.clone()),
         session: Some(session),

@@ -69,6 +69,52 @@ pub struct EngagementTaskContext {
 }
 
 impl Workbench {
+    /// A use chat reads its installed Agent definition from the frozen
+    /// package. These files are a view, not part of any selected work target.
+    fn installed_agent_view(
+        &self,
+        chat_id: &str,
+    ) -> Option<(std::path::PathBuf, serde_json::Value)> {
+        let chat = self.library.chats.get(chat_id)?;
+        let instance = self.library.instances.get(&chat.instance_id)?;
+        if instance.kind != crate::library::InstanceKind::Using {
+            return None;
+        }
+        let agent = self.library.agents.get(&instance.agent_id)?;
+        let target = self.library.authoring_target_for(&agent.id)?;
+        let root = crate::library_state::published_package_root(
+            &self.targets_dir(),
+            &target.id,
+            instance.version,
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("package.json")).ok()?).ok()?;
+        (manifest["schema"] == "whipplescript.agent_package.v1").then_some((root, manifest))
+    }
+
+    fn installed_agent_file(&self, chat_id: &str, path: &str) -> Option<Vec<u8>> {
+        let (root, manifest) = self.installed_agent_view(chat_id)?;
+        let source = manifest.get("source")?.as_str()?;
+        let system = manifest.get("system_prompt")?.as_str()?;
+        let file = match path {
+            "agent/AGENTS.md" => "AGENTS.md",
+            "agent/HUMANS.md" => "HUMANS.md",
+            "agent/SYSTEM.md" => system,
+            _ if path == format!("agent/{source}") => source,
+            _ => return None,
+        };
+        let body = std::fs::read(root.join(file)).ok()?;
+        if path == "agent/SYSTEM.md" && body.is_empty() {
+            return None;
+        }
+        if path == format!("agent/{source}")
+            && body == gaugedesk_boundary::definition::DEFAULT_METHOD_SOURCE.as_bytes()
+        {
+            return None;
+        }
+        Some(body)
+    }
+
     fn engagement_single_target_root(&self, chat_id: &str) -> Option<String> {
         let chat = self.library.chats.get(chat_id)?;
         self.library
@@ -133,7 +179,19 @@ impl Workbench {
     }
 
     pub(crate) fn engagement_workspace_path(&self, chat_id: &str, path: &str) -> String {
-        if path == "targets"
+        if (path == "agent" || path.starts_with("agent/"))
+            && self.installed_agent_view(chat_id).is_some()
+        {
+            return format!(
+                "{}/{path}",
+                gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT
+            );
+        }
+        if path == "artifacts"
+            || path.starts_with("artifacts/")
+            || path == "work"
+            || path.starts_with("work/")
+            || path == "targets"
             || path.starts_with("targets/")
             || path == gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT
             || path.starts_with(&format!(
@@ -536,7 +594,59 @@ impl Workbench {
 
     /// The current file manifest for a live engagement.
     pub fn engagement_tree(&self, chat_id: &str) -> Option<Result<Vec<FileEntry>, WorkspaceError>> {
-        self.engagements.get(chat_id).map(|eng| eng.tree())
+        self.engagements.get(chat_id).map(|eng| {
+            let mut entries = eng.tree()?;
+            if self.installed_agent_view(chat_id).is_some() {
+                let runtime_agent = format!(
+                    "{}/agent/",
+                    gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT
+                );
+                let visible = entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry
+                            .path
+                            .strip_prefix(&runtime_agent)
+                            .map(|suffix| FileEntry {
+                                path: format!("agent/{suffix}"),
+                                is_dir: entry.is_dir,
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                entries.extend(visible);
+                entries.push(FileEntry {
+                    path: "agent".to_owned(),
+                    is_dir: true,
+                });
+                entries.push(FileEntry {
+                    path: "agent/skills".to_owned(),
+                    is_dir: true,
+                });
+                for path in ["agent/AGENTS.md", "agent/HUMANS.md", "agent/SYSTEM.md"] {
+                    if self.installed_agent_file(chat_id, path).is_some() {
+                        entries.push(FileEntry {
+                            path: path.to_owned(),
+                            is_dir: false,
+                        });
+                    }
+                }
+                if let Some((_, manifest)) = self.installed_agent_view(chat_id) {
+                    if let Some(source) = manifest.get("source").and_then(serde_json::Value::as_str)
+                    {
+                        let path = format!("agent/{source}");
+                        if self.installed_agent_file(chat_id, &path).is_some() {
+                            entries.push(FileEntry {
+                                path,
+                                is_dir: false,
+                            });
+                        }
+                    }
+                }
+            }
+            entries.sort_by(|a, b| a.path.cmp(&b.path));
+            entries.dedup_by(|a, b| a.path == b.path);
+            Ok(entries)
+        })
     }
 
     /// Read one file from a live engagement worktree.
@@ -545,6 +655,11 @@ impl Workbench {
         chat_id: &str,
         path: &str,
     ) -> Option<Result<String, WorkspaceError>> {
+        if let Some(bytes) = self.installed_agent_file(chat_id, path) {
+            return Some(String::from_utf8(bytes).map_err(|error| WorkspaceError {
+                message: error.to_string(),
+            }));
+        }
         let path = self.engagement_workspace_path(chat_id, path);
         self.engagements
             .get(chat_id)
@@ -561,6 +676,9 @@ impl Workbench {
         path: &str,
         max_bytes: usize,
     ) -> Option<Result<Option<Vec<u8>>, WorkspaceError>> {
+        if let Some(bytes) = self.installed_agent_file(chat_id, path) {
+            return Some(Ok((bytes.len() <= max_bytes).then_some(bytes)));
+        }
         let path = self.engagement_workspace_path(chat_id, path);
         self.engagements
             .get(chat_id)
@@ -637,6 +755,8 @@ impl Workbench {
         let source = command.path();
         let file_manager_protected = |path: &str| {
             path == "targets"
+                || path == "artifacts"
+                || path == "work"
                 || path == ".whipple"
                 || gaugedesk_boundary::is_method_surface_path(path)
                 || gaugedesk_boundary::is_control_surface_path(path)
@@ -842,6 +962,37 @@ impl Workbench {
 
     fn authorize_file_edit(&self, chat_id: &str, path: &str) -> Result<(), &'static str> {
         let normalized = path.trim_start_matches("./");
+        if normalized == "agent" || normalized.starts_with("agent/") {
+            let chat = self
+                .library
+                .chats
+                .get(chat_id)
+                .ok_or("no such engagement")?;
+            let instance = self
+                .library
+                .instances
+                .get(&chat.instance_id)
+                .ok_or("chat instance is unavailable")?;
+            if instance.kind == crate::library::InstanceKind::Using {
+                return Err("installed Agent files are read-only; edit the Agent draft and publish a version");
+            }
+        }
+        let run_file = normalized.starts_with("artifacts/") || normalized.starts_with("work/");
+        if run_file {
+            let chat = self
+                .library
+                .chats
+                .get(chat_id)
+                .ok_or("no such engagement")?;
+            let instance = self
+                .library
+                .instances
+                .get(&chat.instance_id)
+                .ok_or("chat instance is unavailable")?;
+            if instance.kind == crate::library::InstanceKind::Using {
+                return Ok(());
+            }
+        }
         if gaugedesk_boundary::is_control_surface_path(normalized) {
             return Err("GaugeDesk runtime settings must be changed through Settings");
         }
@@ -1731,6 +1882,7 @@ pub(crate) async fn post_task(
     Path(id): Path<String>,
     headers: HeaderMap,
     actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
+    authenticated: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
     Json(body): Json<TaskBody>,
 ) -> impl IntoResponse {
     // Brief lock: confirm the engagement and grab its worktree, live sender, mode.
@@ -1754,6 +1906,7 @@ pub(crate) async fn post_task(
     let task = body.prompt;
     let images = body.images;
     let actor = actor.map(|axum::extract::Extension(actor)| actor.0);
+    let authenticated = authenticated.map(|axum::extract::Extension(context)| context);
     let id2 = id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         engine::run_engagement_turn(
@@ -1766,6 +1919,7 @@ pub(crate) async fn post_task(
                 images: &images,
                 mode,
                 authenticated_actor: actor.as_ref(),
+                authenticated_context: authenticated.as_ref(),
                 contribution_by: None,
                 account_scope: &account_scope,
                 tenant_scope: &tenant_scope,
@@ -2307,6 +2461,33 @@ mod multi_target_edit_authorization_tests {
     use crate::{open_workbench, LockUnpoisoned, DEFAULT_PLACEMENT, DEFAULT_PROJECT};
 
     #[test]
+    fn use_chat_shows_the_frozen_agent_entry_point_as_read_only() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = open_workbench(root.path()).unwrap();
+        let mut workbench = workbench.lock_unpoisoned();
+        let chat = workbench
+            .create_default_engagement("agent-view-chat".to_owned(), "Agent view".to_owned())
+            .unwrap_or_else(|_| panic!("create Agent work chat"));
+        let entries = workbench.engagement_tree(&chat.id).unwrap().unwrap();
+        assert!(entries.iter().any(|entry| entry.path == "agent/AGENTS.md"));
+        assert!(entries.iter().any(|entry| entry.path == "agent/HUMANS.md"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.path == "agent/skills" && entry.is_dir));
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.path == "agent/method.whip"));
+        assert!(workbench
+            .read_engagement_file(&chat.id, "agent/AGENTS.md")
+            .unwrap()
+            .unwrap()
+            .contains("Agent conventions"));
+        assert!(workbench
+            .authorize_file_edit(&chat.id, "agent/AGENTS.md")
+            .is_err());
+    }
+
+    #[test]
     fn editor_resolves_one_target_root_and_refuses_read_only_members() {
         let root = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
@@ -2363,5 +2544,23 @@ mod multi_target_edit_authorization_tests {
             workbench.authorize_file_edit(chat_id, "unrooted.txt"),
             Err("a multi-target edit must name one selected target root")
         );
+        assert!(workbench
+            .authorize_file_edit(chat_id, "artifacts/report.md")
+            .is_ok());
+        assert!(workbench
+            .authorize_file_edit(chat_id, "work/notes.md")
+            .is_ok());
+        assert_eq!(
+            workbench.engagement_workspace_path(chat_id, "artifacts/report.md"),
+            "artifacts/report.md"
+        );
+        workbench
+            .write_engagement_file(chat_id, "artifacts/report.md", "report")
+            .unwrap()
+            .unwrap();
+        assert!(workbench.engagements[chat_id]
+            .diff_against_main()
+            .unwrap()
+            .is_empty());
     }
 }

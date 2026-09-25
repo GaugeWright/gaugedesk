@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
     handoffCodeFromPaste,
     hubSessionCallback,
+    hubSessionClaimHome,
     hubSessionAccounts,
     hubSessionReach,
     hubSessionSelect,
@@ -99,6 +100,7 @@ describe("hub session wrappers", () => {
             expires: 5,
             expired: false,
             device: null,
+            homeClaim: null,
         });
         expect(calls[0].path).toBe("/account/hub-session");
 
@@ -113,7 +115,23 @@ describe("hub session wrappers", () => {
             expires: null,
             expired: false,
             device: null,
+            homeClaim: null,
         });
+    });
+
+    it("shows the unclaimed local project count and sends the exact selected account to claim", async () => {
+        const calls: Array<{ path: string; body?: unknown }> = [];
+        const status = await hubSessionStatus(jsonReturning({
+            linked: true, person: "alice", home_claim: { state: "available", projects: 3 },
+        }, calls));
+        expect(status.homeClaim).toEqual({ state: "available", projects: 3 });
+        const claimed = await hubSessionClaimHome(jsonReturning({
+            linked: true, person: "alice", home_claim: { state: "claimed", owner: "alice" },
+        }, calls), "alice");
+        expect(calls.at(-1)).toEqual({
+            path: "/account/hub-session/claim-home", body: { person: "alice", confirm: true },
+        });
+        expect(claimed.homeClaim).toEqual({ state: "claimed", owner: "alice" });
     });
 
     it("start demands a login URL", async () => {

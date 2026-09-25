@@ -12,16 +12,9 @@ import { Icon } from "./icons";
 import { LoadError } from "./LoadError";
 import { RunDot, runsLaunched } from "./WhipRun";
 
-// Config/plumbing artifacts (#6): dotfiles like `.agent-config.json` are
-// implementation, not the user's deliverable. Hidden from the Files list by
-// default. The authored package draft is the deliverable in an edit chat, so it
-// is visible there even though it lives under `.whipple`.
-const isInternal = (path: string, editChat: boolean) =>
-    path.split("/").some((seg) => seg.startsWith("."))
-    && !(editChat && (
-        path.startsWith(".whipple/draft/") ||
-        path.startsWith(".whipple/discipline/draft/")
-    ));
+// Generated packages and control files are available in the advanced view.
+// The ordinary tree starts with the authored Agent files and run results.
+const isInternal = (path: string) => path.split("/").some((seg) => seg.startsWith("."));
 
 export interface WorkspaceProps {
     readonly roots?: readonly { path: string; name: string; writable: boolean }[];
@@ -55,20 +48,20 @@ export function Workspace(props: WorkspaceProps = {}) {
         ([id]) => (id ? session.api.getTree(id) : Promise.resolve([])),
     );
     const [showInternal, setShowInternal] = createSignal(false);
-    const [collapsed, setCollapsed] = createSignal<ReadonlySet<string>>(new Set());
+    const [collapsed, setCollapsed] = createSignal<ReadonlySet<string>>(new Set(["agent"]));
     const [menu, setMenu] = createSignal<MenuState | null>(null);
     const [dialog, setDialog] = createSignal<FileDialog | null>(null);
     const [name, setName] = createSignal("");
     const [rootChoice, setRootChoice] = createSignal("");
     const [error, setError] = createSignal("");
     const [saving, setSaving] = createSignal(false);
-    const editChat = () => session.chatKind() === "edit";
     const roots = () => props.roots?.length ? props.roots : [{ path: "", name: "Chat workspace", writable: true }];
     const writableRoots = () => roots().filter((root) => root.writable);
     const rootFor = (path: string) => roots().find((root) => root.path && (path === root.path || path.startsWith(`${root.path}/`)));
     const isRoot = (path: string) => roots().some((root) => root.path && root.path === path);
     const isProtected = (path: string) =>
-        path === "targets" || path === ".whipple" || path.startsWith(".whipple/")
+        (session.chatKind() !== "edit" && (path === "agent" || path.startsWith("agent/")))
+        || path === "targets" || path === ".whipple" || path.startsWith(".whipple/")
         || path === ".gaugedesk-runtime"
         || path.startsWith(".gaugedesk-runtime/") || path.includes("/.gaugedesk-runtime/")
         || path.startsWith("builder_only/")
@@ -81,12 +74,18 @@ export function Workspace(props: WorkspaceProps = {}) {
     const allEntries = () => (tree() ?? []).filter((entry) => leafOf(entry.path) !== FOLDER_MARKER);
     const allFiles = () => allEntries().filter((entry) => !entry.isDir);
     const visibleEntries = createMemo(() => {
-        if (showInternal()) return allEntries();
-        const ordinary = allEntries().filter((entry) => !isInternal(entry.path, editChat()));
-        return allEntries().filter((entry) => ordinary.includes(entry)
-            || (entry.isDir && ordinary.some((child) => child.path.startsWith(`${entry.path}/`))));
+        const order = (path: string) => {
+            const root = path.split("/", 1)[0];
+            return root === "artifacts" ? 0 : root === "work" ? 1 : root === "agent" ? 2 : 3;
+        };
+        const ordered = (entries: readonly FileEntry[]) => [...entries].sort((a, b) =>
+            order(a.path) - order(b.path) || a.path.localeCompare(b.path));
+        if (showInternal()) return ordered(allEntries());
+        const ordinary = allEntries().filter((entry) => !isInternal(entry.path));
+        return ordered(allEntries().filter((entry) => ordinary.includes(entry)
+            || (entry.isDir && ordinary.some((child) => child.path.startsWith(`${entry.path}/`)))));
     });
-    const hiddenCount = createMemo(() => allFiles().filter((entry) => isInternal(entry.path, editChat())).length);
+    const hiddenCount = createMemo(() => allFiles().filter((entry) => isInternal(entry.path)).length);
     const rows = () => visibleEntries().filter((entry) => {
         if (entry.path === "targets" && props.roots?.some((root) => root.path.startsWith("targets/"))) return false;
         let parent = parentOf(entry.path);

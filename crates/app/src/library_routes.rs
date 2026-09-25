@@ -68,20 +68,66 @@ pub async fn get_workspace(
         crate::net_http::bearer(&headers),
         &crate::workbench_auth::req_scope(&headers),
     );
-    Json(scope_workspace_value(&wb, workspace_value(&wb), &vis)).into_response()
+    let actor = workspace_actor(&wb, &headers);
+    Json(scope_workspace_value(
+        &wb,
+        workspace_value(&wb),
+        &vis,
+        actor.as_deref(),
+    ))
+    .into_response()
+}
+
+pub(crate) fn workspace_actor(wb: &Workbench, headers: &axum::http::HeaderMap) -> Option<String> {
+    match crate::net_http::bearer(headers) {
+        Some(bearer) => wb
+            .authenticate_bearer(bearer)
+            .map(|actor| actor.as_str().to_owned()),
+        None => wb.home_owner_account(),
+    }
 }
 
 /// **ENTSEC-2** ([ADR 0065]): prune a workspace projection to what the caller may see — drop
 /// projects that are not visible and any recent chat outside a visible project. Under
-/// [`ProjectVisibility::All`] (solo / owner / admin / bootstrap) it is a no-op, so the
-/// single-user shape is untouched. The archetype library is shared method truth (a placement
+/// [`ProjectVisibility::All`] (solo / owner / admin / bootstrap), ordinary projects
+/// are untouched; Tutorials still shows only the learner's own instance. The
+/// archetype library is shared method truth (a placement
 /// shows its archetype's name as lineage), so it is not project-scoped here.
 pub fn scope_workspace_value(
     wb: &Workbench,
     mut value: serde_json::Value,
     vis: &crate::workbench_auth::ProjectVisibility,
+    actor: Option<&str>,
 ) -> serde_json::Value {
     use crate::workbench_auth::ProjectVisibility;
+    // Owner/admin can administer every project, but the everyday Projects
+    // facet shows only the Tutorials instance belonging to this learner.
+    let own_product_project = |id: &str| {
+        wb.library.projects.get(id).is_some_and(|project| {
+            !crate::shipped_tutorials::is_tutorial_project(project)
+                || project
+                    .extra
+                    .get("product")
+                    .and_then(|v| v.get("learner"))
+                    .and_then(|v| v.as_str())
+                    == actor
+        })
+    };
+    if let Some(projects) = value.get_mut("projects").and_then(|p| p.as_array_mut()) {
+        projects.retain(|p| {
+            p.get("id")
+                .and_then(|i| i.as_str())
+                .is_some_and(&own_product_project)
+        });
+    }
+    if let Some(recent) = value.get_mut("recent").and_then(|r| r.as_array_mut()) {
+        recent.retain(|chat| {
+            chat.get("id")
+                .and_then(|i| i.as_str())
+                .and_then(|id| wb.library.project_of_chat(id))
+                .is_none_or(&own_product_project)
+        });
+    }
     if matches!(vis, ProjectVisibility::All) {
         return value;
     }
@@ -874,6 +920,14 @@ pub fn create_named_project(
     requested_name: &str,
 ) -> Result<serde_json::Value, String> {
     let name = requested_name.trim();
+    if wb
+        .library
+        .projects
+        .get(id)
+        .is_some_and(crate::shipped_tutorials::is_tutorial_project)
+    {
+        return Err("Tutorials is maintained by GaugeWright".into());
+    }
     if name.is_empty() || name.chars().count() > 120 {
         return Err("project name must be between 1 and 120 characters".to_owned());
     }

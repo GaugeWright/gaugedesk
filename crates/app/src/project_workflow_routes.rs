@@ -63,8 +63,8 @@ pub async fn launch(
     }
 }
 
-/// `POST /tutorials/:name/start` — start, or find, the signed-in owner's run of
-/// a tutorial GaugeDesk ships (WHIP-5, DR-0192). The Home supplies the source,
+/// `POST /tutorials/:name/start` — start, or find, the learner's run of
+/// a tutorial GaugeDesk ships (WHIP-5, DR-0225). The Home supplies the source,
 /// revision and learner; the request carries nothing but who is asking. Asked
 /// again, it answers with the run that exists.
 pub async fn start_shipped_tutorial(
@@ -83,6 +83,28 @@ pub async fn start_shipped_tutorial(
         Err(error) => {
             tracing::info!(tutorial = %name, %error, "tutorial start refused");
             problem(StatusCode::CONFLICT, "The tutorial could not be started")
+        }
+    }
+}
+
+/// `GET /tutorials/:name` — the authenticated learner's installed source and
+/// ordinary workflow/tracker status for the Tutorials project surface.
+pub async fn shipped_tutorial_info(
+    State(wb): State<SharedWorkbench>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+) -> Response {
+    let mut wb = wb.lock_unpoisoned();
+    let Some(context) = crate::project_tracker_routes::context(&mut wb, &headers, authenticated)
+    else {
+        return problem(StatusCode::UNAUTHORIZED, "Sign in to view tutorials");
+    };
+    match wb.shipped_tutorial_info(&context, &name) {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => {
+            tracing::info!(tutorial = %name, %error, "tutorial view unavailable");
+            problem(StatusCode::NOT_FOUND, "Tutorial is unavailable")
         }
     }
 }

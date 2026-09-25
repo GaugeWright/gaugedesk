@@ -1127,7 +1127,7 @@
         "callable": "impl inherent for Workbench::revert_engagement",
         "capability": "publish",
         "count": 1,
-        "expression": "self . publish (id , ServerEvent :: Admitted { kind : \"revert\" . into () , text : \"reverted to main \u2014 engagement work discarded\" . into () , } ,)",
+        "expression": "self . publish (id , ServerEvent :: Admitted { kind : \"revert\" . into () , text : \"reverted to main — engagement work discarded\" . into () , } ,)",
         "file": "crates/app/src/engagement_routes.rs"
       },
       "profile": "editor-and-import"
@@ -1307,7 +1307,7 @@
         "callable": "admit_crossing",
         "capability": "publish",
         "count": 1,
-        "expression": "guard . publish (FED_INBOX_SCOPE , ServerEvent :: Admitted { kind : \"federated\" . into () , text : format ! (\"{} \u2190 {} : {}\" , wire . target , wire . source , wire . payload_handle) , } ,)",
+        "expression": "guard . publish (FED_INBOX_SCOPE , ServerEvent :: Admitted { kind : \"federated\" . into () , text : format ! (\"{} ← {} : {}\" , wire . target , wire . source , wire . payload_handle) , } ,)",
         "file": "crates/app/src/federation.rs"
       },
       "profile": "topology-and-settlement"
@@ -1327,7 +1327,7 @@
         "callable": "admit_remote_consent",
         "capability": "publish",
         "count": 1,
-        "expression": "guard . publish (& req . review_scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"remote consent from {} \u2192 {:?}\" , req . consenting_authority , state . phase) , } ,)",
+        "expression": "guard . publish (& req . review_scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"remote consent from {} → {:?}\" , req . consenting_authority , state . phase) , } ,)",
         "file": "crates/app/src/federation.rs"
       },
       "profile": "topology-and-settlement"
@@ -2657,7 +2657,7 @@
         "callable": "impl inherent for Workbench::admit_export_command",
         "capability": "publish",
         "count": 1,
-        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"export\" . into () , text : format ! (\"export \u2192 {:?}\" , admission . state . phase) , } ,)",
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"export\" . into () , text : format ! (\"export → {:?}\" , admission . state . phase) , } ,)",
         "file": "crates/app/src/lifecycle_routes.rs"
       },
       "profile": "publication-review"
@@ -2667,7 +2667,7 @@
         "callable": "impl inherent for Workbench::admit_review_command",
         "capability": "publish",
         "count": 1,
-        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"review \u2192 {:?}\" , admission . state . phase) , } ,)",
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"review → {:?}\" , admission . state . phase) , } ,)",
         "file": "crates/app/src/lifecycle_routes.rs"
       },
       "profile": "publication-review"
@@ -2677,7 +2677,7 @@
         "callable": "impl inherent for Workbench::admit_run_command",
         "capability": "publish",
         "count": 1,
-        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"run\" . into () , text : format ! (\"run \u2192 {:?}\" , admission . state . phase) , } ,)",
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"run\" . into () , text : format ! (\"run → {:?}\" , admission . state . phase) , } ,)",
         "file": "crates/app/src/lifecycle_routes.rs"
       },
       "profile": "publication-review"
@@ -4864,33 +4864,43 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::ensure_shipped_tutorials",
+        "callable": "impl inherent for Workbench::ensure_tutorial_project",
         "capability": "current_main_cut",
         "count": 1,
-        "expression": "target . current_main_cut ()",
+        "expression": "self . targets [& target_id] . current_main_cut ()",
         "file": "crates/app/src/shipped_tutorials.rs"
       },
       "profile": "startup-and-migration"
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::ensure_shipped_tutorials",
+        "callable": "impl inherent for Workbench::ensure_tutorial_project",
         "capability": "init_at",
         "count": 1,
-        "expression": "self . workspace_provider (TUTORIALS_TARGET) . init_at (& self . targets_dir () . join (TUTORIALS_TARGET))",
+        "expression": "self . workspace_provider (& target_id) . init_at (& self . targets_dir () . join (& target_id))",
         "file": "crates/app/src/shipped_tutorials.rs"
       },
       "profile": "startup-and-migration"
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::ensure_shipped_tutorials",
+        "callable": "impl inherent for Workbench::ensure_tutorial_project",
         "capability": "seed_main_exactly",
         "count": 1,
-        "expression": "self . targets [TUTORIALS_TARGET] . seed_main_exactly (SHIPPED , \"whip\")",
+        "expression": "self . targets [& target_id] . seed_main_exactly (SHIPPED , \"whip\")",
         "file": "crates/app/src/shipped_tutorials.rs"
       },
       "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::shipped_tutorial_info",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "target . read_main_file (& file)",
+        "file": "crates/app/src/shipped_tutorials.rs"
+      },
+      "profile": "editor-and-import"
     },
     {
       "site": {
@@ -5071,6 +5081,396 @@
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (\"agent/AGENTS.md\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (\"agent/HUMANS.md\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (\"agent/SYSTEM.md\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& authored_source)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& format ! (\"{draft}/package.json\"))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{draft}/AGENTS.md\") , & agents)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{draft}/HUMANS.md\") , & humans)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{draft}/{source_name}\") , & source)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::freeze_archetype_draft",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{draft}/{system_name}\") , & system)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (\"migrate Agent draft files\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "open_at",
+        "count": 1,
+        "expression": "provider_for (providers , & target . id) . open_at (& targets_dir . join (& target . id))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& format ! (\"{}/{}\" , files :: DRAFT_ROOT , source_name))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& format ! (\"{}/{}\" , files :: DRAFT_ROOT , system_name))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& manifest_path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (\"agent/AGENTS.md\" , \"\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (\"agent/HUMANS.md\" , files :: HUMAN_GUIDE)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (\"agent/SYSTEM.md\" , & system)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (\"agent/skills/.gaugedesk-folder\" , \"\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"agent/{source_name}\") , & source)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{}/AGENTS.md\" , files :: DRAFT_ROOT) , \"\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{}/{}\" , files :: DRAFT_ROOT , files :: GENERATED_CHAT_SOURCE_FILE) , & source ,)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_file_drafts",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& manifest_path , & format ! (\"{}\\n\" , serde_json :: to_string_pretty (& manifest) . map_err (io) ?) ,)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& discipline_path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& source_path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& discipline_path , & format ! (\"{}\\n\" , serde_json :: to_string_pretty (& discipline) . map_err (| error | error . to_string ()) ?) ,)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::set_archetype_abilities",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& source_path , & source)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (\"publish Default agent task filing ability\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "open_at",
+        "count": 1,
+        "expression": "provider_for (providers , & target . id) . open_at (& targets_dir . join (& target . id))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& format ! (\"{root}/{file}\"))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& format ! (\"{v1}/{}\" , gaugedesk_boundary :: definition :: HUMANS_FILE))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& v2_manifest)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& format ! (\"{v2}/{}\" , gaugedesk_boundary :: definition :: HUMANS_FILE) , & humans ,)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_default_task_ability",
+        "capability": "write_file",
+        "count": 2,
+        "expression": "engagement . write_file (& path , body)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
     }
   ]
 }

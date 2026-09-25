@@ -195,7 +195,7 @@ export interface ArchetypeNode {
     readonly workstreams: WorkstreamNode[];
 }
 export type AgentKind = "work" | "panel";
-export type AgentAbility = "workspace.read" | "workspace.write" | "command.run";
+export type AgentAbility = "workspace.read" | "workspace.write" | "command.run" | "tracker.file";
 
 export interface PublicDeploymentBindingSummary {
     readonly id: string;
@@ -211,8 +211,9 @@ export interface PlacementNode {
     readonly kind: AgentKind;
     readonly archetypeId: ArchetypeId;
     readonly archetypeName: string;
-    /** The project's built-in **general** placement (project-tied default): the nav hides
-     *  it as a node and shows its chats directly under the project (WS-H / project.md). */
+    /** The project's built-in **general** placement (project-tied default): Recent
+     *  activity shows its chats directly under the project; Agent view shows the
+     *  placement as a node with its chats underneath. */
     readonly isDefault: boolean;
     /** Whether this placement carries a config-only customization (config overlay or
      *  notes) — the nav badges it so a customized client placement is legible. */
@@ -243,6 +244,8 @@ export interface ProjectNode {
     readonly name: string;
     /** The always-visible zero-setup personal trust boundary (ADR 0097). */
     readonly isPersonal: boolean;
+    /** Release-managed project, when the product owns its source and layout. */
+    readonly product?: { readonly kind: "tutorials"; readonly publisher: string } | null;
     /** Network egress posture (RF-B3): `true` isolates this project's chats from
      *  the network (fail-closed); `false` (the default) lets them reach the model. */
     readonly networkIsolated: boolean;
@@ -810,6 +813,7 @@ export function parseWorkspace(raw: unknown): Workspace {
             home_id?: string;
             name: string;
             is_personal?: boolean;
+            product?: { kind?: string; publisher?: string } | null;
             network_isolated?: boolean;
             targets: unknown[];
             placements: {
@@ -855,6 +859,7 @@ export function parseWorkspace(raw: unknown): Workspace {
             homeId: (p.home_id ?? "") as HomeId,
             name: p.name,
             isPersonal: p.is_personal ?? false,
+            product: p.product?.kind === "tutorials" ? { kind: "tutorials", publisher: p.product.publisher ?? "GaugeWright" } : null,
             networkIsolated: p.network_isolated ?? false,
             targets: valueList(p.targets, "project.targets").map(parseWorkTarget),
             placements: p.placements.map((pl) => ({

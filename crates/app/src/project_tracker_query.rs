@@ -1,6 +1,7 @@
 //! Current-recipient discovery and reads of project-owned native trackers.
 use super::*;
 use gaugedesk_workspace::WorkflowProtection;
+use whipplescript_store::tracker_filing::{TrackerFiling, TrackerFilings};
 fn query_error(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
 }
@@ -118,6 +119,81 @@ fn visible(snapshot: &Snapshot, actor: &str) -> Result<Option<ReadableProjectTra
 }
 
 impl Workbench {
+    /// File a real issue in the current project's Home-owned tasks tracker.
+    /// The package tool is only an intent: this path rechecks the actor,
+    /// project, resource policy, handoff state, and protected store at use.
+    pub(crate) fn file_agent_project_task(
+        &mut self,
+        context: &AuthenticatedActionContext,
+        project: &str,
+        chat_id: &str,
+        operation_id: &str,
+        content: &str,
+    ) -> Result<String, String> {
+        let content = content.trim();
+        if content.is_empty()
+            || content.len() > 16 * 1024
+            || chat_id.trim().is_empty()
+            || operation_id.trim().is_empty()
+        {
+            return Err("task content or operation identity is invalid".to_owned());
+        }
+        if self.library_project_of_chat(chat_id).as_deref() != Some(project) {
+            return Err("task chat no longer belongs to this project".to_owned());
+        }
+        let (tracker, basis) = self
+            .prepare_project_tracker_read(
+                context,
+                project,
+                crate::project_tracker::PROJECT_TASKS,
+                TrackerPermission::Contribute,
+            )
+            .map_err(query_error)?;
+        crate::federation::require_project_writes_available(self.store_ref(), project)
+            .map_err(query_error)?;
+        let key = self.workflow_key(project, &tracker.workspace_id, true)?;
+        let protection =
+            WorkflowProtection::new(&tracker.workspace_id, key.clone()).map_err(query_error)?;
+        let storage = self.workflow_storage(&tracker.workspace_id)?;
+        let (title, body) = content
+            .split_once('\n')
+            .map_or((content, ""), |(title, body)| (title.trim(), body.trim()));
+        if title.is_empty() || title.len() > 512 {
+            return Err("task title must be 1–512 bytes".to_owned());
+        }
+        let filing = TrackerFiling {
+            operation_id: operation_id.to_owned(),
+            instance_id: format!("project-agent-chat:{chat_id}"),
+            effect_id: operation_id.to_owned(),
+            actor: context.actor().as_str().to_owned(),
+            queue: tracker.queue,
+            title: title.to_owned(),
+            body: body.to_owned(),
+            labels: Vec::new(),
+            metadata: serde_json::json!({"source": "agent"}),
+            assigned_to: Some(context.actor().as_str().to_owned()),
+        };
+        let mut writer = self.store_ref().sibling().map_err(query_error)?;
+        let item_id = writer
+            .with_dispatch_basis(&basis, || {
+                key.retain(|| {
+                    let mut stores = storage
+                        .initialize_protected(&protection)
+                        .map_err(|error| std::io::Error::other(query_error(error)))?;
+                    stores
+                        .runtime
+                        .items
+                        .file_issue_once(&filing)
+                        .map(|receipt| receipt.item_id)
+                        .map_err(|error| std::io::Error::other(query_error(error)))
+                })
+            })
+            .map_err(query_error)?
+            .map_err(query_error)?;
+        self.notify_library_changed("project_tracker", project, "upsert");
+        Ok(item_id)
+    }
+
     /// The person's queue is a projection of a currently readable native tracker.
     /// Assignment is a filter, never admission and never inferred from a claim.
     pub fn read_project_tracker_tasks(

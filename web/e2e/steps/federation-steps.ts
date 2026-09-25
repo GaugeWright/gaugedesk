@@ -157,8 +157,11 @@ Given("the two federated workbenches are open", async ({ page, request }) => {
     await page.locator(".menu-item", { hasText: "new workstream" }).click();
     await page.locator(".inline-edit").fill("Federated line");
     await page.locator(".inline-edit").press("Enter");
-    const lens = invitedProject.locator(".tree-node.project .lens-toggle");
-    if ((await lens.getAttribute("data-lens")) === "chats") await lens.click();
+    const lens = invitedProject.locator(".tree-node.project .lens-sort");
+    if ((await lens.getAttribute("data-lens")) === "chats") {
+        await lens.click();
+        await page.getByRole("menuitemradio", { name: "Agent view" }).click();
+    }
     await expect(
         invitedProject.locator(".ws-group", {
             has: page.locator(".ws-label-name", { hasText: "Federated line" }),

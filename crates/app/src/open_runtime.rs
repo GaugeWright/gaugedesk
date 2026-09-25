@@ -249,10 +249,8 @@ pub(crate) async fn supervise_home_reachability(
         .subscribe();
     let mut parked: Option<ParkedLeg> = None;
     loop {
-        // A computer already signed in when DR-0183 shipped never crosses the
-        // sign-in transition again, so the attach that transition performs is
-        // also asked from state here — `first_home::attach_if_never_offered`
-        // says why, and why it is not simply "not active".
+        // An already claimed computer may need its reachability attachment
+        // reconciled from state. An unclaimed computer remains local-only.
         match crate::first_home::attach_if_never_offered(&wb, &root) {
             Ok(true) => eprintln!(
                 "[first-home] library sync attached; this computer is now publishing its reachability"
@@ -260,20 +258,11 @@ pub(crate) async fn supervise_home_reachability(
             Ok(false) => {}
             Err(error) => tracing::warn!("first Home not attached: {error}"),
         }
-        // Claimed from state for the same reason (DR-0187 §4). Asked on every
-        // wake; after the first claim it is one read that changes nothing.
-        match crate::home_owner::claim_if_never_claimed(&wb) {
-            Ok(crate::home_owner::HomeClaim::Owner(account)) => {
-                eprintln!("[home-owner] {account} owns this Home")
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!("Home owner not claimed: {error}"),
-        }
-        // The owner's Tutorials folder, brought to this release (DR-0192).
-        // After the first pass it is one comparison that writes nothing.
+        // Each learner's GaugeWright-maintained Tutorials project (DR-0225).
+        // After the first pass its source is only compared with this release.
         match wb.lock_unpoisoned().ensure_shipped_tutorials() {
             Ok(crate::shipped_tutorials::ShippedTutorials::Updated(_)) => {
-                eprintln!("[tutorials] the Tutorials folder now holds this release's tutorials")
+                eprintln!("[tutorials] Tutorials projects now hold this release's source")
             }
             Ok(_) => {}
             Err(error) => tracing::warn!("shipped tutorials not reconciled: {error}"),
@@ -752,7 +741,11 @@ mod reachability_tests {
         wb.lock_unpoisoned()
             .upsert_account_facility(&publication(FacilityStatus::Active))
             .expect("attach publication");
-        assert!(settle(&wb, 1).await, "the Home never published a locator");
+        assert!(
+            settle(&wb, 2).await,
+            "the Home published {} of 2 locators",
+            live_locators(&wb),
+        );
         let (client, carrier) =
             gaugedesk_relay_transport::bind_client_loopback(published_route(&wb))
                 .await

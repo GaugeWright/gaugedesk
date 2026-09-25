@@ -3,14 +3,15 @@
 //! This pure reducer orders candidates, activation, revocation and erasure for
 //! one opaque owner scope. It holds exact backing references, never material.
 //! The admitting shell authenticates capabilities and Key Vault observations.
-//! Grants, single-use dispatch, independent recovery fences and provider I/O
-//! remain separate required work: this state alone must never authorize use.
+//! The dispatch ledger orders one-use final effects against rotation and
+//! revocation. The shell still must verify grants, the independent recovery
+//! fence and the exact request; this state alone must never authorize use.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ids::{
     AuthorityId, ObservationId, ScopeId, SecretHandleId, VaultBackingVersionId, VaultCandidateId,
-    VaultCredentialId,
+    VaultCredentialId, VaultDispatchId, VaultOperationId, VaultSubjectId, VaultTargetId,
 };
 use crate::{Lifecycle, Rejection};
 
@@ -76,6 +77,50 @@ impl Candidate {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UseMode {
+    AuthenticateEffect,
+    DeliverMaterial,
+}
+
+/// Secret-free identity of the exact final effect. The admitting shell checks
+/// its canonical request, target, subject and operation against a current grant.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Effect {
+    pub subject: VaultSubjectId,
+    pub operation: VaultOperationId,
+    pub target: VaultTargetId,
+    pub mode: UseMode,
+    pub request_evidence: ObservationId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchPhase {
+    Dispatched,
+    Unknown,
+    Settled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    EffectObserved,
+    NoEffectObserved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchRecord {
+    pub effect: Effect,
+    pub reference: VaultBackingVersionId,
+    pub grant_evidence: ObservationId,
+    pub fence_evidence: ObservationId,
+    pub phase: DispatchPhase,
+    pub outcome: Option<Outcome>,
+    pub outcome_evidence: Option<ObservationId>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
     pub binding: Option<Binding>,
@@ -88,6 +133,9 @@ pub struct State {
     /// Retained after cleanup so a provider version cannot be rebound to a
     /// different candidate through replay or a later intake.
     pub used_references: BTreeSet<VaultBackingVersionId>,
+    /// Retained across rotation and closure. The hosted recovery fence must
+    /// also preserve this history when an old product snapshot is restored.
+    pub dispatches: BTreeMap<VaultDispatchId, DispatchRecord>,
 }
 
 impl State {
@@ -112,6 +160,10 @@ pub enum Capability {
     ConfirmCleanup,
     OwnerClosure,
     ObserveDeadline,
+    /// Only the shell that rechecks grant, exact request and recovery fence.
+    AdmitFinalUse,
+    /// Only the custodian that authenticates final-use outcome observations.
+    ConfirmFinalUse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +206,24 @@ pub enum Operation {
     ConfirmErasure {
         evidence: ObservationId,
     },
+    Dispatch {
+        id: VaultDispatchId,
+        effect: Effect,
+        /// The version selected when the exact effect was admitted. A rotation
+        /// between work admission and final dispatch must re-admit the request.
+        expected_reference: VaultBackingVersionId,
+        grant_evidence: ObservationId,
+        fence_evidence: ObservationId,
+    },
+    OutcomeUnknown {
+        id: VaultDispatchId,
+        evidence: ObservationId,
+    },
+    SettleDispatch {
+        id: VaultDispatchId,
+        outcome: Outcome,
+        evidence: ObservationId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -190,6 +260,22 @@ pub enum Change {
     Revoked,
     ErasureFenced,
     Erased {
+        evidence: ObservationId,
+    },
+    Dispatched {
+        id: VaultDispatchId,
+        effect: Effect,
+        reference: VaultBackingVersionId,
+        grant_evidence: ObservationId,
+        fence_evidence: ObservationId,
+    },
+    DispatchOutcomeUnknown {
+        id: VaultDispatchId,
+        evidence: ObservationId,
+    },
+    DispatchSettled {
+        id: VaultDispatchId,
+        outcome: Outcome,
         evidence: ObservationId,
     },
 }
@@ -330,6 +416,56 @@ pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> 
         {
             Change::Erased { evidence }
         }
+        Operation::Dispatch {
+            id,
+            effect,
+            expected_reference,
+            grant_evidence,
+            fence_evidence,
+        } if command.capability == Capability::AdmitFinalUse
+            && state.status == Status::Active
+            && !state.dispatches.contains_key(&id)
+            && state.active_reference() == Some(&expected_reference) =>
+        {
+            Change::Dispatched {
+                id,
+                effect,
+                reference: expected_reference,
+                grant_evidence,
+                fence_evidence,
+            }
+        }
+        Operation::OutcomeUnknown { id, evidence }
+            if command.capability == Capability::ConfirmFinalUse
+                && matches!(
+                    state.dispatches.get(&id),
+                    Some(DispatchRecord {
+                        phase: DispatchPhase::Dispatched,
+                        ..
+                    })
+                ) =>
+        {
+            Change::DispatchOutcomeUnknown { id, evidence }
+        }
+        Operation::SettleDispatch {
+            id,
+            outcome,
+            evidence,
+        } if command.capability == Capability::ConfirmFinalUse
+            && matches!(
+                state.dispatches.get(&id),
+                Some(DispatchRecord {
+                    phase: DispatchPhase::Dispatched | DispatchPhase::Unknown,
+                    ..
+                })
+            ) =>
+        {
+            Change::DispatchSettled {
+                id,
+                outcome,
+                evidence,
+            }
+        }
         _ => return refuse("GaugeVault: operation lacks standing or capability"),
     };
     Ok(vec![Event {
@@ -423,6 +559,41 @@ pub fn evolve(state: &State, event: Event) -> State {
             }
         }
         Change::Erased { .. } => next.status = Status::Erased,
+        Change::Dispatched {
+            id,
+            effect,
+            reference,
+            grant_evidence,
+            fence_evidence,
+        } => {
+            next.dispatches.insert(
+                id,
+                DispatchRecord {
+                    effect,
+                    reference,
+                    grant_evidence,
+                    fence_evidence,
+                    phase: DispatchPhase::Dispatched,
+                    outcome: None,
+                    outcome_evidence: None,
+                },
+            );
+        }
+        Change::DispatchOutcomeUnknown { id, evidence } => {
+            let dispatch = next.dispatches.get_mut(&id).expect("admitted dispatch");
+            dispatch.phase = DispatchPhase::Unknown;
+            dispatch.outcome_evidence = Some(evidence);
+        }
+        Change::DispatchSettled {
+            id,
+            outcome,
+            evidence,
+        } => {
+            let dispatch = next.dispatches.get_mut(&id).expect("admitted dispatch");
+            dispatch.phase = DispatchPhase::Settled;
+            dispatch.outcome = Some(outcome);
+            dispatch.outcome_evidence = Some(evidence);
+        }
     }
     next
 }
@@ -816,6 +987,188 @@ mod tests {
                 operation: Operation::RecordStored {
                     id: VaultCandidateId::from("candidate-3"),
                     reference: VaultBackingVersionId::from("exact-version-2"),
+                },
+            }
+        )
+        .is_err());
+    }
+
+    fn effect(mode: UseMode) -> Effect {
+        Effect {
+            subject: VaultSubjectId::from("subject-1"),
+            operation: VaultOperationId::from("operation-1"),
+            target: VaultTargetId::from("target-1"),
+            mode,
+            request_evidence: ObservationId::from("request-1"),
+        }
+    }
+
+    fn dispatch(id: &str, mode: UseMode, expected_reference: &str) -> Operation {
+        Operation::Dispatch {
+            id: VaultDispatchId::from(id),
+            effect: effect(mode),
+            expected_reference: VaultBackingVersionId::from(expected_reference),
+            grant_evidence: ObservationId::from("grant-1"),
+            fence_evidence: ObservationId::from("fence-1"),
+        }
+    }
+
+    #[test]
+    fn dispatch_is_single_use_and_binds_the_exact_active_version() {
+        let mut state = active();
+        let untrusted = Command {
+            binding: binding(),
+            capability: Capability::Manage,
+            expected_revision: state.revision,
+            now: 5,
+            operation: dispatch("dispatch-1", UseMode::AuthenticateEffect, "exact-version-1"),
+        };
+        assert!(decide(&state, untrusted).is_err());
+        apply(
+            &mut state,
+            Capability::AdmitFinalUse,
+            5,
+            dispatch("dispatch-1", UseMode::AuthenticateEffect, "exact-version-1"),
+        );
+        let recorded = &state.dispatches[&VaultDispatchId::from("dispatch-1")];
+        assert_eq!(recorded.reference.as_str(), "exact-version-1");
+        assert_eq!(recorded.phase, DispatchPhase::Dispatched);
+        assert_eq!(recorded.effect.mode, UseMode::AuthenticateEffect);
+        assert!(decide(
+            &state,
+            Command {
+                binding: binding(),
+                capability: Capability::AdmitFinalUse,
+                expected_revision: state.revision,
+                now: 6,
+                operation: dispatch("dispatch-1", UseMode::DeliverMaterial, "exact-version-1"),
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rotation_and_revocation_order_dispatch_without_erasing_settlement() {
+        let mut state = active();
+        apply(
+            &mut state,
+            Capability::AdmitFinalUse,
+            5,
+            dispatch(
+                "dispatch-old",
+                UseMode::AuthenticateEffect,
+                "exact-version-1",
+            ),
+        );
+        apply(
+            &mut state,
+            Capability::Manage,
+            6,
+            Operation::BeginCandidate {
+                id: VaultCandidateId::from("candidate-2"),
+                deadline: 20,
+            },
+        );
+        apply(
+            &mut state,
+            Capability::IntakeReceipt,
+            7,
+            Operation::RecordStored {
+                id: VaultCandidateId::from("candidate-2"),
+                reference: VaultBackingVersionId::from("exact-version-2"),
+            },
+        );
+        apply(
+            &mut state,
+            Capability::Manage,
+            8,
+            Operation::Activate {
+                id: VaultCandidateId::from("candidate-2"),
+            },
+        );
+        assert!(decide(
+            &state,
+            Command {
+                binding: binding(),
+                capability: Capability::AdmitFinalUse,
+                expected_revision: state.revision,
+                now: 9,
+                operation: dispatch(
+                    "dispatch-stale",
+                    UseMode::AuthenticateEffect,
+                    "exact-version-1",
+                ),
+            }
+        )
+        .is_err());
+        apply(
+            &mut state,
+            Capability::AdmitFinalUse,
+            9,
+            dispatch("dispatch-new", UseMode::DeliverMaterial, "exact-version-2"),
+        );
+        assert_eq!(
+            state.dispatches[&VaultDispatchId::from("dispatch-old")]
+                .reference
+                .as_str(),
+            "exact-version-1"
+        );
+        assert_eq!(
+            state.dispatches[&VaultDispatchId::from("dispatch-new")]
+                .reference
+                .as_str(),
+            "exact-version-2"
+        );
+        apply(&mut state, Capability::Manage, 10, Operation::Revoke);
+        assert!(decide(
+            &state,
+            Command {
+                binding: binding(),
+                capability: Capability::AdmitFinalUse,
+                expected_revision: state.revision,
+                now: 11,
+                operation: dispatch(
+                    "dispatch-late",
+                    UseMode::AuthenticateEffect,
+                    "exact-version-2",
+                ),
+            }
+        )
+        .is_err());
+        apply(
+            &mut state,
+            Capability::ConfirmFinalUse,
+            12,
+            Operation::OutcomeUnknown {
+                id: VaultDispatchId::from("dispatch-old"),
+                evidence: ObservationId::from("unknown-1"),
+            },
+        );
+        apply(
+            &mut state,
+            Capability::ConfirmFinalUse,
+            13,
+            Operation::SettleDispatch {
+                id: VaultDispatchId::from("dispatch-old"),
+                outcome: Outcome::EffectObserved,
+                evidence: ObservationId::from("settlement-1"),
+            },
+        );
+        assert_eq!(
+            state.dispatches[&VaultDispatchId::from("dispatch-old")].phase,
+            DispatchPhase::Settled
+        );
+        assert!(decide(
+            &state,
+            Command {
+                binding: binding(),
+                capability: Capability::ConfirmFinalUse,
+                expected_revision: state.revision,
+                now: 14,
+                operation: Operation::SettleDispatch {
+                    id: VaultDispatchId::from("dispatch-old"),
+                    outcome: Outcome::NoEffectObserved,
+                    evidence: ObservationId::from("settlement-2"),
                 },
             }
         )

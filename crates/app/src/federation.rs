@@ -1028,6 +1028,7 @@ fn engine_peer_turn(
             images: &[], // remote/federated runs are text-only (no image attachments yet)
             mode: crate::library::ChatMode::Use,
             authenticated_actor: None,
+            authenticated_context: None,
             contribution_by,
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,

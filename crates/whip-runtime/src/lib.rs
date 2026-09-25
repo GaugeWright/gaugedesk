@@ -23,7 +23,7 @@ use gaugedesk_harness::sandbox::Network;
 use gaugedesk_harness::{
     ContextWindowReading, CredentialCapability, CredentialProbe, EgressGate, Harness,
     HarnessContinuitySpec, HarnessFactory, HarnessSpec, ImageContent, Observation, OutputFieldFlow,
-    RuntimePosition, ToolInfo, TurnOutcome,
+    RuntimePosition, TaskFiler, ToolInfo, TurnOutcome,
 };
 pub use whipplescript::gov::{
     external_signing_bytes, external_signing_bytes_v2, ExternalAttestation,
@@ -1386,6 +1386,60 @@ impl WhipHarnessFactory {
         .map_err(invalid_data)
     }
 
+    fn refresh_agent_skill_catalogue(&self, chat_id: &str, worktree: &Path) -> io::Result<()> {
+        let store = whipplescript_store::SqliteStore::open(chat_runtime_database(
+            &self.runtime_root,
+            chat_id,
+        ))
+        .map_err(|error| invalid_data(format!("{error:?}")))?;
+        store
+            .remove_unattached_skills_from_source("gaugedesk-agent")
+            .map_err(|error| invalid_data(format!("{error:?}")))?;
+        let root = worktree.join(".gaugedesk-runtime/agent/skills");
+        if !root.exists() {
+            return Ok(());
+        }
+        let mut entries = std::fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if !entry.file_type()?.is_dir() {
+                return Err(invalid_data("an Agent skill is not a directory"));
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let source_path = format!(".gaugedesk-runtime/agent/skills/{name}/SKILL.md");
+            let body = std::fs::read_to_string(worktree.join(&source_path))?;
+            let frontmatter =
+                whipplescript_store::skill_frontmatter::parse_skill_frontmatter(&body)
+                    .map_err(invalid_data)?;
+            if frontmatter.name != name {
+                return Err(invalid_data(format!(
+                    "Agent skill `{}` differs from its directory `{name}`",
+                    frontmatter.name
+                )));
+            }
+            let version = frontmatter
+                .metadata
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("0.0.0");
+            let metadata = serde_json::to_string(&frontmatter.metadata).map_err(invalid_data)?;
+            store
+                .register_skill(whipplescript_store::SkillRegistration {
+                    skill_id: &format!("skill:{name}"),
+                    name: &name,
+                    version,
+                    source: "gaugedesk-agent",
+                    source_path: &source_path,
+                    body: &body,
+                    description: &frontmatter.description,
+                    required_capabilities_json: "[]",
+                    metadata_json: &metadata,
+                })
+                .map_err(|error| invalid_data(format!("{error:?}")))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn package_for(
         mode: gaugedesk_harness::ChatMode,
         package_root: Option<&Path>,
@@ -1495,6 +1549,9 @@ impl WhipHarnessFactory {
             )
         })?;
         let mut runtime = self.runtime_for_chat(&spec.chat_id, epoch, signed_policy)?;
+        if spec.mode == gaugedesk_harness::ChatMode::Use {
+            self.refresh_agent_skill_catalogue(&spec.chat_id, &spec.worktree)?;
+        }
         let mut source_runtime = self.runtime_for_chat(&spec.chat_id, epoch, signed_policy)?;
         let source_open = Self::open_request(
             &spec.chat_id,
@@ -1586,6 +1643,7 @@ impl WhipHarnessFactory {
             respondent_ref: self.authority.as_str().to_owned(),
             turn_sequence: 0,
             next_command_id: None,
+            task_filer: None,
             cancellation: Arc::new(Mutex::new(None)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             pursuing_cancel: Arc::new(AtomicBool::new(false)),
@@ -1785,6 +1843,7 @@ struct WhipHarness {
     respondent_ref: String,
     turn_sequence: u64,
     next_command_id: Option<String>,
+    task_filer: Option<Arc<dyn TaskFiler>>,
     cancellation: Arc<Mutex<Option<HostCancellationHandle>>>,
     /// That a cancellation has been asked for, held separately from the handle
     /// that performs it. The handle exists only from `install_cancellation` to
@@ -1810,6 +1869,10 @@ impl Harness for WhipHarness {
         self.next_command_id = command_id.map(str::to_owned);
     }
 
+    fn bind_task_filer(&mut self, filer: Option<Arc<dyn TaskFiler>>) {
+        self.task_filer = filer;
+    }
+
     fn run_turn(
         &mut self,
         _legacy_gate: &dyn EgressGate,
@@ -1830,6 +1893,7 @@ impl Harness for WhipHarness {
         let resources = TurnResources {
             workspace: &self.workspace,
             images,
+            task_filer: self.task_filer.as_deref(),
             asked: std::cell::RefCell::new(Vec::new()),
             live: std::cell::RefCell::new(sink),
             streamed: std::cell::Cell::new(false),
@@ -1956,6 +2020,14 @@ impl WhipHarness {
                 kind: QUESTION_RESOURCE.to_owned(),
                 selector: None,
                 writable: None,
+            });
+        }
+        if has("tracker.file") && self.task_filer.is_some() {
+            resources.push(ResourceRef {
+                handle: "tasks".to_owned(),
+                kind: "tracker".to_owned(),
+                selector: None,
+                writable: Some(true),
             });
         }
         StartTurnCommand {
@@ -2739,6 +2811,7 @@ impl SecretResolver for ProviderConfig {
 struct TurnResources<'a> {
     workspace: &'a NativeWorkspaceResolver,
     images: &'a [ImageContent],
+    task_filer: Option<&'a dyn TaskFiler>,
     /// Questions asked during this turn. Interior mutability because
     /// `execute_tool` takes `&self`; the engine drains these once the turn
     /// settles, since it holds the store across the run (ADR 0113).
@@ -2783,6 +2856,37 @@ impl ResourceResolver for TurnResources<'_> {
         admitted_resources: &[ResourceRef],
         call: &ToolCall,
     ) -> Result<String, String> {
+        if call.name == "add_todo" {
+            if !admitted_resources.iter().any(|resource| {
+                resource.handle == "tasks"
+                    && resource.kind == "tracker"
+                    && resource.writable == Some(true)
+            }) {
+                return Err("turn has no admitted project task tracker".to_owned());
+            }
+            let content = call
+                .arguments
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if content.is_empty() {
+                return Err("`add_todo` requires task content".to_owned());
+            }
+            if call
+                .arguments
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|status| status != "pending")
+            {
+                return Err("new tasks must start pending".to_owned());
+            }
+            let filer = self
+                .task_filer
+                .ok_or("project task filing is unavailable")?;
+            let id = filer.file_task(&call.id, content)?;
+            return Ok(serde_json::json!({"id": id}).to_string());
+        }
         if call.name == "ask" {
             if !admitted_resources
                 .iter()
@@ -3113,6 +3217,92 @@ impl std::error::Error for PolicyAdmissionError {}
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_agent_skill_catalogue_tracks_the_mounted_version() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        let skill = worktree.join(".gaugedesk-runtime/agent/skills/triage");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: triage\ndescription: Inspect reports\n---\nRead the report.\n",
+        )
+        .unwrap();
+        let runtime_root = root.path().join("runtime");
+        std::fs::create_dir_all(&runtime_root).unwrap();
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            SigningKey::from_seed(&[7u8; 32]).unwrap(),
+            &runtime_root,
+        );
+        factory
+            .refresh_agent_skill_catalogue("chat-one", &worktree)
+            .unwrap();
+        let store = whipplescript_store::SqliteStore::open(chat_runtime_database(
+            &runtime_root,
+            "chat-one",
+        ))
+        .unwrap();
+        let registered = store.list_skills().unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].name, "triage");
+        assert_eq!(registered[0].description, "Inspect reports");
+        std::fs::remove_dir_all(skill).unwrap();
+        factory
+            .refresh_agent_skill_catalogue("chat-one", &worktree)
+            .unwrap();
+        assert!(store.list_skills().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_todo_requires_an_admitted_tracker_and_returns_the_committed_id() {
+        use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
+        struct Filed(std::sync::Mutex<Vec<(String, String)>>);
+        impl gaugedesk_harness::TaskFiler for Filed {
+            fn file_task(&self, call_id: &str, content: &str) -> Result<String, String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((call_id.into(), content.into()));
+                Ok("issue-123".into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = NativeWorkspaceResolver::new(root.path()).unwrap();
+        let filer = Filed(std::sync::Mutex::new(Vec::new()));
+        let mut sink = |_observation: &gaugedesk_harness::Observation| {};
+        let resources = super::TurnResources {
+            workspace: &workspace,
+            images: &[],
+            task_filer: Some(&filer),
+            asked: std::cell::RefCell::new(Vec::new()),
+            live: std::cell::RefCell::new(&mut sink),
+            streamed: std::cell::Cell::new(false),
+        };
+        let call = super::ToolCall {
+            id: "call-1".into(),
+            name: "add_todo".into(),
+            arguments: serde_json::json!({"content":"Test task"}),
+        };
+        assert!(resources.execute_tool(&[], &call).is_err());
+        assert!(filer.0.lock().unwrap().is_empty());
+        let admitted = super::ResourceRef {
+            handle: "tasks".into(),
+            kind: "tracker".into(),
+            selector: None,
+            writable: Some(true),
+        };
+        assert_eq!(
+            resources.execute_tool(&[admitted], &call).unwrap(),
+            serde_json::json!({"id":"issue-123"}).to_string()
+        );
+        assert_eq!(
+            *filer.0.lock().unwrap(),
+            vec![("call-1".into(), "Test task".into())]
+        );
+    }
+
+    #[test]
     fn sparse_target_resources_are_exact_and_never_include_project() {
         let targets = vec![
             gaugedesk_harness::WorkspaceTargetBinding {
@@ -3233,6 +3423,7 @@ mod tests {
             let resources = super::TurnResources {
                 workspace: &workspace,
                 images: &[],
+                task_filer: None,
                 asked: std::cell::RefCell::new(Vec::new()),
                 live: std::cell::RefCell::new(&mut sink),
                 streamed: std::cell::Cell::new(false),
@@ -3764,6 +3955,7 @@ mod tests {
             resources: std::collections::BTreeMap::from([
                 ("file:workspace:chat-1".to_owned(), ordinary.clone()),
                 ("memory:turn-images:chat-1".to_owned(), ordinary),
+                ("tracker:tasks".to_owned(), ResourcePolicy::default()),
                 ("command:workspace:chat-1".to_owned(), principal.clone()),
                 ("provider:openai".to_owned(), principal.clone()),
                 ("provider:owned".to_owned(), principal.clone()),
@@ -3776,6 +3968,7 @@ mod tests {
                     "memory:turn-images:chat-1".to_owned(),
                 ),
                 ("command".to_owned(), "command:workspace:chat-1".to_owned()),
+                ("tasks".to_owned(), "tracker:tasks".to_owned()),
                 ("model".to_owned(), "provider:openai".to_owned()),
                 ("owned".to_owned(), "provider:owned".to_owned()),
                 ("local".to_owned(), "placement:local".to_owned()),
@@ -3784,6 +3977,7 @@ mod tests {
                 "workspace.read".to_owned(),
                 "workspace.write".to_owned(),
                 "command.run".to_owned(),
+                "tracker.file".to_owned(),
             ]),
             provider_bindings: std::collections::BTreeMap::from([(
                 "model".to_owned(),
@@ -4054,8 +4248,8 @@ mod tests {
   "workflow":"Method",
   "agent":"assistant",
   "system_prompt":"persona.md",
-  "capabilities":["workspace.read","workspace.write","command.run"],
-  "agent_abilities":["workspace.read","workspace.write","command.run"],
+  "capabilities":["workspace.read","workspace.write","command.run","tracker.file"],
+  "agent_abilities":["workspace.read","workspace.write","command.run","tracker.file"],
   "max_steps":32
 }"#,
         )
@@ -4069,7 +4263,7 @@ workflow Method {
     provider owned
     profile "repo-writer"
     capacity 1
-    capabilities ["workspace.read", "workspace.write", "command.run"]
+    capabilities ["workspace.read", "workspace.write", "command.run", "tracker.file"]
   }
   rule converse when started => {
     tell assistant requires ["workspace.read", "workspace.write", "command.run"]
@@ -4120,7 +4314,31 @@ workflow Method {
             SigningKey::from_seed(&[7u8; 32]).expect("key"),
             root.path(),
         );
-        let first = factory.create_harness(&spec).expect("first harness");
+        let mut first = factory.create_harness(&spec).expect("first harness");
+        assert!(first
+            .package
+            .resolve(first.package.version_ref())
+            .unwrap()
+            .tools
+            .iter()
+            .any(|tool| tool.name == "add_todo"));
+        assert!(!first
+            .new_turn_command("question", &[], 1, None)
+            .resources
+            .iter()
+            .any(|resource| resource.handle == "tasks"));
+        struct AdmittedTask;
+        impl gaugedesk_harness::TaskFiler for AdmittedTask {
+            fn file_task(&self, _call_id: &str, _content: &str) -> Result<String, String> {
+                Ok("issue-1".to_owned())
+            }
+        }
+        first.bind_task_filer(Some(Arc::new(AdmittedTask)));
+        assert!(first
+            .new_turn_command("question", &[], 1, None)
+            .resources
+            .iter()
+            .any(|resource| resource.handle == "tasks" && resource.kind == "tracker"));
         assert_eq!(first.package.version_ref(), package_ref);
         assert!(!first
             .package

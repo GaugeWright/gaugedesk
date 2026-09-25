@@ -47,10 +47,13 @@ fn set_membership(wb: &SharedWorkbench, account: &str, status: MembershipStatus)
 #[test]
 fn nobody_signed_in_claims_nothing_and_leaves_the_question_open() {
     let (_root, wb) = open();
+    assert!(
+        matches!(claim_state(&wb).unwrap(), HomeClaimState::Available { projects } if projects >= 1)
+    );
     assert_eq!(claim_if_never_claimed(&wb).unwrap(), HomeClaim::NotSignedIn);
     assert!(
         claims(&wb).is_empty(),
-        "signing in later is still the moment"
+        "signing in later still leaves the claim open"
     );
     assert_eq!(org(&wb).active_count_with_role("owner"), 0);
 }
@@ -62,6 +65,12 @@ fn the_signed_in_account_becomes_the_owner_once() {
     assert_eq!(
         claim_if_never_claimed(&wb).unwrap(),
         HomeClaim::Owner("account-root".into())
+    );
+    assert_eq!(
+        claim_state(&wb).unwrap(),
+        HomeClaimState::Claimed {
+            owner: "account-root".into()
+        }
     );
     let directory = org(&wb);
     assert_eq!(
@@ -86,6 +95,21 @@ fn the_signed_in_account_becomes_the_owner_once() {
         1,
         "the wake loop asks again and writes nothing"
     );
+}
+
+#[test]
+fn a_hub_check_for_one_account_cannot_claim_after_selection_changes() {
+    let (_root, wb) = open();
+    crate::account_signin::store_session_for_test(&wb);
+    crate::account_signin::store_session_as_for_test(&wb, "someone-else");
+    assert_eq!(
+        claim_verified_selected(&wb, "account-root").unwrap(),
+        HomeClaim::NotSignedIn,
+    );
+    assert!(matches!(
+        claim_state(&wb).unwrap(),
+        HomeClaimState::Available { .. }
+    ));
 }
 
 /// The condition is the claim, not an empty directory: an owner who is later
@@ -121,6 +145,20 @@ fn a_home_that_already_has_an_owner_is_marked_claimed_without_adding_one() {
         claim_if_never_claimed(&wb).unwrap(),
         HomeClaim::AlreadyClaimed
     );
+}
+
+#[test]
+fn explicit_claim_refuses_a_governed_home_without_writing_a_marker() {
+    let (root, wb) = open();
+    set_membership(&wb, "tenant-owner", MembershipStatus::Active);
+    crate::account_signin::store_session_as_for_test(&wb, "tenant-owner");
+    assert_eq!(
+        claim_verified_selected(&wb, "tenant-owner").unwrap(),
+        HomeClaim::Governed
+    );
+    assert!(claims(&wb).is_empty());
+    assert!(!crate::first_home::attach_if_never_offered(&wb, root.path()).unwrap());
+    assert!(!wb.lock_unpoisoned().library_sync_active());
 }
 
 #[test]

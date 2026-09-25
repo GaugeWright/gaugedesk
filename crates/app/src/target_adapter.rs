@@ -315,6 +315,9 @@ impl Workbench {
             .projects
             .get(project_id)
             .ok_or_else(|| "no such project".to_owned())?;
+        if crate::shipped_tutorials::is_tutorial_project(project) {
+            return Err("Tutorials is maintained by GaugeWright".into());
+        }
         if &project.home_id != self.home_id() {
             return Err("project belongs to another Home".to_owned());
         }

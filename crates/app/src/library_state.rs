@@ -161,6 +161,11 @@ fn validate_panel_profile(
                     "collection path `{path}` is not a bounded selector"
                 ));
             }
+            if !path.starts_with("artifacts/") {
+                return Err(format!(
+                    "collection path `{path}` must be inside artifacts/"
+                ));
+            }
         }
     }
     Ok(())
@@ -169,13 +174,15 @@ fn validate_panel_profile(
 fn archetype_files(
     definition: &gaugedesk_boundary::definition::AgentDefinition,
     skills: BTreeSet<String>,
+    task_filing: bool,
 ) -> Result<Vec<(String, String)>, String> {
-    let mut files = definition.seed_files();
+    let capabilities = gaugedesk_boundary::definition::PackageCapabilities {
+        tracker_file: task_filing,
+        ..Default::default()
+    };
+    let mut files = definition.seed_files_with_capabilities(capabilities);
     let manifest = crate::discipline::manifest(
-        gaugedesk_boundary::definition::PackageCapabilities::default()
-            .names()
-            .into_iter()
-            .map(str::to_owned),
+        capabilities.names().into_iter().map(str::to_owned),
         skills,
         Vec::new(),
     );
@@ -195,6 +202,7 @@ fn default_archetype_files() -> Vec<(String, String)> {
     archetype_files(
         &crate::app_support::default_agent_definition(),
         BTreeSet::new(),
+        true,
     )
     .expect("the built-in Default archetype is valid")
 }
@@ -392,6 +400,10 @@ pub(crate) fn load_startup_library_state(
     if migrate_agent_ability_manifests(store, &library, targets_dir, providers)? {
         library = crate::library::Library::rebuild(store).map_err(io)?;
     }
+    migrate_agent_file_drafts(&library, targets_dir, providers)?;
+    if migrate_default_task_ability(store, &library, targets_dir, providers)? {
+        library = crate::library::Library::rebuild(store).map_err(io)?;
+    }
     validate_archetype_versions(&library, targets_dir)?;
     let deleted_chats = explicitly_deleted_chats(store)?;
     let (targets, mut engagements, mut engagement_index) =
@@ -423,6 +435,239 @@ pub(crate) fn load_startup_library_state(
         engagements,
         engagement_index,
     })
+}
+
+/// Publish a new built-in Default version for installations seeded before task
+/// filing existed. Frozen v1 stays byte-for-byte; the draft gains the new
+/// ability when its generated source still has the standard declaration.
+/// Only the original Personal placement is advanced automatically.
+fn migrate_default_task_ability(
+    store: &mut Store,
+    library: &crate::library::Library,
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+) -> std::io::Result<bool> {
+    let Some(agent) = library.agents.get(DEFAULT_AGENT) else {
+        return Ok(false);
+    };
+    if agent.current_version != 1 {
+        return Ok(false);
+    }
+    let target = library
+        .authoring_target_for(DEFAULT_AGENT)
+        .ok_or_else(|| invalid_data("Default agent has no authoring target"))?;
+    let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(published_package_root(
+        targets_dir,
+        &target.id,
+        1,
+    ))
+    .map_err(invalid_data)?;
+    if package
+        .capabilities()
+        .iter()
+        .any(|ability| ability == "tracker.file")
+    {
+        return Ok(false);
+    }
+    if package.capabilities() != ["command.run", "workspace.read", "workspace.write"]
+        || package.agent_abilities() != ["command.run", "workspace.read", "workspace.write"]
+    {
+        return Ok(false);
+    }
+    let workspace = provider_for(providers, &target.id).open_at(&targets_dir.join(&target.id));
+    let v1 = gaugedesk_boundary::definition::version_root(1);
+    let v2 = gaugedesk_boundary::definition::version_root(2);
+    let d1 = crate::discipline::discipline_version_root(1);
+    let d2 = crate::discipline::discipline_version_root(2);
+    let v2_manifest = format!("{v2}/{}", gaugedesk_boundary::definition::MANIFEST_FILE);
+    if workspace
+        .read_main_file(&v2_manifest)
+        .map_err(io)?
+        .is_none()
+    {
+        let engagement_id = library::gen_id("default-task-ability");
+        let engagement = workspace.create_engagement(&engagement_id).map_err(io)?;
+        let result = (|| {
+            let read = |root: &str, file: &str| {
+                engagement.read_file(&format!("{root}/{file}")).map_err(io)
+            };
+            let manifest_text = read(&v1, gaugedesk_boundary::definition::MANIFEST_FILE)?;
+            let mut manifest: serde_json::Value =
+                serde_json::from_str(&manifest_text).map_err(io)?;
+            let source_name = manifest["source"]
+                .as_str()
+                .ok_or_else(|| invalid_data("Default package has no source"))?
+                .to_owned();
+            let system_name = manifest["system_prompt"]
+                .as_str()
+                .ok_or_else(|| invalid_data("Default package has no system prompt"))?
+                .to_owned();
+            let context_name = manifest["project_context"].as_str().map(str::to_owned);
+            for field in ["capabilities", "agent_abilities"] {
+                manifest[field]
+                    .as_array_mut()
+                    .ok_or_else(|| invalid_data("Default package has no ability list"))?
+                    .push(serde_json::Value::String("tracker.file".to_owned()));
+            }
+            let old_source = read(&v1, &source_name)?;
+            let old = "capabilities [\"workspace.read\", \"workspace.write\", \"command.run\"]";
+            let new = "capabilities [\"workspace.read\", \"workspace.write\", \"command.run\", \"tracker.file\"]";
+            if !old_source.contains(old) {
+                return Err(invalid_data(
+                    "Default package source has no standard ability declaration",
+                ));
+            }
+            let source = old_source.replacen(old, new, 1);
+            let old_persona = read(&v1, &system_name)?;
+            let mut persona = old_persona.clone();
+            if !persona.contains("use add_todo") {
+                persona.push_str("\nWhen asked to create a project task or task-bar item, use add_todo. Report success only after it returns an issue id.\n");
+            }
+            let context = if let Some(name) = &context_name {
+                read(&v1, name)?
+            } else {
+                manifest["schema"] = serde_json::json!("whipplescript.agent_package.v1");
+                manifest["project_context"] = serde_json::json!("AGENTS.md");
+                String::new()
+            };
+            let old_discipline = read(&d1, crate::discipline::DISCIPLINE_MANIFEST)?;
+            let mut discipline: crate::discipline::DisciplineManifest =
+                serde_json::from_str(&old_discipline).map_err(io)?;
+            discipline.capabilities.insert("tracker.file".to_owned());
+            let new_manifest =
+                format!("{}\n", serde_json::to_string_pretty(&manifest).map_err(io)?);
+            let new_discipline = format!(
+                "{}\n",
+                serde_json::to_string_pretty(&discipline).map_err(io)?
+            );
+            for (path, body) in [
+                (v2_manifest.clone(), new_manifest.as_str()),
+                (format!("{v2}/{source_name}"), source.as_str()),
+                (format!("{v2}/{system_name}"), persona.as_str()),
+                (format!("{v2}/AGENTS.md"), context.as_str()),
+                (
+                    format!("{d2}/{}", crate::discipline::DISCIPLINE_MANIFEST),
+                    new_discipline.as_str(),
+                ),
+            ] {
+                engagement.write_file(&path, body).map_err(io)?;
+            }
+            if let Some(humans) = workspace
+                .read_main_file(&format!(
+                    "{v1}/{}",
+                    gaugedesk_boundary::definition::HUMANS_FILE
+                ))
+                .map_err(io)?
+            {
+                engagement
+                    .write_file(
+                        &format!("{v2}/{}", gaugedesk_boundary::definition::HUMANS_FILE),
+                        &humans,
+                    )
+                    .map_err(io)?;
+            }
+            let draft = gaugedesk_boundary::definition::DRAFT_ROOT;
+            let draft_discipline = crate::discipline::DISCIPLINE_DRAFT_ROOT;
+            let draft_manifest_text = read(draft, gaugedesk_boundary::definition::MANIFEST_FILE)?;
+            let mut draft_manifest: serde_json::Value =
+                serde_json::from_str(&draft_manifest_text).map_err(io)?;
+            let draft_source_name = draft_manifest["source"]
+                .as_str()
+                .ok_or_else(|| invalid_data("Default draft has no source"))?
+                .to_owned();
+            let draft_source = read(draft, &draft_source_name)?;
+            let draft_system_name = draft_manifest["system_prompt"]
+                .as_str()
+                .ok_or_else(|| invalid_data("Default draft has no system prompt"))?;
+            let draft_system = read(draft, draft_system_name)?;
+            let draft_context = draft_manifest["project_context"]
+                .as_str()
+                .map(|name| read(draft, name))
+                .transpose()?;
+            let draft_discipline_text =
+                read(draft_discipline, crate::discipline::DISCIPLINE_MANIFEST)?;
+            if draft_source.contains(old)
+                && draft_source == old_source
+                && draft_system == old_persona
+                && draft_context.as_deref() == Some(context.as_str())
+                && draft_discipline_text == old_discipline
+                && draft_manifest["capabilities"]
+                    == serde_json::json!(["workspace.read", "workspace.write", "command.run"])
+                && draft_manifest["agent_abilities"]
+                    == serde_json::json!(["workspace.read", "workspace.write", "command.run"])
+            {
+                for field in ["capabilities", "agent_abilities"] {
+                    draft_manifest[field]
+                        .as_array_mut()
+                        .expect("checked ability list")
+                        .push(serde_json::Value::String("tracker.file".to_owned()));
+                }
+                let draft_source = draft_source.replacen(old, new, 1);
+                let mut draft_discipline_manifest: crate::discipline::DisciplineManifest =
+                    serde_json::from_str(&draft_discipline_text).map_err(io)?;
+                draft_discipline_manifest
+                    .capabilities
+                    .insert("tracker.file".to_owned());
+                let draft_manifest_text = format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&draft_manifest).map_err(io)?
+                );
+                let draft_discipline_text = format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&draft_discipline_manifest).map_err(io)?
+                );
+                for (path, body) in [
+                    (
+                        format!("{draft}/{}", gaugedesk_boundary::definition::MANIFEST_FILE),
+                        draft_manifest_text.as_str(),
+                    ),
+                    (
+                        format!("{draft}/{draft_source_name}"),
+                        draft_source.as_str(),
+                    ),
+                    (
+                        format!(
+                            "{draft_discipline}/{}",
+                            crate::discipline::DISCIPLINE_MANIFEST
+                        ),
+                        draft_discipline_text.as_str(),
+                    ),
+                ] {
+                    engagement.write_file(&path, body).map_err(io)?;
+                }
+            }
+            gaugedesk_whip_runtime::AuthoredAgentPackage::load(engagement.path().join(&v2))
+                .map_err(invalid_data)?;
+            engagement
+                .commit_turn("publish Default agent task filing ability")
+                .map_err(io)?;
+            if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
+                return Err(invalid_data(
+                    "Default agent changed during task ability migration",
+                ));
+            }
+            Ok(())
+        })();
+        let _ = workspace.remove_engagement(&engagement_id);
+        result?;
+    }
+    let version = published_archetype_version(targets_dir, &target.id, 2)?;
+    let mut agent = agent.clone();
+    agent.op = RecordOp::Upsert;
+    agent.current_version = 2;
+    agent.versions.insert(2, version);
+    append_library_record(store, "agent", &agent)?;
+    if let Some(placement) = library
+        .instances
+        .get(DEFAULT_PLACEMENT)
+        .filter(|p| p.version == 1)
+    {
+        let mut placement = placement.clone();
+        placement.op = RecordOp::Upsert;
+        placement.version = 2;
+        append_library_record(store, "instance", &placement)?;
+    }
+    Ok(true)
 }
 
 /// ADR 0150/0151's exact additive cutover. A project gains one distinct
@@ -822,6 +1067,140 @@ fn migrate_exact_pre_target_defaults(
     Ok(true)
 }
 
+/// Project an existing draft into the visible Agent file layout. Frozen
+/// versions are deliberately untouched, so their package references and live
+/// placements keep their exact v0 behavior. The next publication uses v1.
+fn migrate_agent_file_drafts(
+    library: &crate::library::Library,
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+) -> std::io::Result<()> {
+    use gaugedesk_boundary::definition as files;
+
+    for archetype in library.agents.values() {
+        let target = library.authoring_target_for(&archetype.id).ok_or_else(|| {
+            invalid_data(format!(
+                "archetype {} has no authoring target",
+                archetype.id
+            ))
+        })?;
+        if target.kind != WorkTargetKind::Managed {
+            continue;
+        }
+        let workspace = provider_for(providers, &target.id).open_at(&targets_dir.join(&target.id));
+        let manifest_path = format!("{}/{}", files::DRAFT_ROOT, files::MANIFEST_FILE);
+        let text = workspace
+            .read_main_file(&manifest_path)
+            .map_err(io)?
+            .ok_or_else(|| {
+                invalid_data(format!("archetype {} has no draft manifest", archetype.id))
+            })?;
+        let mut manifest: serde_json::Value = serde_json::from_str(&text).map_err(invalid_data)?;
+        if manifest.get("schema").and_then(serde_json::Value::as_str)
+            == Some("whipplescript.agent_package.v1")
+        {
+            continue;
+        }
+        if manifest.get("schema").and_then(serde_json::Value::as_str)
+            != Some("whipplescript.agent_package.v0")
+        {
+            return Err(invalid_data(format!(
+                "archetype {} has an unsupported draft schema",
+                archetype.id
+            )));
+        }
+        let source_name = manifest
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_data("legacy draft has no source"))?;
+        let system_name = manifest
+            .get("system_prompt")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_data("legacy draft has no system prompt"))?;
+        for name in [source_name, system_name] {
+            if !matches!(
+                std::path::Path::new(name)
+                    .components()
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                [std::path::Component::Normal(_)]
+            ) {
+                return Err(invalid_data(format!(
+                    "legacy draft file `{name}` is not a direct package child"
+                )));
+            }
+        }
+        let source_name = source_name.to_owned();
+        let system_name = system_name.to_owned();
+        let source = workspace
+            .read_main_file(&format!("{}/{}", files::DRAFT_ROOT, source_name))
+            .map_err(io)?
+            .ok_or_else(|| invalid_data("legacy draft source is absent"))?;
+        let system = workspace
+            .read_main_file(&format!("{}/{}", files::DRAFT_ROOT, system_name))
+            .map_err(io)?
+            .ok_or_else(|| invalid_data("legacy draft system prompt is absent"))?;
+        let engagement_id = library::gen_id("agent-files-migration");
+        let engagement = workspace.create_engagement(&engagement_id).map_err(io)?;
+        let result = (|| {
+            // The old persona was system text. Retaining it in SYSTEM.md avoids
+            // silently changing its role or injecting it a second time.
+            engagement.write_file("agent/AGENTS.md", "").map_err(io)?;
+            engagement
+                .write_file("agent/HUMANS.md", files::HUMAN_GUIDE)
+                .map_err(io)?;
+            engagement
+                .write_file("agent/skills/.gaugedesk-folder", "")
+                .map_err(io)?;
+            if !system.is_empty() {
+                engagement
+                    .write_file("agent/SYSTEM.md", &system)
+                    .map_err(io)?;
+            }
+            if source.trim() != files::DEFAULT_METHOD_SOURCE.trim() {
+                engagement
+                    .write_file(&format!("agent/{source_name}"), &source)
+                    .map_err(io)?;
+            } else {
+                manifest["source"] = serde_json::json!(files::GENERATED_CHAT_SOURCE_FILE);
+                engagement
+                    .write_file(
+                        &format!(
+                            "{}/{}",
+                            files::DRAFT_ROOT,
+                            files::GENERATED_CHAT_SOURCE_FILE
+                        ),
+                        &source,
+                    )
+                    .map_err(io)?;
+            }
+            manifest["schema"] = serde_json::json!("whipplescript.agent_package.v1");
+            manifest["project_context"] = serde_json::json!("AGENTS.md");
+            engagement
+                .write_file(
+                    &manifest_path,
+                    &format!("{}\n", serde_json::to_string_pretty(&manifest).map_err(io)?),
+                )
+                .map_err(io)?;
+            engagement
+                .write_file(&format!("{}/AGENTS.md", files::DRAFT_ROOT), "")
+                .map_err(io)?;
+            engagement
+                .commit_turn("migrate Agent draft files")
+                .map_err(io)?;
+            if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
+                return Err(invalid_data(
+                    "archetype changed during Agent-files migration",
+                ));
+            }
+            Ok(())
+        })();
+        let _ = workspace.remove_engagement(&engagement_id);
+        result?;
+    }
+    Ok(())
+}
+
 /// ABIL-3's hard cutover persists the new explicit authority ceiling into every
 /// pre-cutover authored package exactly once. This is a state migration, not a
 /// loader fallback: after this commit lands, ordinary package loading remains
@@ -895,10 +1274,11 @@ fn migrate_agent_ability_manifests(
                         )
                         .map_err(io)?;
 
-                    let source_path = format!(
-                        "{package_root}/{}",
-                        gaugedesk_boundary::definition::SOURCE_FILE
-                    );
+                    let source_name = manifest
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| invalid_data("legacy package has no source"))?;
+                    let source_path = format!("{package_root}/{source_name}");
                     let source = engagement.read_file(&source_path).map_err(io)?;
                     let source = remove_legacy_human_authority(&source);
                     engagement.write_file(&source_path, &source).map_err(io)?;
@@ -2648,7 +3028,7 @@ fn seed_builtin_archetype(
         .official_skills
         .then(crate::official_skills::office_skill_references)
         .unwrap_or_default();
-    let authored_files = archetype_files(&definition, skills)
+    let authored_files = archetype_files(&definition, skills, archetype.id == DEFAULT_AGENT)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let authored_files = authored_files
         .iter()
@@ -3055,7 +3435,7 @@ impl Workbench {
             .official_skills
             .then(crate::official_skills::office_skill_references)
             .unwrap_or_default();
-        let authored = archetype_files(&definition, skills)
+        let authored = archetype_files(&definition, skills, false)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let authored = authored
             .iter()
@@ -3738,6 +4118,9 @@ impl Workbench {
             .projects
             .get(project_id)
             .ok_or_else(|| "no such project".to_owned())?;
+        if crate::shipped_tutorials::is_tutorial_project(project) {
+            return Err("Tutorials is maintained by GaugeWright".into());
+        }
         if &project.home_id != self.home_id() {
             return Err("project belongs to another Home".to_owned());
         }
@@ -4177,7 +4560,45 @@ impl Workbench {
         if mount.exists() {
             std::fs::remove_dir_all(&mount).map_err(|error| error.to_string())?;
         }
+        let agent_mount = mount.join("agent");
+        if agent_mount.exists() {
+            std::fs::remove_dir_all(&agent_mount).map_err(|error| error.to_string())?;
+        }
+        let visible_agent = package.project_context_document().is_some();
+        if visible_agent {
+            std::fs::create_dir_all(agent_mount.join("skills"))
+                .map_err(|error| error.to_string())?;
+            for (name, source) in [
+                ("AGENTS.md", package_root.join("AGENTS.md")),
+                ("HUMANS.md", package_root.join("HUMANS.md")),
+            ] {
+                std::fs::copy(source, agent_mount.join(name)).map_err(|error| error.to_string())?;
+            }
+            if !package.system_prompt_document().is_empty() {
+                std::fs::write(
+                    agent_mount.join("SYSTEM.md"),
+                    package.system_prompt_document(),
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
         for (path, body) in bundle.files {
+            if visible_agent {
+                let visible = path
+                    .strip_prefix("agent-files/")
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        path.strip_prefix("agent-skills/")
+                            .map(|rest| format!("skills/{rest}"))
+                    });
+                if let Some(visible) = visible {
+                    let destination = agent_mount.join(visible);
+                    if let Some(parent) = destination.parent() {
+                        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                    }
+                    std::fs::write(destination, &body).map_err(|error| error.to_string())?;
+                }
+            }
             let destination = mount.join("discipline").join(path);
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -4195,6 +4616,10 @@ impl Workbench {
             .engagements
             .get(chat_id)
             .ok_or_else(|| "chat target candidate is unavailable".to_owned())?;
+        for root in ["artifacts", "work"] {
+            std::fs::create_dir_all(engagement.path().join(root))
+                .map_err(|error| error.to_string())?;
+        }
         let mount = engagement
             .path()
             .join(gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT);
@@ -4506,6 +4931,12 @@ impl Workbench {
             None => storage.create_engagement(&chat_id),
         }
         .map_err(|e| e.to_string())?;
+        if inst_rec.kind == InstanceKind::Using {
+            for root in ["artifacts", "work"] {
+                std::fs::create_dir_all(eng.path().join(root))
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         // Pin the exact standing target basis. Runtime config and discipline
         // are control/materialized state and never mint target cuts.
         let _candidate = eng.boundary_cut().map_err(|error| error.to_string())?.0;
@@ -4834,7 +5265,7 @@ impl Workbench {
     ) -> Result<Vec<String>, String> {
         abilities.sort();
         abilities.dedup();
-        let admitted = [
+        let mut admitted = vec![
             Vec::<String>::new(),
             vec!["workspace.read".to_owned()],
             vec!["workspace.read".to_owned(), "workspace.write".to_owned()],
@@ -4844,6 +5275,11 @@ impl Workbench {
                 "workspace.write".to_owned(),
             ],
         ];
+        admitted.extend(admitted.clone().into_iter().map(|mut abilities| {
+            abilities.push("tracker.file".to_owned());
+            abilities.sort();
+            abilities
+        }));
         if !admitted.contains(&abilities) {
             return Err("abilities must match one GaugeDesk ability preset".to_owned());
         }
@@ -4875,15 +5311,86 @@ impl Workbench {
                 .get("capabilities")
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| "package manifest has no capability registry".to_owned())?;
-            for ability in &abilities {
-                if !capabilities
+            let add_tracker = abilities.iter().any(|ability| ability == "tracker.file")
+                && !capabilities
                     .iter()
-                    .any(|capability| capability.as_str() == Some(ability))
+                    .any(|capability| capability.as_str() == Some("tracker.file"));
+            for ability in &abilities {
+                if ability != "tracker.file"
+                    && !capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == Some(ability))
                 {
                     return Err(format!(
                         "agent ability `{ability}` is absent from the package capability registry"
                     ));
                 }
+            }
+            if add_tracker {
+                manifest["capabilities"]
+                    .as_array_mut()
+                    .expect("validated capability registry")
+                    .push(serde_json::Value::String("tracker.file".to_owned()));
+                let source_name = manifest["source"]
+                    .as_str()
+                    .ok_or_else(|| "package manifest has no source".to_owned())?;
+                let source_path = format!(
+                    "{}/{}",
+                    gaugedesk_boundary::definition::DRAFT_ROOT,
+                    source_name
+                );
+                let source = engagement
+                    .read_file(&source_path)
+                    .map_err(|error| error.to_string())?;
+                let declaration = "capabilities [";
+                if source.matches(declaration).count() != 1 {
+                    return Err("edit the Agent package's capability declaration before enabling task filing".to_owned());
+                }
+                let start = source.find(declaration).expect("one declaration") + declaration.len();
+                let end = source[start..]
+                    .find(']')
+                    .map(|offset| start + offset)
+                    .ok_or_else(|| {
+                        "Agent capability declaration has no closing bracket".to_owned()
+                    })?;
+                let source = if source[start..end].contains("\"tracker.file\"") {
+                    source
+                } else {
+                    let separator = if source[start..end].trim().is_empty() {
+                        ""
+                    } else {
+                        ", "
+                    };
+                    format!(
+                        "{}{separator}\"tracker.file\"{}",
+                        &source[..end],
+                        &source[end..]
+                    )
+                };
+                engagement
+                    .write_file(&source_path, &source)
+                    .map_err(|error| error.to_string())?;
+                let discipline_path = format!(
+                    "{}/{}",
+                    crate::discipline::DISCIPLINE_DRAFT_ROOT,
+                    crate::discipline::DISCIPLINE_MANIFEST
+                );
+                let discipline_text = engagement
+                    .read_file(&discipline_path)
+                    .map_err(|error| error.to_string())?;
+                let mut discipline: crate::discipline::DisciplineManifest =
+                    serde_json::from_str(&discipline_text).map_err(|error| error.to_string())?;
+                discipline.capabilities.insert("tracker.file".to_owned());
+                engagement
+                    .write_file(
+                        &discipline_path,
+                        &format!(
+                            "{}\n",
+                            serde_json::to_string_pretty(&discipline)
+                                .map_err(|error| error.to_string())?
+                        ),
+                    )
+                    .map_err(|error| error.to_string())?;
             }
             manifest["agent_abilities"] = serde_json::Value::Array(
                 abilities
@@ -5106,6 +5613,9 @@ impl Workbench {
         run_purpose: Option<Option<String>>,
     ) -> Option<ProjectRecord> {
         let existing = self.library.projects.get(id).cloned()?;
+        if crate::shipped_tutorials::is_tutorial_project(&existing) {
+            return None;
+        }
         let updated = ProjectRecord {
             name: name.unwrap_or_else(|| existing.name.clone()),
             network_isolated: network_isolated.unwrap_or(existing.network_isolated),
@@ -5121,6 +5631,9 @@ impl Workbench {
         let Some(project) = self.library.projects.get(id).cloned() else {
             return false;
         };
+        if crate::shipped_tutorials::is_tutorial_project(&project) {
+            return false;
+        }
         let instance_ids: Vec<String> = self
             .library
             .using_instances_of(id)
@@ -5484,6 +5997,14 @@ impl Workbench {
         if !self.library.projects.contains_key(project_id) {
             return Err("no such project".to_owned());
         }
+        if self
+            .library
+            .projects
+            .get(project_id)
+            .is_some_and(crate::shipped_tutorials::is_tutorial_project)
+        {
+            return Err("Tutorials is maintained by GaugeWright".into());
+        }
         let agent = self
             .library
             .agents
@@ -5593,6 +6114,16 @@ impl Workbench {
         if !self.library.projects.contains_key(project_id) {
             return Err(BindPlacementError::ProjectNotFound);
         }
+        if self
+            .library
+            .projects
+            .get(project_id)
+            .is_some_and(crate::shipped_tutorials::is_tutorial_project)
+        {
+            return Err(BindPlacementError::Create(
+                "Tutorials is maintained by GaugeWright".into(),
+            ));
+        }
         let agent_kind = self
             .library
             .agents
@@ -5661,6 +6192,83 @@ impl Workbench {
         let draft = gaugedesk_boundary::definition::DRAFT_ROOT;
         let target = gaugedesk_boundary::definition::version_root(version);
         let result = (|| {
+            let manifest_text = engagement
+                .read_file(&format!("{draft}/package.json"))
+                .map_err(|error| PublishArchetypeError::InvalidPackage(error.to_string()))?;
+            let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+                .map_err(|error| PublishArchetypeError::InvalidPackage(error.to_string()))?;
+            let v1 = manifest.get("schema").and_then(serde_json::Value::as_str)
+                == Some("whipplescript.agent_package.v1");
+            if v1 {
+                let agents = engagement
+                    .read_file("agent/AGENTS.md")
+                    .map_err(|error| PublishArchetypeError::InvalidPackage(error.to_string()))?;
+                engagement
+                    .write_file(&format!("{draft}/AGENTS.md"), &agents)
+                    .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
+                let humans = engagement
+                    .read_file("agent/HUMANS.md")
+                    .map_err(|error| PublishArchetypeError::InvalidPackage(error.to_string()))?;
+                engagement
+                    .write_file(&format!("{draft}/HUMANS.md"), &humans)
+                    .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
+                let system_path = engagement.path().join("agent/SYSTEM.md");
+                let system = if system_path.exists() {
+                    engagement
+                        .read_file("agent/SYSTEM.md")
+                        .map_err(|error| PublishArchetypeError::InvalidPackage(error.to_string()))?
+                } else {
+                    String::new()
+                };
+                let system_name = manifest
+                    .get("system_prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        PublishArchetypeError::InvalidPackage(
+                            "draft system prompt is absent".to_owned(),
+                        )
+                    })?;
+                if !matches!(
+                    std::path::Path::new(system_name)
+                        .components()
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    [std::path::Component::Normal(_)]
+                ) {
+                    return Err(PublishArchetypeError::InvalidPackage(
+                        "draft system prompt must be a direct child".to_owned(),
+                    ));
+                }
+                engagement
+                    .write_file(&format!("{draft}/{system_name}"), &system)
+                    .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
+                if let Some(source_name) =
+                    manifest.get("source").and_then(serde_json::Value::as_str)
+                {
+                    if !matches!(
+                        std::path::Path::new(source_name)
+                            .components()
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                        [std::path::Component::Normal(_)]
+                    ) {
+                        return Err(PublishArchetypeError::InvalidPackage(
+                            "draft source must be a direct child".to_owned(),
+                        ));
+                    }
+                    let authored_source = format!("agent/{source_name}");
+                    if source_name != gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
+                        && engagement.path().join(&authored_source).is_file()
+                    {
+                        let source = engagement.read_file(&authored_source).map_err(|error| {
+                            PublishArchetypeError::InvalidPackage(error.to_string())
+                        })?;
+                        engagement
+                            .write_file(&format!("{draft}/{source_name}"), &source)
+                            .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?;
+                    }
+                }
+            }
             if engagement
                 .tree()
                 .map_err(|error| PublishArchetypeError::Workspace(error.to_string()))?
@@ -5671,11 +6279,40 @@ impl Workbench {
                     "package version {version} is already frozen"
                 )));
             }
-            for file in [
-                gaugedesk_boundary::definition::MANIFEST_FILE,
-                gaugedesk_boundary::definition::SOURCE_FILE,
-                gaugedesk_boundary::definition::PERSONA_FILE,
-            ] {
+            let source_name = manifest
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    PublishArchetypeError::InvalidPackage("draft source is absent".to_owned())
+                })?;
+            let system_name = manifest
+                .get("system_prompt")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    PublishArchetypeError::InvalidPackage(
+                        "draft system prompt is absent".to_owned(),
+                    )
+                })?;
+            for name in [source_name, system_name] {
+                if !matches!(
+                    std::path::Path::new(name)
+                        .components()
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    [std::path::Component::Normal(_)]
+                ) {
+                    return Err(PublishArchetypeError::InvalidPackage(format!(
+                        "draft package file `{name}` must be a direct child"
+                    )));
+                }
+            }
+            let mut files = vec!["package.json", source_name, system_name];
+            if v1 {
+                files.extend(["AGENTS.md", "HUMANS.md"]);
+            }
+            files.sort_unstable();
+            files.dedup();
+            for file in files {
                 let body = engagement
                     .read_file(&format!("{draft}/{file}"))
                     .map_err(|error| PublishArchetypeError::InvalidPackage(error.to_string()))?;
@@ -5689,6 +6326,15 @@ impl Workbench {
             if let Some(profile) = &panel_profile {
                 validate_panel_profile(profile, package.capabilities(), package.agent_abilities())
                     .map_err(PublishArchetypeError::InvalidPackage)?;
+            }
+            if v1 {
+                crate::discipline::materialize_agent_definition(
+                    &engagement.path().join("agent"),
+                    &engagement
+                        .path()
+                        .join(crate::discipline::DISCIPLINE_DRAFT_ROOT),
+                )
+                .map_err(PublishArchetypeError::InvalidPackage)?;
             }
             let discipline = crate::discipline::load(
                 &engagement
@@ -7012,6 +7658,9 @@ impl Workbench {
                     "name": project.name,
                     "authority": self.authority.as_str(),
                     "is_personal": project.is_default,
+                    "product": if crate::shipped_tutorials::is_tutorial_project(project) {
+                        Some(serde_json::json!({"kind":"tutorials", "publisher":"GaugeWright"}))
+                    } else { None },
                     "home_id": project.home_id.as_str(),
                     "network_isolated": project.network_isolated,
                     "targets": lib.targets_for_project(&project.id).into_iter().map(Self::work_target_json).collect::<Vec<_>>(),

@@ -146,7 +146,10 @@ async function pickFirstMethod(page: import("@playwright/test").Page) {
 // scenario, so one pivot covers every later structural step on that project.
 async function ensureArchetypeLens(page: import("@playwright/test").Page, name: string) {
     const toggle = page.locator("[data-project]", { hasText: name }).locator("[data-lens-toggle]");
-    if ((await toggle.getAttribute("data-lens")) === "chats") await toggle.click();
+    if ((await toggle.getAttribute("data-lens")) === "chats") {
+        await toggle.click();
+        await page.getByRole("menuitemradio", { name: "Agent view" }).click();
+    }
 }
 
 // ---- navigation / setup ----
@@ -353,6 +356,21 @@ Then("the project workstream groups both chats", async ({ page }) => {
     });
     await expect(group).toBeVisible();
     await expect(group.locator(".ws-members [data-chat]")).toHaveCount(2);
+});
+
+Then("Agent view shows each chat under its own Agent", async ({ page }) => {
+    const project = page.locator("[data-project]", { hasText: multiTargetProject });
+    await project.locator(".lens-sort").click();
+    await page.getByRole("menuitemradio", { name: "Agent view" }).click();
+    const first = project.locator(".tree-subgroup[data-placement]", { hasText: "First placement chat" });
+    const second = project.locator(".tree-subgroup[data-placement]", { hasText: "Second placement chat" });
+    await expect(first).toHaveCount(1);
+    await expect(second).toHaveCount(1);
+    await expect(first.locator("[data-chat]")).toHaveCount(1);
+    await expect(second.locator("[data-chat]")).toHaveCount(1);
+    await expect(project.locator("[data-project-home] [data-chat]")).toHaveCount(0);
+    await project.locator(".lens-sort").click();
+    await page.getByRole("menuitemradio", { name: "Recent activity" }).click();
 });
 
 When("I promote collaboration and start a later target settlement", async ({ page, request }) => {
@@ -697,14 +715,14 @@ When("I create a Panel agent named {string}", async ({ page }, name: string) => 
 Then("the Panel agent {string} is in the Workshop", async ({ page }, name: string) => {
     const row = page.locator("[data-archetype]", { hasText: name });
     await expect(row.locator(".node-label", { hasText: new RegExp(`^${name}$`) })).toBeVisible();
-    await expect(row.locator(".cfg-badge", { hasText: "Panel agent" })).toBeVisible();
+    await expect(row.locator('[data-agent-kind="panel"]')).toHaveAttribute("title", "Panel agent");
 });
 
-// Opening a Panel agent is one movement across the panes (PANEL-12): its edit
-// chat in Chat, the agent itself — contract and Preview — in Content.
+// The Preview action opens the Panel-agent draft across the chat and content panes.
 When("I open the Panel agent {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Workshop" }).click();
-    await page.locator("[data-archetype]", { hasText: name }).locator(".tree-node.archetype").click();
+    await page.locator("[data-archetype]", { hasText: name }).locator(".tree-node.archetype [data-row-menu]").click();
+    await page.locator(".menu-item-label", { hasText: "open Preview" }).click();
 });
 
 Then("the Panel agent is open as the Workshop draft", async ({ page }) => {
@@ -755,14 +773,14 @@ When("I place the Panel agent {string} on project {string}", async ({ page }, ag
 });
 
 Then("project {string} has a Panel-agent placement without a new-chat action", async ({ page }, project: string) => {
-    const placement = page.locator("[data-project]", { hasText: project }).locator(".tree-subgroup[data-placement]", { hasText: "Panel agent" });
+    const placement = page.locator("[data-project]", { hasText: project }).locator('.tree-subgroup[data-placement]', { has: page.locator('[data-agent-kind="panel"]') });
     await expect(placement).toBeVisible();
     await expect(placement.locator("[data-create='new-placement-chat']")).toHaveCount(0);
     await expect(placement.locator("[data-create='open-panel-agent']")).toBeVisible();
 });
 
 When("I open deployment for the Panel agent in project {string}", async ({ page }, project: string) => {
-    await page.locator("[data-project]", { hasText: project }).locator(".tree-subgroup[data-placement]", { hasText: "Panel agent" }).locator(".tree-node.placement").click({ button: "right" });
+    await page.locator("[data-project]", { hasText: project }).locator('.tree-subgroup[data-placement]', { has: page.locator('[data-agent-kind="panel"]') }).locator(".tree-node.placement").click({ button: "right" });
     await page.locator(".menu-item-label", { hasText: /^deploy…$/ }).click();
 });
 
@@ -794,14 +812,14 @@ When("I create a project named {string}", async ({ page }, name: string) => {
     await page.locator(".inline-edit").press("Enter");
 });
 
-// An EDIT chat is rooted on an archetype — opened from its right-click menu ("edit").
+// An authoring chat is rooted on an archetype and opened from its row menu.
 When("I add an edit chat under the archetype {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
         .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "edit" }).click();
+    await page.locator(".menu-item-label", { hasText: "new authoring chat" }).click();
     // Creating the chat and opening its event stream are separate operations.
     // The scripted agent can finish before a late subscriber sees completion,
     // so never send until the same production SSE path used by work chats is up.
@@ -1140,12 +1158,11 @@ Then("I see a forked chat", async ({ page }) => {
     await expect(page.locator(".chat-item", { hasText: "(fork)" }).first()).toBeVisible();
 });
 
-// Round-8 #3: the forked row carries a quiet "copy of {source}" sublabel so its
-// lineage is legible (it's not just a coincidental name-twin of its source).
+// The fork mark keeps the source available without adding a second row of text.
 Then("the forked chat shows it is a copy of its source", async ({ page }) => {
-    const sub = page.locator(".chat-item", { hasText: "(fork)" }).first().locator(".leaf-sub");
-    await expect(sub).toBeVisible();
-    await expect(sub).toContainText("copy of");
+    const source = page.locator(".chat-item", { hasText: "(fork)" }).first().locator("[data-fork-source]");
+    await expect(source).toBeVisible();
+    await expect(source).toHaveAttribute("title", /Copy of/);
 });
 
 // Round-8 #3, revised by ADR 0141: a fork inherits its parent's transcript, so
@@ -1176,7 +1193,7 @@ When("I create an edit chat under the archetype {string}", async ({ page }, name
         .locator("[data-archetype]", { hasText: name })
         .locator(".tree-node.archetype")
         .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "edit" }).click();
+    await page.locator(".menu-item-label", { hasText: "new authoring chat" }).click();
     // Creation navigates asynchronously. Do not let the next step operate on the
     // quick-start composer that was visible before the new edit chat was selected.
     await expect(page.locator('[data-chat].active[data-kind="edit"]')).toBeVisible();
@@ -1910,9 +1927,9 @@ When("I use the archetype {string} from its menu", async ({ page }, name: string
         .click({ button: "right" });
     // The label lives in `.menu-item-label`; the `.menu-item` text also carries the
     // hint, so anchor on the label span (the click bubbles to the item).
-    // The Workshop menu label is "test" (run the method to try it out) — same action
+    // The Workshop menu's test action — same behavior
     // as the old "use": opens a work chat in the hidden Personal project.
-    await page.locator(".menu-item-label", { hasText: /^test$/ }).click();
+    await page.locator(".menu-item-label", { hasText: /^test in a chat$/ }).click();
 });
 
 Then("a work chat opens", async ({ page }) => {

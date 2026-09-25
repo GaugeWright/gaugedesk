@@ -218,11 +218,11 @@ export function AgentSettings(props: AgentSettingsProps) {
                     <fieldset class="settings-field" data-settings-abilities>
                         <legend class="settings-label">Abilities</legend>
                         <p class="status" style={{ margin: "2px 0 8px" }}>
-                            Choose the maximum workspace access this agent receives.
+                            Choose the workspace and task abilities this agent receives.
                         </p>
                         {AGENT_ABILITY_PRESETS.map((preset) => {
                             const checked = () =>
-                                JSON.stringify([...abilities()].sort()) ===
+                                JSON.stringify(abilities().filter((ability) => ability !== "tracker.file").sort()) ===
                                 JSON.stringify([...preset.value].sort());
                             return (
                                 <label
@@ -239,7 +239,8 @@ export function AgentSettings(props: AgentSettingsProps) {
                                         name="agent-abilities"
                                         checked={checked()}
                                         onChange={() => {
-                                            setSelectedAbilities(preset.value);
+                                            setSelectedAbilities(abilities().includes("tracker.file")
+                                                ? [...preset.value, "tracker.file"] : preset.value);
                                             setMsg("");
                                         }}
                                     />
@@ -250,6 +251,16 @@ export function AgentSettings(props: AgentSettingsProps) {
                                 </label>
                             );
                         })}
+                        <label style={{ display: "flex", gap: "8px", "align-items": "start", margin: "10px 0 0" }}>
+                            <input type="checkbox" checked={abilities().includes("tracker.file")}
+                                onChange={(event) => {
+                                    setSelectedAbilities(event.currentTarget.checked
+                                        ? [...abilities(), "tracker.file"]
+                                        : abilities().filter((ability) => ability !== "tracker.file"));
+                                    setMsg("");
+                                }} />
+                            <span>File project tasks <small class="status" style={{ display: "block" }}>Allows this agent to create real items in the current project’s task bar. Publish the draft to make this available to placed Agents.</small></span>
+                        </label>
                     </fieldset>
 
                 </div>

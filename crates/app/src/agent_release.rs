@@ -122,6 +122,18 @@ fn release_discipline_files(
         let media_type = discipline_media_type(&path);
         if path.starts_with("workspace/") {
             workspace.push(ReleaseFile::new(path, media_type, body.into_bytes()));
+        } else if let Some(skill_path) = path.strip_prefix("agent-skills/") {
+            workspace.push(ReleaseFile::new(
+                format!("workspace/agent/skills/{skill_path}"),
+                media_type,
+                body.into_bytes(),
+            ));
+        } else if let Some(agent_path) = path.strip_prefix("agent-files/") {
+            workspace.push(ReleaseFile::new(
+                format!("workspace/agent/{agent_path}"),
+                media_type,
+                body.into_bytes(),
+            ));
         } else if let Some(name) = &skill_name {
             if path == crate::discipline::DISCIPLINE_MANIFEST {
                 instructions.push(ReleaseFile::new(
@@ -546,6 +558,8 @@ struct PackageManifestPaths {
     workflow: String,
     agent: String,
     system_prompt: String,
+    #[serde(default)]
+    project_context: Option<String>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
     max_steps: usize,
@@ -674,6 +688,18 @@ impl Workbench {
             .versions
             .get(&instance.version)
             .ok_or_else(|| invalid("deployment archetype version is not published"))?;
+        // New releases obey the authored collection closure even when they
+        // refer to a version frozen before the Agent-files migration. Signed
+        // releases already in use are not rebuilt or reinterpreted here.
+        if let Some(collection) = &spec.collection {
+            for path in &collection.exportable_paths {
+                if !path.starts_with("artifacts/") {
+                    return Err(invalid(format!(
+                        "collection path `{path}` must be inside artifacts/"
+                    )));
+                }
+            }
+        }
         let target = self
             .library
             .authoring_target_for(&agent.id)
@@ -690,8 +716,10 @@ impl Workbench {
         }
         let manifest: PackageManifestPaths =
             serde_json::from_str(package.manifest_document()).map_err(invalid)?;
-        if manifest.schema != "whipplescript.agent_package.v0"
-            || manifest.workflow.trim().is_empty()
+        if !matches!(
+            manifest.schema.as_str(),
+            "whipplescript.agent_package.v0" | "whipplescript.agent_package.v1"
+        ) || manifest.workflow.trim().is_empty()
             || manifest.agent.trim().is_empty()
             || manifest.max_steps == 0
         {
@@ -731,7 +759,7 @@ impl Workbench {
         let package_manifest_path = format!("{package_prefix}/package.json");
         let package_source_path = format!("{package_prefix}/{}", manifest.source);
         let package_persona_path = format!("{package_prefix}/{}", manifest.system_prompt);
-        let package_files = vec![
+        let mut package_files = vec![
             ReleaseFile::new(
                 package_manifest_path.clone(),
                 "application/json",
@@ -748,6 +776,13 @@ impl Workbench {
                 package.system_prompt_document().as_bytes().to_vec(),
             ),
         ];
+        if let Some(context_path) = &manifest.project_context {
+            package_files.push(ReleaseFile::new(
+                format!("{package_prefix}/{context_path}"),
+                "text/markdown",
+                std::fs::read(package_root.join(context_path))?,
+            ));
+        }
         if !spec.public_abilities.is_subset(&package_abilities) {
             return Err(invalid(
                 "public ability ceiling exceeds the package agent abilities",
@@ -991,13 +1026,50 @@ impl Workbench {
         let _snapshot = PreviewSnapshot {
             roots: vec![package_root.clone(), discipline_root.clone()],
         };
-        for file in [
-            gaugedesk_boundary::definition::MANIFEST_FILE,
-            gaugedesk_boundary::definition::SOURCE_FILE,
-            gaugedesk_boundary::definition::PERSONA_FILE,
-        ] {
+        let preview_manifest: PackageManifestPaths = serde_json::from_str(
+            &std::fs::read_to_string(draft_package_root.join("package.json"))?,
+        )
+        .map_err(invalid)?;
+        let mut package_names = vec![
+            "package.json",
+            preview_manifest.source.as_str(),
+            preview_manifest.system_prompt.as_str(),
+        ];
+        package_names.sort_unstable();
+        package_names.dedup();
+        for file in package_names {
+            if !matches!(
+                std::path::Path::new(file)
+                    .components()
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                [std::path::Component::Normal(_)]
+            ) {
+                return Err(invalid(format!(
+                    "preview package file `{file}` must be a direct child"
+                )));
+            }
             std::fs::copy(draft_package_root.join(file), package_root.join(file))?;
         }
+        if preview_manifest.schema == "whipplescript.agent_package.v1" {
+            let agents = std::fs::read(repo.join("agent/AGENTS.md"))?;
+            std::fs::write(package_root.join("AGENTS.md"), agents)?;
+            std::fs::copy(repo.join("agent/HUMANS.md"), package_root.join("HUMANS.md"))?;
+            let system = match std::fs::read(repo.join("agent/SYSTEM.md")) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            std::fs::write(package_root.join(&preview_manifest.system_prompt), system)?;
+            let authored_source = repo.join("agent").join(&preview_manifest.source);
+            if preview_manifest.source != gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
+                && authored_source.is_file()
+            {
+                std::fs::copy(authored_source, package_root.join(&preview_manifest.source))?;
+            }
+        }
+        let preview_package =
+            gaugedesk_whip_runtime::AuthoredAgentPackage::load(&package_root).map_err(invalid)?;
         for (path, body) in &draft_discipline.files {
             let destination = discipline_root.join(path);
             if let Some(parent) = destination.parent() {
@@ -1005,11 +1077,20 @@ impl Workbench {
             }
             std::fs::write(destination, body)?;
         }
+        if preview_manifest.schema == "whipplescript.agent_package.v1" {
+            crate::discipline::materialize_agent_definition(&repo.join("agent"), &discipline_root)
+                .map_err(invalid)?;
+        }
+        let preview_discipline = crate::discipline::load(
+            &discipline_root,
+            preview_package.capabilities().iter().cloned(),
+        )
+        .map_err(invalid)?;
 
         let preview_instance_id = crate::library::gen_id("panel-preview-instance");
         let version = ArchetypeVersionRecord {
-            package_ref: draft_package.version_ref().to_owned(),
-            discipline_ref: draft_discipline.reference,
+            package_ref: preview_package.version_ref().to_owned(),
+            discipline_ref: preview_discipline.reference,
             panel_profile: Some(profile.clone()),
         };
         self.library
@@ -2660,6 +2741,54 @@ mod publisher_tests {
     use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
 
     #[test]
+    fn new_panel_collection_only_selects_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        guard
+            .seed_panel_placement(
+                "inst-artifact-paths",
+                crate::library::PanelPublicProfile::default(),
+            )
+            .unwrap();
+        let collection = |path: &str| CollectionPolicy {
+            exportable_paths: vec![path.to_owned()],
+            transcript_eligible: false,
+            schema_ref: "schema:test".to_owned(),
+            recipient_class: "test-recipient".to_owned(),
+            max_artifact_bytes: 1024,
+        };
+
+        for path in ["work/notes.md", "agent/AGENTS.md", "report.md"] {
+            let mut profile = guard.panel_profile("inst-artifact-paths-agent").unwrap();
+            profile.collection = Some(collection(path));
+            assert!(guard
+                .set_panel_profile("inst-artifact-paths-agent", profile)
+                .unwrap_err()
+                .contains("must be inside artifacts/"));
+
+            // The public release builder also refuses a direct spec that
+            // bypassed profile editing or names an older frozen profile.
+            let mut spec = preview_release_spec(
+                &crate::library::PanelPublicProfile::default(),
+                1_800_000_000_000,
+            );
+            spec.collection = Some(collection(path));
+            assert!(guard
+                .build_agent_release("inst-artifact-paths", spec)
+                .unwrap_err()
+                .to_string()
+                .contains("must be inside artifacts/"));
+        }
+
+        let mut profile = guard.panel_profile("inst-artifact-paths-agent").unwrap();
+        profile.collection = Some(collection("artifacts/*"));
+        guard
+            .set_panel_profile("inst-artifact-paths-agent", profile)
+            .unwrap();
+    }
+
+    #[test]
     fn library_preview_signs_the_draft_without_publishing_or_placing_it() {
         let root = tempfile::tempdir().unwrap();
         let workbench = crate::open_workbench(root.path()).unwrap();
@@ -3060,6 +3189,14 @@ mod publisher_tests {
                 "workspace/brief.md".to_owned(),
                 "# Client brief\n".to_owned(),
             ),
+            (
+                "agent-skills/triage/SKILL.md".to_owned(),
+                "---\nname: triage\ndescription: Inspect reports\n---\n".to_owned(),
+            ),
+            (
+                "agent-files/references/guide.md".to_owned(),
+                "Reference\n".to_owned(),
+            ),
         ])
         .unwrap();
 
@@ -3072,6 +3209,8 @@ mod publisher_tests {
             BTreeSet::from([
                 "workspace/.agents/skills/theory-a/SKILL.md",
                 "workspace/.agents/skills/theory-a/references/core.md",
+                "workspace/agent/skills/triage/SKILL.md",
+                "workspace/agent/references/guide.md",
                 "workspace/brief.md",
             ])
         );

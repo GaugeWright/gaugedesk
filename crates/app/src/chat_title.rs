@@ -102,6 +102,62 @@ struct TitleTransport<'a> {
     broker: Option<&'a OrganizationModelBrokerConfig>,
 }
 
+/// Keep the naming call's effort independent of the chat's chosen effort.
+/// Only send fields supported by a known provider/model pair: a custom
+/// OpenAI-compatible endpoint may reject an OpenAI-specific reasoning field.
+struct TitleEffortTransport<'a, T> {
+    inner: &'a T,
+    descriptor: &'a NativeProviderDescriptor,
+}
+
+impl<T: CoerceTransport> CoerceTransport for TitleEffortTransport<'_, T> {
+    fn post(&self, request: &HttpRequest) -> Result<HttpResponse, CoerceTransportError> {
+        let mut request = request.clone();
+        let model = self.descriptor.model.to_ascii_lowercase();
+        match self.descriptor.provider_name.as_str() {
+            // These standard GPT-5 models accept no reasoning on Responses.
+            "openai-codex" | "openai" if known_standard_gpt_five(&model) => {
+                request.body["reasoning"] = serde_json::json!({ "effort": "none" });
+            }
+            // The documented floor for the Pro variants is medium.
+            "openai" if matches!(model.as_str(), "gpt-5.4-pro" | "gpt-5.5-pro") => {
+                request.body["reasoning"] = serde_json::json!({ "effort": "medium" });
+            }
+            // The xAI title call uses Responses so these effort controls are
+            // accepted there, unlike on the regular Chat Completions wire.
+            "xai" if model.starts_with("grok-4.3") => {
+                request.body["reasoning"] = serde_json::json!({ "effort": "none" });
+            }
+            "xai"
+                if ["grok-4.5", "grok-4.6", "grok-4.7"]
+                    .iter()
+                    .any(|family| model.starts_with(family)) =>
+            {
+                request.body["reasoning"] = serde_json::json!({ "effort": "low" });
+            }
+            // Anthropic's currently shipped models run without extended
+            // thinking when the field is omitted. Other endpoints and the
+            // Grok subscription proxy have no verified low-effort wire here.
+            _ => {}
+        }
+        self.inner.post(&request)
+    }
+}
+
+fn known_standard_gpt_five(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-5.4"
+            | "gpt-5.4-mini"
+            | "gpt-5.4-nano"
+            | "gpt-5.5"
+            | "gpt-5.6"
+            | "gpt-5.6-sol"
+            | "gpt-5.6-terra"
+            | "gpt-5.6-luna"
+    )
+}
+
 impl CoerceTransport for TitleTransport<'_> {
     fn post(&self, request: &HttpRequest) -> Result<HttpResponse, CoerceTransportError> {
         if let Some(broker) = self.broker {
@@ -184,11 +240,15 @@ fn generate_title_with_transport<T: CoerceTransport>(
         .resolve(capability.credential_ref())
         .map_err(|_| "title model credential unavailable".to_owned())?;
     let descriptor = &context.descriptor;
+    let title_transport = TitleEffortTransport {
+        inner: transport,
+        descriptor,
+    };
     let cache_key = Some(format!("gaugedesk-title:{}", context.chat_id));
     let messages = [ChatMessage::user_text(title_prompt(user, assistant))];
     let model: Box<dyn HarnessModelClient + '_> = match descriptor.provider_name.as_str() {
         "openai-codex" => Box::new(RealHarnessModelClient::new_codex(
-            transport,
+            &title_transport,
             material.secret(),
             material
                 .account_id()
@@ -199,16 +259,20 @@ fn generate_title_with_transport<T: CoerceTransport>(
             Some(256),
             cache_key,
         )),
-        "xai" => Box::new(RealHarnessModelClient::new_xai(
-            transport,
+        // xAI exposes reasoning effort on Responses, while regular turns use
+        // its Chat Completions wire. The title call has no tools and can use
+        // Responses without changing the turn's provider or credential.
+        "xai" => Box::new(RealHarnessModelClient::new(
+            &title_transport,
+            ModelWire::OpenAiResponses,
             material.secret(),
             &descriptor.model,
             &descriptor.base_url,
             Some(256),
-            cache_key,
+            None,
         )),
         "xai-grok" => Box::new(RealHarnessModelClient::new_xai_subscription(
-            transport,
+            &title_transport,
             material.secret(),
             &descriptor.model,
             &descriptor.base_url,
@@ -216,7 +280,7 @@ fn generate_title_with_transport<T: CoerceTransport>(
             cache_key,
         )),
         _ => Box::new(RealHarnessModelClient::new(
-            transport,
+            &title_transport,
             ModelWire::parse(descriptor.wire).ok_or("unsupported title model wire")?,
             material.secret(),
             &descriptor.model,
@@ -284,6 +348,97 @@ mod tests {
         let body = requests[0].body.to_string();
         assert!(body.contains("Please fix the login expiry bug"));
         assert!(body.contains("timer mismatch"));
+        assert_eq!(requests[0].body["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn title_effort_uses_each_known_models_lowest_request_setting() {
+        for (provider, model, expected) in [
+            ("openai-codex", "gpt-5.5", "none"),
+            ("openai", "gpt-5.4-mini", "none"),
+            ("openai", "gpt-5.4-pro", "medium"),
+            ("openai", "gpt-5.5-pro", "medium"),
+            ("openai", "gpt-5.6-sol", "none"),
+            ("xai", "grok-4.3", "none"),
+            ("xai", "grok-4.6", "low"),
+        ] {
+            let descriptor =
+                gaugedesk_whip_runtime::native_provider_descriptor(provider, Some(model), None)
+                    .unwrap();
+            let inner = FakeTransport(Mutex::new(Vec::new()));
+            let transport = TitleEffortTransport {
+                inner: &inner,
+                descriptor: &descriptor,
+            };
+            transport
+                .post(&HttpRequest {
+                    url: "https://example.test".into(),
+                    headers: Vec::new(),
+                    body: serde_json::json!({ "model": model }),
+                })
+                .unwrap();
+            let requests = inner.0.lock().unwrap();
+            assert_eq!(
+                requests[0].body["reasoning"]["effort"], expected,
+                "{provider}/{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn xai_title_call_uses_responses_for_low_reasoning() {
+        let transport = FakeTransport(Mutex::new(Vec::new()));
+        let context = TitleModelContext {
+            descriptor: gaugedesk_whip_runtime::native_provider_descriptor(
+                "xai",
+                Some("grok-4.6"),
+                None,
+            )
+            .unwrap(),
+            credential: Some(crate::account::resolved_credential_capability(
+                "credential-1".into(),
+                "synthetic-key".into(),
+                None,
+            )),
+            organization_broker: None,
+            personal_selection: None,
+            chat_id: "chat-1".into(),
+        };
+        assert_eq!(
+            generate_title_with_transport(&context, "Fix login", "Done", &transport).unwrap(),
+            "Fix login expiry"
+        );
+        let requests = transport.0.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.ends_with("/v1/responses"));
+        assert_eq!(requests[0].body["reasoning"]["effort"], "low");
+        assert!(requests[0].body.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn unknown_endpoint_does_not_get_an_unsupported_reasoning_field() {
+        let descriptor = gaugedesk_whip_runtime::native_provider_descriptor(
+            "openai-generic",
+            Some("custom-model"),
+            Some("https://model.example/v1"),
+        )
+        .unwrap();
+        let inner = FakeTransport(Mutex::new(Vec::new()));
+        let transport = TitleEffortTransport {
+            inner: &inner,
+            descriptor: &descriptor,
+        };
+        transport
+            .post(&HttpRequest {
+                url: "https://model.example/v1/chat/completions".into(),
+                headers: Vec::new(),
+                body: serde_json::json!({ "model": "custom-model" }),
+            })
+            .unwrap();
+        assert_eq!(
+            inner.0.lock().unwrap()[0].body,
+            serde_json::json!({ "model": "custom-model" })
+        );
     }
 
     #[test]

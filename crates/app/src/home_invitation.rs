@@ -303,6 +303,9 @@ pub async fn post_accept_invitation(
             )
                 .into_response();
         }
+        if let Err(error) = wb.ensure_shipped_tutorials() {
+            tracing::warn!(%error, "new member's Tutorials project was not reconciled");
+        }
     }
     let home = wb.home_id().clone();
     let admission = wb.home_admissions.open(home.clone(), actor);

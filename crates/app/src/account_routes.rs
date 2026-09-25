@@ -163,6 +163,10 @@ pub fn runtime_credential_routes() -> Router<SharedWorkbench> {
             post(crate::account_signin::post_signin_select_local),
         )
         .route(
+            "/account/hub-session/claim-home",
+            post(crate::account_signin::post_claim_desktop_home),
+        )
+        .route(
             "/account/hub-session/start",
             post(crate::account_signin::post_signin_start),
         )

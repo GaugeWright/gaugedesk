@@ -33,8 +33,8 @@ use whipplescript_store::diff::DiffEntry;
 use whipplescript_store::materialize::MaterializedScratch;
 use whipplescript_store::stat_cache::{CachedEntry, StatCache};
 use whipplescript_store::vcs::{
-    MergeProbeOutcome, NativeWorkspaceVcs, ReconcileOutcome, RestoreOutcome, VcsMergeOutcome,
-    VcsWriteOutcome,
+    GateCommit, GateVerdict, MainlineGate, MergeProbeOutcome, NativeWorkspaceVcs, ReconcileOutcome,
+    RestoreOutcome, VcsMergeOutcome, VcsWriteOutcome,
 };
 use whipplescript_store::workstreams::{
     ArchiveOutcome, BoundaryReservation, CreateStreamOutcome, ReserveBoundaryOutcome,
@@ -63,10 +63,34 @@ pub use workflow_storage::{
     NativeWorkflowStorage, NativeWorkflowStores, WorkflowProtection, WorkflowProtectionMode,
 };
 
-/// Host-owned per-chat materializations are never target history. The runtime
-/// mount contains the selected archetype discipline; it is recreated from the
-/// immutable archetype version and layered read-only by the sandbox.
-const CHAT_LOCAL_PATHS: &[&str] = &[".gaugedesk-runtime"];
+/// Per-chat files never enter a target candidate or the project's mainline.
+/// The runtime mount is host-owned; artifacts and work are writable by the
+/// chat and persist with its engagement.
+const CHAT_LOCAL_PATHS: &[&str] = &[".gaugedesk-runtime", "artifacts", "work"];
+
+/// GaugeDesk gates target changes through its own signed admission and
+/// candidate review. Its workspace store has no WhippleScript norm ledger;
+/// the new store gate preserves the existing compare-and-swap behavior here.
+struct GaugeDeskMainlineGate;
+
+impl MainlineGate for GaugeDeskMainlineGate {
+    fn prepare(
+        &mut self,
+        _base_cut: Option<&str>,
+        _proposed_cut: &str,
+        _artifacts: &whipplescript_store::norm_commands::NormArtifactCapture<'_>,
+    ) -> whipplescript_store::StoreResult<GateVerdict> {
+        Ok(GateVerdict::Admit)
+    }
+
+    fn commit(
+        &mut self,
+        advance: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+    ) -> whipplescript_store::StoreResult<GateCommit> {
+        advance()?;
+        Ok(GateCommit::Committed)
+    }
+}
 
 fn is_chat_local_path(path: &str) -> bool {
     CHAT_LOCAL_PATHS
@@ -702,7 +726,12 @@ impl Instance {
             }
         }
         // The transport line is disposable: a plain adopting merge.
-        match vcs.merge(&transport, &fresh_cut_id("pull-merge"), &now_at())? {
+        match vcs.merge(
+            &transport,
+            &fresh_cut_id("pull-merge"),
+            &now_at(),
+            &mut GaugeDeskMainlineGate,
+        )? {
             VcsMergeOutcome::Adopted { .. } | VcsMergeOutcome::Landed { .. } => {
                 sync_out(&mut vcs, &self.store_root, MAINLINE_BRANCH_ID, &self.repo)?;
                 Ok(MergeOutcome::Clean)
@@ -1406,6 +1435,7 @@ impl Instance {
                 receipt_scope: workspace_authority_id,
             },
             &mut SingleWriterSerialization,
+            &mut GaugeDeskMainlineGate,
         )
         .map_err(WorkspaceError::msg)?;
         match outcome {
@@ -1442,6 +1472,9 @@ impl Instance {
                 })
             }
             BoundaryRunOutcome::Refused(reason) => Ok(WorkstreamPromotionOutcome::Refused(reason)),
+            BoundaryRunOutcome::GateRefused(refusal) => {
+                Ok(WorkstreamPromotionOutcome::Refused(refusal.reason))
+            }
         }
     }
 }
@@ -1772,7 +1805,13 @@ impl Engagement {
 
         let restored = match destination.head_cut_id {
             Some(head_cut) => {
-                match vcs.restore(&self.branch, &head_cut, &fresh_cut_id("rehome"), &now_at())? {
+                match vcs.restore(
+                    &self.branch,
+                    &head_cut,
+                    &fresh_cut_id("rehome"),
+                    &now_at(),
+                    &mut GaugeDeskMainlineGate,
+                )? {
                     RestoreOutcome::Restored { .. } | RestoreOutcome::AlreadyThere => Ok(()),
                     other => Err(WorkspaceError::msg(format!(
                         "rehome restore refused: {other:?}"
@@ -1861,7 +1900,13 @@ impl Engagement {
             .ok_or_else(|| WorkspaceError::msg(format!("no target line `{}`", self.target)))?;
         match target.head_cut_id {
             Some(head_cut) => {
-                match vcs.restore(&self.branch, &head_cut, &fresh_cut_id("revert"), &now_at())? {
+                match vcs.restore(
+                    &self.branch,
+                    &head_cut,
+                    &fresh_cut_id("revert"),
+                    &now_at(),
+                    &mut GaugeDeskMainlineGate,
+                )? {
                     RestoreOutcome::Restored { .. } | RestoreOutcome::AlreadyThere => {}
                     other => return Err(WorkspaceError::msg(format!("revert refused: {other:?}"))),
                 }
@@ -1915,7 +1960,12 @@ impl Engagement {
         // landing after this import is work no import has considered yet, not
         // content the merge decided against.
         let sides = self.import_sides_under_writer(&mut vcs)?;
-        match vcs.merge_keeping(&self.branch, &fresh_cut_id("keep"), &now_at())? {
+        match vcs.merge_keeping(
+            &self.branch,
+            &fresh_cut_id("keep"),
+            &now_at(),
+            &mut GaugeDeskMainlineGate,
+        )? {
             VcsMergeOutcome::Landed { .. } | VcsMergeOutcome::Adopted { .. } => {
                 if let Some(repo) = &sides.repo {
                     sync_out_observing(
@@ -4893,6 +4943,41 @@ mod tests {
     }
 
     #[test]
+    fn run_files_survive_reconciliation_without_entering_a_target_candidate() {
+        let (_directory, instance) = instance();
+        instance
+            .seed_main(&[("targets/t-one/source.txt", "source")])
+            .expect("target basis");
+        let chat = instance
+            .create_engagement_subset(
+                "chat-with-results",
+                MAINLINE_BRANCH_ID,
+                &BTreeSet::from(["targets/t-one".to_owned()]),
+            )
+            .expect("sparse chat");
+        chat.write_file("artifacts/result.md", "final answer")
+            .expect("artifact");
+        chat.write_file("work/research.md", "intermediate")
+            .expect("work note");
+        assert!(chat.diff_against_main().expect("target diff").is_empty());
+        chat.sync_from_main().expect("reconcile");
+        assert_eq!(
+            chat.read_file("artifacts/result.md").unwrap(),
+            "final answer"
+        );
+        assert_eq!(chat.read_file("work/research.md").unwrap(), "intermediate");
+        let other = instance
+            .create_engagement_subset(
+                "other-chat",
+                MAINLINE_BRANCH_ID,
+                &BTreeSet::from(["targets/t-one".to_owned()]),
+            )
+            .expect("other chat");
+        assert!(!other.path().join("artifacts/result.md").exists());
+        assert!(!other.path().join("work/research.md").exists());
+    }
+
+    #[test]
     fn no_op_cut_and_file_facets_remain_compatible() {
         let (_directory, instance) = instance();
         let chat = instance.create_engagement("chat").expect("chat");
@@ -5061,6 +5146,7 @@ mod tests {
                             nonempty(&reservation.expected_main_cut),
                             &reservation.proposed_main_cut,
                             "t2",
+                            &mut GaugeDeskMainlineGate,
                         )
                         .unwrap();
                     assert!(matches!(
@@ -5217,6 +5303,7 @@ mod tests {
                 nonempty(&reservation.expected_main_cut),
                 &reservation.proposed_main_cut,
                 &at,
+                &mut GaugeDeskMainlineGate,
             )
             .expect("main CAS");
         let (position, handle) = match promoted {
@@ -5750,7 +5837,12 @@ mod tests {
             .expect("late repo");
 
         match vcs
-            .merge_keeping(&chat.branch, &fresh_cut_id("keep"), &now_at())
+            .merge_keeping(
+                &chat.branch,
+                &fresh_cut_id("keep"),
+                &now_at(),
+                &mut GaugeDeskMainlineGate,
+            )
             .expect("merge")
         {
             VcsMergeOutcome::Landed { .. } | VcsMergeOutcome::Adopted { .. } => {}

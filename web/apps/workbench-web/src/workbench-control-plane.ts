@@ -1092,6 +1092,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.startShippedTutorial(this.workbenchTransport(), name);
     }
 
+    getShippedTutorial(name: string) {
+        return workbenchClient.getShippedTutorial(this.workbenchTransport(), name);
+    }
+
     async completeProjectTrackerIssue(project: ProjectId, queue: string, item: string, intent: workbenchClient.TrackerCompletionIntent) {
         return workbenchClient.completeProjectTrackerIssue(await this.projectTrackerTransport(project), project, queue, item, intent);
     }
@@ -2163,6 +2167,10 @@ export class WorkbenchControlPlane implements ControlPlane {
     // one-time code, and non-secret status.
     hubSessionStatus(): Promise<accountClient.HubSessionStatus> {
         return this.desktopSessionJson().then((json) => accountClient.hubSessionStatus(json));
+    }
+
+    hubSessionClaimHome(person: string): Promise<accountClient.HubSessionStatus> {
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionClaimHome(json, person));
     }
 
     hubSessionAccounts(): Promise<accountClient.HubSessionAccounts> {

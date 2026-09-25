@@ -7024,7 +7024,7 @@
       "producer": "gaugedesk-app hosted Home composition",
       "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
       "authentication": "verified-account-or-machine-session; hosted-home-admission",
-      "scope": "home-owner-personal-shipped-tutorial",
+      "scope": "learner-product-tutorials-project",
       "capability": "start-shipped-tutorial",
       "requestSchema": "http/empty",
       "responseSchema": "rust:gaugedesk-app/project_workflow/ProjectWorkflowInvocation",
@@ -7048,6 +7048,42 @@
         "deployed": [],
         "property": [
           "crates/app/src/shipped_tutorials_tests.rs#basics_starts_once_from_the_tutorials_folder"
+        ]
+      }
+    },
+    {
+      "id": "home.tutorial.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/tutorials/:name",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "verified-account-or-machine-session; hosted-home-admission",
+      "scope": "learner-product-tutorials-project",
+      "capability": "read-installed-tutorial-source-and-status",
+      "requestSchema": "http/path-name",
+      "responseSchema": "rust:gaugedesk-app/shipped_tutorials/ShippedTutorialInfo",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/project-workflow.test.ts#reads installed tutorial source and status by name without a local file path"
+        ],
+        "authority": [
+          "crates/app/src/shipped_tutorials_tests.rs#the_source_route_is_authenticated_and_reads_the_release_target"
+        ],
+        "journey": [
+          "crates/app/src/shipped_tutorials_tests.rs#the_source_route_is_authenticated_and_reads_the_release_target"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/shipped_tutorials_tests.rs#the_read_only_view_shows_installed_source_and_launch_state"
         ]
       }
     },
@@ -10006,6 +10042,13 @@
     {
       "method": "POST",
       "path": "/account/hub-session/callback",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/account/hub-session/claim-home",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

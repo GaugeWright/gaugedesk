@@ -47,6 +47,8 @@ pub(crate) struct PolicyCompilationInput {
     pub placement_kind: String,
     pub command_network: bool,
     pub resources: Vec<ResourceRecord>,
+    /// Current project tracker admitted separately from chat context resources.
+    pub task_tracker: Option<ResourceRecord>,
     /// Complete stable-target process binding derived from the chat's pinned
     /// target-set revision. Empty is the single undivided edit-workspace shape.
     pub target_bindings: Vec<crate::target_change_set::ProcessTargetBinding>,
@@ -63,6 +65,7 @@ pub(crate) struct CompiledPolicyEpoch {
     pub provider_binding_ref: String,
     pub credential_ref: String,
     pub placement_ceiling_ref: String,
+    pub task_tracker_admitted: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -83,6 +86,7 @@ impl Workbench {
         input: PolicyCompilationInput,
     ) -> Result<CompiledPolicyEpoch, String> {
         let policy = compile_policy(&input)?;
+        let task_tracker_admitted = policy.bindings.contains_key("tasks");
         let unsigned_policy = declare_guarantees(policy.to_json()?, &input.advancement_scopes)?;
         let previous = latest_epoch(self, &input.chat_id)?;
         let record = match previous {
@@ -120,6 +124,7 @@ impl Workbench {
             provider_binding_ref: PROVIDER_BINDING_HANDLE.to_owned(),
             credential_ref: input.credential_ref,
             placement_ceiling_ref: PLACEMENT_HANDLE.to_owned(),
+            task_tracker_admitted,
         })
     }
 
@@ -187,6 +192,16 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         .iter()
         .filter(|record| !record.tombstoned)
         .collect::<Vec<_>>();
+    if let Some(tracker) = &input.task_tracker {
+        validate_resources_for_action(
+            &[tracker],
+            &input.actor_attributes,
+            &input.org_policy,
+            input.turn_purpose.as_deref(),
+            input.placement_kind == "attested",
+            Action::Run,
+        )?;
+    }
     validate_execution_resources(
         &active_resources,
         &input.actor_attributes,
@@ -256,6 +271,32 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         ("owned".to_owned(), "provider:owned".to_owned()),
         (PLACEMENT_HANDLE.to_owned(), placement_address),
     ]);
+    if let Some(tracker) = &input.task_tracker {
+        if !input.package_capabilities.contains("tracker.file") {
+            return Err("task tracker requires the package tracker.file capability".to_owned());
+        }
+        let address = tracker.resource.id.as_str().to_owned();
+        // Project task readers follow the selected project targets, not the
+        // union of every extra context resource admitted to this chat. An
+        // outside resource must not widen the task sink merely by being read.
+        let mut reader = BTreeSet::from([actor_role.clone()]);
+        reader.extend(input.target_bindings.iter().flat_map(|binding| {
+            binding
+                .authorities
+                .iter()
+                .map(|authority| authority_role(authority))
+        }));
+        policy_resources.insert(
+            address.clone(),
+            ResourcePolicy {
+                reader,
+                writer: BTreeSet::from([actor_role.clone()]),
+                principal: false,
+                internal: false,
+            },
+        );
+        policy_bindings.insert("tasks".to_owned(), address);
+    }
     // Authored host packages statically declare `project`; it remains an
     // abstract IFC surface so WhippleScript can verify the package. A sparse
     // target turn never sends this handle to a resolver, so it cannot restore
@@ -336,7 +377,7 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         }
     }
 
-    for record in active_resources {
+    for record in &active_resources {
         let id = record.resource.id.as_str();
         let address = format!("gaugedesk:resource:{id}");
         let handle = format!("resource:{id}");
@@ -378,6 +419,31 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
             .filter(|clearance| clearance != &actor_role)
             .map(|clearance| [actor_role.clone(), clearance]),
     );
+    if input.task_tracker.is_some() {
+        let document = policy.to_json()?;
+        let verified = gaugedesk_whip_runtime::ifc::VerifiedEnvelope::verify_text(&document)?;
+        let sources = std::iter::once("turn_images".to_owned())
+            .chain(std::iter::once("project".to_owned()))
+            .chain(
+                input
+                    .target_bindings
+                    .iter()
+                    .map(|binding| binding.resource_handle.clone()),
+            )
+            .chain(
+                active_resources
+                    .iter()
+                    .map(|record| format!("resource:{}", record.resource.id.as_str())),
+            );
+        if sources
+            .into_iter()
+            .any(|source| verified.check_resource_flow(&source, "tasks").is_err())
+        {
+            if let Some(address) = policy.bindings.remove("tasks") {
+                policy.resources.remove(&address);
+            }
+        }
+    }
     policy.validate()?;
     Ok(policy)
 }
@@ -577,9 +643,38 @@ mod tests {
             placement_kind: "local".to_owned(),
             command_network: false,
             resources: Vec::new(),
+            task_tracker: None,
             target_bindings: Vec::new(),
             advancement_scopes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn task_tracker_is_offered_only_when_every_admitted_input_can_flow_to_it() {
+        let make = |id: &str, owner: &str| {
+            ResourceRecord::new(
+                Resource::input(
+                    ResourceId::new(id),
+                    ResourceKind::context(),
+                    Authority::from(owner),
+                ),
+                ContentLocator::Content {
+                    handle: id.to_owned(),
+                },
+                |_| Authority::from(owner),
+            )
+        };
+        let mut turn = input();
+        turn.package_capabilities.insert("tracker.file".to_owned());
+        turn.task_tracker = Some(make("tracker:tasks", "home"));
+        let plain = compile_policy(&turn).unwrap();
+        assert!(plain.bindings.contains_key("tasks"));
+
+        turn.resources
+            .push(make("private-context", "outside-client"));
+        let with_external_input = compile_policy(&turn).unwrap();
+        assert!(!with_external_input.bindings.contains_key("tasks"));
+        assert!(!with_external_input.resources.contains_key("tracker:tasks"));
     }
 
     /// The envelope an OIDC actor gets when the IdP asserts no clearance.

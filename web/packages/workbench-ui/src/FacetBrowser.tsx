@@ -46,7 +46,7 @@ import { type ChatRunTone } from "./chat-run-state";
 import { StatusGem } from "./StatusGem";
 import { forkSource } from "./fork-lineage";
 import { groupChatsByWorkstream } from "./workstream-grouping";
-import { Icon } from "./icons";
+import { Icon, type IconName } from "./icons";
 import { canTransferToMain, canTransferToWorkstream } from "./workstream-transfer";
 import {
     archetypeVisible,
@@ -106,6 +106,16 @@ const FACETS: { id: Facet; label: string }[] = [
     { id: "projects", label: "Projects" },
     { id: "library", label: "Workshop" },
 ];
+
+function AgentKindMark(props: { kind: AgentKind; settings?: boolean }) {
+    const label = () => props.kind === "panel" ? "Panel agent" : "Agent";
+    return (
+        <span class="agent-kind-mark" data-agent-kind={props.kind} title={label()} aria-label={label()}>
+            <Icon name={props.kind === "panel" ? "panel" : "chat-bubble"} />
+            <Show when={props.settings}><Icon name="gear" class="agent-settings-corner" /></Show>
+        </span>
+    );
+}
 
 export interface FacetBrowserApi {
     getWorkspaceCarriage(): Promise<ProjectionCarriage<Workspace>>;
@@ -170,6 +180,7 @@ export function FacetBrowser(props: {
     onOpenModelAccess: (id: ProjectId, name: string) => void;
     onOpenProjectHome: (id: ProjectId, name: string) => void;
     onOpenProjectTasks?: (id: ProjectId, name: string) => void;
+    onOpenTutorials?: (id: ProjectId) => void;
     /** Hand the exact tested placement to the managed website-deployment flow. */
     onDeployPlacement?: (selection: {
         projectId: ProjectId;
@@ -975,14 +986,14 @@ export function FacetBrowser(props: {
         </Show>
     );
 
-    // ADR 0112 (NAVLENS-2): a container row's actions — one primary icon act plus
-    // a ⋯ button opening the row's context menu — revealed on row hover or
-    // keyboard focus. Replaces the always-visible chip rows; right-click still
-    // opens the same menu.
+    // A container row keeps its direct create action and an anchored menu.
+    // Right-click opens the same full action list.
     const rowActions = (opts: {
         /** Extra control rendered before the buttons (the project lens chip). */
         lead?: JSX.Element;
-        primary?: { icon: "robot" | "pencil"; title: string; aria: string; data?: string; run: () => void };
+        primary?: { icon: IconName; title: string; aria: string; data?: string; plus?: boolean; run: () => void };
+        menuIcon?: IconName;
+        menuPlus?: boolean;
         menuAria: string;
         menuItems: () => MenuState["items"];
     }) => (
@@ -1000,7 +1011,7 @@ export function FacetBrowser(props: {
                     >
                         <Icon name={primary.icon} class="icon" />
                         {/* The corner "+" marks creation; edit (pencil) is not a create. */}
-                        <Show when={primary.icon === "robot"}>
+                        <Show when={primary.plus}>
                             <i class="row-act-plus" aria-hidden="true">+</i>
                         </Show>
                     </button>
@@ -1014,7 +1025,8 @@ export function FacetBrowser(props: {
                 aria-label={opts.menuAria}
                 onClick={(e) => { e.stopPropagation(); openMenuAt(e.currentTarget, opts.menuItems()); }}
             >
-                <Icon name="kebab" class="icon" />
+                <Icon name={opts.menuIcon ?? "kebab"} class="icon" />
+                <Show when={opts.menuPlus}><i class="row-act-plus" aria-hidden="true">+</i></Show>
             </button>
         </span>
     );
@@ -1040,15 +1052,20 @@ export function FacetBrowser(props: {
             props.onSelect(eng.id);
         }, "new chat");
     }
+    const lensMenuItems = (p: ProjectNode): MenuState["items"] => [
+        { label: "Recent activity", selected: lensOf(p.id) === "chats", run: () => setLens(p.id, "chats") },
+        { label: "Agent view", selected: lensOf(p.id) === "archetype", run: () => setLens(p.id, "archetype") },
+    ];
     const projectMenuItems = (p: ProjectNode): MenuState["items"] => {
+        if (p.product?.kind === "tutorials") return [
+            { label: "open tutorials", run: () => props.onOpenTutorials?.(p.id) },
+            ...(props.onOpenProjectTasks ? [{ label: "tasks…", hint: "Open your tutorial tasks", run: () => props.onOpenProjectTasks?.(p.id, p.name) }] : []),
+        ];
         const home = p.placements.find((pl) => pl.isDefault)?.placementId;
         const lens = lensOf(p.id);
         return [
-            ...(canStartProjectChat(p) ? [
-                { label: "new chat", hint: "Start a new chat in this project", run: () => void newProjectChat(p) },
-            ] : []),
             ...(home ? [
-                { label: "new workstream", hint: "Create a shared auto-sync line in this project", run: () => startEdit({ kind: "new-workstream", placementId: home }) },
+                { label: "new workstream", icon: "child-branch" as const, hint: "Create a shared auto-sync line in this project", run: () => startEdit({ kind: "new-workstream", placementId: home }) },
             ] : []),
             ...(lens === "chats"
                 ? p.placements
@@ -1059,14 +1076,7 @@ export function FacetBrowser(props: {
                         run: () => void newWorkChat(p.id, pl.placementId),
                     }))
                 : []),
-            {
-                label: lens === "chats" ? "group by Agent" : "flat chats",
-                hint: lens === "chats"
-                    ? "Show this project's placements as structure (workstreams, drag, merge live there)"
-                    : "Show this project's chats as one flat, current-first list",
-                run: () => setLens(p.id, lens === "chats" ? "archetype" : "chats"),
-            },
-            { label: "add an agent", run: () => openAddMethod(p.id, p.name) },
+            { label: "add an Agent", icon: "chat-bubble" as const, run: () => openAddMethod(p.id, p.name) },
             ...(props.onAttachTarget ? [
                 { label: "attach Git repository…", hint: "Use its native Git history and explicit apply lifecycle", run: () => props.onAttachTarget?.(p.id, p.name, "external-vcs" as const) },
                 { label: "attach folder…", hint: "Fingerprint the folder and compare before every write", run: () => props.onAttachTarget?.(p.id, p.name, "external-folder" as const) },
@@ -1143,8 +1153,8 @@ export function FacetBrowser(props: {
                 }}
                 onContextMenu={(event) => openMenu(event, placementMenuItems(p, pl))}
             >
+                <AgentKindMark kind="panel" />
                 <span class="node-label" data-lineage-archetype={pl.archetypeId}>{mark(pl.archetypeName)}</span>
-                <span class="cfg-badge">Panel agent</span>
                 <Show when={pl.upgradeAvailable}><button
                     class="upgrade-badge"
                     data-upgrade-available={pl.placementId}
@@ -1156,7 +1166,7 @@ export function FacetBrowser(props: {
                 >update available</button></Show>
                 {rowActions({
                     primary: props.onOpenPanelAgent ? {
-                        icon: "robot",
+                        icon: "panel",
                         title: "Open this Panel agent placement",
                         aria: `open ${pl.archetypeName}`,
                         data: "open-panel-agent",
@@ -1176,12 +1186,12 @@ export function FacetBrowser(props: {
     type ArchetypeNode = Workspace["archetypes"][number];
     const archetypeMenuItems = (a: ArchetypeNode): MenuState["items"] => [
         ...(a.kind === "work"
-            ? [{ label: "test", hint: "Try this Agent in a Personal work chat", run: () => void useArchetype(a.id) }]
+            ? [{ label: "test in a chat", icon: "eye" as const, hint: "Try this Agent in a Personal work chat", run: () => void useArchetype(a.id) }]
             : props.onOpenPanelAgent
-                ? [{ label: "open", hint: "Open this Panel agent: its edit chat, public contract, and Preview", run: () => props.onOpenPanelAgent?.(a) }]
+                ? [{ label: "open Preview", icon: "eye" as const, hint: "Open this Panel agent: its edit chat, public contract, and Preview", run: () => props.onOpenPanelAgent?.(a) }]
                 : []),
-        { label: "edit", hint: "Open a chat to edit what this Agent does — you review every change before it's kept", run: () => newEditChat(a.id) },
-        { label: "new workstream", hint: "Create a shared auto-sync line over this method's edit chats", run: () => startEdit({ kind: "new-workstream", placementId: a.instanceId }) },
+        { label: "new authoring chat", icon: "page-edit", hint: "Open a chat to edit what this Agent does — you review every change before it's kept", run: () => newEditChat(a.id) },
+        { label: "new workstream", icon: "child-branch", hint: "Create a shared auto-sync line over this Agent's edit chats", run: () => startEdit({ kind: "new-workstream", placementId: a.instanceId }) },
         { label: "settings", run: () => props.onOpenArchetypeSettings(a.id, a.name, a.kind) },
         { label: "publish a new version", hint: "Make this the current version — placements of it get an upgrade-available notice (UX-9)", run: () => void withRefresh(() => props.api.publishArchetype(a.id), "published a new version") },
         ...(a.kind === "work" ? [{ label: "copy as Panel agent", run: () => void withRefresh(() => props.api.copyAgentAsPanel(a.id), "Panel agent created") }] : []),
@@ -1210,6 +1220,18 @@ export function FacetBrowser(props: {
             workstream.projectId === p.id);
         if (rows.length === 0) return <div class="status">no chats yet — start one from the row above</div>;
         return chatGroups(rows.map(({ chat }) => chat), projectWorkstreams);
+    };
+
+    // In Agent view, each placement owns its chat rows. A project workstream may
+    // include chats from several placements, so show that line under every
+    // participating Agent and under its owner even when it is empty.
+    const placementChats = (p: ProjectNode, pl: ProjectNode["placements"][number]) => {
+        const rank = recentRank();
+        const chats = [...chatsFor(`${p.name} ${pl.archetypeName}`, pl.chats)]
+            .sort((a, b) => (rank.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(b.id) ?? Number.MAX_SAFE_INTEGER));
+        const workstreams = (tree()?.workstreams ?? []).filter((ws) =>
+            ws.projectId === p.id && (ws.placementId === pl.placementId || chats.some((chat) => chat.workstream === ws.id)));
+        return chats.length > 0 || workstreams.length > 0 ? chatGroups(chats, workstreams, true) : null;
     };
 
     // The structural chat-leaf renderer for Projects and Workshop.
@@ -1241,6 +1263,7 @@ export function FacetBrowser(props: {
         // Recent stays a flat current-first lens, but uses this same canonical
         // chat row and menu. Lineage is presentation context, not another row kind.
         recentLineageLabel?: string,
+        nestedUnderAgent = false,
     ) => (
         <>
         <div
@@ -1249,6 +1272,7 @@ export function FacetBrowser(props: {
                 active: props.selected === chat.id,
                 dragging: draggingChat()?.id === chat.id,
                 "recent-chat-item": Boolean(recentLineageLabel),
+                "agent-child": nestedUnderAgent || (chat.kind === "edit" && facet() === "library"),
             }}
             data-chat={chat.id}
             data-recent-chat={recentLineageLabel ? chat.id : undefined}
@@ -1263,7 +1287,8 @@ export function FacetBrowser(props: {
             // standard tree pattern: role="treeitem" + tabindex + Enter/Space activate.
             role="treeitem"
             tabindex="0"
-            aria-label={`open chat ${displayTitle(chat)}${recentLineageLabel ? ` — ${recentLineageLabel}` : ""}`}
+            aria-label={`open chat ${displayTitle(chat)}${recentLineageLabel ? ` — ${recentLineageLabel}` : ""}${chat.targets?.length ? ` — ${chat.targets.map((target) => `${target.name}${target.participation === "read-only" ? " (read-only)" : ""}`).join(" + ")}` : ""}`}
+            title={[recentLineageLabel, chat.targets?.map((target) => `${target.name}${target.participation === "read-only" ? " (read-only)" : ""}`).join(" + "), forkSource(chat.title) ? `Copy of ${forkSource(chat.title)}` : undefined].filter(Boolean).join(" · ")}
             onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
@@ -1381,30 +1406,35 @@ export function FacetBrowser(props: {
                 ])
             }
         >
-            {/* Per-row status gem (WS-H): a robot glyph that doubles as
-                the row's status light — quiet when idle, coloured working / needs-review /
-                error. Its tooltip still distinguishes work and edit chats. It replaces the
-                old standalone status dot and the "editing" badge;
-                the change-count and conflict/sync lights wire in once the projection
-                carries them (WS-H b/c). */}
-            <StatusGem kind={chat.kind} tone={props.runToneOf?.(chat.id)} conflict={chat.conflict} />
+            <StatusGem
+                kind={chat.kind}
+                base={nestedUnderAgent || (chat.kind === "edit" && facet() === "library")
+                    ? "child-connector"
+                    : chat.kind === "edit" && tree()?.archetypes.some((a) => a.kind === "panel" && a.chats.some((c) => c.id === chat.id))
+                        ? "panel"
+                        : "chat-bubble"}
+                tone={props.runToneOf?.(chat.id)}
+                conflict={chat.conflict}
+            />
             <Show
                 when={editingIs("rename-chat", chat.id)}
                 fallback={
-                    <span class="leaf-label leaf-label-stack">
-                        {/* The title is its own ellipsising line: the stack is a flex
-                            column, where text-overflow can't reach a bare text child,
-                            so a long title clipped mid-word with no "…" (round-11 #6). */}
+                    <span class="leaf-label leaf-label-inline">
+                        <Show when={forkSource(chat.title)}>
+                            {(src) => (
+                                <span class="leaf-fork" data-fork-source={src()} title={`Copy of ${src()}`} aria-label={`Copy of ${src()}`}>↳</span>
+                            )}
+                        </Show>
                         <span class="leaf-title">{mark(displayTitle(chat))}</span>
-                        <Show when={recentLineageLabel}>
+                        <Show when={searching() && contentMatches().get(chat.id) ? undefined : recentLineageLabel}>
                             {(lineage) => (
-                                <span class="leaf-sub" data-recent-lineage={chat.id}>
+                                <span class="leaf-context" data-recent-lineage={chat.id} title={lineage()}>
                                     {mark(lineage())}
                                 </span>
                             )}
                         </Show>
-                        <Show when={(chat.targets?.length ?? 0) > 0}>
-                            <span class="leaf-sub" data-chat-target-count={chat.targets?.length}>
+                        <Show when={!recentLineageLabel && (chat.targets?.length ?? 0) > 1 && !(searching() && contentMatches().get(chat.id))}>
+                            <span class="leaf-context" data-chat-target-count={chat.targets?.length} title={chat.targets?.map((target) => `${target.name}${target.participation === "read-only" ? " (read-only)" : ""}`).join(" + ")}>
                                 {(chat.targets ?? []).map((target) =>
                                     `${target.name}${target.participation === "read-only" ? " (read-only)" : ""}`,
                                 ).join(" + ")}
@@ -1417,25 +1447,11 @@ export function FacetBrowser(props: {
                         <Show when={searching() && contentMatches().get(chat.id)}>
                             {(snip) => (
                                 <span
-                                    class="leaf-sub leaf-snippet"
+                                    class="leaf-context leaf-snippet"
                                     data-snippet={chat.id}
                                     title="matched in this chat's content"
                                 >
                                     {mark(snip())}
-                                </span>
-                            )}
-                        </Show>
-                        {/* Fork lineage (#3): a "(fork)" chat is a flat sibling of its
-                            source, indistinguishable but for the suffix. Show a quiet
-                            "copy of {source}" sublabel so the relationship is legible. */}
-                        <Show when={forkSource(chat.title)}>
-                            {(src) => (
-                                <span
-                                    class="leaf-sub"
-                                    data-fork-source={src()}
-                                    title={`Forked from "${src()}" — its files and conversation history came along`}
-                                >
-                                    copy of {src()}
                                 </span>
                             )}
                         </Show>
@@ -1446,6 +1462,13 @@ export function FacetBrowser(props: {
             </Show>
             <Show when={meta}>
                 <span class="leaf-meta" title={`runs the ${meta} Agent`}>{meta}</span>
+            </Show>
+            <Show when={chat.conflict || chat.changes}>
+                <span class="nav-vcs-state" classList={{ conflict: chat.conflict }}
+                    title={chat.conflict ? "VCS conflict — resolve changes" : "VCS changes pending"}
+                    aria-label={chat.conflict ? "VCS conflict" : "VCS changes pending"}>
+                    <Icon name={chat.conflict ? "conflict" : "git-branch"} />
+                </span>
             </Show>
         </div>
         {/* Create-a-workstream-from-this-chat (WS-H): the cross-cutting way to start a
@@ -1468,6 +1491,7 @@ export function FacetBrowser(props: {
     const chatGroups = (
         chats: { id: EngagementId; title: string; kind: "edit" | "work"; workstream?: WorkstreamId | null; placement?: PlacementId | null; workspaceRoot: WorkspaceRootId; targets?: readonly { targetId: WorkTargetId; name: string; participation: "read-only" | "writable" }[]; rehomeBlocked: boolean; changes?: boolean; conflict?: boolean }[],
         workstreams: WorkstreamNode[],
+        nestedUnderAgent = false,
     ) => {
         const { groups, main, ungrouped } = groupChatsByWorkstream(chats, workstreams);
         const joinTargets = workstreams;
@@ -1532,7 +1556,7 @@ export function FacetBrowser(props: {
                         </div>
                         <div class="ws-members">
                             <For each={main!}>
-                                {(c) => chatRow(c, undefined, joinTargets)}
+                                {(c) => chatRow(c, undefined, joinTargets, true, undefined, nestedUnderAgent)}
                             </For>
                         </div>
                     </div>
@@ -1638,14 +1662,14 @@ export function FacetBrowser(props: {
                             </div>
                             <div class="ws-members">
                                 <For each={g.chats}>
-                                    {(c) => chatRow(c, undefined, joinTargets)}
+                                    {(c) => chatRow(c, undefined, joinTargets, true, undefined, nestedUnderAgent)}
                                 </For>
                             </div>
                         </div>
                     )}
                 </For>
                 <Show when={main === null}>
-                    <For each={ungrouped}>{(c) => chatRow(c, undefined, joinTargets)}</For>
+                    <For each={ungrouped}>{(c) => chatRow(c, undefined, joinTargets, true, undefined, nestedUnderAgent)}</For>
                 </Show>
                 <For each={workstreams.filter((workstream) =>
                     workstream.status === "promoted" && workstream.promotionManifestRef !== null)}>
@@ -1872,11 +1896,13 @@ export function FacetBrowser(props: {
                                             aria-expanded={!isCollapsed(p.id)}
                                             aria-label={`project ${p.name}`}
                                             onKeyDown={(e) => {
-                                                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleCollapse(p.id); }
+                                                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); p.product?.kind === "tutorials" ? props.onOpenTutorials?.(p.id) : toggleCollapse(p.id); }
                                             }}
+                                            onClick={() => { if (p.product?.kind === "tutorials") props.onOpenTutorials?.(p.id); }}
                                             onContextMenu={(e) => openMenu(e, projectMenuItems(p))}
                                         >
                                             {caret(p.id, true)}
+                                            <span class="project-kind-mark" title={p.product?.kind === "tutorials" ? "GaugeWright tutorials" : "Project"} aria-label="Project"><Icon name="folder-open" /></span>
                                             <Show
                                                 when={editingIs("rename-project", p.id)}
                                                 fallback={<span class="node-label">{mark(p.name)}</span>}
@@ -1884,27 +1910,26 @@ export function FacetBrowser(props: {
                                                 {renameInput()}
                                             </Show>
                                             {rowActions({
-                                                /* The lens flip (ADR 0112): revealed with the row's
-                                                   other tools; the grouped structure itself is the
-                                                   standing signal that a project is pivoted. */
-                                                lead: (
+                                                /* A labeled menu for the project's two saved lens
+                                                   choices. Its active option is checked in the menu. */
+                                                lead: p.product?.kind === "tutorials" ? undefined : (
                                                     <button
                                                         type="button"
-                                                        class="lens-toggle"
+                                                        class="lens-sort"
                                                         data-lens-toggle={p.id}
                                                         data-lens={lensOf(p.id)}
-                                                        title={lensOf(p.id) === "chats"
-                                                            ? "Flat chats — click to group by Agent"
-                                                            : "Grouped by Agent — click for flat chats"}
-                                                        aria-label={`change how ${p.name} is grouped`}
-                                                        onClick={(e) => { e.stopPropagation(); setLens(p.id, lensOf(p.id) === "chats" ? "archetype" : "chats"); }}
+                                                        title={`Sort and group chats in ${p.name}`}
+                                                        aria-label={`Sort by in ${p.name}`}
+                                                        aria-haspopup="menu"
+                                                        onClick={(e) => { e.stopPropagation(); openMenuAt(e.currentTarget, lensMenuItems(p)); }}
                                                     >
-                                                        {lensOf(p.id) === "chats" ? "chats" : "by Agent"}
+                                                        Sort by <Icon name="chevron" />
                                                     </button>
                                                 ),
-                                                primary: canStartProjectChat(p)
+                                                primary: p.product?.kind !== "tutorials" && canStartProjectChat(p)
                                                     ? {
-                                                        icon: "robot",
+                                                        icon: "chat-bubble",
+                                                        plus: true,
                                                         title: "Start a new chat in this project",
                                                         aria: `new chat in ${p.name}`,
                                                         data: "new-project-chat",
@@ -1912,15 +1937,22 @@ export function FacetBrowser(props: {
                                                     }
                                                     : undefined,
                                                 menuAria: `actions for project ${p.name}`,
+                                                menuIcon: "folder-open",
+                                                menuPlus: true,
                                                 menuItems: () => projectMenuItems(p),
                                             })}
                                         </div>
                                         <Show when={!isCollapsed(p.id)}>
+                                        <Show when={p.product?.kind === "tutorials"}>
+                                            <button type="button" class="tree-leaf" data-tutorial-file="basics.whip" onClick={() => props.onOpenTutorials?.(p.id)}>
+                                                basics.whip <span class="muted">by GaugeWright</span>
+                                            </button>
+                                        </Show>
                                         {/* The flat `chats` lens (ADR 0112, default): every work chat
                                             in the project, current-first, archetype as a row tag. The
                                             workstream naming editor still renders here — the menu's
                                             "new workstream" targets the general placement. */}
-                                        <Show when={lensOf(p.id) === "chats"}>
+                                        <Show when={p.product?.kind !== "tutorials" && lensOf(p.id) === "chats"}>
                                             {(() => {
                                                 const home = p.placements.find((pl) => pl.isDefault);
                                                 return <Show when={home}>{wsEditorFor(home!.placementId)}</Show>;
@@ -1929,34 +1961,21 @@ export function FacetBrowser(props: {
                                                 {flatProjectChats(p)}
                                             </div>
                                             <Show when={p.placements.some((placement) => placement.kind === "panel")}>
-                                                <div class="status panel-agents-heading">Panel agents</div>
-                                                <For each={p.placements.filter((placement) =>
-                                                    placement.kind === "panel"
-                                                    && placementVisible(p.name, placement, query(), contentHits()))}>
-                                                    {(placement) => panelPlacementRow(p, placement)}
-                                                </For>
+                                                <div class="panel-agent-list" role="group" aria-label="Panel agents">
+                                                    <For each={p.placements.filter((placement) =>
+                                                        placement.kind === "panel"
+                                                        && placementVisible(p.name, placement, query(), contentHits()))}>
+                                                        {(placement) => panelPlacementRow(p, placement)}
+                                                    </For>
+                                                </div>
                                             </Show>
                                         </Show>
-                                        <Show when={lensOf(p.id) === "archetype"}>
-                                        {/* Workstreams are project topology, so even this structural
-                                            placement lens keeps every chat in the one project-wide
-                                            collaboration grouping. Agent placements remain below as
-                                            configuration/start-chat nodes; they never manufacture a
-                                            second per-placement view of Main or a named line. */}
-                                        {(() => {
-                                            const generals = p.placements.filter((pl) => pl.isDefault);
-                                            const home = generals[0];
-                                            return (
-                                                <Show when={home}>
-                                                    {wsEditorFor(home!.placementId)}
-                                                    <div class="project-home" data-project-home={p.id}>
-                                                        {flatProjectChats(p)}
-                                                    </div>
-                                                </Show>
-                                            );
-                                        })()}
+                                        <Show when={p.product?.kind !== "tutorials" && lensOf(p.id) === "archetype"}>
+                                        {/* A chat appears under the Agent placement that created it.
+                                            The built-in Default placement is visible in this lens so
+                                            its chats have an Agent row too. */}
                                         <For
-                                            each={p.placements.filter((pl) => !pl.isDefault && placementVisible(p.name, pl, query(), contentHits()))}
+                                            each={p.placements.filter((pl) => placementVisible(p.name, pl, query(), contentHits()))}
                                         >
                                             {(pl) => (
                                                 <div class="tree-subgroup" data-placement={pl.placementId}>
@@ -2002,12 +2021,12 @@ export function FacetBrowser(props: {
                                                         onContextMenu={(e) => openMenu(e, placementMenuItems(p, pl))}
                                                     >
                                                         {caret(pl.placementId, pl.kind === "work" && pl.chats.length > 0)}
+                                                        <AgentKindMark kind={pl.kind} />
                                                         {/* Just the method name here (round-6 #6): this row is
                                                             already nested under its project, so the "· project"
                                                             half of the old lineage was redundant noise. Keep a
                                                             stable hook for the pivot via the data attribute. */}
                                                         <span class="node-label" data-lineage-archetype={pl.archetypeId} title="the Agent this placement runs">{mark(pl.archetypeName)}</span>
-                                                        <Show when={pl.kind === "panel"}><span class="cfg-badge">Panel agent</span></Show>
                                                         {/* This placement carries client-specific config/notes
                                                             (config-only customization, no fork). */}
                                                         <Show when={pl.hasConfig}>
@@ -2040,13 +2059,14 @@ export function FacetBrowser(props: {
                                                         </Show>
                                                         {rowActions({
                                                             primary: pl.kind === "work" ? {
-                                                                icon: "robot",
+                                                                icon: "chat-bubble",
+                                                                plus: true,
                                                                 title: "Start a new chat with this Agent",
                                                                 aria: `new chat with ${pl.archetypeName}`,
                                                                 data: "new-placement-chat",
                                                                 run: () => void newWorkChat(p.id, pl.placementId),
                                                             } : props.onOpenPanelAgent ? {
-                                                                icon: "robot",
+                                                                icon: "panel",
                                                                 title: "Open this Panel agent placement",
                                                                 aria: `open ${pl.archetypeName}`,
                                                                 data: "open-panel-agent",
@@ -2061,7 +2081,7 @@ export function FacetBrowser(props: {
                                                     </div>
                                                     <Show when={pl.kind === "work" && !isCollapsed(pl.placementId)}>
                                                         {wsEditorFor(pl.placementId)}
-                                                        <div class="status">Chats are grouped by project workstream above.</div>
+                                                        {placementChats(p, pl)}
                                                     </Show>
                                                 </div>
                                             )}
@@ -2098,37 +2118,28 @@ export function FacetBrowser(props: {
                                             tabindex="0"
                                             aria-expanded={archetypeHasChildren(a) ? !isCollapsed(a.id) : undefined}
                                             aria-label={`${a.kind === "panel" ? "Panel agent" : "Agent"} ${a.name}`}
-                                            title={a.kind === "panel" ? "Open this Panel agent: its edit chat, public contract, and Preview" : undefined}
-                                            // Opening a Panel agent is one movement across the panes
-                                            // (navigation.md, PANEL-12); a work Agent's row still only
-                                            // folds its edit chats, since editing it is the pencil.
+                                            title={`Open ${a.name} settings`}
                                             onClick={() => {
-                                                if (a.kind === "panel" && !editingIs("rename-archetype", a.id)) props.onOpenPanelAgent?.(a);
+                                                if (!editingIs("rename-archetype", a.id)) props.onOpenArchetypeSettings(a.id, a.name, a.kind);
                                             }}
                                             onKeyDown={(e) => {
                                                 if (e.key !== "Enter" && e.key !== " ") return;
-                                                if (a.kind === "panel") { e.preventDefault(); props.onOpenPanelAgent?.(a); }
-                                                else if (archetypeHasChildren(a)) { e.preventDefault(); toggleCollapse(a.id); }
+                                                e.preventDefault();
+                                                props.onOpenArchetypeSettings(a.id, a.name, a.kind);
                                             }}
                                             onContextMenu={(e) => openMenu(e, archetypeMenuItems(a))}
                                         >
                                             {caret(a.id, archetypeHasChildren(a))}
+                                            <AgentKindMark kind={a.kind} settings />
                                             <Show
                                                 when={editingIs("rename-archetype", a.id)}
                                                 fallback={<span class="node-label">{mark(a.name)}</span>}
                                             >
                                                 {renameInput()}
                                             </Show>
-                                            <Show when={a.kind === "panel"}><span class="cfg-badge">Panel agent</span></Show>
                                             {rowActions({
-                                                primary: {
-                                                    icon: "pencil",
-                                                    title: "Open a chat to edit what this method does — every change is reviewed before it's kept",
-                                                    aria: `edit ${a.name}`,
-                                                    data: "edit-archetype",
-                                                    run: () => newEditChat(a.id),
-                                                },
                                                 menuAria: `actions for Agent ${a.name}`,
+                                                menuIcon: "plus",
                                                 menuItems: () => archetypeMenuItems(a),
                                             })}
                                         </div>

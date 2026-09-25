@@ -76,9 +76,10 @@ fn every_writer_refuses_while_its_project_is_mid_move_and_works_after_an_abort()
         },
     ));
 
-    // Home-maintained Personal content.
+    // Home-maintained Personal content. Tutorials now has its own project, so
+    // a move of Personal leaves its independent release reconciliation running.
     assert!(!wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap());
-    paused(wb.ensure_shipped_tutorials());
+    assert!(wb.ensure_shipped_tutorials().is_ok());
 
     // An agent turn: refused before it starts, so nothing reaches the chat.
     drop(wb);
@@ -96,6 +97,7 @@ fn every_writer_refuses_while_its_project_is_mid_move_and_works_after_an_abort()
             images: &[],
             mode: crate::library::ChatMode::Use,
             authenticated_actor: None,
+            authenticated_context: None,
             contribution_by: None,
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,

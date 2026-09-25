@@ -800,11 +800,18 @@ fn selected_home_transport(
 }
 
 fn admit_selected_home(endpoint: &str, bearer: &str, home: &str) -> Result<String, String> {
+    // This is a new command at the Home, not a replay of the browser's command
+    // to the desktop broker. Give it its own key so the Home's command guard can
+    // admit it without colliding with the broker's idempotency record.
+    let headers = [(
+        "idempotency-key".to_string(),
+        format!("native-home-admission:{}", new_verifier()),
+    )];
     let response = open_account_authority_request(
         "POST",
         &format!("{endpoint}/home/admissions"),
         bearer,
-        &[],
+        &headers,
         &[],
     )?;
     let admitted = small_json_response(response, "Home admission")?;
@@ -1134,10 +1141,11 @@ struct SelectedRecord {
 
 fn selected_person(wb: &SharedWorkbench) -> Option<String> {
     let workbench = wb.lock_unpoisoned();
-    let rows = workbench
-        .store_ref()
-        .records(ACCOUNT_SCOPE, SELECTED_KIND)
-        .ok()?;
+    selected_person_in_store(workbench.store_ref())
+}
+
+pub(crate) fn selected_person_in_store(store: &gaugedesk_store::Store) -> Option<String> {
+    let rows = store.records(ACCOUNT_SCOPE, SELECTED_KIND).ok()?;
     serde_json::from_str::<SelectedRecord>(rows.last()?)
         .ok()
         .map(|record| record.person)
@@ -1573,6 +1581,19 @@ fn desktop_status_json(
     available: bool,
 ) -> Value {
     let mut status = status_json(record, available);
+    if let Ok(state) = crate::home_owner::claim_state(wb) {
+        match state {
+            crate::home_owner::HomeClaimState::Available { projects } => {
+                status["home_claim"] = json!({ "state": "available", "projects": projects });
+            }
+            crate::home_owner::HomeClaimState::Claimed { owner } => {
+                status["home_claim"] = json!({ "state": "claimed", "owner": owner });
+            }
+            crate::home_owner::HomeClaimState::Governed => {
+                status["home_claim"] = json!({ "state": "governed" });
+            }
+        }
+    }
     if local_operator_selected(wb) {
         status["local"] = Value::Bool(true);
     } else if wb.lock_unpoisoned().home_owner_account().is_some()
@@ -1712,28 +1733,119 @@ pub async fn post_signin_callback(
     }
 }
 
-/// A successful handoff may claim a fresh computer. Once claimed, only its
-/// owner may trigger local Home setup; another retained account belongs at its
-/// own admitted Home even though it used this computer to sign in.
+/// A successful handoff may reconnect a Home already claimed by this account.
+/// An unclaimed computer waits for the separate claim act (DR-0219).
 fn reconcile_first_home_after_signin(wb: &SharedWorkbench, person: &str) {
-    // Reported rather than propagated: a Home setup failure must not turn a
-    // successful Hub sign-in into an apparent authentication failure.
-    if let Err(error) = crate::home_owner::claim_if_never_claimed(wb) {
-        tracing::warn!("Home owner not claimed: {error}");
-    }
+    // Existing claims retain their owner, but a sign-in never changes the
+    // person's publication choice. In particular, it must not undo a later
+    // library-sync detach (DR-0219). The reachability supervisor catches up
+    // an older claim that has never been offered.
     if wb.lock_unpoisoned().home_owner_account().as_deref() != Some(person) {
         return;
-    }
-    match crate::first_home::attach_library_sync(wb) {
-        Ok(true) => eprintln!(
-            "[first-home] library sync attached; this computer is now publishing its reachability"
-        ),
-        Ok(false) => {}
-        Err(error) => tracing::warn!("first Home not attached: {error}"),
     }
     if let Err(error) = wb.lock_unpoisoned().ensure_shipped_tutorials() {
         tracing::warn!("shipped tutorials not reconciled: {error}");
     }
+}
+
+/// The separate, one-time act that gives the selected account ownership of
+/// this computer's local Home (DR-0219). A fresh Hub check prevents a revoked
+/// session in local custody from claiming it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimDesktopHome {
+    person: String,
+    confirm: bool,
+}
+
+pub async fn post_claim_desktop_home(
+    State(wb): State<SharedWorkbench>,
+    desktop: Option<Extension<DesktopOperatorPlane>>,
+    Json(request): Json<ClaimDesktopHome>,
+) -> Response {
+    if desktop.is_none() || crate::auth_oidc::web_account_mode() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(standing) = hub_standing(&wb).filter(|s| s.expires_ms > now_ms()) else {
+        return (StatusCode::UNAUTHORIZED, "select a signed-in account first").into_response();
+    };
+    if !request.confirm || request.person != standing.person {
+        return (
+            StatusCode::CONFLICT,
+            "confirm the selected account before claiming this computer",
+        )
+            .into_response();
+    }
+    let Some(bearer) = hub_session_token(&wb) else {
+        return (StatusCode::UNAUTHORIZED, "select a signed-in account first").into_response();
+    };
+    let checked = tokio::task::spawn_blocking(move || {
+        use crate::relay_route_stack::BearerAccounts;
+        crate::relay_route_stack::HubBearerAccounts::configured().account_for(&bearer)
+    })
+    .await;
+    match checked {
+        Ok(Ok(Some(account))) if account == standing.person => {}
+        Ok(Ok(_)) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "the selected account session is no longer valid",
+            )
+                .into_response()
+        }
+        Ok(Err(error)) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the account service could not be checked",
+            )
+                .into_response()
+        }
+    }
+    complete_verified_desktop_claim(&wb, &standing.person)
+}
+
+fn complete_verified_desktop_claim(wb: &SharedWorkbench, person: &str) -> Response {
+    match crate::home_owner::claim_verified_selected(wb, person) {
+        Ok(crate::home_owner::HomeClaim::Owner(account)) if account == person => {}
+        Ok(crate::home_owner::HomeClaim::AlreadyClaimed)
+            if matches!(
+                crate::home_owner::claim_state(wb),
+                Ok(crate::home_owner::HomeClaimState::Claimed { owner }) if owner == person
+            ) => {}
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                "this computer cannot be claimed by the selected account",
+            )
+                .into_response()
+        }
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+    // A failed publication does not unwind the durable claim. Repeating this
+    // exact act under the owner session resumes setup without a second claim.
+    // This endpoint is an explicit request to make the Home reachable, so it
+    // may also re-enable publication after the owner turned it off. A sign-in
+    // or background reconcile never makes that choice for them.
+    if let Err(error) = crate::first_home::attach_library_sync(wb) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Home claimed; reachability setup needs a retry: {error}"),
+        )
+            .into_response();
+    }
+    let root = wb.lock_unpoisoned().root_path().to_path_buf();
+    if let Err(error) = crate::first_home::attach_if_never_offered(wb, &root) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Home claimed; reachability setup needs a retry: {error}"),
+        )
+            .into_response();
+    }
+    if let Err(error) = wb.lock_unpoisoned().ensure_shipped_tutorials() {
+        tracing::warn!("shipped tutorials not reconciled after Home claim: {error}");
+    }
+    Json(desktop_status_json(wb, latest_session(wb).as_ref(), true)).into_response()
 }
 
 /// `GET /account/hub-session` — non-secret status. A session inside the
@@ -2132,6 +2244,108 @@ pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_in_does_not_claim_or_publish_existing_local_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session_for_test(&wb);
+        reconcile_first_home_after_signin(&wb, "account-root");
+        assert!(matches!(
+            crate::home_owner::claim_state(&wb).unwrap(),
+            crate::home_owner::HomeClaimState::Available { .. }
+        ));
+        assert!(!wb.lock_unpoisoned().library_sync_active());
+    }
+
+    #[tokio::test]
+    async fn home_claim_requires_exact_selected_account_confirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session_for_test(&wb);
+        for request in [
+            ClaimDesktopHome {
+                person: "another-account".into(),
+                confirm: true,
+            },
+            ClaimDesktopHome {
+                person: "account-root".into(),
+                confirm: false,
+            },
+        ] {
+            let response = post_claim_desktop_home(
+                State(wb.clone()),
+                Some(Extension(DesktopOperatorPlane)),
+                Json(request),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+        assert!(matches!(
+            crate::home_owner::claim_state(&wb).unwrap(),
+            crate::home_owner::HomeClaimState::Available { .. }
+        ));
+    }
+
+    #[test]
+    fn verified_home_claim_keeps_projects_in_place_and_owner_retry_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let original_home = wb.lock_unpoisoned().home_id().clone();
+        let original_projects: Vec<_> = wb
+            .lock_unpoisoned()
+            .library
+            .projects
+            .iter()
+            .map(|(id, project)| (id.clone(), project.home_id.clone()))
+            .collect();
+        store_session_for_test(&wb);
+        assert_eq!(
+            complete_verified_desktop_claim(&wb, "account-root").status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            wb.lock_unpoisoned().home_owner_account().as_deref(),
+            Some("account-root")
+        );
+        assert!(wb.lock_unpoisoned().library_sync_active());
+        assert_eq!(wb.lock_unpoisoned().home_id(), &original_home);
+        let after_projects: Vec<_> = wb
+            .lock_unpoisoned()
+            .library
+            .projects
+            .iter()
+            .map(|(id, project)| (id.clone(), project.home_id.clone()))
+            .collect();
+        assert!(original_projects
+            .iter()
+            .all(|project| after_projects.contains(project)));
+        assert_eq!(after_projects.len(), original_projects.len() + 1);
+        assert!(after_projects.iter().any(|(id, home)| id
+            == &crate::shipped_tutorials::tutorial_project_id("account-root")
+            && home == &original_home));
+        assert_eq!(
+            complete_verified_desktop_claim(&wb, "account-root").status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            wb.lock_unpoisoned()
+                .store_ref()
+                .records(crate::org::ORG_SCOPE, crate::home_owner::CLAIM_KIND)
+                .unwrap()
+                .len(),
+            1,
+        );
+        store_session_as_for_test(&wb, "someone-else");
+        assert_eq!(
+            complete_verified_desktop_claim(&wb, "someone-else").status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            wb.lock_unpoisoned().home_owner_account().as_deref(),
+            Some("account-root")
+        );
+    }
 
     #[test]
     fn verifier_and_challenge_have_the_handoff_shape() {
@@ -3043,5 +3257,41 @@ mod tests {
             name.as_str(),
             "authorization" | "cookie" | "origin" | "x-forwarded-host"
         )));
+    }
+
+    #[test]
+    fn native_home_admission_carries_its_own_idempotency_key() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "the admission request ended before its headers");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("post /home/admissions http/1.1\r\n"));
+            assert!(request.contains("\r\nauthorization: bearer sealed-hub-session\r\n"));
+            assert!(request.contains("\r\nidempotency-key: native-home-admission:"));
+            let body = r#"{"home":"home:mine","admission":"admitted"}"#;
+            write!(stream,
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            admit_selected_home(&endpoint, "sealed-hub-session", "home:mine").unwrap(),
+            "admitted",
+        );
+        server.join().unwrap();
     }
 }

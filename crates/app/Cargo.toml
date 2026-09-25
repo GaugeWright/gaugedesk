@@ -83,23 +83,23 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 # run (no FD passed ⇒ normal bind). Dev ergonomics only; no production behaviour.
 listenfd = "1"
 tempfile = "3"
-whipplescript-store = { version = "0.5.6" }
+whipplescript-store = { version = "0.6.0" }
 # SUPPLY-4 verifies each supplied envelope against its authority's governance
 # root and composes the set at admission, so the kernel is a runtime dependency
 # now, not only a test one. The comment below in [dev-dependencies] described the
 # parser's dev-only use and no longer covers the kernel.
-whipplescript-kernel = { version = "0.5.6" }
+whipplescript-kernel = { version = "0.6.0" }
 
 [dev-dependencies]
 # Competing connection proves publication holds the content authority's lock.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
-whipplescript = { version = "0.5.6", default-features = false }
+whipplescript = { version = "0.6.0", default-features = false }
 gaugedesk-pi-bridge = { path = "../pi-bridge" }
 gaugedesk-relay-transport = { path = "../relay-transport", features = ["test-relay"] }
 # Compiles the shipped gate program in tests. A gate we ship but never parse is
 # the same class of bug as a sealing construction nobody cross-checked: it looks
 # fine until it runs. Dev-only — nothing at runtime depends on the parser.
-whipplescript-parser = { version = "0.5.6" }
+whipplescript-parser = { version = "0.6.0" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 proptest = "1"

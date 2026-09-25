@@ -9,10 +9,14 @@
  */
 
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
+import { Icon, type IconName } from "./icons";
 
 export interface MenuItem {
     readonly label: string;
     readonly run: () => void;
+    readonly icon?: IconName;
+    /** Marks the chosen option in a menu used as a single-choice picker. */
+    readonly selected?: boolean;
     /** Destructive items require a confirming second click. */
     readonly danger?: boolean;
     /** An optional one-line explanation, carried on the item's **tooltip** (not a
@@ -84,6 +88,8 @@ export function ContextMenu(props: { menu: MenuState | null; onClose: () => void
                         {(item, i) => (
                             <button
                                 class="menu-item"
+                                role={item.selected === undefined ? "menuitem" : "menuitemradio"}
+                                aria-checked={item.selected}
                                 // The explanatory hint rides on the tooltip, not a visible
                                 // sub-line (round-12 E): no help sub-lines anywhere.
                                 title={item.hint}
@@ -97,6 +103,10 @@ export function ContextMenu(props: { menu: MenuState | null; onClose: () => void
                                     item.run();
                                 }}
                             >
+                                <Show when={item.selected !== undefined}>
+                                    <span class="menu-item-check" aria-hidden="true">{item.selected ? "✓" : ""}</span>
+                                </Show>
+                                <Show when={item.icon} keyed>{(icon) => <Icon name={icon} class="menu-item-icon" />}</Show>
                                 <span class="menu-item-label">{confirming() === i() ? `confirm: ${item.label}` : item.label}</span>
                                 {/* The destructive blast-radius warning is NOT a help
                                     sub-line — it appears only while armed, at the moment

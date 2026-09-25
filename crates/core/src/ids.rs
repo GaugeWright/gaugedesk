@@ -178,6 +178,22 @@ id_newtype!(
     /// The exact provider-issued backing version returned to trusted intake.
     VaultBackingVersionId
 );
+id_newtype!(
+    /// One final-use dispatch, retained to reject replay after rotation or closure.
+    VaultDispatchId
+);
+id_newtype!(
+    /// The admitted subject of a GaugeVault effect, interpreted by the shell.
+    VaultSubjectId
+);
+id_newtype!(
+    /// The exact permitted effect operation, interpreted by the shell.
+    VaultOperationId
+);
+id_newtype!(
+    /// The canonical target of a GaugeVault effect, interpreted by the shell.
+    VaultTargetId
+);
 
 #[cfg(test)]
 mod tests {

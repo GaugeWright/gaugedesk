@@ -36,7 +36,17 @@ export type IconName =
     | "more"
     | "filter"
     | "git-branch"
+    | "chat-bubble"
+    | "folder-open"
+    | "child-branch"
+    | "child-connector"
+    | "gear"
+    | "eye"
+    | "page-edit"
+    | "plus"
+    | "conflict"
     | "robot"
+    | "panel"
     | "kebab"
     | "pencil";
 
@@ -226,6 +236,47 @@ const PATHS: Record<IconName, () => JSX.Element> = {
             <path d="M18 8c0 5.5-3.5 9-10 9" />
         </>
     ),
+    "chat-bubble": () => (
+        <path d="M20 11.5a8 8 0 0 1-8 8c-1.5 0-2.9-.4-4.1-1.1L3 20l1.6-4.7A8 8 0 1 1 20 11.5Z" />
+    ),
+    "folder-open": () => (
+        <>
+            <path d="M3 18V6.5a2 2 0 0 1 2-2h5l2.2 2.5H19a2 2 0 0 1 2 2v2" />
+            <path d="M3.8 20h13.8a2 2 0 0 0 1.8-1.1l2.4-5a1.5 1.5 0 0 0-1.4-2.1H8.2a2 2 0 0 0-1.8 1.1L2 20Z" />
+        </>
+    ),
+    "child-branch": () => (
+        <>
+            <path d="M6 3v11a4 4 0 0 0 4 4h9" />
+            <path d="m16 15 3 3-3 3" />
+        </>
+    ),
+    "child-connector": () => <path d="M12 0v8a4 4 0 0 0 4 4h8" />,
+    gear: () => (
+        <>
+            <path d="m10 2-.5 2.2a8 8 0 0 0-1.8.8L5.8 3.9 3.9 5.8 5 7.7a8 8 0 0 0-.8 1.8L2 10v4l2.2.5a8 8 0 0 0 .8 1.8l-1.1 1.9 1.9 1.9 1.9-1.1a8 8 0 0 0 1.8.8L10 22h4l.5-2.2a8 8 0 0 0 1.8-.8l1.9 1.1 1.9-1.9-1.1-1.9a8 8 0 0 0 .8-1.8L22 14v-4l-2.2-.5a8 8 0 0 0-.8-1.8l1.1-1.9-1.9-1.9-1.9 1.1a8 8 0 0 0-1.8-.8L14 2Z" />
+            <circle cx="12" cy="12" r="3" />
+        </>
+    ),
+    eye: () => (
+        <>
+            <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" />
+            <circle cx="12" cy="12" r="2.5" />
+        </>
+    ),
+    "page-edit": () => (
+        <>
+            <path d="M13 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-8" />
+            <path d="m9 15 8.8-8.8a2 2 0 0 1 2.8 2.8L11.8 17.8 8 19Z" />
+        </>
+    ),
+    plus: () => <path d="M12 5v14M5 12h14" />,
+    conflict: () => (
+        <>
+            <path d="M12 3 2.5 20h19L12 3Z" />
+            <path d="M12 9v5m0 3h.01" />
+        </>
+    ),
     // A small robot face — chats are conversations with an agent, regardless of
     // whether their root edits an archetype or works in a project placement.
     robot: () => (
@@ -235,6 +286,16 @@ const PATHS: Record<IconName, () => JSX.Element> = {
             <path d="M8 12h.01" />
             <path d="M16 12h.01" />
             <path d="M8 16h8" />
+        </>
+    ),
+    // A framed public panel, distinct from the robot used for work Agents.
+    panel: () => (
+        <>
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <path d="M3 9h18" />
+            <path d="M7 13h5" />
+            <path d="M7 16h3" />
+            <circle cx="17" cy="15" r="1" fill="currentColor" stroke="none" />
         </>
     ),
     // Three dots — a row's "more actions" menu affordance (ADR 0112). Filled,

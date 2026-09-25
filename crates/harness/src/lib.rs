@@ -281,6 +281,10 @@ pub trait Harness: Send {
     /// command and receipt instead of minting a second effect.
     fn bind_runtime_command_id(&mut self, _command_id: Option<&str>) {}
 
+    /// Bind the Home's current, authenticated project-task filing operation for
+    /// this turn. The adapter never derives tracker authority from a package.
+    fn bind_task_filer(&mut self, _filer: Option<Arc<dyn TaskFiler>>) {}
+
     /// Deliver `prompt` (+ any native `images` for this turn), mediate every tool
     /// call through `gate`, stream each [`Observation`] to `sink`, and return the
     /// neutral outcome. `images` are model input only — never durable evidence.
@@ -316,6 +320,12 @@ pub trait Harness: Send {
     fn shutdown(self: Box<Self>) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// A product-authorized operation that returns a tracker issue id only after
+/// the issue has committed. Each call id is stable within its turn.
+pub trait TaskFiler: Send + Sync {
+    fn file_task(&self, call_id: &str, content: &str) -> Result<String, String>;
 }
 
 /// A [`Harness`] that runs in a *different* trust authority, reached over the

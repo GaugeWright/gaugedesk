@@ -1,7 +1,7 @@
-//! Signing in on a computer makes it your first Home (DR-0183).
+//! An explicit claim makes a signed-in computer the account's Home (DR-0219).
 //!
-//! `specs/experience/desk.md` promises that installing GaugeDesk and signing in
-//! makes that computer the person's first Home, "which desk will then open".
+//! `specs/experience/desk.md` promises that installing GaugeDesk, signing in,
+//! and claiming the computer makes it the person's first Home.
 //! The page saying so shipped in August 2026; this is the half that makes it
 //! true.
 //!
@@ -27,10 +27,8 @@ use crate::net_http::HttpClient;
 use crate::{LockUnpoisoned, SharedWorkbench};
 
 /// The facility that publication and therefore reachability follow (ADR 0131
-/// §6). Attached when a person signs in, because the page that sent them here
-/// already told them that signing in is what makes this computer their Home —
-/// asking again immediately afterwards would be asking them to confirm
-/// something they were just told they had done (DR-0183 §2).
+/// §6). Attached after the explicit Home claim. An account sign-in alone does
+/// not publish the local projects (DR-0219).
 pub const LIBRARY_SYNC_FACILITY_ID: &str = "library-sync";
 
 /// Attach `library_sync` if it is not already active. Idempotent, and returns
@@ -63,17 +61,11 @@ pub fn attach_library_sync(wb: &SharedWorkbench) -> Result<bool, String> {
 /// attach — suppressing the same catch-up on each of them.
 const OFFERED_MARKER: &str = "first-home-offered";
 
-/// Attach `library_sync` on a computer that is signed in and has never been
-/// offered as a Home.
+/// Attach `library_sync` on a claimed computer that has not yet been offered
+/// as a Home.
 ///
-/// The attach above is called when a person signs in, and that is the moment the
-/// page they came from described. But a hook on a transition reaches only the
-/// computers that cross it, and a desktop that was already signed in when this
-/// shipped never signs in again — so it never becomes a Home, and nothing says
-/// why. That is precisely the state this module exists to end, arriving through
-/// the one door the sign-in hook does not cover, and it is the state every
-/// existing install upgrades into. So the question is asked from state here as
-/// well, which is what the rest of this module already does.
+/// Existing claims may predate this release, so the offer is still reconciled
+/// from state. The owner claim itself is never made by this function.
 ///
 /// The condition is deliberately not `!library_sync_active()`, and not the
 /// absence of a facility record either. Detaching library sync tombstones the
@@ -87,16 +79,14 @@ pub fn attach_if_never_offered(
 ) -> Result<bool, String> {
     // Taken before the guard: reading the session locks the workbench itself.
     // No session is the ordinary state of a fresh install, not a failure, and
-    // leaves the marker unwritten so that signing in later is still the moment.
-    let selected = crate::account_signin::hub_session_actor(wb);
-    if selected.is_some() {
-        // An upgraded desktop may already be signed in before the one-time
-        // owner claim existed. Establish its owner before deciding whether
-        // this selected account may offer the Home.
-        crate::home_owner::claim_if_never_claimed(wb)?;
-    }
-    let owner = wb.lock_unpoisoned().home_owner_account();
-    if selected.is_none() || selected != owner {
+    // leaves the marker unwritten until an explicit claim is made later.
+    let selected = crate::account_signin::live_hub_session_actor(wb);
+    let claimed_by_selected = matches!(
+        crate::home_owner::claim_state(wb)?,
+        crate::home_owner::HomeClaimState::Claimed { owner }
+            if selected.as_deref() == Some(owner.as_str())
+    );
+    if !claimed_by_selected {
         return Ok(false);
     }
     let marker = root.join(OFFERED_MARKER);
@@ -344,16 +334,15 @@ mod tests {
         assert!(!root.path().join(OFFERED_MARKER).exists());
     }
 
-    /// The facility is what publication and reachability follow, so "signing in
-    /// makes this computer your Home" is false unless signing in attaches it.
-    /// This is the assertion that the promise on the desk page is kept.
+    /// The facility is what publication and reachability follow. It is attached
+    /// after the separate owner claim, not on sign-in alone.
     #[test]
     fn attaching_turns_publication_on_and_is_idempotent() {
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
         assert!(
             !wb.lock_unpoisoned().library_sync_active(),
-            "a fresh install publishes nothing until someone signs in",
+            "a fresh install publishes nothing until its Home is claimed",
         );
         assert!(
             attach_library_sync(&wb).expect("attach"),
@@ -361,7 +350,7 @@ mod tests {
         );
         assert!(
             wb.lock_unpoisoned().library_sync_active(),
-            "after signing in, this Home authors and publishes its reachability",
+            "after attachment, this Home authors and publishes its reachability",
         );
         assert!(
             !attach_library_sync(&wb).expect("attach again"),
@@ -369,12 +358,11 @@ mod tests {
         );
     }
 
-    /// A desktop that was already signed in when this shipped is the install
-    /// every existing person has, and the sign-in hook cannot reach it. Without
-    /// this the promise stays false on exactly the computers that have been
-    /// waiting for it longest.
+    /// Even an account already signed in before this change may not acquire
+    /// the local Home from a startup reconcile. Once the separate claim is
+    /// made, the old reachability reconciliation still catches up.
     #[test]
-    fn a_computer_already_signed_in_still_becomes_a_home() {
+    fn a_computer_already_signed_in_waits_for_explicit_claim() {
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
         assert!(
@@ -383,12 +371,16 @@ mod tests {
         );
         assert!(
             !root.path().join(OFFERED_MARKER).exists(),
-            "and the question is left open, so signing in later is still the moment",
+            "and the question is left open",
         );
         crate::account_signin::store_session_for_test(&wb);
+        assert!(!attach_if_never_offered(&wb, root.path()).expect("signed in"));
+        assert!(!wb.lock_unpoisoned().library_sync_active());
+        assert!(!root.path().join(OFFERED_MARKER).exists());
+        crate::home_owner::claim_if_never_claimed(&wb).expect("explicit claim");
         assert!(
             attach_if_never_offered(&wb, root.path()).expect("attach"),
-            "an upgrade finds the session already there and attaches anyway",
+            "a claimed Home can publish without another sign-in",
         );
         assert!(wb.lock_unpoisoned().library_sync_active());
         assert!(
@@ -407,6 +399,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
         crate::account_signin::store_session_for_test(&wb);
+        crate::home_owner::claim_if_never_claimed(&wb).expect("explicit claim");
         assert!(attach_if_never_offered(&wb, root.path()).expect("attach"));
         wb.lock_unpoisoned()
             .revoke_account_facility(LIBRARY_SYNC_FACILITY_ID)

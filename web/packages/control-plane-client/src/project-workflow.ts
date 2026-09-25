@@ -46,6 +46,30 @@ export async function startShippedTutorial(transport: WorkbenchTransport, name: 
     return { project: identity(raw.project), workspace: identity(raw.workspace), instanceId: identity(admission.instance_ref) };
 }
 
+/** The installed source and ordinary run status for a learner's Tutorials project. */
+export interface ShippedTutorialInfo {
+    project: string;
+    runProject: string;
+    publisher: string;
+    file: string;
+    source: string;
+    status: "ready" | "continue" | "complete";
+    openTasks: number;
+}
+
+export async function getShippedTutorial(transport: WorkbenchTransport, name: string): Promise<ShippedTutorialInfo> {
+    identity(name);
+    const raw = record(await transport.json("GET", `/tutorials/${encodeURIComponent(name)}`));
+    const status = raw.status;
+    if (status !== "ready" && status !== "continue" && status !== "complete") throw new Error("Invalid tutorial status");
+    if (typeof raw.source !== "string" || typeof raw.open_tasks !== "number") throw new Error("Invalid tutorial source");
+    return {
+        project: identity(raw.project), runProject: identity(raw.run_project),
+        publisher: identity(raw.publisher), file: identity(raw.file), source: raw.source,
+        status, openTasks: raw.open_tasks,
+    };
+}
+
 /** A declared workflow input's type, as the Run form draws it. */
 export type WorkflowInputType =
     | { kind: "string" | "int" | "float" | "bool" | "json" }

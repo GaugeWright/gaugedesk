@@ -481,7 +481,7 @@ use gaugedesk_core::merge::{MergeCommand, MergePhase, MergeState};
 use gaugedesk_core::run::{RunCommand, RunPhase, RunState};
 use gaugedesk_harness::{
     CredentialProbe, EgressGate, GateDecision, Harness, HarnessFactory, HarnessSpec, ImageContent,
-    InterruptHandle, Observation, TurnOutcome,
+    InterruptHandle, Observation, TaskFiler, TurnOutcome,
 };
 use gaugedesk_store::{AdmitError, Store};
 use gaugedesk_workspace::{ChatWorkspace, MergeOutcome};
@@ -676,6 +676,7 @@ fn target_writable_roots(worktree: &Path, path_scope: &[String]) -> Vec<std::pat
 }
 
 fn chat_writable_roots(wb: &Workbench, chat_id: &str, worktree: &Path) -> Vec<std::path::PathBuf> {
+    let chat_roots = || vec![worktree.join("artifacts"), worktree.join("work")];
     let is_project_chat = wb
         .library
         .chats
@@ -683,7 +684,7 @@ fn chat_writable_roots(wb: &Workbench, chat_id: &str, worktree: &Path) -> Vec<st
         .and_then(|chat| wb.library.instances.get(&chat.instance_id))
         .is_some_and(|instance| instance.kind == crate::library::InstanceKind::Using);
     if is_project_chat {
-        return wb
+        let mut writable = wb
             .library
             .current_target_set(chat_id)
             .into_iter()
@@ -705,11 +706,16 @@ fn chat_writable_roots(wb: &Workbench, chat_id: &str, worktree: &Path) -> Vec<st
                     })
                 })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        writable.extend(chat_roots());
+        return writable;
     }
-    wb.library_chat_target_binding(chat_id)
+    let mut writable = wb
+        .library_chat_target_binding(chat_id)
         .map(|binding| target_writable_roots(worktree, &binding.path_scope))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    writable.extend(chat_roots());
+    writable
 }
 
 /// The result of one tasked turn.
@@ -1583,6 +1589,8 @@ pub struct EngagementTurnInput<'a> {
     pub images: &'a [ImageContent],
     pub mode: ChatMode,
     pub authenticated_actor: Option<&'a gaugedesk_core::ids::AuthorityId>,
+    /// Verified request authority, rechecked when a tracker tool executes.
+    pub authenticated_context: Option<&'a crate::identity::AuthenticatedActionContext>,
     /// Authority that drove this turn for workstream contribution attribution.
     /// This is distinct from the runtime actor: a verified federated crossing may
     /// drive a hub-resident chat while the hub still owns runtime execution.
@@ -1790,6 +1798,7 @@ fn run_claimed_engagement_turn(
         images,
         mode,
         authenticated_actor,
+        authenticated_context,
         contribution_by,
         account_scope,
         tenant_scope,
@@ -1797,6 +1806,9 @@ fn run_claimed_engagement_turn(
         runtime_command_id,
         harness_factory,
     } = input;
+    let task_action_context = authenticated_context.cloned().or_else(|| {
+        account_bearer.and_then(|bearer| wb.lock_unpoisoned().authenticate_action_context(bearer))
+    });
     // A protected-commercial placement releases its owner-authorized package
     // only for this turn. The TempDir guard remains live through the harness
     // call and erases the material on every return path.
@@ -2087,6 +2099,8 @@ fn run_claimed_engagement_turn(
             None,
             runtime_command_id,
             process_declaration,
+            None,
+            None,
         )?
     } else {
         if let Some(reason) = organization_selection_error {
@@ -2404,27 +2418,54 @@ fn run_claimed_engagement_turn(
                 Network::Deny => base.allow_hosts(egress_hosts),
             }
         };
-        let package_capabilities: BTreeSet<String> = match mode {
+        let (package_capabilities, package_task_ability): (BTreeSet<String>, bool) = match mode {
             ChatMode::Use => {
                 let root = package_root.as_deref().ok_or_else(|| {
                     "a work chat has no selected WhippleScript package root".to_owned()
                 })?;
-                gaugedesk_whip_runtime::AuthoredAgentPackage::load(root)
-                    .map_err(|error| error.to_string())?
-                    .capabilities()
-                    .iter()
-                    .cloned()
-                    .collect()
+                let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(root)
+                    .map_err(|error| error.to_string())?;
+                (
+                    package.capabilities().iter().cloned().collect(),
+                    package
+                        .agent_abilities()
+                        .iter()
+                        .any(|ability| ability == "tracker.file"),
+                )
             }
-            ChatMode::Edit => gaugedesk_whip_runtime::editor_package_capabilities()
-                .map_err(|error| error.to_string())?,
+            ChatMode::Edit => (
+                gaugedesk_whip_runtime::editor_package_capabilities()
+                    .map_err(|error| error.to_string())?,
+                false,
+            ),
         };
         let runtime_placement_id;
         let mut process_declaration;
+        let mut task_tracker_project = None;
         let policy_epoch = {
             let mut g = wb.lock_unpoisoned();
             runtime_placement_id = g.library_placement_of_chat(id);
             let project_id = g.library_project_of_chat(id);
+            let task_tracker =
+                if mode == ChatMode::Use && factory.kind() == "whip" && package_task_ability {
+                    match (project_id.as_deref(), task_action_context.as_ref()) {
+                        (Some(project), Some(context)) if context.actor() == &actor => g
+                            .read_project_tracker(
+                                context,
+                                project,
+                                crate::project_tracker::PROJECT_TASKS,
+                                crate::project_tracker::TrackerPermission::Contribute,
+                            )
+                            .ok()
+                            .map(|tracker| {
+                                task_tracker_project = Some(project.to_owned());
+                                tracker.resource
+                            }),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
             let turn_purpose = g.library_chat_run_purpose(id);
             let granted = crate::resource_store::granted_context(&g.store, id)
                 .map_err(|error| format!("{error:?}"))?
@@ -2475,7 +2516,7 @@ fn run_claimed_engagement_turn(
                 0,
                 None,
             )?;
-            g.compile_whipple_policy(PolicyCompilationInput {
+            let compiled = g.compile_whipple_policy(PolicyCompilationInput {
                 chat_id: id.to_owned(),
                 project_id,
                 actor: actor.as_str().to_owned(),
@@ -2499,12 +2540,17 @@ fn run_claimed_engagement_turn(
                 command_network: sandbox_policy.network
                     != gaugedesk_harness::sandbox::Network::Deny,
                 resources,
+                task_tracker,
                 target_bindings: process_declaration
                     .as_ref()
                     .map(|process| process.bindings.clone())
                     .unwrap_or_default(),
                 advancement_scopes,
-            })?
+            })?;
+            if !compiled.task_tracker_admitted {
+                task_tracker_project = None;
+            }
+            compiled
         };
         if let Some(process) = process_declaration.as_mut() {
             process.bind_governance(policy_epoch.epoch, &policy_epoch.signed_envelope);
@@ -2582,6 +2628,8 @@ fn run_claimed_engagement_turn(
                 .map(|_| resolved_funding_ref.as_str()),
             runtime_command_id,
             process_declaration,
+            task_action_context.as_ref(),
+            task_tracker_project.as_deref(),
         );
         // A real harness reports a turn Stop cut short as its stream dying —
         // either an `io` error or a `Failed` phase — and neither says who ended
@@ -2975,6 +3023,35 @@ fn live_sink(sender: &broadcast::Sender<ServerEvent>) -> impl FnMut(&Observation
     }
 }
 
+/// Bound to the authenticated turn; each call rechecks current project authority.
+struct CurrentProjectTaskFiler {
+    wb: SharedWorkbench,
+    context: crate::identity::AuthenticatedActionContext,
+    chat_id: String,
+    project_id: String,
+    turn_id: String,
+}
+
+impl TaskFiler for CurrentProjectTaskFiler {
+    fn file_task(&self, call_id: &str, content: &str) -> Result<String, String> {
+        if call_id.trim().is_empty() {
+            return Err("task tool call has no identity".to_owned());
+        }
+        let mut g = self.wb.lock_unpoisoned();
+        if g.library_project_of_chat(&self.chat_id).as_deref() != Some(self.project_id.as_str()) {
+            return Err("chat no longer belongs to the admitted project".to_owned());
+        }
+        let operation = format!("agent-task:{}:{}:{}", self.chat_id, self.turn_id, call_id);
+        g.file_agent_project_task(
+            &self.context,
+            &self.project_id,
+            &self.chat_id,
+            &operation,
+            content,
+        )
+    }
+}
+
 /// Drive one turn over the engagement's session, constructed by `factory` from
 /// `spec`. A caching adapter's harness ([`HarnessFactory::reuse_across_turns`])
 /// is **persistent** — created on the first turn and reused thereafter, so
@@ -3005,6 +3082,8 @@ fn drive_persistent_turn(
     managed_funding_ref: Option<&str>,
     runtime_command_id: Option<&str>,
     process_declaration: Option<crate::target_change_set::TurnProcessDeclaration>,
+    task_action_context: Option<&crate::identity::AuthenticatedActionContext>,
+    task_tracker_project: Option<&str>,
 ) -> Result<TaskResult, EngineError> {
     // 1. Check out this turn's resources under a brief lock, then drop it.
     let (mut store, engagement, harness, persistent, answers, fork_snapshot, pause_project) = {
@@ -3078,6 +3157,20 @@ fn drive_persistent_turn(
         // different authenticated member than the one who created its harness.
         harness.bind_authenticated_actor(actor_ref);
         harness.bind_runtime_command_id(runtime_command_id);
+        let task_filer: Option<Arc<dyn TaskFiler>> =
+            match (task_action_context, task_tracker_project) {
+                (Some(context), Some(project)) => Some(Arc::new(CurrentProjectTaskFiler {
+                    wb: Arc::clone(wb),
+                    context: context.clone(),
+                    chat_id: id.to_owned(),
+                    project_id: project.to_owned(),
+                    turn_id: runtime_command_id
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| crate::library::gen_id("task-turn")),
+                })),
+                _ => None,
+            };
+        harness.bind_task_filer(task_filer);
         // Publish this turn's interrupt handle so a concurrent Stop can terminate it
         // out-of-band (unblocking `recv`). A harness with nothing to interrupt binds
         // nothing — the claim taken in `run_engagement_turn` is what records that a
@@ -4187,6 +4280,7 @@ mod tests {
                 images: &[],
                 mode: ChatMode::Use,
                 authenticated_actor: None,
+                authenticated_context: None,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
@@ -4257,6 +4351,7 @@ mod tests {
                 images: &[],
                 mode: ChatMode::Use,
                 authenticated_actor: None,
+                authenticated_context: None,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
@@ -4329,6 +4424,7 @@ mod tests {
                 images: &[],
                 mode: ChatMode::Use,
                 authenticated_actor: None,
+                authenticated_context: None,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,

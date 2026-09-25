@@ -1,7 +1,7 @@
 /**
- * The per-row **status gem** (WS-H): a compact kind glyph that doubles as the row's
- * status light. Chats use a robot glyph while its tooltip says whether it is a
- * **work**, **edit**, or **management** chat; its colour says the single most important *state* — a sync
+ * The per-row **status gem** (WS-H): a compact type or structural glyph with a
+ * top-right status dot and a bottom-right authoring mark. Colour says the
+ * single most important *state* — a sync
  * **conflict** to resolve, the agent **working**, a turn that **errored**, or changes
  * waiting for **review**; and a conflict carries a `!` mark.
  *
@@ -15,7 +15,7 @@
 
 import { Show, type JSX } from "solid-js";
 import { type ChatRunTone, runDotTitle } from "./chat-run-state";
-import { Icon } from "./icons";
+import { Icon, type IconName } from "./icons";
 
 /** The kind of row a gem sits on — a chat's kind is its root (ADR 0035). */
 export type GemKind = "work" | "edit" | "management" | "project";
@@ -24,8 +24,8 @@ export type GemKind = "work" | "edit" | "management" | "project";
 export type GemState = "idle" | "working" | "review" | "error" | "conflict";
 
 const KIND_TITLE: Record<GemKind, string> = {
-    work: "work chat — uses the method to do the project's work",
-    edit: "edit chat — changes what the method itself does",
+    work: "work chat — uses an Agent to do the project's work",
+    edit: "authoring chat — changes what the Agent does",
     management: "management chat — helps manage this account or organization",
     project: "project",
 };
@@ -58,6 +58,8 @@ export function gemState(opts: {
 
 export function StatusGem(props: {
     readonly kind: GemKind;
+    /** The type icon in a flat lens, or connector when the Agent parent is visible. */
+    readonly base?: Extract<IconName, "chat-bubble" | "panel" | "child-connector">;
     /** The row's live run tone (working / review / error); `undefined` = none. */
     readonly tone?: ChatRunTone;
     /** The chat hit a sync/merge conflict being repaired (projection, WS-H c). */
@@ -66,7 +68,7 @@ export function StatusGem(props: {
     const state = () => gemState(props);
     // When the row has a live state, its hover text names it; idle falls back to the
     // kind, so the glyph is never an unexplained mark.
-    const title = () => STATE_TITLE[state()] ?? KIND_TITLE[props.kind];
+    const title = () => [KIND_TITLE[props.kind], STATE_TITLE[state()]].filter(Boolean).join(" · ");
     return (
         <span
             class="status-gem"
@@ -75,14 +77,12 @@ export function StatusGem(props: {
             title={title()}
             aria-label={title()}
         >
-            <Show
-                when={props.kind !== "project"}
-                fallback={<span class="status-gem-glyph" aria-hidden="true">▣</span>}
-            >
-                <Icon name="robot" class="status-gem-glyph" />
+            <Icon name={props.base ?? "chat-bubble"} class="status-gem-glyph" />
+            <Show when={props.kind === "edit"}>
+                <Icon name="page-edit" class="status-gem-corner" />
             </Show>
-            <Show when={state() === "conflict"}>
-                <span class="status-gem-mark" data-gem-conflict aria-hidden="true">!</span>
+            <Show when={state() !== "idle"}>
+                <span class="status-gem-dot" data-gem-state={state()} aria-hidden="true" />
             </Show>
         </span>
     );

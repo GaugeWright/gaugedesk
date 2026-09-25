@@ -576,7 +576,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
    controls; the navigation and chat controls retain their established right edge. */
 .panel.nav .panel-body .facets { padding-right: 22px; }
 /* The nav column owns a pinned footer for organization and account controls. */
-.panel.nav .panel-body { overflow: hidden; }
+.panel.nav .panel-body { overflow: hidden; padding: 10px 2px; }
 .nav-stack { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .nav-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
 /* Negative margins let footer rows span the panel's full width. */
@@ -1782,17 +1782,28 @@ input {
 /* The "no method here yet" on-ramp (#1): the empty placement state must shout the
    one obvious next step, not dead-end. A short line + a primary-tinted button. */
 .tree-group { margin-bottom: 4px; }
-.tree-subgroup { margin-left: 12px; }
-.panel-agents-heading { margin: 7px 6px 2px 18px; text-transform: uppercase; letter-spacing: 0.04em; }
-.tree-node { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 4px;
+.tree-subgroup { margin-left: 10px; }
+.panel-agent-list { margin: 7px 6px 0 18px; padding-top: 5px; border-top: 1px solid var(--edge); }
+.panel-agent-list .tree-subgroup { margin-left: 0; }
+.tree-node { display: flex; align-items: center; gap: 3px; padding: 3px 4px; border-radius: 4px;
     cursor: default; }
 .tree-node:hover { background: color-mix(in srgb, var(--accent) 7%, var(--edge)); }
-.tree-node .node-icon { color: var(--muted); font-size: var(--fs-label); cursor: pointer; width: 12px; display: inline-block; text-align: center; }
+.tree-node .node-icon { color: var(--muted); font-size: var(--fs-label); cursor: pointer; width: 10px; display: inline-block; text-align: center; }
 .tree-node .node-icon:hover { color: var(--fg); }
 /* A leaf with no children gets a width-matched spacer instead of a caret, so the
    ▾/▸ no longer promises a fold that expands to nothing (#2 round-9). */
 .tree-node .node-icon-empty { cursor: default; }
 .tree-node .node-icon-empty:hover { color: var(--muted); }
+.agent-kind-mark { position: relative; display: inline-flex; align-items: center; justify-content: center;
+    flex: 0 0 21px; width: 21px; height: 21px; color: var(--muted); }
+.agent-kind-mark > .icon { width: 18px; height: 18px; }
+.agent-kind-mark .agent-settings-corner { position: absolute; right: -3px; bottom: -3px;
+    width: 12px; height: 12px; padding: 1px; border-radius: 2px; color: var(--gold);
+    background: var(--panel); }
+.project-kind-mark { display: inline-flex; align-items: center; justify-content: center;
+    flex: 0 0 21px; width: 21px; height: 21px; color: var(--muted); }
+.project-kind-mark .icon { width: 18px; height: 18px; }
+.tree-node:hover .agent-kind-mark { color: var(--ink); }
 /* Search match highlight (#6 round-9): mark the literal matched substring so a
    filtered list shows why each surviving row stayed. */
 mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); color: inherit;
@@ -1816,41 +1827,52 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; cursor: pointer; }
 .tree-leaf { padding: 2px 6px 2px 18px; border-radius: 4px; cursor: pointer; font-size: var(--fs-ui);
     display: flex; align-items: center; gap: 6px; }
+.tree-leaf.agent-child { padding-left: 24px; gap: 0; }
+.tree-leaf[data-tutorial-file] { width: 100%; border: 0; background: transparent; color: var(--ink); text-align: left; }
+.tree-leaf[data-tutorial-file] .muted { margin-left: auto; color: var(--muted); font-size: var(--fs-label); }
+.tutorials-view { min-width: 0; padding: 24px; overflow: auto; height: 100%; color: var(--ink); }
+.tutorials-view h1 { margin: 0 0 6px; }
+.tutorials-view h2 { margin: 0 0 8px; }
+.tutorials-view > p { color: var(--muted); }
+.tutorial-card { margin: 24px 0; padding: 20px; border: 1px solid var(--edge); border-radius: 10px; background: var(--edge); }
+.tutorial-card p { max-width: 54ch; }
+.tutorial-actions { display: flex; align-items: center; gap: 14px; }
+.tutorial-actions button { padding: 8px 14px; border: 1px solid var(--accent); border-radius: 6px; color: var(--ink); background: transparent; cursor: pointer; }
+.tutorial-source { max-height: 50vh; padding: 16px; overflow: auto; border: 1px solid var(--edge); border-radius: 8px; font-size: var(--fs-small); }
 .tree-leaf:hover { background: color-mix(in srgb, var(--accent) 7%, var(--edge)); }
 .tree-leaf.active { background: color-mix(in srgb, var(--accent) 13%, var(--edge)); color: #c9dcff; }
 .tree-leaf .leaf-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     min-width: 0; flex: 1 1 auto; }
-/* A chat row that carries a fork sublabel stacks title + "copy of …" (#3). */
-.tree-leaf .leaf-label.leaf-label-stack { display: flex; flex-direction: column; min-width: 0; }
-/* The title is its own line so it ellipsises inside the flex column (round-11 #6):
-   text-overflow can't reach a bare text child of a flex container. */
-.tree-leaf .leaf-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    max-width: 100%; min-width: 0; }
-.tree-leaf .leaf-sub { color: var(--muted); font-size: var(--fs-label); line-height: 1.2;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Chat-log search snippet (SEARCH-1): a faint italic context line under the title
-   showing why a content-only hit stayed; the matched term keeps the search-hit mark. */
+/* One scan line per chat. The title leads; lineage or target context shares the
+   row and truncates before it can crowd the title out. */
+.tree-leaf .leaf-label.leaf-label-inline { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.tree-leaf .leaf-title { flex: 1 1 auto; min-width: 54px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+.tree-leaf .leaf-context { flex: 0 1 auto; max-width: 48%; min-width: 0;
+    color: var(--muted); font-size: var(--fs-label); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+.tree-leaf .leaf-fork { flex: 0 0 auto; color: var(--muted); font-size: var(--fs-label); }
+/* A content search uses the context slot to explain why this row matched. */
 .tree-leaf .leaf-snippet { font-style: italic; opacity: 0.85; }
-/* Per-row status gem (WS-H): the leftmost robot glyph doubles as the row's
-   status light. Its tooltip carries the work/edit distinction; its colour
-   carries the single most important state — quiet/muted when idle, working pulses
-   (accent), needs-review is steady amber, a failed turn is red. An optional count
-   badge rides its corner (pending changes; wired in phase 2). */
-.tree-leaf .status-gem { flex: 0 0 auto; position: relative; display: inline-flex;
-    align-items: center; justify-content: center; width: 14px; height: 14px;
-    font-size: var(--fs-small); line-height: 1; color: var(--muted); }
-.tree-leaf .status-gem-glyph { display: block; width: 14px; height: 14px; }
-.tree-leaf .status-gem[data-state="working"] { color: var(--accent);
-    animation: pulse 1.1s ease-in-out infinite; }
-.tree-leaf .status-gem[data-state="review"] { color: var(--warn); }
-.tree-leaf .status-gem[data-state="error"] { color: var(--bad); }
-/* Conflict (WS-H c): red like an error, but carries a `!` mark so it reads as
-   "needs resolving", distinct from a plain failed turn. */
-.tree-leaf .status-gem[data-state="conflict"] { color: var(--bad); }
-.tree-leaf .status-gem-mark { position: absolute;
-    top: -3px; right: -4px; font-size: 8px; line-height: 1; padding: 0 2px;
-    border-radius: 6px; color: var(--accent-contrast); font-variant-numeric: tabular-nums; }
-.tree-leaf .status-gem-mark { background: var(--bad); font-weight: 400; padding: 0 3px; }
+/* Base = type in flat views, connector under a visible Agent. The top-right
+   dot carries thread state; the bottom-right page-edit identifies authoring. */
+.tree-leaf .status-gem { flex: 0 0 21px; position: relative; display: inline-flex;
+    align-items: center; justify-content: center; width: 21px; height: 21px;
+    line-height: 1; color: var(--muted); }
+.tree-leaf .status-gem-glyph { display: block; width: 18px; height: 18px; }
+.tree-leaf .status-gem-corner { position: absolute; right: -3px; bottom: -3px;
+    width: 12px; height: 12px; padding: 1px; border-radius: 2px;
+    color: var(--gold); background: var(--panel); }
+.tree-leaf.active .status-gem-corner { background: color-mix(in srgb, var(--accent) 13%, var(--edge)); }
+.tree-leaf .status-gem-dot { position: absolute; top: 0; right: 0; width: 6px;
+    height: 6px; border-radius: 50%; border: 1px solid var(--panel); background: var(--warn); }
+.tree-leaf .status-gem-dot[data-gem-state="working"] { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+.tree-leaf .status-gem-dot[data-gem-state="error"],
+.tree-leaf .status-gem-dot[data-gem-state="conflict"] { background: var(--bad); }
+.tree-leaf .nav-vcs-state { display: inline-flex; flex: 0 0 16px; width: 16px; height: 16px;
+    color: var(--warn); }
+.tree-leaf .nav-vcs-state.conflict { color: var(--bad); }
+.tree-leaf .nav-vcs-state .icon { width: 16px; height: 16px; }
 /* The row's demoted-facet tag (ADR 0112): under a flat lens the archetype
    survives as a quiet serif chip on the row instead of a tree level. */
 .tree-leaf .leaf-meta { margin-left: auto; flex: 0 0 auto; color: var(--muted);
@@ -1869,7 +1891,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .row-actions { margin-left: auto; flex: 0 0 auto; display: inline-flex; gap: 2px;
     align-items: center; }
 .row-act { position: relative; display: inline-flex; align-items: center;
-    justify-content: center; width: 22px; height: 20px; padding: 0; border: 0;
+    justify-content: center; width: 26px; height: 24px; padding: 0; border: 0;
     border-radius: 4px; background: transparent; color: var(--muted);
     opacity: 0; transition: opacity .1s; cursor: pointer; }
 /* Reveal on pointer hover, or on KEYBOARD focus only (:focus-visible) — a
@@ -1886,16 +1908,18 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
    FacetBrowser): Chrome on Linux/Wayland can stop applying :hover rules while
    still delivering pointer events — the class path keeps working there. */
 .tree-node.row-hot .row-act { opacity: 1; }
+.tree-node.project .row-act, .tree-node.archetype .row-act { opacity: 1; }
 .row-act:hover { color: var(--accent); background: var(--bg); border: 0; }
-.row-act .icon { width: 13px; height: 13px; }
-.row-act-plus { position: absolute; right: 1px; top: -2px; font-style: normal;
-    font-size: 9px; font-weight: 400; line-height: 1; color: var(--accent); }
-.lens-toggle { flex: 0 0 auto; display: inline-flex; align-items: center;
-    border: 1px solid var(--edge); border-radius: 3px; padding: 1px 6px; margin-right: 2px;
+.row-act .icon { width: 17px; height: 17px; }
+.row-act-plus { position: absolute; right: 0; bottom: -2px; font-style: normal;
+    font-size: 12px; font-weight: 600; line-height: 1; color: var(--gold);
+    background: var(--panel); border-radius: 2px; }
+.lens-sort { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 2px;
+    border: 1px solid var(--edge); border-radius: 3px; padding: 2px 4px; margin-right: 2px;
     background: transparent; color: var(--muted); cursor: pointer; white-space: nowrap;
-    font: 400 var(--fs-label) var(--serif); text-transform: uppercase; letter-spacing: .05em; }
-.lens-toggle[data-lens="archetype"] { color: #c9dcff; }
-.lens-toggle:hover { color: var(--accent); border-color: var(--accent); background: transparent; }
+    font: 400 var(--fs-label) system-ui, sans-serif; }
+.lens-sort .icon { width: 11px; height: 11px; }
+.lens-sort:hover, .lens-sort:focus-visible { color: var(--ink); border-color: var(--accent); }
 /* Workstreams (WS-F): the shared-line indicator, the workstream row, and its
    explicit promote/archive actions. Member chats auto-sync — no per-sync buttons. */
 .ws-badge { color: var(--accent, #6ab0f3); width: 13px; height: 13px; flex: 0 0 auto;
@@ -2047,8 +2071,10 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .context-menu { position: fixed; z-index: 50; background: var(--panel); border: 1px solid var(--edge);
     border-radius: 6px; padding: 4px; min-width: 130px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
     display: flex; flex-direction: column; gap: 1px; }
-.menu-item { text-align: left; background: transparent; border: none; color: var(--ink);
+.menu-item { display: flex; align-items: center; gap: 8px; text-align: left; background: transparent; border: none; color: var(--ink);
     padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: var(--fs-ui); }
+.menu-item-icon { width: 16px; height: 16px; flex: 0 0 16px; color: var(--muted); }
+.menu-item-check { width: 14px; flex: 0 0 14px; color: var(--accent); text-align: center; }
 .menu-item:hover { background: var(--edge); border: none; }
 .menu-item.danger { color: var(--bad); }
 .menu-item.confirming { background: var(--bad); color: var(--accent-contrast); }
@@ -2424,6 +2450,8 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .homegate-connect-row button, .homegate-cloud button { padding: 9px 14px; border: 0;
     border-radius: 7px; background: var(--accent); color: #0b1220; font-weight: 400; cursor: pointer; }
 .homegate-connect-row button:disabled, .homegate-cloud button:disabled { opacity: .45; cursor: default; }
+.homegate-connect-row .homegate-link { align-self: center; padding: 0; border: 0;
+    border-radius: 0; background: none; color: var(--accent); text-decoration: underline; }
 .homegate-cloud { display: flex; align-items: center; justify-content: space-between; gap: 18px;
     padding-top: 14px; border-top: 1px solid var(--edge); }
 .homegate-cloud div { display: flex; flex-direction: column; gap: 3px; }

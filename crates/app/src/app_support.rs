@@ -58,6 +58,7 @@ pub struct BuiltinArchetype {
 /// Starter method definitions for the built-in library archetypes.
 pub(crate) const DEFAULT_AGENT_SYSTEM_MD: &str = "\
 You are a general-purpose assistant. Work carefully and directly on the task.
+When asked to create a project task or task-bar item, use add_todo. Report success only after it returns an issue id.
 ";
 
 pub(crate) const SOFTWARE_ENGINEER_SYSTEM_MD: &str = "\

@@ -298,6 +298,9 @@ impl Workbench {
             )),
             Some(O::NotHeld) => Err(format!("{TRACKER_CONTROL_REFUSED}: it is not claimed")),
             Some(O::NotOpen) => Err(format!("{TRACKER_CONTROL_REFUSED}: it is not open")),
+            Some(O::NotReady { reasons }) => {
+                Err(format!("{TRACKER_CONTROL_REFUSED}: {}", reasons.join("; ")))
+            }
             Some(O::NotMonotonic | O::DeadlineElapsed) => Err(format!(
                 "{TRACKER_CONTROL_REFUSED}: its lease cannot be moved that way"
             )),

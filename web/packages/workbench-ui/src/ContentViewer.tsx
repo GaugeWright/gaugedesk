@@ -333,6 +333,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
         const path = file();
         if (!path || path === ".agent-config.json" || path.startsWith(".whipple/versions/")
             || path.startsWith(".gaugedesk-runtime/")) return false;
+        if ((path === "agent" || path.startsWith("agent/")) && chatKind() !== "edit") return false;
         // The editor is a text buffer, and a save writes text. A picture, a
         // PDF or a recording is viewable here and not editable here — but a
         // spreadsheet export is text that happens to be drawn as a grid, and

@@ -308,8 +308,13 @@ pub(crate) async fn get_workspace_delta(
         crate::net_http::bearer(&headers),
         &crate::workbench_auth::req_scope(&headers),
     );
-    let workspace =
-        library_routes::scope_workspace_value(&wb, library_routes::workspace_value(&wb), &vis);
+    let actor = library_routes::workspace_actor(&wb, &headers);
+    let workspace = library_routes::scope_workspace_value(
+        &wb,
+        library_routes::workspace_value(&wb),
+        &vis,
+        actor.as_deref(),
+    );
     let Some(value) = library_routes::workspace_delta_value(&workspace, &record, &id) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -373,7 +378,13 @@ pub(crate) async fn get_projection(
                 crate::net_http::bearer(&headers),
                 &crate::workbench_auth::req_scope(&headers),
             );
-            library_routes::scope_workspace_value(&wb, library_routes::workspace_value(&wb), &vis)
+            let actor = library_routes::workspace_actor(&wb, &headers);
+            library_routes::scope_workspace_value(
+                &wb,
+                library_routes::workspace_value(&wb),
+                &vis,
+                actor.as_deref(),
+            )
         } else {
             match wb.lifecycle_projection_value(&scope, &kind) {
                 Ok(Some(value)) => value,

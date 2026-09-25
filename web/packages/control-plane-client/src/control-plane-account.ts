@@ -668,11 +668,22 @@ export interface HubSessionStatus {
     expired: boolean;
     /** The Hub-minted trusted-device id this session is bound to (LOGIN-3). */
     device: string | null;
+    /** This computer's one-time Home claim, separate from account sign-in. */
+    homeClaim: { state: "available"; projects: number }
+        | { state: "claimed"; owner: string }
+        | { state: "governed" }
+        | null;
 }
 
 function hubSessionStatusFrom(value: unknown): HubSessionStatus {
     const o = value as Record<string, unknown> | null;
     const person = typeof o?.person === "string" && o.person ? o.person : null;
+    const claim = o?.home_claim as Record<string, unknown> | null;
+    const homeClaim = claim?.state === "available" && typeof claim.projects === "number"
+        ? { state: "available" as const, projects: claim.projects }
+        : claim?.state === "claimed" && typeof claim.owner === "string"
+            ? { state: "claimed" as const, owner: claim.owner }
+            : claim?.state === "governed" ? { state: "governed" as const } : null;
     return {
         available: Boolean(o?.available),
         linked: Boolean(o?.linked),
@@ -683,11 +694,21 @@ function hubSessionStatusFrom(value: unknown): HubSessionStatus {
         expires: typeof o?.expires === "number" ? o.expires : null,
         expired: Boolean(o?.expired),
         device: typeof o?.device === "string" && o.device ? o.device : null,
+        homeClaim,
     };
 }
 
 export async function hubSessionStatus(json: RouteJson): Promise<HubSessionStatus> {
     return hubSessionStatusFrom(await json("GET", "/account/hub-session"));
+}
+
+/** Give the selected account this computer's local Home after its own explicit
+ * act. The control plane rechecks the session at the Hub before recording it. */
+export async function hubSessionClaimHome(json: RouteJson, person: string): Promise<HubSessionStatus> {
+    if (!person) throw new Error("Select an account before claiming this computer");
+    return hubSessionStatusFrom(await json("POST", "/account/hub-session/claim-home", {
+        person, confirm: true,
+    }));
 }
 
 /** Native roster is a non-secret projection. Retaining a session does not

@@ -19,7 +19,7 @@
 import "./wasm-modules";
 import { accountSelectionSync } from "./account-selection-sync";
 import { desktopHomeSession } from "./desktop-home-session";
-import { createEffect, createMemo, createResource, createSignal, For, on, onCleanup, onMount, Show, untrack, type Accessor, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack, type Accessor, type JSX } from "solid-js";
 import {
     authority,
     bearer,
@@ -475,6 +475,48 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [hubSession, { refetch: refetchHubSession }] = createResource(() =>
         api.hubSessionStatus().catch(() => null),
     );
+    const [claimPromptOpen, setClaimPromptOpen] = createSignal(false);
+    const [claimBusy, setClaimBusy] = createSignal(false);
+    const [claimError, setClaimError] = createSignal("");
+    const canClaimThisComputer = () => hubSession()?.linked === true
+        && hubSession()?.expired !== true
+        && hubSession()?.homeClaim?.state === "available";
+    const localProjectCount = () => {
+        const claim = hubSession()?.homeClaim;
+        return claim?.state === "available" ? claim.projects : 0;
+    };
+    const selectedOwnsThisComputer = () => {
+        const claim = hubSession()?.homeClaim;
+        return hubSession()?.expired !== true && claim?.state === "claimed"
+            && claim.owner === hubSession()?.person;
+    };
+    const otherOwnerOfThisComputer = () => {
+        const claim = hubSession()?.homeClaim;
+        if (claim?.state !== "claimed" || claim.owner === hubSession()?.person) return null;
+        return retainedAccounts()?.accounts.find((account) => account.person === claim.owner)?.label
+            ?? claim.owner;
+    };
+    const claimThisComputer = async () => {
+        if ((!canClaimThisComputer() && !selectedOwnsThisComputer()) || claimBusy()) return;
+        const person = hubSession()?.person;
+        if (!person) return;
+        setClaimBusy(true);
+        setClaimError("");
+        try {
+            await api.hubSessionClaimHome(person);
+            setClaimPromptOpen(false);
+            await refetchHubSession();
+            await refetchHome();
+            // Registration follows the Home's relay leg, which can park after
+            // this command returns. Recheck that state without claiming twice.
+            window.setTimeout(() => void refetchHome(), 3000);
+        } catch (error) {
+            setClaimError(error instanceof Error ? error.message : "Could not claim this computer.");
+            await refetchHubSession();
+        } finally {
+            setClaimBusy(false);
+        }
+    };
     const [retainedAccounts] = createResource(
         // A signed-out selection still leaves other sessions retained. Read
         // their non-secret roster so the person can choose one without another
@@ -711,6 +753,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         props.gaugeApps?.clearProjectRequest?.();
     });
     const [projectTasks, setProjectTasks] = createSignal<{ id: ProjectId; name: string; queue?: string; subject?: string } | null>(null);
+    const [tutorialsProject, setTutorialsProject] = createSignal<ProjectId | null>(null);
     const trackerActor = createMemo(() => JSON.stringify([authority(), hubSession()?.person ?? null]));
     // A panel may close while delivery is uncertain. Its command survives in
     // this actor's session; changing accounts creates a separate signal so even
@@ -746,6 +789,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // per keystroke-ish action and churned the tree (round-13 follow-up).
     const [navTick, setNavTick] = createSignal(0);
     const bumpNav = () => setNavTick((k) => k + 1);
+    const [tutorialInfo, { refetch: refetchTutorial }] = createResource(
+        () => tutorialsProject() ? [tutorialsProject(), navTick()] as const : false,
+        () => api.getShippedTutorial("basics"),
+    );
+    createEffect(() => {
+        const settings = projectSettings();
+        if (settings && tutorialsProject() && settings.id !== tutorialsProject()) setTutorialsProject(null);
+    });
     const [projectSettingsWorkspace, { refetch: refetchProjectSettings }] = createResource(
         () => projectSettings() ? ([projectSettings()!.id, navTick()] as const) : false,
         async ([id]) => {
@@ -1482,6 +1533,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     let composerEl: HTMLTextAreaElement | undefined;
     function openChat(id: EngagementId) {
         closeProjectSettings();
+        setTutorialsProject(null);
         setOpenedPanelAgent(null);
         setSelected(id);
         // UX-4: mirror the selection into the URL (`?chat=<id>`) so it's deep-linkable.
@@ -1499,6 +1551,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // placement and leaves the chat alone, because a panel placement hosts no
     // chats.
     async function openPanelAgent(agent: ArchetypeNode, project?: ProjectNode) {
+        setTutorialsProject(null);
         const placement = project?.placements.find((candidate) =>
             candidate.kind === "panel" && candidate.archetypeId === agent.id);
         if (!placement) {
@@ -2022,6 +2075,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 setProjectSettingsPage("people");
             }}
             onOpenProjectTasks={(id, name) => setProjectTasks({ id, name })}
+            onOpenTutorials={(id) => {
+                closeProjectSettings();
+                setOpenedPanelAgent(null);
+                setRoutedProject(id);
+                api.setCurrentProject(id);
+                setTutorialsProject(id);
+                workbenchShell.openPane("content", { chatSelected: false, fileSelected: true });
+            }}
             onDeployPlacement={setDeployment}
             onOpenPanelAgent={(agent, project) => void openPanelAgent(agent, project)}
             onOpenInbox={(id, name) => setProjectInbox({ id, name })}
@@ -2074,6 +2135,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             {(gaugeApps) => <div class="organization-bar">{gaugeApps().organizationSelector()}</div>}
         </Show>
         <div class="account-bar">
+            <Show when={canClaimThisComputer()}>
+                <button type="button" data-open-home-claim onClick={() => setClaimPromptOpen(true)}>
+                    Claim this computer
+                </button>
+            </Show>
             <Show when={(retainedAccounts()?.accounts.length ?? 0) > 0}>
                 <div class="account-switcher" aria-label="Accounts on this GaugeDesk">
                     <For each={retainedAccounts()?.accounts ?? []}>
@@ -2291,15 +2357,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         />
     );
 
-    const retainedBrowserChoices = (): JSX.Element => (
-        <Show when={!isTauri() && retainedAccounts()?.accounts.some((account) =>
-            !account.expired && account.person !== retainedAccounts()?.selected)}>
+    const retainedAccountChoices = (): JSX.Element => (
+        <Show when={retainedAccounts()?.accounts.some((account) =>
+            !account.expired && account.person !== retainedAccounts()?.selected)
+            || (isTauri() && !hubSession()?.local)}>
             <div class="account-switcher" aria-label="Other accounts on this GaugeDesk">
                 <For each={retainedAccounts()?.accounts.filter((account) =>
                     !account.expired && account.person !== retainedAccounts()?.selected) ?? []}>
                     {(account) => <button type="button" disabled={switchingAccount()}
                         onClick={() => void switchAccount(account.person)}>{account.label}</button>}
                 </For>
+                <Show when={isTauri() && !hubSession()?.local}>
+                    <button type="button" disabled={switchingAccount()}
+                        onClick={() => void switchLocal()}>Use this computer locally</button>
+                </Show>
                 <Show when={accountSwitchError()}><p role="alert">{accountSwitchError()}</p></Show>
             </div>
         </Show>
@@ -2466,8 +2537,37 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         </>
     );
 
+    const tutorialPane = () => <section class="tutorials-view" data-tutorials-project>
+        <Show when={tutorialInfo()} fallback={<p role="status">{tutorialInfo.error ? "Tutorials are unavailable. Try again." : "Loading tutorials…"}</p>}>
+            {(info) => <>
+                <h1>Tutorials</h1>
+                <p>Learn GaugeDesk with real tasks · by {info().publisher}</p>
+                <article class="tutorial-card">
+                    <h2>Basics</h2>
+                    <p>Create a chat, an Agent, a project, and an invitation. You can stop and continue at any time.</p>
+                    <div class="tutorial-actions">
+                        <Show when={info().status === "ready"} fallback={<button type="button" onClick={() => setProjectTasks({ id: info().runProject as ProjectId, name: info().runProject === info().project ? "Tutorials" : "Personal", queue: "tutorials" })}>{info().status === "complete" ? "Review tasks" : "Continue Basics"}</button>}>
+                            <button type="button" onClick={async () => {
+                                try {
+                                    await api.startShippedTutorial("basics");
+                                    bumpNav();
+                                    const next = await refetchTutorial();
+                                    setProjectTasks({ id: (next?.runProject ?? info().project) as ProjectId, name: "Tutorials", queue: "tutorials" });
+                                } catch (error) { setStatus(`Could not start Basics: ${String(error)}`); }
+                            }}>Start Basics</button>
+                        </Show>
+                        <span>{info().status === "complete" ? "Completed" : info().openTasks ? `${info().openTasks} open task${info().openTasks === 1 ? "" : "s"}` : ""}</span>
+                    </div>
+                </article>
+                <h3>{info().file}</h3>
+                <p>Read-only source · updated with GaugeDesk releases</p>
+                <pre class="tutorial-source"><code>{info().source}</code></pre>
+            </>}
+        </Show>
+    </section>;
+
     const panelAgentOrContent = () => (
-        <Show when={openedPanelAgent()} fallback={contentPane()}>
+        <Show when={tutorialsProject()} fallback={<Show when={openedPanelAgent()} fallback={contentPane()}>
             {(opened) => <PanelAgentSurface
                 api={api}
                 agent={opened().agent}
@@ -2493,6 +2593,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     : undefined}
                 onPublished={(version) => { bumpNav(); setStatus(`published v${version}`); }}
             />}
+        </Show>}>
+            {tutorialPane()}
         </Show>
     );
 
@@ -3008,8 +3110,52 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 <span class="homegate-error" role="alert">{gateSignOutError()}</span>
             </Show>
         </p>
-        {retainedBrowserChoices()}
+        {retainedAccountChoices()}
     </>);
+    const claimCard = (): JSX.Element => (
+        <section class="homegate-card" aria-labelledby="home-claim-title" data-home-claim>
+            <div class="homegate-card-inner">
+                <p class="homegate-kicker">This computer</p>
+                <h1 id="home-claim-title">Claim this computer as your Home</h1>
+                <p class="homegate-lede">
+                    {hubSession()?.label ?? hubSession()?.person} will become the owner of this
+                    computer's Home and can reach its {localProjectCount()} existing local {localProjectCount() === 1 ? "project" : "projects"}.
+                </p>
+                <p class="homegate-lede">Project files and history stay on this computer. Their routes become
+                    discoverable through that account, so you can open them from another device
+                    while this computer is running.</p>
+                <p class="homegate-lede">This choice is permanent for this Home. Signing out or adding another account
+                    will not transfer it.</p>
+                <div class="homegate-connect-row">
+                    <button type="button" class="firstrun-connect" data-claim-home
+                        disabled={claimBusy()} onClick={() => void claimThisComputer()}>
+                        {claimBusy() ? "Claiming…" : "Claim this computer"}
+                    </button>
+                    <button type="button" class="homegate-link" data-defer-home-claim
+                        onClick={() => homeState()?.kind === "none"
+                            ? void switchLocal() : setClaimPromptOpen(false)}>
+                        {homeState()?.kind === "none" ? "Use this computer locally" : "Later"}
+                    </button>
+                </div>
+                <Show when={claimError()}><p class="homegate-error" role="alert">{claimError()}</p></Show>
+                <p class="homegate-auth-note">Signing in alone does not claim local work. You can keep using this computer locally.</p>
+                {signedInNote()}
+            </div>
+        </section>
+    );
+    const otherOwnerCard = (): JSX.Element => (
+        <section class="homegate-card" data-home-claimed-by-another>
+            <div class="homegate-card-inner">
+                <p class="homegate-kicker">This computer</p>
+                <h1>This Home belongs to another account</h1>
+                <p class="homegate-lede">{otherOwnerOfThisComputer()} already owns the Home and its local projects.
+                    Signing in as {hubSession()?.label ?? hubSession()?.person} does not transfer them.</p>
+                <p class="homegate-lede">Choose the owning account to use this Home, or continue with
+                    this computer's local work without changing its owner.</p>
+                {signedInNote()}
+            </div>
+        </section>
+    );
     const HomeSetup = () => {
         // A person with a valid account and no Home yet is an ordinary starting
         // state, not an error (`experience/desk.md`). It gets one page whose single
@@ -3065,39 +3211,46 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         <Show
                             when={homes().length > 0}
                             fallback={
-                                <section class="homegate-card" aria-labelledby="homegate-title">
-                                  <div class="homegate-card-inner">
-                                    <p class="homegate-kicker">Welcome to GaugeDesk</p>
-                                    <h1 id="homegate-title">Your work needs a Home</h1>
-                                    <p class="homegate-lede">
-                                        Projects, chats, and files live on a Home — a computer you
-                                        control — rather than in this browser. Install GaugeDesk and
-                                        sign in there, and that computer becomes your first Home.
-                                        This page then opens it from anywhere you sign in.
-                                    </p>
-                                    <a
-                                        class="firstrun-connect"
-                                        data-home-download
-                                        href={downloadUrl}
-                                        rel="noreferrer"
-                                    >
-                                        Download GaugeDesk
-                                    </a>
-                                    <p class="homegate-auth-note">
-                                        GaugeWright-hosted Homes, where we run one for you, are coming.
-                                        {" "}
-                                        <button
-                                            type="button"
-                                            class="homegate-link"
-                                            data-home-recovery
-                                            onClick={() => setHomeRecovery(true)}
-                                        >
-                                            Already have a Home?
-                                        </button>
-                                    </p>
-                                    {signedInNote()}
-                                  </div>
-                                </section>
+                                <Switch fallback={
+                                    <section class="homegate-card" aria-labelledby="homegate-title">
+                                        <div class="homegate-card-inner">
+                                            <p class="homegate-kicker">Welcome to GaugeDesk</p>
+                                            <h1 id="homegate-title">Your work needs a Home</h1>
+                                            <p class="homegate-lede">
+                                                Projects, chats, and files live on a Home — a computer you
+                                                control — rather than in this browser. Install GaugeDesk,
+                                                sign in there, and claim that computer as your first Home.
+                                                This page then opens it from anywhere you sign in.
+                                            </p>
+                                            <a class="firstrun-connect" data-home-download href={downloadUrl} rel="noreferrer">
+                                                Download GaugeDesk
+                                            </a>
+                                            <p class="homegate-auth-note">
+                                                GaugeWright-hosted Homes, where we run one for you, are coming. {" "}
+                                                <button type="button" class="homegate-link" data-home-recovery
+                                                    onClick={() => setHomeRecovery(true)}>Already have a Home?</button>
+                                            </p>
+                                            {signedInNote()}
+                                        </div>
+                                    </section>
+                                }>
+                                    <Match when={canClaimThisComputer()}>{claimCard()}</Match>
+                                    <Match when={selectedOwnsThisComputer()}>
+                                        <section class="homegate-card" data-home-claim-connecting>
+                                            <div class="homegate-card-inner">
+                                                <h1>Connecting this computer</h1>
+                                                <p class="homegate-lede">This Home is yours. Its project files remain here while GaugeDesk publishes the routes your account uses to reach them.</p>
+                                                <button type="button" class="firstrun-connect" disabled={claimBusy()}
+                                                    onClick={() => void claimThisComputer()}>
+                                                    {claimBusy() ? "Connecting…" : "Make this Home reachable"}
+                                                </button>
+                                                <Show when={claimError()}><p class="homegate-error" role="alert">{claimError()}</p></Show>
+                                                {signedInNote()}
+                                            </div>
+                                        </section>
+                                    </Match>
+                                    <Match when={otherOwnerOfThisComputer()}>{otherOwnerCard()}</Match>
+                                </Switch>
                             }
                         >
                             <Show
@@ -3115,6 +3268,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                         <div class="homegate-homes">
                                             <For each={homes()}>{(home) => homeRow(home, false)}</For>
                                         </div>
+                                        <Show when={canClaimThisComputer()}>
+                                            <button type="button" class="homegate-link" data-open-home-claim
+                                                onClick={() => setClaimPromptOpen(true)}>Claim this computer</button>
+                                        </Show>
                                         <p class="homegate-auth-note">
                                             <button
                                                 type="button"
@@ -3151,6 +3308,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                         >
                                             {homeBusy() ? "Checking…" : "Try again"}
                                         </button>
+                                        <Show when={canClaimThisComputer()}>
+                                            <button type="button" class="homegate-link" data-open-home-claim
+                                                onClick={() => setClaimPromptOpen(true)}>Claim this computer</button>
+                                        </Show>
                                         <Show when={homes().length > 1}>
                                             <div class="homegate-homes">
                                                 <span class="homegate-label">Your other Homes</span>
@@ -3183,6 +3344,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={noHomeState()}>
                 {(state) => <div class="homegate-scrim" data-tauri-drag-region data-home-setup>
                     <section class="homegate-card" aria-labelledby="homegate-title">
+                    <Show when={canClaimThisComputer()}>
+                        <button type="button" class="homegate-link" data-open-home-claim
+                            onClick={() => setClaimPromptOpen(true)}>Claim this computer</button>
+                    </Show>
                     <p class="homegate-kicker">Free account</p>
                     <h1 id="homegate-title">Choose where your projects run</h1>
                     <p class="homegate-lede">
@@ -3357,7 +3522,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 </Show>
                             }
                         >
-                            {retainedBrowserChoices()}
+                            {retainedAccountChoices()}
                             {signInCard()}
                         </Show>
                         <Show when={!homeNeedsLogin() && !homeRelayClosed()}>
@@ -3402,7 +3567,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     fallback={
                         <div class="homegate-scrim" data-tauri-drag-region data-first-run-signin>
                             <section class="homegate-card">
-                                {retainedBrowserChoices()}
+                                {retainedAccountChoices()}
                                 {signInCard(
                                     <span class="signin__quiet">
                                         No sign up necessary.{" "}
@@ -3570,7 +3735,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </Show>}>
                         {props.gaugeApps?.content()}
                     </Show>}
-                    files={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={projectSettings()} fallback={filesPane()}>
+                    files={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={tutorialsProject()} fallback={<Show when={projectSettings()} fallback={filesPane()}>
                         {(request) => <ProjectSettingsMenu
                             projectName={request().name}
                             isPersonal={currentProjectSettingsWorkspace()?.project.isPersonal}
@@ -3578,6 +3743,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             onSelect={setProjectSettingsPage}
                             onClose={closeProjectSettings}
                         />}
+                    </Show>}>
+                        <div class="project-settings-empty"><h2>Files</h2><button type="button" onClick={() => void refetchTutorial()}>basics.whip</button><p>Read-only · GaugeWright</p></div>
                     </Show>}>
                         {props.gaugeApps?.menu()}
                     </Show>}
@@ -3603,10 +3770,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 onClick={() => void switchLocal()}>Use this computer locally</button>
                             <button type="button" class="homegate-link" disabled={switchingAccount()}
                                 onClick={() => setSignInOpen(true)}>Add account</button>
-                            <Show when={accountSwitchError()}><p role="alert">{accountSwitchError()}</p></Show>
+            <Show when={accountSwitchError()}><p role="alert">{accountSwitchError()}</p></Show>
                         </div>
                     </section>
                 </div>
+            </Show>
+            <Show when={claimPromptOpen() && canClaimThisComputer()}>
+                <div class="homegate-scrim" data-home-claim-prompt>{claimCard()}</div>
             </Show>
         </>
     );

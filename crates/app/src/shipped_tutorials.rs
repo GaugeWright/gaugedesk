@@ -1,28 +1,21 @@
-//! The tutorials GaugeDesk ships, and the folder they live in (DR-0192).
-//!
-//! Shipped tutorials are product content: GaugeDesk installs and updates them,
-//! and they are neither the person's own files nor the Home's. They live in a
-//! Tutorials folder in Personal — a managed work target beside Personal's files
-//! — owned by the Home's owner so their text may flow into that person's
-//! `tutorials` tracker, and read-only to people and agents so a release never
-//! has to reconcile anyone's edits. Its head is exactly what this release ships.
+//! Release-maintained tutorials in a separate project for each learner (DR-0225).
+//! The release is the publisher; the serving Home still orders project facts.
 
 use crate::{
     home_owner::{HomeOwnerClaim, CLAIM_KIND},
-    library::{TargetCapabilities, WorkTargetOwner},
-    org::ORG_SCOPE,
+    library::{
+        ProjectCollaborationWorkspaceRecord, ProjectRecord, RecordOp, TargetCapabilities,
+        WorkTargetOwner, LIBRARY_RECORD_SCHEMA,
+    },
+    org::{MemberGrantRecord, MembershipStatus, Org, ORG_SCOPE},
     Workbench, DEFAULT_PROJECT,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
-/// The Tutorials folder's work-target id. One per Home: it hangs off Personal.
+/// The old Personal attachment is retained for runs pinned before DR-0225.
 pub const TUTORIALS_TARGET: &str = "target-tutorials";
-
-/// Every tutorial this release ships, as `(file, source)`. Each is an ordinary
-/// `.whip` file; nothing about a tutorial is known to the product beyond this.
 pub const SHIPPED: &[(&str, &str)] = &[("basics.whip", include_str!("tutorials/basics.whip"))];
-
-/// Library record noting which release put the folder at which revision.
 const RELEASE_KIND: &str = "shipped_tutorials_release";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,23 +26,46 @@ struct ShippedRelease {
     version: String,
 }
 
-/// What [`Workbench::ensure_shipped_tutorials`] found or did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ShippedTutorials {
-    /// Nobody owns this Home yet, so there is no one for the folder to belong to.
     NoOwner,
-    /// The folder already held exactly this release's tutorials.
     Current(String),
-    /// The folder was created or brought to this release; its new head.
     Updated(String),
 }
 
+/// Stable identities separate learners' workspaces without putting an account
+/// authority (which may contain personal data) into a path or projection.
+pub fn tutorial_project_id(learner: &str) -> String {
+    let digest = sha2::Sha256::digest(learner.as_bytes());
+    format!("tutorials-{}", hex::encode(&digest[..16]))
+}
+
+pub fn tutorial_target_id(learner: &str) -> String {
+    format!("target-{}", tutorial_project_id(learner))
+}
+
+pub fn is_tutorial_project(project: &ProjectRecord) -> bool {
+    project
+        .extra
+        .get("product")
+        .and_then(|p| p.get("kind"))
+        .and_then(|k| k.as_str())
+        == Some("tutorials")
+}
+
 impl Workbench {
-    /// The account that owns this Home: the one that claimed it (DR-0187), or,
-    /// for a Home governed by a directory of its own — a Cloud Home is
-    /// provisioned with its tenant's owner — that directory's one active owner.
-    /// A directory with several owners names nobody here: whose the tutorials
-    /// are is not something to guess.
+    fn tutorial_learner_admitted(&self, actor: &str, org: &Org) -> bool {
+        if org
+            .members
+            .values()
+            .any(|member| member.status == MembershipStatus::Active)
+        {
+            org.role_of(actor).is_some()
+        } else {
+            self.home_owner_account().as_deref() == Some(actor)
+        }
+    }
+
     pub(crate) fn home_owner_account(&self) -> Option<String> {
         let claimed = self
             .store_ref()
@@ -61,63 +77,161 @@ impl Workbench {
         if claimed.is_some() {
             return claimed;
         }
-        let org = crate::org::Org::rebuild(self.store_ref()).ok()?;
-        let mut owners = org.members.values().filter(|member| {
-            member.status == crate::org::MembershipStatus::Active && member.role == "owner"
-        });
+        let org = Org::rebuild(self.store_ref()).ok()?;
+        let mut owners = org
+            .members
+            .values()
+            .filter(|member| member.status == MembershipStatus::Active && member.role == "owner");
         let owner = owners.next()?;
         owners.next().is_none().then(|| owner.authority.clone())
     }
 
-    /// Ensure the owner's Tutorials folder exists in Personal and holds exactly
-    /// this release's tutorials (DR-0192 §1–§3). Asked wherever the Home's owner
-    /// is established, and on every reconcile; once current it changes nothing.
+    /// Install or reconcile one product project for each active learner. An
+    /// unclaimed Home creates none. Reconcile is idempotent on every wake.
     pub fn ensure_shipped_tutorials(&mut self) -> Result<ShippedTutorials, String> {
-        let Some(owner) = self.home_owner_account() else {
-            return Ok(ShippedTutorials::NoOwner);
-        };
-        if !self.library.projects.contains_key(DEFAULT_PROJECT) {
+        let org = Org::rebuild(self.store_ref()).map_err(|e| format!("{e:?}"))?;
+        let mut learners = org
+            .members
+            .values()
+            .filter(|member| member.status == MembershipStatus::Active)
+            .map(|member| member.authority.clone())
+            .collect::<Vec<_>>();
+        if let Some(owner) = self.home_owner_account() {
+            if !learners.contains(&owner) {
+                learners.push(owner);
+            }
+        }
+        if learners.is_empty() {
             return Ok(ShippedTutorials::NoOwner);
         }
-        // Personal mid-move takes no writes; the next reconcile catches up.
-        if self.project_moving(DEFAULT_PROJECT) {
+        let mut result = ShippedTutorials::NoOwner;
+        for learner in learners {
+            let next = self.ensure_tutorial_project(&learner, &org)?;
+            if matches!(next, ShippedTutorials::Updated(_))
+                || matches!(result, ShippedTutorials::NoOwner)
+            {
+                result = next;
+            }
+        }
+        Ok(result)
+    }
+
+    fn ensure_tutorial_project(
+        &mut self,
+        learner: &str,
+        org: &Org,
+    ) -> Result<ShippedTutorials, String> {
+        let project_id = tutorial_project_id(learner);
+        let target_id = tutorial_target_id(learner);
+        if self.project_moving(&project_id) {
             return Err(crate::federation::PAUSED_FOR_MOVE.into());
         }
-        if !self.targets.contains_key(TUTORIALS_TARGET) {
-            let workspace = self
-                .workspace_provider(TUTORIALS_TARGET)
-                .init_at(&self.targets_dir().join(TUTORIALS_TARGET))
-                .map_err(|error| error.to_string())?;
-            self.targets.insert(TUTORIALS_TARGET.to_owned(), workspace);
+        if let Some(existing) = self.library.projects.get(&project_id) {
+            if !is_tutorial_project(existing)
+                || existing
+                    .extra
+                    .get("product")
+                    .and_then(|p| p.get("learner"))
+                    .and_then(|v| v.as_str())
+                    != Some(learner)
+            {
+                return Err("Tutorials project identity is occupied".into());
+            }
+        } else {
+            let mut extra = std::collections::BTreeMap::new();
+            extra.insert("product".into(), serde_json::json!({"kind":"tutorials", "publisher":"GaugeWright", "learner":learner}));
+            self.write_project_record(ProjectRecord {
+                id: project_id.clone(),
+                op: RecordOp::Upsert,
+                name: "Tutorials".into(),
+                is_default: false,
+                home_id: self.home_id().clone(),
+                network_isolated: false,
+                run_purpose: None,
+                deployment_mode: None,
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra,
+            });
         }
-        let before = self
-            .targets
-            .get(TUTORIALS_TARGET)
-            .and_then(|target| target.current_main_cut().ok().flatten());
-        let head = self.targets[TUTORIALS_TARGET]
+        if !self.has_project_collaboration_workspace(&project_id) {
+            self.write_project_collaboration_workspace_record(
+                ProjectCollaborationWorkspaceRecord {
+                    project_id: project_id.clone(),
+                    workspace_id: format!("project-workspace-{project_id}"),
+                    home_id: self.home_id().clone(),
+                    substrate: "whipplescript".into(),
+                    host_contract_revision: crate::workstream_host_contract::REVISION.into(),
+                    host_contract_digest: crate::workstream_host_contract::DIGEST.into(),
+                    op: RecordOp::Upsert,
+                    schema: LIBRARY_RECORD_SCHEMA,
+                    extra: Default::default(),
+                },
+            );
+        }
+        self.ensure_project_collaboration_workspace(&project_id)?;
+        if org.role_of(learner).is_some()
+            && !org
+                .grants
+                .contains_key(&MemberGrantRecord::make_id(learner, &project_id))
+        {
+            let grant = MemberGrantRecord {
+                id: MemberGrantRecord::make_id(learner, &project_id),
+                op: RecordOp::Upsert,
+                authority: learner.into(),
+                project_id: project_id.clone(),
+            };
+            self.store_mut()
+                .append_record(
+                    ORG_SCOPE,
+                    "member_grant",
+                    &serde_json::to_string(&grant).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        if !self.targets.contains_key(&target_id) {
+            let workspace = self
+                .workspace_provider(&target_id)
+                .init_at(&self.targets_dir().join(&target_id))
+                .map_err(|e| e.to_string())?;
+            self.targets.insert(target_id.clone(), workspace);
+        }
+        let before = self.targets[&target_id]
+            .current_main_cut()
+            .map_err(|e| e.to_string())?;
+        let head = self.targets[&target_id]
             .seed_main_exactly(SHIPPED, "whip")
-            .map_err(|error| error.to_string())?
+            .map_err(|e| e.to_string())?
             .0;
-        let recorded = self.library.work_targets.get(TUTORIALS_TARGET);
-        let current = recorded.is_some_and(|target| {
-            target.authority == owner && target.current_basis.as_deref() == Some(head.as_str())
-        }) && before.as_deref() == Some(head.as_str());
+        let current = self
+            .library
+            .work_targets
+            .get(&target_id)
+            .is_some_and(|target| {
+                target.current_basis.as_deref() == Some(head.as_str())
+                    && target.owner
+                        == WorkTargetOwner::Project {
+                            project_id: project_id.clone(),
+                        }
+                    && target.authority == learner
+                    && target.capabilities.read
+                    && !target.capabilities.propose
+                    && !target.capabilities.apply
+            })
+            && before.as_deref() == Some(head.as_str());
         if current {
             return Ok(ShippedTutorials::Current(head));
         }
         let mut record = crate::library_state::managed_target_record(
-            TUTORIALS_TARGET.to_owned(),
-            "Tutorials".to_owned(),
-            WorkTargetOwner::Project {
-                project_id: DEFAULT_PROJECT.to_owned(),
-            },
+            target_id.clone(),
+            "Tutorials files".into(),
+            WorkTargetOwner::Project { project_id },
             self.home_id(),
             head.clone(),
         );
-        // The owner's, so its text may flow into their tutorial tracker; and
-        // read-only, so a release never meets an edit (DR-0192 §2, §4).
-        record.authority = owner.clone();
-        record.parties = vec![owner];
+        // The learner is the information-flow principal for their tracker;
+        // GaugeWright is the source's release publisher, not a Home principal.
+        record.authority = learner.into();
+        record.parties = vec![learner.into()];
         record.capabilities = TargetCapabilities {
             read: true,
             propose: false,
@@ -126,34 +240,96 @@ impl Workbench {
             release: false,
         };
         self.write_work_target_record(record);
-        let release = ShippedRelease {
-            target: TUTORIALS_TARGET.to_owned(),
-            cut: head.clone(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        };
         self.store_mut()
             .append_record(
                 crate::library::LIBRARY_SCOPE,
                 RELEASE_KIND,
-                &serde_json::to_string(&release).map_err(|e| e.to_string())?,
+                &serde_json::to_string(&ShippedRelease {
+                    target: target_id,
+                    cut: head.clone(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                })
+                .map_err(|e| e.to_string())?,
             )
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(|e| format!("{e:?}"))?;
         Ok(ShippedTutorials::Updated(head))
     }
 }
 
-/// The request id a shipped tutorial is launched under: fixed per tutorial, so
-/// a second window, a retry or a restart finds the run that exists instead of
-/// starting another (`experience/onboarding.md`).
 pub fn tutorial_request_id(name: &str) -> String {
     format!("shipped-tutorial:{name}")
 }
 
 impl Workbench {
-    /// Start, or find, the signed-in owner's run of a shipped tutorial (WHIP-5).
-    /// Ensures the Tutorials folder and the owner's `tutorials` tracker, then
-    /// launches the tutorial from the folder's current revision — or, when it
-    /// was launched before, resumes that run on the revision it pinned.
+    /// Read-only view for the project surface. Source comes from the installed
+    /// target head, while progress is derived from the ordinary run and tracker.
+    pub fn shipped_tutorial_info(
+        &self,
+        context: &crate::identity::AuthenticatedActionContext,
+        name: &str,
+    ) -> Result<serde_json::Value, String> {
+        let file = format!("{name}.whip");
+        if !SHIPPED.iter().any(|(shipped, _)| *shipped == file) {
+            return Err("no such shipped tutorial".into());
+        }
+        crate::identity::revalidate_workflow_context(self.store_ref(), self.home_id(), context)
+            .map_err(|e| format!("{e:?}"))?;
+        let actor = context.actor().as_str();
+        let org = Org::rebuild(self.store_ref()).map_err(|e| format!("{e:?}"))?;
+        if !self.tutorial_learner_admitted(actor, &org) {
+            return Err("Tutorials are unavailable to this account".into());
+        }
+        let project = tutorial_project_id(actor);
+        let record = self
+            .library
+            .projects
+            .get(&project)
+            .ok_or("Tutorials project is unavailable")?;
+        if !is_tutorial_project(record)
+            || record
+                .extra
+                .get("product")
+                .and_then(|p| p.get("learner"))
+                .and_then(|v| v.as_str())
+                != Some(actor)
+        {
+            return Err("Tutorials project is unavailable".into());
+        }
+        let target = self
+            .targets
+            .get(&tutorial_target_id(actor))
+            .ok_or("Tutorials source is unavailable")?;
+        let source = target
+            .read_main_file(&file)
+            .map_err(|e| e.to_string())?
+            .ok_or("Tutorial source is unavailable")?;
+        let request_id = tutorial_request_id(name);
+        let legacy = self.project_workflow_launched(DEFAULT_PROJECT, actor, &request_id)?;
+        let launched = legacy || self.project_workflow_launched(&project, actor, &request_id)?;
+        let run_project = if legacy { DEFAULT_PROJECT } else { &project };
+        let open_tasks = if launched {
+            self.read_project_tracker_tasks(context, run_project, "tutorials")
+                .map(|tasks| tasks.backlog.issues.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let completed = launched
+            && open_tasks == 0
+            && self
+                .read_project_tracker_backlog(context, run_project, "tutorials")
+                .is_ok_and(|backlog| {
+                    !backlog.issues.is_empty()
+                        && backlog.issues.iter().all(|issue| issue.status == "closed")
+                });
+        Ok(serde_json::json!({
+            "project": project, "run_project": run_project, "publisher": "GaugeWright",
+            "file": file, "source": source,
+            "status": if completed { "complete" } else if launched { "continue" } else { "ready" },
+            "open_tasks": open_tasks,
+        }))
+    }
+
     pub fn start_shipped_tutorial(
         &mut self,
         context: &crate::identity::AuthenticatedActionContext,
@@ -167,17 +343,26 @@ impl Workbench {
         let actor = context.actor().as_str().to_owned();
         let request_id = tutorial_request_id(name);
         let limits = ProjectWorkflowLimits::PRODUCT;
+        // Runs already admitted in Personal retain their pinned source and tasks.
         if self.project_workflow_launched(DEFAULT_PROJECT, &actor, &request_id)? {
             return self.resume_project_workflow(context, DEFAULT_PROJECT, &request_id, limits);
         }
-        let cut = match self.ensure_shipped_tutorials()? {
+        let project = tutorial_project_id(&actor);
+        if self.project_workflow_launched(&project, &actor, &request_id)? {
+            return self.resume_project_workflow(context, &project, &request_id, limits);
+        }
+        let org = Org::rebuild(self.store_ref()).map_err(|e| format!("{e:?}"))?;
+        if !self.tutorial_learner_admitted(&actor, &org) {
+            return Err("this Home has no owner yet".into());
+        }
+        let cut = match self.ensure_tutorial_project(&actor, &org)? {
             ShippedTutorials::NoOwner => return Err("this Home has no owner yet".into()),
             ShippedTutorials::Current(cut) | ShippedTutorials::Updated(cut) => cut,
         };
         if self
             .prepare_project_tracker_read(
                 context,
-                DEFAULT_PROJECT,
+                &project,
                 "tutorials",
                 crate::project_tracker::TrackerPermission::Contribute,
             )
@@ -185,25 +370,28 @@ impl Workbench {
         {
             self.declare_project_tracker(
                 context,
-                DEFAULT_PROJECT,
+                &project,
                 "tutorials",
                 "shipped-tutorials",
                 gaugedesk_core::abac::ResourceAttributes::default(),
             )
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(|e| format!("{e:?}"))?;
         }
-        let request = ProjectWorkflowLaunch {
-            project: DEFAULT_PROJECT.to_owned(),
-            target: TUTORIALS_TARGET.to_owned(),
-            path: file,
-            cut,
-            request_id,
-            inputs: std::collections::BTreeMap::from([(
-                "learner".to_owned(),
-                serde_json::json!({ "authority": actor }),
-            )]),
-        };
-        self.launch_project_workflow(context, &request, limits)
+        self.launch_project_workflow(
+            context,
+            &ProjectWorkflowLaunch {
+                project,
+                target: tutorial_target_id(&actor),
+                path: file,
+                cut,
+                request_id,
+                inputs: std::collections::BTreeMap::from([(
+                    "learner".into(),
+                    serde_json::json!({"authority":actor}),
+                )]),
+            },
+            limits,
+        )
     }
 }
 
