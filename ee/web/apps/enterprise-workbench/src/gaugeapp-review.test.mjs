@@ -196,14 +196,6 @@ test("every supported human or agent proposal has a concrete summary example", a
     }
 });
 
-test("every immediate command exposed to a management agent has a concrete review summary", () => {
-    const source = readFileSync(new URL("../../../../../crates/app/src/gaugeapp_agent.rs", import.meta.url), "utf8");
-    const registry = source.match(/pub const AGENT_PROPOSABLE_IMMEDIATE_COMMANDS:[\s\S]*?\n\];/)[0];
-    const commands = [...registry.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
-    assert.ok(commands.length > 0);
-    for (const command of commands) assert.ok(REVIEW_COMMANDS[command], `${command} has no review presentation`);
-});
-
 test("product review exposes every price component and included service without inventing a payable total", () => {
     const result = summary("commercial-product.revise", ...examples["commercial-product.revise"]);
     const fields = Object.fromEntries(result.fields.map(({ label, value }) => [label, value]));

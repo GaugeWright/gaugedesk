@@ -296,6 +296,18 @@ html.mobile-scanner-active #root,
     text-align: left;
 }
 
+.mobile-account-back {
+    display: block;
+    margin: 12px auto 0;
+    min-height: 40px;
+    padding: 8px 14px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    text-decoration: underline;
+}
+
 .mobile-account-recent:active,
 .mobile-account-recent:focus-visible {
     background: var(--edge);

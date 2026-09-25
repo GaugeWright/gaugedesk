@@ -117,6 +117,34 @@ function isUnprovisionedHomeError(error: unknown): boolean {
     return /POST \/home\/admissions: 403 Home has no active owner/.test(message);
 }
 
+/** How long "Finding your Home…" waits on the selected Home before saying it is
+ * not responding. A Home that accepts the connection and never answers would
+ * otherwise hold that screen, which has no other way off it, forever. */
+export const HOME_DIAL_TIMEOUT_MS = 20_000;
+
+export class HomeDialTimeoutError extends Error {
+    constructor() {
+        super("The Home did not answer in time");
+        this.name = "HomeDialTimeoutError";
+    }
+}
+
+function withinHomeDialTimeout<T>(pending: Promise<T>, ms: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new HomeDialTimeoutError()), ms);
+    });
+    return Promise.race([pending, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Whether dialing a Home failed because nothing answered: the connection
+ * could not be made (`fetch` rejects with a TypeError), or a gateway in front of
+ * the Home said it is down. A refusal from a Home that did answer is not this. */
+function isHomeUnreachable(error: unknown): boolean {
+    if (error instanceof TypeError || error instanceof HomeDialTimeoutError) return true;
+    return error instanceof RouteHttpError && [502, 503, 504].includes(error.status);
+}
+
 /** A Home restart invalidates its memory-only admissions. This exact refusal is
  * emitted by the admission middleware before a work route can run, so it is
  * safe to obtain a fresh admission and retry the same operation once. Other
@@ -152,6 +180,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     private readonly request: RouteRequest;
     private readonly events: RouteEventStream;
     private readonly splitHomes: boolean;
+    private readonly homeDialTimeoutMs: number;
     private readonly workTransport: workbenchClient.WorkbenchTransport;
     private homeTransport: Promise<workbenchClient.WorkbenchTransport> | null = null;
     /** Several Homes at once, resolved per project (DESK-3). There is no
@@ -163,9 +192,10 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     constructor(
         private readonly base = controlPlaneBase(),
-        options: { readonly splitHomes?: boolean } = {},
+        options: { readonly splitHomes?: boolean; readonly homeDialTimeoutMs?: number } = {},
     ) {
         this.splitHomes = options.splitHomes ?? import.meta.env?.VITE_HOME_SPLIT === "true";
+        this.homeDialTimeoutMs = options.homeDialTimeoutMs ?? HOME_DIAL_TIMEOUT_MS;
         const auth = {
             bearer: () => this.bearer,
             // In split mode this is the Hub transport. A Home credential must
@@ -629,12 +659,16 @@ export class WorkbenchControlPlane implements ControlPlane {
     async bootstrapHome(): Promise<HomeBootstrapState> {
         if (!this.splitHomes) return { kind: "direct" };
         try {
-            await this.requireHomeTransport();
+            await withinHomeDialTimeout(this.requireHomeTransport(), this.homeDialTimeoutMs);
             const state = await accountClient.accountHomes(this.route);
             const home = state.homes.find((item) => item.id === state.selectedHome);
             if (!home) throw new NoSelectedHomeError("No reachable Home is selected");
             return { kind: "connected", home };
         } catch (error) {
+            // `requireHomeTransport` keeps the connection attempt, rejected or
+            // not. A failed one must not outlive this call, or every Retry would
+            // read back the same rejection without dialing anything.
+            this.homeTransport = null;
             // A selected Home that has published no route belongs with the other
             // "no Home is serving you yet" states, not with connection failures
             // (ADR 0134 §5): the surface below lists the account's Homes and
@@ -644,20 +678,33 @@ export class WorkbenchControlPlane implements ControlPlane {
                 && !(error instanceof UnroutedHomeError)
                 && !isUnprovisionedHomeError(error)
             ) {
+                // So does a Home that did not answer while the account did: an
+                // asleep laptop is "that Home is not responding", with the
+                // account's other Homes beside it — not "we couldn't load your
+                // Homes", which blamed the account service and offered only a
+                // Retry of the same Home. Authentication and identity refusals
+                // are not outages and still fail as themselves.
+                if (isHomeUnreachable(error)) {
+                    const none = await this.noHomeServing().catch(() => null);
+                    if (none?.selectedHome) return none;
+                }
                 throw error;
             }
-            this.homeTransport = null;
-            const [state, routes] = await Promise.all([
-                accountClient.accountHomes(this.route),
-                this.homeRoutes(),
-            ]);
-            return {
-                kind: "none",
-                homes: state.homes,
-                routes,
-                selectedHome: state.selectedHome,
-            };
+            return this.noHomeServing();
         }
+    }
+
+    private async noHomeServing(): Promise<HomeBootstrapState & { kind: "none" }> {
+        const [state, routes] = await Promise.all([
+            accountClient.accountHomes(this.route),
+            this.homeRoutes(),
+        ]);
+        return {
+            kind: "none",
+            homes: state.homes,
+            routes,
+            selectedHome: state.selectedHome,
+        };
     }
 
     async connectHome(endpoint: string): Promise<HomeBootstrapState> {

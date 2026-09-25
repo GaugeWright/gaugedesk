@@ -513,6 +513,11 @@ pub fn auth_routes(state: AuthShellState) -> axum::Router<SharedWorkbench> {
         // with an expired/absent session so logout is always idempotent cleanup.
         .route("/auth/logout", post(post_logout))
         .merge(crate::account_auth_ceremony::routes())
+        // A refusal on a browser navigation gets a page with a way back to
+        // GaugeDesk and a way out of the account, not a bare line of text.
+        .layer(axum::middleware::from_fn(
+            crate::auth_error_page::render_browser_errors,
+        ))
         .layer(Extension(state))
 }
 
@@ -1660,6 +1665,45 @@ fn admit_browser_refresh(
     Ok(grant)
 }
 
+/// Whether a refused browser refresh means the session itself is over — its
+/// absolute lifetime or idle timeout has elapsed — rather than that this session
+/// simply has no refresh grant to use.
+fn refresh_refusal_ends_session(reason: &str) -> bool {
+    matches!(
+        reason,
+        "absolute session lifetime exceeded" | "session idle timeout exceeded"
+    )
+}
+
+/// End a browser session whose bounds have elapsed: revoke it and its refresh
+/// grant, as sign-out does, and expire the cookies on the refusal.
+fn end_browser_session(
+    wb: &SharedWorkbench,
+    token: &str,
+    person: &str,
+    session_id: &str,
+    reason: &str,
+) -> axum::response::Response {
+    {
+        let mut g = wb.lock_unpoisoned();
+        g.revoke_account_session(token);
+        let scope = crate::account::account_scope(person);
+        let _ = g.revoke_account_refresh_in(&scope, session_id);
+    }
+    let mut response = (StatusCode::UNAUTHORIZED, reason.to_string()).into_response();
+    for value in [
+        expired_session_cookie_header(),
+        expired_session_hint_cookie_header(),
+    ] {
+        if let Ok(cookie) = axum::http::HeaderValue::from_str(&value) {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie);
+        }
+    }
+    response
+}
+
 /// Admit (or refuse) a **native** refresh for `person`'s opaque `session_id` at
 /// `now_ms` (ADR 0147 §2/§4, SOC 2 F-4.2). The bearer digest selects that exact
 /// durable grant; its stored device binding must still be admitted and the grant
@@ -1755,6 +1799,33 @@ impl OfflineGrant {
             Self::OfflineAccessScope => String::new(),
         }
     }
+}
+
+/// Add `select_account` to an authorize URL's `prompt`, keeping any prompt it
+/// already asks for: Google's is `consent` under `OIDC_PROMPT_CONSENT`, and the
+/// OIDC prompt is one space-separated list, not a repeatable parameter.
+pub fn with_account_chooser(url: &str) -> String {
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let mut prompted = false;
+    let mut params: Vec<String> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.strip_prefix("prompt=") {
+            Some(existing) => {
+                prompted = true;
+                if existing.split("%20").any(|v| v == "select_account") {
+                    p.to_string()
+                } else {
+                    format!("prompt={existing}%20select_account")
+                }
+            }
+            None => p.to_string(),
+        })
+        .collect();
+    if !prompted {
+        params.push("prompt=select_account".to_string());
+    }
+    format!("{base}?{}", params.join("&"))
 }
 
 /// A consumer identity provider the hosted account may offer as an entrance.
@@ -2389,6 +2460,9 @@ async fn begin_enterprise_browser_login(
                     native_return,
                     native_handoff_challenge,
                     purpose: PendingAuthPurpose::Login,
+                    // A company's own identity provider decides which account
+                    // its people use; nothing here second-guesses it.
+                    choose_account: false,
                 },
             )
             .await
@@ -2422,6 +2496,9 @@ struct OidcBrowserOptions {
     native_return: Option<String>,
     native_handoff_challenge: Option<String>,
     purpose: PendingAuthPurpose,
+    /// Ask the provider to show its account chooser rather than silently use
+    /// whichever account the browser is already signed in to.
+    choose_account: bool,
 }
 
 async fn begin_oidc_browser_login(
@@ -2458,6 +2535,9 @@ async fn prepare_oidc_browser_login(
     })
     .await;
     let (url, state, mut pending) = match started {
+        Ok(Ok((url, state, pending))) if options.choose_account => {
+            (with_account_chooser(&url), state, pending)
+        }
         Ok(Ok(value)) => value,
         Ok(Err(error)) => return Err(login_err(error)),
         Err(_) => {
@@ -2597,6 +2677,7 @@ pub async fn get_login(
             native_return,
             native_handoff_challenge: query.handoff_challenge,
             purpose: PendingAuthPurpose::Login,
+            choose_account: query.select_account.as_deref() == Some("1"),
         },
     )
     .await
@@ -3157,6 +3238,9 @@ pub async fn post_consumer_oidc_link_start(
             native_return: None,
             native_handoff_challenge: None,
             purpose,
+            // Linking is choosing an account; the one the browser happens to hold
+            // is not necessarily it.
+            choose_account: true,
         },
     )
     .await
@@ -3256,6 +3340,9 @@ pub async fn post_consumer_oidc_avatar_start(
             native_return: None,
             native_handoff_challenge: None,
             purpose,
+            // The photo must come from the subject already linked; offering a
+            // choice would only offer the wrong one.
+            choose_account: false,
         },
     )
     .await
@@ -3275,7 +3362,8 @@ fn ceremony_result_page(title: &str, message: &str) -> axum::response::Response 
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><main><h1>{title}</h1><p>{message}</p></main></body></html>"
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head><body><main><h1>{title}</h1><p>{message}</p><p><a href=\"{desk}\">Back to GaugeDesk</a></p></main></body></html>",
+            desk = crate::auth_error_page::desk_url().replace('&', "&amp;").replace('"', "&quot;")
         ),
     )
         .into_response()
@@ -3366,6 +3454,11 @@ pub struct LoginQuery {
     /// configured; it cannot introduce one.
     #[serde(default)]
     provider: Option<String>,
+    /// `1` asks the provider for its account chooser. The refusal page sends a
+    /// person here when the account the browser already held was not the one
+    /// they meant, which the provider would otherwise pick again silently.
+    #[serde(default)]
+    select_account: Option<String>,
 }
 
 /// Hand the one-time code back to the client that began the login (DR-0203).
@@ -4088,7 +4181,15 @@ pub async fn get_callback(
                 );
             }
             ConsumerCallbackDecision::Refuse(status, message) => {
-                return (status, message).into_response()
+                // The provider answered for an account this refusal is about,
+                // so the page can offer the provider's chooser for another.
+                let mut response = (status, message).into_response();
+                if let Ok(slug) = axum::http::HeaderValue::from_str(provider.slug) {
+                    response
+                        .headers_mut()
+                        .insert(crate::auth_error_page::CHOOSE_ACCOUNT_HEADER, slug);
+                }
+                return response;
             }
         }
     };
@@ -4277,6 +4378,15 @@ pub async fn get_refresh(
         let session_id = crate::account_session::session_id(token);
         let grant = match admit_browser_refresh(&g, &person, &session_id, now_ms) {
             Ok(grant) => grant,
+            Err(reason) if refresh_refusal_ends_session(reason) => {
+                // The session is over, so end it here, as this handler's contract
+                // says. Refusing the refresh alone left the cookie resolving: the
+                // person still counted as signed in, got no Home credential, and
+                // "Sign in" bounced them straight back (`login_ceremony_skippable`)
+                // — a loop whose only exit was finding Sign out.
+                drop(g);
+                return end_browser_session(&wb, token, &person, &session_id, reason);
+            }
             Err(reason) => return (StatusCode::UNAUTHORIZED, reason).into_response(),
         };
         // Which provider minted this session, so the grant is refreshed at that
@@ -4670,7 +4780,14 @@ pub async fn post_logout(
             let _ = g.revoke_account_refresh_in(&scope, &session_id);
         }
     }
-    let mut resp = StatusCode::NO_CONTENT.into_response();
+    // A person pressing Sign out on a page (the sign-in refusal page) submits a
+    // form; a 204 would leave them on that page, so send the browser on to
+    // GaugeDesk. Script callers keep the 204.
+    let mut resp = if crate::auth_error_page::wants_html(&headers) {
+        Redirect::to(&crate::auth_error_page::desk_url()).into_response()
+    } else {
+        StatusCode::NO_CONTENT.into_response()
+    };
     for value in [
         expired_session_cookie_header(),
         expired_session_hint_cookie_header(),
@@ -5951,6 +6068,64 @@ iqlTEKVISscuchxZtKQJ4k8=
     }
 
     #[test]
+    fn the_account_chooser_joins_an_existing_prompt_rather_than_repeating_it() {
+        assert_eq!(
+            with_account_chooser(
+                "https://op/authorize?client_id=c&access_type=offline&prompt=consent"
+            ),
+            "https://op/authorize?client_id=c&access_type=offline&prompt=consent%20select_account"
+        );
+        assert_eq!(
+            with_account_chooser("https://op/authorize?client_id=c&scope=openid"),
+            "https://op/authorize?client_id=c&scope=openid&prompt=select_account"
+        );
+        let once = with_account_chooser("https://op/authorize?prompt=select_account");
+        assert_eq!(once, "https://op/authorize?prompt=select_account");
+    }
+
+    #[test]
+    fn an_elapsed_browser_session_is_ended_not_just_refused() {
+        use crate::account::{RefreshBinding, SESSION_ABSOLUTE_LIFETIME_MS};
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let person = "google-sub-idle";
+        let token = wb
+            .lock_unpoisoned()
+            .mint_account_session(person, "oidc", SESSION_ABSOLUTE_LIFETIME_MS / 1000)
+            .unwrap();
+        let session_id = crate::account_session::session_id(&token);
+        {
+            let mut g = wb.lock_unpoisoned();
+            store_refresh_token(&mut g, person, "rt", RefreshBinding::Web, &session_id, "");
+        }
+        let response = end_browser_session(
+            &wb,
+            &token,
+            person,
+            &session_id,
+            "session idle timeout exceeded",
+        );
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cookies.len(), 2, "{cookies:?}");
+        assert!(
+            cookies.iter().all(|c| c.contains("Max-Age=0")),
+            "{cookies:?}"
+        );
+        let g = wb.lock_unpoisoned();
+        // The cookie no longer names anyone, so "Sign in" runs the ceremony
+        // instead of bouncing an expired person straight back.
+        assert!(g.account_sessions().resolve_now(&token).is_none());
+        assert_ne!(g.actor(Some(&token)), person);
+        assert!(resolve_refresh_grant(&g, person, &session_id).is_none());
+    }
+
+    #[test]
     fn google_keeps_access_type_offline_and_its_consent_prompt() {
         let grant = CONSUMER_GOOGLE.offline_grant;
         assert_eq!(grant, OfflineGrant::AccessTypeOffline);
@@ -6540,6 +6715,17 @@ iqlTEKVISscuchxZtKQJ4k8=
                 admit_browser_refresh(&g, person, WEB_REFRESH_BINDING, idle),
                 Err("session idle timeout exceeded"),
             );
+            // Both bounds end the session; a session with no grant is not ended
+            // by asking.
+            for refusal in [
+                admit_browser_refresh(&g, person, WEB_REFRESH_BINDING, over_absolute),
+                admit_browser_refresh(&g, person, WEB_REFRESH_BINDING, idle),
+            ] {
+                assert!(refresh_refusal_ends_session(refusal.unwrap_err()));
+            }
+            assert!(!refresh_refusal_ends_session(
+                "no refresh token on file; sign in again"
+            ));
         }
 
         // F-1.4: a refresh preserves issued-at (the absolute clock keeps running

@@ -2,8 +2,9 @@
 //!
 //! This is the implementation pair for `specs/models/environment-agent.qnt`.
 //! Provider output is untrusted input: a model may request only one exact tool
-//! declared by the freshly rebuilt GaugeApp session. Mutating requests can
-//! produce a proposal envelope, never a reviewed or applied domain effect.
+//! declared by the freshly rebuilt GaugeApp session. Reviewed mutations
+//! produce proposals; an enabled direct command callback may execute an
+//! immediate command through the same owning route as the person-facing page.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -38,14 +39,15 @@ pub const MANAGEMENT_AGENT_TOOLS: [&str; 4] = [
     HUMAN_ASK_TOOL,
 ];
 
-// Immediate commands are not automatically safe management-agent proposals.
+// Immediate commands are not automatically safe management-agent actions.
 // Most immediate operations are browser/device ceremonies, secret intake,
 // addressed-recipient acts, processor handoffs, or read/navigation controls.
 // Those must stay page-owned. Human-reviewed commands already have a review
 // presentation; this closed list admits only ordinary secret-free mutations
-// whose immediate human path also has a concrete proposal presentation.
+// whose immediate human path also has a concrete command presentation.
 pub const AGENT_PROPOSABLE_IMMEDIATE_COMMANDS: &[&str] = &[
     "account.profile.set",
+    "account.avatar.remove",
     "account.invitation.accept",
     "account.invitation.decline",
     "account.membership.leave",
@@ -67,11 +69,102 @@ pub const AGENT_PROPOSABLE_IMMEDIATE_COMMANDS: &[&str] = &[
     "commercial-engagement.entitlement.activate",
     "commercial-engagement.invoice.issue",
     "commercial-payments.invoice.issue",
+    "enterprise-identity.connection.validate",
 ];
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GaugeAppAgentActionKind {
+    Direct,
+    Proposal,
+    Read,
+    HumanCeremony,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GaugeAppAgentActionGrant {
+    pub id: String,
+    pub kind: GaugeAppAgentActionKind,
+}
+
+const AGENT_READ_COMMANDS: &[&str] = &[
+    "commercial-product.read",
+    "commercial-client.read",
+    "commercial-engagements.read-by-client",
+    "commercial-payments.read-by-client",
+    "commercial-engagement.proposal-delivery.read",
+    "commercial-engagement.agreement.read",
+    "commercial-engagement.payments.read",
+    "commercial-payments.payment.read",
+];
+
+const AGENT_HUMAN_CEREMONIES: &[&str] = &[
+    "account.avatar.set",
+    "account.authenticator.begin-add",
+    "account.authenticator.complete-add",
+    "account.recovery-codes.reissue",
+    "provider-connection.api-key.add",
+    "provider-connection.subscription.begin",
+    "provider-connection.subscription.complete",
+    "provider-connection.compatible.add",
+    "provider-connection.verify",
+    "managed-inference.plan.change",
+    "trusted-device.link.begin",
+    "trusted-device.link.accept",
+    "trusted-device.link.reject",
+    "trusted-device.link.cancel",
+    "enterprise-identity.connection.credential.set",
+    "enterprise-identity.connection.credential.remove",
+    "enterprise-identity.test.begin",
+    "commercial-engagement.agreement.accept",
+    "commercial-payments.connect.begin",
+    "commercial-payments.connect.continue",
+    "commercial-payments.connect-component.open",
+    "commercial-payments.checkout.create",
+    "commercial-payments.processor-documents.open",
+    "commercial-payments.processor-support.open",
+];
+
+pub fn gaugeapp_agent_action_kind(
+    command: &GaugeAppCommandGrant,
+) -> Option<GaugeAppAgentActionKind> {
+    if command.review == ReviewPolicy::Human {
+        return Some(GaugeAppAgentActionKind::Proposal);
+    }
+    let id = command.id.as_str();
+    if AGENT_PROPOSABLE_IMMEDIATE_COMMANDS.contains(&id) {
+        return Some(GaugeAppAgentActionKind::Direct);
+    }
+    if AGENT_READ_COMMANDS.contains(&id) {
+        return Some(GaugeAppAgentActionKind::Read);
+    }
+    if AGENT_HUMAN_CEREMONIES.contains(&id) {
+        return Some(GaugeAppAgentActionKind::HumanCeremony);
+    }
+    None
+}
+
+pub fn gaugeapp_agent_page_actions(
+    session: &GaugeAppSession,
+    page: &GaugeAppPageGrant,
+) -> Vec<GaugeAppAgentActionGrant> {
+    page.commands
+        .iter()
+        .filter_map(|id| {
+            let command = session.commands.iter().find(|command| command.id == *id)?;
+            let kind = gaugeapp_agent_action_kind(command)?;
+            Some(GaugeAppAgentActionGrant {
+                id: id.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
 
 pub fn gaugeapp_agent_can_propose(command: &GaugeAppCommandGrant) -> bool {
     command.review == ReviewPolicy::Human
         || AGENT_PROPOSABLE_IMMEDIATE_COMMANDS.contains(&command.id.as_str())
+        || AGENT_READ_COMMANDS.contains(&command.id.as_str())
 }
 
 pub fn gaugeapp_agent_page_commands(
@@ -120,6 +213,8 @@ pub struct GaugeAppAgentPage {
     pub resource_basis: String,
     pub model: Value,
     pub commands: Vec<String>,
+    #[serde(default)]
+    pub actions: Vec<GaugeAppAgentActionGrant>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1556,7 +1651,7 @@ fn provider_tools() -> Value {
         // schemas forbid an open nested object, so only this proposal tool is
         // non-strict; the outer arguments remain closed and every read tool
         // remains strict.
-        { "type": "function", "name": "gaugeapp_proposals_prepare", "description": "Prepare, but never apply or review, one declared GaugeApp command proposal.", "parameters": { "type": "object", "properties": { "page_id": { "type": "string" }, "command_id": { "type": "string" }, "payload": { "type": "object", "additionalProperties": true } }, "required": ["page_id", "command_id", "payload"], "additionalProperties": false }, "strict": false }
+        { "type": "function", "name": "gaugeapp_proposals_prepare", "description": "Submit one declared GaugeApp command. The tool result says whether it was applied immediately or prepared for human review. Never infer success before reading that result.", "parameters": { "type": "object", "properties": { "page_id": { "type": "string" }, "command_id": { "type": "string" }, "payload": { "type": "object", "additionalProperties": true } }, "required": ["page_id", "command_id", "payload"], "additionalProperties": false }, "strict": false }
     ])
 }
 
@@ -2011,13 +2106,24 @@ fn assistant_text(output: &[Value]) -> String {
         .join("\n")
 }
 
+pub type DirectAction<'a> =
+    &'a mut dyn FnMut(&GaugeAppAgentProposal, &str) -> Result<Value, GaugeAppAgentError>;
+
+// Keep the live grant, opening grant, and direct-action state explicit at the
+// untrusted provider boundary so none is silently reused as another.
+#[allow(clippy::too_many_arguments)]
 fn tool_result(
+    gaugeapp_session: &GaugeAppSession,
     live_agent_session: &GaugeAppAgentSession,
     requested_agent_session: &GaugeAppAgentSession,
     pages: &[GaugeAppAgentPage],
     name: &str,
     arguments: Value,
     proposals: &mut Vec<GaugeAppAgentProposal>,
+    validate_proposal: &mut dyn FnMut(&GaugeAppAgentProposal) -> Result<(), GaugeAppAgentError>,
+    direct_action: &mut Option<DirectAction<'_>>,
+    direct_key: &str,
+    direct_used: &mut bool,
 ) -> Result<Value, GaugeAppAgentError> {
     let tool = canonical_tool(name).unwrap_or(name);
     let request = GaugeAppAgentToolRequest {
@@ -2039,6 +2145,7 @@ fn tool_result(
                 "version": page.version,
                 "resource_basis": page.resource_basis,
                 "commands": page.commands,
+                "actions": page.actions,
             })).collect::<Vec<_>>()
         })),
         GaugeAppAgentAction::ReadPage => {
@@ -2084,6 +2191,36 @@ fn tool_result(
                 expected_basis: page.resource_basis.clone(),
                 payload,
             };
+            match validate_proposal(&proposal) {
+                Ok(()) => {}
+                Err(GaugeAppAgentError::InvalidOutput(reason)) => {
+                    return Ok(json!({ "prepared": false, "error": reason }));
+                }
+                Err(error) => return Err(error),
+            }
+            let immediate = gaugeapp_session
+                .commands
+                .iter()
+                .find(|command| command.id == command_id)
+                .is_some_and(|command| command.review == ReviewPolicy::Immediate);
+            if immediate {
+                if let Some(apply) = direct_action.as_mut() {
+                    if *direct_used {
+                        return Ok(
+                            json!({ "applied": false, "error": "Only one immediate action can be applied in one message. Send another message for the next action." }),
+                        );
+                    }
+                    let result = match apply(&proposal, direct_key) {
+                        Ok(result) => result,
+                        Err(GaugeAppAgentError::InvalidOutput(reason)) => {
+                            return Ok(json!({ "applied": false, "error": reason }));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    *direct_used = true;
+                    return Ok(json!({ "applied": true, "result": result }));
+                }
+            }
             proposals.push(proposal.clone());
             Ok(
                 json!({ "prepared": true, "proposal": proposal, "notice": "The proposal is not applied. The GaugeApp command route must reauthorize it and open required review." }),
@@ -2191,14 +2328,72 @@ pub fn run_gaugeapp_agent_turn_with_refresh_stop_and_events<F, S, E>(
     workbench: &SharedWorkbench,
     context: GaugeAppAgentContext,
     message: &str,
-    mut refresh: F,
-    mut is_stopped: S,
-    mut emit: E,
+    refresh: F,
+    is_stopped: S,
+    emit: E,
 ) -> Result<GaugeAppAgentTurn, GaugeAppAgentError>
 where
     F: FnMut() -> Result<GaugeAppAgentContext, GaugeAppAgentError>,
     S: FnMut() -> bool,
     E: FnMut(GaugeAppAgentLiveEvent) -> Result<(), GaugeAppAgentError>,
+{
+    run_gaugeapp_agent_turn_with_refresh_stop_events_and_validation(
+        workbench,
+        context,
+        message,
+        refresh,
+        is_stopped,
+        emit,
+        |_, _| Ok(()),
+    )
+}
+
+pub fn run_gaugeapp_agent_turn_with_refresh_stop_events_and_validation<F, S, E, V>(
+    workbench: &SharedWorkbench,
+    context: GaugeAppAgentContext,
+    message: &str,
+    refresh: F,
+    is_stopped: S,
+    emit: E,
+    validate_proposal: V,
+) -> Result<GaugeAppAgentTurn, GaugeAppAgentError>
+where
+    F: FnMut() -> Result<GaugeAppAgentContext, GaugeAppAgentError>,
+    S: FnMut() -> bool,
+    E: FnMut(GaugeAppAgentLiveEvent) -> Result<(), GaugeAppAgentError>,
+    V: FnMut(&GaugeAppAgentContext, &GaugeAppAgentProposal) -> Result<(), GaugeAppAgentError>,
+{
+    run_gaugeapp_agent_turn_with_direct_actions(
+        workbench,
+        context,
+        message,
+        refresh,
+        is_stopped,
+        emit,
+        validate_proposal,
+        None,
+        "",
+    )
+}
+
+// The callback tuple is the caller's exact authority and execution boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn run_gaugeapp_agent_turn_with_direct_actions<F, S, E, V>(
+    workbench: &SharedWorkbench,
+    context: GaugeAppAgentContext,
+    message: &str,
+    mut refresh: F,
+    mut is_stopped: S,
+    mut emit: E,
+    mut validate_proposal: V,
+    mut direct_action: Option<DirectAction<'_>>,
+    direct_key: &str,
+) -> Result<GaugeAppAgentTurn, GaugeAppAgentError>
+where
+    F: FnMut() -> Result<GaugeAppAgentContext, GaugeAppAgentError>,
+    S: FnMut() -> bool,
+    E: FnMut(GaugeAppAgentLiveEvent) -> Result<(), GaugeAppAgentError>,
+    V: FnMut(&GaugeAppAgentContext, &GaugeAppAgentProposal) -> Result<(), GaugeAppAgentError>,
 {
     let message = message.trim();
     if message.is_empty() {
@@ -2229,7 +2424,7 @@ where
     let credential = resolve_agent_credential(workbench, &context.session.actor)?;
     let agent_session = GaugeAppAgentSession::from_gaugeapp(&context.session);
     let system = format!(
-        "You are the {} agent for one exact GaugeApp scope. Explain the admitted page models and help the person operate them. Use only the declared tools. Never claim that a proposal is applied or reviewed. Never request, display, infer, or place secrets in tool arguments. Ask the person when required data is missing. Your exact scope is {}:{} and your actor is {}.",
+        "You are the {} agent for one exact GaugeApp scope. Explain the admitted page models and help the person operate them. Use only the declared tools. A command with immediate review policy may apply directly when the tool returns an applied receipt; a human-reviewed command remains a proposal until the person reviews it. Never claim success without the tool's applied receipt. Never request, display, infer, or place secrets in tool arguments. Ask the person when required data is missing. Your exact scope is {}:{} and your actor is {}.",
         context.session.app.as_str(), context.session.scope.kind, context.session.scope.id, context.session.actor,
     );
     let mut input = vec![json!({
@@ -2237,6 +2432,7 @@ where
         "content": [{ "type": "input_text", "text": message }]
     })];
     let mut proposals = Vec::new();
+    let mut direct_used = false;
     for _ in 0..MAX_TOOL_ROUNDS {
         let body = json!({
             "model": gaugedesk_env::var("MANAGEMENT_AGENT_MODEL").unwrap_or_else(|| "gpt-5.6-terra".into()),
@@ -2309,12 +2505,17 @@ where
             }
             let live_agent_session = GaugeAppAgentSession::from_gaugeapp(&current.session);
             let result = tool_result(
+                &current.session,
                 &live_agent_session,
                 &agent_session,
                 &current.pages,
                 name,
                 arguments,
                 &mut proposals,
+                &mut |proposal| validate_proposal(&current, proposal),
+                &mut direct_action,
+                direct_key,
+                &mut direct_used,
             )?;
             emit(GaugeAppAgentLiveEvent::ToolResult {
                 call_id: call_id.to_owned(),
@@ -2460,12 +2661,15 @@ mod tests {
             "commercial-payments.invoice.issue",
             ReviewPolicy::Immediate,
         )));
+        assert!(gaugeapp_agent_can_propose(&grant(
+            "commercial-product.read",
+            ReviewPolicy::Immediate,
+        )));
         for id in [
             "account.authenticator.begin-add",
             "provider-connection.api-key.add",
             "trusted-device.link.begin",
             "enterprise-identity.connection.credential.remove",
-            "commercial-product.read",
             "commercial-engagement.agreement.accept",
             "commercial-payments.connect-component.open",
             "future.immediate-command",
@@ -2475,6 +2679,44 @@ mod tests {
                 "{id} must remain page-owned",
             );
         }
+    }
+
+    #[test]
+    fn action_kinds_keep_direct_commands_and_human_ceremonies_distinct() {
+        let grant = |id: &str, review| GaugeAppCommandGrant {
+            id: id.into(),
+            capability: "example".into(),
+            review,
+        };
+        assert_eq!(
+            gaugeapp_agent_action_kind(&grant(
+                "application-settings.appearance.set",
+                ReviewPolicy::Immediate,
+            )),
+            Some(GaugeAppAgentActionKind::Direct)
+        );
+        assert_eq!(
+            gaugeapp_agent_action_kind(&grant(
+                "organization.display-name.set",
+                ReviewPolicy::Human,
+            )),
+            Some(GaugeAppAgentActionKind::Proposal)
+        );
+        assert_eq!(
+            gaugeapp_agent_action_kind(&grant("commercial-product.read", ReviewPolicy::Immediate,)),
+            Some(GaugeAppAgentActionKind::Read)
+        );
+        assert_eq!(
+            gaugeapp_agent_action_kind(&grant(
+                "account.authenticator.complete-add",
+                ReviewPolicy::Immediate,
+            )),
+            Some(GaugeAppAgentActionKind::HumanCeremony)
+        );
+        assert_eq!(
+            gaugeapp_agent_action_kind(&grant("future.operation", ReviewPolicy::Immediate)),
+            None
+        );
     }
 
     #[test]
@@ -2509,6 +2751,23 @@ mod tests {
                 "commercial-payments.invoice.issue",
             ],
         );
+        assert_eq!(
+            gaugeapp_agent_page_actions(&session, &session.pages[0]),
+            vec![
+                GaugeAppAgentActionGrant {
+                    id: "organization.display-name.set".into(),
+                    kind: GaugeAppAgentActionKind::Proposal,
+                },
+                GaugeAppAgentActionGrant {
+                    id: "commercial-payments.invoice.issue".into(),
+                    kind: GaugeAppAgentActionKind::Direct,
+                },
+                GaugeAppAgentActionGrant {
+                    id: "account.authenticator.begin-add".into(),
+                    kind: GaugeAppAgentActionKind::HumanCeremony,
+                },
+            ],
+        );
     }
 
     #[test]
@@ -2522,6 +2781,7 @@ mod tests {
                 resource_basis: "revision-1".into(),
                 model: json!({ "display_name": "Example" }),
                 commands: vec!["update-organization".into()],
+                actions: vec![],
             }],
         };
 
@@ -2544,6 +2804,7 @@ mod tests {
                 resource_basis: "revision-7".into(),
                 model: json!({}),
                 commands: vec!["member.invite".into()],
+                actions: vec![],
             }],
         };
 
@@ -2613,12 +2874,17 @@ mod tests {
 
         assert!(matches!(
             tool_result(
+                &changed,
                 &live,
                 &opening,
                 &[],
                 "gaugeapp_pages_list",
                 json!({}),
                 &mut proposals,
+                &mut |_| Ok(()),
+                &mut None,
+                "",
+                &mut false,
             ),
             Err(GaugeAppAgentError::Rejected(
                 GaugeAppAgentRejection::SessionMismatch
@@ -2646,6 +2912,110 @@ mod tests {
                 assert!(strict, "read tool {name} must remain strict");
             }
         }
+    }
+
+    #[test]
+    fn proposal_validation_refusal_returns_tool_feedback_without_admitting_it() {
+        let session = gaugeapp();
+        let agent_session = GaugeAppAgentSession::from_gaugeapp(&session);
+        let page = GaugeAppAgentPage {
+            id: session.pages[0].id.clone(),
+            read_model: session.pages[0].read_model.clone(),
+            version: session.pages[0].version,
+            resource_basis: session.pages[0].resource_basis.clone(),
+            model: json!({}),
+            commands: vec!["organization.display-name.set".into()],
+            actions: vec![],
+        };
+        let mut proposals = Vec::new();
+        let rejected = tool_result(
+            &session,
+            &agent_session,
+            &agent_session,
+            std::slice::from_ref(&page),
+            "gaugeapp_proposals_prepare",
+            json!({
+                "page_id": page.id,
+                "command_id": "organization.display-name.set",
+                "payload": { "display_name": "" }
+            }),
+            &mut proposals,
+            &mut |_| Err(GaugeAppAgentError::InvalidOutput("name is empty".into())),
+            &mut None,
+            "",
+            &mut false,
+        )
+        .unwrap();
+        assert_eq!(
+            rejected,
+            json!({ "prepared": false, "error": "name is empty" })
+        );
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn immediate_command_returns_a_receipt_and_never_becomes_a_proposal() {
+        let mut session = gaugeapp();
+        session.commands[0].review = ReviewPolicy::Immediate;
+        let agent_session = GaugeAppAgentSession::from_gaugeapp(&session);
+        let page = GaugeAppAgentPage {
+            id: session.pages[0].id.clone(),
+            read_model: session.pages[0].read_model.clone(),
+            version: session.pages[0].version,
+            resource_basis: session.pages[0].resource_basis.clone(),
+            model: json!({}),
+            commands: vec!["organization.display-name.set".into()],
+            actions: vec![],
+        };
+        let mut proposals = Vec::new();
+        let mut used = false;
+        let mut applied = 0;
+        let mut apply = |proposal: &GaugeAppAgentProposal, key: &str| {
+            applied += 1;
+            assert_eq!(proposal.command_id, "organization.display-name.set");
+            assert_eq!(key, "message-key");
+            Ok(json!({ "receipt": "saved" }))
+        };
+        let args = json!({
+            "page_id": page.id,
+            "command_id": "organization.display-name.set",
+            "payload": { "display_name": "Example" }
+        });
+        let first = tool_result(
+            &session,
+            &agent_session,
+            &agent_session,
+            std::slice::from_ref(&page),
+            "gaugeapp_proposals_prepare",
+            args.clone(),
+            &mut proposals,
+            &mut |_| Ok(()),
+            &mut Some(&mut apply),
+            "message-key",
+            &mut used,
+        )
+        .unwrap();
+        assert_eq!(
+            first,
+            json!({ "applied": true, "result": { "receipt": "saved" } })
+        );
+        let second = tool_result(
+            &session,
+            &agent_session,
+            &agent_session,
+            std::slice::from_ref(&page),
+            "gaugeapp_proposals_prepare",
+            args,
+            &mut proposals,
+            &mut |_| Ok(()),
+            &mut Some(&mut apply),
+            "message-key",
+            &mut used,
+        )
+        .unwrap();
+        assert_eq!(second["applied"], false);
+        assert_eq!(applied, 1);
+        assert!(proposals.is_empty());
     }
 
     #[test]

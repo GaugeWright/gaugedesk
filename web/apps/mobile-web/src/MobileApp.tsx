@@ -238,9 +238,14 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
             setMachineEndpoint(loaded.pendingInvitation.endpoint);
             setAccessMode("direct");
         }
+        // Only while signed out. A signed-in person reaches the access page by
+        // asking to pair a Project Host; jumping them straight into the saved
+        // one's direct session — which has no account controls — would put the
+        // page they asked for, and the way back to their projects, out of reach.
         if (
             loaded.native
             && accessMode() === null
+            && accountToken() === null
             && loaded.credentials.length > 0
         ) {
             setMachineEndpoint(loaded.endpoint);
@@ -250,7 +255,7 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
         // its machine-protocol tests. The actual GaugeDesk composition has an
         // account authority, so its first page must preserve Sign in as the
         // primary act instead of silently selecting the secondary direct path.
-        if (!loaded.native && !props.gaugeApps && accessMode() === null) {
+        if (!loaded.native && !props.gaugeApps && accessMode() === null && accountToken() === null) {
             setAccessMode("direct");
             setMachineEndpoint(loaded.endpoint);
         }
@@ -487,6 +492,22 @@ export function MobileApp(props: { readonly gaugeApps?: MobileGaugeApps } = {}):
                             <button type="submit" class="pairing-submit" data-machine-connect>
                                 connect
                             </button>
+                            {/* Signed in, this page is a detour from the account's
+                                projects, not a way in; it must lead back, or the
+                                only exit is quitting the app. Sign-out lives there. */}
+                            <Show when={signedIn()}>
+                                <button
+                                    type="button"
+                                    class="mobile-account-back"
+                                    data-mobile-back-to-account
+                                    onClick={() => {
+                                        setEnrollmentError(null);
+                                        setAccessMode("account");
+                                    }}
+                                >
+                                    back to projects
+                                </button>
+                            </Show>
                         </form>
                     }
                 >
@@ -690,7 +711,7 @@ function MobileAccountShell(props: {
         readonly engagement: EngagementId | null;
         readonly target: MobileTargetReference | null;
     } | null>(null);
-    const [projects] = createResource(
+    const [projects, projectActions] = createResource(
         () => {
             const directory = pool();
             const current = routes();
@@ -902,7 +923,11 @@ function MobileAccountShell(props: {
 
     return (
         <Show when={!props.gaugeApps?.active()} fallback={<MobileGaugeAppSurface gaugeApps={props.gaugeApps!} />}><Show
-            when={selected() && activeConnection()}
+            // Reading a resource that failed throws, and nothing above this
+            // catches it: a project whose Project Host was down, with nothing
+            // cached, took the whole screen with it. A failed connection keeps
+            // the person on the project list and says why (below).
+            when={selected() && !activeConnection.error && activeConnection()}
             keyed
             fallback={
                 <div class="mobile-project-browser" data-pane="nav">
@@ -913,6 +938,15 @@ function MobileAccountShell(props: {
                         </button>
                     </header>
                     <main class="mobile-project-browser-body">
+                        <Show when={selected() && activeConnection.error}>
+                            <div class="status mobile-enrollment-error" role="alert" data-mobile-open-failed>
+                                Could not open this project — its Project Host did not answer.
+                                {" "}
+                                <button type="button" class="mobile-account-recent" onClick={() => setSelected(null)}>
+                                    dismiss
+                                </button>
+                            </div>
+                        </Show>
                         <Show when={props.gaugeApps}>
                             {(gaugeApps) => <section class="mobile-management-menu" aria-label="Account and organization management">
                                 {gaugeApps().organizationSelector()}
@@ -930,6 +964,17 @@ function MobileAccountShell(props: {
                                 fallback={
                                     <div class="status mobile-enrollment-error" role="alert">
                                         {String(routes.error ?? projects.error)}
+                                        {" "}
+                                        <button
+                                            type="button"
+                                            class="mobile-account-recent"
+                                            onClick={() => {
+                                                if (routes.error) void routeActions.refetch();
+                                                else void projectActions.refetch();
+                                            }}
+                                        >
+                                            try again
+                                        </button>
                                     </div>
                                 }
                             >

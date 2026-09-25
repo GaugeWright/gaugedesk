@@ -147,9 +147,9 @@ pub struct GaugeAppAdmission {
 
 /// Decide one command against a freshly rebuilt authenticated session.
 ///
-/// Every client uses this one policy path. Agent-originated mutation is the
-/// deliberate strict subset: even a command that is immediate for a person is
-/// proposal-only for an agent, which can never review its own proposal.
+/// Every client uses this one policy path. The command's review policy governs
+/// disposition for the person and their bounded agent alike; agent tool
+/// admission separately limits which commands the model can reach.
 pub fn decide_gaugeapp_command(
     session: &GaugeAppSession,
     envelope: &GaugeAppCommandEnvelope,
@@ -189,13 +189,9 @@ pub fn decide_gaugeapp_command(
         return Err(GaugeAppRejection::StaleBasis);
     }
     Ok(GaugeAppAdmission {
-        disposition: if envelope.client == GaugeAppClient::Agent {
-            AdmissionDisposition::Propose
-        } else {
-            match command.review {
-                ReviewPolicy::Immediate => AdmissionDisposition::Apply,
-                ReviewPolicy::Human => AdmissionDisposition::Propose,
-            }
+        disposition: match command.review {
+            ReviewPolicy::Immediate => AdmissionDisposition::Apply,
+            ReviewPolicy::Human => AdmissionDisposition::Propose,
         },
         command: command.clone(),
     })
@@ -411,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_cannot_apply_an_otherwise_immediate_command() {
+    fn agent_and_person_apply_the_same_immediate_command() {
         let mut session = session();
         session.commands[0].review = ReviewPolicy::Immediate;
         assert_eq!(
@@ -424,7 +420,7 @@ mod tests {
             decide_gaugeapp_command(&session, &envelope(GaugeAppClient::Agent))
                 .unwrap()
                 .disposition,
-            AdmissionDisposition::Propose,
+            AdmissionDisposition::Apply,
         );
     }
 

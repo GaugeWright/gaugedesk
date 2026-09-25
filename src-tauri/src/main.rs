@@ -179,6 +179,23 @@ fn main() {
             }
             // Browser-style zoom: Ctrl +/-/0 and Ctrl+wheel, remembered across restarts.
             window = window.initialization_script(ZOOM_HOTKEYS);
+            // A link that LAUNCHED the app is not an event anyone is listening for
+            // yet. On Linux/Windows it is only in this process's argv (single-instance
+            // forwards argv from a second process, never the first); on macOS the
+            // open-url event can fire before the page registers its listener. Both
+            // lost a sign-in or invite that arrived while GaugeDesk was closed. The
+            // page reads this queue once it is listening.
+            let launch_link =
+                deep_link_from_argv(&std::env::args().collect::<Vec<_>>()).or_else(|| {
+                    app.deep_link()
+                        .get_current()
+                        .ok()
+                        .flatten()
+                        .and_then(|urls| urls.first().map(|u| u.to_string()))
+                });
+            if let Some(script) = launch_link.as_deref().and_then(deep_link_launch_script) {
+                window = window.initialization_script(script);
+            }
             // The title bar is drawn over the page on macOS; tell the page so its task bar
             // can make room for the traffic lights and carry the window drag.
             if cfg!(target_os = "macos") {
@@ -415,19 +432,32 @@ fn deep_link_from_argv(argv: &[String]) -> Option<String> {
 /// The webview init script that dispatches a `gw-deep-link` CustomEvent carrying `url` (FED-7).
 /// JSON-escaped (via `serde_json`) so a crafted URL cannot break out of the string literal.
 /// Pure in its input → the produced script is unit-testable without a window.
+///
+/// The URL is also queued on `window.__gwDeepLinks` before the event fires, so a page that is
+/// not yet listening finds it when it starts; the page consumes each URL once.
 fn deep_link_dispatch_script(url: &str) -> Option<String> {
     let lit = serde_json::to_string(url).ok()?;
     Some(format!(
-        "try {{ window.dispatchEvent(new CustomEvent('gw-deep-link', {{ detail: {lit} }})); }} catch (e) {{}}"
+        "try {{ (window.__gwDeepLinks = window.__gwDeepLinks || []).push({lit}); window.dispatchEvent(new CustomEvent('gw-deep-link', {{ detail: {lit} }})); }} catch (e) {{}}"
+    ))
+}
+
+/// The initialization script that queues the link the app was launched with. It runs before
+/// every page load of the window, so it queues only on the first: a reload — sign-out reloads —
+/// must not redeem a one-time sign-in code, or accept an invite, a second time.
+fn deep_link_launch_script(url: &str) -> Option<String> {
+    let lit = serde_json::to_string(url).ok()?;
+    Some(format!(
+        "try {{ if (!sessionStorage.getItem('gw.deep-link.launch')) {{ sessionStorage.setItem('gw.deep-link.launch', '1'); (window.__gwDeepLinks = window.__gwDeepLinks || []).push({lit}); }} }} catch (e) {{}}"
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv, external_open_allowed,
-        local_cp_bind, webkit_dmabuf_override, webview_org_cp_script, OVERLAY_TITLE_BAR,
-        ZOOM_HOTKEYS,
+        cp_launch_decision, deep_link_dispatch_script, deep_link_from_argv,
+        deep_link_launch_script, external_open_allowed, local_cp_bind, webkit_dmabuf_override,
+        webview_org_cp_script, OVERLAY_TITLE_BAR, ZOOM_HOTKEYS,
     };
 
     #[test]
@@ -583,7 +613,9 @@ mod tests {
         assert!(ZOOM_HOTKEYS.contains("setProperty('--shell-zoom'"));
         // `<html>` does not exist yet when an initialization script runs.
         assert!(OVERLAY_TITLE_BAR.contains("if (document.documentElement)"));
-        assert!(OVERLAY_TITLE_BAR.starts_with("try {") && OVERLAY_TITLE_BAR.ends_with("} catch (e) {}"));
+        assert!(
+            OVERLAY_TITLE_BAR.starts_with("try {") && OVERLAY_TITLE_BAR.ends_with("} catch (e) {}")
+        );
     }
 
     #[test]
@@ -606,6 +638,23 @@ mod tests {
         let script = deep_link_dispatch_script("gaugewright://invite?d=ab").unwrap();
         assert!(script.contains("gw-deep-link"));
         assert!(script.contains("\"gaugewright://invite?d=ab\""));
+    }
+
+    #[test]
+    fn a_launch_link_is_queued_once_and_escaped() {
+        let script =
+            deep_link_launch_script("gaugewright://auth/callback#code=x\");evil()//").unwrap();
+        assert!(script.contains("sessionStorage.getItem('gw.deep-link.launch')"));
+        assert!(script.contains("__gwDeepLinks"));
+        assert!(script.contains("x\\\");evil()//"));
+    }
+
+    #[test]
+    fn a_dispatched_link_is_queued_before_the_event() {
+        let script = deep_link_dispatch_script("gaugewright://invite?d=ab").unwrap();
+        let queued = script.find("__gwDeepLinks").unwrap();
+        let fired = script.find("dispatchEvent").unwrap();
+        assert!(queued < fired);
     }
 
     #[test]

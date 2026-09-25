@@ -126,6 +126,9 @@ pub struct Workbench {
     /// The Home session this process last handed its desktop UI (DR-0188).
     /// Process memory only: a restart mints another.
     pub(crate) desktop_ui_session: Option<crate::desktop_session::DesktopUiSession>,
+    /// The Home session relay crossings for the owner are served under
+    /// (DR-0206). Its own slot, so neither rotates the other out from under it.
+    pub(crate) relay_owner_session: Option<crate::desktop_session::DesktopUiSession>,
     /// Opaque Hub sessions authenticate a durable GaugeDesk account before any
     /// organization-specific membership decision.
     pub(crate) account_sessions: Arc<crate::account_session::AccountSessionStore>,
@@ -402,6 +405,7 @@ impl Workbench {
             home_admissions: crate::home_admission::HomeAdmissionStore::new(),
             idp: None,
             desktop_ui_session: None,
+            relay_owner_session: None,
             account_sessions: Arc::new(crate::account_session::AccountSessionStore::new()),
             audit_sink: None,
             audit_signer: None,

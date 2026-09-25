@@ -41,11 +41,19 @@ pub async fn open_serve_workbench(
         );
     }
     let listener = open_listener(addr).await?;
-    let local = listener.local_addr()?;
     spawn_project_workflow_supervisor(wb.clone());
+    // The relay leg gets a listener of its own, never this one: this is the
+    // operator's channel, where a caller with no credentials is the operator,
+    // and the leg's locator is public (DR-0206). That one admits only this
+    // Home's owner, as the Hub names them.
+    let crossings = serve_relay_crossings(
+        wb.clone(),
+        std::sync::Arc::new(crate::relay_route_stack::HubBearerAccounts::configured()),
+    )
+    .await?;
     tokio::spawn(supervise_home_reachability(
         wb.clone(),
-        local,
+        crossings,
         root.to_path_buf(),
         configured_relay_endpoint(),
     ));
@@ -58,6 +66,35 @@ pub async fn open_serve_workbench(
         open_control_plane(wb).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
+}
+
+/// Serve what a relay crossing reaches, on a loopback listener of its own, and
+/// return its address for the leg to splice to (DR-0206).
+///
+/// A separate listener rather than a separate route prefix because a crossing
+/// arrives from loopback exactly like the desktop's own window does: nothing
+/// in a request can tell the two apart, so the only sound separation is which
+/// socket the leg connects to.
+pub(crate) async fn serve_relay_crossings(
+    wb: crate::SharedWorkbench,
+    accounts: std::sync::Arc<dyn crate::relay_route_stack::BearerAccounts>,
+) -> std::io::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let router = crate::relay_route_stack::relay_control_plane(wb, accounts);
+    tokio::spawn(async move {
+        // With the peer address, as the operator's listener is served: the
+        // handlers behind the relay router are the same ones, and some read it.
+        let served = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+        if let Err(error) = served {
+            eprintln!("[home-relay] the relay router stopped: {error}");
+        }
+    });
+    Ok(address)
 }
 
 /// Drive this Home's launched folder whips for as long as it serves (DR-0191).
@@ -138,7 +175,7 @@ impl ParkedLeg {
 /// environment variable.
 pub(crate) async fn supervise_home_reachability(
     wb: crate::SharedWorkbench,
-    local: std::net::SocketAddr,
+    crossings: std::net::SocketAddr,
     root: std::path::PathBuf,
     endpoint: Option<String>,
 ) {
@@ -195,7 +232,7 @@ pub(crate) async fn supervise_home_reachability(
         // below would stop every request this Home serves.
         let publishes = wb.lock_unpoisoned().library_sync_active();
         match (publishes, parked.is_some()) {
-            (true, false) => match start_home_relay(&wb, local, &root, &endpoint) {
+            (true, false) => match start_home_relay(&wb, crossings, &root, &endpoint) {
                 Ok(leg) => parked = Some(leg),
                 // Said, not swallowed: a Home that cannot park is unreachable,
                 // and the person asked for the opposite.
@@ -254,7 +291,7 @@ pub(crate) async fn supervise_home_reachability(
 /// Park a leg for this Home and publish where it is.
 fn start_home_relay(
     wb: &crate::SharedWorkbench,
-    local: std::net::SocketAddr,
+    crossings: std::net::SocketAddr,
     root: &std::path::Path,
     endpoint: &str,
 ) -> std::io::Result<ParkedLeg> {
@@ -316,7 +353,7 @@ fn start_home_relay(
         // (DR-0184).
         let outcome = gaugedesk_relay_transport::serve_home_supervised(
             route_reader,
-            local,
+            crossings,
             identity,
             |leg| match leg {
                 Ok(epoch) => eprintln!(
@@ -554,5 +591,207 @@ mod reachability_tests {
         );
 
         supervisor.abort();
+    }
+
+    /// The locator this Home published for its one live route, as a client
+    /// holding the account's directory record would read it.
+    fn published_route(wb: &crate::SharedWorkbench) -> gaugedesk_relay_transport::RelayRoute {
+        let guard = wb.lock_unpoisoned();
+        let home = guard.home_id().clone();
+        let account = Account::rebuild(guard.store_ref()).expect("account");
+        let relay = account
+            .home_routes
+            .values()
+            .find(|route| route.home_id == home && route.op != RecordOp::Tombstone)
+            .and_then(|route| route.relay.clone())
+            .expect("a published locator");
+        let fingerprint: [u8; 32] = hex::decode(&relay.home_fingerprint)
+            .expect("hex fingerprint")
+            .try_into()
+            .expect("32-byte fingerprint");
+        gaugedesk_relay_transport::RelayRoute {
+            endpoint: relay.endpoint,
+            handle: relay.handle,
+            epoch: relay.route_epoch,
+            proof: gaugedesk_relay_transport::RouteProof::from_base64url(&relay.proof)
+                .expect("proof"),
+            previous_proof: None,
+            home_fingerprint: fingerprint,
+        }
+    }
+
+    /// One request carried over the relay, with whatever headers the caller
+    /// chose. Answers the status and the whole response.
+    async fn carried(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("loopback");
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: home\r\nidempotency-key: {method}{path}{}\r\n\
+             content-length: 0\r\nconnection: close\r\n",
+            headers.len(),
+        );
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("the crossing answered in time")
+        .expect("read");
+        let text = String::from_utf8_lossy(&response).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {text:?}"));
+        (status, text)
+    }
+
+    /// The Hub, as the relay router asks it: two bearers it recognises.
+    struct FakeHub;
+
+    impl crate::relay_route_stack::BearerAccounts for FakeHub {
+        fn account_for(&self, bearer: &str) -> Result<Option<String>, String> {
+            Ok(match bearer {
+                "owner-bearer" => Some("account-root".to_owned()),
+                "someone-elses-bearer" => Some("someone-else".to_owned()),
+                _ => None,
+            })
+        }
+    }
+
+    /// A Home publishing a relay locator, signed in as its owner, and a client
+    /// loopback that dials it through a test relay with the published locator.
+    async fn reachable_home() -> (
+        TestRelay,
+        tempfile::TempDir,
+        std::net::SocketAddr,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let relay = TestRelay::bind().await.expect("relay");
+        let root = tempfile::tempdir().expect("root");
+        let wb = crate::open_workbench(root.path()).expect("workbench");
+        crate::account_signin::store_session_for_test(&wb);
+        crate::home_owner::claim_if_never_claimed(&wb).expect("owner");
+        let crossings = serve_relay_crossings(wb.clone(), std::sync::Arc::new(FakeHub))
+            .await
+            .expect("relay router");
+        let supervisor = tokio::spawn(supervise_home_reachability(
+            wb.clone(),
+            crossings,
+            root.path().to_path_buf(),
+            Some(relay.endpoint().to_owned()),
+        ));
+        wb.lock_unpoisoned()
+            .upsert_account_facility(&publication(FacilityStatus::Active))
+            .expect("attach publication");
+        assert!(settle(&wb, 1).await, "the Home never published a locator");
+        let (client, carrier) =
+            gaugedesk_relay_transport::bind_client_loopback(published_route(&wb))
+                .await
+                .expect("client loopback");
+        (relay, root, client, vec![supervisor, carrier])
+    }
+
+    /// DR-0206, end to end: a stranger who reads the published record, dials
+    /// the leg and presents nothing reaches a Home that refuses them.
+    ///
+    /// Before this the leg spliced into the operator's own router, where a
+    /// request with no credentials is the local operator: `POST
+    /// /home/admissions` here answered `201 Created` to nobody at all.
+    #[tokio::test]
+    async fn a_stranger_over_the_relay_reaches_nothing_but_health() {
+        let (_relay, _root, client, tasks) = reachable_home().await;
+        let (status, body) = carried(client, "GET", "/health", &[]).await;
+        assert_eq!(status, 200, "health is answered over the relay: {body}");
+        for (method, path) in [
+            ("POST", "/home/admissions"),
+            ("GET", "/workspace"),
+            ("POST", "/projects"),
+        ] {
+            let (status, body) = carried(client, method, path, &[]).await;
+            assert_eq!(
+                status, 401,
+                "{method} {path} was served over the relay: {body}"
+            );
+        }
+        let (status, body) = carried(
+            client,
+            "POST",
+            "/home/admissions",
+            &[("authorization", "Bearer forged")],
+        )
+        .await;
+        assert_eq!(status, 401, "a bearer the Hub does not know: {body}");
+        tasks.iter().for_each(|task| task.abort());
+    }
+
+    /// The owner, as the Hub names them, is admitted over the relay and works
+    /// with the admission the Home mints — and only with it.
+    #[tokio::test]
+    async fn the_owner_over_the_relay_is_admitted_and_works() {
+        let (_relay, _root, client, tasks) = reachable_home().await;
+        let owner = [("authorization", "Bearer owner-bearer")];
+        let (status, body) = carried(client, "POST", "/home/admissions", &owner).await;
+        assert_eq!(status, 201, "the owner is admitted: {body}");
+        let reply: serde_json::Value =
+            serde_json::from_str(body.split("\r\n\r\n").nth(1).expect("a body")).expect("json");
+        let admission = reply["admission"]
+            .as_str()
+            .expect("an admission")
+            .to_owned();
+
+        let (status, body) = carried(client, "GET", "/workspace", &owner).await;
+        assert_eq!(status, 401, "a login bearer alone does no work: {body}");
+        assert!(body.contains("target Home admission required"), "{body}");
+
+        let admitted = [
+            ("authorization", "Bearer owner-bearer"),
+            ("x-gaugewright-home-admission", admission.as_str()),
+        ];
+        let (status, body) = carried(client, "GET", "/workspace", &admitted).await;
+        assert_eq!(status, 200, "the admitted owner works: {body}");
+
+        // This computer's own sign-in is not the owner's to change from afar.
+        let (status, body) =
+            carried(client, "POST", "/account/hub-session/logout", &admitted).await;
+        assert_eq!(
+            status, 403,
+            "signing this computer out from elsewhere: {body}"
+        );
+
+        let (status, body) = carried(client, "DELETE", "/home/admissions", &admitted).await;
+        assert_eq!(status, 204, "the owner revokes their admission: {body}");
+        let (status, body) = carried(client, "GET", "/workspace", &admitted).await;
+        assert_eq!(status, 401, "a revoked admission does no work: {body}");
+        tasks.iter().for_each(|task| task.abort());
+    }
+
+    /// Another account the Hub recognises is still not this Home's owner.
+    #[tokio::test]
+    async fn another_account_over_the_relay_is_refused() {
+        let (_relay, _root, client, tasks) = reachable_home().await;
+        let (status, body) = carried(
+            client,
+            "POST",
+            "/home/admissions",
+            &[("authorization", "Bearer someone-elses-bearer")],
+        )
+        .await;
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("belongs to another account"), "{body}");
+        tasks.iter().for_each(|task| task.abort());
     }
 }

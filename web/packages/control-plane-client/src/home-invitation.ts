@@ -82,7 +82,9 @@ export function parseHomeInvitation(encoded: string): HomeInvitationPreview {
 
 /** Accept directly on the owner's Home using ordinary account authentication.
  * The opaque capability is used only in this request body, never a header, log,
- * Home registry entry, or browser storage value. */
+ * or Home registry entry. The one place it rests is the invitee's own tab
+ * (sessionStorage), from arrival until it is answered, so that it survives the
+ * sign-in the invitee usually has to do first (DR-0204). */
 export async function acceptHomeInvitation(
     encoded: string,
     options: { readonly bearer?: () => string | null } = {},

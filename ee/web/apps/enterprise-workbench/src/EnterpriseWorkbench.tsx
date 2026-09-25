@@ -446,6 +446,16 @@ export function EnterpriseWorkbench(): JSX.Element {
         if (!deviceLinkInvitation() || !account.session()) return;
         openGaugeApp("account-settings", "trusted-devices");
     });
+    // An organization invitation is answered on the Account page, which nothing
+    // opened: following the link showed the ordinary workbench, and the
+    // invitation appeared only to someone who happened to open Account Settings.
+    // Opened once, so closing the App is not undone by the next session refresh.
+    let organizationInvitationOpened = false;
+    createEffect(() => {
+        if (organizationInvitationOpened || !organizationInvitation() || !account.session()) return;
+        organizationInvitationOpened = true;
+        openGaugeApp("account-settings", "account");
+    });
     createEffect(() => {
         const app = activeApp();
         if (!app) return;

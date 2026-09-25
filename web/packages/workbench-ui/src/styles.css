@@ -2404,7 +2404,14 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .homegate-invite button { flex: 0 0 auto; padding: 9px 14px; border: 0; border-radius: 7px;
   background: var(--accent); color: var(--accent-contrast, #fff); cursor: pointer; }
 .homegate-invite button:disabled { opacity: .45; cursor: default; }
+.homegate-invite .homegate-link { align-self: flex-start; padding: 0; border-radius: 0;
+  background: none; color: var(--accent); }
 .homegate-auth-note { margin: 0; }
+/* Who is signed in, and the way out, at the foot of every gate a signed-in person
+   can meet before the workbench — ruled off so it reads as the account's line and
+   not as one more act the card is asking for. */
+.homegate-signed-in { padding-top: 12px; border-top: 1px solid var(--edge); text-align: center; }
+.homegate-signed-in .homegate-error { display: block; margin-top: 6px; }
 .homegate-error { margin: 0; color: var(--danger, #e66); font-size: var(--fs-ui); }
 /* The first-run act is a link (it leaves for the download), so it has to carry
    the button shape `.firstrun-connect` gives a <button> (DESK-4). */

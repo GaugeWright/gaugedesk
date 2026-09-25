@@ -131,6 +131,10 @@ export interface SignInCardProps {
     lede?: string;
     /** Trailing line for the local route — "set up a model credential instead". */
     footnote?: JSX.Element;
+    /** Something the host learned outside the card that the person needs to
+     *  hear on it — a desktop sign-in that came back from the browser and could
+     *  not be finished. Shown on the opening step, where they would try again. */
+    notice?: string;
 }
 
 type Step =
@@ -603,6 +607,9 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                             >
                                 {busy() ? "Sending…" : "Email me a code"}
                             </button>
+                            <button class="signin__quiet" type="button" data-signin-restart onClick={restart}>
+                                Use a different sign-in
+                            </button>
                         </form>
                     )}
             </Show>
@@ -644,8 +651,13 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
             <Show when={at('provider-create')}>
                 {(current) => (
                         <form class="signin__act" data-signin-provider-create onSubmit={(event) => finishProviderSignup(event, current())}>
+                            {/* Change, like every other step past the first. The
+                                provider may have signed in whichever account the
+                                browser already held; without this the only way
+                                off the card was to create an account for it. */}
                             <p class="signin__resolved">
                                 <span>{providerLabel()} verified {current().email}</span>
+                                <button class="signin__change" type="button" data-signin-restart onClick={restart}>Change</button>
                             </p>
                             {/* One button. The name field that used to sit here
                                 asked for something the provider had already
@@ -781,6 +793,9 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                 </div>
             </Show>
 
+            <Show when={props.notice && step().at === "identify" && !status()}>
+                <p class="signin__status" role="alert" data-signin-notice>{props.notice}</p>
+            </Show>
             <Show when={status()}>
                 <p class="signin__status" role="status" data-signin-status>{status()}</p>
             </Show>

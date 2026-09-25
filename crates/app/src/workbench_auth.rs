@@ -269,8 +269,15 @@ impl Workbench {
             ));
         }
         let idp = self.idp.as_ref()?;
-        let actor = idp.authenticate(token)?;
-        let claims = idp.claims(&actor);
+        let verified = idp.authenticate(token)?;
+        let claims = idp.claims(&verified);
+        // Home admission and action routes must name the same account for a
+        // linked consumer id-token. Keep the provider's verified claims; the
+        // account mapping changes the actor, not the authentication source.
+        let actor = self
+            .linked_account_for_verified_id_token(token)
+            .map(gaugedesk_core::ids::AuthorityId::new)
+            .unwrap_or(verified);
         Some(AuthenticatedActionContext::identity_provider(actor, claims))
     }
 
@@ -1924,6 +1931,26 @@ mod id_token_bearer_tests {
             true,
         );
         assert_eq!(who(&wb, &token).as_deref(), Some("account-root-key"));
+    }
+
+    /// Task reads and governed actions use the authenticated action context.
+    /// It must name the same account as Home admission for this bearer.
+    #[test]
+    fn a_linked_identity_has_the_same_action_actor_as_home_admission() {
+        let token = id_token(GOOGLE, "google-subject-1");
+        let (_root, wb) = hub(&[&token]);
+        link(
+            &wb,
+            "account-root-key",
+            "google-subject-1",
+            AuthMethodStatus::Active,
+            true,
+        );
+        let wb = wb.lock_unpoisoned();
+        let admitted = wb.authenticate_bearer(&token).unwrap();
+        let action = wb.authenticate_action_context(&token).unwrap();
+        assert_eq!(action.actor(), &admitted);
+        assert_eq!(action.actor().as_str(), "account-root-key");
     }
 
     #[test]

@@ -130,6 +130,84 @@ describe("hosted Home bootstrap", () => {
             .toEqual(["home:laptop", "home:studio"]);
     });
 
+    // An asleep laptop is the commonest way a selected Home stops serving, and
+    // it used to fail discovery outright: "We couldn't load your Homes", which
+    // blamed the account service, hid the other Homes, and offered a Retry that
+    // replayed the cached rejection without dialing again.
+    it("reports a selected Home that does not answer as not serving, and dials it again on retry", async () => {
+        let laptopAwake = false;
+        const dialed: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/homes") {
+                return new Response(JSON.stringify({
+                    homes: [
+                        { id: "home:laptop", kind: "registered", endpoint: "https://laptop.example" },
+                        { id: "home:studio", kind: "registered", endpoint: "https://studio.example" },
+                    ],
+                    selected_home: "home:laptop",
+                }));
+            }
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({ routes: [] }));
+            }
+            if (url === "https://laptop.example/home/admissions") {
+                dialed.push(url);
+                if (!laptopAwake) throw new TypeError("Failed to fetch");
+                return new Response(JSON.stringify({ home: "home:laptop", admission: "t" }), { status: 201 });
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+
+        const asleep = await api.bootstrapHome();
+        expect(asleep).toMatchObject({ kind: "none", selectedHome: "home:laptop" });
+        expect(asleep.kind === "none" && asleep.homes.map((home) => home.id))
+            .toEqual(["home:laptop", "home:studio"]);
+
+        laptopAwake = true;
+        await expect(api.bootstrapHome()).resolves.toMatchObject({
+            kind: "connected",
+            home: { id: "home:laptop" },
+        });
+        expect(dialed).toHaveLength(2);
+    });
+
+    it("gives up on a selected Home that accepts the connection and never answers", async () => {
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/homes") {
+                return new Response(JSON.stringify({
+                    homes: [{ id: "home:laptop", kind: "registered", endpoint: "https://laptop.example" }],
+                    selected_home: "home:laptop",
+                }));
+            }
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({ routes: [] }));
+            }
+            if (url === "https://laptop.example/home/admissions") {
+                return new Promise<Response>(() => {});
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", {
+            splitHomes: true,
+            homeDialTimeoutMs: 10,
+        });
+        await expect(api.bootstrapHome()).resolves.toMatchObject({
+            kind: "none",
+            selectedHome: "home:laptop",
+        });
+    });
+
+    it("still fails discovery when the account service itself does not answer", async () => {
+        vi.stubGlobal("fetch", vi.fn(async () => {
+            throw new TypeError("Failed to fetch");
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        await expect(api.bootstrapHome()).rejects.toThrow("Failed to fetch");
+    });
+
     it("treats an unprovisioned managed Home as setup state, not an access error", async () => {
         const fetch = vi.fn(async (input: RequestInfo | URL) => {
             const url = String(input);

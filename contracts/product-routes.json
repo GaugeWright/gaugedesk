@@ -4208,6 +4208,42 @@
       }
     },
     {
+      "id": "account.identity.read",
+      "jurisdiction": "hub-person",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/account/identity",
+      "producer": "gaugedesk-app account_routes::hub_routes",
+      "consumer": "HubBearerAccounts in gaugedesk-app relay_route_stack",
+      "authentication": "account-session",
+      "scope": "person",
+      "capability": null,
+      "requestSchema": "none",
+      "responseSchema": "rust:gaugedesk-app/account_identity/AccountIdentity",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#production-bundle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#production-bundle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud@06ba233:web/e2e/home-authenticated-wiring.mjs#generated-authority-encoding-state"
+        ]
+      }
+    },
+    {
       "id": "account.home.register",
       "jurisdiction": "hub-person",
       "transport": "http-json",

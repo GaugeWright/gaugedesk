@@ -28,7 +28,7 @@ use gaugedesk_app::gaugeapp_agent::{
     gaugeapp_agent_live_subscription, gaugeapp_agent_page_commands, gaugeapp_agent_transcript,
     gaugeapp_agent_turn_was_stopped, gaugeapp_thread_id, migrate_legacy_gaugeapp_agent_transcript,
     replayed_gaugeapp_agent_turn, request_gaugeapp_agent_stop,
-    run_gaugeapp_agent_turn_with_refresh_stop_and_events, GaugeAppAgentContext, GaugeAppAgentError,
+    run_gaugeapp_agent_turn_with_direct_actions, GaugeAppAgentContext, GaugeAppAgentError,
     GaugeAppAgentLiveEvent, GaugeAppAgentLiveFrame, GaugeAppAgentMessage, GaugeAppAgentPage,
     GaugeAppAgentRejection,
 };
@@ -1888,10 +1888,100 @@ async fn agent_message(
     let runtime_headers = headers.clone();
     let runtime_extension = extension.clone();
     let refresh_wb = wb.clone();
+    let validate_wb = wb.clone();
+    let validate_headers = headers.clone();
+    let validate_extension = extension.clone();
+    let action_wb = wb.clone();
+    let action_headers = headers.clone();
+    let action_extension = extension.clone();
+    let action_session = context.session.clone();
+    let direct_key = format!(
+        "agent-direct:{}",
+        hex::encode(Sha256::digest(
+            format!("{}:{}", context.session.id, body.idempotency_key).as_bytes()
+        ))
+    );
     let runtime_thread_id = turn_thread_id.clone();
     let runtime_live_turn = live_turn.clone();
     match tokio::task::spawn_blocking(move || {
-        let result = run_gaugeapp_agent_turn_with_refresh_stop_and_events(
+        let mut invoke = |proposal: &gaugedesk_app::gaugeapp_agent::GaugeAppAgentProposal,
+                          key: &str|
+         -> Result<Value, GaugeAppAgentError> {
+            if proposal.command_id != "enterprise-identity.connection.validate" {
+                return Err(GaugeAppAgentError::InvalidOutput(
+                    "This action needs its page-owned human flow.".into(),
+                ));
+            }
+            let envelope = {
+                let guard = action_wb.lock_unpoisoned();
+                let (current, _) = build_session(
+                    &guard,
+                    &action_headers,
+                    extension_ref(&action_extension),
+                )
+                .map_err(|_| {
+                    GaugeAppAgentError::Rejected(GaugeAppAgentRejection::SessionRevoked)
+                })?;
+                if current.id != action_session.id
+                    || current.generation != action_session.generation
+                    || current.actor != action_session.actor
+                    || current.scope != action_session.scope
+                {
+                    return Err(GaugeAppAgentError::Rejected(
+                        GaugeAppAgentRejection::SessionMismatch,
+                    ));
+                }
+                GaugeAppCommandEnvelope {
+                    session_id: current.id,
+                    generation: current.generation,
+                    app: current.app,
+                    scope: current.scope,
+                    page_id: proposal.page_id.clone(),
+                    command_id: proposal.command_id.clone(),
+                    expected_basis: proposal.expected_basis.clone(),
+                    idempotency_key: key.to_owned(),
+                    payload: proposal.payload.clone(),
+                    client: GaugeAppClient::Agent,
+                }
+            };
+            let response = tokio::runtime::Handle::current().block_on(
+                submit_sso_configuration_validation(
+                    action_wb.clone(),
+                    action_extension.clone(),
+                    action_headers.clone(),
+                    envelope,
+                    key.to_owned(),
+                ),
+            );
+            let status = response.status();
+            let bytes = tokio::runtime::Handle::current()
+                .block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+                .map_err(|error| GaugeAppAgentError::Store(format!("command response: {error}")))?;
+            let body: Value = serde_json::from_slice(&bytes)
+                .map_err(|error| GaugeAppAgentError::Store(format!("command result: {error}")))?;
+            if !status.is_success() {
+                return Err(GaugeAppAgentError::InvalidOutput(
+                    body["error"]
+                        .as_str()
+                        .unwrap_or("Configuration validation was refused.")
+                        .to_owned(),
+                ));
+            }
+            let page = {
+                let guard = action_wb.lock_unpoisoned();
+                build_session(&guard, &action_headers, extension_ref(&action_extension))
+                    .ok()
+                    .map(|(session, projected)| agent_context(session, projected))
+                    .and_then(|current| {
+                        current
+                            .pages
+                            .into_iter()
+                            .find(|page| page.id == proposal.page_id)
+                    })
+            };
+            Ok(json!({ "receipt": body["receipt"], "page": page }))
+        };
+        let result = run_gaugeapp_agent_turn_with_direct_actions(
             &runtime_wb,
             context,
             &body.message,
@@ -1906,6 +1996,39 @@ async fn agent_message(
             },
             || gaugeapp_agent_turn_was_stopped(&runtime_thread_id),
             |event| runtime_live_turn.publish(event),
+            |current, proposal| {
+                let guard = validate_wb.lock_unpoisoned();
+                let envelope = GaugeAppCommandEnvelope {
+                    session_id: current.session.id.clone(),
+                    generation: current.session.generation.clone(),
+                    app: current.session.app,
+                    scope: current.session.scope.clone(),
+                    page_id: proposal.page_id.clone(),
+                    command_id: proposal.command_id.clone(),
+                    expected_basis: proposal.expected_basis.clone(),
+                    idempotency_key: "agent:validation".into(),
+                    payload: proposal.payload.clone(),
+                    client: GaugeAppClient::Agent,
+                };
+                decide_gaugeapp_command(&current.session, &envelope).map_err(|error| {
+                    GaugeAppAgentError::InvalidOutput(format!("Proposal refused: {error:?}"))
+                })?;
+                plan_command(
+                    &guard,
+                    &validate_headers,
+                    &envelope,
+                    extension_ref(&validate_extension),
+                )
+                .map_err(|_| {
+                    GaugeAppAgentError::InvalidOutput(format!(
+                        "{} has invalid values for this page; read the current page and correct the payload",
+                        proposal.command_id
+                    ))
+                })?;
+                Ok(())
+            },
+            Some(&mut invoke),
+            &direct_key,
         );
         (turn_claim, result)
     })
@@ -2058,6 +2181,9 @@ fn agent_context(
                 resource_basis: grant.resource_basis.clone(),
                 model: page.model,
                 commands: gaugeapp_agent_page_commands(&session, grant),
+                actions: gaugedesk_app::gaugeapp_agent::gaugeapp_agent_page_actions(
+                    &session, grant,
+                ),
             }
         })
         .collect();
@@ -5185,6 +5311,38 @@ fn requires_fresh_authorization(command_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_administration_command_has_an_agent_action_kind() {
+        for policy in COMMANDS {
+            let grant = GaugeAppCommandGrant {
+                id: policy.id.into(),
+                capability: "classified".into(),
+                review: policy.review,
+            };
+            assert!(
+                gaugedesk_app::gaugeapp_agent::gaugeapp_agent_action_kind(&grant).is_some(),
+                "{} has no agent action path",
+                policy.id
+            );
+        }
+        let validation = GaugeAppCommandGrant {
+            id: "enterprise-identity.connection.validate".into(),
+            capability: "classified".into(),
+            review: ReviewPolicy::Immediate,
+        };
+        assert!(gaugedesk_app::gaugeapp_agent::gaugeapp_agent_can_propose(
+            &validation
+        ));
+        let browser_test = GaugeAppCommandGrant {
+            id: "enterprise-identity.test.begin".into(),
+            ..validation
+        };
+        assert_eq!(
+            gaugedesk_app::gaugeapp_agent::gaugeapp_agent_action_kind(&browser_test),
+            Some(gaugedesk_app::gaugeapp_agent::GaugeAppAgentActionKind::HumanCeremony)
+        );
+    }
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

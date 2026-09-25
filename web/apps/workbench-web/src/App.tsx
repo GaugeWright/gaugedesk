@@ -203,8 +203,6 @@ api.setBearer(bearer());
 // `/auth/refresh` on a timer under the id-token's ~1h life. No-op on the loopback desktop.
 startSessionRefresh(controlPlaneBase());
 
-/** Read an ordinary project invitation into memory, then immediately remove its
- * capability from the address bar/history. It is never copied into storage. */
 /** The public edge's custom domain.
  *
  * Not a `workers.dev` subdomain: the previous default named the founder's
@@ -214,18 +212,40 @@ startSessionRefresh(controlPlaneBase());
  */
 const PUBLIC_EDGE_ORIGIN = "https://panels.gaugewright.com";
 
+/** Where a project invitation waits between arriving and being answered. */
+const PENDING_INVITATION_KEY = "gw.pending-project-invitation";
+
+/** Read an ordinary project invitation, then immediately remove its capability
+ * from the address bar/history.
+ *
+ * It is kept in this tab's sessionStorage until it is accepted or dismissed
+ * (DR-0204). In memory alone it did not survive what most invitees do next —
+ * sign in, which leaves for the provider and returns to a fresh load — so a
+ * person who followed an invitation and signed in found no invitation at all.
+ * Session storage is this tab's alone and is gone when the tab closes. */
 function consumeHomeInvitation(): string {
     if (typeof window === "undefined") return "";
     try {
         const url = new URL(window.location.href);
-        if (url.pathname !== "/invite") return "";
-        const invite = url.searchParams.get("d") ?? "";
-        url.searchParams.delete("d");
-        url.pathname = "/";
-        window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
-        return invite;
+        if (url.pathname === "/invite") {
+            const invite = url.searchParams.get("d") ?? "";
+            url.searchParams.delete("d");
+            url.pathname = "/";
+            window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+            if (invite) sessionStorage.setItem(PENDING_INVITATION_KEY, invite);
+            return invite;
+        }
+        return sessionStorage.getItem(PENDING_INVITATION_KEY) ?? "";
     } catch {
         return "";
+    }
+}
+
+function forgetHomeInvitation(): void {
+    try {
+        sessionStorage.removeItem(PENDING_INVITATION_KEY);
+    } catch {
+        /* storage unavailable: nothing was kept */
     }
 }
 
@@ -312,6 +332,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         return state?.kind === "failure" ? state : null;
     });
     const homeNeedsLogin = createMemo(() => homeFailure()?.authentication ?? false);
+    const homeRelayClosed = createMemo(() => homeFailure()?.relayClosed ?? false);
     const [homeEndpoint, setHomeEndpoint] = createSignal("");
     const [homeError, setHomeError] = createSignal("");
     const [homeBusy, setHomeBusy] = createSignal(false);
@@ -349,13 +370,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setHomeBusy(false);
         }
     };
+    const dismissHomeInvite = () => {
+        setHomeInvite("");
+        forgetHomeInvitation();
+    };
     const acceptHomeInvite = async () => {
         if (!homeInvite()) return;
         setHomeBusy(true);
         setHomeError("");
         try {
             await api.acceptHomeInvitation(homeInvite());
-            setHomeInvite("");
+            dismissHomeInvite();
             await refetchHome();
         } catch (error) {
             setHomeError(String(error));
@@ -530,27 +555,58 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         () => api.hubSessionReach().catch(() => null),
     );
     if (typeof window !== "undefined") {
-        const onDeepLink = (e: Event) => {
-            const url = (e as CustomEvent).detail;
-            if (typeof url !== "string") return;
+        const handleDeepLink = (url: string) => {
             // ADR 0123 (LOGIN-2): a native account sign-in return. The deep link
             // carries only the one-time code; the control plane redeems it with
             // its held verifier and custodies the session — status surfaces read
             // the result from `/account/hub-session` (server truth).
             const handoffCode = parseNativeHandoffCode(url);
             if (handoffCode) {
+                setSignInReturnError("");
                 void api
                     .hubSessionCallback(handoffCode)
                     .then(() => refetchHubSession())
                     .then(() => refreshAfterSignIn())
-                    .catch(() => {});
+                    .catch((error: unknown) => {
+                        // The person finished in the browser and came back to a
+                        // card that had not moved. Say so, on the card, where
+                        // they would try again.
+                        const reason = error instanceof Error ? error.message : String(error ?? "");
+                        setSignInReturnError(
+                            `Sign-in did not finish${reason ? ` (${reason})` : ""}. Try again.`,
+                        );
+                        setSignInOpen(true);
+                    });
                 return;
             }
             if (url.startsWith("gaugewright://invite")) {
                 setInviteDeepLink(url);
             }
         };
+        // The desktop shell queues every link on `window.__gwDeepLinks` before it
+        // fires the event, and queues the link that LAUNCHED the app before this
+        // page exists. Taking from the queue — on start, and on every event — is
+        // what reaches a sign-in or invite that arrived while GaugeDesk was
+        // closed; the set keeps a link the shell both queued at launch and
+        // delivered as an event from being redeemed twice.
+        const handledDeepLinks = new Set<string>();
+        const takeDeepLink = (url: unknown) => {
+            if (typeof url !== "string" || handledDeepLinks.has(url)) return;
+            handledDeepLinks.add(url);
+            handleDeepLink(url);
+        };
+        const drainDeepLinks = () => {
+            const queue = (window as { __gwDeepLinks?: unknown[] }).__gwDeepLinks;
+            while (queue?.length) takeDeepLink(queue.shift());
+        };
+        const onDeepLink = (e: Event) => {
+            takeDeepLink((e as CustomEvent).detail);
+            drainDeepLinks();
+        };
         window.addEventListener("gw-deep-link", onDeepLink);
+        // After setup, not during it: redeeming a sign-in touches state the
+        // component declares further down.
+        onMount(drainDeepLinks);
         onCleanup(() => window.removeEventListener("gw-deep-link", onDeepLink));
         // ADR 0140: a dev web return — the Hub handed the one-time handoff code
         // back to this browser origin (`#code=…`) instead of the `gaugewright://`
@@ -852,6 +908,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // signed out and mid-ceremony. Open the card for them rather than leaving
     // them on a shell with the one step they still owe hidden behind a menu.
     const [signInOpen, setSignInOpen] = createSignal(accountSignupTicket !== null);
+    const [signInReturnError, setSignInReturnError] = createSignal("");
     // The non-secret projection of that ticket: the address Google attested and
     // the name it offered, so the card can say whose account it is about to
     // create. Reading it does not spend the ticket.
@@ -2109,6 +2166,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const signInCard = (footnote?: JSX.Element): JSX.Element => (
         <SignInCard
             footnote={footnote}
+            notice={signInReturnError() || undefined}
             title="Sign in"
             lede="Sign in to save model credentials, settings, and link your chats."
             resolve={async (email) => {
@@ -2909,12 +2967,93 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // (endpoint entry, registered Homes, account reach). Off by default so a new
     // person meets one act, not a control panel.
     const [homeRecovery, setHomeRecovery] = createSignal(false);
+    // One arrangement of a project invitation, for the setup card and for the
+    // card that offers it over a working workbench. Either way it can be put
+    // down: a malformed one used to sit on the setup card as an error nobody
+    // could dismiss, and kept the simpler first-run card from ever showing.
+    const invitationBlock = (): JSX.Element => (
+        <Show when={homeInvite()}>
+            <Show
+                when={invitationPreview()}
+                fallback={<div class="homegate-notice homegate-error" role="alert" data-home-invite-invalid>
+                    This project invitation is malformed or uses an unsafe Home endpoint.
+                    {" "}
+                    <button type="button" class="homegate-link" onClick={dismissHomeInvite}>
+                        Dismiss
+                    </button>
+                </div>}
+            >
+                {(invite) => <div class="homegate-invite" data-home-invite>
+                    <div>
+                        <strong>Project invitation</strong>
+                        <span>
+                            Join {invite().project} on {invite().homeId}. Your free account
+                            uses the owner’s Home; it does not create hosted work here.
+                        </span>
+                        <small>{invite().endpoint}</small>
+                        <button type="button" class="homegate-link" disabled={homeBusy()} onClick={dismissHomeInvite}>
+                            Not now
+                        </button>
+                    </div>
+                    <button
+                        type="button"
+                        disabled={homeBusy()}
+                        onClick={() => void acceptHomeInvite()}
+                    >
+                        {homeBusy() ? "Joining…" : "Accept invitation"}
+                    </button>
+                </div>}
+            </Show>
+        </Show>
+    );
+    // Every gate a signed-in person can meet before the workbench carries a way
+    // out of the account. Sign-out otherwise lives only in the account menu,
+    // which is in the shell these gates stand in front of — so a person with no
+    // Home, or whose Home is asleep, could not sign out at all.
+    const [gateSignOutBusy, setGateSignOutBusy] = createSignal(false);
+    const [gateSignOutError, setGateSignOutError] = createSignal("");
+    const gateSignOut = async () => {
+        if (gateSignOutBusy()) return;
+        setGateSignOutBusy(true);
+        setGateSignOutError("");
+        try {
+            await signOutAccount();
+        } catch (error) {
+            setGateSignOutError(error instanceof Error ? error.message : "Sign out failed. Please try again.");
+        } finally {
+            setGateSignOutBusy(false);
+        }
+    };
+    const signedInNote = (): JSX.Element => (
+        <p class="homegate-auth-note homegate-signed-in" data-home-signed-in>
+            {menuIdentity()
+                ? <>Signed in as {menuIdentity()?.email ?? menuIdentity()?.name}.</>
+                : "Signed in."}
+            {" "}
+            <button
+                type="button"
+                class="homegate-link"
+                data-home-sign-out
+                disabled={gateSignOutBusy()}
+                onClick={() => void gateSignOut()}
+            >
+                {gateSignOutBusy() ? "Signing out…" : "Sign out"}
+            </button>
+            <Show when={gateSignOutError()}>
+                <span class="homegate-error" role="alert">{gateSignOutError()}</span>
+            </Show>
+        </p>
+    );
     const HomeSetup = () => {
         // A person with a valid account and no Home yet is an ordinary starting
         // state, not an error (`experience/desk.md`). It gets one page whose single
         // primary act is a way to *get* a Home; the endpoint/picker affordances
         // below are recovery, revealed on request rather than met on arrival.
-        if (import.meta.env.VITE_HOME_SPLIT === "true" && !homeInvite() && !homeRecovery()) {
+        // Which card is a live question — dismissing an invitation, or asking
+        // for the recovery affordances ("Already have a Home?"), must move
+        // between them. A plain `if` here ran once, when the component was
+        // made, so both links did nothing and the recovery card was unreachable.
+        const simpleSetup = () => {
             const downloadUrl = props.downloadUrl
                 || import.meta.env.VITE_DOWNLOAD_URL
                 || "https://gaugewright.com/gaugedesk/download";
@@ -2990,6 +3129,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                             Already have a Home?
                                         </button>
                                     </p>
+                                    {signedInNote()}
                                   </div>
                                 </section>
                             }
@@ -3019,6 +3159,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                                 Connect a different Home
                                             </button>
                                         </p>
+                                        {signedInNote()}
                                       </div>
                                     </section>
                                 }
@@ -3062,6 +3203,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                                 Connect a different Home
                                             </button>
                                         </p>
+                                        {signedInNote()}
                                       </div>
                                     </section>
                                 )}
@@ -3070,8 +3212,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </div>
                 </Show>
             );
-        }
-        return (
+        };
+        const advancedSetup = () => (
             <Show when={noHomeState()}>
                 {(state) => <div class="homegate-scrim" data-tauri-drag-region data-home-setup>
                     <section class="homegate-card" aria-labelledby="homegate-title">
@@ -3083,32 +3225,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         or a paid Cloud Home.
                     </p>
 
-                    <Show when={homeInvite()}>
-                        <Show
-                            when={invitationPreview()}
-                            fallback={<div class="homegate-notice homegate-error" role="alert">
-                                This project invitation is malformed or uses an unsafe Home endpoint.
-                            </div>}
-                        >
-                            {(invite) => <div class="homegate-invite">
-                                <div>
-                                    <strong>Project invitation</strong>
-                                    <span>
-                                        Join {invite().project} on {invite().homeId}. Your free account
-                                        uses the owner’s Home; it does not create hosted work here.
-                                    </span>
-                                    <small>{invite().endpoint}</small>
-                                </div>
-                                <button
-                                    type="button"
-                                    disabled={homeBusy()}
-                                    onClick={() => void acceptHomeInvite()}
-                                >
-                                    {homeBusy() ? "Joining…" : "Accept invitation"}
-                                </button>
-                            </div>}
-                        </Show>
-                    </Show>
+                    {invitationBlock()}
 
                     <Show when={state().routes.length > 0}>
                         <div class="homegate-notice">
@@ -3216,8 +3333,24 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     <Show when={homeError()}>
                         <p class="homegate-error" role="alert">{homeError()}</p>
                     </Show>
+                    <Show when={homeRecovery()}>
+                        <p class="homegate-auth-note">
+                            <button type="button" class="homegate-link" data-home-recovery-back onClick={() => setHomeRecovery(false)}>
+                                Back
+                            </button>
+                        </p>
+                    </Show>
+                    {signedInNote()}
                     </section>
                 </div>}
+            </Show>
+        );
+        return (
+            <Show
+                when={import.meta.env.VITE_HOME_SPLIT === "true" && !homeInvite() && !homeRecovery()}
+                fallback={advancedSetup()}
+            >
+                {simpleSetup()}
             </Show>
         );
     };
@@ -3236,17 +3369,31 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         <Show
                             when={homeNeedsLogin()}
                             fallback={
-                                <>
-                                    <h1>We couldn’t load your Homes</h1>
+                                <Show
+                                    when={homeRelayClosed()}
+                                    fallback={
+                                        <>
+                                            <h1>We couldn’t load your Homes</h1>
+                                            <p class="homegate-lede">
+                                                The account service could not be reached. Retry when the connection is available.
+                                            </p>
+                                        </>
+                                    }
+                                >
+                                    {/* The Home answered and declined (DR-0206). It is
+                                        not an outage and a Retry cannot change it, so
+                                        none is offered. */}
+                                    <h1>Your Home can’t be opened from here right now</h1>
                                     <p class="homegate-lede">
-                                        The account service could not be reached. Retry when the connection is available.
+                                        Your computer is on, but GaugeDesk on it isn’t signed in as you.
+                                        Sign in to GaugeDesk on that computer, then reload this page.
                                     </p>
-                                </>
+                                </Show>
                             }
                         >
                             {signInCard()}
                         </Show>
-                        <Show when={!homeNeedsLogin()}>
+                        <Show when={!homeNeedsLogin() && !homeRelayClosed()}>
                             <div class="homegate-connect-row">
                                 <button
                                     class="firstrun-connect"
@@ -3256,7 +3403,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                     Retry
                                 </button>
                             </div>
+                            {/* The account service did not answer, so whether anyone is
+                                signed in is only known when a session already named them. */}
+                            <Show when={menuIdentity()}>{signedInNote()}</Show>
                         </Show>
+                        {/* Here the account service answered — it named the Home — so
+                            the person is signed in, and signing out is the one thing
+                            this card can still do for them. */}
+                        <Show when={homeRelayClosed()}>{signedInNote()}</Show>
                     </section>
                 </div>
             </Show>
@@ -3337,6 +3491,32 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 </button>
                             </span>,
                         )}
+                    </section>
+                </div>
+            </Show>
+            {/* An invitation that arrives while a Home already serves the person.
+                The setup card, which used to be its only place, is not on screen
+                then, so the invitation was dropped without a word. */}
+            <Show
+                when={
+                    homeInvite()
+                    && !homeState.loading
+                    && !homeFailure()
+                    && homeState()?.kind === "connected"
+                    && !showFirstRun()
+                    && !signInOpen()
+                }
+            >
+                <div class="homegate-scrim" data-tauri-drag-region data-home-invite-overlay>
+                    <section class="homegate-card">
+                      <div class="homegate-card-inner">
+                        <p class="homegate-kicker">Invitation</p>
+                        <h1 id="homegate-title">You have been invited to a project</h1>
+                        {invitationBlock()}
+                        <Show when={homeError()}>
+                            <p class="homegate-error" role="alert">{homeError()}</p>
+                        </Show>
+                      </div>
                     </section>
                 </div>
             </Show>

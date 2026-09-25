@@ -944,6 +944,9 @@ pub fn browser_routes() -> Router<SharedWorkbench> {
             get(launch_saml_browser_test),
         )
         .route("/auth/saml/acs", post(complete_saml_browser_test))
+        .layer(axum::middleware::from_fn(
+            gaugedesk_app::auth_error_page::render_browser_errors,
+        ))
 }
 
 async fn launch_saml_browser_test(

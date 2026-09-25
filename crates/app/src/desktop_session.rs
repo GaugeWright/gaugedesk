@@ -26,10 +26,25 @@ fn now_ms() -> i64 {
     i64::try_from(crate::account::session_now_ms()).unwrap_or(i64::MAX)
 }
 
-/// Revoke whatever this process last handed its UI.
-fn revoke_held(wb: &SharedWorkbench) {
+/// Which held session: the UI's own, or the one relay crossings are served
+/// under. Two slots, so rotating one never revokes the other's token.
+#[derive(Clone, Copy)]
+enum Slot {
+    Ui,
+    Relay,
+}
+
+fn slot(guard: &mut crate::Workbench, which: Slot) -> &mut Option<DesktopUiSession> {
+    match which {
+        Slot::Ui => &mut guard.desktop_ui_session,
+        Slot::Relay => &mut guard.relay_owner_session,
+    }
+}
+
+/// Revoke whatever this process last handed from one slot.
+fn revoke_held(wb: &SharedWorkbench, which: Slot) {
     let mut guard = wb.lock_unpoisoned();
-    if let Some(held) = guard.desktop_ui_session.take() {
+    if let Some(held) = slot(&mut guard, which).take() {
         guard.revoke_account_session(&held.token);
     }
 }
@@ -39,22 +54,40 @@ fn revoke_held(wb: &SharedWorkbench) {
 /// the signed-in account holds no standing here. Reuses the session it minted
 /// while that still holds; otherwise revokes it and mints another.
 pub fn home_session(wb: &SharedWorkbench) -> Option<String> {
+    session_for(wb, Slot::Ui, None)
+}
+
+/// The Home session a relay crossing is served under once the Hub has said
+/// its bearer is `account`'s (DR-0206): the same session the UI would get,
+/// minted only while this computer is signed in as exactly that account.
+///
+/// Signed in as someone else, or not at all, it is `None`, and the crossing is
+/// refused. The Home acts for a remote caller only as the person signed in at
+/// it, so a sign-out here ends remote access too.
+pub(crate) fn relay_session(wb: &SharedWorkbench, account: &str) -> Option<String> {
+    session_for(wb, Slot::Relay, Some(account))
+}
+
+fn session_for(wb: &SharedWorkbench, which: Slot, account: Option<&str>) -> Option<String> {
     // Read before the guard: this locks the workbench itself.
     let hub = crate::account_signin::hub_standing(wb);
     let now = now_ms();
-    let Some(hub) = hub.filter(|hub| hub.expires_ms > now) else {
-        revoke_held(wb);
+    let Some(hub) = hub
+        .filter(|hub| hub.expires_ms > now)
+        .filter(|hub| account.is_none_or(|account| hub.person == account))
+    else {
+        revoke_held(wb, which);
         return None;
     };
     let standing = Org::rebuild(wb.lock_unpoisoned().store_ref())
         .ok()
         .is_some_and(|org| org.role_of(&hub.person).is_some());
     if !standing {
-        revoke_held(wb);
+        revoke_held(wb, which);
         return None;
     }
     let mut guard = wb.lock_unpoisoned();
-    if let Some(held) = &guard.desktop_ui_session {
+    if let Some(held) = slot(&mut guard, which).clone() {
         // Kept while it is the same sign-in, not near its end, and live here.
         if held.hub == hub
             && held.expires_ms - now > MAX_LIFETIME_MS / 12
@@ -63,7 +96,7 @@ pub fn home_session(wb: &SharedWorkbench) -> Option<String> {
             return Some(held.token.clone());
         }
     }
-    if let Some(held) = guard.desktop_ui_session.take() {
+    if let Some(held) = slot(&mut guard, which).take() {
         guard.revoke_account_session(&held.token);
     }
     let expires_ms = hub.expires_ms.min(now.saturating_add(MAX_LIFETIME_MS));
@@ -71,7 +104,7 @@ pub fn home_session(wb: &SharedWorkbench) -> Option<String> {
         .ok()
         .filter(|s| *s > 0)?;
     let token = guard.mint_account_session(&hub.person, METHOD, lifetime_secs)?;
-    guard.desktop_ui_session = Some(DesktopUiSession {
+    *slot(&mut guard, which) = Some(DesktopUiSession {
         token: token.clone(),
         hub,
         expires_ms,
@@ -79,10 +112,11 @@ pub fn home_session(wb: &SharedWorkbench) -> Option<String> {
     Some(token)
 }
 
-/// Revoke the UI's session now, for a sign-out that should not wait for the
-/// next read.
+/// Revoke both sessions now, for a sign-out that should not wait for the next
+/// read: the UI's, and the one remote crossings were being served under.
 pub fn revoke(wb: &SharedWorkbench) {
-    revoke_held(wb);
+    revoke_held(wb, Slot::Ui);
+    revoke_held(wb, Slot::Relay);
 }
 
 #[cfg(test)]

@@ -72,6 +72,12 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
         )
         .route("/account/settings", get(get_settings))
         .route("/account/settings/{key}", put(put_setting))
+        // Which account a bearer belongs to, for a Home admitting a relay
+        // caller (DR-0206). Answers on the Hub only.
+        .route(
+            "/account/identity",
+            get(crate::account_identity::get_account_identity),
+        )
         .route("/account/homes", get(get_homes).post(post_home))
         .route("/account/homes/selected", put(put_selected_home))
         .route("/account/homes/{id}", delete(delete_home))

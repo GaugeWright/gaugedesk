@@ -36,7 +36,7 @@ const EXPECTED_DIGEST = "181317932e20bf8414ea53e4a35e62c9fe9b8504e3b7ba26e7c3a03
 const REGION_DIGEST = "11b88306966cbe895de213bde90d3f0ca623abd63e1a24ddc23508ac2c8bca71";
 // A digest of this file with the 64 characters below blanked, so it can describe
 // the body it sits in. Written by tools/palette.mjs at render time.
-const SELF_DIGEST = "9339523034cfc8704597ac3c34624a4623911f16a0dd3d424a215842b87e8c14";
+const SELF_DIGEST = "0c0831a6ccfbac617f722ec71a988135a39bf16c60449cfe265c0048c15d48f8";
 const TOKENS_PATH = "web/packages/workbench-ui/src/brand-tokens.css";
 const SCAN_ROOTS = ["web/packages","web/apps","web/lab","ee/web"];
 // "file" — TOKENS_PATH is wholly generated. "block" — the tokens are a rendered
@@ -65,12 +65,10 @@ const BLOCK_END = "/* END GAUGEWRIGHT BRAND TOKENS */";
 // skipping the directory bought nothing and cost the scripts.
 const SKIP_DIRECTORIES = new Set([
   "node_modules",
-  "dist",
-  "dist-embed",
-  "dist-static-edge",
   "target",
   ".git",
 ]);
+const isBuildOutputDirectory = (name) => name === "dist" || name.startsWith("dist-");
 const SOURCE_EXTENSIONS = new Set([".css", ".ts", ".tsx", ".js", ".jsx", ".html", ".svelte"]);
 
 // A file that declares itself a projection is exempt: flattening the tokens to
@@ -218,7 +216,9 @@ function* sourceFiles(dir) {
   }
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      if (!SKIP_DIRECTORIES.has(entry.name)) yield* sourceFiles(path.join(dir, entry.name));
+      if (!SKIP_DIRECTORIES.has(entry.name) && !isBuildOutputDirectory(entry.name)) {
+        yield* sourceFiles(path.join(dir, entry.name));
+      }
     } else if (SOURCE_EXTENSIONS.has(path.extname(entry.name))) {
       yield path.join(dir, entry.name);
     }

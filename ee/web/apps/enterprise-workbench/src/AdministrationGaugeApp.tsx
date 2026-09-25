@@ -2257,8 +2257,14 @@ function AccountPage(props: {
                     <Show when={!invitationPreview.loading} fallback={<p class="gaugeapp-loading">Opening invitation…</p>}>
                         <Show when={!invitationPreview.error && valueRecord(invitationPreview()?.invitation)} fallback={<div><strong>This invitation link cannot be opened.</strong><span>Ask an organization administrator for a new link.</span></div>}>
                             {(preview) => <>
-                                <div><span class="gaugeapp-eyebrow">Organization invitation</span><strong>{text(preview().display_name, "Organization")}</strong><span>Join as {text(preview().role, "member")} · addressed to {text(preview().email, "this recipient")}</span><Show when={!Boolean(preview().account_matches)}><span role="alert">Sign in with the GaugeDesk account that has this verified email to respond.</span></Show></div>
+                                <div><span class="gaugeapp-eyebrow">Organization invitation</span><strong>{text(preview().display_name, "Organization")}</strong><span>Join as {text(preview().role, "member")} · addressed to {text(preview().email, "this recipient")}</span><Show when={!Boolean(preview().account_matches)}><span role="alert">This invitation is for another account. Sign out, sign in with the GaugeDesk account that has this verified email, then open the invitation link again.</span></Show></div>
                                 <div class="gaugeapp-actions">
+                                    {/* Signed in as the wrong account, Accept and Decline are
+                                        disabled; without this the way to the right account was
+                                        a Sessions panel further down the page. */}
+                                    <Show when={!Boolean(preview().account_matches)}>
+                                        <CommandButton command="account.session.revoke-current" commands={props.commands} label="Sign out" payload={{}} onSubmit={props.onSubmit} />
+                                    </Show>
                                     <button type="button" disabled={respondingToInvitation() || !Boolean(preview().can_respond)} onClick={() => void respondToInvitation("decline")}>Decline</button>
                                     <button type="button" class="primary" disabled={respondingToInvitation() || !Boolean(preview().can_respond)} onClick={() => void respondToInvitation("accept")}>{respondingToInvitation() ? "Responding…" : "Accept"}</button>
                                 </div>
