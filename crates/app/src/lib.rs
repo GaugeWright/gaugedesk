@@ -69,6 +69,7 @@ pub mod gaugeapp_agent;
 pub mod gaugeapp_contract;
 pub mod gaugevault_dispatch;
 pub mod gaugevault_intake;
+pub mod gaugevault_outcome;
 pub mod harness_select;
 pub mod home;
 pub mod home_admission;
