@@ -54,7 +54,10 @@ def check_resolved(pin, expected_source, consumer_root=ROOT):
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=runtime, text=True).strip()
     require(commit == pin["public_commit"], "resolved checkout is not the pinned public commit")
     publication = subprocess.check_output(["git", "show", "-s", "--format=%B", "HEAD"], cwd=runtime, text=True)
-    require(pin["source_commit"] in publication, "public snapshot does not name the pinned source commit")
+    # publish-mirror.sh writes the source's short SHA in this fixed footer.
+    # The public commit itself is pinned by its full SHA above.
+    require(re.search(rf"^Curated snapshot of {pin['source_commit'][:8]}\. See ", publication, re.M),
+            "public snapshot does not name the pinned source commit")
     require(subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=runtime).returncode == 0,
             "resolved runtime has modified tracked files")
     bundle = json.loads((runtime / pin["contract_path"]).read_text())

@@ -31,7 +31,6 @@ describe("Administration GaugeApp models", () => {
         expect(parseOrganizationModel(null, "model")).toBeNull();
         const model = parseOrganizationModel(administrationEmptyModels.organization, "model");
         expectTypeOf(model).toEqualTypeOf<ReturnType<typeof parseOrganizationModel>>();
-        expect(model?.kind).toBe("client");
     });
 
     it("requires every organization identity and ownership field", () => {

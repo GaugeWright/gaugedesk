@@ -346,6 +346,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         )
         .route("/chats/{id}/merge-preview", post(er::post_merge_preview))
         .route("/chats/{id}/transcript", get(er::get_transcript))
+        .route("/chats/{id}/model-context", get(er::get_model_context))
         .route("/chats/{id}/choice-cards", get(er::get_choice_cards))
         .route(
             "/chats/{id}/choice-cards/{card_id}/answer",

@@ -12,7 +12,6 @@ const organizationPrincipal = shape({
 });
 export const parseOrganizationModel = nullable(shape({
     display_name: stringValue,
-    kind: oneOf("client", "consultant"),
     owner: nullable(organizationPrincipal),
     ownership_candidates: arrayOf(shape({
         id: stringValue, authority: stringValue, email: stringValue, label: stringValue,

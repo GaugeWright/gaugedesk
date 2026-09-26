@@ -1425,6 +1425,312 @@ pub(crate) async fn get_transcript(
     }
 }
 
+/// A live, privileged view of the actual provider request bodies. The hosted
+/// path stays redacted until the runtime can prove every input's provenance;
+/// chat ownership by itself is not authority to inspect an Agent's method or
+/// tool reads. Nothing from this route is appended to the transcript.
+pub(crate) async fn get_model_context(
+    State(shared): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    fn no_store(status: StatusCode, body: serde_json::Value) -> axum::response::Response {
+        (
+            status,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(body),
+        )
+            .into_response()
+    }
+    let authorize = |wb: &Workbench| -> Result<(), (StatusCode, &'static str)> {
+        let chat = wb
+            .library
+            .chats
+            .get(&id)
+            .ok_or((StatusCode::NOT_FOUND, "chat not found"))?;
+        let project = wb.library.project_of_chat(&id);
+        let actor = wb.admit_data_request(crate::net_http::bearer(&headers), project)?;
+        if chat.owner.as_deref().is_some_and(|owner| owner != actor)
+            || (chat.owner.is_none()
+                && (wb.idp.is_some() || crate::workbench_auth::web_account_mode()))
+        {
+            return Err((StatusCode::FORBIDDEN, "chat context is unavailable"));
+        }
+        Ok(())
+    };
+    let (handle, live) = {
+        let wb = shared.lock_unpoisoned();
+        if let Err((status, message)) = authorize(&wb) {
+            return no_store(status, serde_json::json!({"error": message}));
+        }
+        (
+            crate::engine::running_turn_model_context(&id),
+            crate::engine::turn_is_live(&id),
+        )
+    };
+    let Some(handle) = handle else {
+        return no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "available": false,
+                "reason": if live {
+                    "This runtime does not support raw context."
+                } else {
+                    "No live provider request is available for this chat."
+                }
+            }),
+        );
+    };
+    let captured = tokio::task::spawn_blocking(move || handle()).await;
+    let Ok(Ok(raw)) = captured else {
+        return no_store(
+            StatusCode::OK,
+            serde_json::json!({
+                "available": false, "reason": "No exact provider request is available yet."
+            }),
+        );
+    };
+    let Ok(view) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return no_store(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({"error": "invalid runtime capture"}),
+        );
+    };
+    // Keep the workbench locked from the final admission through projection:
+    // a revocation cannot race between the source check and the response.
+    let wb = shared.lock_unpoisoned();
+    if let Err((status, message)) = authorize(&wb) {
+        return no_store(status, serde_json::json!({"error": message}));
+    }
+    let projection = project_model_context(&view, |source| {
+        if source == "runtime" || source == format!("chat:{id}") {
+            return true;
+        }
+        if let Some(workspace_chat) = source.strip_prefix("workspace:") {
+            return workspace_chat == id
+                && wb.idp.is_none()
+                && !crate::workbench_auth::web_account_mode()
+                && wb.engagements.contains_key(&id);
+        }
+        let Some(package_ref) = source.strip_prefix("package:") else {
+            return false;
+        };
+        // A work package can include method bytes outside the chat's grant.
+        // Only the single-user owner currently has a proven package read.
+        if wb.idp.is_some() || crate::workbench_auth::web_account_mode() {
+            return false;
+        }
+        let Some((version, selected_ref)) = wb.package_selection_for_chat(&id) else {
+            return false;
+        };
+        if selected_ref != package_ref {
+            return false;
+        }
+        wb.package_root_for_chat(&id, version)
+            .and_then(|root| gaugedesk_whip_runtime::AuthoredAgentPackage::load(&root).ok())
+            .is_some_and(|package| package.version_ref() == package_ref)
+    });
+    match projection {
+        Ok(body) => no_store(StatusCode::OK, body),
+        Err(()) => no_store(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({"error": "invalid runtime capture"}),
+        ),
+    }
+}
+
+fn project_model_context(
+    view: &serde_json::Value,
+    authorized_source: impl Fn(&str) -> bool,
+) -> Result<serde_json::Value, ()> {
+    let calls = view
+        .get("calls")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    let incomplete = view
+        .get("incomplete")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(())?;
+    let mut projected = Vec::with_capacity(calls.len());
+    for call in calls {
+        let ordinal = call
+            .get("ordinal")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(())?;
+        let body = call.get("body").ok_or(())?;
+        let authorized = call.get("provenance_complete") == Some(&serde_json::Value::Bool(true))
+            && call.get("ordered_provenance").is_some_and(|labels| {
+                let Some(object) = labels.as_object() else {
+                    return false;
+                };
+                if object.len() != 2 {
+                    return false;
+                }
+                let Some(messages) = object.get("messages").and_then(serde_json::Value::as_array)
+                else {
+                    return false;
+                };
+                !messages.is_empty()
+                    && messages
+                        .iter()
+                        .chain(object.get("tools"))
+                        .all(|label| authorized_model_source_label(label, &authorized_source))
+                    && object.contains_key("tools")
+            });
+        if authorized {
+            projected.push(serde_json::json!({ "ordinal": ordinal, "body": body }));
+        } else {
+            projected.push(serde_json::json!({
+                "ordinal": ordinal,
+                "redacted": true,
+                "reason": "Current access to every model input source could not be proven."
+            }));
+        }
+    }
+    Ok(serde_json::json!({
+        "available": true,
+        "calls": projected,
+        "incomplete": incomplete
+    }))
+}
+
+fn authorized_model_source_label(
+    label: &serde_json::Value,
+    authorized_source: &impl Fn(&str) -> bool,
+) -> bool {
+    let Some(object) = label.as_object() else {
+        return false;
+    };
+    if object.len() != 2 || object.get("complete") != Some(&serde_json::Value::Bool(true)) {
+        return false;
+    }
+    object
+        .get("source_handles")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|handles| {
+            handles
+                .iter()
+                .all(|handle| handle.as_str().is_some_and(authorized_source))
+        })
+}
+
+#[cfg(test)]
+mod raw_model_context_tests {
+    use super::project_model_context;
+    use crate::{
+        library::{ChatRecord, RecordOp, LIBRARY_RECORD_SCHEMA},
+        LockUnpoisoned,
+    };
+    use axum::{
+        extract::{Path, State},
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+    };
+
+    #[test]
+    fn unknown_provenance_releases_no_prompt_or_source_handle() {
+        let view = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {"input": "private prompt"},
+                "source_handles": ["private source"],
+                "provenance_complete": false
+            }],
+            "incomplete": false,
+            "future_private_field": "private metadata"
+        });
+        let projection = project_model_context(&view, |_| true).unwrap();
+        let output = projection.to_string();
+        assert!(!output.contains("private prompt"));
+        assert!(!output.contains("private source"));
+        assert!(!output.contains("private metadata"));
+        assert_eq!(projection["calls"][0]["redacted"], true);
+    }
+
+    #[test]
+    fn malformed_capture_is_refused() {
+        let view = serde_json::json!({"calls": [{"body": "secret"}], "incomplete": false});
+        assert!(project_model_context(&view, |_| true).is_err());
+    }
+
+    #[test]
+    fn release_requires_current_access_to_every_labeled_source() {
+        let view = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {"messages": ["private method", "user prompt"]},
+                "ordered_provenance": {
+                    "messages": [
+                        {"source_handles": ["package:pinned"], "complete": true},
+                        {"source_handles": ["chat:one"], "complete": true}
+                    ],
+                    "tools": {"source_handles": ["package:pinned"], "complete": true}
+                },
+                "provenance_complete": true,
+                "secret_metadata": "must not leave"
+            }],
+            "incomplete": false
+        });
+        let visible = project_model_context(&view, |_| true).unwrap();
+        assert_eq!(visible["calls"][0]["body"], view["calls"][0]["body"]);
+        assert!(!visible.to_string().contains("package:pinned"));
+        assert!(!visible.to_string().contains("secret_metadata"));
+
+        let revoked = project_model_context(&view, |source| source == "chat:one").unwrap();
+        assert_eq!(revoked["calls"][0]["redacted"], true);
+        assert!(!revoked.to_string().contains("private method"));
+
+        let mut unknown = view;
+        unknown["calls"][0]["ordered_provenance"]["tools"]["complete"] = false.into();
+        let redacted = project_model_context(&unknown, |_| true).unwrap();
+        assert_eq!(redacted["calls"][0]["redacted"], true);
+
+        unknown["calls"][0]["ordered_provenance"]["tools"]["complete"] = true.into();
+        unknown["calls"][0]["ordered_provenance"]["future_input_plane"] =
+            serde_json::json!({"source_handles": ["private"], "complete": true});
+        let redacted = project_model_context(&unknown, |_| true).unwrap();
+        assert_eq!(redacted["calls"][0]["redacted"], true);
+    }
+
+    #[tokio::test]
+    async fn live_route_refuses_another_chats_owner_and_never_caches() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        {
+            let mut guard = wb.lock_unpoisoned();
+            let instance_id = guard.default_instance.clone();
+            guard.write_chat_record(ChatRecord {
+                id: "private-chat".into(),
+                op: RecordOp::Upsert,
+                instance_id,
+                title: "Private".into(),
+                created_position: 0,
+                forked_from: None,
+                forked_from_entry: None,
+                forked_from_cut: None,
+                owner: Some("another-person".into()),
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            });
+        }
+        let denied = super::get_model_context(
+            State(wb.clone()),
+            Path("private-chat".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(denied.headers()["cache-control"], "no-store");
+
+        let unavailable =
+            super::get_model_context(State(wb), Path("missing-chat".into()), HeaderMap::new())
+                .await
+                .into_response();
+        assert_eq!(unavailable.status(), StatusCode::NOT_FOUND);
+    }
+}
+
 pub(crate) async fn get_choice_cards(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,

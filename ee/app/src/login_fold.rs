@@ -471,7 +471,6 @@ mod tests {
             verified_domains: vec!["acme.example".into()],
             pending_domains: Vec::new(),
             default_region: None,
-            kind: Default::default(),
         };
         let mut connection = SsoConnectionRecord {
             id: ORG_ID.into(),

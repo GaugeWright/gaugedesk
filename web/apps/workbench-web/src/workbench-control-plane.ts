@@ -1700,6 +1700,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.getTranscript(this.workbenchTransport(), id);
     }
 
+    getModelContext(id: EngagementId): Promise<workbenchClient.LiveModelContext> {
+        return workbenchClient.getModelContext(this.workbenchTransport(), id);
+    }
+
     getContextUsage(id: EngagementId): Promise<workbenchClient.ChatContextUsage | null> {
         return workbenchClient.getContextUsage(this.workbenchTransport(), id);
     }

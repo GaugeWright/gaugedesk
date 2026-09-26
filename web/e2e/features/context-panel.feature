@@ -9,7 +9,7 @@ Feature: Context sources panel (O-1)
 
   Scenario: an attached folder appears as a context source
     Given a new engagement
-    When I attach the context folder "/home/jack/code/gaugedesk/plugin"
+    When I attach the context folder "plugin"
     When I open the context sources panel
     Then the context sources panel lists a "context" source
     And the context source is marked "available"

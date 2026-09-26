@@ -51,6 +51,7 @@ struct LiveTurn {
     /// precheck, the workbench lock, the harness build — which is exactly the
     /// stretch a person presses Stop in, having just changed their mind.
     interrupt: Option<InterruptHandle>,
+    model_context: Option<gaugedesk_harness::ModelContextHandle>,
     /// Whether a Stop was asked for. Recorded against the *claim*, which exists
     /// for the whole turn, rather than against the handle, which does not: an
     /// intent that outlives the moment it arrived in is honoured by whichever
@@ -141,6 +142,21 @@ pub fn running_turn_interrupt(id: &str) -> Option<InterruptHandle> {
         .lock_unpoisoned()
         .get(id)
         .and_then(|live| live.interrupt.clone())
+}
+
+pub(crate) fn running_turn_model_context(
+    id: &str,
+) -> Option<gaugedesk_harness::ModelContextHandle> {
+    running_turns()
+        .lock_unpoisoned()
+        .get(id)
+        .and_then(|live| live.model_context.clone())
+}
+
+fn bind_turn_model_context(id: &str, handle: gaugedesk_harness::ModelContextHandle) {
+    if let Some(live) = running_turns().lock_unpoisoned().get_mut(id) {
+        live.model_context = Some(handle);
+    }
 }
 
 /// Record that this chat's live turn is to be stopped, and hand back its
@@ -3186,6 +3202,7 @@ fn drive_persistent_turn(
         // different authenticated member than the one who created its harness.
         harness.bind_authenticated_actor(actor_ref);
         harness.bind_runtime_command_id(runtime_command_id);
+        harness.bind_user_context_provenance(answers.is_empty());
         let task_filer: Option<Arc<dyn TaskFiler>> =
             match (task_action_context, task_tracker_project) {
                 (Some(context), Some(project)) => Some(Arc::new(CurrentProjectTaskFiler {
@@ -3244,6 +3261,9 @@ fn drive_persistent_turn(
         // turn is live, so an uninterruptible one is still visible (ADR 0138 §6).
         if let Some(interrupt) = harness.interrupt_handle() {
             bind_turn_interrupt(id, interrupt);
+        }
+        if let Some(handle) = harness.model_context_handle() {
+            bind_turn_model_context(id, handle);
         }
         // The last checkpoint, and the only one past the bind: a turn stopped
         // while it waited for another turn's harness lock must not now go and

@@ -1526,6 +1526,28 @@ export async function getTranscript(
     return (await transport.json("GET", `/chats/${id}/transcript`)) as StreamEvent[];
 }
 
+export interface ModelContextCall {
+    readonly ordinal: number;
+    readonly body?: unknown;
+    readonly redacted?: boolean;
+    readonly reason?: string;
+}
+
+export interface LiveModelContext {
+    readonly available: boolean;
+    readonly reason?: string;
+    readonly calls?: readonly ModelContextCall[];
+    readonly incomplete?: boolean;
+}
+
+/** A live view only; the runtime discards request bodies when the turn ends. */
+export async function getModelContext(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+): Promise<LiveModelContext> {
+    return (await transport.json("GET", `/chats/${encodeURIComponent(id)}/model-context`)) as LiveModelContext;
+}
+
 export interface ChoiceOption {
     readonly id: string;
     readonly label: string;

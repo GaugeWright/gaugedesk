@@ -1005,7 +1005,6 @@ fn project_page(
                 });
             json!({
                 "display_name": record.display_name,
-                "kind": record.kind,
                 "owner": owner,
                 "ownership_candidates": org.members.values().filter(|member| {
                     member.status == MembershipStatus::Active
@@ -7635,13 +7634,14 @@ mod tests {
             verified_domains: vec!["example.test".into()],
             pending_domains: Vec::new(),
             default_region: Some("eu".into()),
-            kind: gaugedesk_app::org::OrgKind::Consultant,
         };
+        let mut historical = serde_json::to_value(&original).unwrap();
+        historical["kind"] = json!("consultant");
         shared
             .lock()
             .unwrap()
             .store_mut()
-            .append_record("org", "org", &serde_json::to_string(&original).unwrap())
+            .append_record("org", "org", &historical.to_string())
             .unwrap();
         let session = open(&app).await;
         let organization = session["pages"]
@@ -7687,7 +7687,7 @@ mod tests {
         assert_eq!(record.display_name, "Expert Group");
         assert_eq!(record.verified_domains, vec!["example.test"]);
         assert_eq!(record.default_region.as_deref(), Some("eu"));
-        assert_eq!(record.kind, gaugedesk_app::org::OrgKind::Consultant);
+        assert!(serde_json::to_value(&record).unwrap().get("kind").is_none());
     }
 
     #[tokio::test]
@@ -7970,7 +7970,6 @@ mod tests {
             verified_domains: vec!["acme.example".into(), "keep.example".into()],
             pending_domains: Vec::new(),
             default_region: Some("us".into()),
-            kind: gaugedesk_app::org::OrgKind::Client,
         };
         shared
             .lock()
@@ -8448,7 +8447,6 @@ mod tests {
             verified_domains: vec!["keep.example".into()],
             pending_domains: vec!["mistyped.example".into()],
             default_region: None,
-            kind: gaugedesk_app::org::OrgKind::Client,
         };
         shared
             .lock()

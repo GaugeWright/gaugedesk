@@ -266,6 +266,11 @@ pub struct WorkspaceTargetBinding {
 /// registered before the turn blocked.
 pub type InterruptHandle = Arc<dyn Fn() + Send + Sync>;
 
+/// A privileged, out-of-band read of the current provider request capture.
+/// The product must authorize the person before invoking this handle. A
+/// missing capture is reported by the adapter, never reconstructed here.
+pub type ModelContextHandle = Arc<dyn Fn() -> std::io::Result<String> + Send + Sync>;
+
 /// Product implementation of a package-declared external tool. The first
 /// argument is the durable turn/call identity; a successful return is the
 /// tool's receipt and must follow persistence of its effect.
@@ -286,6 +291,10 @@ pub trait Harness: Send {
     /// schedulers use this so crash/retry addresses the same WhippleScript
     /// command and receipt instead of minting a second effect.
     fn bind_runtime_command_id(&mut self, _command_id: Option<&str>) {}
+
+    /// The shell may prepend answer context to this turn's user text. The
+    /// runtime cannot attest that input as chat-owned when that happens.
+    fn bind_user_context_provenance(&mut self, _complete: bool) {}
 
     /// Bind the Home's current, authenticated project-task filing operation for
     /// this turn. The adapter never derives tracker authority from a package.
@@ -322,6 +331,9 @@ pub trait Harness: Send {
                 .arg(pid.to_string())
                 .status();
         }))
+    }
+    fn model_context_handle(&self) -> Option<ModelContextHandle> {
+        None
     }
     /// Terminate the harness, consuming it.
     fn shutdown(self: Box<Self>) -> io::Result<()> {

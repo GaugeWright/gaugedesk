@@ -375,6 +375,7 @@ mod tests {
                     url: "https://example.test".into(),
                     headers: Vec::new(),
                     body: serde_json::json!({ "model": model }),
+                    model_provenance: None,
                 })
                 .unwrap();
             let requests = inner.0.lock().unwrap();
@@ -433,6 +434,7 @@ mod tests {
                 url: "https://model.example/v1/chat/completions".into(),
                 headers: Vec::new(),
                 body: serde_json::json!({ "model": "custom-model" }),
+                model_provenance: None,
             })
             .unwrap();
         assert_eq!(

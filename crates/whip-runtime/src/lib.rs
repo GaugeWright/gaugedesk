@@ -22,8 +22,8 @@ use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
 use gaugedesk_harness::sandbox::Network;
 use gaugedesk_harness::{
     ContextWindowReading, CredentialCapability, CredentialProbe, EgressGate, Harness,
-    HarnessContinuitySpec, HarnessFactory, HarnessSpec, ImageContent, Observation, OutputFieldFlow,
-    RuntimePosition, TaskFiler, ToolInfo, TurnOutcome,
+    HarnessContinuitySpec, HarnessFactory, HarnessSpec, ImageContent, ModelContextHandle,
+    Observation, OutputFieldFlow, RuntimePosition, TaskFiler, ToolInfo, TurnOutcome,
 };
 pub use whipplescript::gov::{
     external_signing_bytes, external_signing_bytes_v2, ExternalAttestation,
@@ -50,6 +50,9 @@ pub use whipplescript::host_runtime::{
 /// WhippleScript's information-flow surface, re-exported so a host can parse and
 /// check the governance envelopes it ships rather than trusting their text.
 pub use whipplescript::ifc;
+use whipplescript_kernel::sansio::{
+    InitialModelProvenance, ModelContentProvenance, ModelRequestProvenance,
+};
 
 /// One compiled WhippleScript program, with its diagnostics flattened to
 /// messages so callers do not need the parser's diagnostic type.
@@ -1512,7 +1515,12 @@ impl WhipHarnessFactory {
     ) -> OpenInstanceCommand {
         OpenInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),
-            request_id: format!("gaugedesk:{chat_id}:{package_version_ref}"),
+            // A replayed open must name the same immutable policy. A later turn
+            // can gain a tracker or change authority, which advances the epoch.
+            request_id: format!(
+                "gaugedesk:{chat_id}:{package_version_ref}:policy:{}:{}",
+                policy.epoch, policy.envelope_hash
+            ),
             package_version_ref: package_version_ref.to_owned(),
             policy,
         }
@@ -1572,10 +1580,12 @@ impl WhipHarnessFactory {
         let upgrade = ForkInstanceCommand {
             protocol: HOST_PROTOCOL.to_owned(),
             request_id: format!(
-                "gaugedesk:package-upgrade:{}:{}:{}",
+                "gaugedesk:package-upgrade:{}:{}:{}:policy:{}:{}",
                 spec.chat_id,
                 packages.previous.version_ref,
-                package.version_ref()
+                package.version_ref(),
+                open.policy.epoch,
+                open.policy.envelope_hash
             ),
             source: source_position,
             target_request_id: open.request_id,
@@ -1624,6 +1634,8 @@ impl WhipHarnessFactory {
             provider,
             workspace,
             chat_id: spec.chat_id.clone(),
+            mode: spec.mode,
+            runtime_store_path: chat_runtime_database(&self.runtime_root, &spec.chat_id),
             provider_binding_ref: spec.provider_binding_ref.clone().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1641,6 +1653,7 @@ impl WhipHarnessFactory {
                 )
             })?,
             respondent_ref: self.authority.as_str().to_owned(),
+            user_context_complete: true,
             turn_sequence: 0,
             next_command_id: None,
             task_filer: None,
@@ -1649,6 +1662,7 @@ impl WhipHarnessFactory {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             pursuing_cancel: Arc::new(AtomicBool::new(false)),
             organization_model_broker: self.organization_model_broker.clone(),
+            native_model_context: Arc::new(Mutex::new(NativeModelContext::default())),
         })
     }
 }
@@ -1837,11 +1851,14 @@ struct WhipHarness {
     provider: ProviderConfig,
     workspace: NativeWorkspaceResolver,
     chat_id: String,
+    mode: gaugedesk_harness::ChatMode,
+    runtime_store_path: PathBuf,
     provider_binding_ref: String,
     credential_ref: String,
     workspace_targets: Vec<gaugedesk_harness::WorkspaceTargetBinding>,
     placement_ceiling_ref: String,
     respondent_ref: String,
+    user_context_complete: bool,
     turn_sequence: u64,
     next_command_id: Option<String>,
     task_filer: Option<Arc<dyn TaskFiler>>,
@@ -1858,6 +1875,100 @@ struct WhipHarness {
     /// does not start a second one.
     pursuing_cancel: Arc<AtomicBool>,
     organization_model_broker: Option<OrganizationModelBrokerConfig>,
+    native_model_context: Arc<Mutex<NativeModelContext>>,
+}
+
+const NATIVE_MODEL_CONTEXT_LIMIT: usize = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct NativeModelContext {
+    active: bool,
+    calls: Vec<serde_json::Value>,
+    bytes: usize,
+    incomplete: bool,
+}
+
+impl NativeModelContext {
+    fn observe(&mut self, body: &serde_json::Value, provenance: Option<&ModelRequestProvenance>) {
+        if !self.active || self.incomplete {
+            return;
+        }
+        let Ok(size) = serde_json::to_vec(body).map(|bytes| bytes.len()) else {
+            self.incomplete = true;
+            return;
+        };
+        if self.bytes.saturating_add(size) > NATIVE_MODEL_CONTEXT_LIMIT {
+            self.incomplete = true;
+            return;
+        }
+        self.bytes += size;
+        let complete = provenance.is_some_and(|labels| {
+            labels.messages.iter().all(|label| label.complete) && labels.tools.complete
+        });
+        self.calls.push(serde_json::json!({
+            "ordinal": self.calls.len(),
+            "body": body,
+            "ordered_provenance": provenance,
+            "provenance_complete": complete
+        }));
+    }
+}
+
+struct ActiveNativeModelContext(Arc<Mutex<NativeModelContext>>);
+
+impl Drop for ActiveNativeModelContext {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = NativeModelContext::default();
+    }
+}
+
+#[cfg(test)]
+mod native_model_context_tests {
+    use super::{ActiveNativeModelContext, NativeModelContext};
+    use std::sync::{Arc, Mutex};
+    use whipplescript_kernel::sansio::{ModelContentProvenance, ModelRequestProvenance};
+
+    #[test]
+    fn ordered_bodies_disappear_when_the_turn_ends() {
+        let state = Arc::new(Mutex::new(NativeModelContext {
+            active: true,
+            ..NativeModelContext::default()
+        }));
+        {
+            let _turn = ActiveNativeModelContext(Arc::clone(&state));
+            let mut capture = state.lock().unwrap();
+            capture.observe(&serde_json::json!({"messages": ["first"]}), None);
+            let labels = ModelRequestProvenance {
+                messages: vec![ModelContentProvenance {
+                    source_handles: vec!["chat:one".to_owned()],
+                    complete: true,
+                }],
+                tools: ModelContentProvenance {
+                    source_handles: vec!["runtime".to_owned()],
+                    complete: true,
+                },
+            };
+            capture.observe(
+                &serde_json::json!({"messages": ["first", "tool result"]}),
+                Some(&labels),
+            );
+            assert_eq!(capture.calls[0]["ordinal"], 0);
+            assert_eq!(capture.calls[1]["ordinal"], 1);
+            assert_eq!(capture.calls[1]["body"]["messages"][1], "tool result");
+            assert_eq!(capture.calls[0]["provenance_complete"], false);
+            assert_eq!(capture.calls[1]["provenance_complete"], true);
+            assert_eq!(
+                capture.calls[1]["ordered_provenance"]["messages"][0]["source_handles"][0],
+                "chat:one"
+            );
+        }
+        let capture = state.lock().unwrap();
+        assert!(!capture.active);
+        assert!(capture.calls.is_empty());
+    }
 }
 
 impl Harness for WhipHarness {
@@ -1869,6 +1980,10 @@ impl Harness for WhipHarness {
 
     fn bind_runtime_command_id(&mut self, command_id: Option<&str>) {
         self.next_command_id = command_id.map(str::to_owned);
+    }
+
+    fn bind_user_context_provenance(&mut self, complete: bool) {
+        self.user_context_complete = complete;
     }
 
     fn bind_task_filer(&mut self, filer: Option<Arc<dyn TaskFiler>>) {
@@ -1901,6 +2016,7 @@ impl Harness for WhipHarness {
         let command = self.new_turn_command(prompt, images, nonce, admitted_command_id);
         let resources = TurnResources {
             workspace: &self.workspace,
+            chat_id: &self.chat_id,
             images,
             task_filer: self.task_filer.as_deref(),
             asked: std::cell::RefCell::new(Vec::new()),
@@ -1916,6 +2032,21 @@ impl Harness for WhipHarness {
         // turn is an ordinary turn; an agent that needs a person files a task
         // and the answer arrives as the next turn's context.
         self.install_cancellation(&command);
+        let _native_context_guard = if self.organization_model_broker.is_none() {
+            let mut state = self
+                .native_model_context
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *state = NativeModelContext {
+                active: true,
+                ..NativeModelContext::default()
+            };
+            Some(ActiveNativeModelContext(Arc::clone(
+                &self.native_model_context,
+            )))
+        } else {
+            None
+        };
         let package = ProjectTaskPackage {
             inner: &self.package,
             recipients: self
@@ -1923,6 +2054,7 @@ impl Harness for WhipHarness {
                 .as_ref()
                 .map_or_else(Vec::new, |filer| filer.assignable_recipients()),
         };
+        let model_provenance = self.initial_model_provenance(&command);
         let execution = match &self.organization_model_broker {
             Some(broker) => self.runtime.run_turn_with_driver(
                 &command,
@@ -1931,9 +2063,23 @@ impl Harness for WhipHarness {
                 &resources,
                 &OrganizationModelHostDriver(broker),
             ),
-            None => self
-                .runtime
-                .run_turn(&command, &package, &self.provider, &resources),
+            None => {
+                let capture = Arc::clone(&self.native_model_context);
+                self.runtime
+                    .run_turn_observing_model_requests_with_provenance(
+                        &command,
+                        &package,
+                        &self.provider,
+                        &resources,
+                        &model_provenance,
+                        &move |body, provenance| {
+                            capture
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .observe(body, provenance);
+                        },
+                    )
+            }
         }
         .map_err(turn_failure);
         self.clear_cancellation();
@@ -1997,9 +2143,69 @@ impl Harness for WhipHarness {
             pursue_cancellation(&cancellation, &pursuing);
         }))
     }
+
+    fn model_context_handle(&self) -> Option<ModelContextHandle> {
+        if self.organization_model_broker.is_some() {
+            return None;
+        }
+        let capture = Arc::clone(&self.native_model_context);
+        Some(Arc::new(move || {
+            let state = capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.active {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no live model context",
+                ));
+            }
+            serde_json::to_string(&serde_json::json!({
+                "calls": state.calls,
+                "incomplete": state.incomplete
+            }))
+            .map_err(io::Error::other)
+        }))
+    }
 }
 
 impl WhipHarness {
+    fn initial_model_provenance(&self, command: &StartTurnCommand) -> InitialModelProvenance {
+        let chat = format!("chat:{}", self.chat_id);
+        let package = if self.mode == gaugedesk_harness::ChatMode::Use {
+            format!("package:{}", command.package_version_ref)
+        } else {
+            "runtime".to_owned()
+        };
+        let known = |handles: Vec<String>| ModelContentProvenance {
+            source_handles: handles,
+            complete: true,
+        };
+        let mut system = known(vec![package.clone(), chat.clone()]);
+        // The runtime can add catalogue entries to the system context. Until
+        // each entry has its own source witness, an installed skill makes the
+        // whole system plane unknown.
+        let skills_known_empty =
+            whipplescript_store::SqliteStore::open_read_only(&self.runtime_store_path)
+                .and_then(|store| store.list_skills())
+                .is_ok_and(|skills| skills.is_empty());
+        if !skills_known_empty {
+            system.complete = false;
+        }
+        InitialModelProvenance {
+            system,
+            user: ModelContentProvenance {
+                source_handles: vec![chat.clone()],
+                complete: self.user_context_complete,
+            },
+            world: known(vec![
+                package.clone(),
+                chat.clone(),
+                format!("workspace:{}", self.chat_id),
+            ]),
+            tools: known(vec![package, chat]),
+        }
+    }
+
     fn new_turn_command(
         &self,
         prompt: &str,
@@ -2044,7 +2250,9 @@ impl WhipHarness {
                 handle: "tasks".to_owned(),
                 kind: "tracker".to_owned(),
                 selector: None,
-                writable: Some(true),
+                // `writable` attenuates file_store writes only. The tracker
+                // tool is admitted by this resource and the bound TaskFiler.
+                writable: None,
             });
         }
         StartTurnCommand {
@@ -2870,6 +3078,7 @@ impl SecretResolver for ProviderConfig {
 
 struct TurnResources<'a> {
     workspace: &'a NativeWorkspaceResolver,
+    chat_id: &'a str,
     images: &'a [ImageContent],
     task_filer: Option<&'a dyn TaskFiler>,
     /// Questions asked during this turn. Interior mutability because
@@ -2890,6 +3099,34 @@ struct TurnResources<'a> {
 }
 
 impl ResourceResolver for TurnResources<'_> {
+    fn model_output_provenance(
+        &self,
+        _admitted_resources: &[ResourceRef],
+        call: &ToolCall,
+    ) -> ModelContentProvenance {
+        if call.name == "ask" {
+            // Its returned acknowledgement is fixed runtime text. The
+            // question arguments already inherit the model's input labels.
+            ModelContentProvenance {
+                source_handles: vec!["runtime".to_owned()],
+                complete: true,
+            }
+        } else if matches!(
+            call.name.as_str(),
+            "read" | "write" | "edit" | "ls" | "find" | "grep" | "bash"
+        ) {
+            // These native tools are confined to the admitted workspace
+            // snapshot (including virtual Bashkit). A single-user reader can
+            // authorize that workspace as one source; a shared reader cannot.
+            ModelContentProvenance {
+                source_handles: vec![format!("workspace:{}", self.chat_id)],
+                complete: true,
+            }
+        } else {
+            ModelContentProvenance::default()
+        }
+    }
+
     fn resolve_image(&self, image: &ResourceRef) -> Result<ResolvedImage, String> {
         if image.handle != "turn_images" || image.kind != "image" {
             return Err("image ref is outside the admitted turn-image capability".to_owned());
@@ -2922,7 +3159,7 @@ impl ResourceResolver for TurnResources<'_> {
             if !admitted_resources.iter().any(|resource| {
                 resource.handle == "tasks"
                     && resource.kind == "tracker"
-                    && resource.writable == Some(true)
+                    && resource.writable.is_none()
             }) {
                 return Err("turn has no admitted project task tracker".to_owned());
             }
@@ -3359,6 +3596,7 @@ mod tests {
         let mut sink = |_observation: &gaugedesk_harness::Observation| {};
         let resources = super::TurnResources {
             workspace: &workspace,
+            chat_id: "test-chat",
             images: &[],
             task_filer: Some(&filer),
             asked: std::cell::RefCell::new(Vec::new()),
@@ -3372,13 +3610,26 @@ mod tests {
             name: "add_todo".into(),
             arguments: serde_json::json!({"content":"Test task"}),
         };
+        assert!(!resources.model_output_provenance(&[], &call).complete);
+        assert_eq!(
+            resources
+                .model_output_provenance(
+                    &[],
+                    &super::ToolCall {
+                        name: "read".into(),
+                        ..call.clone()
+                    }
+                )
+                .source_handles,
+            vec!["workspace:test-chat".to_owned()]
+        );
         assert!(resources.execute_tool(&[], &call).is_err());
         assert!(filer.0.lock().unwrap().is_empty());
         let admitted = super::ResourceRef {
             handle: "tasks".into(),
             kind: "tracker".into(),
             selector: None,
-            writable: Some(true),
+            writable: None,
         };
         assert_eq!(
             resources.execute_tool(&[admitted], &call).unwrap(),
@@ -3400,7 +3651,7 @@ mod tests {
                         handle: "tasks".into(),
                         kind: "tracker".into(),
                         selector: None,
-                        writable: Some(true),
+                        writable: None,
                     }],
                     &assigned
                 )
@@ -3426,7 +3677,7 @@ mod tests {
                     handle: "tasks".into(),
                     kind: "tracker".into(),
                     selector: None,
-                    writable: Some(true),
+                    writable: None,
                 }],
                 &invalid
             )
@@ -3579,6 +3830,7 @@ mod tests {
             };
             let resources = super::TurnResources {
                 workspace: &workspace,
+                chat_id: "test-chat",
                 images: &[],
                 task_filer: None,
                 asked: std::cell::RefCell::new(Vec::new()),
@@ -3789,6 +4041,7 @@ mod tests {
                 "model": ORGANIZATION_MODEL_CANARY_MODEL,
                 "input": "Return the bounded GaugeWright production canary response."
             }),
+            model_provenance: None,
         };
         assert_eq!(
             admit_organization_model_request(
@@ -4498,11 +4751,13 @@ workflow Method {
             }
         }
         first.bind_task_filer(Some(Arc::new(AdmittedTask)));
-        assert!(first
-            .new_turn_command("question", &[], 1, None)
-            .resources
-            .iter()
-            .any(|resource| resource.handle == "tasks" && resource.kind == "tracker"));
+        let task_turn = first.new_turn_command("question", &[], 1, None);
+        task_turn
+            .validate()
+            .expect("tracker is a valid host resource");
+        assert!(task_turn.resources.iter().any(|resource| {
+            resource.handle == "tasks" && resource.kind == "tracker" && resource.writable.is_none()
+        }));
         assert_eq!(first.package.version_ref(), package_ref);
         assert!(!first
             .package
@@ -4531,6 +4786,19 @@ workflow Method {
         drop(first);
         let reopened = factory.create_harness(&spec).expect("reopened harness");
         assert_eq!(reopened.instance_ref, instance);
+        let mut changed_policy = spec.clone();
+        changed_policy.policy_epoch = Some(2);
+        let changed = factory
+            .create_harness(&changed_policy)
+            .expect("new policy epoch opens a new instance");
+        assert_ne!(changed.instance_ref, instance);
+        assert_eq!(
+            factory
+                .create_harness(&changed_policy)
+                .expect("replay under the new epoch")
+                .instance_ref,
+            changed.instance_ref
+        );
         let exact_source_position = reopened
             .runtime
             .current_position(&reopened.instance_ref)

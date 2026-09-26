@@ -781,7 +781,6 @@ function OrganizationPageReady(props: {
             <Show when={editingName()} fallback={
                 <div class="gaugeapp-identity-summary">
                     <Fact label="Display name" value={model().display_name || "Organization not configured"} />
-                    <Fact label="Type" value={model().kind} />
                     <Fact
                         label="Owner"
                         value={model().owner?.label ?? "Owner unavailable"}

@@ -45,7 +45,6 @@ export interface OrgSettings {
     readonly display_name: string;
     readonly verified_domains: string[];
     readonly default_region?: string | null;
-    readonly kind: "client" | "consultant";
 }
 /** A directory member (B11). */
 export interface Member {

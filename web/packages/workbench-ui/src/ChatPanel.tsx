@@ -6,7 +6,8 @@
  * attachment controls). Remote/audience environments use the panel's default
  * Session-backed composer. The panel shell and transcript are shared either way.
  */
-import {createEffect, createSignal, on, onCleanup, Show, type JSX} from "solid-js";
+import {createEffect, createSignal, For, on, onCleanup, Show, type JSX} from "solid-js";
+import type { LiveModelContext } from "@gaugewright/control-plane-client";
 import { ChatComposer, type ComposerMode } from "./ChatComposer";
 import { createTranscriptScroll } from "./transcript-scroll";
 import { Icon } from "./icons";
@@ -105,6 +106,8 @@ export interface ChatPanelProps {
     /** Context-window usage for the composer's meter. Hosts that cannot
      *  measure it leave it undefined and the meter is honestly absent. */
     readonly context?: ContextUsage;
+    readonly rawMode?: boolean;
+    readonly rawContext?: LiveModelContext;
 }
 
 export function SessionComposer(props: {
@@ -327,18 +330,52 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 data-pending-send={props.pendingSend}
             >
                 <div class="transcript-body" ref={scroll.bodyRef}>
-                    <TranscriptView
-                        lines={lines()}
-                        agentName={props.agentName}
-                        onOpen={session().selectFile}
-                        prefs={props.prefs}
-                        onResolveCredential={props.onResolveCredential}
-                        onFork={session().forkAt}
-                        choiceCards={choiceCards()}
-                        onAnswerChoice={session().api.answerChoiceCard ? answerChoice : undefined}
-                    />
-                    <TurnActivity session={session()} agentName={props.agentName} />
-                    {props.transcriptTail}
+                    <Show when={props.rawMode} fallback={
+                        <>
+                            <TranscriptView
+                                lines={lines()}
+                                agentName={props.agentName}
+                                onOpen={session().selectFile}
+                                prefs={props.prefs}
+                                onResolveCredential={props.onResolveCredential}
+                                onFork={session().forkAt}
+                                choiceCards={choiceCards()}
+                                onAnswerChoice={session().api.answerChoiceCard ? answerChoice : undefined}
+                            />
+                            <TurnActivity session={session()} agentName={props.agentName} />
+                            {props.transcriptTail}
+                        </>
+                    }>
+                        <section class="raw-model-context" aria-label="Raw model context">
+                            <h2>Raw context</h2>
+                            <p class="raw-model-context-note">Live provider requests. This view clears when the turn ends.</p>
+                            <Show when={props.rawContext?.available} fallback={
+                                <p class="raw-model-context-status" role="status">
+                                    {props.rawContext?.reason ?? "Checking for a live provider request…"}
+                                </p>
+                            }>
+                                <Show when={props.rawContext?.incomplete}>
+                                    <p class="raw-model-context-status">Capture is incomplete.</p>
+                                </Show>
+                                <Show when={props.rawContext?.calls?.some((call) => call.redacted)}>
+                                    <p class="raw-model-context-status">This view is incomplete because some model input is redacted.</p>
+                                </Show>
+                                <For each={props.rawContext?.calls ?? []}>{(call) =>
+                                    <article class="raw-model-context-call">
+                                        <h3>Model call {call.ordinal + 1}</h3>
+                                        <Show when={!call.redacted} fallback={
+                                            <p class="raw-model-context-redacted">[Redacted] {call.reason}</p>
+                                        }>
+                                            <pre>{JSON.stringify(call.body, null, 2)}</pre>
+                                        </Show>
+                                    </article>
+                                }</For>
+                                <Show when={!props.rawContext?.calls?.length}>
+                                    <p class="raw-model-context-status">Waiting for the model’s first request…</p>
+                                </Show>
+                            </Show>
+                        </section>
+                    </Show>
                 </div>
                 <div class="transcript-spacer" ref={scroll.spacerRef} aria-hidden="true" />
             </div>

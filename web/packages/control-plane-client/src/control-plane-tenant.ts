@@ -20,7 +20,7 @@ export interface AccountTenant {
     readonly displayName: string;
     readonly role: string;
     readonly personal: boolean;
-    /** Server-derived from the tenant's durable consultant/provider kind. */
+    /** Server-derived from active Commercial Operations standing. */
     readonly providerCommercial: boolean;
 }
 

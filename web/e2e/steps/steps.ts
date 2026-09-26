@@ -49,10 +49,21 @@ async function dropTextFile(page: Page, target: string, name: string, content: s
 // fed-control-plane.sh) stops live agents, wipes the state, and re-seeds — so every
 // scenario starts from the same fresh workbench, pollution-proof by construction.
 Before(async ({ request }) => {
+    // The desktop operator plane requires an explicit local selection before
+    // Home routes can be used. Reset removes that selection with the state root.
+    await selectLocalHome(request);
     const res = await request.post(`${aliceCP}/test/reset`, { headers: mutationHeaders() });
     if (!res.ok()) throw new Error(`control-plane reset failed: ${res.status()} ${await res.text()}`);
+    await selectLocalHome(request);
     await linkLiveModelCredential(request);
 });
+
+async function selectLocalHome(request: APIRequestContext): Promise<void> {
+    const res = await request.post(`${aliceCP}/account/hub-session/select-local`, {
+        headers: mutationHeaders(),
+    });
+    if (!res.ok()) throw new Error(`local Home selection failed: ${res.status()} ${await res.text()}`);
+}
 
 /** Link the live lane's model credential, through the production link route.
  *
@@ -140,7 +151,7 @@ async function placeArchetypeOnFreshProject(page: Page): Promise<string> {
     await expect(group.locator(".tree-node.project")).toBeVisible();
     // The product's Agent action opens the placement picker.
     await group.locator(".tree-node.project").click({ button: "right" });
-    await page.getByRole("button", { name: "add an agent", exact: true }).click();
+    await page.getByRole("menuitem", { name: "add an Agent", exact: true }).click();
     await pickFirstMethod(page);
     await ensureArchetypeLens(page, name);
     await expect(group.locator(".tree-subgroup[data-placement]").first()).toBeVisible();
@@ -154,16 +165,12 @@ async function pickFirstMethod(page: import("@playwright/test").Page) {
     await page.locator("[data-picker-archetype]").first().click();
 }
 
-// ADR 0112: projects open in the flat `chats` lens. Steps that address placement
-// STRUCTURE (placement nodes, workstream groups, drag targets) pivot the project
-// to its `by archetype` lens first. Idempotent; the lens persists for the
-// scenario, so one pivot covers every later structural step on that project.
-async function ensureArchetypeLens(page: import("@playwright/test").Page, name: string) {
-    const toggle = page.locator("[data-project]", { hasText: name }).locator("[data-lens-toggle]");
-    if ((await toggle.getAttribute("data-lens")) === "chats") {
-        await toggle.click();
-        await page.getByRole("menuitemradio", { name: "Agent view" }).click();
-    }
+// ADR 0112: projects open in the flat `chats` lens. Placement structure is
+// shown by the Projects filter's global grouping control.
+async function ensureArchetypeLens(page: Page, _name: string) {
+    await page.getByRole("button", { name: "Filter projects" }).click();
+    await page.getByRole("menuitem", { name: /Group by/ }).click();
+    await page.getByRole("menuitemradio", { name: "Agent view" }).click();
 }
 
 // ---- navigation / setup ----
@@ -782,7 +789,7 @@ When("I close the Agent settings", async ({ page }) => {
 When("I place the Panel agent {string} on project {string}", async ({ page }, agent: string, project: string) => {
     await page.locator(".facet", { hasText: "Projects" }).click();
     await page.locator("[data-project]", { hasText: project }).locator(".tree-node.project").click({ button: "right" });
-    await page.locator(".menu-item-label", { hasText: /^add an agent$/ }).click();
+    await page.locator(".menu-item-label", { hasText: /^add an Agent$/ }).click();
     await page.locator("[data-picker-archetype]", { hasText: agent }).click();
 });
 
@@ -847,7 +854,7 @@ When("I place an archetype on the project {string}", async ({ page }, name: stri
         .locator("[data-project]", { hasText: name })
         .locator(".tree-node.project")
         .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "add an agent" }).click();
+    await page.locator(".menu-item", { hasText: "add an Agent" }).click();
     await pickFirstMethod(page);
     await ensureArchetypeLens(page, name);
     await expect(
@@ -1346,10 +1353,10 @@ When("I attach the context folder {string}", async ({ page }, path: string) => {
     // The browser build ingests context by uploading the picked folder's file
     // *contents* (ENTSEC-5), not by a server-local path — browsers hide real paths.
     // Playwright drives the hidden `webkitdirectory` input by handing it a real
-    // directory path, which it walks and uploads; `path` is that folder (its files,
-    // e.g. gaugewright-plugin.ts, are what downstream diff/context assertions look
-    // for). No `Add files` click is needed — the input is set programmatically.
-    await page.locator("[data-add-folder-input]").setInputFiles(path);
+    // directory path, which it walks and uploads. `path` is relative to this
+    // checkout; its files (e.g. gaugewright-plugin.ts) are what downstream
+    // diff/context assertions look for. No `Add files` click is needed.
+    await page.locator("[data-add-folder-input]").setInputFiles(resolve(process.cwd(), "..", path));
 });
 
 When("I drop the file {string} containing {string} on Files", async ({ page }, name: string, content: string) => {
@@ -1936,7 +1943,7 @@ When("I open the add-method picker for project {string}", async ({ page }, name:
         .locator("[data-project]", { hasText: name })
         .locator(".tree-node.project")
         .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "add an agent" }).click();
+    await page.locator(".menu-item", { hasText: "add an Agent" }).click();
 });
 
 Then("the place picker is open", async ({ page }) => {

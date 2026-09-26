@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gaugedesk_harness::{
     ContextWindowReading, EgressGate, Harness, HarnessContinuitySpec, HarnessSpec, ImageContent,
-    InterruptHandle, ModelUsage, Observation, OutputFieldFlow, RuntimePosition, ToolInfo,
-    TurnOutcome,
+    InterruptHandle, ModelContextHandle, ModelUsage, Observation, OutputFieldFlow, RuntimePosition,
+    ToolInfo, TurnOutcome,
 };
 use serde_json::{json, Value};
 
@@ -740,6 +740,29 @@ impl Harness for DoHarness {
             if let Some(command) = command {
                 cancel_hosted_turn(&config, &placement, &instance, &command);
             }
+        }))
+    }
+
+    fn model_context_handle(&self) -> Option<ModelContextHandle> {
+        let config = self.config.clone();
+        let placement = self.placement.clone();
+        let instance = self.instance_ref.clone();
+        let active = Arc::clone(&self.active_command);
+        Some(Arc::new(move || {
+            let command = active
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no active model call"))?;
+            get_text(
+                &config,
+                &placement,
+                &format!(
+                    "/host/instances/{}/turns/{}/model-context",
+                    encode(&instance),
+                    encode(&command)
+                ),
+            )
         }))
     }
 }

@@ -451,6 +451,13 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
    anchoring reacts to that swap by adjusting scrollTop itself — a jitter the
    hold then visibly corrects. One owner, not two. */
 .transcript { overscroll-behavior: contain; overflow-anchor: none; }
+.raw-model-context { padding: 20px; min-width: 0; }
+.raw-model-context h2 { margin: 0 0 8px; font-size: 13px; letter-spacing: .1em; text-transform: uppercase; }
+.raw-model-context-note, .raw-model-context-status { color: var(--muted); font-size: 13px; }
+.raw-model-context-call { margin-top: 18px; border: 1px solid var(--edge); border-radius: 8px; overflow: hidden; }
+.raw-model-context-call h3 { margin: 0; padding: 9px 12px; border-bottom: 1px solid var(--edge); font-size: 12px; }
+.raw-model-context-call pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; }
+.raw-model-context-redacted { margin: 0; padding: 12px; color: var(--muted); }
 .jump-latest-wrap { position: relative; height: 0; overflow: visible; z-index: 3; }
 .jump-latest { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
     display: inline-flex; align-items: center; justify-content: center;

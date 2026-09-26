@@ -9608,6 +9608,42 @@
       }
     },
     {
+      "id": "home.chat.model-context",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/chats/:id/model-context",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-chat",
+      "capability": null,
+      "requestSchema": "none",
+      "responseSchema": "typescript:control-plane-client/LiveModelContext",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#production-bundle"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#authority-matrix"
+        ],
+        "journey": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#production-bundle"
+        ],
+        "deployed": [],
+        "property": [
+          "gaugewright-cloud@06ba233:web/e2e/home-authenticated-wiring.mjs#generated-authority-encoding-state"
+        ]
+      }
+    },
+    {
       "id": "machine.mobile.enrollment.invitation.create",
       "jurisdiction": "private-home",
       "transport": "http-json",

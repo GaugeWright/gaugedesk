@@ -11,7 +11,7 @@ const billing = { billing: null, billing_contact: null, seats_used: 0, managed_u
 
 export const administrationEmptyModels = {
     organization: {
-        display_name: "Example Organization", kind: "client", owner: null,
+        display_name: "Example Organization", owner: null,
         ownership_candidates: [], domains: [],
     },
     "plans-services": billing,

@@ -68,23 +68,11 @@ pub enum MembershipStatus {
     Deprovisioned,
 }
 
-/// Which **party** a tenant is (`DEPLOY-6`, [ADR 0061](../../../specs/decisions/0061-tenant-and-home-governance.md)).
-/// The org is a *party-neutral* tenant: a **client** org buys + hosts data; a **consultant**
-/// org sells methods + gets paid. The same primitive, different role — the role selects which
-/// levers apply (a client org sets a placement policy, a consultant org owes the seat fee /
-/// `SETTLE-3`). Defaults to `Client` so the existing single-org path is unchanged.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum OrgKind {
-    #[default]
-    Client,
-    Consultant,
-}
-
 /// The org's profile (B10): display name, verified email domains (the basis for
 /// domain-capture auto-join, `ID-6`), the domains still awaiting their DNS
 /// proof, the default data-residency region new projects inherit (the ADR 0032
-/// `region` attribute), and the tenant **kind** (party-neutral, ADR 0061).
+/// `region` attribute). Historical events may carry the retired `kind` field;
+/// Serde ignores it when rebuilding the current record.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct OrgRecord {
     pub id: String,
@@ -105,9 +93,6 @@ pub struct OrgRecord {
     pub pending_domains: Vec<String>,
     #[serde(default)]
     pub default_region: Option<String>,
-    /// The tenant party (`DEPLOY-6`): `client` (default) or `consultant`.
-    #[serde(default)]
-    pub kind: OrgKind,
 }
 
 /// One person in the directory (B11): the [[authority]] they authenticate to, their
@@ -1684,7 +1669,6 @@ mod tests {
             verified_domains: vec!["acme.com".into()],
             pending_domains: Vec::new(),
             default_region: None,
-            kind: Default::default(),
         };
         let store = store_with(&[("org", &serde_json::to_string(&rec).unwrap())]);
         let org = Org::rebuild(&store).unwrap();
@@ -1998,7 +1982,6 @@ mod tests {
                 verified_domains: vec!["acme.example".into()],
                 pending_domains: Vec::new(),
                 default_region: None,
-                kind: Default::default(),
             }),
             sso: Some(connection.clone()),
             sso_admission: Some(SsoAdmissionRecord {

@@ -10,6 +10,8 @@ export interface ChatOptionsMenuProps {
     readonly onSaveFilterDefault: () => void;
     readonly onHistory: () => void;
     readonly onSources: () => void;
+    readonly rawMode?: boolean;
+    readonly onRawMode?: () => void;
 }
 
 export function ChatOptionsMenu(props: ChatOptionsMenuProps): JSX.Element {
@@ -86,6 +88,12 @@ export function ChatOptionsMenu(props: ChatOptionsMenuProps): JSX.Element {
                             data-open-sources onClick={() => openSurface(props.onSources)}>
                             Context sources
                         </button>
+                        <Show when={props.onRawMode}>
+                            <button type="button" role="menuitem" class="chat-options-item"
+                                data-open-raw-context onClick={() => openSurface(props.onRawMode!)}>
+                                Raw context <span class="chat-options-item-detail">{props.rawMode ? "On" : ""}</span>
+                            </button>
+                        </Show>
                     </Show>
                 </div>
             </Show>

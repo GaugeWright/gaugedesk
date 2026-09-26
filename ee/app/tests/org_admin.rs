@@ -359,7 +359,7 @@ async fn org_settings_round_trip() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["display_name"], "Acme");
     assert!(body["domains"].as_array().unwrap().is_empty());
-    assert_eq!(body["kind"], "client");
+    assert!(body.get("kind").is_none());
     assert_eq!(body["owner"]["authority"], "local-user");
 }
 
@@ -386,7 +386,7 @@ async fn organization_display_name_rejects_unowned_fields_and_preserves_truth() 
     let (status, body) = document(&app, None, "organization").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["display_name"], "Expert LLC");
-    assert_eq!(body["kind"], "client");
+    assert!(body.get("kind").is_none());
 }
 
 #[tokio::test]
@@ -573,7 +573,7 @@ async fn audit_retention_min_guarantee_defaults_to_a_year_and_is_configurable() 
 }
 
 #[tokio::test]
-async fn organization_kind_is_projected_but_not_user_editable() {
+async fn retired_organization_kind_is_absent_and_rejected() {
     let (_dir, app) = workbench();
     let (status, _) = command(
         &app,
@@ -584,7 +584,7 @@ async fn organization_kind_is_projected_but_not_user_editable() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let (_, body) = document(&app, None, "organization").await;
-    assert_eq!(body["kind"], "client");
+    assert!(body.get("kind").is_none());
 
     let (status, body) = command(
         &app,
@@ -595,7 +595,7 @@ async fn organization_kind_is_projected_but_not_user_editable() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     let (_, body) = document(&app, None, "organization").await;
-    assert_eq!(body["kind"], "client");
+    assert!(body.get("kind").is_none());
 }
 
 #[tokio::test]

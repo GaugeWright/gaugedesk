@@ -6,7 +6,7 @@ Feature: Context ingestion
 
   Scenario: attach a folder of context
     Given a new engagement
-    When I attach the context folder "/home/jack/code/gaugedesk/plugin"
+    When I attach the context folder "plugin"
     When I open the "diff" tab
     Then the diff shows "gaugewright-plugin.ts"
 

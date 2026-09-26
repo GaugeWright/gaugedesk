@@ -49,6 +49,7 @@ import {
     describeFailure,
     turnStopped,
     type EngagementId,
+    type LiveModelContext,
     type ProjectId,
     type ProjectNode,
     type PlacementNode,
@@ -1448,6 +1449,32 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         return undefined;
     };
     const busy = () => runToneOf(selected()) === "working";
+    const [rawMode, setRawMode] = createSignal(false);
+    const [rawContext, setRawContext] = createSignal<LiveModelContext | undefined>();
+    createEffect(() => {
+        const chat = selected();
+        const enabled = rawMode();
+        const running = busy();
+        setRawContext(undefined);
+        if (!chat || !enabled) return;
+        let current = true;
+        let pending = false;
+        const refresh = () => {
+            if (pending) return;
+            pending = true;
+            void api.getModelContext(chat).then(
+                (view) => { if (current) setRawContext(view); },
+                () => { if (current) setRawContext({ available: false,
+                    reason: "Raw context could not be loaded for this chat." }); },
+            ).finally(() => { pending = false; });
+        };
+        refresh();
+        const timer = running ? window.setInterval(refresh, 250) : undefined;
+        onCleanup(() => {
+            current = false;
+            if (timer !== undefined) window.clearInterval(timer);
+        });
+    });
     const [activity, setActivity] = createSignal(""); // what the agent is doing now
     // The agent's pending approvals from the last turn (UX-3): an `extension_ui_request`
     // the runtime surfaced but did not auto-confirm — answered out-of-band via the
@@ -2760,6 +2787,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             onSaveFilterDefault={saveFilterDefault}
                             onHistory={() => setShowShelf(true)}
                             onSources={() => setShowSources(true)}
+                            rawMode={rawMode()}
+                            onRawMode={() => setRawMode((value) => !value)}
                         />
                     </Show>
                 }
@@ -2821,6 +2850,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     onTranscribe={(audio, signal) => api.transcribeAudio(audio, signal)}
                     bare
                     prefs={filterPrefs()}
+                    rawMode={rawMode()}
+                    rawContext={rawContext()}
                     pendingSend={pendingSend()?.id === selected() ? pendingSend()?.rid : undefined}
                     onResolveCredential={() => setAccountRequest((n) => n + 1)}
                     transcriptTail={
