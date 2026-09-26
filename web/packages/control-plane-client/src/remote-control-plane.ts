@@ -326,6 +326,10 @@ export class RemoteControlPlane implements ControlPlane {
         return workbench.deleteChat(this.transport(), id);
     }
 
+    organizeChat(id: EngagementId, change: { archived?: boolean; pinned?: boolean }) {
+        return workbench.organizeChat(this.transport(), id, change);
+    }
+
     getTranscript(id: EngagementId) {
         return workbench.getTranscript(this.transport(), id);
     }

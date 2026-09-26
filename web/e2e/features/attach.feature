@@ -12,6 +12,14 @@ Feature: Message attachments
     Then the transcript echoes my message "hello from attachment"
     And the composer has no pending attachments
 
+  Scenario: drop a file onto chat
+    Given a new engagement
+    When I drop the file "dropped.txt" containing "hello from drop" on chat
+    Then the composer shows a text attachment "dropped.txt"
+    When I task the agent with "summarize the dropped file"
+    Then the transcript echoes my message "hello from drop"
+    And the composer has no pending attachments
+
   Scenario: attach an image to a message
     Given a new engagement
     When I attach a PNG image "screenshot.png"

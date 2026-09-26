@@ -894,6 +894,14 @@ export async function deleteChat(transport: WorkbenchTransport, id: EngagementId
     await transport.json("DELETE", `/chats/${id}`);
 }
 
+export async function organizeChat(
+    transport: WorkbenchTransport,
+    id: EngagementId,
+    change: { archived?: boolean; pinned?: boolean },
+): Promise<void> {
+    await transport.json("PUT", `/chats/${id}/navigation`, change);
+}
+
 export async function engagementDiff(transport: WorkbenchTransport, id: EngagementId): Promise<string> {
     const o = (await transport.json("GET", `/chats/${id}/diff`)) as { diff: string };
     return o.diff;

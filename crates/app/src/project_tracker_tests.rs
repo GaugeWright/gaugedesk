@@ -710,3 +710,146 @@ fn access_evidence_without_its_original_receipt_cannot_be_reissued() {
         .unwrap()
         .is_none());
 }
+#[test]
+fn a_new_home_owned_tracker_reads_as_empty_without_creating_native_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    let shared = crate::open_workbench(directory.path()).unwrap();
+    let mut wb = shared.lock_unpoisoned();
+    let (owner, _) = context(&mut wb, "owner-account", "owner");
+    wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    let tracker = wb
+        .read_project_tracker(
+            &owner,
+            DEFAULT_PROJECT,
+            PROJECT_TASKS,
+            TrackerPermission::Read,
+        )
+        .unwrap();
+    let storage = wb.workflow_storage(&tracker.workspace_id).unwrap();
+    assert_eq!(
+        storage.protection_mode(&tracker.workspace_id).unwrap(),
+        None
+    );
+
+    let backlog = wb
+        .read_project_tracker_backlog(&owner, DEFAULT_PROJECT, PROJECT_TASKS)
+        .unwrap();
+    assert!(backlog.issues.is_empty());
+    assert_eq!(backlog.tracker.project_id, DEFAULT_PROJECT);
+    assert_eq!(
+        storage.protection_mode(&tracker.workspace_id).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_desktop_account_turn_binds_the_real_task_filer() {
+    use gaugedesk_harness::{
+        EgressGate, Harness, HarnessFactory, HarnessSpec, ImageContent, Observation, TaskFiler,
+        TurnOutcome,
+    };
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    struct FilingHarness {
+        actor: String,
+        filer: Option<Arc<dyn TaskFiler>>,
+        observed: Arc<Mutex<Option<(String, String)>>>,
+    }
+    impl Harness for FilingHarness {
+        fn bind_authenticated_actor(&mut self, actor: &str) {
+            self.actor = actor.into();
+        }
+        fn bind_task_filer(&mut self, filer: Option<Arc<dyn TaskFiler>>) {
+            self.filer = filer;
+        }
+        fn run_turn(
+            &mut self,
+            _gate: &dyn EgressGate,
+            _prompt: &str,
+            _images: &[ImageContent],
+            _sink: &mut dyn FnMut(&Observation),
+        ) -> io::Result<TurnOutcome> {
+            let id = self
+                .filer
+                .as_ref()
+                .ok_or_else(|| io::Error::other("task filer absent"))?
+                .file_task("test-call", "Test task\nVerify the app works", None)
+                .map_err(io::Error::other)?;
+            *self.observed.lock().unwrap() = Some((self.actor.clone(), id.clone()));
+            Ok(TurnOutcome {
+                assistant_text: id,
+                ..TurnOutcome::default()
+            })
+        }
+    }
+    struct FilingFactory(Arc<Mutex<Option<(String, String)>>>);
+    impl HarnessFactory for FilingFactory {
+        fn kind(&self) -> &'static str {
+            "whip"
+        }
+        fn create(&self, _: &HarnessSpec) -> io::Result<Box<dyn Harness>> {
+            Ok(Box::new(FilingHarness {
+                actor: String::new(),
+                filer: None,
+                observed: self.0.clone(),
+            }))
+        }
+        fn reuse_across_turns(&self) -> bool {
+            false
+        }
+        fn credential_status(
+            &self,
+            _: &str,
+            _: Option<&dyn gaugedesk_harness::CredentialCapability>,
+        ) -> gaugedesk_harness::CredentialProbe {
+            gaugedesk_harness::CredentialProbe::Ready
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let shared = crate::open_workbench(directory.path()).unwrap();
+    let (token, context, turn) = {
+        let mut wb = shared.lock_unpoisoned();
+        wb.create_default_engagement("chat-task".into(), "Task chat".into())
+            .unwrap_or_else(|_| panic!("create task chat"));
+        wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+        let (_, token) = context(&mut wb, "signed-in-owner", "owner");
+        let context = wb.authenticate_action_context(&token).unwrap();
+        let turn = wb.engagement_task_context("chat-task").unwrap();
+        (token, context, turn)
+    };
+    let observed = Arc::new(Mutex::new(None));
+    // The fake adapter does not publish WhippleScript's durable turn boundary,
+    // so the turn cannot settle after the tool call. The filing receipt and
+    // current tracker read below prove the admission path under test.
+    let _ = crate::engine::run_engagement_turn(
+        &shared,
+        "chat-task",
+        &turn.worktree,
+        &turn.sender,
+        crate::engine::EngagementTurnInput {
+            task: "file the task",
+            images: &[],
+            mode: turn.mode,
+            authenticated_actor: None,
+            authenticated_context: None,
+            contribution_by: None,
+            account_scope: crate::account::ACCOUNT_SCOPE,
+            tenant_scope: crate::org::ORG_SCOPE,
+            account_bearer: Some(&token),
+            runtime_command_id: None,
+            harness_factory: Some(Arc::new(FilingFactory(observed.clone()))),
+        },
+    );
+    let (actor, id) = observed.lock().unwrap().clone().unwrap();
+    assert_eq!(actor, "signed-in-owner");
+    let wb = shared.lock_unpoisoned();
+    let tasks = wb
+        .read_project_tracker_tasks(&context, DEFAULT_PROJECT, PROJECT_TASKS)
+        .unwrap();
+    assert_eq!(tasks.backlog.issues[0].id, id);
+    assert_eq!(tasks.backlog.issues[0].title, "Test task");
+}

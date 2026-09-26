@@ -155,6 +155,8 @@
     --navy: var(--gw-default-navy);
     --blue: var(--gw-default-blue);
     --gold: var(--gw-default-gold);
+    --shell-gold-rule: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 70%, transparent) 30%,
+        var(--gold) 50%, color-mix(in srgb, var(--gold) 70%, transparent) 70%, transparent);
     --red: var(--gw-default-red);
     --bg: var(--gw-default-bg);
     --panel: var(--gw-default-panel);
@@ -297,6 +299,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .chat-identity-branch { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .chat-identity-divider { opacity: 0.65; }
 .chat-identity-kind { flex: 0 0 auto; }
+.chat-empty-title { grid-column: 2; justify-self: center; }
 .chat-options-trigger { display: inline-flex; align-items: center; justify-content: center;
     width: 22px; height: 18px; padding: 0; border: 0; border-radius: 4px;
     background: transparent; color: var(--muted); cursor: pointer; }
@@ -311,7 +314,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .chat-options-item:hover { background: var(--edge); }
 .chat-options-item-detail { color: var(--accent); font-size: var(--fs-small); }
 .tasks { grid-column: 1 / -1; background: linear-gradient(90deg, var(--navy), var(--panel) 34%, var(--panel));
-    border-bottom: 1px solid var(--edge); padding: 6px 12px; display: flex; align-items: center; gap: 10px; }
+    border-bottom: 1px solid; border-image: var(--shell-gold-rule) 1; padding: 6px 12px; display: flex; align-items: center; gap: 10px; }
 .tasks > .taskbar { flex: 1; min-width: 0; }
 /* The desktop shell overlays the title bar on macOS (main.rs `OVERLAY_TITLE_BAR`) and
    centres the traffic lights on this row, so the row starts after them. The lights
@@ -407,16 +410,26 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* The two-click keep guard (round-6 #2): the armed state reads "confirm keep" in
    a warn tone so a permanent merge from the top bar is never a single blind click. */
 
-/* Drag handles between panels (a thin grid column each). */
-.resizer { background: var(--edge); cursor: col-resize; }
-.resizer:hover, .resizer.dragging { background: var(--accent); }
+/* Two gold strokes fill the existing five-pixel drag column. */
+.resizer { position: relative; cursor: col-resize; background: var(--panel); touch-action: none; }
+.resizer::before { content: ""; position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(90deg, transparent 20%, var(--gold) 20% 40%,
+        transparent 40% 60%, var(--gold) 60% 80%, transparent 80%); opacity: .65; }
+.resizer:hover::before, .resizer.dragging::before { opacity: 1; }
+.resizer.disabled { visibility: hidden; pointer-events: none; }
 .run .transcript { flex: 1; overflow: auto; min-height: 0; }
 /* The work shell wraps the chat pane in a slot so GaugeApps can swap its own
    chat in beside it. The slot has to carry .run's column layout through, or the
    transcript stops absorbing the pane's slack and the composer rides up under
    the last turn instead of docking at the bottom. */
-[data-work-chat-slot] { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+[data-work-chat-slot] { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; position: relative; }
 [data-work-chat-slot][hidden] { display: none; }
+.files-drop-target { min-height: 100%; position: relative; }
+.file-drop-overlay { position: absolute; inset: 0; z-index: 20; pointer-events: none;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+    border: 2px dashed var(--accent); border-radius: 6px;
+    background: color-mix(in srgb, var(--accent) 12%, var(--panel)); color: var(--ink);
+    font-size: var(--fs-ui); font-weight: 600; text-align: center; }
 /* No-selection chat pane (the quick-start on-ramp): same anatomy as a live
    chat — this empty transcript absorbs the slack so the composer docks at the
    bottom, with one quiet line of guidance where the conversation will be. */
@@ -582,11 +595,11 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* Negative margins let footer rows span the panel's full width. */
 .nav-footer { flex: 0 0 auto; margin: 0 -12px -10px; }
 .update-status { display: flex; align-items: center;
-    border-top: 1px solid var(--edge); padding: 6px 12px;
+    border-top: 1px solid; border-image: var(--shell-gold-rule) 1; padding: 6px 12px;
     font-size: var(--fs-small); }
 /* The account row, flush to the very bottom corner of the column. */
-.organization-bar { padding: 5px 8px 0; border-top: 1px solid var(--edge); }
-.account-bar { padding: 5px 8px 6px; border-top: 1px solid var(--edge); }
+.organization-bar { padding: 5px 8px 0; border-top: 1px solid; border-image: var(--shell-gold-rule) 1; }
+.account-bar { padding: 5px 8px 6px; border-top: 1px solid; border-image: var(--shell-gold-rule) 1; }
 .account-switcher { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 0 6px; }
 .account-switcher button { border: 1px solid var(--edge); border-radius: 5px; background: transparent; color: inherit; padding: 4px 7px; cursor: pointer; }
 .account-switcher button[aria-current="true"] { font-weight: 700; }
@@ -657,7 +670,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
    the row. */
 .account-menu-hint { flex: 0 0 auto; color: var(--muted); font-size: var(--fs-small); }
 .account-menu-more { flex: 0 0 auto; color: var(--muted); }
-.account-menu-separator { height: 1px; background: var(--edge); margin: 4px 6px; }
+.account-menu-separator { height: 1px; background: var(--shell-gold-rule); margin: 4px 6px; }
 
 /* --- Settings: rooms, not one scroll ------------------------------------- */
 /* Wider than the default modal because it holds a rail plus content, and capped
@@ -850,7 +863,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .files-menu-trigger:disabled { opacity: 0.45; cursor: default; }
 .files-menu-popover { width: 200px; }
 .files-menu-popover .chat-options-item:disabled { opacity: 0.45; cursor: default; }
-.files-menu-separator { border-top: 1px solid var(--edge); margin: 4px 5px; }
+.files-menu-separator { border-top: 1px solid; border-image: var(--shell-gold-rule) 1; margin: 4px 5px; }
 /* Content modes share the pane's top edge with its fold control. With no
    available mode, the same slot names the pane instead of inventing a tab. */
 .panel.content .panel-body > .viewer:first-child > .content-mode-tabs {
@@ -862,7 +875,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .panel.content .content-mode-tabs:has(.whip-run-control) { padding-right: 80px; }
 .panel.content .content-mode-tabs .whip-run-control { position: absolute; right: 6px;
     top: 50%; transform: translateY(-50%); margin-left: 0; }
-.content-empty-title { color: var(--muted); font-family: var(--serif);
+.content-empty-title, .chat-empty-title { color: var(--muted); font-family: var(--serif);
     font-size: var(--fs-small); text-transform: uppercase; letter-spacing: 0.08em;
     line-height: 18px; }
 .panel-collapse:hover { color: var(--accent); background: var(--edge); }
@@ -1504,7 +1517,29 @@ input {
    ellipsise under extreme narrowness instead of wrapping into a ragged second
    line (the old flex-wrap orphaned LIBRARY below the other two). */
 .facets { display: flex; flex-wrap: nowrap; gap: 4px; margin-bottom: 6px; min-width: 0; }
-.facet-search-row { position: relative; margin-bottom: 10px; }
+.facet-toolbar { position: relative; display: flex; align-items: center; gap: 3px; padding: 2px 6px 5px; margin-bottom: 4px; }
+.facet-toolbar .create-btn { margin-right: auto; border: 0; padding-left: 3px; }
+.facet-toolbar-spacer { flex: 1 1 auto; }
+.facet-toolbar-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 27px;
+    width: 27px; height: 27px; padding: 0; border: 0; border-radius: 5px; background: transparent;
+    color: var(--muted); cursor: pointer; }
+.facet-toolbar-icon .icon { width: 17px; height: 17px; }
+.facet-toolbar-icon:hover, .facet-toolbar-icon.active { color: var(--accent); background: var(--edge); }
+.facet-filter-backdrop { position: fixed; inset: 0; z-index: 70; }
+.facet-filter-menu { position: absolute; z-index: 71; top: calc(100% + 2px); right: 6px;
+    width: min(236px, calc(100vw - 24px)); padding: 5px; border: 1px solid var(--edge);
+    border-radius: 9px; background: var(--panel); box-shadow: 0 12px 28px rgba(0, 0, 0, .4); }
+.facet-filter-menu button { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px;
+    width: 100%; padding: 8px 9px; border: 0; border-radius: 5px; background: transparent; color: var(--fg);
+    text-align: left; font: 400 var(--fs-ui) var(--font-chrome); cursor: pointer; }
+.facet-filter-menu button:hover, .facet-filter-menu button:focus-visible { background: var(--edge); }
+.facet-filter-menu button[role="menuitem"] { grid-template-columns: minmax(0, 1fr) auto 12px; }
+.facet-filter-menu button[role="menuitem"] > span:nth-child(2) { color: var(--muted); }
+.facet-filter-menu button[role="menuitem"] .icon { width: 12px; height: 12px; transform: rotate(-90deg); }
+.facet-filter-menu button[role="menuitemradio"] > span:last-child { color: var(--accent); }
+.facet-filter-menu .facet-filter-back { margin-bottom: 4px; color: var(--muted);
+    border-bottom: 1px solid; border-image: var(--shell-gold-rule) 1; border-radius: 0; }
+.facet-search-row { position: relative; margin: 0 6px 8px; }
 .facet-search { width: 100%; box-sizing: border-box; font-size: var(--fs-small); padding: 3px 7px;
     padding-right: 22px; }
 .facet-search-clear { position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
@@ -1526,7 +1561,7 @@ input {
 /* The filter page lives inside the single chat menu, with its own return action. */
 .filter-panel { min-width: 0; padding: 2px; }
 .filter-back { width: 100%; text-align: left; padding: 6px 7px; margin-bottom: 5px;
-    border: 0; border-bottom: 1px solid var(--edge); border-radius: 0; background: transparent;
+    border: 0; border-bottom: 1px solid; border-image: var(--shell-gold-rule) 1; border-radius: 0; background: transparent;
     color: var(--muted); font-size: var(--fs-ui); cursor: pointer; }
 .filter-back:hover { color: var(--ink); }
 .filter-head { display: flex; align-items: center; gap: 8px; padding: 2px 6px 4px;
@@ -1549,7 +1584,7 @@ input {
 /* Footer actions: persist the current filter as the user's default, or reset to
    showing everything (this session). Separated from the rows by a hairline. */
 .filter-actions { display: flex; gap: 6px; margin-top: 6px; padding-top: 6px;
-    border-top: 1px solid var(--edge); }
+    border-top: 1px solid; border-image: var(--shell-gold-rule) 1; }
 .filter-save { flex: 1 1 auto; text-align: center; font-size: var(--fs-small);
     background: color-mix(in srgb, var(--accent) 18%, transparent);
     border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); color: var(--ink); }
@@ -1665,10 +1700,23 @@ input {
     border: 1px solid var(--edge); border-radius: 4px; padding: 8px;
     font-family: var(--mono); font-size: var(--fs-ui); margin: 6px 0; resize: vertical; }
 
-/* The plain-language settings form (#5 round-5): leads the modal so the beginner
+/* The plain-language settings form (#5 round-5): leads the page so the beginner
    instruction "set what this method does" lands on real, plain controls — not the
    raw {} JSON, which is now a collapsed Advanced surface. */
 .settings-form { display: flex; flex-direction: column; gap: 12px; margin: 4px 0 12px; }
+.agent-settings-content { box-sizing: border-box; height: 100%; min-height: 0; overflow: auto; padding: 24px clamp(12px, 2vw, 28px); }
+.agent-settings-page { width: min(100%, 680px); margin: 0 auto; }
+.agent-settings-page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 24px; }
+.agent-settings-page-head span { color: var(--muted); font-size: var(--fs-small); }
+.agent-settings-page-head h1 { margin: 4px 0 0; font-size: 1.5em; font-weight: 600; line-height: 1.2; }
+.agent-settings-page-head button { flex: none; }
+.agent-settings-content .settings-form { margin-top: 20px; }
+.agent-settings-content [data-panel-public-profile] .settings-checkbox { display: flex; align-items: center; gap: 7px; }
+.agent-settings-content [data-panel-public-profile] .settings-checkbox input[type="checkbox"] { flex: none; width: auto; margin: 0; }
+.agent-settings-content [data-panel-public-profile] .deployment-field-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); }
+.agent-settings-content [data-panel-public-profile] .settings-field { min-width: 0; }
+.agent-settings-content [data-panel-public-profile] .settings-field input,
+.agent-settings-content [data-panel-public-profile] .settings-field select { box-sizing: border-box; min-width: 0; width: 100%; }
 .settings-field { display: flex; flex-direction: column; gap: 4px; border: none; padding: 0;
     margin: 0; }
 .settings-label { font-size: var(--fs-small); color: var(--muted); text-transform: uppercase;
@@ -1799,7 +1847,7 @@ input {
    one obvious next step, not dead-end. A short line + a primary-tinted button. */
 .tree-group { margin-bottom: 4px; }
 .tree-subgroup { margin-left: 10px; }
-.panel-agent-list { margin: 7px 6px 0 18px; padding-top: 5px; border-top: 1px solid var(--edge); }
+.panel-agent-list { margin: 7px 6px 0 18px; padding-top: 5px; border-top: 1px solid; border-image: var(--shell-gold-rule) 1; }
 .panel-agent-list .tree-subgroup { margin-left: 0; }
 .tree-node { display: flex; align-items: center; gap: 3px; padding: 3px 4px; border-radius: 4px;
     cursor: default; }
@@ -1857,6 +1905,18 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .tutorial-source { max-height: 50vh; padding: 16px; overflow: auto; border: 1px solid var(--edge); border-radius: 8px; font-size: var(--fs-small); }
 .tree-leaf:hover { background: color-mix(in srgb, var(--accent) 7%, var(--edge)); }
 .tree-leaf.active { background: color-mix(in srgb, var(--accent) 13%, var(--edge)); color: #c9dcff; }
+.chat-collection { padding: 3px 0 5px; border-bottom: 1px solid; border-image: var(--shell-gold-rule) 1; }
+.chat-collection-heading { display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 9px;
+    color: var(--muted); font: 600 var(--fs-label) var(--font-chrome); text-transform: uppercase; letter-spacing: .06em; }
+.chat-collection-heading .icon { width: 15px; height: 15px; }
+.chat-collection-heading span { margin-left: auto; }
+.chat-hover-actions { display: inline-flex; flex: 0 0 auto; gap: 1px; opacity: 0; pointer-events: none; }
+.chat-item:hover .chat-hover-actions, .chat-item:focus-within .chat-hover-actions { opacity: 1; pointer-events: auto; }
+.chat-hover-actions button { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
+    padding: 2px; border: 0; border-radius: 3px; background: transparent; color: var(--muted); cursor: pointer; }
+.chat-hover-actions button:hover { color: var(--gold); background: var(--bg); }
+.chat-hover-actions button[data-pinned] { color: var(--gold); }
+.chat-hover-actions .icon { width: 15px; height: 15px; }
 .tree-leaf .leaf-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     min-width: 0; flex: 1 1 auto; }
 /* One scan line per chat. The title leads; lineage or target context shares the
@@ -1896,14 +1956,12 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     border: 1px solid var(--edge); border-radius: 3px; padding: 0 4px;
     max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* --- container-row actions + the per-project lens (ADR 0112) ---------------
-   One primary icon act plus a ⋯ menu per row: hidden at rest, revealed on row
+/* --- container-row actions -----------------------------------------------
+   Direct actions plus a ⋯ menu: hidden at rest, revealed on row
    hover or keyboard focus. The controls stay IN FLOW (opacity only — never
    display/pointer-events games, never an overlay), so revealing them cannot
    shift layout or cover the label, and a keyboard user gets the identical
-   reveal via :focus-within. The project's lens chip is the exception: it stays
-   visible at rest — a mode switch you might come to flip deserves a standing
-   affordance, and it doubles as the "this level is grouped" signal. */
+   reveal via :focus-within. */
 .row-actions { margin-left: auto; flex: 0 0 auto; display: inline-flex; gap: 2px;
     align-items: center; }
 .row-act { position: relative; display: inline-flex; align-items: center;
@@ -1924,18 +1982,12 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
    FacetBrowser): Chrome on Linux/Wayland can stop applying :hover rules while
    still delivering pointer events — the class path keeps working there. */
 .tree-node.row-hot .row-act { opacity: 1; }
-.tree-node.project .row-act, .tree-node.archetype .row-act { opacity: 1; }
+.tree-node.archetype .row-act { opacity: 1; }
 .row-act:hover { color: var(--accent); background: var(--bg); border: 0; }
 .row-act .icon { width: 17px; height: 17px; }
 .row-act-plus { position: absolute; right: 0; bottom: -2px; font-style: normal;
     font-size: 12px; font-weight: 600; line-height: 1; color: var(--gold);
     background: var(--panel); border-radius: 2px; }
-.lens-sort { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 2px;
-    border: 1px solid var(--edge); border-radius: 3px; padding: 2px 4px; margin-right: 2px;
-    background: transparent; color: var(--muted); cursor: pointer; white-space: nowrap;
-    font: 400 var(--fs-label) system-ui, sans-serif; }
-.lens-sort .icon { width: 11px; height: 11px; }
-.lens-sort:hover, .lens-sort:focus-visible { color: var(--ink); border-color: var(--accent); }
 /* Workstreams (WS-F): the shared-line indicator, the workstream row, and its
    explicit promote/archive actions. Member chats auto-sync — no per-sync buttons. */
 .ws-badge { color: var(--accent, #6ab0f3); width: 13px; height: 13px; flex: 0 0 auto;
@@ -2087,6 +2139,13 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .context-menu { position: fixed; z-index: 50; background: var(--panel); border: 1px solid var(--edge);
     border-radius: 6px; padding: 4px; min-width: 130px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
     display: flex; flex-direction: column; gap: 1px; }
+/* Menu surfaces carry the same fading rule without changing their shape or text. */
+.chat-options-popover, .account-popover, .facet-filter-menu, .context-menu {
+    background-image: var(--shell-gold-rule), var(--shell-gold-rule);
+    background-repeat: no-repeat;
+    background-position: center top, center bottom;
+    background-size: calc(100% - 16px) 1px;
+}
 .menu-item { display: flex; align-items: center; gap: 8px; text-align: left; background: transparent; border: none; color: var(--ink);
     padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: var(--fs-ui); }
 .menu-item-icon { width: 16px; height: 16px; flex: 0 0 16px; color: var(--muted); }

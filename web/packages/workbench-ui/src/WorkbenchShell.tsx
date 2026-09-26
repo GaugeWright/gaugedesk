@@ -1,5 +1,7 @@
 import {
+    batch,
     createEffect,
+    createMemo,
     createSignal,
     onCleanup,
     Show,
@@ -13,9 +15,8 @@ import { initial as initialCarousel, reduce as reduceCarousel } from "./carousel
 import { tapGesture } from "./carousel-view";
 import type { CarouselState, PaneKind, Selection } from "./mobile-layout";
 import { PanelCollapseIcon, type PanelCollapseDirection } from "./PanelCollapseIcon";
+import { dragWorkbenchDivider, resolveWorkbenchLayout, type PaneDivider } from "./workbench-layout";
 
-const RAIL = 30;
-const RESIZER = 5;
 const MOBILE_QUERY = "(max-width: 1024px)";
 
 export interface WorkbenchShellState {
@@ -27,7 +28,7 @@ export interface WorkbenchShellState {
     openPane: (pane: PaneKind, selection?: Selection) => void;
     columns: Accessor<string>;
     observeShell: (element: HTMLDivElement) => void;
-    resize: (boundary: "nav" | "mid" | "files", clientX: number) => void;
+    beginResize: (boundary: PaneDivider) => (deltaX: number) => void;
 }
 
 export interface WorkbenchShellOptions {
@@ -61,6 +62,10 @@ export function createWorkbenchShellState(options: WorkbenchShellOptions): Workb
     const [navWidth, setNavWidth] = createSignal(storedNumber("navW", 206));
     const [filesWidth, setFilesWidth] = createSignal(storedNumber("wsW", 230));
     const [chatFraction, setChatFraction] = createSignal(storedNumber("runFr", 0.5));
+    // An explicit width is set on the first drag. Until then, the saved fraction
+    // gives the middle pair a useful initial split on any window size.
+    const [chatWidth, setChatWidth] = createSignal<number | null>(null);
+    const [shellWidth, setShellWidth] = createSignal(typeof window === "undefined" ? 1200 : window.innerWidth);
     const [navCollapsed, setNavCollapsed] = createSignal(storedCollapsed("navPanel"));
     const [chatCollapsed, setChatCollapsed] = createSignal(storedCollapsed("chatPanel"));
     const [contentCollapsed, setContentCollapsed] = createSignal(storedCollapsed("contentPanel"));
@@ -117,55 +122,42 @@ export function createWorkbenchShellState(options: WorkbenchShellOptions): Workb
         }
     };
 
-    const clamp = (value: number, low: number, high: number) =>
-        Math.max(low, Math.min(high, value));
-    const effectiveNavWidth = () => (navCollapsed() ? RAIL : navWidth());
-    const effectiveFilesWidth = () => (filesCollapsed() ? RAIL : filesWidth());
-    let shellElement: HTMLDivElement | undefined;
+    let shellObserver: ResizeObserver | undefined;
     const observeShell = (element: HTMLDivElement) => {
-        shellElement = element;
-    };
-    const resize = (boundary: "nav" | "mid" | "files", clientX: number) => {
-        if (!shellElement) return;
-        const bounds = shellElement.getBoundingClientRect();
-        if (boundary === "nav") {
-            setNavWidth(clamp(clientX - bounds.left, 120, bounds.width - effectiveFilesWidth() - 240));
-        } else if (boundary === "files" && includeFiles) {
-            setFilesWidth(clamp(bounds.right - clientX, 150, bounds.width - effectiveNavWidth() - 240));
-        } else {
-            const middleLeft = bounds.left + effectiveNavWidth() + RESIZER;
-            const afterContent = !includeFiles ? 0 : filesCollapsed() ? RAIL : filesWidth() + RESIZER;
-            const middleRight = bounds.right - afterContent;
-            setChatFraction(clamp((clientX - middleLeft) / (middleRight - middleLeft), 0.15, 0.85));
+        shellObserver?.disconnect();
+        setShellWidth(element.getBoundingClientRect().width);
+        if (typeof ResizeObserver !== "undefined") {
+            shellObserver = new ResizeObserver(([entry]) => setShellWidth(entry.contentRect.width));
+            shellObserver.observe(element);
         }
+    };
+    onCleanup(() => shellObserver?.disconnect());
+
+    const layout = createMemo(() => resolveWorkbenchLayout({
+        width: shellWidth(), includeFiles,
+        collapsed: { nav: navCollapsed(), chat: chatCollapsed(), content: contentCollapsed(), files: filesCollapsed() },
+        navWidth: navWidth(), filesWidth: filesWidth(), chatWidth: chatWidth(), chatFraction: chatFraction(),
+    }));
+    const beginResize = (boundary: PaneDivider) => {
+        const initial = layout();
+        return (deltaX: number) => {
+            const next = dragWorkbenchDivider(initial, boundary, deltaX);
+            batch(() => {
+                if (boundary === "nav") setNavWidth(next.nav);
+                if (boundary === "files") setFilesWidth(next.files);
+                if (initial.midDivider) {
+                    setChatWidth(next.chat);
+                    setChatFraction(next.chat / (next.chat + next.content));
+                }
+            });
+        };
     };
 
     const columns = () => {
-        const bothMiddleOpen = !chatCollapsed() && !contentCollapsed();
-        const nav = navCollapsed()
-            ? `${RAIL}px`
-            : chatCollapsed() && contentCollapsed() && (!includeFiles || filesCollapsed())
-                ? `minmax(${navWidth()}px,1fr)`
-                : `${navWidth()}px`;
-        const navResizer = navCollapsed() ? "0px" : `${RESIZER}px`;
-        const chat = chatCollapsed()
-            ? `${RAIL}px`
-            : bothMiddleOpen
-                ? `minmax(280px,${chatFraction()}fr)`
-                : "minmax(280px,1fr)";
-        const content = contentCollapsed()
-            ? `${RAIL}px`
-            : bothMiddleOpen
-                ? `${RESIZER}px minmax(240px,${1 - chatFraction()}fr)`
-                : `${RESIZER}px minmax(240px,1fr)`;
-        const files = filesCollapsed()
-            ? `${RAIL}px`
-            : chatCollapsed() && contentCollapsed()
-                ? `${RESIZER}px minmax(${filesWidth()}px,1fr)`
-                : `${RESIZER}px ${filesWidth()}px`;
+        const p = layout();
         return includeFiles
-            ? `${nav} ${navResizer} ${chat} ${content} ${files}`
-            : `${nav} ${navResizer} ${chat} ${content}`;
+            ? `${p.nav}px ${p.navDivider}px ${p.chat}px ${p.midDivider}px ${p.content}px ${p.filesDivider}px ${p.files}px`
+            : `${p.nav}px ${p.navDivider}px ${p.chat}px ${p.midDivider}px ${p.content}px`;
     };
 
     return {
@@ -177,7 +169,7 @@ export function createWorkbenchShellState(options: WorkbenchShellOptions): Workb
         openPane,
         columns,
         observeShell,
-        resize,
+        beginResize,
     };
 }
 
@@ -216,7 +208,7 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
     const RightPanels = () => (
         <>
             <Show when={!props.state.collapsed("content")}>
-                <Resizer onMove={(x) => props.state.resize("mid", x)} />
+                <Resizer enabled={!props.state.collapsed("chat")} onStart={() => props.state.beginResize("mid")} />
             </Show>
             <CollapsiblePanel
                 cls="content"
@@ -232,7 +224,7 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
             <Show when={props.files}>{
                 <>
                     <Show when={!props.state.collapsed("files")}>
-                        <Resizer onMove={(x) => props.state.resize("files", x)} />
+                        <Resizer enabled={!props.state.collapsed("content")} onStart={() => props.state.beginResize("files")} />
                     </Show>
                     <CollapsiblePanel
                         cls="workspace"
@@ -275,7 +267,8 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
                     {props.navFooter?.()}
                 </div>
             </CollapsiblePanel>
-            <Resizer onMove={(x) => props.state.resize("nav", x)} />
+            <Resizer enabled={!props.state.collapsed("nav") && !props.state.collapsed("chat")}
+                onStart={() => props.state.beginResize("nav")} />
             <Show
                 when={!props.state.collapsed("chat")}
                 fallback={
@@ -369,28 +362,34 @@ function CollapsiblePanel(props: {
     );
 }
 
-function Resizer(props: { onMove: (clientX: number) => void }) {
+function Resizer(props: { enabled: boolean; onStart: () => (deltaX: number) => void }) {
     const [dragging, setDragging] = createSignal(false);
     const down = (event: PointerEvent) => {
+        if (!props.enabled) return;
         event.preventDefault();
+        (event.currentTarget as HTMLDivElement).setPointerCapture(event.pointerId);
+        const startX = event.clientX;
+        const apply = props.onStart();
         setDragging(true);
         document.body.style.cursor = "col-resize";
         document.body.style.userSelect = "none";
-        const move = (next: PointerEvent) => props.onMove(next.clientX);
+        const move = (next: PointerEvent) => apply(next.clientX - startX);
         const up = () => {
             setDragging(false);
             document.body.style.cursor = "";
             document.body.style.userSelect = "";
             window.removeEventListener("pointermove", move);
             window.removeEventListener("pointerup", up);
+            window.removeEventListener("pointercancel", up);
         };
         window.addEventListener("pointermove", move);
         window.addEventListener("pointerup", up);
+        window.addEventListener("pointercancel", up);
     };
     return (
         <div
             class="resizer"
-            classList={{ dragging: dragging() }}
+            classList={{ dragging: dragging(), disabled: !props.enabled }}
             onPointerDown={down}
             role="separator"
             aria-orientation="vertical"

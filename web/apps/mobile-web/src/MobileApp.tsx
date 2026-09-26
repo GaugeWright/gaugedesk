@@ -1927,7 +1927,7 @@ function MobileSession(props: {
                     onOpenModelAccess={() => undefined}
                     onOpenProjectHome={openProjectSettings}
                     onOpenForkTree={() => undefined}
-                    onChatDeleted={(id) => {
+                    onChatRemoved={(id) => {
                         if (engagement() === id) {
                             unsubscribe?.();
                             setEngagement(null);

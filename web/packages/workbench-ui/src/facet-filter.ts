@@ -78,6 +78,7 @@ export function childrenFor<T extends { title: string; id?: string; targets?: re
 
 export interface FilterChat {
     readonly title: string;
+    readonly archived?: boolean;
     /** The chat id, used to test membership in the content-hit set. Optional so
      *  pure title-only callers (and tests) need not supply it. */
     readonly id?: string;
@@ -99,7 +100,7 @@ export interface FilterArchetype {
 /** A placement survives iff the owning project matches, the placement's archetype
  *  name matches, or one of its chats matches (title or content). */
 export function placementVisible(projectName: string, pl: FilterPlacement, query: string, contentHits: ReadonlySet<string> = NO_CONTENT): boolean {
-    return hit(projectName, query) || hit(pl.archetypeName, query) || pl.chats.some((c) => chatMatches(c, query, contentHits));
+    return hit(projectName, query) || hit(pl.archetypeName, query) || pl.chats.some((c) => !c.archived && chatMatches(c, query, contentHits));
 }
 
 /** A project survives iff its own name matches or any of its placements survive. */
@@ -110,7 +111,7 @@ export function projectVisible(p: FilterProject, query: string, contentHits: Rea
 /** A library archetype survives iff its name matches or any of its chats match
  *  (title or content). */
 export function archetypeVisible(a: FilterArchetype, query: string, contentHits: ReadonlySet<string> = NO_CONTENT): boolean {
-    return hit(a.name, query) || a.chats.some((c) => chatMatches(c, query, contentHits));
+    return hit(a.name, query) || a.chats.some((c) => !c.archived && chatMatches(c, query, contentHits));
 }
 
 /** The compact lineage shown by the read-only Recent lens. Work chats name both

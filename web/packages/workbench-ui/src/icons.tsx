@@ -49,7 +49,11 @@ export type IconName =
     | "robot"
     | "panel"
     | "kebab"
-    | "pencil";
+    | "pencil"
+    | "pin"
+    | "archive"
+    | "search"
+    | "sliders";
 
 // Each entry is a *factory*, not a stored element: Solid evaluates JSX into real
 // DOM nodes eagerly, and a node can only live under one parent. An icon used by
@@ -57,6 +61,10 @@ export type IconName =
 // reparented to the last mounter, leaving the earlier button blank. Calling the
 // factory per render mints fresh nodes for each `<Icon>`.
 const PATHS: Record<IconName, () => JSX.Element> = {
+    search: () => <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
+    sliders: () => <><path d="M4 5v14M12 5v14M20 5v14" /><circle cx="4" cy="9" r="2" fill="var(--panel)" /><circle cx="12" cy="15" r="2" fill="var(--panel)" /><circle cx="20" cy="8" r="2" fill="var(--panel)" /></>,
+    pin: () => <><path d="m16 3 5 5-3 1-4 4-1 4-2-2-4-4 4-1 4-4z" /><path d="m11 15-6 6" /></>,
+    archive: () => <><rect x="3" y="4" width="18" height="4" rx="1" /><path d="M5 8v12h14V8M10 12h4" /></>,
     microphone: () => (
         <>
             <rect x="9" y="2" width="6" height="12" rx="3" />

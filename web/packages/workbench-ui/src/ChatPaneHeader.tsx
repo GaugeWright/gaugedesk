@@ -27,6 +27,9 @@ export function ChatPaneHeader(props: ChatPaneHeaderProps): JSX.Element {
                     <span class="chat-identity-kind">{kindLabel()}</span>
                 </span>
             </Show>
+            <Show when={!props.branch || !props.kind}>
+                <span class="chat-empty-title">Chat</span>
+            </Show>
             <Show when={props.statusLabel}>
                 <span
                     class="chat-status-assistive"

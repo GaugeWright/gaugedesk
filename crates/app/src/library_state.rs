@@ -7335,6 +7335,40 @@ impl Workbench {
         Some(updated)
     }
 
+    /// Pin and archive are durable navigation state on the chat record. They do
+    /// not destroy its execution history or workspace; deletion remains the
+    /// separate erasure operation.
+    pub(crate) fn organize_chat_record(
+        &mut self,
+        id: &str,
+        archived: Option<bool>,
+        pinned: Option<bool>,
+    ) -> Option<ChatRecord> {
+        let mut record = self.library.chats.get(id)?.clone();
+        if let Some(archived) = archived {
+            record
+                .extra
+                .insert("archived".to_owned(), serde_json::Value::Bool(archived));
+            if archived {
+                record
+                    .extra
+                    .insert("pinned".to_owned(), serde_json::Value::Bool(false));
+            }
+        }
+        if let Some(pinned) = pinned {
+            record
+                .extra
+                .insert("pinned".to_owned(), serde_json::Value::Bool(pinned));
+            if pinned {
+                record
+                    .extra
+                    .insert("archived".to_owned(), serde_json::Value::Bool(false));
+            }
+        }
+        self.write_chat_record(record.clone());
+        Some(record)
+    }
+
     /// Set a generated name only while this chat still has its creation
     /// placeholder. A concurrent human rename wins, including while a model
     /// response is in flight.
@@ -7491,6 +7525,8 @@ impl Workbench {
         serde_json::json!({
             "id": chat.id,
             "title": chat.title,
+            "archived": chat.extra.get("archived").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            "pinned": chat.extra.get("pinned").and_then(serde_json::Value::as_bool).unwrap_or(false),
             "kind": kind,
             "forked_from": chat.forked_from,
             "placement": chat.instance_id,
@@ -8465,6 +8501,37 @@ mod managed_target_basis_tests {
 #[cfg(test)]
 mod engagement_removal_tests {
     use crate::{app_support::DEFAULT_PLACEMENT, LockUnpoisoned};
+
+    #[test]
+    fn archiving_preserves_a_chat_and_survives_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let chat_id = {
+            let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+            let mut workbench = shared.lock_unpoisoned();
+            let chat = workbench
+                .create_chat_in_instance(DEFAULT_PLACEMENT, "keep me")
+                .unwrap();
+            let id = chat["id"].as_str().unwrap().to_owned();
+            workbench
+                .organize_chat_record(&id, None, Some(true))
+                .unwrap();
+            let archived = workbench
+                .organize_chat_record(&id, Some(true), None)
+                .unwrap();
+            assert_eq!(archived.extra["pinned"], false);
+            assert_eq!(archived.extra["archived"], true);
+            assert!(workbench.engagements.contains_key(&id));
+            id
+        };
+        let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+        let mut workbench = shared.lock_unpoisoned();
+        assert_eq!(workbench.library.chats[&chat_id].extra["archived"], true);
+        let restored = workbench
+            .organize_chat_record(&chat_id, Some(false), None)
+            .unwrap();
+        assert_eq!(restored.extra["archived"], false);
+        assert!(workbench.engagements.contains_key(&chat_id));
+    }
 
     /// Deleting a chat is a governed removal of its working copy, and the
     /// working copy is files on disk as well as a line in the store. Both go.

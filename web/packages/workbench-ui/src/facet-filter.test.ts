@@ -114,6 +114,12 @@ describe("placementVisible / projectVisible (a node shows iff it or a descendant
     it("hides a project when nothing in it matches", () => {
         expect(projectVisible(project, "zzz")).toBe(false);
     });
+    it("does not leave a ghost project or Agent from an archived-only search hit", () => {
+        const hidden = { title: "old launch", id: "chat-old", archived: true };
+        const p = { name: "Personal", placements: [{ archetypeName: "Default", chats: [hidden] }] };
+        expect(projectVisible(p, "launch", new Set(["chat-old"]))).toBe(false);
+        expect(archetypeVisible({ name: "Writer", chats: [hidden] }, "launch", new Set(["chat-old"]))).toBe(false);
+    });
 });
 
 describe("archetypeVisible", () => {

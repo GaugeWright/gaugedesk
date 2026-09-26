@@ -325,10 +325,29 @@ impl Workbench {
             .ok_or("tracker requires a current recipient-specific read grant")?;
         tracker.can_complete &=
             crate::federation::require_project_writes_available(self.store_ref(), project).is_ok();
+        let storage = self.workflow_storage(&tracker.workspace_id)?;
+        // Every project's automatic Home-owned `tasks` tracker is declared on
+        // open, before any issue exists. Its uninitialized native store reads
+        // empty without creating one. Other declared trackers still report
+        // missing storage: their absence may mean lost native authority.
+        if snapshot.home_owned
+            && queue == PROJECT_TASKS
+            && storage
+                .protection_mode(&tracker.workspace_id)
+                .map_err(query_error)?
+                .is_none()
+        {
+            let mut writer = self.store_ref().sibling().map_err(query_error)?;
+            return writer
+                .with_dispatch_basis(&basis, || ProjectTrackerBacklog {
+                    tracker,
+                    issues: Vec::new(),
+                })
+                .map_err(query_error);
+        }
         let key = self.workflow_key(project, &tracker.workspace_id, false)?;
         let protection =
             WorkflowProtection::new(&tracker.workspace_id, key.clone()).map_err(query_error)?;
-        let storage = self.workflow_storage(&tracker.workspace_id)?;
         let mut writer = self.store_ref().sibling().map_err(query_error)?;
         let issues = writer
             .with_dispatch_basis(&basis, || {

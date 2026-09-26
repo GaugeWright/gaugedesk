@@ -79,6 +79,7 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     forkChat: "command",
     renameChat: "command",
     deleteChat: "command",
+    organizeChat: "command",
     createWorkstream: "command",
     joinWorkstream: "command",
     leaveWorkstream: "command",
@@ -383,6 +384,10 @@ export class MobileControlPlane implements FacetBrowserApi {
 
     deleteChat(id: EngagementId): Promise<void> {
         return workbenchClient.deleteChat(this.workbenchTransport(), id);
+    }
+
+    organizeChat(id: EngagementId, change: { archived?: boolean; pinned?: boolean }): Promise<void> {
+        return workbenchClient.organizeChat(this.workbenchTransport(), id, change);
     }
 
     createWorkstream(placementId: PlacementId, name: string): Promise<WorkstreamNode> {

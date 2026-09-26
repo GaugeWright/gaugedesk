@@ -389,6 +389,7 @@ function fixtureWorkspace(scope: ScopeFixture, projectFixtures: readonly Project
                 firstChat = false;
                 return {
                     id, title, kind: "work" as const, workstream: null, placement: placementId, workspaceRoot: root,
+                    archived: false, pinned: false,
                     targets: [fixtureTargetMember(target, targetId)], targetSetRevision: 1, collaborationWorkspaceId: null,
                     targetId, targetBasis: "current", targetKind: target.kind, targetAdapter: target.adapter,
                     targetPathScope: [], targetCapabilities: FIXTURE_TARGET_CAPABILITIES,
@@ -420,7 +421,7 @@ function fixtureWorkspace(scope: ScopeFixture, projectFixtures: readonly Project
     const editChat = (archetypeId: ArchetypeId, targetId: ReturnType<typeof workTargetId>, title: string) => {
         const instanceId = fixturePlacementId(`${archetypeId}:authoring`);
         return {
-            id: engagementId(`${archetypeId}:edit`), title, kind: "edit" as const, workstream: null,
+            id: engagementId(`${archetypeId}:edit`), title, archived: false, pinned: false, kind: "edit" as const, workstream: null,
             placement: instanceId, workspaceRoot: fixtureWorkspaceRootId(instanceId),
             targets: [fixtureTargetMember({ id: targetId, name: title, kind: "managed", adapter: "gaugedesk" }, targetId)],
             targetSetRevision: 1, collaborationWorkspaceId: null, targetId,
@@ -437,7 +438,7 @@ function fixtureWorkspace(scope: ScopeFixture, projectFixtures: readonly Project
     });
     const archetypes = libraryAgents.map(archetype);
     const recent = projects.flatMap((project) => project.placements.flatMap((placement) => placement.chats.map((chat) => ({
-        id: chat.id, title: chat.title, archetype: placement.archetypeName, kind: chat.kind,
+        id: chat.id, title: chat.title, archived: chat.archived, pinned: chat.pinned, archetype: placement.archetypeName, kind: chat.kind,
         workstream: chat.workstream, placement: chat.placement, workspaceRoot: chat.workspaceRoot,
         targets: chat.targets, targetSetRevision: chat.targetSetRevision,
         collaborationWorkspaceId: chat.collaborationWorkspaceId,
@@ -499,6 +500,7 @@ function fixtureFacetApi(readWorkspace: () => Workspace): FacetBrowserApi {
         useArchetype: async () => generatedChat(),
         createEngagement: async (): Promise<Engagement> => ({ id: generatedChat(), branch: "fixture", path: "/fixture" }),
         deleteChat: async () => undefined,
+        organizeChat: async () => undefined,
         forkChat: async () => generatedChat(),
         deleteProject: async () => undefined,
         upgradePlacement: async () => 4,
@@ -930,7 +932,7 @@ export function GaugeAppsComposition(): JSX.Element {
             onOpenInbox={(id) => openProjectSettings(id, "Project Work")}
             onAttachTarget={(id) => openProjectSettings(id, "Project Work")}
             onOpenForkTree={openNavChat}
-            onChatDeleted={(id) => id === selectedNavChat() && setSelectedNavChat(null)}
+            onChatRemoved={(id) => id === selectedNavChat() && setSelectedNavChat(null)}
             onStatus={() => undefined}
             refreshKey={scopeId()} />}
         navFooter={() => <div class="nav-footer gaugeapp-account-footer">

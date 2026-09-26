@@ -1467,6 +1467,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.deleteChat(this.workbenchTransport(), id);
     }
 
+    organizeChat(id: EngagementId, change: { archived?: boolean; pinned?: boolean }): Promise<void> {
+        return workbenchClient.organizeChat(this.workbenchTransport(), id, change);
+    }
+
     engagementDiff(id: EngagementId): Promise<string> {
         return workbenchClient.engagementDiff(this.workbenchTransport(), id);
     }

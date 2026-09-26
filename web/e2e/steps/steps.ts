@@ -27,6 +27,20 @@ async function openChatOption(page: Page, option: "Filters" | "History" | "Conte
     await page.getByRole("menuitem", { name: option, exact: true }).click();
 }
 
+async function dropTextFile(page: Page, target: string, name: string, content: string) {
+    await page.locator(target).evaluate((element, file) => {
+        const transfer = new DataTransfer();
+        transfer.items.add(new File([file.content], file.name, { type: "text/plain" }));
+        for (const type of ["dragenter", "dragover", "drop"]) {
+            element.dispatchEvent(new DragEvent(type, {
+                bubbles: true,
+                cancelable: true,
+                dataTransfer: transfer,
+            }));
+        }
+    }, { name, content });
+}
+
 // Per-scenario clean slate. The whole suite shares ONE control plane, run serially,
 // so without this the append-only store accumulates every prior scenario's projects,
 // archetypes and chats — and later scenarios collide with the pile (a global
@@ -1258,6 +1272,10 @@ Then("the {string} tab is absent", async ({ page }, tab: string) => {
     await expect(page.locator(`[data-viewer-tabs] .tab[data-tab="${tab}"]`)).toHaveCount(0);
 });
 
+Then("the content viewer is on the {string} tab", async ({ page }, tab: string) => {
+    await expect(page.locator(`[data-viewer-tabs] .tab[data-tab="${tab}"]`)).toHaveClass(/active/);
+});
+
 When("I open the {string} tab", async ({ page }, tab: string) => {
     // The visible label may be plain language ("changes" for the diff), so match
     // the stable data-tab mode value the feature passes (view/edit/diff).
@@ -1307,7 +1325,7 @@ When("I set the config to {string}", async ({ page }, json: string) => {
     // The raw settings text is now a collapsed "Advanced" surface (round 5 #5):
     // the plain form leads. Reveal Advanced, then edit the JSON. Click the toggle
     // directly (it auto-waits) rather than a one-shot isVisible() check, which can
-    // read false before the modal paints and skip the reveal (config:13 race).
+    // read false before the page paints and skip the reveal (config:13 race).
     await page.locator("[data-settings-advanced-toggle]").click();
     await page.locator("[data-config-text]").fill(json);
     await page.locator("[data-settings-save]").click();
@@ -1332,6 +1350,10 @@ When("I attach the context folder {string}", async ({ page }, path: string) => {
     // e.g. gaugewright-plugin.ts, are what downstream diff/context assertions look
     // for). No `Add files` click is needed — the input is set programmatically.
     await page.locator("[data-add-folder-input]").setInputFiles(path);
+});
+
+When("I drop the file {string} containing {string} on Files", async ({ page }, name: string, content: string) => {
+    await dropTextFile(page, "[data-files-drop-target] .files-header", name, content);
 });
 
 When("I reload as the desktop app and add the repository plugin folder", async ({ page }) => {
@@ -1415,6 +1437,10 @@ When(
     },
 );
 
+When("I drop the file {string} containing {string} on chat", async ({ page }, name: string, content: string) => {
+    await dropTextFile(page, "[data-chat-drop-target] .transcript", name, content);
+});
+
 // A 1x1 transparent PNG — enough for the client to classify + base64 + chip it.
 const TINY_PNG = Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
@@ -1449,6 +1475,10 @@ When("I paste a PNG image {string}", async ({ page }, name: string) => {
 
 Then("the composer shows an image attachment {string}", async ({ page }, name: string) => {
     await expect(page.locator(`[data-attachment][data-kind="image"]`, { hasText: name })).toBeVisible();
+});
+
+Then("the composer shows a text attachment {string}", async ({ page }, name: string) => {
+    await expect(page.locator('[data-attachment][data-kind="text"]', { hasText: name })).toBeVisible();
 });
 
 // A minimal, valid DOCX package containing one paragraph. Its bytes stay in the
@@ -1965,7 +1995,7 @@ When("I click the settings link on the method {string}", async ({ page }, name: 
     await page.locator(".menu-item", { hasText: /^settings$/ }).click();
 });
 
-Then("the method settings modal is open", async ({ page }) => {
+Then("the method settings page is open", async ({ page }) => {
     await expect(page.locator("[data-config-editor]")).toBeVisible();
 });
 
@@ -2033,8 +2063,8 @@ When("I open a chat by keyboard", async ({ page }) => {
     await row.press("Enter");
 });
 
-// The settings modal leads with a plain-language form, with the raw JSON demoted (#5).
-Then("the settings modal shows a plain-language form", async ({ page }) => {
+// The settings page leads with a plain-language form, with the raw JSON demoted (#5).
+Then("the settings page shows a plain-language form", async ({ page }) => {
     await expect(page.locator("[data-settings-form]")).toBeVisible();
     await expect(page.locator("[data-settings-model]")).toBeVisible();
     // The raw JSON is hidden until Advanced is expanded.
@@ -2049,13 +2079,9 @@ Then("the raw settings text is shown", async ({ page }) => {
     await expect(page.locator("[data-config-text]")).toBeVisible();
 });
 
-// Escape closes the settings modal (#6).
-When("I press Escape", async ({ page }) => {
-    await page.keyboard.press("Escape");
-});
-
-Then("the settings modal is closed", async ({ page }) => {
-    await expect(page.locator("[data-config-editor]")).toBeHidden();
+Then("the settings page is open beside an edit chat", async ({ page }) => {
+    await expect(page.locator("[data-config-editor]")).toBeVisible();
+    await expect(page.locator("[data-work-chat-slot]")).toContainText(/Edit chat/i);
 });
 
 // Search has a clear control that resets the filter (#6).

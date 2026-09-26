@@ -742,7 +742,8 @@
 .organization-popover button { width: 100%; background: transparent; border: 1px solid transparent; border-radius: 2px; text-align: left; }
 .organization-popover button:hover,
 .organization-popover button.active { background: color-mix(in srgb, var(--edge) 58%, transparent); border-color: var(--edge); }
-.organization-create-trigger { margin-top: 5px; border-top-color: var(--edge) !important; color: var(--accent) !important; }
+.organization-create-trigger { padding: 6px 8px; color: var(--accent) !important; }
+.organization-menu-choices:not(:empty) + .organization-create-trigger { margin-top: 5px; }
 .organization-create { display: grid; gap: 6px; margin-top: 5px; padding: 9px; border: 1px solid var(--edge); background: color-mix(in srgb, var(--panel) 72%, var(--bg)); }
 .organization-create label { color: var(--muted); font-size: var(--fs-label); letter-spacing: .06em; text-transform: uppercase; }
 .organization-create input { box-sizing: border-box; width: 100%; min-width: 0; }

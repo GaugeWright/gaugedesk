@@ -1877,8 +1877,16 @@ fn run_claimed_engagement_turn(
             });
         (
             factory,
+            // Hosted middleware supplies the actor. The co-resident desktop
+            // authenticates its Home bearer here instead; use that same proven
+            // actor for the turn and its task filer.
             authenticated_actor
                 .cloned()
+                .or_else(|| {
+                    task_action_context
+                        .as_ref()
+                        .map(|context| context.actor().clone())
+                })
                 .unwrap_or_else(|| g.authority().clone()),
             package_selection,
             selected_package_root,

@@ -98,6 +98,8 @@ export interface ChatTargetMember {
 export interface ChatNode {
     readonly id: EngagementId;
     readonly title: string;
+    readonly archived: boolean;
+    readonly pinned: boolean;
     readonly kind: ChatKind;
     /** The id of the workstream this chat is homed to, or `null` for the placement
      *  mainline (the default). Drives workstream grouping in the nav (WS-F). */
@@ -452,6 +454,8 @@ export interface PublicDeploymentInspection {
 export interface RecentChat {
     readonly id: EngagementId;
     readonly title: string;
+    readonly archived: boolean;
+    readonly pinned: boolean;
     readonly archetype: string;
     readonly kind: ChatKind;
     readonly workstream: WorkstreamId | null;
@@ -613,6 +617,8 @@ function parseTargetActs(value: unknown, field: string): TargetActKind[] {
 type RawChat = {
     id: string;
     title: string;
+    archived?: boolean;
+    pinned?: boolean;
     kind?: ChatKind;
     workstream?: string | null;
     placement?: string | null;
@@ -679,6 +685,8 @@ const parseChat = (c: RawChat): ChatNode => {
     return ({
     id: engagementId(c.id),
     title: c.title,
+    archived: c.archived ?? false,
+    pinned: c.pinned ?? false,
     kind: c.kind === "edit" ? "edit" : "work",
     workstream: c.workstream ? workstreamId(c.workstream) : null,
     placement: c.placement ? (c.placement as PlacementId) : null,
@@ -896,6 +904,8 @@ export function parseWorkspace(raw: unknown): Workspace {
             return ({
             id: engagementId(c.id),
             title: c.title,
+            archived: c.archived ?? false,
+            pinned: c.pinned ?? false,
             archetype: c.archetype,
             kind: c.kind === "edit" ? "edit" : "work",
             workstream: c.workstream ? workstreamId(c.workstream) : null,

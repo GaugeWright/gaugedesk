@@ -10229,6 +10229,13 @@
       "expires": "2026-10-31"
     },
     {
+      "method": "PUT",
+      "path": "/chats/{id}/navigation",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
       "method": "POST",
       "path": "/gaugeapps/administration/enterprise-identity/credential",
       "owner": "gaugedesk",

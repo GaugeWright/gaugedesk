@@ -317,6 +317,42 @@ export interface WorkbenchGaugeApps {
     readonly onNativeAccountSessionChanged?: (linked: boolean) => void | Promise<void>;
 }
 
+/** Only OS file drags are accepted. Chat rows and selected text already use
+ * drag gestures elsewhere in the workbench. */
+function createFileDropTarget(onFiles: (files: readonly File[]) => void) {
+    const [active, setActive] = createSignal(false);
+    let depth = 0;
+    const carriesFiles = (event: DragEvent) =>
+        Array.from(event.dataTransfer?.types ?? []).includes("Files");
+    return {
+        active,
+        enter(event: DragEvent) {
+            if (!carriesFiles(event)) return;
+            event.preventDefault();
+            depth += 1;
+            setActive(true);
+        },
+        over(event: DragEvent) {
+            if (!carriesFiles(event)) return;
+            event.preventDefault();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+        },
+        leave(event: DragEvent) {
+            if (!carriesFiles(event)) return;
+            depth = Math.max(0, depth - 1);
+            if (depth === 0) setActive(false);
+        },
+        drop(event: DragEvent) {
+            if (!carriesFiles(event)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            depth = 0;
+            setActive(false);
+            onFiles(Array.from(event.dataTransfer?.files ?? []));
+        },
+    };
+}
+
 function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // The mobile projection-client flow harness (MOB-029) is addressed directly at
     // `?mobile=1` / `#mobile`, composing the committed D-MOBILE islands (pairing,
@@ -729,6 +765,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
     }
     const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string; kind: AgentKind } | null>(null);
+    let agentSettingsOpenSequence = 0;
     // The per-project Engagement pane (FED-7), opened from a project node.
     const [engagement, setEngagement] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // LLM-2: the per-project model-access panel (pin a BYOK key at project scope).
@@ -1532,7 +1569,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // exists before we focus it.)
     let composerEl: HTMLTextAreaElement | undefined;
     function openChat(id: EngagementId) {
+        agentSettingsOpenSequence += 1;
         closeProjectSettings();
+        setAgentSettings(null);
         setTutorialsProject(null);
         setOpenedPanelAgent(null);
         setSelected(id);
@@ -1543,6 +1582,27 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         // A folded chat reopens, and a narrow shell navigates straight to it.
         workbenchShell.openPane("chat", { chatSelected: true, fileSelected: false });
         queueMicrotask(() => composerEl?.focus());
+    }
+
+    async function openAgentSettings(id: ArchetypeId, name: string, kind: AgentKind) {
+        const sequence = ++agentSettingsOpenSequence;
+        try {
+            const workspace = await api.getWorkspace();
+            if (sequence !== agentSettingsOpenSequence) return;
+            const agent = workspace.archetypes.find((candidate) => candidate.id === id);
+            if (!agent) throw new Error("This Agent is no longer available.");
+            const existing = editChatToOpen(agent.chats);
+            const chat = existing ?? await api.createChatUnderArchetype(id, "edit chat");
+            if (!existing) bumpNav();
+            if (sequence !== agentSettingsOpenSequence) return;
+            openChat(chat);
+            setAgentSettings({ id, name, kind });
+            workbenchShell.openPane("content");
+        } catch (error) {
+            if (sequence === agentSettingsOpenSequence) {
+                setStatus(`Couldn't open ${name} settings: ${String(error)}`);
+            }
+        }
     }
 
     // Opening a Panel agent is one movement across the panes (navigation.md,
@@ -1888,16 +1948,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // request, and for small files that is the cheaper shape.
     const MAX_STREAM_BYTES = 512 * 1024 * 1024;
 
-    // Browser context ingest: a native picker (folder or single file) hands us
+    // Browser context ingest: a native picker or Files-pane drop hands us
     // `File`s; we read their text and upload it (ENTSEC-5). No absolute path is
     // involved — browsers hide those — so this is the path-free counterpart to the
-    // desktop shell's native-path ingest. Called from the hidden inputs' onChange.
-    async function uploadPickedFiles(input: HTMLInputElement | undefined) {
+    // desktop shell's native-path ingest.
+    async function uploadFiles(picked: readonly File[]) {
         const id = selected();
-        if (!id || !input) return;
-        const picked = Array.from(input.files ?? []);
-        input.value = ""; // let the same folder/file be picked again later
+        if (!id) return;
         if (!picked.length) return;
+        // Bind the destination before reading any bytes. A large dropped file
+        // must not silently follow a later chat switch into another workspace.
+        const targetId = contextDestination();
+        if (targetId === null) return;
         const files: import("@gaugewright/control-plane-client").UploadContextFile[] = [];
         const streamed: File[] = [];
         const skipped: string[] = [];
@@ -1932,8 +1994,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setStatus(`nothing ingested — ${skipped.length} file(s) too large or unreadable`);
             return;
         }
-        const targetId = contextDestination();
-        if (targetId === null) return;
         try {
             let n = 0;
             if (files.length) n += await api.ingestContextUpload(id, files, targetId);
@@ -1949,6 +2009,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         } catch (e) {
             setStatus(`context error: ${String(e)}`);
         }
+    }
+
+    async function uploadPickedFiles(input: HTMLInputElement | undefined) {
+        if (!input) return;
+        const picked = Array.from(input.files ?? []);
+        input.value = ""; // let the same folder/file be picked again later
+        await uploadFiles(picked);
     }
 
     // Folder import: in the desktop shell, open the native OS folder picker (which
@@ -2064,7 +2131,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             api={api}
             selected={selected()}
             onSelect={openChat}
-            onOpenArchetypeSettings={(id, name, kind) => setAgentSettings({ id, name, kind })}
+            onOpenArchetypeSettings={(id, name, kind) => void openAgentSettings(id, name, kind)}
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
             onOpenProjectHome={(id, name) => {
@@ -2088,7 +2155,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenInbox={(id, name) => setProjectInbox({ id, name })}
             onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
-            onChatDeleted={(id) => selected() === id && setSelected(null)}
+            onChatRemoved={(id) => selected() === id && setSelected(null)}
             onStatus={setStatus}
             runToneOf={runToneOf}
             refreshKey={navRefresh()}
@@ -2418,6 +2485,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         onStatus: setStatus,
     });
 
+    const chatFileDrop = createFileDropTarget((files) => void desktopComposerController.attachFiles(files));
+    const workspaceFileDrop = createFileDropTarget((files) => {
+        if (!selected()) {
+            setStatus("Open a chat before importing files.");
+            return;
+        }
+        void uploadFiles(files);
+    });
+
     /** The composer's fork, which is not `forkAt`. `forkAt` branches from an
      *  existing transcript entry and leaves you reading history; this branches at
      *  the head and carries what you were *about* to say into the new line, so
@@ -2592,7 +2668,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     );
 
     const filesPane = () => (
-        <>
+        <div
+            class="files-drop-target"
+            data-files-drop-target
+            onDragEnter={workspaceFileDrop.enter}
+            onDragOver={workspaceFileDrop.over}
+            onDragLeave={workspaceFileDrop.leave}
+            onDrop={workspaceFileDrop.drop}
+        >
+            <Show when={workspaceFileDrop.active()}>
+                <div class="file-drop-overlay" aria-hidden="true">Drop files to import into this chat</div>
+            </Show>
             {/* Durable context upload lives here (UX-14), not in the composer.
                 The menu keeps the folder and single-file actions together. */}
             <FilesHeader
@@ -2654,7 +2740,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </SessionProvider>
                 )}
             </Show>
-        </>
+        </div>
     );
 
     const chatPane = () => (
@@ -2814,22 +2900,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </div>
                 )}
             </Show>
-            <Show when={agentSettings()}>
-                {(a) => (
-                    <div class="modal-overlay" onClick={() => setAgentSettings(null)}>
-                        <div onClick={(e) => e.stopPropagation()}>
-                            <AgentSettings
-                                api={api}
-                                id={a().id}
-                                name={a().name}
-                                kind={a().kind}
-                                onClose={() => setAgentSettings(null)}
-                            />
-                        </div>
-                    </div>
-                )}
-            </Show>
-
             <Show when={engagement()}>
                 {(e) => (
                     <EngagementPane
@@ -3679,7 +3749,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     // when a chat is open, and the facet tabs are always the nav's top
                     // row so NAVIGATE never shows. The Admin Environment keeps shell
                     // defaults — its navigator has no tabs, so its title carries.
-                    headings={{ nav: false, chat: !selected() && !props.gaugeApps?.active(), content: false, files: false }}
+                    headings={{ nav: false, chat: false, content: false, files: false }}
                     taskBar={() => (
                         <TaskBar
                             api={api}
@@ -3713,39 +3783,64 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     >{navPane()}</div>}
                     navFooter={navFooter}
                     chat={() => <>
-                        <div hidden={props.gaugeApps?.active()} data-work-chat-slot>
+                        <div
+                            hidden={props.gaugeApps?.active()}
+                            data-work-chat-slot
+                            data-chat-drop-target
+                            onDragEnter={chatFileDrop.enter}
+                            onDragOver={chatFileDrop.over}
+                            onDragLeave={chatFileDrop.leave}
+                            onDrop={chatFileDrop.drop}
+                        >
                             {chatPane()}
+                            <Show when={chatFileDrop.active()}>
+                                <div class="file-drop-overlay" aria-hidden="true">Drop files to attach to your message</div>
+                            </Show>
                         </div>
                         <Show when={props.gaugeApps?.active()}>{props.gaugeApps?.chat({
                             mobile: workbenchShell.isMobile(),
                             onCollapse: () => workbenchShell.setCollapsed("chat", true),
                         })}</Show>
                     </>}
-                    content={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={projectSettings()} fallback={panelAgentOrContent()}>
-                        <Show when={currentProjectSettingsWorkspace()} fallback={
-                            <Show when={projectSettingsWorkspace.error} fallback={<p class="project-settings-empty" role="status">Loading project settings…</p>}>
-                                {(error) => <div class="project-settings-empty" role="alert">
-                                    <p>Project settings unavailable: {String(error())}</p>
-                                    <button type="button" onClick={() => void refetchProjectSettings()}>Retry</button>
-                                </div>}
+                    content={() => <Show when={props.gaugeApps?.active()} fallback={
+                        <Show when={agentSettings()} keyed fallback={
+                            <Show when={projectSettings()} fallback={panelAgentOrContent()}>
+                                <Show when={currentProjectSettingsWorkspace()} fallback={
+                                    <Show when={projectSettingsWorkspace.error} fallback={<p class="project-settings-empty" role="status">Loading project settings…</p>}>
+                                        {(error) => <div class="project-settings-empty" role="alert">
+                                            <p>Project settings unavailable: {String(error())}</p>
+                                            <button type="button" onClick={() => void refetchProjectSettings()}>Retry</button>
+                                        </div>}
+                                    </Show>
+                                }>
+                                    {(workspace) => <ProjectSettingsContent
+                                        api={api}
+                                        project={workspace().project}
+                                        library={workspace().library}
+                                        page={projectSettingsPage()}
+                                        onClose={closeProjectSettings}
+                                        onChanged={refreshProjectSettings}
+                                        onAttachTarget={isTauri()
+                                            ? (kind) => void attachTarget(workspace().project.id, workspace().project.name, kind)
+                                            : undefined}
+                                        onManageDeployment={setDeployment}
+                                        projectShareCandidates={props.gaugeApps?.projectShareCandidates}
+                                        onOpenOrganizationPeople={props.gaugeApps?.openOrganizationPeople}
+                                    />}
+                                </Show>
                             </Show>
                         }>
-                            {(workspace) => <ProjectSettingsContent
+                            {(a) => <AgentSettings
                                 api={api}
-                                project={workspace().project}
-                                library={workspace().library}
-                                page={projectSettingsPage()}
-                                onClose={closeProjectSettings}
-                                onChanged={refreshProjectSettings}
-                                onAttachTarget={isTauri()
-                                    ? (kind) => void attachTarget(workspace().project.id, workspace().project.name, kind)
-                                    : undefined}
-                                onManageDeployment={setDeployment}
-                                projectShareCandidates={props.gaugeApps?.projectShareCandidates}
-                                onOpenOrganizationPeople={props.gaugeApps?.openOrganizationPeople}
+                                id={a.id}
+                                name={a.name}
+                                kind={a.kind}
+                                refreshKey={navRefresh()}
+                                onClose={() => setAgentSettings(null)}
+                                onSaved={bumpNav}
                             />}
                         </Show>
-                    </Show>}>
+                    }>
                         {props.gaugeApps?.content()}
                     </Show>}
                     files={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={tutorialsProject()} fallback={<Show when={projectSettings()} fallback={filesPane()}>

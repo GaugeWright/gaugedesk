@@ -10,6 +10,11 @@ Feature: Context ingestion
     When I open the "diff" tab
     Then the diff shows "gaugewright-plugin.ts"
 
+  Scenario: drop a file onto Files
+    Given a new engagement
+    When I drop the file "source.txt" containing "workspace context" on Files
+    Then the target workspace contains "source.txt"
+
   # desktop-native-context-production-client
   @transport
   Scenario: the desktop folder picker ingests a local path through the shipped client

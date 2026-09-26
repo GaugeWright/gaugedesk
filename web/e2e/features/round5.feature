@@ -13,18 +13,18 @@ Feature: Round 5 — honest View after discard, plain chat types, reachable nav,
     When I open a chat by keyboard
     Then the run phase is "Init"
 
-  Scenario: the settings modal leads with a plain form and demotes the raw JSON to Advanced
+  Scenario: the settings page leads with a plain form and demotes the raw JSON to Advanced
     Given the workbench is open
     When I open the config editor
-    Then the settings modal shows a plain-language form
+    Then the settings page shows a plain-language form
     When I expand the advanced settings
     Then the raw settings text is shown
 
-  Scenario: Escape closes the settings modal
+  Scenario: Agent settings share the workbench with its authoring chat
     Given the workbench is open
     When I open the config editor
-    And I press Escape
-    Then the settings modal is closed
+    Then the settings page is open beside an edit chat
+    When I close the config editor
 
   Scenario: search has a clear control that resets the filter
     Given the workbench is open

@@ -1682,6 +1682,39 @@ pub async fn rename_chat(
         .into_response()
 }
 
+#[derive(Deserialize)]
+pub struct OrganizeChat {
+    pub archived: Option<bool>,
+    pub pinned: Option<bool>,
+}
+
+pub async fn organize_chat(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    Json(body): Json<OrganizeChat>,
+) -> impl IntoResponse {
+    if body.archived.is_none() && body.pinned.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "choose archive or pin state" })),
+        )
+            .into_response();
+    }
+    let mut wb = wb.lock_unpoisoned();
+    let Some(updated) = wb.organize_chat_record(&id, body.archived, body.pinned) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such chat" })),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, Json(json!({
+        "id": id,
+        "archived": updated.extra.get("archived").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        "pinned": updated.extra.get("pinned").and_then(serde_json::Value::as_bool).unwrap_or(false),
+    }))).into_response()
+}
+
 // ---- boundary acceptance (D-ATTEST / ADR 0040, ATTEST-7) -----------------
 
 /// The optional attestation payload a participant presents when accepting an

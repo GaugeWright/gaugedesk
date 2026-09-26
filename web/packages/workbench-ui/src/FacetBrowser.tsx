@@ -16,7 +16,7 @@
  * archetype lists everywhere it is placed.
  */
 
-import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { LoadError } from "./LoadError";
 import { navLoadState } from "./nav-load-state";
@@ -61,23 +61,19 @@ import {
 
 type Facet = "recent" | "projects" | "library";
 
-/** A project's child grouping (ADR 0112, NAVLENS-1): `chats` renders the
- *  project's work chats flat and current-first (the default); `archetype`
- *  renders the structural placement view where workstream headers, drag, and
- *  Merge live. Local UI state, persisted per project. */
+/** Project child grouping: `chats` is flat/current-first; `archetype` shows
+ *  Agent placements. The Projects filter applies one lens across its tree. */
 type ProjectLens = "chats" | "archetype";
-const LENS_KEY = "ui.navLens";
+type ProjectStatus = "active" | "archived" | "all";
+const GROUPING_KEY = "ui.projectsGrouping";
+const STATUS_KEY = "ui.projectsStatus";
 
-function readStoredLenses(): Record<string, ProjectLens> {
+function readStoredChoice<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
     try {
-        const raw = window.localStorage?.getItem(LENS_KEY);
-        if (!raw) return {};
-        const parsed = JSON.parse(raw) as Record<string, unknown>;
-        return Object.fromEntries(
-            Object.entries(parsed).filter(([, v]) => v === "chats" || v === "archetype"),
-        ) as Record<string, ProjectLens>;
+        const value = window.localStorage?.getItem(key);
+        return allowed.find((choice) => choice === value) ?? fallback;
     } catch {
-        return {};
+        return fallback;
     }
 }
 
@@ -157,6 +153,7 @@ export interface FacetBrowserApi {
     useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId>;
     createEngagement(): Promise<Engagement>;
     deleteChat(id: EngagementId): Promise<void>;
+    organizeChat(id: EngagementId, change: { archived?: boolean; pinned?: boolean }): Promise<void>;
     forkChat(id: EngagementId, destination?: { kind: "inherit" } | { kind: "main" } | { kind: "workstream"; workstream_id: string }): Promise<EngagementId>;
     deleteProject(id: ProjectId): Promise<void>;
     upgradePlacement(placementId: PlacementId): Promise<number>;
@@ -197,7 +194,7 @@ export function FacetBrowser(props: {
     onOpenInbox?: (project: ProjectId, name: string) => void;
     onAttachTarget?: (id: ProjectId, name: string, kind: "external-vcs" | "external-folder") => void;
     onOpenForkTree: (chat: EngagementId) => void;
-    onChatDeleted: (id: EngagementId) => void;
+    onChatRemoved: (id: EngagementId) => void;
     onStatus: (msg: string) => void;
     /** A chat's agent run tone (round-13): drives the status dot beside its name —
      *  working / needs-review / error, or undefined when idle (no dot). Optional so
@@ -218,6 +215,11 @@ export function FacetBrowser(props: {
     // commands or drag/drop targets.
     const [facet, setFacet] = createSignal<Facet>("projects");
     const [query, setQuery] = createSignal("");
+    const [searchOpen, setSearchOpen] = createSignal(false);
+    const [filterOpen, setFilterOpen] = createSignal(false);
+    const [filterPage, setFilterPage] = createSignal<"root" | "status" | "grouping">("root");
+    const [grouping, setGroupingSignal] = createSignal<ProjectLens>(readStoredChoice(GROUPING_KEY, ["chats", "archetype"], "chats"));
+    const [projectStatus, setProjectStatus] = createSignal<ProjectStatus>(readStoredChoice(STATUS_KEY, ["active", "archived", "all"], "active"));
     // The nav's initial/repair read uses the workspace **freshness carriage** (ADR
     // 0037), never a bare value. Desktop refreshKey bumps still re-read it; mobile
     // routine events take the delta path below. `fresh` is surfaced so a stale tree
@@ -382,8 +384,9 @@ export function FacetBrowser(props: {
     // For a parent node: keep it if its own label matches, else keep only the
     // descendants that match — by title or content (so search narrows into a group,
     // surfacing content-only hits, never hides a hit).
-    const chatsFor = <T extends { title: string; id?: EngagementId }>(label: string, chats: T[]) =>
-        childrenFor(label, chats, query(), contentHits());
+    const chatsFor = <T extends { title: string; id?: EngagementId; archived?: boolean }>(label: string, chats: T[]) =>
+        childrenFor(label, chats.filter((chat) => !chat.archived), query(), contentHits());
+    const activeChatCount = (chats: readonly { archived?: boolean }[]) => chats.filter((chat) => !chat.archived).length;
 
     const [menu, setMenu] = createSignal<MenuState | null>(null);
     // Row-tool reveal driven by pointer EVENTS, not CSS :hover (ADR 0112).
@@ -392,19 +395,16 @@ export function FacetBrowser(props: {
     // live 2026-07-28); pointerenter/leave keep firing in that state, so a
     // class toggle stays reliable where the pseudo-class silently isn't.
     const [hotRow, setHotRow] = createSignal<string | null>(null);
-    // Per-project lens (ADR 0112): which facet organizes a project's children.
-    const [lenses, setLenses] = createSignal<Record<string, ProjectLens>>(readStoredLenses());
-    const lensOf = (id: ProjectId): ProjectLens => lenses()[id] ?? "chats";
-    const setLens = (id: ProjectId, lens: ProjectLens) =>
-        setLenses((m) => {
-            const next = { ...m, [id]: lens };
-            try {
-                window.localStorage?.setItem(LENS_KEY, JSON.stringify(next));
-            } catch {
-                /* storage unavailable — the lens lives for this session only */
-            }
-            return next;
-        });
+    const setGrouping = (value: ProjectLens) => {
+        setGroupingSignal(value);
+        try { window.localStorage?.setItem(GROUPING_KEY, value); } catch { /* session-only preference */ }
+        setFilterOpen(false);
+    };
+    const setStatus = (value: ProjectStatus) => {
+        setProjectStatus(value);
+        try { window.localStorage?.setItem(STATUS_KEY, value); } catch { /* session-only preference */ }
+        setFilterOpen(false);
+    };
     // Current-first rank for the flat `chats` lens, derived from the same server
     // projection Recent renders; chats absent from it sink to the end in tree order.
     const recentRank = createMemo(() => new Map((tree()?.recent ?? []).map((c, i) => [c.id, i] as const)));
@@ -562,8 +562,8 @@ export function FacetBrowser(props: {
     // children (#2 round-9); on a method with no chats and nowhere placed it
     // expanded to nothing, so the caret lied. Render a real caret only when there
     // are children, and a fixed-width spacer otherwise so labels stay aligned.
-    const archetypeHasChildren = (a: { id: string; chats: unknown[] }) =>
-        a.chats.length > 0 || (placementsOf().get(a.id)?.length ?? 0) > 0;
+    const archetypeHasChildren = (a: { id: string; chats: { archived?: boolean }[] }) =>
+        activeChatCount(a.chats) > 0 || (placementsOf().get(a.id)?.length ?? 0) > 0;
     const caret = (id: string, hasChildren: boolean) =>
         hasChildren ? (
             <span class="node-icon" onClick={(e) => { e.stopPropagation(); toggleCollapse(id); }}>
@@ -922,8 +922,15 @@ export function FacetBrowser(props: {
     function deleteChat(id: EngagementId) {
         void withRefresh(async () => {
             await props.api.deleteChat(id);
-            props.onChatDeleted(id);
+            props.onChatRemoved(id);
         }, "chat deleted");
+    }
+
+    function organizeChat(id: EngagementId, change: { archived?: boolean; pinned?: boolean }) {
+        void withRefresh(async () => {
+            await props.api.organizeChat(id, change);
+            if (change.archived) props.onChatRemoved(id);
+        }, change.archived === true ? "chat archived" : change.archived === false ? "chat restored" : change.pinned ? "chat pinned" : "chat unpinned");
     }
 
     const editingIs = (kind: string, id: string) => {
@@ -989,16 +996,14 @@ export function FacetBrowser(props: {
     // A container row keeps its direct create action and an anchored menu.
     // Right-click opens the same full action list.
     const rowActions = (opts: {
-        /** Extra control rendered before the buttons (the project lens chip). */
-        lead?: JSX.Element;
         primary?: { icon: IconName; title: string; aria: string; data?: string; plus?: boolean; run: () => void };
+        secondary?: { icon: IconName; title: string; aria: string; plus?: boolean; run: () => void };
         menuIcon?: IconName;
         menuPlus?: boolean;
         menuAria: string;
         menuItems: () => MenuState["items"];
     }) => (
         <span class="row-actions">
-            {opts.lead}
             <Show when={opts.primary} keyed>
                 {(primary) => (
                     <button
@@ -1014,6 +1019,15 @@ export function FacetBrowser(props: {
                         <Show when={primary.plus}>
                             <i class="row-act-plus" aria-hidden="true">+</i>
                         </Show>
+                    </button>
+                )}
+            </Show>
+            <Show when={opts.secondary} keyed>
+                {(secondary) => (
+                    <button type="button" class="row-act" title={secondary.title} aria-label={secondary.aria}
+                        onClick={(e) => { e.stopPropagation(); secondary.run(); }}>
+                        <Icon name={secondary.icon} class="icon" />
+                        <Show when={secondary.plus}><i class="row-act-plus" aria-hidden="true">+</i></Show>
                     </button>
                 )}
             </Show>
@@ -1052,17 +1066,13 @@ export function FacetBrowser(props: {
             props.onSelect(eng.id);
         }, "new chat");
     }
-    const lensMenuItems = (p: ProjectNode): MenuState["items"] => [
-        { label: "Recent activity", selected: lensOf(p.id) === "chats", run: () => setLens(p.id, "chats") },
-        { label: "Agent view", selected: lensOf(p.id) === "archetype", run: () => setLens(p.id, "archetype") },
-    ];
     const projectMenuItems = (p: ProjectNode): MenuState["items"] => {
         if (p.product?.kind === "tutorials") return [
             { label: "open tutorials", run: () => props.onOpenTutorials?.(p.id) },
             ...(props.onOpenProjectTasks ? [{ label: "tasks…", hint: "Open your tutorial tasks", run: () => props.onOpenProjectTasks?.(p.id, p.name) }] : []),
         ];
         const home = p.placements.find((pl) => pl.isDefault)?.placementId;
-        const lens = lensOf(p.id);
+        const lens = grouping();
         return [
             ...(home ? [
                 { label: "new workstream", icon: "child-branch" as const, hint: "Create a shared auto-sync line in this project", run: () => startEdit({ kind: "new-workstream", placementId: home }) },
@@ -1076,7 +1086,7 @@ export function FacetBrowser(props: {
                         run: () => void newWorkChat(p.id, pl.placementId),
                     }))
                 : []),
-            { label: "add an Agent", icon: "chat-bubble" as const, run: () => openAddMethod(p.id, p.name) },
+            { label: "add an Agent", icon: "robot" as const, run: () => openAddMethod(p.id, p.name) },
             ...(props.onAttachTarget ? [
                 { label: "attach Git repository…", hint: "Use its native Git history and explicit apply lifecycle", run: () => props.onAttachTarget?.(p.id, p.name, "external-vcs" as const) },
                 { label: "attach folder…", hint: "Fingerprint the folder and compare before every write", run: () => props.onAttachTarget?.(p.id, p.name, "external-folder" as const) },
@@ -1252,7 +1262,7 @@ export function FacetBrowser(props: {
         displayChatTitle(chat.title, untitledTag(chat.id));
 
     const chatRow = (
-        chat: { id: EngagementId; title: string; kind: "edit" | "work"; workstream?: WorkstreamId | null; placement?: PlacementId | null; workspaceRoot: WorkspaceRootId; targets?: readonly { targetId: WorkTargetId; name: string; participation: "read-only" | "writable" }[]; rehomeBlocked: boolean; changes?: boolean; conflict?: boolean },
+        chat: { id: EngagementId; title: string; kind: "edit" | "work"; archived?: boolean; pinned?: boolean; workstream?: WorkstreamId | null; placement?: PlacementId | null; workspaceRoot: WorkspaceRootId; targets?: readonly { targetId: WorkTargetId; name: string; participation: "read-only" | "writable" }[]; rehomeBlocked: boolean; changes?: boolean; conflict?: boolean },
         meta?: string,
         // The placement's workstreams (WS-F), present only in the Projects facet, so a
         // work chat's menu can offer join/leave and its row can badge membership.
@@ -1264,7 +1274,9 @@ export function FacetBrowser(props: {
         // chat row and menu. Lineage is presentation context, not another row kind.
         recentLineageLabel?: string,
         nestedUnderAgent = false,
+        archivedList = false,
     ) => (
+        <Show when={archivedList ? chat.archived : !chat.archived}>
         <>
         <div
             class="tree-leaf chat-item"
@@ -1342,7 +1354,12 @@ export function FacetBrowser(props: {
             onContextMenu={(e) =>
                 // A chat's kind (edit/work) is fixed at creation by its root
                 // (ADR 0035) — no mid-life toggle.
-                openMenu(e, [
+                openMenu(e, chat.archived ? [
+                    { label: "restore", run: () => organizeChat(chat.id, { archived: false }) },
+                    { label: "delete permanently", danger: true, confirmHint: "Erases this chat's transcript and unique workspace content", run: () => deleteChat(chat.id) },
+                ] : [
+                    { label: chat.pinned ? "unpin" : "pin", run: () => organizeChat(chat.id, { pinned: !chat.pinned }) },
+                    { label: "archive", run: () => organizeChat(chat.id, { archived: true }) },
                     {
                         label: "fork",
                         run: () =>
@@ -1402,7 +1419,6 @@ export function FacetBrowser(props: {
                         }]
                         : []),
                     { label: "rename", run: () => startEdit({ kind: "rename-chat", id: chat.id }, chat.title) },
-                    { label: "delete", danger: true, run: () => deleteChat(chat.id) },
                 ])
             }
         >
@@ -1463,6 +1479,12 @@ export function FacetBrowser(props: {
             <Show when={meta}>
                 <span class="leaf-meta" title={`runs the ${meta} Agent`}>{meta}</span>
             </Show>
+            <span class="chat-hover-actions">
+                <Show when={!chat.archived} fallback={<button type="button" title="Restore chat" aria-label={`Restore ${displayTitle(chat)}`} onClick={(e) => { e.stopPropagation(); organizeChat(chat.id, { archived: false }); }}><Icon name="archive" /></button>}>
+                    <button type="button" data-pinned={chat.pinned || undefined} title={chat.pinned ? "Unpin chat" : "Pin chat"} aria-label={`${chat.pinned ? "Unpin" : "Pin"} ${displayTitle(chat)}`} onClick={(e) => { e.stopPropagation(); organizeChat(chat.id, { pinned: !chat.pinned }); }}><Icon name="pin" /></button>
+                    <button type="button" title="Archive chat" aria-label={`Archive ${displayTitle(chat)}`} onClick={(e) => { e.stopPropagation(); organizeChat(chat.id, { archived: true }); }}><Icon name="archive" /></button>
+                </Show>
+            </span>
             <Show when={chat.conflict || chat.changes}>
                 <span class="nav-vcs-state" classList={{ conflict: chat.conflict }}
                     title={chat.conflict ? "VCS conflict — resolve changes" : "VCS changes pending"}
@@ -1479,6 +1501,7 @@ export function FacetBrowser(props: {
             <div class="tree-leaf ws-new-inline">{renameInput("name this workstream, then Enter")}</div>
         </Show>
         </>
+        </Show>
     );
 
     // Group a chat list by workstream (WS-F): when a named line is active, `Main` is
@@ -1789,7 +1812,7 @@ export function FacetBrowser(props: {
                             aria-selected={facet() === f.id}
                             data-facet={f.id}
                             classList={{ active: facet() === f.id }}
-                            onClick={() => setFacet(f.id)}
+                            onClick={() => { setFacet(f.id); setFilterOpen(false); }}
                         >
                             {f.label}
                         </button>
@@ -1810,31 +1833,68 @@ export function FacetBrowser(props: {
                     </button>
                 </Show>
             </div>
-            {/* Search with a clear control (#6 round-5): typing filters the tree,
-                but there was no way to reset it short of selecting-and-deleting. */}
-            <div class="facet-search-row">
-                <input
-                    class="facet-search"
-                    data-testid="facet-search"
-                    aria-label="Search projects, Agents, and chats"
-                    placeholder="search…"
-                    value={query()}
-                    onInput={(e) => setQuery(e.currentTarget.value)}
-                    onKeyDown={(e) => e.key === "Escape" && setQuery("")}
-                />
-                <Show when={query()}>
-                    <button
-                        type="button"
-                        class="facet-search-clear"
-                        data-testid="facet-search-clear"
-                        title="Clear search"
-                        aria-label="Clear search"
-                        onClick={() => setQuery("")}
-                    >
-                        ✕
+            <div class="facet-toolbar" data-facet-toolbar={facet()}>
+                <Show when={facet() === "projects"}>
+                    {createBtn("+ project", () => { setStatus("active"); startEdit({ kind: "new-project" }); }, { title: "Create a new project" })}
+                </Show>
+                <Show when={facet() === "library"}>
+                    {createBtn("+ agent", openCreateAgent, { title: "Create an Agent or Panel agent" })}
+                </Show>
+                <Show when={facet() === "recent"}><span class="facet-toolbar-spacer" /></Show>
+                <button type="button" class="facet-toolbar-icon" classList={{ active: searchOpen() }}
+                    title={searchOpen() ? "Close search" : "Search"} aria-label={searchOpen() ? "Close search" : "Search"}
+                    aria-expanded={searchOpen()} onClick={() => {
+                        if (searchOpen()) setQuery("");
+                        setSearchOpen(!searchOpen());
+                    }}><Icon name="search" /></button>
+                <Show when={facet() === "projects"}>
+                    <button type="button" class="facet-toolbar-icon" classList={{ active: filterOpen() || grouping() !== "chats" || projectStatus() !== "active" }}
+                        data-project-filter title="Filter projects" aria-label="Filter projects" aria-haspopup="menu"
+                        aria-expanded={filterOpen()} onClick={() => { setFilterPage("root"); setFilterOpen((value) => !value); }}>
+                        <Icon name="sliders" />
                     </button>
                 </Show>
+                <Show when={filterOpen() && facet() === "projects"}>
+                    <div class="facet-filter-backdrop" onClick={() => setFilterOpen(false)} />
+                    <div class="facet-filter-menu" role="menu" aria-label="Projects filter" onKeyDown={(event) => event.key === "Escape" && setFilterOpen(false)}>
+                        <Show when={filterPage() === "root"}>
+                            <button type="button" role="menuitem" onClick={() => setFilterPage("status")}>
+                                <span>Status</span><span>{projectStatus() === "active" ? "Active" : projectStatus() === "archived" ? "Archived" : "All"}</span><Icon name="chevron" />
+                            </button>
+                            <button type="button" role="menuitem" onClick={() => setFilterPage("grouping")}>
+                                <span>Group by</span><span>{grouping() === "chats" ? "Recent activity" : "Agent"}</span><Icon name="chevron" />
+                            </button>
+                        </Show>
+                        <Show when={filterPage() === "status"}>
+                            <button type="button" class="facet-filter-back" onClick={() => setFilterPage("root")}>‹ Status</button>
+                            <For each={(["active", "archived", "all"] as const)}>{(choice) =>
+                                <button type="button" role="menuitemradio" aria-checked={projectStatus() === choice} onClick={() => setStatus(choice)}>
+                                    <span>{choice === "active" ? "Active" : choice === "archived" ? "Archived" : "All"}</span><span>{projectStatus() === choice ? "✓" : ""}</span>
+                                </button>
+                            }</For>
+                        </Show>
+                        <Show when={filterPage() === "grouping"}>
+                            <button type="button" class="facet-filter-back" onClick={() => setFilterPage("root")}>‹ Group by</button>
+                            <For each={(["chats", "archetype"] as const)}>{(choice) =>
+                                <button type="button" role="menuitemradio" aria-checked={grouping() === choice} onClick={() => setGrouping(choice)}>
+                                    <span>{choice === "chats" ? "Recent activity" : "Agent view"}</span><span>{grouping() === choice ? "✓" : ""}</span>
+                                </button>
+                            }</For>
+                        </Show>
+                    </div>
+                </Show>
             </div>
+            <Show when={searchOpen()}>
+                <div class="facet-search-row">
+                    <input class="facet-search" data-testid="facet-search" aria-label="Search projects, Agents, and chats"
+                        placeholder="Search projects, Agents, chats…" value={query()}
+                        ref={(element) => queueMicrotask(() => element.focus())}
+                        onInput={(event) => setQuery(event.currentTarget.value)}
+                        onKeyDown={(event) => { if (event.key === "Escape") { setQuery(""); setSearchOpen(false); } }} />
+                    <Show when={query()}><button type="button" class="facet-search-clear" data-testid="facet-search-clear"
+                        title="Clear search" aria-label="Clear search" onClick={() => setQuery("")}>✕</button></Show>
+                </div>
+            </Show>
 
             <Show
                 when={navLoadState({ errored: !!carriage.error, hasTree: !!tree() }) !== "error"}
@@ -1869,17 +1929,27 @@ export function FacetBrowser(props: {
 
                         {/* PROJECTS — the default facet: project → placements → work chats. */}
                         <Show when={facet() === "projects"}>
-                            {/* Hide the create affordance while a search is active (#6
-                                round-9): "+ project" rendered inside filtered results
-                                read like a stray search hit. */}
-                            <Show when={!searching()}>
-                            <div class="action-row" data-actions="projects">
-                                {createBtn("+ project", () => startEdit({ kind: "new-project" }), { title: "Create a new project" })}
-                            </div>
-                            </Show>
                             <Show when={editing()?.kind === "new-project"}>
                                 <div class="tree-leaf">{renameInput("name this project, then Enter")}</div>
                             </Show>
+                            <Show when={projectStatus() !== "archived" && t().recent.some((chat) => chat.pinned && !chat.archived)}>
+                                <section class="chat-collection" aria-label="Pinned chats">
+                                    <div class="chat-collection-heading"><Icon name="pin" /> Pinned</div>
+                                    <For each={t().recent.filter((chat) => chat.pinned && !chat.archived && recentVisible(chat, recentLineage(chat, t().projects, t().workstreams), query(), contentHits()))}>
+                                        {(chat) => chatRow(chat, undefined, undefined, false, recentLineage(chat, t().projects, t().workstreams))}
+                                    </For>
+                                </section>
+                            </Show>
+                            <Show when={projectStatus() === "archived" || (projectStatus() === "all" && t().recent.some((chat) => chat.archived))}>
+                                <section class="chat-collection" aria-label="Archived chats">
+                                    <div class="chat-collection-heading"><Icon name="archive" /> Archived <span>{t().recent.filter((chat) => chat.archived).length}</span></div>
+                                    <For each={t().recent.filter((chat) => chat.archived && recentVisible(chat, recentLineage(chat, t().projects, t().workstreams), query(), contentHits()))}
+                                        fallback={<div class="status">no archived chats</div>}>
+                                        {(chat) => chatRow(chat, undefined, undefined, false, recentLineage(chat, t().projects, t().workstreams), false, true)}
+                                    </For>
+                                </section>
+                            </Show>
+                            <Show when={projectStatus() !== "archived"}>
                             <For
                                 each={t().projects.filter((p) => projectVisible(p, query(), contentHits()))}
                                 fallback={<div class="status">no projects</div>}
@@ -1910,22 +1980,6 @@ export function FacetBrowser(props: {
                                                 {renameInput()}
                                             </Show>
                                             {rowActions({
-                                                /* A labeled menu for the project's two saved lens
-                                                   choices. Its active option is checked in the menu. */
-                                                lead: p.product?.kind === "tutorials" ? undefined : (
-                                                    <button
-                                                        type="button"
-                                                        class="lens-sort"
-                                                        data-lens-toggle={p.id}
-                                                        data-lens={lensOf(p.id)}
-                                                        title={`Sort and group chats in ${p.name}`}
-                                                        aria-label={`Sort by in ${p.name}`}
-                                                        aria-haspopup="menu"
-                                                        onClick={(e) => { e.stopPropagation(); openMenuAt(e.currentTarget, lensMenuItems(p)); }}
-                                                    >
-                                                        Sort by <Icon name="chevron" />
-                                                    </button>
-                                                ),
                                                 primary: p.product?.kind !== "tutorials" && canStartProjectChat(p)
                                                     ? {
                                                         icon: "chat-bubble",
@@ -1936,9 +1990,14 @@ export function FacetBrowser(props: {
                                                         run: () => void newProjectChat(p),
                                                     }
                                                     : undefined,
+                                                secondary: {
+                                                    icon: "robot",
+                                                    plus: true,
+                                                    title: "Add an Agent to this project",
+                                                    aria: `add an Agent to ${p.name}`,
+                                                    run: () => openAddMethod(p.id, p.name),
+                                                },
                                                 menuAria: `actions for project ${p.name}`,
-                                                menuIcon: "folder-open",
-                                                menuPlus: true,
                                                 menuItems: () => projectMenuItems(p),
                                             })}
                                         </div>
@@ -1952,7 +2011,7 @@ export function FacetBrowser(props: {
                                             in the project, current-first, archetype as a row tag. The
                                             workstream naming editor still renders here — the menu's
                                             "new workstream" targets the general placement. */}
-                                        <Show when={p.product?.kind !== "tutorials" && lensOf(p.id) === "chats"}>
+                                        <Show when={p.product?.kind !== "tutorials" && grouping() === "chats"}>
                                             {(() => {
                                                 const home = p.placements.find((pl) => pl.isDefault);
                                                 return <Show when={home}>{wsEditorFor(home!.placementId)}</Show>;
@@ -1970,7 +2029,7 @@ export function FacetBrowser(props: {
                                                 </div>
                                             </Show>
                                         </Show>
-                                        <Show when={p.product?.kind !== "tutorials" && lensOf(p.id) === "archetype"}>
+                                        <Show when={p.product?.kind !== "tutorials" && grouping() === "archetype"}>
                                         {/* A chat appears under the Agent placement that created it.
                                             The built-in Default placement is visible in this lens so
                                             its chats have an Agent row too. */}
@@ -1986,15 +2045,15 @@ export function FacetBrowser(props: {
                                                         onPointerLeave={() => setHotRow((v) => (v === pl.placementId ? null : v))}
                                                         role="treeitem"
                                                         tabindex="0"
-                                                        aria-expanded={pl.kind === "work" && pl.chats.length > 0 ? !isCollapsed(pl.placementId) : undefined}
+                                                        aria-expanded={pl.kind === "work" && activeChatCount(pl.chats) > 0 ? !isCollapsed(pl.placementId) : undefined}
                                                         aria-label={
                                                             pl.kind === "panel"
                                                                 ? `Panel agent ${pl.archetypeName} on ${p.name}`
-                                                                : pl.chats.length > 0
+                                                                : activeChatCount(pl.chats) > 0
                                                                 ? `Agent ${pl.archetypeName} on ${p.name} — open its chats`
                                                                 : `Agent ${pl.archetypeName} on ${p.name} — start a chat`
                                                         }
-                                                        title={pl.kind === "panel" ? "Open this placement: pinned contract, Preview, deployments, Inbox" : pl.chats.length > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
+                                                        title={pl.kind === "panel" ? "Open this placement: pinned contract, Preview, deployments, Inbox" : activeChatCount(pl.chats) > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
                                                         // Clicking the row is the obvious "start working" path: with no
                                                         // chats yet it opens a new work chat; otherwise it reveals the
                                                         // existing ones (the `+ chat` button always adds another).
@@ -2004,7 +2063,7 @@ export function FacetBrowser(props: {
                                                                     const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
                                                                     if (agent) props.onOpenPanelAgent?.(agent, p);
                                                                 })()
-                                                                : pl.chats.length > 0
+                                                                : activeChatCount(pl.chats) > 0
                                                                 ? toggleCollapse(pl.placementId)
                                                                 : void newWorkChat(p.id, pl.placementId)
                                                         }
@@ -2014,13 +2073,13 @@ export function FacetBrowser(props: {
                                                                 if (pl.kind === "panel") {
                                                                     const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
                                                                     if (agent) props.onOpenPanelAgent?.(agent, p);
-                                                                } else if (pl.chats.length > 0) toggleCollapse(pl.placementId);
+                                                                } else if (activeChatCount(pl.chats) > 0) toggleCollapse(pl.placementId);
                                                                 else void newWorkChat(p.id, pl.placementId);
                                                             }
                                                         }}
                                                         onContextMenu={(e) => openMenu(e, placementMenuItems(p, pl))}
                                                     >
-                                                        {caret(pl.placementId, pl.kind === "work" && pl.chats.length > 0)}
+                                                        {caret(pl.placementId, pl.kind === "work" && activeChatCount(pl.chats) > 0)}
                                                         <AgentKindMark kind={pl.kind} />
                                                         {/* Just the method name here (round-6 #6): this row is
                                                             already nested under its project, so the "· project"
@@ -2091,18 +2150,11 @@ export function FacetBrowser(props: {
                                     </div>
                                 )}
                             </For>
+                            </Show>
                         </Show>
 
                         {/* LIBRARY — archetypes (the methods) → edit chats. */}
                         <Show when={facet() === "library"}>
-                            <Show when={!searching()}>
-                            {/* No facet-level "+ workstream" here: a workstream is a shared line
-                                over one archetype's edit chats, so it lives per-archetype (below),
-                                not at the Workshop root where there's no single target. */}
-                            <div class="action-row" data-actions="library">
-                                {createBtn("+ agent", openCreateAgent, { title: "Create an Agent or Panel agent" })}
-                            </div>
-                            </Show>
                             <For
                                 each={t().archetypes.filter((a) => archetypeVisible(a, query(), contentHits()))}
                                 fallback={<div class="status">no Agents yet</div>}

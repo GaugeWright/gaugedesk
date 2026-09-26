@@ -3,7 +3,7 @@
  * authority live in the authored WhippleScript package; this surface owns only
  * host/provider choices such as the preferred model.
  *
- * Round 5 (#5): the modal used to be a single raw `{}` JSON textarea labelled
+ * Round 5 (#5): this editor used to be a single raw `{}` JSON textarea labelled
  * "Advanced … leave it as {} to use the defaults" — so the one beginner
  * instruction the empty state gives ("set what this method does in settings")
  * dead-ended at a field that told the beginner not to touch it. There was nowhere
@@ -12,7 +12,7 @@
  * package draft is edited in an edit chat and frozen by Publish.
  */
 
-import { createEffect, createMemo, createResource, createSignal, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, Show } from "solid-js";
 import { PanelContractEditor } from "./PanelContractEditor";
 import {
     type AgentAbility,
@@ -75,7 +75,9 @@ export interface AgentSettingsProps {
     id: ArchetypeId;
     name: string;
     kind: AgentKind;
+    refreshKey?: number;
     onClose: () => void;
+    onSaved?: () => void;
 }
 
 export const AGENT_ABILITY_PRESETS: ReadonlyArray<{
@@ -106,17 +108,17 @@ export const AGENT_ABILITY_PRESETS: ReadonlyArray<{
 ];
 
 export function AgentSettings(props: AgentSettingsProps) {
-    const [loaded] = createResource(
-        () => props.id,
-        (id) => props.api.getArchetypeConfig(id),
+    const [loaded, { refetch: refetchConfig }] = createResource(
+        () => [props.id, props.refreshKey] as const,
+        ([id]) => props.api.getArchetypeConfig(id),
     );
-    const [loadedAbilities] = createResource(
-        () => props.id,
-        (id) => props.api.getArchetypeAbilities(id),
+    const [loadedAbilities, { refetch: refetchAbilities }] = createResource(
+        () => [props.id, props.refreshKey] as const,
+        ([id]) => props.api.getArchetypeAbilities(id),
     );
-    const [loadedPanel] = createResource(
-        () => props.kind === "panel" ? props.id : null,
-        (id) => props.api.getPanelProfile(id),
+    const [loadedPanel, { refetch: refetchPanel }] = createResource(
+        () => props.kind === "panel" ? [props.id, props.refreshKey] as const : null,
+        ([id]) => props.api.getPanelProfile(id),
     );
     // The raw JSON the Advanced section edits. Until the user touches Advanced it
     // tracks the loaded config; the form edits flow through it too, so saving always
@@ -128,14 +130,8 @@ export function AgentSettings(props: AgentSettingsProps) {
         null,
     );
     const [panelDraft, setPanelDraft] = createSignal<PanelPublicProfile | null>(null);
+    const [panelDirty, setPanelDirty] = createSignal(false);
     const text = () => raw() ?? loaded() ?? "{}";
-
-    // Escape closes the modal (#6 round-5: it didn't, leaving the user to hunt for
-    // "close" — a forgiveness/convention gap). A native listener: Solid delegates
-    // events, so a synthetic keydown on the modal wouldn't catch a focused textarea.
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && props.onClose();
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => document.removeEventListener("keydown", onKey));
 
     // Parse the current text for the form. If the raw JSON is mid-edit and invalid,
     // the form falls back to defaults (and we keep editing through Advanced).
@@ -153,7 +149,7 @@ export function AgentSettings(props: AgentSettingsProps) {
 
     createEffect(() => {
         const loadedProfile = loadedPanel();
-        if (loadedProfile && panelDraft() === null) setPanelDraft(loadedProfile);
+        if (loadedProfile && !panelDirty()) setPanelDraft(loadedProfile);
     });
 
     function updateForm(patch: Partial<FormConfig>) {
@@ -171,18 +167,24 @@ export function AgentSettings(props: AgentSettingsProps) {
             }
             await props.api.setArchetypeAbilities(props.id, abilities());
             await props.api.setArchetypeConfig(props.id, text());
+            setPanelDirty(false);
+            setRaw(null);
+            setSelectedAbilities(null);
+            await Promise.all([refetchConfig(), refetchAbilities(), ...(props.kind === "panel" ? [refetchPanel()] : [])]);
             setMsg("saved");
+            props.onSaved?.();
         } catch (e) {
             setMsg(plainConfigError(String(e)));
         }
     }
 
     return (
-        <div class="modal embed-monitor" data-config-editor>
-            <div class="modal-head">
-                <h3>Settings · {props.name}</h3>
-                <button onClick={props.onClose}>close</button>
-            </div>
+        <main class="agent-settings-content" data-config-editor>
+            <article class="agent-settings-page">
+            <header class="agent-settings-page-head">
+                <div><span>Agent settings</span><h1>{props.name}</h1></div>
+                <button type="button" onClick={props.onClose}>Close</button>
+            </header>
             <p class="status" style={{ margin: "0 0 10px" }}>
                 {props.kind === "panel"
                     ? "Preview uses this public contract. Publishing freezes it into a version; deployments cannot redefine it."
@@ -200,7 +202,7 @@ export function AgentSettings(props: AgentSettingsProps) {
                     <Show when={props.kind === "panel" && panel()}>
                         {(profile) => <PanelContractEditor
                             profile={profile()}
-                            onChange={(next) => { setPanelDraft(next); setMsg(""); }}
+                            onChange={(next) => { setPanelDraft(next); setPanelDirty(true); setMsg(""); }}
                             onNotice={setMsg} />}
                     </Show>
 
@@ -296,6 +298,7 @@ export function AgentSettings(props: AgentSettingsProps) {
                 <button data-settings-save onClick={save}>save</button>
                 <span class="status" data-config-status>{msg()}</span>
             </div>
-        </div>
+            </article>
+        </main>
     );
 }

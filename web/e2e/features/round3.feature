@@ -11,7 +11,7 @@ Feature: Honest discard, reachable settings, grouped chats (round 3)
     Given the workbench is open
     When I create an archetype named "round3-method"
     And I click the settings link on the method "round3-method"
-    Then the method settings modal is open
+    Then the method settings page is open
 
   Scenario: placements carry no decorative version badge
     Given a new engagement

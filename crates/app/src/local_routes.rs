@@ -331,6 +331,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/chats/{id}/stop", post(er::post_stop))
         .route("/chats/{id}", delete(lr::delete_chat))
         .route("/chats/{id}/title", put(lr::rename_chat))
+        .route("/chats/{id}/navigation", put(lr::organize_chat))
         .route(
             "/chats",
             post(er::create_engagement).get(er::list_engagements),
