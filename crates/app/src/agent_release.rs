@@ -248,6 +248,8 @@ pub struct PublishDeploymentRequest {
     /// plane; the desktop route may acquire it from its sealed Hub session.
     #[serde(default)]
     pub funding_entitlement: Option<crate::managed_entitlement::Entitlement>,
+    #[serde(default)]
+    pub dictation_entitlement: Option<String>,
     /// Audience admission for the public deployment. Anonymous remains the
     /// compatibility default, while an explicit OIDC tuple is carried into the
     /// signed publisher request consumed by the edge.
@@ -321,6 +323,8 @@ pub struct StartPanelPreviewRequest {
     pub managed_tenant_id: Option<String>,
     #[serde(default)]
     pub funding_entitlement: Option<crate::managed_entitlement::Entitlement>,
+    #[serde(default)]
+    pub dictation_entitlement: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1256,6 +1260,9 @@ impl Workbench {
             config["funding_entitlement"] =
                 serde_json::Value::String(serde_json::to_string(entitlement).map_err(invalid)?);
         }
+        if let Some(entitlement) = &request.dictation_entitlement {
+            config["dictation_entitlement"] = serde_json::Value::String(entitlement.clone());
+        }
         let body = serde_json::to_vec(&serde_json::json!({
             "config": config,
             "initial_release_id": release.release_id(),
@@ -1676,6 +1683,9 @@ impl Workbench {
             config["funding_entitlement"] =
                 serde_json::Value::String(serde_json::to_string(entitlement).map_err(invalid)?);
         }
+        if let Some(entitlement) = &request.dictation_entitlement {
+            config["dictation_entitlement"] = serde_json::Value::String(entitlement.clone());
+        }
         if let (Some(collection), Some(recipient)) = (&profile.collection, &recipient) {
             // The release carries the class; the deployment names the exact
             // recipient reference and the edge proves the class before a
@@ -1723,7 +1733,9 @@ impl Workbench {
                     .pointer("/deployment/active_release_id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| invalid("deployment inspection omitted its active release"))?;
-                if reuses_admitted_operational
+                if (reuses_admitted_operational
+                    && current.pointer("/deployment/config/dictation_entitlement")
+                        == config.get("dictation_entitlement"))
                     || current.pointer("/deployment/config") == Some(&config)
                 {
                     let body = serde_json::to_vec(&serde_json::json!({

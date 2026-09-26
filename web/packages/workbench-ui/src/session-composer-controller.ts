@@ -141,6 +141,7 @@ export interface SessionComposerControllerOptions {
 }
 
 export interface SessionComposerController {
+    readonly scope: Accessor<string>;
     readonly draft: Accessor<string>;
     readonly setDraft: (value: string) => void;
     readonly queue: Accessor<readonly ComposerQueueItem[]>;
@@ -821,6 +822,7 @@ export function createSessionComposerController(
     };
 
     return {
+        scope: options.scope,
         draft,
         setDraft,
         queue,

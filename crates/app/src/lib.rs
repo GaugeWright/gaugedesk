@@ -67,6 +67,7 @@ pub mod gate;
 pub mod gate_service;
 pub mod gaugeapp_agent;
 pub mod gaugeapp_contract;
+pub mod gaugevault_dispatch;
 pub mod gaugevault_intake;
 pub mod harness_select;
 pub mod home;

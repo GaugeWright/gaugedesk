@@ -58,6 +58,14 @@ pub struct DesktopOperatorPlane;
 pub fn gaugeapp_proxy_routes() -> Router<SharedWorkbench> {
     Router::new()
         .route(
+            "/account/dictation/transcribe",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
+            "/account/dictation/entitlement",
+            post(proxy_account_gaugeapp),
+        )
+        .route(
             "/gaugeapps/account-settings/sessions",
             post(proxy_account_gaugeapp),
         )

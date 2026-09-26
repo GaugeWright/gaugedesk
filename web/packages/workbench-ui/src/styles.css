@@ -637,7 +637,8 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 
 .account-popover { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 61;
     min-width: 268px; background: var(--panel); border: 1px solid var(--edge);
-    border-radius: 8px; padding: 5px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    border-radius: 8px; padding: 5px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    max-height: min(70vh, 560px); overflow-y: auto; }
 /* The address proves *which* account; the trigger already carried the name. The
    build reports here rather than spending a permanent slot in the chrome. */
 .account-menu-head { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px 9px; }
@@ -2578,19 +2579,9 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .signin__head { display: grid; grid-template-columns: 1fr auto 1fr;
   align-items: center; gap: 12px; }
 .signin__brand { grid-column: 1; justify-self: end; width: 40px; height: 40px; display: block; }
-.signin__headtext { grid-column: 2; display: flex; flex-direction: column;
-  align-items: stretch; gap: 5px; min-width: 0; }
+.signin__headtext { grid-column: 2; min-width: 0; }
 .signin__title { margin: 0; font-family: var(--ui); font-size: var(--fs-title);
   font-weight: 400; color: var(--ink); line-height: 1.1; }
-/* The wordmark's own underline: hairlines running out to the edges and meeting
-   a small rotated square, in gold. The same figure `.whip-div` draws between
-   firings, sized to sit under a title rather than across a column. */
-.signin__orn { display: flex; align-items: center; gap: 7px; }
-.signin__orn::before, .signin__orn::after { content: ""; height: 1px; flex: 1;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 55%, transparent)); }
-.signin__orn::after { background: linear-gradient(90deg, color-mix(in srgb, var(--gold) 55%, transparent), transparent); }
-.signin__orn i { width: 5px; height: 5px; flex: none; transform: rotate(45deg);
-  border: 1px solid color-mix(in srgb, var(--gold) 60%, transparent); }
 .signin__lede { margin: 0; text-align: center; color: var(--muted);
   font-size: var(--fs-body); line-height: 1.5; }
 
@@ -2614,14 +2605,8 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .signin__primary:hover:not(:disabled) { border-color: var(--accent); }
 .signin__primary:disabled { opacity: .45; cursor: default; }
 
-/* The divider, in the brand's line: gold hairlines fading out from the word. */
-.signin__rule { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
-  gap: 10px; margin: 1px 0; }
-.signin__rule::before, .signin__rule::after { content: ""; height: 1px;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 45%, transparent)); }
-.signin__rule::after { background: linear-gradient(90deg, color-mix(in srgb, var(--gold) 45%, transparent), transparent); }
-.signin__rule span { color: var(--muted); font-size: var(--fs-small); text-transform: uppercase;
-  letter-spacing: .08em; }
+.signin__rule { margin: 1px 0; text-align: center; color: var(--muted);
+  font-size: var(--fs-small); }
 
 /* Three marks at their own size, in a row that starts where the act above it
    does. Adding Apple and Microsoft beside Google changes the count, nothing

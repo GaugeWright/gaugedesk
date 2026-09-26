@@ -60,10 +60,12 @@ function fixturePortrait(): string {
     return canvas.toDataURL("image/jpeg", 0.9);
 }
 
-function AccountMenuHarness(props: { state: "signed-out" | "signed-in"; fail?: boolean; photo?: boolean }) {
+function AccountMenuHarness(props: { state: "signed-out" | "signed-in"; fail?: boolean; photo?: boolean; choices?: boolean }) {
     const [result, setResult] = createSignal("");
     const avatar = props.photo ? fixturePortrait() : undefined;
-    return <main style="max-width:320px;margin:64px auto;padding:20px">
+    return <main style={props.choices
+        ? "max-width:320px;margin:640px auto 20px;padding:20px"
+        : "max-width:320px;margin:64px auto;padding:20px"}>
         <OpenSettingsMenu
             api={{} as OpenSettingsMenuApi}
             composition="desktop"
@@ -71,6 +73,13 @@ function AccountMenuHarness(props: { state: "signed-out" | "signed-in"; fail?: b
                 ? { name: "Ada Lovelace", email: "ada@example.test", edition: "Personal", ...(avatar ? { avatar } : {}) }
                 : null}
             gaugeAppActions={() => []}
+            accountChoices={props.choices ? () => [
+                { person: "ada", label: "ada@example.test", selected: true, expired: false },
+                { person: "grace", label: "grace@example.test", selected: false, expired: false },
+                { person: "old", label: "old@example.test", selected: false, expired: true },
+            ] : undefined}
+            onSelectAccount={(person) => setResult(`Selected ${person}`)}
+            onAddAccount={() => setResult("Add account requested")}
             onSignIn={async () => {
                 if (props.fail) throw new Error("Account service unavailable. Try again.");
                 setResult("Account sign-in requested");
@@ -1489,6 +1498,7 @@ render(
         if (query.get("account-menu") === "signed-out-failure") return <AccountMenuHarness state="signed-out" fail />;
         if (query.get("account-menu") === "signed-in-failure") return <AccountMenuHarness state="signed-in" fail />;
         if (query.get("account-menu") === "signed-in-photo") return <AccountMenuHarness state="signed-in" photo />;
+        if (query.get("account-menu") === "signed-in-choices") return <AccountMenuHarness state="signed-in" choices />;
         return <Harness />;
     },
     document.getElementById("root")!,

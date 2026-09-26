@@ -43,6 +43,8 @@ import {
 export interface SessionApi {
     getChoiceCards?(id: EngagementId): Promise<ChoiceCard[]>;
     answerChoiceCard?(id: EngagementId, cardId: string, selections: ChoiceSelection[]): Promise<void>;
+    /** Bounded speech input for the local composer draft; never a Session turn. */
+    transcribeAudio?(audio: Blob, signal: AbortSignal): Promise<string>;
     getFile(id: EngagementId, path: string): Promise<string>;
     /** The project's whip programs with their structure and instances, as
      *  WhippleScript projects them. Optional: only a session standing in a

@@ -35,6 +35,13 @@ export interface SettingsGaugeAppAction {
     readonly open: () => void;
 }
 
+export interface SettingsAccountChoice {
+    readonly person: string;
+    readonly label: string;
+    readonly selected: boolean;
+    readonly expired: boolean;
+}
+
 /** A settings modal that throws during render must degrade to a visible,
  *  closable failure notice — a silent dead click is indistinguishable from a
  *  broken button and leaves no way back (the Devices crash of 2026-07-31). */
@@ -109,6 +116,13 @@ export function SettingsMenu(props: {
     /** Server-discovered Account Settings pages. An empty admitted list is
      * rendered as empty; it never falls back to the retired modal. */
     gaugeAppActions?: Accessor<readonly SettingsGaugeAppAction[]>;
+    /** Retained sign-ins shown only after Change account is opened. */
+    accountChoices?: Accessor<readonly SettingsAccountChoice[]>;
+    onSelectAccount?: (person: string) => void;
+    onAddAccount?: () => void;
+    onUseLocal?: () => void;
+    switchingAccount?: Accessor<boolean>;
+    accountSwitchError?: Accessor<string>;
     /** Authenticated org floor supplied only by an enrolled composition. */
     placementPolicy?: Accessor<PlacementPolicy | undefined>;
     /** How this runtime opens a URL in the person's browser — the desktop shell's
@@ -117,6 +131,7 @@ export function SettingsMenu(props: {
     openExternal?: (url: string) => Promise<boolean>;
 }): JSX.Element {
     const [menuOpen, setMenuOpen] = createSignal(false);
+    const [accountPickerOpen, setAccountPickerOpen] = createSignal(false);
     const [devicesOpen, setDevicesOpen] = createSignal(false);
     const [settingsOpen, setSettingsOpen] = createSignal(false);
     // Which room Settings lands in for *this* opening. Held here because the opener knows
@@ -140,6 +155,7 @@ export function SettingsMenu(props: {
             setSignInError("");
             setSignOutError("");
         }
+        setAccountPickerOpen(false);
         setMenuOpen((open) => !open);
     };
 
@@ -177,6 +193,30 @@ export function SettingsMenu(props: {
     };
 
     const items = (): AccountMenuItem[] => {
+        if (accountPickerOpen()) {
+            const busy = props.switchingAccount?.() ?? false;
+            return [
+                { id: "account-picker-back", label: "‹ Account menu", run: () => setAccountPickerOpen(false) },
+                { id: "account-picker-rule", label: "", separator: true, run: () => {} },
+                ...(props.accountChoices?.() ?? []).map((account): AccountMenuItem => ({
+                    id: `account-${account.person}`,
+                    label: account.label,
+                    hint: account.selected ? "Current" : account.expired ? "Sign in again" : undefined,
+                    disabled: busy || account.selected || account.expired,
+                    run: () => props.onSelectAccount?.(account.person),
+                })),
+                { id: "account-picker-actions-rule", label: "", separator: true, run: () => {} },
+                { id: "add-account", label: "Add account", disabled: busy, run: () => {
+                    setMenuOpen(false);
+                    setAccountPickerOpen(false);
+                    props.onAddAccount?.();
+                } },
+                ...(props.onUseLocal ? [{
+                    id: "use-local", label: "Use this computer locally", disabled: busy,
+                    run: () => props.onUseLocal?.(),
+                }] : []),
+            ];
+        }
         const supplied = props.gaugeAppActions;
         const rows: AccountMenuItem[] = supplied
             ? supplied().map((action) => ({
@@ -217,6 +257,14 @@ export function SettingsMenu(props: {
                     setMenuOpen(false);
                     props.environmentAction?.open();
                 },
+            });
+        }
+        if ((props.accountChoices?.().length ?? 0) > 0) {
+            rows.push({
+                id: "change-account",
+                label: "Change account",
+                submenu: true,
+                run: () => setAccountPickerOpen(true),
             });
         }
         // The session verb follows the session, not the presence of a handler — that is
@@ -299,7 +347,7 @@ export function SettingsMenu(props: {
                 version={props.version ?? ""}
                 reach={props.reach}
                 items={items()}
-                status={signInError() || signOutError()}
+                status={signInError() || signOutError() || (accountPickerOpen() ? props.accountSwitchError?.() : "")}
                 open={menuOpen()}
                 onToggle={toggleMenu}
             />

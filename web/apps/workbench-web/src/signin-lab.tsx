@@ -145,7 +145,7 @@ function Lab(): JSX.Element {
                             <section class="homegate-card">
                                 <SignInCard
                                     title="Sign in"
-                                    lede="Sign in to save model credentials, settings, and link your chats."
+                                    lede="Sign in to your account. Projects on this computer stay local unless you choose to claim it."
                                     resolve={benchResolve}
                                     passkey={benchPasskey}
                                     recovery={benchRecovery}

@@ -254,6 +254,8 @@ export interface ProjectNode {
 }
 
 export interface PublicDeploymentInput {
+    /** Hub-signed paid-plan identity for visitor dictation, independent of turn funding. */
+    readonly dictation_entitlement?: string;
     readonly placement_id: PlacementId;
     readonly deployment_id: string;
     readonly edge_origin: string;
@@ -290,6 +292,7 @@ export interface PublicDeploymentInput {
 }
 
 export interface PanelPreviewInput {
+    readonly dictation_entitlement?: string;
     readonly agent_id: ArchetypeId;
     readonly placement_id?: PlacementId;
     readonly edge_origin: string;

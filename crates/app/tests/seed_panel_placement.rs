@@ -299,6 +299,39 @@ fn a_republication_ships_the_retention_it_asks_for() {
     );
 }
 
+#[test]
+fn republishing_adds_paid_dictation_to_an_existing_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    let workbench = open_workbench(dir.path()).unwrap();
+    workbench
+        .lock_unpoisoned()
+        .seed_panel_placement("inst-seeded", PanelPublicProfile::default())
+        .unwrap();
+    let (edge, state) = publisher_edge();
+
+    let mut initial = publish_request("inst-seeded");
+    initial.edge_origin = edge.clone();
+    workbench
+        .lock_unpoisoned()
+        .publish_agent_deployment(initial)
+        .unwrap();
+
+    let mut paid = publish_request("inst-seeded");
+    paid.edge_origin = edge;
+    paid.dictation_entitlement = Some("signed-publisher-claim".to_owned());
+    workbench
+        .lock_unpoisoned()
+        .publish_agent_deployment(paid)
+        .unwrap();
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.mutation_bodies.len(), 2);
+    assert_eq!(
+        state.mutation_bodies[1]["config"]["dictation_entitlement"],
+        "signed-publisher-claim",
+    );
+}
+
 /// The other half of the same rule: a release update that says nothing about
 /// the lease must leave it alone. Before the request could express "unchanged"
 /// this was the reason retention was copied back unconditionally — every

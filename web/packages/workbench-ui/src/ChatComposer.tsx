@@ -6,11 +6,12 @@
  * send only. Capability changes therefore remove controls from this shared
  * composer instead of selecting a second, lesser UI.
  */
-import { createEffect, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
+import { createEffect, createSignal, For, on, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { IMAGE_MIMES, type Attachment } from "./attachments";
 import { ComposerMenuButton } from "./ComposerMenu";
 import { ContextMeter, type ContextUsage } from "./ContextMeter";
 import { Icon } from "./icons";
+import { MAX_DICTATION_SECONDS, recordedAudioAsWav } from "./dictation";
 
 /** Below this field width the rail cannot hold tools, both settings, the meter
  *  and delivery without crushing something, so everything non-essential folds
@@ -153,6 +154,10 @@ export interface ChatComposerProps {
     readonly onCompact?: () => void;
     readonly compactPending?: boolean;
     readonly onDraft: (value: string) => void;
+    /** The host admits and transcribes a WAV; the composer never sends it as a turn. */
+    readonly onTranscribe?: (audio: Blob, signal: AbortSignal) => Promise<string>;
+    /** Changes whenever the draft belongs to another chat. */
+    readonly dictationScope?: string;
     /** Dispatch the draft. `send` while a turn is running is a steer. */
     readonly onSubmit: (destination: ComposerDestination) => void;
     readonly onStop?: () => void;
@@ -180,6 +185,91 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     let field: HTMLDivElement | undefined;
     const [compact, setCompact] = createSignal(false);
     const [moreOpen, setMoreOpen] = createSignal(false);
+    const [dictating, setDictating] = createSignal<"idle" | "recording" | "transcribing">("idle");
+    const [dictationError, setDictationError] = createSignal<string>();
+    let recorder: MediaRecorder | undefined;
+    let recordingStream: MediaStream | undefined;
+    let recordingTimer: ReturnType<typeof setTimeout> | undefined;
+    let transcription: AbortController | undefined;
+    let recordingScope = "";
+    let generation = 0;
+    const releaseRecording = () => {
+        if (recordingTimer) clearTimeout(recordingTimer);
+        recordingTimer = undefined;
+        recordingStream?.getTracks().forEach((track) => track.stop());
+        recordingStream = undefined;
+        recorder = undefined;
+    };
+    const cancelDictation = () => {
+        generation++;
+        transcription?.abort();
+        transcription = undefined;
+        if (recorder?.state === "recording") recorder.stop();
+        releaseRecording();
+        setDictating("idle");
+    };
+    createEffect(on(() => props.dictationScope, cancelDictation, { defer: true }));
+    onCleanup(cancelDictation);
+    const toggleDictation = async () => {
+        if (dictating() === "transcribing") return cancelDictation();
+        if (dictating() === "recording") return recorder?.stop();
+        if (!props.onTranscribe) return;
+        setDictationError(undefined);
+        const current = ++generation;
+        recordingScope = props.dictationScope ?? "";
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            if (current !== generation || recordingScope !== (props.dictationScope ?? "")) {
+                stream.getTracks().forEach((track) => track.stop());
+                return;
+            }
+            recordingStream = stream;
+            const captured: BlobPart[] = [];
+            const media = new MediaRecorder(stream);
+            recorder = media;
+            media.ondataavailable = (event) => { if (event.data.size) captured.push(event.data); };
+            media.onerror = () => {
+                if (current === generation) {
+                    setDictationError("Recording failed. Try again.");
+                    cancelDictation();
+                }
+            };
+            media.onstop = async () => {
+                releaseRecording();
+                if (current !== generation) return;
+                setDictating("transcribing");
+                const controller = new AbortController();
+                transcription = controller;
+                try {
+                    const audio = await recordedAudioAsWav(new Blob(captured, { type: media.mimeType }));
+                    if (current !== generation) return;
+                    const text = (await props.onTranscribe!(audio, controller.signal)).trim();
+                    if (current !== generation || recordingScope !== (props.dictationScope ?? "")) return;
+                    if (text) props.onDraft(`${props.draft}${props.draft && !/\s$/.test(props.draft) ? " " : ""}${text}`);
+                    else setDictationError("No speech was detected.");
+                    messageInput?.focus();
+                } catch (error) {
+                    if (current === generation && !controller.signal.aborted) {
+                        setDictationError(error instanceof Error ? error.message : "Transcription failed.");
+                    }
+                } finally {
+                    if (current === generation) {
+                        transcription = undefined;
+                        setDictating("idle");
+                    }
+                }
+            };
+            media.start();
+            setDictating("recording");
+            recordingTimer = setTimeout(() => media.state === "recording" && media.stop(), MAX_DICTATION_SECONDS * 1000);
+        } catch {
+            if (current === generation) {
+                releaseRecording();
+                setDictationError("Microphone access was unavailable.");
+                setDictating("idle");
+            }
+        }
+    };
     const queue = () => props.queue ?? [];
     const attachments = () => props.attachments ?? [];
     const hasQueueCommands = () =>
@@ -450,6 +540,9 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                     {props.error}
                 </div>
             </Show>
+            <Show when={dictationError()}>
+                <div class="composer-error" data-dictation-error role="status">{dictationError()}</div>
+            </Show>
 
             <Show when={props.onAttachInput}>
                 <input
@@ -608,6 +701,15 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                     stays at the reading start, next to the message. */}
                 <div class="composer-rail">
                     <div class="composer-tools">
+                        <Show when={props.onTranscribe}>
+                            <button class="composer-icon" type="button" data-dictation
+                                aria-label={dictating() === "recording" ? "Stop recording" : dictating() === "transcribing" ? "Cancel transcription" : "Dictate message"}
+                                title={dictating() === "recording" ? "Stop recording and transcribe" : "Dictate a message (30 seconds maximum)"}
+                                onClick={() => void toggleDictation()}>
+                                <Icon name="microphone" />
+                                <Show when={dictating() !== "idle"}><span>{dictating() === "recording" ? "Recording" : "Transcribing"}</span></Show>
+                            </button>
+                        </Show>
                         <Show
                             when={compact()}
                             fallback={

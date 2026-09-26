@@ -1299,7 +1299,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async publishDeployment(input: PublicDeploymentInput): Promise<PublicDeploymentOutcome> {
-        let admitted = input;
+        let admitted = { ...input, dictation_entitlement: await this.dictationEntitlement() };
         if (
             this.usesRemoteHome()
             && input.funding.kind === "managed"
@@ -1311,13 +1311,26 @@ export class WorkbenchControlPlane implements ControlPlane {
                 input.funding.tenant_id,
                 publicKey,
             );
-            admitted = { ...input, funding: { ...input.funding, entitlement } };
+            admitted = { ...admitted, funding: { ...input.funding, entitlement } };
         }
         return workbenchClient.publishDeployment(this.workbenchTransport(), admitted);
     }
 
+    async transcribeAudio(audio: Blob, signal: AbortSignal): Promise<string> {
+        const response = await this.request("/account/dictation/transcribe", {
+            method: "POST",
+            headers: { "content-type": "audio/wav" },
+            body: audio,
+            signal,
+        });
+        const result = (await response.json()) as { text?: unknown; error?: unknown };
+        if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : "Transcription failed.");
+        if (typeof result.text !== "string") throw new Error("Transcription response was malformed.");
+        return result.text;
+    }
+
     async startPanelPreview(input: PanelPreviewInput): Promise<PanelPreviewOutcome> {
-        let admitted = input;
+        let admitted = { ...input, dictation_entitlement: await this.dictationEntitlement() };
         if (
             this.usesRemoteHome()
             && input.funding.kind === "managed"
@@ -1329,9 +1342,20 @@ export class WorkbenchControlPlane implements ControlPlane {
                 input.funding.tenant_id,
                 publicKey,
             );
-            admitted = { ...input, funding: { ...input.funding, entitlement } };
+            admitted = { ...admitted, funding: { ...input.funding, entitlement } };
         }
         return workbenchClient.startPanelPreview(this.workbenchTransport(), admitted);
+    }
+
+    private async dictationEntitlement(): Promise<string | undefined> {
+        const publicKey = await workbenchClient.publicPublisherKey(this.workbenchTransport());
+        try {
+            const claim = await this.route("POST", "/account/dictation/entitlement", { publisher_key: publicKey });
+            return JSON.stringify(claim);
+        } catch (error) {
+            if (error instanceof RouteHttpError && (error.status === 401 || error.status === 402)) return undefined;
+            throw error;
+        }
     }
 
     stopPanelPreview(previewId: string): Promise<void> {

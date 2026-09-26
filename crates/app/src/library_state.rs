@@ -3440,8 +3440,16 @@ impl Workbench {
             .official_skills
             .then(crate::official_skills::office_skill_references)
             .unwrap_or_default();
-        let authored = archetype_files(&definition, skills, false)
+        let mut authored = archetype_files(&definition, skills, false)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        // The public composition harness opens this disposable Panel in a
+        // host that requires a concrete system prompt. New authored Agents
+        // deliberately start with an empty optional persona.md.
+        for (path, content) in &mut authored {
+            if path.ends_with("/persona.md") {
+                *content = "You are a helpful test Panel agent.".to_owned();
+            }
+        }
         let authored = authored
             .iter()
             .map(|(path, content)| (path.as_str(), content.as_str()))

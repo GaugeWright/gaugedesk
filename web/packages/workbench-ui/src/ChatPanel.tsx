@@ -69,6 +69,7 @@ function TurnActivity(props: { session: Session; agentName?: string }): JSX.Elem
 }
 
 export interface ChatPanelProps {
+    readonly onTranscribe?: (audio: Blob, signal: AbortSignal) => Promise<string>;
     /** Explicit leaf for hosts that mount without an ambient provider. */
     readonly session?: Session;
     /** Optional pre-bound controller for owner Environments and quick-start. */
@@ -107,6 +108,7 @@ export interface ChatPanelProps {
 }
 
 export function SessionComposer(props: {
+    onTranscribe?: (audio: Blob, signal: AbortSignal) => Promise<string>;
     session?: Session;
     audience: boolean;
     agentName?: string;
@@ -165,6 +167,8 @@ export function SessionComposer(props: {
         : undefined;
     return (
         <ChatComposer
+            onTranscribe={props.onTranscribe ?? session?.api.transcribeAudio?.bind(session.api)}
+            dictationScope={String(session?.engagementId() ?? props.controller?.scope?.() ?? "quick-start")}
             draft={controller.draft()}
             placeholder={props.placeholder ?? (props.agentName?.trim() ? `Ask ${props.agentName.trim()}…` : "task the agent…")}
             queue={hasQueue() ? controller.queue() : []}
@@ -353,6 +357,7 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 </div>
             </Show>
             <SessionComposer
+                onTranscribe={props.onTranscribe}
                 session={session()}
                 audience={props.audience === true}
                 agentName={props.agentName}

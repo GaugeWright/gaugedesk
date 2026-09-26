@@ -184,6 +184,24 @@ export class EdgeSessionApi implements EmbedSessionApi {
         ).toString();
     }
 
+    async transcribeAudio(audio: Blob, signal: AbortSignal): Promise<string> {
+        if (Date.now() >= this.connectionExpiresAtUnixMs - 30_000) {
+            await this.refreshConnectionCapability();
+        }
+        const response = await fetch(`${this.deploymentBase}/sessions/${encodeURIComponent(this.sessionId)}/dictation`, {
+            method: "POST",
+            headers: { ...this.projectionHeaders(), "content-type": "audio/wav" },
+            body: audio,
+            signal,
+            credentials: "omit",
+            cache: "no-store",
+        });
+        const result = (await response.json()) as { text?: unknown; error?: unknown };
+        if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : "Transcription failed.");
+        if (typeof result.text !== "string") throw new Error("Transcription response was malformed.");
+        return result.text;
+    }
+
     private projectionHeaders(): HeadersInit {
         return { "x-gw-connection-capability": this.connectionCapability };
     }

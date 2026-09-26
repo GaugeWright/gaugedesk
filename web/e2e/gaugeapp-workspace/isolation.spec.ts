@@ -145,6 +145,23 @@ test("GaugeDesk keeps a failed sign-out actionable only for its current menu ope
     await expect(page.getByRole("menuitem", { name: "Sign out", exact: true })).toBeEnabled();
 });
 
+test("account choices stay behind Change account in the account menu", async ({ page }) => {
+    await page.goto("/?account-menu=signed-in-choices");
+    await page.locator("[data-account-menu-trigger]").click();
+    await expect(page.getByRole("menuitem", { name: "grace@example.test" })).toHaveCount(0);
+    await page.getByRole("menuitem", { name: "Change account" }).click();
+    await expect(page.getByRole("menuitem", { name: /ada@example.test/ })).toBeDisabled();
+    await expect(page.getByRole("menuitem", { name: /old@example.test/ })).toBeDisabled();
+    await page.getByRole("menuitem", { name: "grace@example.test" }).click();
+    await expect(page.getByLabel("Account entry result")).toHaveText("Selected grace");
+    await page.getByRole("menuitem", { name: "‹ Account menu" }).click();
+    await expect(page.getByRole("menuitem", { name: "grace@example.test" })).toHaveCount(0);
+    await page.getByRole("menuitem", { name: "Change account" }).click();
+    await page.getByRole("menuitem", { name: "Add account" }).click();
+    await expect(page.getByLabel("Account entry result")).toHaveText("Add account requested");
+    await expect(page.getByRole("menu")).toHaveCount(0);
+});
+
 test("the account menu shows the account's photo in place of its initials", async ({ page }, info) => {
     await page.goto("/?account-menu=signed-in-photo");
     const trigger = page.locator("[data-account-menu-trigger]");

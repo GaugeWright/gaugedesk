@@ -19,6 +19,7 @@ export type IconName =
     | "add-files"
     | "add-folder"
     | "paperclip"
+    | "microphone"
     | "sources"
     | "history"
     | "pull-latest"
@@ -56,6 +57,12 @@ export type IconName =
 // reparented to the last mounter, leaving the earlier button blank. Calling the
 // factory per render mints fresh nodes for each `<Icon>`.
 const PATHS: Record<IconName, () => JSX.Element> = {
+    microphone: () => (
+        <>
+            <rect x="9" y="2" width="6" height="12" rx="3" />
+            <path d="M5 10a7 7 0 0 0 14 0M12 17v5m-4 0h8" />
+        </>
+    ),
     // A document with a plus — add a single file to the chat's workspace.
     "add-files": () => (
         <>

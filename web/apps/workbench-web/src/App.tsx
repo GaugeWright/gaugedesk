@@ -2140,27 +2140,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     Claim this computer
                 </button>
             </Show>
-            <Show when={(retainedAccounts()?.accounts.length ?? 0) > 0}>
-                <div class="account-switcher" aria-label="Accounts on this GaugeDesk">
-                    <For each={retainedAccounts()?.accounts ?? []}>
-                        {(account) => <button
-                            type="button"
-                            disabled={switchingAccount() || account.expired || account.person === retainedAccounts()?.selected}
-                            aria-current={account.person === retainedAccounts()?.selected ? "true" : undefined}
-                            onClick={() => void switchAccount(account.person)}
-                        >{account.label}{account.expired ? " · Sign in again" : ""}</button>}
-                    </For>
-                    <button type="button" disabled={switchingAccount()}
-                        onClick={() => setSignInOpen(true)}>Add account</button>
-                    <Show when={isTauri() && !hubSession()?.local}>
-                        <button type="button" disabled={switchingAccount()}
-                            onClick={() => void switchLocal()}>Use this computer locally</button>
-                    </Show>
-                    <Show when={accountSwitchError()}>
-                        <p role="alert">{accountSwitchError()}</p>
-                    </Show>
-                </div>
-            </Show>
             <SettingsMenu
                 api={api}
                 placementPolicy={props.placementPolicy}
@@ -2194,6 +2173,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 onSignOut={signOutAccount}
                 environmentAction={props.environmentAction}
                 gaugeAppActions={props.gaugeApps?.accountActions}
+                accountChoices={() => (retainedAccounts()?.accounts ?? []).map((account) => ({
+                    person: account.person,
+                    label: account.label,
+                    selected: account.person === retainedAccounts()?.selected,
+                    expired: account.expired,
+                }))}
+                onSelectAccount={(person) => void switchAccount(person)}
+                onAddAccount={() => setSignInOpen(true)}
+                onUseLocal={isTauri() && !hubSession()?.local ? () => void switchLocal() : undefined}
+                switchingAccount={switchingAccount}
+                accountSwitchError={accountSwitchError}
                 openExternal={openExternal}
             />
         </div>
@@ -2213,7 +2203,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             footnote={footnote}
             notice={signInReturnError() || undefined}
             title="Sign in"
-            lede="Sign in to save model credentials, settings, and link your chats."
+            lede={isTauri()
+                ? "Sign in to your account. Projects on this computer stay local unless you choose to claim it."
+                : "Sign in to reach your account and its projects."}
             resolve={async (email) => {
                 const { organization } = await resolveSignInRoute(
                     controlPlaneBase(),
@@ -2357,19 +2349,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         />
     );
 
-    const retainedAccountChoices = (): JSX.Element => (
+    const retainedAccountChoices = (showLocal = true): JSX.Element => (
         <Show when={retainedAccounts()?.accounts.some((account) =>
             !account.expired && account.person !== retainedAccounts()?.selected)
-            || (isTauri() && !hubSession()?.local)}>
+            || (showLocal && isTauri() && !hubSession()?.local)}>
             <div class="account-switcher" aria-label="Other accounts on this GaugeDesk">
                 <For each={retainedAccounts()?.accounts.filter((account) =>
                     !account.expired && account.person !== retainedAccounts()?.selected) ?? []}>
                     {(account) => <button type="button" disabled={switchingAccount()}
                         onClick={() => void switchAccount(account.person)}>{account.label}</button>}
                 </For>
-                <Show when={isTauri() && !hubSession()?.local}>
+                <Show when={showLocal && isTauri() && !hubSession()?.local}>
                     <button type="button" disabled={switchingAccount()}
-                        onClick={() => void switchLocal()}>Use this computer locally</button>
+                        onClick={() => void switchLocal()}>Open local projects without claiming</button>
                 </Show>
                 <Show when={accountSwitchError()}><p role="alert">{accountSwitchError()}</p></Show>
             </div>
@@ -2483,6 +2475,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const paneComposer = () => (
         <SessionComposer
             audience={false}
+            onTranscribe={(audio, signal) => api.transcribeAudio(audio, signal)}
             controller={desktopComposerController}
             onFork={selected() ? () => void forkWithDraft() : undefined}
             defaultMode={defaultComposerMode()}
@@ -2739,6 +2732,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 </Show>
                 <ChatPanel
                     session={activeDesktopSession()!}
+                    onTranscribe={(audio, signal) => api.transcribeAudio(audio, signal)}
                     bare
                     prefs={filterPrefs()}
                     pendingSend={pendingSend()?.id === selected() ? pendingSend()?.rid : undefined}
@@ -3091,7 +3085,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setGateSignOutBusy(false);
         }
     };
-    const signedInNote = (): JSX.Element => (<>
+    const signedInNote = (showLocal = true): JSX.Element => (<>
         <p class="homegate-auth-note homegate-signed-in" data-home-signed-in>
             {menuIdentity()
                 ? <>Signed in as {menuIdentity()?.email ?? menuIdentity()?.name}.</>
@@ -3110,7 +3104,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 <span class="homegate-error" role="alert">{gateSignOutError()}</span>
             </Show>
         </p>
-        {retainedAccountChoices()}
+        {retainedAccountChoices(showLocal)}
     </>);
     const claimCard = (): JSX.Element => (
         <section class="homegate-card" aria-labelledby="home-claim-title" data-home-claim>
@@ -3132,14 +3126,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         {claimBusy() ? "Claiming…" : "Claim this computer"}
                     </button>
                     <button type="button" class="homegate-link" data-defer-home-claim
-                        onClick={() => homeState()?.kind === "none"
-                            ? void switchLocal() : setClaimPromptOpen(false)}>
-                        {homeState()?.kind === "none" ? "Use this computer locally" : "Later"}
+                        onClick={() => setClaimPromptOpen(false)}>
+                        Stay signed in without claiming
                     </button>
                 </div>
+                <button type="button" class="homegate-link" data-open-local-without-claim
+                    disabled={switchingAccount()} onClick={() => void switchLocal()}>
+                    Open local projects without claiming
+                </button>
                 <Show when={claimError()}><p class="homegate-error" role="alert">{claimError()}</p></Show>
-                <p class="homegate-auth-note">Signing in alone does not claim local work. You can keep using this computer locally.</p>
-                {signedInNote()}
+                <p class="homegate-auth-note">Opening local projects switches to local mode. Your account stays saved here, so you can select it again later.</p>
+                {signedInNote(false)}
             </div>
         </section>
     );
@@ -3234,7 +3231,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                         </div>
                                     </section>
                                 }>
-                                    <Match when={canClaimThisComputer()}>{claimCard()}</Match>
                                     <Match when={selectedOwnsThisComputer()}>
                                         <section class="homegate-card" data-home-claim-connecting>
                                             <div class="homegate-card-inner">
@@ -3344,17 +3340,30 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             <Show when={noHomeState()}>
                 {(state) => <div class="homegate-scrim" data-tauri-drag-region data-home-setup>
                     <section class="homegate-card" aria-labelledby="homegate-title">
-                    <Show when={canClaimThisComputer()}>
-                        <button type="button" class="homegate-link" data-open-home-claim
-                            onClick={() => setClaimPromptOpen(true)}>Claim this computer</button>
+                    <div class="homegate-card-inner">
+                    <Show when={canClaimThisComputer()} fallback={<>
+                        <p class="homegate-kicker">Free account</p>
+                        <h1 id="homegate-title">Choose where your projects run</h1>
+                        <p class="homegate-lede">
+                            Your account and invitations live here. Project files, event logs, and
+                            agents stay on the Home you choose—your computer, another team’s Home,
+                            or a paid Cloud Home.
+                        </p>
+                    </>}>
+                        <p class="homegate-kicker">Signed in</p>
+                        <h1 id="homegate-title">Your local projects are unclaimed</h1>
+                        <p class="homegate-lede">
+                            Signing in did not give your account access to the {localProjectCount()} local {localProjectCount() === 1 ? "project" : "projects"} on this computer.
+                            You can open {localProjectCount() === 1 ? "it" : "them"} in local mode, or claim this computer when you choose.
+                        </p>
+                        <div class="homegate-connect-row">
+                            <button type="button" data-open-local-without-claim disabled={switchingAccount()}
+                                onClick={() => void switchLocal()}>Open local projects without claiming</button>
+                            <button type="button" class="homegate-link" data-open-home-claim
+                                onClick={() => setClaimPromptOpen(true)}>Review claim</button>
+                        </div>
+                        <p class="homegate-auth-note">Local mode keeps the projects on this computer. Your account stays saved here for later use.</p>
                     </Show>
-                    <p class="homegate-kicker">Free account</p>
-                    <h1 id="homegate-title">Choose where your projects run</h1>
-                    <p class="homegate-lede">
-                        Your account and invitations live here. Project files, event logs, and
-                        agents stay on the Home you choose—your computer, another team’s Home,
-                        or a paid Cloud Home.
-                    </p>
 
                     {invitationBlock()}
 
@@ -3456,11 +3465,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             </button>
                         </div>
                     </Show>
-                    <p class="homegate-auth-note">
+                    <Show when={!canClaimThisComputer()}><p class="homegate-auth-note">
                         {localDevLogin
                             ? "This isolated local account never contacts Google or the production account service."
                             : "Google sign-in identifies your GaugeWright account. Connecting OpenAI or another model provider is a separate authorization in Account settings."}
-                    </p>
+                    </p></Show>
                     <Show when={homeError()}>
                         <p class="homegate-error" role="alert">{homeError()}</p>
                     </Show>
@@ -3471,14 +3480,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             </button>
                         </p>
                     </Show>
-                    {signedInNote()}
+                    {signedInNote(!canClaimThisComputer())}
+                    </div>
                     </section>
                 </div>}
             </Show>
         );
         return (
             <Show
-                when={import.meta.env.VITE_HOME_SPLIT === "true" && !homeInvite() && !homeRecovery()}
+                // An unclaimed desktop always gets the explicit choice screen.
+                // Rendering the claim card inline would make its defer button
+                // dismiss only a prompt signal, leaving the same card in place.
+                when={import.meta.env.VITE_HOME_SPLIT === "true" && !homeInvite() && !homeRecovery() && !canClaimThisComputer()}
                 fallback={advancedSetup()}
             >
                 {simpleSetup()}

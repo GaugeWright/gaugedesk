@@ -421,7 +421,6 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                 <img class="signin__brand" src={markUrl} alt="" width="40" height="40" />
                 <span class="signin__headtext">
                     <h1 class="signin__title">{props.title}</h1>
-                    <span class="signin__orn" role="presentation"><i /></span>
                 </span>
             </header>
             <Show when={props.lede}><p class="signin__lede">{props.lede}</p></Show>
@@ -774,7 +773,7 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                     && (step().at === "identify" || step().at === "personal")
                 }
             >
-                <div class="signin__rule"><span>or</span></div>
+                <div class="signin__rule">Other ways to sign in</div>
                 <div class="signin__providers" data-signin-providers>
                     <For each={props.providers}>
                         {(provider) => (
@@ -813,7 +812,6 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                 and on the codes step they have just made an account, where an
                 offer to skip signing up is nonsense. */}
             <Show when={props.footnote && step().at === "identify"}>
-                <div class="signin__rule"><span>or</span></div>
                 <div class="signin__foot">{props.footnote}</div>
             </Show>
         </div>
