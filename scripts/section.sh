@@ -194,6 +194,12 @@ case "${1:-}" in
     else
         cargo test --workspace
     fi ;;
+  # What the tests section runs after nextest, alone: the native test runs, like
+  # nextest, do not run doctests.
+  doctests)                cargo test --workspace --doc ;;
+  # The native targets are rendered from Cargo.toml (GaugeWright BUILD.md
+  # stages 5 and 6); this fails when the rendering has drifted from it.
+  native-crates)           python3 scripts/buckify-crates.py --check ;;
   no-default-features)
     # The open build must stay buildable without the enterprise features. Keep
     # this feature graph out of the all-feature test graph's fingerprints:

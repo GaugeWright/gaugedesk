@@ -98,4 +98,73 @@ describe("mobile control-plane authority inventory", () => {
         expect(unavailable).toHaveBeenCalledWith(expect.stringContaining("Failed to fetch"));
         expect(rejected).not.toHaveBeenCalled();
     });
+
+    /** A response whose body is an SSE stream of `frames`, ending after them. */
+    function eventStream(frames: string[]): Response {
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                for (const frame of frames) controller.enqueue(new TextEncoder().encode(frame));
+                controller.close();
+            },
+        });
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+
+    it("carries account identity and Home admission on its event streams (DR-0232)", async () => {
+        // A bare EventSource carries no headers, so every stream a Home checks
+        // was refused — over the relay, where a desktop Home admits only its
+        // owner, that was every stream.
+        const requests: Request[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            requests.push(new Request(input, init));
+            return eventStream([
+                'data: {"type":"workspacechanged","record":"project","id":"p1","op":"upsert"}\n\n',
+            ]);
+        }));
+        const api = new MobileControlPlane("http://127.0.0.1:4100", {
+            bearer: () => "account-token",
+            homeAdmission: () => "home-admission",
+        });
+        const changes: string[] = [];
+        const stop = api.subscribeWorkspace((change) => changes.push(change.id));
+        await vi.waitFor(() => expect(changes).toContain("p1"));
+        stop();
+        const stream = requests.find((r) => r.url.endsWith("/workspace/events"));
+        expect(stream?.headers.get("authorization")).toBe("Bearer account-token");
+        expect(stream?.headers.get("x-gaugewright-home-admission")).toBe("home-admission");
+        expect(stream?.headers.get("accept")).toBe("text/event-stream");
+    });
+
+    it("opens its stream again when the one it had ends, as EventSource did", async () => {
+        // A stream over the relay ends whenever its tunnel does.
+        let opened = 0;
+        vi.stubGlobal("fetch", vi.fn(async () => {
+            opened += 1;
+            return eventStream([`data: {"type":"hello","n":${opened}}\n\n`]);
+        }));
+        const api = new MobileControlPlane("http://127.0.0.1:4100", {
+            bearer: () => "account-token",
+            homeAdmission: () => "home-admission",
+        });
+        const stop = api.subscribe("chat:one" as never, () => undefined);
+        await vi.waitFor(() => expect(opened).toBeGreaterThanOrEqual(2), { timeout: 3_000 });
+        stop();
+    });
+
+    it("reports a refused stream the way a refused call is reported", async () => {
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(
+            JSON.stringify({ error: "target Home admission required" }),
+            { status: 401, headers: { "content-type": "application/json", "content-length": "41" } },
+        )));
+        const rejected: Array<[number, string]> = [];
+        const api = new MobileControlPlane("http://127.0.0.1:4100", {
+            bearer: () => "account-token",
+            homeAdmission: () => "stale-admission",
+            onAuthorizationRejected: (status, detail) => rejected.push([status, detail]),
+        });
+        const stop = api.subscribeWorkspace(() => undefined);
+        await vi.waitFor(() => expect(rejected.length).toBeGreaterThan(0));
+        stop();
+        expect(rejected[0]).toEqual([401, "target Home admission required"]);
+    });
 });

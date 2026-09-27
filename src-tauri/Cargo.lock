@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-app"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2387,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-boundary"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-core",
  "serde",
@@ -2396,7 +2396,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-core"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "ciborium",
  "getrandom 0.4.2",
@@ -2408,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-desktop"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-app",
  "serde_json",
@@ -2425,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-directory-protocol"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-core",
  "serde",
@@ -2434,11 +2434,11 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-env"
-version = "0.4.27"
+version = "0.4.28"
 
 [[package]]
 name = "gaugedesk-harness"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-env",
  "serde",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-relay-transport"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
@@ -2466,14 +2466,16 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tokio-util",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "yamux",
 ]
 
 [[package]]
 name = "gaugedesk-store"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-core",
  "gaugedesk-env",
@@ -2484,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-tracker"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "serde_json",
  "whipplescript-kernel",
@@ -2493,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-whip-runtime"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "base64 0.23.1",
  "gaugedesk-core",
@@ -2513,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-workspace"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "hex",
  "rusqlite",
@@ -4060,6 +4062,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4735,6 +4743,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pin-project"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
+dependencies = [
+ "pin-project-internal",
+]
+
+[[package]]
+name = "pin-project-internal"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5110,8 +5138,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
  "libc",
- "rand_chacha",
+ "rand_chacha 0.3.1",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "rand"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
+dependencies = [
+ "rand_chacha 0.9.0",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -5136,12 +5174,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_chacha"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.9.5",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
+dependencies = [
+ "getrandom 0.3.4",
 ]
 
 [[package]]
@@ -6213,6 +6270,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "string_cache"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7029,6 +7092,7 @@ checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "pin-project-lite",
  "tokio",
@@ -9079,6 +9143,22 @@ checksum = "d3dc9559429edf0cd3f327cc0afd9d6b36fa8cec6d93107b7fbe64f806b5f2d9"
 dependencies = [
  "log",
  "markup5ever",
+]
+
+[[package]]
+name = "yamux"
+version = "0.13.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1991f6690292030e31b0144d73f5e8368936c58e45e7068254f7138b23b00672"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "rand 0.9.5",
+ "static_assertions",
+ "web-time",
 ]
 
 [[package]]

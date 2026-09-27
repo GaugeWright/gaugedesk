@@ -4,6 +4,15 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[package.metadata.native-tests]
+# What this crate's tests read at run time beyond the crate and what its
+# sources name by relative path, for the native test runs (GaugeWright BUILD.md
+# stages 5 and 6). action_source_inventory runs `cargo metadata` over the whole
+# workspace, scans the app's sources, and compares what it finds with the
+# committed inventory. A run's mount holds only declared files, so a missing
+# entry fails the test instead of caching a pass it never earned.
+data = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "contracts/workspace-action-sites.json", "crates", "ee/app"]
+
 [dependencies]
 # The versioned-workspace substrate AND the merge engine (SUB-6
 # convergence port, 2026-07-11): whip's WorkspaceVcs over its native

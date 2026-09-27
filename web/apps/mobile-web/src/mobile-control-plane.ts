@@ -26,7 +26,10 @@ import type {
     ProjectOrganizationModelSelection,
 } from "@gaugewright/control-plane-client";
 import {
+    browserRouteEventStream,
     browserRouteJson,
+    browserRouteRequest,
+    reconnectingRouteEventStream,
     controlPlaneBase,
     type BrowserRouteJsonOptions,
     type RouteJson,
@@ -115,6 +118,12 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
 /** App-owned control-plane edge for the mobile web harness. */
 export class MobileControlPlane implements FacetBrowserApi {
     private readonly route: RouteJson;
+    /** Raw fetches and event streams, carrying the same credentials as `route`.
+     * Without them the workbench falls back to a bare `fetch` and `EventSource`,
+     * which carry none, so every stream a Home checks was refused — over the
+     * relay above all, where a desktop Home admits only its owner (DR-0232). */
+    private readonly request: workbenchClient.RouteRequest;
+    private readonly events: workbenchClient.RouteEventStream;
 
     constructor(
         private readonly base = controlPlaneBase(),
@@ -136,13 +145,25 @@ export class MobileControlPlane implements FacetBrowserApi {
             typeof configuredSession === "function"
                 ? configuredSession
                 : () => configuredSession ?? null;
-        const route =
-            config.routeJson
-            ?? browserRouteJson(this.base, {
-                machineSession: session,
-                bearer: config.bearer,
-                homeAdmission: config.homeAdmission,
-            });
+        const credentials = {
+            machineSession: session,
+            bearer: config.bearer,
+            homeAdmission: config.homeAdmission,
+        };
+        const route = config.routeJson ?? browserRouteJson(this.base, credentials);
+        this.request = browserRouteRequest(this.base, credentials);
+        // Reconnecting, as `EventSource` did by itself: a stream over the relay
+        // ends whenever its tunnel does. A refusal is reported the way a
+        // refused call is, so the owner can admit again or say why.
+        const eventSource = browserRouteEventStream(this.base, credentials);
+        this.events = reconnectingRouteEventStream(() => eventSource, {
+            beforeReconnect: (reason) => {
+                const status = reason?.status;
+                if (status === 401 || status === 403 || status === 421) {
+                    config.onAuthorizationRejected?.(status, reason?.detail ?? "");
+                }
+            },
+        });
         this.route = async (method, path, body, requestOptions) => {
             try {
                 return await route(method, path, body, requestOptions);
@@ -168,7 +189,12 @@ export class MobileControlPlane implements FacetBrowserApi {
     }
 
     private workbenchTransport(): workbenchClient.WorkbenchTransport {
-        return { base: this.base, json: this.routeJson() };
+        return {
+            base: this.base,
+            json: this.routeJson(),
+            request: this.request,
+            events: this.events,
+        };
     }
 
     getWorkspaceCarriage(): Promise<ProjectionCarriage<Workspace>> {

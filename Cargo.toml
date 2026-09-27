@@ -13,11 +13,21 @@ resolver = "2"
 members = ["crates/env", "crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/whip-runtime", "crates/relay-transport", "crates/directory-protocol", "crates/app", "ee/app"]
 # The Tauri desktop shell is its own workspace (needs system webkit/CLI to build);
 # excluded so `cargo test` over the backend stays self-contained.
-exclude = ["src-tauri"]
+# third-party/ is reindeer's input for the native third-party targets, not a crate.
+exclude = ["src-tauri", "third-party"]
+
+# How this workspace is rendered as native Buck2 targets (GaugeWright BUILD.md
+# stages 5 and 6): the cell and repository it is, and the section of the bar
+# whose `cargo check -p` line is its other configuration. Read by
+# scripts/buckify-crates.py, which the GaugeWright repository renders here.
+[workspace.metadata.native]
+cell = "gaugedesk"
+checkout = "gaugedesk-src"
+feature-checks = "no-default-features"
 
 [workspace.package]
 edition = "2021"
-version = "0.4.27"
+version = "0.4.28"
 # The platform default (ADR 0121 / company DR-0056).
 license = "AGPL-3.0-only"
 

@@ -564,6 +564,15 @@ impl TlsIdentity {
         )
         .map_err(|error| other(format!("relay TLS identity: {error}")))
     }
+
+    /// [`Self::server_config`] for a Home's availability leg, which also offers
+    /// to carry many streams in one crossing ([`crate::mux`]). A client that
+    /// does not ask gets the one-connection crossing it always had.
+    pub(crate) fn home_leg_server_config(&self) -> std::io::Result<ServerConfig> {
+        let mut config = self.server_config()?;
+        config.alpn_protocols = vec![crate::mux::MUX_ALPN.to_vec()];
+        Ok(config)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -791,7 +800,7 @@ async fn park_home_leg(
     identity: &TlsIdentity,
     parked: impl FnOnce(),
 ) -> std::io::Result<()> {
-    let acceptor = TlsAcceptor::from(Arc::new(identity.server_config()?));
+    let acceptor = TlsAcceptor::from(Arc::new(identity.home_leg_server_config()?));
     let broker = match connect_home_stream(route).await {
         Ok(broker) => broker,
         Err(error) if is_wait_expired(&error) => {
@@ -804,6 +813,11 @@ async fn park_home_leg(
     parked();
     let crossing = async {
         let mut tunnel = acceptor.accept(broker).await?;
+        // A client that asked to multiplex carries all of its connections in
+        // this one crossing; anything else is a single connection, as before.
+        if tunnel.get_ref().1.alpn_protocol() == Some(crate::mux::MUX_ALPN) {
+            return crate::mux::serve_streams(tunnel, local_control_plane).await;
+        }
         let mut local = TcpStream::connect(local_control_plane).await?;
         tokio::io::copy_bidirectional(&mut tunnel, &mut local).await?;
         Ok(())
@@ -914,12 +928,23 @@ pub async fn serve_home_supervised(
 async fn connect_client(
     route: &RelayRoute,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<WebSocketByteStream>> {
+    connect_client_offering(route, &[]).await
+}
+
+/// [`connect_client`], offering `protocols` by ALPN. The Home's answer is on
+/// the returned session (`get_ref().1.alpn_protocol()`); a Home that does not
+/// know them answers nothing, and the session is an ordinary one.
+async fn connect_client_offering(
+    route: &RelayRoute,
+    protocols: &[&[u8]],
+) -> std::io::Result<tokio_rustls::client::TlsStream<WebSocketByteStream>> {
     let broker =
         connect_relay_leg(&websocket_route(route, false), WebSocketRelayRole::Client).await?;
     // The pin and the configuration are the portable half; only the provider is
     // this carrier's choice (ADR 0130 §4 — `ring` here, pure-Rust on wasm32).
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let config = wire::pinned_client_config(route.home_fingerprint, provider)?;
+    let mut config = wire::pinned_client_config(route.home_fingerprint, provider)?;
+    config.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
     let name = tokio_rustls::rustls::pki_types::ServerName::try_from(PIN_SNI)
         .map_err(|error| other(format!("relay TLS server name: {error}")))?;
     TlsConnector::from(Arc::new(config))
@@ -935,26 +960,97 @@ pub async fn serve_client_once(route: &RelayRoute, mut loopback: TcpStream) -> s
     Ok(())
 }
 
-/// Bind an ephemeral device-loopback endpoint. Each accepted keep-alive/SSE
-/// socket receives a fresh Home/client rendezvous tunnel.
+/// Bind an ephemeral device-loopback endpoint that carries every accepted
+/// connection to the Home over **one** tunnel (DR-0232).
+///
+/// A route holds one pair at a time, so a tunnel per connection meant the
+/// first connection — an event stream, which never closes — held the Home and
+/// every later call waited for a leg that could not park. Instead the first
+/// connection opens a tunnel offering to multiplex, and each connection after
+/// it is a stream inside that tunnel, until the tunnel ends and the next
+/// connection opens another.
+///
+/// A Home that does not multiplex answers the offer with nothing. Then this
+/// route falls back to what it always did: that tunnel carries the connection
+/// that opened it, and each later connection opens its own.
+///
+/// Aborting the returned task hangs the tunnel up.
 pub async fn bind_client_loopback(
     route: RelayRoute,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     route.validate()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    let carrier = Arc::new(tokio::sync::Mutex::new(Carrier::Unopened));
     let task = tokio::spawn(async move {
+        // Held here and by nothing else that outlives a connection, so aborting
+        // this task drops the last handle and the driver hangs the tunnel up.
+        let carrier = carrier;
         while let Ok((stream, peer)) = listener.accept().await {
             if !peer.ip().is_loopback() {
                 continue;
             }
             let route = route.clone();
+            let carrier = Arc::downgrade(&carrier);
             tokio::spawn(async move {
-                let _ = serve_client_once(&route, stream).await;
+                let _ = carry_loopback(&route, &carrier, stream).await;
             });
         }
     });
     Ok((address, task))
+}
+
+/// What a loopback route carries its connections over.
+enum Carrier {
+    /// Nothing yet, or the last tunnel ended.
+    Unopened,
+    /// One multiplexed tunnel; each connection is a stream on it.
+    Mux(crate::mux::MuxClient),
+    /// The Home answered the offer with nothing: a tunnel per connection.
+    PerConnection,
+}
+
+async fn carry_loopback(
+    route: &RelayRoute,
+    carrier: &std::sync::Weak<tokio::sync::Mutex<Carrier>>,
+    mut loopback: TcpStream,
+) -> std::io::Result<()> {
+    let Some(carrier) = carrier.upgrade() else {
+        return Ok(());
+    };
+    let mux = {
+        // Held across the dial: two connections arriving together must not
+        // race to open two tunnels, and the route admits only one anyway.
+        let mut current = carrier.lock().await;
+        match &*current {
+            Carrier::Mux(mux) if !mux.is_closed() => Some(mux.clone()),
+            Carrier::PerConnection => None,
+            Carrier::Mux(_) | Carrier::Unopened => {
+                let mut tunnel = connect_client_offering(route, &[crate::mux::MUX_ALPN]).await?;
+                if tunnel.get_ref().1.alpn_protocol() == Some(crate::mux::MUX_ALPN) {
+                    let mux = crate::mux::MuxClient::start(tunnel);
+                    *current = Carrier::Mux(mux.clone());
+                    Some(mux)
+                } else {
+                    *current = Carrier::PerConnection;
+                    drop(current);
+                    drop(carrier);
+                    tokio::io::copy_bidirectional(&mut loopback, &mut tunnel).await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+    drop(carrier);
+    match mux {
+        Some(mux) => {
+            let mut stream = mux.open().await?;
+            drop(mux);
+            tokio::io::copy_bidirectional(&mut loopback, &mut stream).await?;
+            Ok(())
+        }
+        None => serve_client_once(route, loopback).await,
+    }
 }
 
 /// Wrap an ordered byte stream in a TLS client session **pinned** to one
@@ -2099,5 +2195,159 @@ mod tests {
             KEEPALIVE_INTERVAL.as_millis() * 5 <= EDGE_IDLE_MILLIS,
             "five keepalives must fit inside the edge's idle bound",
         );
+    }
+
+    /// A control plane with one endless event stream (`GET /events`) and one
+    /// ordinary call (`GET /ping`), each connection its own request.
+    async fn stream_and_ping(listener: TcpListener) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                if head.starts_with(b"GET /events ") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+                        .await;
+                    while stream.write_all(b"data: tick\n\n").await.is_ok() {
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                } else {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
+                        )
+                        .await;
+                }
+            });
+        }
+    }
+
+    /// One `GET /ping` through the loopback endpoint, bounded.
+    async fn ping(loopback: SocketAddr) -> String {
+        let mut client = TcpStream::connect(loopback).await.unwrap();
+        client
+            .write_all(b"GET /ping HTTP/1.1\r\nhost: home\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(15), client.read_to_end(&mut response))
+            .await
+            .expect("the call was answered while the stream stayed open")
+            .unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Read from an open event stream until a tick arrives.
+    async fn next_tick(events: &mut TcpStream) {
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 256];
+        timeout(Duration::from_secs(15), async {
+            while !String::from_utf8_lossy(&seen).contains("data: tick") {
+                let read = events.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "the event stream closed");
+                seen.extend_from_slice(&chunk[..read]);
+            }
+        })
+        .await
+        .expect("the event stream kept flowing");
+    }
+
+    async fn reachable_home(
+        home_supports_mux: bool,
+    ) -> (
+        crate::test_relay::TestRelay,
+        RelayRoute,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let relay = crate::test_relay::TestRelay::bind().await.unwrap();
+        let control_plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = control_plane.local_addr().unwrap();
+        tokio::spawn(stream_and_ping(control_plane));
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(relay.endpoint().to_owned(), identity.fingerprint());
+        let home_route = route.clone();
+        let home = if home_supports_mux {
+            tokio::spawn(async move {
+                let _ = serve_home_forever(home_route, local, identity).await;
+            })
+        } else {
+            // A Home from before multiplexing: no ALPN, one connection per
+            // crossing, park again when it ends.
+            tokio::spawn(async move {
+                let acceptor = TlsAcceptor::from(Arc::new(identity.server_config().unwrap()));
+                loop {
+                    let Ok(broker) = connect_home_stream(&home_route).await else {
+                        continue;
+                    };
+                    let acceptor = acceptor.clone();
+                    let _ = async move {
+                        let mut tunnel = acceptor.accept(broker).await?;
+                        let mut local = TcpStream::connect(local).await?;
+                        tokio::io::copy_bidirectional(&mut tunnel, &mut local).await?;
+                        std::io::Result::Ok(())
+                    }
+                    .await;
+                }
+            })
+        };
+        (relay, route, home)
+    }
+
+    /// DR-0232: the phone's case. An event stream never closes, and a route
+    /// holds one pair, so with a tunnel per connection the stream held the
+    /// Home and every call after it waited for a leg that could not park.
+    #[tokio::test]
+    async fn a_client_keeps_calling_while_its_event_stream_is_open() {
+        let (_relay, route, home) = reachable_home(true).await;
+        let (loopback, carrier) = bind_client_loopback(route).await.unwrap();
+        let mut events = TcpStream::connect(loopback).await.unwrap();
+        events
+            .write_all(b"GET /events HTTP/1.1\r\nhost: home\r\n\r\n")
+            .await
+            .unwrap();
+        next_tick(&mut events).await;
+        for _ in 0..3 {
+            assert!(ping(loopback).await.ends_with("pong"));
+        }
+        next_tick(&mut events).await;
+        carrier.abort();
+        home.abort();
+    }
+
+    /// A Home that answers the offer with nothing is carried the way it always
+    /// was: one tunnel per connection.
+    #[tokio::test]
+    async fn a_home_that_does_not_multiplex_is_carried_a_connection_at_a_time() {
+        let (_relay, route, home) = reachable_home(false).await;
+        let (loopback, carrier) = bind_client_loopback(route).await.unwrap();
+        for _ in 0..3 {
+            assert!(ping(loopback).await.ends_with("pong"));
+        }
+        carrier.abort();
+        home.abort();
+    }
+
+    /// Closing a route hangs its tunnel up. Left open, it would hold the
+    /// Home's only pair until the Home judged it idle, and nobody else —
+    /// desk in a browser included — could reach the Home until then.
+    #[tokio::test]
+    async fn closing_a_route_hangs_its_tunnel_up() {
+        let (_relay, route, home) = reachable_home(true).await;
+        let (loopback, first) = bind_client_loopback(route.clone()).await.unwrap();
+        assert!(ping(loopback).await.ends_with("pong"));
+        first.abort();
+        let (loopback, second) = bind_client_loopback(route).await.unwrap();
+        assert!(ping(loopback).await.ends_with("pong"));
+        second.abort();
+        home.abort();
     }
 }

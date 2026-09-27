@@ -31,6 +31,11 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 getrandom = "0.2"
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# One tunnel carrying many streams, for a client that opens many connections
+# to one Home — the phone's WebView (`mux`). `compat` bridges yamux's futures
+# I/O traits to tokio's.
+yamux = "0.13"
+tokio-util = { version = "0.7", features = ["compat"] }
 
 # The browser carrier. `ring` is the *same* provider the native carrier uses —
 # its `wasm32_unknown_unknown_js` feature routes entropy to

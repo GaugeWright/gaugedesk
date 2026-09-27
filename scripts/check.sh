@@ -386,18 +386,49 @@ run_rust() {
     echo "== formatting =="
     gate_section formatting
 
+    echo "== native targets =="
+    gate_section native-crates
+
+    # Where this checkout is a cell and the host is Linux with bubblewrap --
+    # every Linux fleet host that answers this bar -- the lints, the tests and
+    # the no-default-features check run on the native targets instead
+    # (GaugeWright BUILD.md stages 5 and 6), which scripts/buckify-crates.py
+    # renders from Cargo.toml and from the no-default-features case of
+    # scripts/section.sh. Clippy runs on each target and any report with
+    # anything in it fails the build, which is what `-D warnings` makes of it;
+    # each test binary runs as its own action over only the files its crate
+    # declares, so a binary whose code and data did not change is served its
+    # recorded pass. Anywhere else -- a Mac, a worktree outside a workspace --
+    # the cargo lines run, and assert the same set.
+    local native=""
+    if [ -n "$via_buck2" ] && [ "$(uname -s)" = Linux ] && command -v bwrap >/dev/null 2>&1; then
+        native=1
+    fi
+
     echo "== lints =="
-    gate_section lints
+    if [ -n "$native" ]; then native_section native-lints; else gate_section lints; fi
 
     # cargo-nextest, the tmpfs the fixtures write to, and the doctest run
     # nextest does not do are stated once, in scripts/section.sh — including the
     # tmpfs, which a section running as a Buck2 action has to set up itself
-    # because it inherits nothing from this shell.
+    # because it inherits nothing from this shell. Natively, the doctests are
+    # their own section beside the test runs.
     echo "== tests =="
-    gate_section tests
+    if [ -n "$native" ]; then
+        native_section native-tests
+        gate_section doctests
+    else
+        gate_section tests
+    fi
 
     echo "== no-default-features =="
-    gate_section no-default-features
+    if [ -n "$native" ]; then native_section native-feature-checks; else gate_section no-default-features; fi
+}
+
+# A native suite: one target over many actions, so there is no one transcript
+# to print and nothing in it announces what it could not establish.
+native_section() {
+  buck2 build "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" -c "green_bar.prerequisites=${prerequisites:-required}"
 }
 
 

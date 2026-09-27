@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-app"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-boundary"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-core",
  "proptest",
@@ -1585,7 +1585,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-core"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "ciborium",
  "getrandom 0.4.3",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-directory-protocol"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-core",
  "serde",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-ee"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1637,11 +1637,11 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-env"
-version = "0.4.27"
+version = "0.4.28"
 
 [[package]]
 name = "gaugedesk-harness"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-env",
  "serde",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-pi-bridge"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-core",
  "gaugedesk-env",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-relay-transport"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
@@ -1686,15 +1686,17 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tokio-util",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "yamux",
 ]
 
 [[package]]
 name = "gaugedesk-store"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "gaugedesk-core",
  "gaugedesk-env",
@@ -1706,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-tracker"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -1716,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-whip-runtime"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "base64 0.23.1",
  "gaugedesk-core",
@@ -1737,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-workspace"
-version = "0.4.27"
+version = "0.4.28"
 dependencies = [
  "hex",
  "quote",
@@ -2713,6 +2715,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3089,6 +3097,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
+]
+
+[[package]]
+name = "pin-project"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
+dependencies = [
+ "pin-project-internal",
+]
+
+[[package]]
+name = "pin-project-internal"
+version = "1.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4110,6 +4138,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "string_cache"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4209,7 +4243,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4444,6 +4478,7 @@ checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "pin-project-lite",
  "tokio",
@@ -5663,6 +5698,22 @@ checksum = "d3dc9559429edf0cd3f327cc0afd9d6b36fa8cec6d93107b7fbe64f806b5f2d9"
 dependencies = [
  "log",
  "markup5ever",
+]
+
+[[package]]
+name = "yamux"
+version = "0.13.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1991f6690292030e31b0144d73f5e8368936c58e45e7068254f7138b23b00672"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "rand 0.9.5",
+ "static_assertions",
+ "web-time",
 ]
 
 [[package]]
