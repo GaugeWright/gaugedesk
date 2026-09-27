@@ -279,6 +279,8 @@ pub(crate) fn create_harness(
         instance_ref,
         policy,
         chat_id: spec.chat_id.clone(),
+        mode: spec.mode,
+        user_context_complete: true,
         provider_binding_ref: required_ref(
             spec.provider_binding_ref.as_deref(),
             "provider binding ref",
@@ -521,6 +523,8 @@ struct DoHarness {
     instance_ref: String,
     policy: PolicyEpochRef,
     chat_id: String,
+    mode: gaugedesk_harness::ChatMode,
+    user_context_complete: bool,
     provider_binding_ref: String,
     credential_ref: String,
     workspace_targets: Vec<gaugedesk_harness::WorkspaceTargetBinding>,
@@ -550,6 +554,10 @@ impl Harness for DoHarness {
 
     fn bind_runtime_command_id(&mut self, command_id: Option<&str>) {
         self.runtime_command_id = command_id.map(str::to_owned);
+    }
+
+    fn bind_user_context_provenance(&mut self, complete: bool) {
+        self.user_context_complete = complete;
     }
 
     fn run_turn(
@@ -630,7 +638,14 @@ impl Harness for DoHarness {
         };
         command.validate().map_err(invalid_data)?;
         let route = "/host/turns".to_owned();
-        let request = host_turn_request(&command, &self.package, images)?;
+        let request = host_turn_request(
+            &command,
+            &self.package,
+            images,
+            self.mode,
+            &self.chat_id,
+            self.user_context_complete,
+        )?;
         *self
             .active_command
             .lock()
@@ -906,8 +921,17 @@ fn host_turn_request(
     command: &StartTurnCommand,
     package: &AuthoredAgentPackage,
     images: &[ImageContent],
+    mode: gaugedesk_harness::ChatMode,
+    chat_id: &str,
+    user_context_complete: bool,
 ) -> io::Result<Value> {
     let mut request = host_request(command, package)?;
+    request["initial_model_provenance"] = hosted_initial_model_provenance(
+        &command.package_version_ref,
+        mode,
+        chat_id,
+        user_context_complete,
+    );
     request["image_bodies"] = Value::Array(
         images
             .iter()
@@ -920,6 +944,35 @@ fn host_turn_request(
             .collect(),
     );
     Ok(request)
+}
+
+fn hosted_initial_model_provenance(
+    package_version_ref: &str,
+    mode: gaugedesk_harness::ChatMode,
+    chat_id: &str,
+    user_context_complete: bool,
+) -> Value {
+    let chat = format!("chat:{chat_id}");
+    let package = if mode == gaugedesk_harness::ChatMode::Use {
+        format!("package:{package_version_ref}")
+    } else {
+        "runtime".to_owned()
+    };
+    let known = |handles: Vec<String>| {
+        json!({
+            "source_handles": handles,
+            "complete": true,
+        })
+    };
+    json!({
+        "system": known(vec![package.clone(), chat.clone()]),
+        "user": {
+            "source_handles": [chat.clone()],
+            "complete": user_context_complete,
+        },
+        "world": known(vec![package.clone(), chat.clone(), format!("workspace:{chat_id}")]),
+        "tools": known(vec![package, chat]),
+    })
 }
 
 fn host_fork_request(
@@ -1620,6 +1673,35 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn hosted_labels_keep_private_answers_unknown() {
+        let labels = hosted_initial_model_provenance(
+            "pinned",
+            gaugedesk_harness::ChatMode::Use,
+            "chat-one",
+            false,
+        );
+        assert_eq!(
+            labels["system"]["source_handles"],
+            json!(["package:pinned", "chat:chat-one"])
+        );
+        assert_eq!(
+            labels["world"]["source_handles"],
+            json!(["package:pinned", "chat:chat-one", "workspace:chat-one"])
+        );
+        assert_eq!(labels["user"]["complete"], false);
+        let edit = hosted_initial_model_provenance(
+            "editor",
+            gaugedesk_harness::ChatMode::Edit,
+            "chat-one",
+            true,
+        );
+        assert_eq!(
+            edit["system"]["source_handles"],
+            json!(["runtime", "chat:chat-one"])
+        );
+    }
 
     #[derive(Debug, Default)]
     struct RecordingTransport {

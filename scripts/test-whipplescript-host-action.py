@@ -52,6 +52,19 @@ class PinTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cargo resolved a different runtime", result.stderr)
 
+    def test_only_the_current_publications_build_output_is_kept(self):
+        parent = self.root / "target/host-action-contract"
+        for commit in ("a" * 40, "b" * 40, "c" * 40):
+            (parent / commit / "debug").mkdir(parents=True)
+        target = checker.publication_target(self.root, "b" * 40)
+        self.assertEqual(target, parent / ("b" * 40))
+        self.assertEqual([p.name for p in parent.iterdir()], ["b" * 40])
+
+    def test_a_first_publication_creates_nothing_to_remove(self):
+        target = checker.publication_target(self.root, "a" * 40)
+        self.assertEqual(target, self.root / "target/host-action-contract" / ("a" * 40))
+        self.assertFalse((self.root / "target").exists())
+
     def test_changed_source_public_revision_and_digest_are_refused(self):
         path = self.root / checker.PIN
         original = json.loads(path.read_text())

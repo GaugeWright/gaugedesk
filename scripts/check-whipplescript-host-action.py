@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -42,6 +43,22 @@ def check_pin(root=ROOT):
     return pin, expected_source
 
 
+def publication_target(consumer_root, commit):
+    """The build directory for one publication, with every other one's removed.
+
+    A publication gets a directory of its own (see check_resolved), and nothing
+    reads an earlier one again. Kept, they were never removed: a checkout held
+    one of about 3.5 GB for every runtime pin it had ever verified, in each
+    worktree and in each of a gate host's slots.
+    """
+    parent = consumer_root / "target/host-action-contract"
+    if parent.is_dir():
+        for stale in parent.iterdir():
+            if stale.name != commit:
+                shutil.rmtree(stale, ignore_errors=True)
+    return parent / commit
+
+
 def check_resolved(pin, expected_source, consumer_root=ROOT):
     # Cargo tells us which package the product actually resolves. No peer
     # checkout or caller-supplied alternate runtime may stand in for that pin.
@@ -75,7 +92,7 @@ def check_resolved(pin, expected_source, consumer_root=ROOT):
     # otherwise reuse the prior publication's path-dependency artifacts when
     # their package versions are unchanged, even after this pin is verified.
     environment = os.environ.copy()
-    environment["CARGO_TARGET_DIR"] = str(consumer_root / "target/host-action-contract" / commit)
+    environment["CARGO_TARGET_DIR"] = str(publication_target(consumer_root, commit))
     subprocess.run([
         "cargo", "test", "--locked", "--manifest-path", str(runtime / "crates/whipplescript-kernel/Cargo.toml"),
         "-p", "whipplescript-kernel", "--test", "host_action_contract",

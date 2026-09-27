@@ -1425,10 +1425,10 @@ pub(crate) async fn get_transcript(
     }
 }
 
-/// A live, privileged view of the actual provider request bodies. The hosted
-/// path stays redacted until the runtime can prove every input's provenance;
-/// chat ownership by itself is not authority to inspect an Agent's method or
-/// tool reads. Nothing from this route is appended to the transcript.
+/// A live, privileged view of the actual provider request bodies. Source
+/// labels alone do not grant access: every label must pass current read and
+/// erasure checks before the provider body leaves this route. Nothing here is
+/// appended to the transcript.
 pub(crate) async fn get_model_context(
     State(shared): State<SharedWorkbench>,
     Path(id): Path<String>,
@@ -1506,17 +1506,18 @@ pub(crate) async fn get_model_context(
         if source == "runtime" || source == format!("chat:{id}") {
             return true;
         }
-        if let Some(workspace_chat) = source.strip_prefix("workspace:") {
-            return workspace_chat == id
-                && wb.idp.is_none()
-                && !crate::workbench_auth::web_account_mode()
-                && wb.engagements.contains_key(&id);
+        if source.starts_with("workspace:") {
+            // A chat-level handle cannot establish whether one file read into
+            // this call was erased after capture. Until the handle names the
+            // exact source cut and its current erasure state, redact the call.
+            return false;
         }
         let Some(package_ref) = source.strip_prefix("package:") else {
             return false;
         };
         // A work package can include method bytes outside the chat's grant.
-        // Only the single-user owner currently has a proven package read.
+        // The selected package is readable by the single-user Home owner;
+        // account-backed reads need an explicit current method grant.
         if wb.idp.is_some() || crate::workbench_auth::web_account_mode() {
             return false;
         }
