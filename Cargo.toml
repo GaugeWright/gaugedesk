@@ -27,7 +27,7 @@ feature-checks = "no-default-features"
 
 [workspace.package]
 edition = "2021"
-version = "0.4.29"
+version = "0.4.30"
 # The platform default (ADR 0121 / company DR-0056).
 license = "AGPL-3.0-only"
 

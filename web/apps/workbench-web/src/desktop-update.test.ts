@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
     desktopUpdateAllowed,
+    desktopUpdateScopeReady,
     desktopUpdateShouldRecheck,
     selectedDesktopUpdatePolicy,
     DESKTOP_UPDATE_RECHECK_MS,
@@ -21,13 +22,20 @@ describe("desktopUpdateAllowed", () => {
 describe("selectedDesktopUpdatePolicy", () => {
     it("discovers updates for Personal while its Home is unreachable", async () => {
         const unreachableHome = () => Promise.reject(new TypeError("Load failed"));
-        await expect(selectedDesktopUpdatePolicy({ personal: true }, unreachableHome)).resolves.toBeNull();
-        await expect(selectedDesktopUpdatePolicy({ personal: false }, unreachableHome)).rejects.toThrow("Load failed");
+        await expect(selectedDesktopUpdatePolicy({ personal: true }, false, unreachableHome)).resolves.toBeNull();
+        await expect(selectedDesktopUpdatePolicy({ personal: false }, false, unreachableHome)).rejects.toThrow("Load failed");
+    });
+
+    it("checks from explicit local mode without asking an absent Home", async () => {
+        const unreachableHome = () => Promise.reject(new TypeError("Load failed"));
+        expect(desktopUpdateScopeReady(null, false)).toBe(false);
+        expect(desktopUpdateScopeReady(null, true)).toBe(true);
+        await expect(selectedDesktopUpdatePolicy(null, true, unreachableHome)).resolves.toBeNull();
     });
 
     it("keeps an organization's channel restriction", async () => {
         const policy = { allowedChannels: ["beta"] };
-        await expect(selectedDesktopUpdatePolicy({ personal: false }, async () => policy)).resolves.toEqual(policy);
+        await expect(selectedDesktopUpdatePolicy({ personal: false }, true, async () => policy)).resolves.toEqual(policy);
     });
 });
 

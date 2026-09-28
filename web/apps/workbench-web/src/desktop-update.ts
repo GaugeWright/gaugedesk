@@ -29,14 +29,25 @@ export interface SoftwareUpdatePolicy {
     readonly allowedChannels: readonly string[];
 }
 
-/** Personal membership has no organization software policy. The account
- * authority has already supplied that fact, so update discovery does not
- * depend on reaching a Home that may be offline. */
+/** Personal membership and explicit local mode have no organization software
+ * policy. A selected organization still governs its own release channel. */
 export function selectedDesktopUpdatePolicy(
     selected: { readonly personal: boolean } | null | undefined,
+    localMode: boolean,
     readOrganizationPolicy: () => Promise<SoftwareUpdatePolicy | null>,
 ): Promise<SoftwareUpdatePolicy | null> {
-    return selected?.personal ? Promise.resolve(null) : readOrganizationPolicy();
+    return selected?.personal || (!selected && localMode)
+        ? Promise.resolve(null)
+        : readOrganizationPolicy();
+}
+
+/** Account membership can arrive after the shell mounts. Local mode is an
+ * explicit choice, so it may check without waiting for a membership. */
+export function desktopUpdateScopeReady(
+    selected: { readonly personal: boolean } | null | undefined,
+    localMode: boolean,
+): boolean {
+    return Boolean(selected) || localMode;
 }
 
 /** An absent policy, or one without a channel restriction, preserves the

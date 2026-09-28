@@ -73,7 +73,7 @@ import {
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
-import { desktopUpdateAllowed, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
+import { desktopUpdateAllowed, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
 import "@gaugewright/gw-embed";
 import {
@@ -440,7 +440,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     } | null>(isTauri() ? { kind: "checking" } : null);
 
     const selectedSoftwareUpdatePolicy = () =>
-        selectedDesktopUpdatePolicy(props.gaugeApps?.selectedTenant(), () => api.softwareUpdatePolicy());
+        selectedDesktopUpdatePolicy(props.gaugeApps?.selectedTenant(), hubSession()?.local === true,
+            () => api.softwareUpdatePolicy());
 
     /** `announce` states the check in the interface. A check a person asked for
      * says so; the recheck timer's does not, because a footer that announces
@@ -493,13 +494,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     }
 
     if (isTauri()) {
-        // The account membership arrives after the shell mounts. Wait for its
-        // authoritative Personal flag before asking a Home for organization
-        // policy; re-evaluate if the selected organization changes.
-        createEffect(on(() => props.gaugeApps?.selectedTenant(), (selected) => {
-            if (props.gaugeApps && !selected) return;
-            void checkDesktopUpdate(false);
-        }));
         // The startup check alone answers with whatever was published before this
         // window opened, and a desktop client stays open for days. See
         // `DESKTOP_UPDATE_RECHECK_MS` for why discovery is a timer at all.
@@ -523,6 +517,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [hubSession, { refetch: refetchHubSession }] = createResource(() =>
         api.hubSessionStatus().catch(() => null),
     );
+    const localUpdateMode = createMemo(() => hubSession()?.local === true);
+    if (isTauri()) {
+        // Wait for account membership or an explicit local choice. A local
+        // workbench has no organization policy to fetch, and otherwise waits
+        // forever on a selection that will never arrive.
+        createEffect(on([() => props.gaugeApps?.selectedTenant(), localUpdateMode],
+            ([selected, localMode]) => {
+                if (props.gaugeApps && !desktopUpdateScopeReady(selected, localMode)) return;
+                void checkDesktopUpdate(false);
+            }));
+    }
     const [claimPromptOpen, setClaimPromptOpen] = createSignal(false);
     const [claimBusy, setClaimBusy] = createSignal(false);
     const [claimError, setClaimError] = createSignal("");
