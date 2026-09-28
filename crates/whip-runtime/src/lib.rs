@@ -3110,13 +3110,30 @@ impl ResourceResolver for TurnResources<'_> {
                 source_handles: vec!["runtime".to_owned()],
                 complete: true,
             }
+        } else if call.name == "read" {
+            // The resolver witnessed the exact full file bytes for this call.
+            // A failed read has no witness and stays under the coarse source,
+            // which the viewer cannot authorize as an individual retained cut.
+            if let Some(witness) = self.workspace.take_model_read_witness(&call.id) {
+                ModelContentProvenance {
+                    source_handles: vec![format!(
+                        "workspace-file:{}:{}:{}",
+                        self.chat_id, witness.content_hash, witness.path
+                    )],
+                    complete: true,
+                }
+            } else {
+                ModelContentProvenance {
+                    source_handles: vec![format!("workspace:{}", self.chat_id)],
+                    complete: true,
+                }
+            }
         } else if matches!(
             call.name.as_str(),
-            "read" | "write" | "edit" | "ls" | "find" | "grep" | "bash"
+            "write" | "edit" | "ls" | "find" | "grep" | "bash"
         ) {
-            // These native tools are confined to the admitted workspace
-            // snapshot (including virtual Bashkit). A single-user reader can
-            // authorize that workspace as one source; a shared reader cannot.
+            // These tools may combine several workspace sources. Keep the
+            // coarse label until they can attest exact file cuts too.
             ModelContentProvenance {
                 source_handles: vec![format!("workspace:{}", self.chat_id)],
                 complete: true,
@@ -3682,6 +3699,69 @@ mod tests {
             )
             .is_err());
         assert_eq!(filer.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn native_read_result_uses_its_own_file_witness() {
+        use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("targets/t-one");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("first.txt"), "first\n").unwrap();
+        std::fs::write(target.join("second.txt"), "second\n").unwrap();
+        let workspace = NativeWorkspaceResolver::new(root.path()).unwrap();
+        let mut sink = |_observation: &gaugedesk_harness::Observation| {};
+        let resources = super::TurnResources {
+            workspace: &workspace,
+            chat_id: "test-chat",
+            images: &[],
+            task_filer: None,
+            asked: std::cell::RefCell::new(Vec::new()),
+            external_tool_handler: None,
+            command_id: "test-turn".to_owned(),
+            live: std::cell::RefCell::new(&mut sink),
+            streamed: std::cell::Cell::new(false),
+        };
+        let admitted = [super::ResourceRef {
+            handle: "target:t-one".into(),
+            kind: "file_store".into(),
+            selector: Some("targets/t-one".into()),
+            writable: Some(false),
+        }];
+        let read = |id: &str, path: &str| super::ToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": path}),
+        };
+        let first = read("one", "targets/t-one/first.txt");
+        let second = read("two", "targets/t-one/second.txt");
+        resources.execute_tool(&admitted, &first).unwrap();
+        resources.execute_tool(&admitted, &second).unwrap();
+        let first_source = resources.model_output_provenance(&admitted, &first);
+        let second_source = resources.model_output_provenance(&admitted, &second);
+        assert_eq!(
+            first_source.source_handles,
+            vec![format!(
+                "workspace-file:test-chat:{}:targets/t-one/first.txt",
+                whipplescript_store::stable_hash_bytes_hex(b"first\n")
+            )]
+        );
+        assert_eq!(
+            second_source.source_handles,
+            vec![format!(
+                "workspace-file:test-chat:{}:targets/t-one/second.txt",
+                whipplescript_store::stable_hash_bytes_hex(b"second\n")
+            )]
+        );
+        assert!(first_source.complete && second_source.complete);
+        assert_eq!(
+            resources
+                .model_output_provenance(&admitted, &first)
+                .source_handles,
+            vec!["workspace:test-chat".to_owned()],
+            "a witness is consumed only once"
+        );
     }
 
     #[test]
