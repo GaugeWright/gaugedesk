@@ -5,6 +5,7 @@ export const PANE_DIVIDER = 5;
 const MIN = { nav: 120, chat: 280, content: 240, files: 150 } as const;
 type Pane = keyof typeof MIN;
 export type PaneDivider = "nav" | "mid" | "files";
+const PANE_ORDER: readonly Pane[] = ["nav", "chat", "content", "files"];
 
 export interface WorkbenchLayoutInput {
     width: number;
@@ -77,4 +78,33 @@ export function dragWorkbenchDivider(layout: WorkbenchLayout, divider: PaneDivid
     const total = layout.content + layout.files;
     const content = clamp(layout.content + deltaX, MIN.content, total - MIN.files);
     return { ...layout, content, files: total - content };
+}
+
+/** A folded rail stays 30px wide. Dragging it divides space between the
+ * nearest expanded panes on either side, even across several folded rails. */
+export function workbenchRailResizePair(
+    layout: WorkbenchLayout,
+    collapsed: Record<Pane, boolean>,
+    rail: Pane,
+): readonly [Pane, Pane] | null {
+    if (!collapsed[rail]) return null;
+    const index = PANE_ORDER.indexOf(rail);
+    const open = (pane: Pane) => !collapsed[pane] && (pane !== "files" || layout.files > 0);
+    const left = PANE_ORDER.slice(0, index).reverse().find(open);
+    const right = PANE_ORDER.slice(index + 1).find(open);
+    return left && right ? [left, right] : null;
+}
+
+export function dragWorkbenchRail(
+    layout: WorkbenchLayout,
+    collapsed: Record<Pane, boolean>,
+    rail: Pane,
+    deltaX: number,
+): WorkbenchLayout {
+    const pair = workbenchRailResizePair(layout, collapsed, rail);
+    if (!pair) return layout;
+    const [left, right] = pair;
+    const width = layout[left] + layout[right];
+    const leftWidth = clamp(layout[left] + deltaX, MIN[left], width - MIN[right]);
+    return { ...layout, [left]: leftWidth, [right]: width - leftWidth };
 }

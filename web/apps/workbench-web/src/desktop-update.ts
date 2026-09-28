@@ -29,6 +29,16 @@ export interface SoftwareUpdatePolicy {
     readonly allowedChannels: readonly string[];
 }
 
+/** Personal membership has no organization software policy. The account
+ * authority has already supplied that fact, so update discovery does not
+ * depend on reaching a Home that may be offline. */
+export function selectedDesktopUpdatePolicy(
+    selected: { readonly personal: boolean } | null | undefined,
+    readOrganizationPolicy: () => Promise<SoftwareUpdatePolicy | null>,
+): Promise<SoftwareUpdatePolicy | null> {
+    return selected?.personal ? Promise.resolve(null) : readOrganizationPolicy();
+}
+
 /** An absent policy, or one without a channel restriction, preserves the
  * unmanaged/solo updater behavior. A managed channel list is a ceiling. */
 export function desktopUpdateAllowed(policy: SoftwareUpdatePolicy | null): boolean {

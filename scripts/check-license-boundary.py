@@ -28,6 +28,13 @@ APACHE_LICENSES = {
 # SDK exceptions above are keyed by exact relative path, so the same two
 # packages read as unlicensed AGPL violations at any other prefix, and the check
 # fails on files that are not in the repository at all.
+# Cargo manifests that are not a crate of this product. third-party/Cargo.toml
+# is reindeer's vendoring input, rendered by scripts/buckify-crates.py: its
+# [package] exists only so cargo will resolve the external crates the native
+# targets build, it is excluded from the workspace, publishes nothing, and the
+# public mirror does not carry it. The licences that matter there are the
+# vendored crates' own, which it only names.
+NON_PRODUCT_MANIFESTS = {Path("third-party/Cargo.toml")}
 EXCLUDED_DIRS = {".claude", ".git", "dist", "node_modules", "target"}
 PUBLIC_DRIFT_TERMS = ("BUSL-1.1", "Business Source License", "Enterprise Use Grant")
 PUBLIC_DRIFT_ROOTS = (
@@ -100,7 +107,7 @@ def check(errors: list[str]) -> None:
     if workspace.get("workspace", {}).get("package", {}).get("license") != AGPL:
         errors.append(f"Cargo workspace license must be {AGPL}")
     for manifest in sorted(ROOT.rglob("Cargo.toml")):
-        if excluded(manifest):
+        if excluded(manifest) or manifest.relative_to(ROOT) in NON_PRODUCT_MANIFESTS:
             continue
         data = tomllib.loads(manifest.read_text(encoding="utf-8"))
         package = data.get("package")

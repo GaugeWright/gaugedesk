@@ -508,6 +508,7 @@ export function EnterpriseWorkbench(): JSX.Element {
     const surfaceOpen = () => Boolean(proposalAccess() || activeController()?.session());
     const gaugeApps: WorkbenchGaugeApps = {
         active: surfaceOpen,
+        selectedTenant: () => memberships().find((membership) => membership.id === tenant()) ?? null,
         accountIdentity: () => gaugeAppMenuIdentity(
             account.session.error ? undefined : account.session(), accountIndex(),
         ),

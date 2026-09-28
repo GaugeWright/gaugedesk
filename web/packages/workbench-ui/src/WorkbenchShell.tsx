@@ -15,7 +15,7 @@ import { initial as initialCarousel, reduce as reduceCarousel } from "./carousel
 import { tapGesture } from "./carousel-view";
 import type { CarouselState, PaneKind, Selection } from "./mobile-layout";
 import { PanelCollapseIcon, type PanelCollapseDirection } from "./PanelCollapseIcon";
-import { dragWorkbenchDivider, resolveWorkbenchLayout, type PaneDivider } from "./workbench-layout";
+import { dragWorkbenchDivider, dragWorkbenchRail, resolveWorkbenchLayout, workbenchRailResizePair, type PaneDivider } from "./workbench-layout";
 
 const MOBILE_QUERY = "(max-width: 1024px)";
 
@@ -29,6 +29,8 @@ export interface WorkbenchShellState {
     columns: Accessor<string>;
     observeShell: (element: HTMLDivElement) => void;
     beginResize: (boundary: PaneDivider) => (deltaX: number) => void;
+    canResizeRail: (pane: PaneKind) => boolean;
+    beginRailResize: (pane: PaneKind) => ((deltaX: number) => void) | null;
 }
 
 export interface WorkbenchShellOptions {
@@ -138,19 +140,36 @@ export function createWorkbenchShellState(options: WorkbenchShellOptions): Workb
         collapsed: { nav: navCollapsed(), chat: chatCollapsed(), content: contentCollapsed(), files: filesCollapsed() },
         navWidth: navWidth(), filesWidth: filesWidth(), chatWidth: chatWidth(), chatFraction: chatFraction(),
     }));
+    const collapsedPanes = () => ({
+        nav: navCollapsed(), chat: chatCollapsed(), content: contentCollapsed(), files: filesCollapsed(),
+    });
+    const applyPair = (pair: readonly [PaneKind, PaneKind], next: ReturnType<typeof resolveWorkbenchLayout>) => {
+        batch(() => {
+            if (pair.includes("nav")) setNavWidth(next.nav);
+            if (pair.includes("files")) setFilesWidth(next.files);
+            if (pair.includes("chat")) {
+                setChatWidth(next.chat);
+                if (!contentCollapsed()) setChatFraction(next.chat / (next.chat + next.content));
+            }
+        });
+    };
     const beginResize = (boundary: PaneDivider) => {
         const initial = layout();
         return (deltaX: number) => {
             const next = dragWorkbenchDivider(initial, boundary, deltaX);
-            batch(() => {
-                if (boundary === "nav") setNavWidth(next.nav);
-                if (boundary === "files") setFilesWidth(next.files);
-                if (initial.midDivider) {
-                    setChatWidth(next.chat);
-                    setChatFraction(next.chat / (next.chat + next.content));
-                }
-            });
+            const pair = boundary === "nav" ? ["nav", "chat"] as const
+                : boundary === "mid" ? ["chat", "content"] as const
+                    : ["content", "files"] as const;
+            applyPair(pair, next);
         };
+    };
+    const canResizeRail = (pane: PaneKind) => workbenchRailResizePair(layout(), collapsedPanes(), pane) !== null;
+    const beginRailResize = (pane: PaneKind) => {
+        const initial = layout();
+        const initialCollapsed = collapsedPanes();
+        const pair = workbenchRailResizePair(initial, initialCollapsed, pane);
+        if (!pair) return null;
+        return (deltaX: number) => applyPair(pair, dragWorkbenchRail(initial, initialCollapsed, pane, deltaX));
     };
 
     const columns = () => {
@@ -170,6 +189,8 @@ export function createWorkbenchShellState(options: WorkbenchShellOptions): Workb
         columns,
         observeShell,
         beginResize,
+        canResizeRail,
+        beginRailResize,
     };
 }
 
@@ -207,9 +228,8 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
 
     const RightPanels = () => (
         <>
-            <Show when={!props.state.collapsed("content")}>
-                <Resizer enabled={!props.state.collapsed("chat")} onStart={() => props.state.beginResize("mid")} />
-            </Show>
+            <Resizer enabled={!props.state.collapsed("chat") && !props.state.collapsed("content")}
+                onStart={() => props.state.beginResize("mid")} />
             <CollapsiblePanel
                 cls="content"
                 fold="right"
@@ -217,15 +237,16 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
                 title={title("content")}
                 collapsed={props.state.collapsed("content")}
                 onToggle={(value) => props.state.setCollapsed("content", value)}
+                canResize={props.state.canResizeRail("content")}
+                onStartResize={() => props.state.beginRailResize("content")}
             >
                 {props.content()}
             </CollapsiblePanel>
 
             <Show when={props.files}>{
                 <>
-                    <Show when={!props.state.collapsed("files")}>
-                        <Resizer enabled={!props.state.collapsed("content")} onStart={() => props.state.beginResize("files")} />
-                    </Show>
+                    <Resizer enabled={!props.state.collapsed("content") && !props.state.collapsed("files")}
+                        onStart={() => props.state.beginResize("files")} />
                     <CollapsiblePanel
                         cls="workspace"
                         fold="right"
@@ -233,6 +254,8 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
                         title={title("files")}
                         collapsed={props.state.collapsed("files")}
                         onToggle={(value) => props.state.setCollapsed("files", value)}
+                        canResize={props.state.canResizeRail("files")}
+                        onStartResize={() => props.state.beginRailResize("files")}
                     >
                         {props.files?.()}
                     </CollapsiblePanel>
@@ -258,6 +281,8 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
                 title={title("nav")}
                 collapsed={props.state.collapsed("nav")}
                 onToggle={(value) => props.state.setCollapsed("nav", value)}
+                canResize={props.state.canResizeRail("nav")}
+                onStartResize={() => props.state.beginRailResize("nav")}
             >
                 <div class="nav-stack">
                     <div class="nav-scroll">
@@ -272,21 +297,12 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
             <Show
                 when={!props.state.collapsed("chat")}
                 fallback={
-                    <div
-                        class="panel run rail"
-                        data-rail="run"
-                        role="button"
-                        tabindex="0"
-                        title={`Show ${title("chat")}`}
-                        onClick={() => props.state.setCollapsed("chat", false)}
-                        onKeyDown={(event) =>
-                            (event.key === "Enter" || event.key === " ") &&
-                            props.state.setCollapsed("chat", false)
-                        }
-                    >
-                        <span class="rail-chevron">›</span>
-                        <span class="rail-label">{title("chat")}</span>
-                    </div>
+                    <CollapsedRail
+                        cls="run" title={title("chat")} glyph="›"
+                        onExpand={() => props.state.setCollapsed("chat", false)}
+                        canResize={props.state.canResizeRail("chat")}
+                        onStartResize={() => props.state.beginRailResize("chat")}
+                    />
                 }
             >
                 <section class="panel run">
@@ -323,6 +339,8 @@ function CollapsiblePanel(props: {
     title: string;
     collapsed: boolean;
     onToggle: (value: boolean) => void;
+    canResize: boolean;
+    onStartResize: () => ((deltaX: number) => void) | null;
     children: JSX.Element;
 }) {
     const expandGlyph = () => (props.fold === "left" ? "›" : "‹");
@@ -330,20 +348,12 @@ function CollapsiblePanel(props: {
         <Show
             when={!props.collapsed}
             fallback={
-                <div
-                    class={`panel ${props.cls} rail`}
-                    data-rail={props.cls}
-                    role="button"
-                    tabindex="0"
-                    title={`Show ${props.title}`}
-                    onClick={() => props.onToggle(false)}
-                    onKeyDown={(event) =>
-                        (event.key === "Enter" || event.key === " ") && props.onToggle(false)
-                    }
-                >
-                    <span class="rail-chevron">{expandGlyph()}</span>
-                    <span class="rail-label">{props.title}</span>
-                </div>
+                <CollapsedRail
+                    cls={props.cls} title={props.title} glyph={expandGlyph()}
+                    onExpand={() => props.onToggle(false)}
+                    canResize={props.canResize}
+                    onStartResize={props.onStartResize}
+                />
             }
         >
             <div class={`panel ${props.cls} collapsible`}>
@@ -360,6 +370,71 @@ function CollapsiblePanel(props: {
             </div>
         </Show>
     );
+}
+
+function CollapsedRail(props: {
+    cls: string;
+    title: string;
+    glyph: string;
+    onExpand: () => void;
+    canResize: boolean;
+    onStartResize: () => ((deltaX: number) => void) | null;
+}) {
+    const [dragging, setDragging] = createSignal(false);
+    let gesture: { pointerId: number; startX: number; apply: ((deltaX: number) => void) | null; moved: boolean } | null = null;
+    const end = () => {
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        setDragging(false);
+        gesture = null;
+    };
+    return <div
+        class={`panel ${props.cls} rail`}
+        classList={{ "rail-resizable": props.canResize, dragging: dragging() }}
+        data-rail={props.cls}
+        role="button"
+        tabindex="0"
+        title={props.canResize ? `Drag to resize adjacent panels · Click to show ${props.title}` : `Show ${props.title}`}
+        onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            event.preventDefault();
+            event.currentTarget.setPointerCapture(event.pointerId);
+            gesture = { pointerId: event.pointerId, startX: event.clientX, apply: props.onStartResize(), moved: false };
+        }}
+        onPointerMove={(event) => {
+            if (!gesture || event.pointerId !== gesture.pointerId || !gesture.apply) return;
+            const deltaX = event.clientX - gesture.startX;
+            if (!gesture.moved && Math.abs(deltaX) >= 4) {
+                gesture.moved = true;
+                setDragging(true);
+                document.body.style.cursor = "col-resize";
+                document.body.style.userSelect = "none";
+            }
+            if (gesture.moved) gesture.apply(deltaX);
+        }}
+        onPointerUp={(event) => {
+            if (!gesture || event.pointerId !== gesture.pointerId) return;
+            const moved = gesture.moved;
+            end();
+            if (!moved) props.onExpand();
+        }}
+        onPointerCancel={end}
+        onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                props.onExpand();
+            } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+                const apply = props.onStartResize();
+                if (apply) {
+                    event.preventDefault();
+                    apply(event.key === "ArrowLeft" ? -16 : 16);
+                }
+            }
+        }}
+    >
+        <span class="rail-chevron">{props.glyph}</span>
+        <span class="rail-label">{props.title}</span>
+    </div>;
 }
 
 function Resizer(props: { enabled: boolean; onStart: () => (deltaX: number) => void }) {

@@ -145,18 +145,18 @@ function isHomeUnreachable(error: unknown): boolean {
     return error instanceof RouteHttpError && [502, 503, 504].includes(error.status);
 }
 
-/** A Home restart invalidates its memory-only admissions. This exact refusal is
- * emitted by the admission middleware before a work route can run, so it is
- * safe to obtain a fresh admission and retry the same operation once. Other
- * 401s are account-authentication failures and must not be hidden by reconnects. */
+/** A Home restart clears admissions, and a second admission for the same
+ * identity replaces the first. Both refusals happen before a work route runs,
+ * so either can be retried once with a fresh admission. */
 function isExpiredHomeAdmission(error: unknown): boolean {
     return error instanceof RouteHttpError
-        && error.status === 401
-        && /target Home admission required/.test(error.message);
+        && ((error.status === 401 && /target Home admission required/.test(error.message))
+            || (error.status === 403 && /Home admission does not match this Home and identity/.test(error.message)));
 }
 
 async function isExpiredHomeAdmissionResponse(response: Response): Promise<boolean> {
-    if (response.status !== 401 || !response.headers.get("content-type")?.startsWith("application/json")) {
+    if ((response.status !== 401 && response.status !== 403)
+        || !response.headers.get("content-type")?.startsWith("application/json")) {
         return false;
     }
     const length = Number(response.headers.get("content-length"));
@@ -165,7 +165,8 @@ async function isExpiredHomeAdmissionResponse(response: Response): Promise<boole
     if (!Number.isSafeInteger(length) || length < 1 || length > 256) return false;
     try {
         const body = await response.clone().json() as { error?: unknown };
-        return body.error === "target Home admission required";
+        return (response.status === 401 && body.error === "target Home admission required")
+            || (response.status === 403 && body.error === "Home admission does not match this Home and identity");
     } catch {
         return false;
     }

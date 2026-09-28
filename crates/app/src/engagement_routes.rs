@@ -1506,6 +1506,9 @@ pub(crate) async fn get_model_context(
         if source == "runtime" || source == format!("chat:{id}") {
             return true;
         }
+        if source.starts_with("workspace-file:") {
+            return current_workspace_file_source(&wb, &id, source);
+        }
         if source.starts_with("workspace:") {
             // A chat-level handle cannot establish whether one file read into
             // this call was erased after capture. Until the handle names the
@@ -1540,10 +1543,82 @@ pub(crate) async fn get_model_context(
     }
 }
 
+/// A native `read` witness names the full bytes read, even when the model saw
+/// only selected lines. A viewer read must find those same bytes in the chat's
+/// current worktree and its retained head cut. This is deliberately stricter
+/// than access to an old digest: erasure or replacement must close the view.
+fn current_workspace_file_source(wb: &Workbench, chat_id: &str, source: &str) -> bool {
+    // Retention proves bytes, not a shared viewer's current target grant.
+    // Account-backed workspaces remain unknown until that grant is bound to
+    // this exact source and rechecked here.
+    if wb.idp.is_some() || crate::workbench_auth::web_account_mode() {
+        return false;
+    }
+    let prefix = format!("workspace-file:{chat_id}:");
+    let Some((digest, path)) = source
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    let Some((encoded_target, relative)) = path
+        .strip_prefix("targets/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    let Some(chat) = wb.library.chats.get(chat_id) else {
+        return false;
+    };
+    let Some(member) = wb.library.current_target_set(chat_id).and_then(|set| {
+        set.members.iter().find(|member| {
+            crate::library::target_id_path_v1(&member.target_id)
+                .is_ok_and(|encoded| encoded == encoded_target)
+        })
+    }) else {
+        return false;
+    };
+    let Ok(target) = wb.resolve_placement_target(&chat.instance_id, Some(&member.target_id)) else {
+        return false;
+    };
+    if !member.capability_ceiling.read
+        || !target.capabilities.read
+        || !path_is_in_scope(relative, &member.path_scope)
+        || !path_is_in_scope(relative, &target.path_scope)
+    {
+        return false;
+    }
+    if digest.len() != 32 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let Some(Ok(Some(bytes))) = wb.read_engagement_file_bytes(chat_id, path, 8 * 1024 * 1024)
+    else {
+        return false;
+    };
+    digest == whipplescript_store::stable_hash_bytes_hex(&bytes)
+        && wb
+            .engagement_recorded_file_cut(chat_id, path, &bytes)
+            .and_then(Result::ok)
+            .flatten()
+            .is_some()
+}
+
 fn project_model_context(
     view: &serde_json::Value,
     authorized_source: impl Fn(&str) -> bool,
 ) -> Result<serde_json::Value, ()> {
+    // One provider call often repeats earlier source labels across messages.
+    // Authorize each distinct source once for this response while the caller
+    // holds its workbench lock; the next viewer poll rechecks current access.
+    let source_cache = std::cell::RefCell::new(std::collections::HashMap::<String, bool>::new());
+    let authorize_cached = |source: &str| {
+        if let Some(allowed) = source_cache.borrow().get(source).copied() {
+            return allowed;
+        }
+        let allowed = authorized_source(source);
+        source_cache.borrow_mut().insert(source.to_owned(), allowed);
+        allowed
+    };
     let calls = view
         .get("calls")
         .and_then(serde_json::Value::as_array)
@@ -1575,7 +1650,7 @@ fn project_model_context(
                     && messages
                         .iter()
                         .chain(object.get("tools"))
-                        .all(|label| authorized_model_source_label(label, &authorized_source))
+                        .all(|label| authorized_model_source_label(label, &authorize_cached))
                     && object.contains_key("tools")
             });
         if authorized {
@@ -1617,7 +1692,7 @@ fn authorized_model_source_label(
 
 #[cfg(test)]
 mod raw_model_context_tests {
-    use super::project_model_context;
+    use super::{current_workspace_file_source, project_model_context};
     use crate::{
         library::{ChatRecord, RecordOp, LIBRARY_RECORD_SCHEMA},
         LockUnpoisoned,
@@ -1693,6 +1768,113 @@ mod raw_model_context_tests {
         assert_eq!(redacted["calls"][0]["redacted"], true);
     }
 
+    #[test]
+    fn workspace_result_redacts_only_its_call_after_an_authorized_world_state() {
+        let view = serde_json::json!({
+            "calls": [
+                {
+                    "ordinal": 0,
+                    "body": {"messages": ["generated world state", "user request"]},
+                    "ordered_provenance": {
+                        "messages": [
+                            {"source_handles": ["package:pinned", "chat:one"], "complete": true},
+                            {"source_handles": ["chat:one"], "complete": true}
+                        ],
+                        "tools": {"source_handles": ["package:pinned"], "complete": true}
+                    },
+                    "provenance_complete": true
+                },
+                {
+                    "ordinal": 1,
+                    "body": {"messages": ["generated world state", "erased file bytes"]},
+                    "ordered_provenance": {
+                        "messages": [
+                            {"source_handles": ["package:pinned", "chat:one"], "complete": true},
+                            {"source_handles": ["workspace:one"], "complete": true}
+                        ],
+                        "tools": {"source_handles": ["package:pinned"], "complete": true}
+                    },
+                    "provenance_complete": true
+                }
+            ],
+            "incomplete": false
+        });
+        let projected = project_model_context(&view, |source| source != "workspace:one").unwrap();
+        assert_eq!(projected["calls"][0]["body"], view["calls"][0]["body"]);
+        assert_eq!(projected["calls"][1]["ordinal"], 1);
+        assert_eq!(projected["calls"][1]["redacted"], true);
+        assert!(!projected.to_string().contains("erased file bytes"));
+    }
+
+    #[test]
+    fn file_witness_requires_current_bytes_and_a_retained_cut() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let mut wb = wb.lock_unpoisoned();
+        let chat = wb
+            .create_default_engagement("file-witness-chat".into(), "File witness".into())
+            .unwrap_or_else(|_| panic!("create file witness chat"));
+        let path = wb.engagement_workspace_path(&chat.id, "notes.txt");
+        let bytes = b"private notes\n";
+        let source = format!(
+            "workspace-file:{}:{}:{path}",
+            chat.id,
+            whipplescript_store::stable_hash_bytes_hex(bytes)
+        );
+        wb.engagements
+            .get(&chat.id)
+            .unwrap()
+            .write_file(&path, "private notes\n")
+            .unwrap();
+        assert!(!current_workspace_file_source(&wb, &chat.id, &source));
+        wb.engagements
+            .get(&chat.id)
+            .unwrap()
+            .commit_turn("retain notes")
+            .unwrap();
+        assert!(current_workspace_file_source(&wb, &chat.id, &source));
+        let target_id = wb.library.current_target_set(&chat.id).unwrap().members[0]
+            .target_id
+            .clone();
+        wb.library
+            .work_targets
+            .get_mut(&target_id)
+            .unwrap()
+            .capabilities
+            .read = false;
+        assert!(!current_workspace_file_source(&wb, &chat.id, &source));
+        wb.library
+            .work_targets
+            .get_mut(&target_id)
+            .unwrap()
+            .capabilities
+            .read = true;
+        assert!(current_workspace_file_source(&wb, &chat.id, &source));
+        assert!(!current_workspace_file_source(&wb, "another-chat", &source));
+        assert!(!current_workspace_file_source(
+            &wb,
+            &chat.id,
+            "workspace-file:file-witness-chat:bad:work/notes.txt"
+        ));
+        wb.engagements
+            .get(&chat.id)
+            .unwrap()
+            .write_file(&path, "replaced notes\n")
+            .unwrap();
+        assert!(!current_workspace_file_source(&wb, &chat.id, &source));
+        wb.engagements
+            .get(&chat.id)
+            .unwrap()
+            .delete_entry(&path)
+            .unwrap();
+        wb.engagements
+            .get(&chat.id)
+            .unwrap()
+            .commit_turn("remove notes")
+            .unwrap();
+        assert!(!current_workspace_file_source(&wb, &chat.id, &source));
+    }
+
     #[tokio::test]
     async fn live_route_refuses_another_chats_owner_and_never_caches() {
         let root = tempfile::tempdir().unwrap();
@@ -1729,6 +1911,169 @@ mod raw_model_context_tests {
                 .await
                 .into_response();
         assert_eq!(unavailable.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn live_route_rechecks_sources_and_discards_settled_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let set_owner = |owner: Option<&str>| {
+            let mut guard = wb.lock_unpoisoned();
+            let instance_id = guard.default_instance.clone();
+            guard.write_chat_record(ChatRecord {
+                id: "raw-context-chat".into(),
+                op: RecordOp::Upsert,
+                instance_id,
+                title: "Raw context".into(),
+                created_position: 0,
+                forked_from: None,
+                forked_from_entry: None,
+                forked_from_cut: None,
+                owner: owner.map(str::to_owned),
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            });
+        };
+        set_owner(None);
+        let claim = crate::engine::claim_turn("raw-context-chat").unwrap();
+        let raw = serde_json::json!({
+            "calls": [
+                {
+                    "ordinal": 0,
+                    "body": {"messages": ["visible runtime framing"]},
+                    "ordered_provenance": {
+                        "messages": [{"source_handles": ["runtime", "chat:raw-context-chat"], "complete": true}],
+                        "tools": {"source_handles": ["runtime"], "complete": true}
+                    },
+                    "provenance_complete": true
+                },
+                {
+                    "ordinal": 1,
+                    "body": {"messages": ["erased workspace bytes"]},
+                    "ordered_provenance": {
+                        "messages": [{"source_handles": ["workspace:raw-context-chat"], "complete": true}],
+                        "tools": {"source_handles": ["runtime"], "complete": true}
+                    },
+                    "provenance_complete": true
+                }
+            ],
+            "incomplete": false
+        });
+        crate::engine::bind_turn_model_context(
+            "raw-context-chat",
+            std::sync::Arc::new(move || Ok(raw.to_string())),
+        );
+        let response = super::get_model_context(
+            State(wb.clone()),
+            Path("raw-context-chat".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            view["calls"][0]["body"]["messages"][0],
+            "visible runtime framing"
+        );
+        assert_eq!(view["calls"][1]["redacted"], true);
+        assert!(!view.to_string().contains("erased workspace bytes"));
+
+        set_owner(Some("another-person"));
+        let revoked = super::get_model_context(
+            State(wb.clone()),
+            Path("raw-context-chat".into()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(revoked.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(revoked.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("visible runtime framing"));
+
+        drop(claim);
+        set_owner(None);
+        let settled =
+            super::get_model_context(State(wb), Path("raw-context-chat".into()), HeaderMap::new())
+                .await
+                .into_response();
+        let bytes = axum::body::to_bytes(settled.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let view: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(view["available"], false);
+    }
+
+    #[tokio::test]
+    async fn live_route_redacts_a_file_after_its_current_cut_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let (chat_id, path) = {
+            let mut guard = wb.lock_unpoisoned();
+            let chat = guard
+                .create_default_engagement("file-context-chat".into(), "File context".into())
+                .unwrap_or_else(|_| panic!("create file context chat"));
+            let path = guard.engagement_workspace_path(&chat.id, "notes.txt");
+            let engagement = guard.engagements.get(&chat.id).unwrap();
+            engagement
+                .write_file(&path, "retained private notes\n")
+                .unwrap();
+            engagement.commit_turn("retain notes").unwrap();
+            (chat.id, path)
+        };
+        let source = format!(
+            "workspace-file:{chat_id}:{}:{path}",
+            whipplescript_store::stable_hash_bytes_hex(b"retained private notes\n")
+        );
+        let claim = crate::engine::claim_turn(&chat_id).unwrap();
+        let raw = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {"messages": ["retained private notes"]},
+                "ordered_provenance": {
+                    "messages": [{"source_handles": [source], "complete": true}],
+                    "tools": {"source_handles": ["runtime"], "complete": true}
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        crate::engine::bind_turn_model_context(
+            &chat_id,
+            std::sync::Arc::new(move || Ok(raw.to_string())),
+        );
+        let read = |wb: crate::workbench_state::SharedWorkbench, id: String| async move {
+            let response = super::get_model_context(State(wb), Path(id), HeaderMap::new())
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let visible = read(wb.clone(), chat_id.clone()).await;
+        assert_eq!(
+            visible["calls"][0]["body"]["messages"][0],
+            "retained private notes"
+        );
+
+        {
+            let guard = wb.lock_unpoisoned();
+            let engagement = guard.engagements.get(&chat_id).unwrap();
+            engagement.delete_entry(&path).unwrap();
+            engagement.commit_turn("remove notes").unwrap();
+        }
+        let redacted = read(wb, chat_id).await;
+        assert_eq!(redacted["calls"][0]["redacted"], true);
+        assert!(!redacted.to_string().contains("retained private notes"));
+        drop(claim);
     }
 }
 

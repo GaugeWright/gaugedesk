@@ -5,8 +5,12 @@ version.workspace = true
 license.workspace = true
 description = "Canonical Wasm-compatible wire and signing contract for the blind account directory."
 
-[lib]
-crate-type = ["cdylib", "rlib"]
+# No `crate-type` here, deliberately. The verifier module is a cdylib, and its
+# two builds — scripts/build-wasm.sh here and gaugewright-cloud's directory
+# Worker — ask for one with `cargo rustc --crate-type cdylib`. Declared here, it
+# made cargo drop the hash from every native build of this crate, so a `cargo
+# build` and a `cargo test` overwrote each other's rlib and rebuilt everything
+# above it (DR-0234, DESK-9).
 
 [features]
 default = []

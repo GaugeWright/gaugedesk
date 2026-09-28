@@ -33,6 +33,42 @@
     margin: 0; padding: 12px 14px; background: color-mix(in srgb, var(--navy) 70%, var(--panel));
     border: 0; border-bottom: 1px solid var(--edge); }
 .gaugeapp-page-head h1 { margin: 3px 0 0; font: 400 var(--fs-title)/1.2 var(--font-chrome); }
+/* Organization identity reads as a document, with its name in the masthead.
+   The surrounding workbench pane already provides the outer frame. */
+.gaugeapp-page[data-gaugeapp-page="organization"] {
+    box-sizing: border-box; width: min(880px, calc(100% - 28px)); margin: 30px auto 48px;
+    padding: 0; border: 0; box-shadow: none;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-page-head {
+    display: block; padding: 4px 10px 26px; background: transparent; border: 0;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-page-head h1 {
+    margin-top: 9px; font-size: clamp(1.5rem, 3cqi, 2.3rem); line-height: 1.12;
+    overflow-wrap: anywhere;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-panel {
+    padding: 20px 10px 22px;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-panel::before {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 70%, transparent) 22%, var(--gold) 50%, color-mix(in srgb, var(--gold) 70%, transparent) 78%, transparent);
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-section-head {
+    padding: 0; align-items: start;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-section-head h2 {
+    font-size: 1.1rem; letter-spacing: .015em;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-identity-summary {
+    grid-template-columns: minmax(0, .7fr) minmax(0, 1.3fr); gap: 18px;
+    margin-top: 19px;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-identity-summary .gaugeapp-fact {
+    padding: 0;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-empty {
+    margin: 13px 0 0; padding: 0; line-height: 1.45;
+}
 .gaugeapp-panel { position: relative; display: grid; gap: 0; padding: 12px 14px;
     border: 0; }
 .gaugeapp-panel > * { min-width: 0; }
@@ -219,14 +255,18 @@
 .gaugeapp-one-time .gaugeapp-actions a { display: inline-flex; align-items: center; min-height: 28px; padding: 4px 9px;
     color: var(--warn); border: 1px solid var(--edge); border-radius: 2px; text-decoration: none; }
 
-.gaugeapp-menu { display: grid; align-content: start; gap: 2px; padding: 8px; }
-.gaugeapp-menu h2 { margin: 2px 4px 7px; font: 400 var(--fs-ui)/1.2 var(--font-chrome); }
-.gaugeapp-menu button { display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    width: 100%; padding: 6px 8px; background: transparent; border: 1px solid transparent;
-    border-radius: 3px; text-align: left; }
-.gaugeapp-menu button:hover { background: var(--edge); }
-.gaugeapp-menu button.active { background: color-mix(in srgb, var(--edge) 56%, transparent); border-color: var(--edge); color: var(--warn); }
-.gaugeapp-menu small { color: var(--muted); }
+.gaugeapp-menu { display: grid; align-content: start; gap: 18px; padding: 19px 13px; }
+.gaugeapp-menu-group { position: relative; display: grid; gap: 2px; padding-top: 14px; }
+.gaugeapp-menu-group::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 72%, transparent) 22%, var(--gold) 50%, color-mix(in srgb, var(--gold) 72%, transparent) 78%, transparent); }
+.gaugeapp-menu-label { padding: 0 9px 8px; color: var(--muted); font-size: var(--fs-label); letter-spacing: .1em; text-transform: uppercase; }
+.gaugeapp-menu button { display: grid; gap: 2px; width: 100%; min-height: 32px;
+    padding: 7px 9px; background: transparent; border: 0; border-left: 2px solid transparent;
+    border-radius: 0; text-align: left; }
+.gaugeapp-menu button:hover { background: color-mix(in srgb, var(--gold) 7%, transparent); }
+.gaugeapp-menu button.active { background: color-mix(in srgb, var(--gold) 9%, transparent);
+    border-left-color: var(--gold); color: var(--ink); }
+.gaugeapp-menu small { color: var(--muted); font-size: var(--fs-label); }
 
 .gaugeapp-section-stack { gap: 8px; margin-top: 10px; }
 .gaugeapp-section-head { position: relative; z-index: 1; display: flex; align-items: center;
@@ -265,6 +305,11 @@
 .gaugeapp-danger-zone { margin: 10px 8px 8px !important; padding: 10px 8px;
     background: color-mix(in srgb, var(--danger, #e88) 5%, var(--panel));
     border: 1px solid color-mix(in srgb, var(--danger, #e88) 48%, var(--edge)); }
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-danger-zone {
+    margin: 36px 0 0 !important; padding: 22px 10px;
+    background: transparent; border: 0;
+}
+.gaugeapp-page[data-gaugeapp-page="organization"] .gaugeapp-danger-zone h2 { color: var(--danger, #e88); }
 .gaugeapp-danger-zone button.danger { color: var(--danger, #e88);
     border-color: color-mix(in srgb, var(--danger, #e88) 62%, var(--edge)); }
 .gaugeapp-danger-zone button.danger:not(:disabled):hover {

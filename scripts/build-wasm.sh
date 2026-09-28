@@ -184,10 +184,17 @@ mkdir -p "$out"
 # One module per crate. Kept separate rather than merged because they load on
 # different occasions: the verifier is needed on any signed-in load, the tunnel
 # only when someone opens a relay-only Home.
+#
+# The cdylib is asked for here rather than declared in either crate's manifest.
+# A declared cdylib makes cargo drop the hash from every *native* build of the
+# crate too, so native builds with different features or profiles share one
+# rlib and rebuild each other's dependents (DR-0234). `cargo rustc` applies
+# `--crate-type` to this one library build, and still names the artifact after
+# the crate.
 build_module() {
   local crate="$1" artifact="$2" name="$3"
   shift 3
-  cargo build -p "$crate" --target wasm32-unknown-unknown "${flags[@]}" "$@"
+  cargo rustc -p "$crate" --lib --crate-type cdylib --target wasm32-unknown-unknown "${flags[@]}" "$@"
   local wasm="$target_dir/wasm32-unknown-unknown/$profile/$artifact.wasm"
   if [ ! -f "$wasm" ]; then
     # Name where it looked and why it looked there. The old message named a

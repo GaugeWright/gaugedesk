@@ -2195,14 +2195,13 @@ impl WhipHarness {
             system,
             user: ModelContentProvenance {
                 source_handles: vec![chat.clone()],
-                complete: self.user_context_complete,
+                // Turn images are separate payloads. Chat ownership alone cannot
+                // prove that an image remains readable after erasure.
+                complete: self.user_context_complete && command.input.images.is_empty(),
             },
-            world: known(vec![
-                package.clone(),
-                chat.clone(),
-                format!("workspace:{}", self.chat_id),
-            ]),
+            world: known(vec![package.clone(), chat.clone()]),
             tools: known(vec![package, chat]),
+            workspace_content: known(vec![format!("workspace:{}", self.chat_id)]),
         }
     }
 
@@ -4755,6 +4754,15 @@ workflow Method {
         task_turn
             .validate()
             .expect("tracker is a valid host resource");
+        assert!(first.initial_model_provenance(&task_turn).user.complete);
+        let mut image_turn = task_turn.clone();
+        image_turn.input.images.push(ResourceRef {
+            handle: "turn_images".to_owned(),
+            kind: "image".to_owned(),
+            selector: Some("0".to_owned()),
+            writable: None,
+        });
+        assert!(!first.initial_model_provenance(&image_turn).user.complete);
         assert!(task_turn.resources.iter().any(|resource| {
             resource.handle == "tasks" && resource.kind == "tracker" && resource.writable.is_none()
         }));

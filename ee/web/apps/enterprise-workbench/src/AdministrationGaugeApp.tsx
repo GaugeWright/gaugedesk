@@ -763,7 +763,7 @@ function OrganizationPageReady(props: {
     return <>
         <section class="gaugeapp-panel gaugeapp-section-stack">
             <div class="gaugeapp-section-head">
-                <div><h2>Organization identity</h2><p>The name shown across GaugeDesk and the authority that owns this organization.</p></div>
+                <div><h2>Identity</h2></div>
                 <div class="gaugeapp-row-actions">
                     <Show when={!editingName() && props.commands.includes("organization.display-name.set")}>
                         <button type="button" onClick={() => setEditingName(true)}>Edit name</button>
@@ -814,12 +814,12 @@ function OrganizationPageReady(props: {
 
         <section class="gaugeapp-panel gaugeapp-section-stack">
             <div class="gaugeapp-section-head">
-                <div><h2>Domains</h2><p>A verified domain may admit corporate sign-in when Enterprise Identity is configured. A domain admits nobody until its DNS proof is published and verified.</p></div>
+                <div><h2>Domains</h2><p>Verified domains can be used for corporate sign-in.</p></div>
                 <Show when={props.commands.includes("organization.domain.add") && !addingDomain()}>
                     <button type="button" onClick={() => { setAddingDomain(true); setDomain(""); setChallengeError(""); }}>Add domain</button>
                 </Show>
             </div>
-            <Show when={model().domains.length > 0} fallback={<p class="gaugeapp-empty">No domains have been added.</p>}>
+            <Show when={model().domains.length > 0} fallback={<p class="gaugeapp-empty">No domains yet. Add one to begin DNS verification.</p>}>
                 <div class="gaugeapp-domain-list">
                     <For each={model().domains}>{(entry) => <div class="gaugeapp-domain-row" data-status={entry.status}>
                         <div><strong>{entry.domain}</strong><span>{entry.status === "pending" ? "awaiting DNS proof" : "verified"}</span></div>
@@ -863,9 +863,9 @@ function OrganizationPageReady(props: {
         <Show when={props.commands.includes("organization.delete")}>
             <section class="gaugeapp-panel gaugeapp-section-stack gaugeapp-danger-zone">
                 <div class="gaugeapp-section-head">
-                    <div><h2>Delete organization</h2><p>First remove other members, end organization services and plans, close active engagements, and erase shared model connections.</p></div>
+                    <div><h2>Delete organization</h2><p>Permanent removal requires clearing the organization's active commitments.</p></div>
                     <Show when={!deletingOrganization()}>
-                        <button type="button" class="danger" onClick={() => setDeletingOrganization(true)}>Delete</button>
+                        <button type="button" class="danger" onClick={() => setDeletingOrganization(true)}>Delete organization</button>
                     </Show>
                 </div>
                 <Show when={deletingOrganization()}>
@@ -901,8 +901,8 @@ function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppS
     return <article class="gaugeapp-page" data-gaugeapp-page={page()}>
         <header class="gaugeapp-page-head">
             <div>
-                <span class="gaugeapp-eyebrow">{appLabel("administration", props.session.scope)}</span>
-                <h1>{PAGE_LABELS[page()] ?? page()}</h1>
+                <span class="gaugeapp-eyebrow">{page() === "organization" ? "Organization settings" : appLabel("administration", props.session.scope)}</span>
+                <h1>{organization()?.model?.display_name || PAGE_LABELS[page()] || page()}</h1>
             </div>
             <Show when={pageFreshnessCaveat(typedPage().freshness)}>{(caveat) => <span class="gaugeapp-freshness">{caveat()}</span>}</Show>
         </header>
@@ -4091,9 +4091,7 @@ export function createGaugeAppWorkspace(options: {
             </Show>;
             }}</Show>
         </main>;
-    const menu = () => <nav class="gaugeapp-menu" aria-label={`${APP_LABELS[options.app]} pages`}>
-            <h2>Menu</h2>
-            <For each={session()?.pages ?? []}>{(grant) => <button
+    const menuEntry = (grant: GaugeAppSession["pages"][number]) => <button
                 type="button"
                 classList={{ active: selectedPage() === grant.id }}
                 aria-current={selectedPage() === grant.id ? "page" : undefined}
@@ -4101,7 +4099,19 @@ export function createGaugeAppWorkspace(options: {
             >
                 <span>{PAGE_LABELS[grant.id] ?? grant.id}</span>
                 <Show when={pageFreshnessCaveat(grant.freshness)}>{(caveat) => <small>{caveat()}</small>}</Show>
-            </button>}</For>
+            </button>;
+    const menu = () => <nav class="gaugeapp-menu" aria-label={`${APP_LABELS[options.app]} pages`}>
+            <Show when={options.app === "administration"} fallback={<For each={session()?.pages ?? []}>{menuEntry}</For>}>
+                <div class="gaugeapp-menu-group">
+                    <For each={(session()?.pages ?? []).filter((grant) => ["organization", "plans-services", "people", "sessions", "enterprise-identity"].includes(grant.id))}>{menuEntry}</For>
+                </div>
+                <Show when={(session()?.pages ?? []).some((grant) => !["organization", "plans-services", "people", "sessions", "enterprise-identity"].includes(grant.id))}>
+                    <div class="gaugeapp-menu-group">
+                        <span class="gaugeapp-menu-label">Administration</span>
+                        <For each={(session()?.pages ?? []).filter((grant) => !["organization", "plans-services", "people", "sessions", "enterprise-identity"].includes(grant.id))}>{menuEntry}</For>
+                    </div>
+                </Show>
+            </Show>
         </nav>;
     return {
         app: options.app,

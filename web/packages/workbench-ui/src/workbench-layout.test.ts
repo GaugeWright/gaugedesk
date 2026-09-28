@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dragWorkbenchDivider, resolveWorkbenchLayout, type WorkbenchLayoutInput } from "./workbench-layout";
+import { dragWorkbenchDivider, dragWorkbenchRail, resolveWorkbenchLayout, workbenchRailResizePair, type WorkbenchLayoutInput } from "./workbench-layout";
 
 const base: WorkbenchLayoutInput = {
     width: 1200, includeFiles: true,
@@ -74,5 +74,44 @@ describe("workbench divider geometry", () => {
         expect(total(layout)).toBe(1200);
         expect(layout.files).toBe(0);
         expect(layout.filesDivider).toBe(0);
+    });
+
+    it("resizes the nearest open panes across one or more folded rails", () => {
+        for (const folded of [
+            { nav: false, chat: true, content: false, files: false },
+            { nav: false, chat: true, content: true, files: false },
+        ]) {
+            const initial = resolveWorkbenchLayout({ ...base, collapsed: folded });
+            const pair = workbenchRailResizePair(initial, folded, "chat");
+            expect(pair).toEqual(["nav", folded.content ? "files" : "content"]);
+            const next = dragWorkbenchRail(initial, folded, "chat", 40);
+            expect(total(next)).toBeCloseTo(base.width);
+            expect(next.nav).toBe(initial.nav + 40);
+            expect(next.chat).toBe(initial.chat);
+            expect(next.content).toBe(initial.content - (folded.content ? 0 : 40));
+            expect(next.files).toBe(initial.files - (folded.content ? 40 : 0));
+        }
+    });
+
+    it("keeps the rail and both open panes within their minimums", () => {
+        const folded = { nav: false, chat: false, content: true, files: false };
+        const initial = resolveWorkbenchLayout({ ...base, collapsed: folded });
+        const farLeft = dragWorkbenchRail(initial, folded, "content", -10000);
+        const farRight = dragWorkbenchRail(initial, folded, "content", 10000);
+        expect(total(farLeft)).toBeCloseTo(base.width);
+        expect(total(farRight)).toBeCloseTo(base.width);
+        expect(farLeft.chat).toBeGreaterThanOrEqual(280);
+        expect(farLeft.files).toBeGreaterThanOrEqual(150);
+        expect(farRight.chat).toBeGreaterThanOrEqual(280);
+        expect(farRight.files).toBeGreaterThanOrEqual(150);
+        expect(farLeft.content).toBe(30);
+        expect(farRight.content).toBe(30);
+    });
+
+    it("does not resize a folded rail without open panes on both sides", () => {
+        const folded = { nav: true, chat: false, content: false, files: false };
+        const initial = resolveWorkbenchLayout({ ...base, collapsed: folded });
+        expect(workbenchRailResizePair(initial, folded, "nav")).toBeNull();
+        expect(dragWorkbenchRail(initial, folded, "nav", 80)).toEqual(initial);
     });
 });

@@ -620,6 +620,8 @@ describe("project-first Home resolution (DESK-3)", () => {
         let includeNewProject = false;
         let homeGeneration = 1;
         let workRefusal: string | null = null;
+        let workRefusalStatus = 401;
+        let workRefusalOnce = false;
         const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             if (url === "https://hub.example/account/home-routes") {
@@ -681,8 +683,10 @@ describe("project-first Home resolution (DESK-3)", () => {
             const work = url.match(/^https:\/\/([abcz])\.example\/workspace$/);
             if (work) {
                 if (workRefusal) {
-                    return new Response(JSON.stringify({ error: workRefusal }), {
-                        status: 401,
+                    const reason = workRefusal;
+                    if (workRefusalOnce) workRefusal = null;
+                    return new Response(JSON.stringify({ error: reason }), {
+                        status: workRefusalStatus,
                         headers: { "content-type": "application/json" },
                     });
                 }
@@ -726,7 +730,11 @@ describe("project-first Home resolution (DESK-3)", () => {
             streamed,
             publishNewProject: () => { includeNewProject = true; },
             restartHomes: () => { homeGeneration += 1; },
-            refuseWork: (reason: string) => { workRefusal = reason; },
+            refuseWork: (reason: string, status = 401, once = false) => {
+                workRefusal = reason;
+                workRefusalStatus = status;
+                workRefusalOnce = once;
+            },
         };
     }
 
@@ -833,6 +841,16 @@ describe("project-first Home resolution (DESK-3)", () => {
         refuseWork("target Home admission required");
 
         await expect(api.getWorkspace()).rejects.toThrow(/target Home admission required/);
+        expect(admitted).toEqual(["a", "a"]);
+    });
+
+    it("re-admits when another connection replaced this Home admission", async () => {
+        const { api, admitted, refuseWork } = twoHomes();
+        api.setCurrentProject("proj-a" as never);
+        await api.getWorkspace();
+        refuseWork("Home admission does not match this Home and identity", 403, true);
+
+        await expect(api.getWorkspace()).resolves.toBeDefined();
         expect(admitted).toEqual(["a", "a"]);
     });
 

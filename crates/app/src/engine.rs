@@ -153,7 +153,7 @@ pub(crate) fn running_turn_model_context(
         .and_then(|live| live.model_context.clone())
 }
 
-fn bind_turn_model_context(id: &str, handle: gaugedesk_harness::ModelContextHandle) {
+pub(crate) fn bind_turn_model_context(id: &str, handle: gaugedesk_harness::ModelContextHandle) {
     if let Some(live) = running_turns().lock_unpoisoned().get_mut(id) {
         live.model_context = Some(handle);
     }

@@ -5,10 +5,12 @@ version.workspace = true
 license.workspace = true
 description = "Blind role-aware rendezvous and cert-pinned Home/client tunnel."
 
-# `cdylib` so the wasm32 build emits a module wasm-bindgen can process; `rlib`
-# so native dependents link it as they always have (DESK-7).
-[lib]
-crate-type = ["cdylib", "rlib"]
+# No `crate-type` here, deliberately. The browser's module is a cdylib, and
+# scripts/build-wasm.sh asks for one where it is wanted, with `cargo rustc
+# --crate-type cdylib`. Declared here, it made cargo drop the hash from every
+# native build of this crate, so each feature graph — `cargo build` against
+# `cargo test`'s `test-relay` — overwrote the same rlib and rebuilt everything
+# above it (DR-0234, DESK-9).
 
 [features]
 test-relay = []

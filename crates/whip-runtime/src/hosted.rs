@@ -931,6 +931,7 @@ fn host_turn_request(
         mode,
         chat_id,
         user_context_complete,
+        !images.is_empty(),
     );
     request["image_bodies"] = Value::Array(
         images
@@ -951,6 +952,7 @@ fn hosted_initial_model_provenance(
     mode: gaugedesk_harness::ChatMode,
     chat_id: &str,
     user_context_complete: bool,
+    has_images: bool,
 ) -> Value {
     let chat = format!("chat:{chat_id}");
     let package = if mode == gaugedesk_harness::ChatMode::Use {
@@ -968,10 +970,12 @@ fn hosted_initial_model_provenance(
         "system": known(vec![package.clone(), chat.clone()]),
         "user": {
             "source_handles": [chat.clone()],
-            "complete": user_context_complete,
+            // An attached image has an independent erasure boundary.
+            "complete": user_context_complete && !has_images,
         },
-        "world": known(vec![package.clone(), chat.clone(), format!("workspace:{chat_id}")]),
+        "world": known(vec![package.clone(), chat.clone()]),
         "tools": known(vec![package, chat]),
+        "workspace_content": known(vec![format!("workspace:{chat_id}")]),
     })
 }
 
@@ -1681,6 +1685,7 @@ mod tests {
             gaugedesk_harness::ChatMode::Use,
             "chat-one",
             false,
+            false,
         );
         assert_eq!(
             labels["system"]["source_handles"],
@@ -1688,7 +1693,11 @@ mod tests {
         );
         assert_eq!(
             labels["world"]["source_handles"],
-            json!(["package:pinned", "chat:chat-one", "workspace:chat-one"])
+            json!(["package:pinned", "chat:chat-one"])
+        );
+        assert_eq!(
+            labels["workspace_content"]["source_handles"],
+            json!(["workspace:chat-one"])
         );
         assert_eq!(labels["user"]["complete"], false);
         let edit = hosted_initial_model_provenance(
@@ -1696,11 +1705,20 @@ mod tests {
             gaugedesk_harness::ChatMode::Edit,
             "chat-one",
             true,
+            false,
         );
         assert_eq!(
             edit["system"]["source_handles"],
             json!(["runtime", "chat:chat-one"])
         );
+        let image = hosted_initial_model_provenance(
+            "pinned",
+            gaugedesk_harness::ChatMode::Use,
+            "chat-one",
+            true,
+            true,
+        );
+        assert_eq!(image["user"]["complete"], false);
     }
 
     #[derive(Debug, Default)]

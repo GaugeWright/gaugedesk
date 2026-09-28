@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
     desktopUpdateAllowed,
     desktopUpdateShouldRecheck,
+    selectedDesktopUpdatePolicy,
     DESKTOP_UPDATE_RECHECK_MS,
 } from "./desktop-update";
 
@@ -14,6 +15,19 @@ describe("desktopUpdateAllowed", () => {
     it("does not offer the stable updater outside an organization's allowed channels", () => {
         expect(desktopUpdateAllowed({ allowedChannels: ["beta", "dev"] })).toBe(false);
         expect(desktopUpdateAllowed({ allowedChannels: ["stable"] })).toBe(true);
+    });
+});
+
+describe("selectedDesktopUpdatePolicy", () => {
+    it("discovers updates for Personal while its Home is unreachable", async () => {
+        const unreachableHome = () => Promise.reject(new TypeError("Load failed"));
+        await expect(selectedDesktopUpdatePolicy({ personal: true }, unreachableHome)).resolves.toBeNull();
+        await expect(selectedDesktopUpdatePolicy({ personal: false }, unreachableHome)).rejects.toThrow("Load failed");
+    });
+
+    it("keeps an organization's channel restriction", async () => {
+        const policy = { allowedChannels: ["beta"] };
+        await expect(selectedDesktopUpdatePolicy({ personal: false }, async () => policy)).resolves.toEqual(policy);
     });
 });
 

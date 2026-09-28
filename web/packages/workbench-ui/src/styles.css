@@ -893,7 +893,13 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* The folded rail: a thin, full-height click target with an outward chevron and a
    vertical label. The whole rail expands the panel — a generous affordance. */
 .panel.rail { padding: 0; cursor: pointer; display: flex; flex-direction: column; align-items: center;
-    gap: 8px; padding-top: 8px; color: var(--muted); overflow: hidden; }
+    gap: 8px; padding-top: 8px; color: var(--muted); overflow: hidden;
+    border-inline: 1px solid var(--gold); box-shadow: none; }
+/* Two folded panes share one boundary rather than drawing a doubled stroke. */
+.panel.rail + .panel.rail,
+.panel.rail + .resizer.disabled + .panel.rail { border-inline-start: 0; }
+.panel.rail.rail-resizable { cursor: col-resize; touch-action: none; }
+.panel.rail.dragging { color: var(--gold); }
 .panel.rail:hover { background: var(--edge); color: var(--accent); }
 .rail-chevron { font-size: var(--fs-title); line-height: 1; }
 .rail-label { writing-mode: vertical-rl; text-orientation: mixed; text-transform: uppercase;

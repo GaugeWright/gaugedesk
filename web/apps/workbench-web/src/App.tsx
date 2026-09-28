@@ -73,7 +73,7 @@ import {
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
-import { desktopUpdateAllowed, desktopUpdateShouldRecheck, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
+import { desktopUpdateAllowed, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
 import "@gaugewright/gw-embed";
 import {
@@ -285,6 +285,8 @@ export interface WorkbenchAppProps {
 export interface WorkbenchGaugeApps {
     /** True only while one admitted GaugeApp is selected. */
     readonly active: Accessor<boolean>;
+    /** Account-authoritative tenant selection, including Personal's policy-free scope. */
+    readonly selectedTenant: Accessor<{ readonly id: string; readonly personal: boolean } | null>;
     /** Person-scoped pages flattened into the existing account menu. */
     readonly accountActions: Accessor<readonly SettingsGaugeAppAction[]>;
     /** Identity projected by the admitted account authority, independent of Home login. */
@@ -437,6 +439,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         readonly update?: import("@tauri-apps/plugin-updater").Update;
     } | null>(isTauri() ? { kind: "checking" } : null);
 
+    const selectedSoftwareUpdatePolicy = () =>
+        selectedDesktopUpdatePolicy(props.gaugeApps?.selectedTenant(), () => api.softwareUpdatePolicy());
+
     /** `announce` states the check in the interface. A check a person asked for
      * says so; the recheck timer's does not, because a footer that announces
      * itself every few hours is reporting the timer rather than the release. */
@@ -445,7 +450,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (announce) setDesktopUpdate({ kind: "checking" });
         try {
             const [policy, updater] = await Promise.all([
-                api.softwareUpdatePolicy(),
+                selectedSoftwareUpdatePolicy(),
                 import("@tauri-apps/plugin-updater"),
             ]);
             const update = await updater.check();
@@ -474,7 +479,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         try {
             // Re-read policy at the moment of installation: a stale discovery
             // result must never outlive a newly tightened organization ceiling.
-            if (!desktopUpdateAllowed(await api.softwareUpdatePolicy())) {
+            if (!desktopUpdateAllowed(await selectedSoftwareUpdatePolicy())) {
                 await candidate.update.close();
                 setDesktopUpdate({ kind: "restricted", version: candidate.version });
                 return;
@@ -488,7 +493,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     }
 
     if (isTauri()) {
-        void checkDesktopUpdate();
+        // The account membership arrives after the shell mounts. Wait for its
+        // authoritative Personal flag before asking a Home for organization
+        // policy; re-evaluate if the selected organization changes.
+        createEffect(on(() => props.gaugeApps?.selectedTenant(), (selected) => {
+            if (props.gaugeApps && !selected) return;
+            void checkDesktopUpdate(false);
+        }));
         // The startup check alone answers with whatever was published before this
         // window opened, and a desktop client stays open for days. See
         // `DESKTOP_UPDATE_RECHECK_MS` for why discovery is a timer at all.
@@ -1532,6 +1543,21 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             chatSelected: selected() !== null,
             fileSelected: selectedFile() !== null,
         }),
+    });
+    // Give management pages the reading width while their conversation is idle.
+    // The chat rail remains one click away, and ordinary Work gets its prior
+    // layout back when the GaugeApp closes.
+    let chatBeforeGaugeApp: boolean | undefined;
+    createEffect(() => {
+        if (props.gaugeApps?.active()) {
+            if (chatBeforeGaugeApp === undefined) {
+                chatBeforeGaugeApp = workbenchShell.collapsed("chat");
+                workbenchShell.setCollapsed("chat", true);
+            }
+        } else if (chatBeforeGaugeApp !== undefined) {
+            if (workbenchShell.collapsed("chat")) workbenchShell.setCollapsed("chat", chatBeforeGaugeApp);
+            chatBeforeGaugeApp = undefined;
+        }
     });
     const [showShelf, setShowShelf] = createSignal(false);
     // Browser imports open native OS pickers via these hidden
