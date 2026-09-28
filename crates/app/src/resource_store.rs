@@ -1451,7 +1451,11 @@ pub(crate) async fn get_resource_content(
             Some(Ok(entries)) => {
                 let manifest = entries
                     .into_iter()
-                    .filter(|e| !e.is_dir && is_target_payload_path(&e.path))
+                    .filter(|e| {
+                        !e.is_dir
+                            && is_target_payload_path(&e.path)
+                            && !wb.installed_method_read_requires_grant(&id, &e.path)
+                    })
                     .map(|e| e.path)
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -1770,7 +1774,11 @@ pub(crate) async fn post_resource_export_to_disk(
             None => return (StatusCode::NOT_FOUND, "no such engagement").into_response(),
             Some(Ok(entries)) => entries
                 .into_iter()
-                .filter(|e| !e.is_dir && is_target_payload_path(&e.path))
+                .filter(|e| {
+                    !e.is_dir
+                        && is_target_payload_path(&e.path)
+                        && !wb.installed_method_read_requires_grant(&id, &e.path)
+                })
                 .map(|e| e.path)
                 .collect(),
             Some(Err(e)) => {

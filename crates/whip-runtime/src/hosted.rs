@@ -17,10 +17,10 @@ use gaugedesk_harness::{
 use serde_json::{json, Value};
 
 use super::{
-    validate_workspace_targets, workspace_resource_refs, AuthoredAgentPackage, CredentialRef,
-    EventPosition, ForkInstanceCommand, OpenInstanceCommand, PolicyEpochRef, ProviderBindingRef,
-    ResourceRef, StartTurnCommand, TurnInput, WhipHarnessFactory, HOST_PROTOCOL,
-    TARGET_MANIFEST_SELECTOR,
+    live_turn_image_source, validate_workspace_targets, workspace_resource_refs,
+    AuthoredAgentPackage, CredentialRef, EventPosition, ForkInstanceCommand, OpenInstanceCommand,
+    PolicyEpochRef, ProviderBindingRef, ResourceRef, StartTurnCommand, TurnInput,
+    WhipHarnessFactory, HOST_PROTOCOL, TARGET_MANIFEST_SELECTOR,
 };
 
 const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -930,8 +930,8 @@ fn host_turn_request(
         &command.package_version_ref,
         mode,
         chat_id,
-        user_context_complete,
-        !images.is_empty(),
+        user_context_complete && command.input.images.len() == images.len(),
+        images,
     );
     request["image_bodies"] = Value::Array(
         images
@@ -952,7 +952,7 @@ fn hosted_initial_model_provenance(
     mode: gaugedesk_harness::ChatMode,
     chat_id: &str,
     user_context_complete: bool,
-    has_images: bool,
+    images: &[ImageContent],
 ) -> Value {
     let chat = format!("chat:{chat_id}");
     let package = if mode == gaugedesk_harness::ChatMode::Use {
@@ -966,12 +966,19 @@ fn hosted_initial_model_provenance(
             "complete": true,
         })
     };
+    let image_sources = images
+        .iter()
+        .map(|image| live_turn_image_source(chat_id, image))
+        .collect::<Option<Vec<_>>>();
+    let mut user_sources = vec![chat.clone()];
+    if let Some(sources) = image_sources.as_ref() {
+        user_sources.extend(sources.iter().cloned());
+    }
     json!({
         "system": known(vec![package.clone(), chat.clone()]),
         "user": {
-            "source_handles": [chat.clone()],
-            // An attached image has an independent erasure boundary.
-            "complete": user_context_complete && !has_images,
+            "source_handles": user_sources,
+            "complete": user_context_complete && image_sources.is_some(),
         },
         "world": known(vec![package.clone(), chat.clone()]),
         "tools": known(vec![package, chat]),
@@ -1685,7 +1692,7 @@ mod tests {
             gaugedesk_harness::ChatMode::Use,
             "chat-one",
             false,
-            false,
+            &[],
         );
         assert_eq!(
             labels["system"]["source_handles"],
@@ -1705,20 +1712,53 @@ mod tests {
             gaugedesk_harness::ChatMode::Edit,
             "chat-one",
             true,
-            false,
+            &[],
         );
         assert_eq!(
             edit["system"]["source_handles"],
             json!(["runtime", "chat:chat-one"])
         );
+        let image_body = ImageContent {
+            kind: gaugedesk_harness::ImageKind::Image,
+            data: "aW1hZ2U=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        };
         let image = hosted_initial_model_provenance(
             "pinned",
             gaugedesk_harness::ChatMode::Use,
             "chat-one",
             true,
-            true,
+            std::slice::from_ref(&image_body),
         );
-        assert_eq!(image["user"]["complete"], false);
+        assert_eq!(image["user"]["complete"], true);
+        assert_eq!(
+            image["user"]["source_handles"][1],
+            live_turn_image_source("chat-one", &image_body).unwrap()
+        );
+        assert_ne!(
+            live_turn_image_source("chat-one", &image_body),
+            live_turn_image_source(
+                "chat-one",
+                &ImageContent {
+                    mime_type: "image/jpeg".to_owned(),
+                    ..image_body.clone()
+                }
+            )
+        );
+        let malformed = ImageContent {
+            data: "not base64".to_owned(),
+            ..image_body
+        };
+        assert_eq!(
+            hosted_initial_model_provenance(
+                "pinned",
+                gaugedesk_harness::ChatMode::Use,
+                "chat-one",
+                true,
+                &[malformed]
+            )["user"]["complete"],
+            false
+        );
     }
 
     #[derive(Debug, Default)]

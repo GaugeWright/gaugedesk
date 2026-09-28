@@ -52,6 +52,12 @@ struct LiveTurn {
     /// stretch a person presses Stop in, having just changed their mind.
     interrupt: Option<InterruptHandle>,
     model_context: Option<gaugedesk_harness::ModelContextHandle>,
+    /// Fingerprints of the submitted image bytes still held by this turn.
+    /// The registry drops them with the turn and never stores the image body.
+    image_sources: BTreeSet<String>,
+    /// Verified submitter of this turn's image input. A shared chat's owner
+    /// cannot inherit another person's image source merely by owning the chat.
+    image_submitter: Option<String>,
     /// Whether a Stop was asked for. Recorded against the *claim*, which exists
     /// for the whole turn, rather than against the handle, which does not: an
     /// intent that outlives the moment it arrived in is honoured by whichever
@@ -157,6 +163,41 @@ pub(crate) fn bind_turn_model_context(id: &str, handle: gaugedesk_harness::Model
     if let Some(live) = running_turns().lock_unpoisoned().get_mut(id) {
         live.model_context = Some(handle);
     }
+}
+
+pub(crate) fn bind_turn_image_sources(id: &str, images: &[ImageContent]) {
+    let sources = images
+        .iter()
+        .map(|image| gaugedesk_whip_runtime::live_turn_image_source(id, image))
+        .collect::<Option<BTreeSet<_>>>()
+        .unwrap_or_default();
+    if let Some(live) = running_turns().lock_unpoisoned().get_mut(id) {
+        live.image_sources = sources;
+    }
+}
+
+pub(crate) fn bind_turn_image_submitter(
+    id: &str,
+    actor: Option<&gaugedesk_core::ids::AuthorityId>,
+) {
+    if let Some(live) = running_turns().lock_unpoisoned().get_mut(id) {
+        live.image_submitter = actor.map(|actor| actor.as_str().to_owned());
+    }
+}
+
+pub(crate) fn running_turn_has_image_source(
+    id: &str,
+    source: &str,
+    required_submitter: Option<&str>,
+) -> bool {
+    running_turns()
+        .lock_unpoisoned()
+        .get(id)
+        .is_some_and(|live| {
+            live.image_sources.contains(source)
+                && required_submitter
+                    .is_none_or(|actor| live.image_submitter.as_deref() == Some(actor))
+        })
 }
 
 /// Record that this chat's live turn is to be stopped, and hand back its
@@ -1750,6 +1791,7 @@ pub fn run_engagement_turn(
     let Some(claim) = claim_turn(id) else {
         return Err(EngineError::AlreadyRunning);
     };
+    bind_turn_image_sources(id, input.images);
     let mut result = run_claimed_engagement_turn(wb, id, worktree, sender, input)?;
     drop(claim);
     if let Some(intent) = result.auto_title.take() {
@@ -1825,6 +1867,10 @@ fn run_claimed_engagement_turn(
     let task_action_context = authenticated_context.cloned().or_else(|| {
         account_bearer.and_then(|bearer| wb.lock_unpoisoned().authenticate_action_context(bearer))
     });
+    bind_turn_image_submitter(
+        id,
+        authenticated_actor.or_else(|| task_action_context.as_ref().map(|context| context.actor())),
+    );
     // A protected-commercial placement releases its owner-authorized package
     // only for this turn. The TempDir guard remains live through the harness
     // call and erases the material on every return path.

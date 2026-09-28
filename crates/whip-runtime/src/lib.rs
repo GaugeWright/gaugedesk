@@ -788,7 +788,10 @@ fn post_json_value(
         .map_err(|_| organization_transport("organization model authority response is malformed"))
 }
 
-struct OrganizationModelHostDriver<'a>(&'a OrganizationModelBrokerConfig);
+struct OrganizationModelHostDriver<'a> {
+    broker: &'a OrganizationModelBrokerConfig,
+    capture: Arc<Mutex<NativeModelContext>>,
+}
 
 impl whipplescript_kernel::sansio::HostDriver for OrganizationModelHostDriver<'_> {
     fn fulfill(
@@ -796,7 +799,17 @@ impl whipplescript_kernel::sansio::HostDriver for OrganizationModelHostDriver<'_
         request: &whipplescript_kernel::sansio::IoRequest,
     ) -> whipplescript_kernel::sansio::IoResult {
         let whipplescript_kernel::sansio::IoRequest::Http(request) = request;
-        whipplescript_kernel::sansio::IoResult::Http(self.0.fetch(request))
+        // Only a model request has this label. Other HTTP effects use the
+        // same driver but are not provider calls. Capture the provider JSON
+        // before the broker adds its credential; neither the broker envelope
+        // nor transport headers enter the live view.
+        if let Some(provenance) = request.model_provenance.as_ref() {
+            self.capture
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .observe(&request.body, Some(provenance));
+        }
+        whipplescript_kernel::sansio::IoResult::Http(self.broker.fetch(request))
     }
 }
 
@@ -1880,6 +1893,26 @@ struct WhipHarness {
 
 const NATIVE_MODEL_CONTEXT_LIMIT: usize = 8 * 1024 * 1024;
 
+/// Identity of one image still held by this chat's live, submitted turn. The
+/// source handle carries no bytes and grants nothing on its own; the viewer
+/// must find it in the current turn and recheck the chat's reader.
+pub fn live_turn_image_source(chat_id: &str, image: &ImageContent) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&image.data)
+        .ok()?;
+    let mut digest = Sha256::new();
+    digest.update(b"gaugedesk:live-turn-image:v1");
+    digest.update((image.mime_type.len() as u64).to_be_bytes());
+    digest.update(image.mime_type.as_bytes());
+    digest.update(bytes);
+    Some(format!(
+        "turn-image:{chat_id}:{}",
+        hex::encode(digest.finalize())
+    ))
+}
+
 #[derive(Default)]
 struct NativeModelContext {
     active: bool,
@@ -2032,7 +2065,7 @@ impl Harness for WhipHarness {
         // turn is an ordinary turn; an agent that needs a person files a task
         // and the answer arrives as the next turn's context.
         self.install_cancellation(&command);
-        let _native_context_guard = if self.organization_model_broker.is_none() {
+        let _native_context_guard = {
             let mut state = self
                 .native_model_context
                 .lock()
@@ -2041,11 +2074,7 @@ impl Harness for WhipHarness {
                 active: true,
                 ..NativeModelContext::default()
             };
-            Some(ActiveNativeModelContext(Arc::clone(
-                &self.native_model_context,
-            )))
-        } else {
-            None
+            ActiveNativeModelContext(Arc::clone(&self.native_model_context))
         };
         let package = ProjectTaskPackage {
             inner: &self.package,
@@ -2054,14 +2083,18 @@ impl Harness for WhipHarness {
                 .as_ref()
                 .map_or_else(Vec::new, |filer| filer.assignable_recipients()),
         };
-        let model_provenance = self.initial_model_provenance(&command);
+        let model_provenance = self.initial_model_provenance(&command, images);
         let execution = match &self.organization_model_broker {
-            Some(broker) => self.runtime.run_turn_with_driver(
+            Some(broker) => self.runtime.run_turn_with_driver_and_provenance(
                 &command,
                 &package,
                 &self.provider,
                 &resources,
-                &OrganizationModelHostDriver(broker),
+                &OrganizationModelHostDriver {
+                    broker,
+                    capture: Arc::clone(&self.native_model_context),
+                },
+                &model_provenance,
             ),
             None => {
                 let capture = Arc::clone(&self.native_model_context);
@@ -2145,9 +2178,6 @@ impl Harness for WhipHarness {
     }
 
     fn model_context_handle(&self) -> Option<ModelContextHandle> {
-        if self.organization_model_broker.is_some() {
-            return None;
-        }
         let capture = Arc::clone(&self.native_model_context);
         Some(Arc::new(move || {
             let state = capture
@@ -2169,7 +2199,11 @@ impl Harness for WhipHarness {
 }
 
 impl WhipHarness {
-    fn initial_model_provenance(&self, command: &StartTurnCommand) -> InitialModelProvenance {
+    fn initial_model_provenance(
+        &self,
+        command: &StartTurnCommand,
+        images: &[ImageContent],
+    ) -> InitialModelProvenance {
         let chat = format!("chat:{}", self.chat_id);
         let package = if self.mode == gaugedesk_harness::ChatMode::Use {
             format!("package:{}", command.package_version_ref)
@@ -2191,14 +2225,19 @@ impl WhipHarness {
         if !skills_known_empty {
             system.complete = false;
         }
+        let image_sources = images
+            .iter()
+            .map(|image| live_turn_image_source(&self.chat_id, image))
+            .collect::<Option<Vec<_>>>();
+        let images_known = command.input.images.len() == images.len() && image_sources.is_some();
+        let mut user = known(vec![chat.clone()]);
+        if let Some(sources) = image_sources {
+            user.source_handles.extend(sources);
+        }
+        user.complete = self.user_context_complete && images_known;
         InitialModelProvenance {
             system,
-            user: ModelContentProvenance {
-                source_handles: vec![chat.clone()],
-                // Turn images are separate payloads. Chat ownership alone cannot
-                // prove that an image remains readable after erasure.
-                complete: self.user_context_complete && command.input.images.is_empty(),
-            },
+            user,
             world: known(vec![package.clone(), chat.clone()]),
             tools: known(vec![package, chat]),
             workspace_content: known(vec![format!("workspace:{}", self.chat_id)]),
@@ -3110,16 +3149,29 @@ impl ResourceResolver for TurnResources<'_> {
                 source_handles: vec!["runtime".to_owned()],
                 complete: true,
             }
-        } else if call.name == "read" {
+        } else if matches!(call.name.as_str(), "read" | "grep") {
             // The resolver witnessed the exact full file bytes for this call.
-            // A failed read has no witness and stays under the coarse source,
-            // which the viewer cannot authorize as an individual retained cut.
+            // A directory grep carries the searched root and every traversed
+            // file, including negative matches. An incomplete scan falls back
+            // to the coarse source, which cannot authorize an individual cut.
             if let Some(witness) = self.workspace.take_model_read_witness(&call.id) {
                 ModelContentProvenance {
                     source_handles: vec![format!(
                         "workspace-file:{}:{}:{}",
                         self.chat_id, witness.content_hash, witness.path
                     )],
+                    complete: true,
+                }
+            } else if let Some(scan) = self.workspace.take_model_scan_witness(&call.id) {
+                let mut handles = vec![format!("workspace-dir:{}:{}", self.chat_id, scan.root)];
+                handles.extend(scan.files.into_iter().map(|file| {
+                    format!(
+                        "workspace-file:{}:{}:{}",
+                        self.chat_id, file.content_hash, file.path
+                    )
+                }));
+                ModelContentProvenance {
+                    source_handles: handles,
                     complete: true,
                 }
             } else {
@@ -3130,7 +3182,7 @@ impl ResourceResolver for TurnResources<'_> {
             }
         } else if matches!(
             call.name.as_str(),
-            "write" | "edit" | "ls" | "find" | "grep" | "bash"
+            "write" | "edit" | "ls" | "find" | "bash"
         ) {
             // These tools may combine several workspace sources. Keep the
             // coarse label until they can attest exact file cuts too.
@@ -3702,7 +3754,7 @@ mod tests {
     }
 
     #[test]
-    fn native_read_result_uses_its_own_file_witness() {
+    fn native_read_and_single_file_grep_use_their_own_file_witness() {
         use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
 
         let root = tempfile::tempdir().unwrap();
@@ -3762,6 +3814,39 @@ mod tests {
             vec!["workspace:test-chat".to_owned()],
             "a witness is consumed only once"
         );
+        let grep = |id: &str, path: &str| super::ToolCall {
+            id: id.into(),
+            name: "grep".into(),
+            arguments: serde_json::json!({"path": path, "pattern": "first"}),
+        };
+        let single = grep("single", "targets/t-one/first.txt");
+        let directory = grep("directory", "targets/t-one");
+        resources.execute_tool(&admitted, &single).unwrap();
+        resources.execute_tool(&admitted, &directory).unwrap();
+        assert_eq!(
+            resources
+                .model_output_provenance(&admitted, &single)
+                .source_handles,
+            vec![format!(
+                "workspace-file:test-chat:{}:targets/t-one/first.txt",
+                whipplescript_store::stable_hash_bytes_hex(b"first\n")
+            )]
+        );
+        let scan = resources.model_output_provenance(&admitted, &directory);
+        assert_eq!(scan.source_handles.len(), 3);
+        assert!(scan
+            .source_handles
+            .contains(&"workspace-dir:test-chat:targets/t-one".to_owned()));
+        for (name, bytes) in [
+            ("first.txt", &b"first\n"[..]),
+            ("second.txt", &b"second\n"[..]),
+        ] {
+            assert!(scan.source_handles.contains(&format!(
+                "workspace-file:test-chat:{}:targets/t-one/{name}",
+                whipplescript_store::stable_hash_bytes_hex(bytes)
+            )));
+        }
+        assert!(scan.complete);
     }
 
     #[test]
@@ -4232,6 +4317,10 @@ mod tests {
             coerce_native::CoerceProvider,
             harness_loop::{ChatMessage, HttpModelClient},
             harness_model::MessagesApiClient,
+            sansio::{
+                HostDriver as _, IoRequest, IoResult, ModelContentProvenance,
+                ModelRequestProvenance,
+            },
         };
 
         fn read_request(
@@ -4298,13 +4387,23 @@ mod tests {
             None,
             None,
         );
-        let request = client.build_request(
+        let mut request = client.build_request(
             &[ChatMessage::User {
                 text: "private project prompt".to_owned(),
                 images: Vec::new(),
             }],
             &[],
         );
+        request.model_provenance = Some(ModelRequestProvenance {
+            messages: vec![ModelContentProvenance {
+                source_handles: vec!["chat:one".to_owned()],
+                complete: true,
+            }],
+            tools: ModelContentProvenance {
+                source_handles: vec!["runtime".to_owned()],
+                complete: true,
+            },
+        });
         let expected_request = request.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -4385,9 +4484,28 @@ mod tests {
             binding,
         )
         .unwrap();
-        let response = broker.fetch(&request).unwrap();
+        let capture = Arc::new(Mutex::new(NativeModelContext {
+            active: true,
+            ..NativeModelContext::default()
+        }));
+        let driver = OrganizationModelHostDriver {
+            broker: &broker,
+            capture: Arc::clone(&capture),
+        };
+        let expected_body = request.body.clone();
+        let IoResult::Http(Ok(response)) = driver.fulfill(&IoRequest::Http(request)) else {
+            panic!("broker response");
+        };
         assert_eq!(response.status, 200);
         assert_eq!(response.body["output_text"], "answer");
+        let snapshot = &capture.lock().unwrap().calls[0];
+        assert_eq!(snapshot["body"], expected_body);
+        assert_eq!(
+            snapshot["ordered_provenance"]["messages"][0]["source_handles"][0],
+            "chat:one"
+        );
+        assert_eq!(snapshot["provenance_complete"], true);
+        assert!(snapshot["body"].get("headers").is_none());
         server.join().unwrap();
     }
 
@@ -4834,7 +4952,12 @@ workflow Method {
         task_turn
             .validate()
             .expect("tracker is a valid host resource");
-        assert!(first.initial_model_provenance(&task_turn).user.complete);
+        assert!(
+            first
+                .initial_model_provenance(&task_turn, &[])
+                .user
+                .complete
+        );
         let mut image_turn = task_turn.clone();
         image_turn.input.images.push(ResourceRef {
             handle: "turn_images".to_owned(),
@@ -4842,7 +4965,24 @@ workflow Method {
             selector: Some("0".to_owned()),
             writable: None,
         });
-        assert!(!first.initial_model_provenance(&image_turn).user.complete);
+        assert!(
+            !first
+                .initial_model_provenance(&image_turn, &[])
+                .user
+                .complete
+        );
+        let image_body = ImageContent {
+            kind: gaugedesk_harness::ImageKind::Image,
+            data: "aW1hZ2U=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        };
+        let image_sources =
+            first.initial_model_provenance(&image_turn, std::slice::from_ref(&image_body));
+        assert!(image_sources.user.complete);
+        assert_eq!(
+            image_sources.user.source_handles[1],
+            live_turn_image_source("chat-1", &image_body).unwrap()
+        );
         assert!(task_turn.resources.iter().any(|resource| {
             resource.handle == "tasks" && resource.kind == "tracker" && resource.writable.is_none()
         }));
