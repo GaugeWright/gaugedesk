@@ -1,10 +1,10 @@
 {
   "schema": "gaugedesk.whipplescript_host_action_pin.v1",
   "source_repository": "https://github.com/GaugeWright/whipplescript-src",
-  "source_commit": "968e475e0fcf7595d58b2346274356c1dfc63c07",
-  "source_pull_request": 767,
+  "source_commit": "742e624c3a4e3df157d6cf227c50e97e961a3d36",
+  "source_pull_request": 761,
   "public_repository": "https://github.com/GaugeWright/whipplescript.git",
-  "public_commit": "dbf8b1b4ad0e774729616e9174f88df005c737f4",
+  "public_commit": "0f6d863387ee84d3040d4164573515fed6ec6525",
   "contract_path": "spec/host-action-contract-v4.json",
   "contract_revision": "whipplescript-host-action/v4.0.0",
   "contract_digest": "b468641c9ccb6d41482c2f9c5a2c5f49258611a90fd9776dec87c39546d06370"
