@@ -524,7 +524,12 @@ mod tests {
                 "body": {"messages": ["alice answered: east"]},
                 "ordered_provenance": {
                     "messages": [{"source_handles": [source], "complete": true}],
-                    "tools": {"source_handles": ["runtime"], "complete": true}
+                    "tools": {"source_handles": ["runtime"], "complete": true},
+                    "wire": {
+                        "format": "open-ai-chat-compat",
+                        "items": [{"source_handles": [source], "complete": true}],
+                        "system": null
+                    }
                 },
                 "provenance_complete": true
             }],

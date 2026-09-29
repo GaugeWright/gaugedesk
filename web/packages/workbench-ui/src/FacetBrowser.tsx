@@ -966,6 +966,9 @@ export function FacetBrowser(props: {
             onBlur={() => void commitEdit()}
             onClick={(ev) => ev.stopPropagation()}
             onKeyDown={(ev) => {
+                // The project tree item uses Space and Enter to open itself.
+                // Keep typing in the inline editor from triggering that row.
+                ev.stopPropagation();
                 if (ev.key === "Enter") commitEdit();
                 if (ev.key === "Escape") setEditing(null);
             }}

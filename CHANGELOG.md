@@ -21,7 +21,8 @@ Releases up to and including 0.4.30 are recorded on the
 
 - Raw context keeps authorized provider input items visible when another input
   is hidden, marking the hidden item's role in place. Unknown wire shapes hide
-  the whole call, and unmapped request fields are omitted from partial views.
+  the whole call even when every logical source is readable, and unmapped
+  request fields are omitted from partial views.
 - Account-backed Raw context and Files reads now check a reader-specific grant
   against each new context import's exact file binding. Source owners can
   approve requests in the Context sources panel; old and ambiguous imports

@@ -604,7 +604,12 @@ mod tests {
                 "body": {"messages": ["private Agent method"]},
                 "ordered_provenance": {
                     "messages": [{"source_handles": [format!("package:{package_ref}")], "complete": true}],
-                    "tools": {"source_handles": ["runtime"], "complete": true}
+                    "tools": {"source_handles": ["runtime"], "complete": true},
+                    "wire": {
+                        "format": "open-ai-chat-compat",
+                        "items": [{"source_handles": [format!("package:{package_ref}")], "complete": true}],
+                        "system": null
+                    }
                 },
                 "provenance_complete": true
             }],

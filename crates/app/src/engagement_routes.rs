@@ -1990,9 +1990,10 @@ fn project_model_context(
                 })
             })
         });
-        if fully_authorized
-            && (wire.is_none() || partial.as_ref().is_some_and(|(_, redacted)| !redacted))
-        {
+        // Logical labels do not prove that a custom provider put only those
+        // inputs in its request. Release the whole body only after the exact
+        // wire planes have also been matched to those labels.
+        if fully_authorized && partial.as_ref().is_some_and(|(_, redacted)| !redacted) {
             projected.push(serde_json::json!({ "ordinal": ordinal, "body": body }));
         } else if let Some((body, true)) = partial {
             projected.push(serde_json::json!({
@@ -2261,6 +2262,27 @@ mod raw_model_context_tests {
         response::IntoResponse,
     };
 
+    fn mapped_chat_request(mut view: serde_json::Value) -> serde_json::Value {
+        for call in view["calls"].as_array_mut().expect("calls") {
+            let labels = call["ordered_provenance"]["messages"]
+                .as_array()
+                .expect("logical labels")
+                .clone();
+            assert_eq!(
+                call["body"]["messages"]
+                    .as_array()
+                    .expect("wire inputs")
+                    .len(),
+                labels.len()
+            );
+            assert!(call["ordered_provenance"].get("wire").is_none());
+            call["ordered_provenance"]["wire"] = serde_json::json!({
+                "format": "open-ai-chat-compat", "items": labels, "system": null
+            });
+        }
+        view
+    }
+
     #[tokio::test]
     async fn frozen_skill_requires_exact_body_and_current_method_access() {
         let root = tempfile::tempdir().unwrap();
@@ -2343,7 +2365,7 @@ mod raw_model_context_tests {
             (chat.id, discipline_root, source)
         };
         let turn_claim = crate::engine::claim_turn(&chat_id).unwrap();
-        let raw = serde_json::json!({
+        let raw = mapped_chat_request(serde_json::json!({
             "calls": [{
                 "ordinal": 0,
                 "body": {"messages": ["skill body entered the model"]},
@@ -2354,7 +2376,7 @@ mod raw_model_context_tests {
                 "provenance_complete": true
             }],
             "incomplete": false
-        });
+        }));
         crate::engine::bind_turn_model_context(
             &chat_id,
             std::sync::Arc::new(move || Ok(raw.to_string())),
@@ -2403,6 +2425,31 @@ mod raw_model_context_tests {
     }
 
     #[test]
+    fn logical_labels_without_a_wire_map_cannot_release_a_custom_provider_body() {
+        let view = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {
+                    "messages": [{"role": "user", "content": "visible question"}],
+                    "future_input": "unclassified private instruction"
+                },
+                "ordered_provenance": {
+                    "messages": [{"source_handles": ["chat:one"], "complete": true}],
+                    "tools": {"source_handles": ["runtime"], "complete": true}
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        let projected = project_model_context(&view, |_| true).unwrap();
+        assert_eq!(projected["calls"][0]["redacted"], true);
+        assert!(projected["calls"][0].get("body").is_none());
+        assert!(!projected
+            .to_string()
+            .contains("unclassified private instruction"));
+    }
+
+    #[test]
     fn malformed_capture_is_refused() {
         let view = serde_json::json!({"calls": [{"body": "secret"}], "incomplete": false});
         assert!(project_model_context(&view, |_| true).is_err());
@@ -2410,7 +2457,7 @@ mod raw_model_context_tests {
 
     #[test]
     fn release_requires_current_access_to_every_labeled_source() {
-        let view = serde_json::json!({
+        let view = mapped_chat_request(serde_json::json!({
             "calls": [{
                 "ordinal": 0,
                 "body": {"messages": ["private method", "user prompt"]},
@@ -2425,7 +2472,7 @@ mod raw_model_context_tests {
                 "secret_metadata": "must not leave"
             }],
             "incomplete": false
-        });
+        }));
         let visible = project_model_context(&view, |_| true).unwrap();
         assert_eq!(visible["calls"][0]["body"], view["calls"][0]["body"]);
 
@@ -2691,7 +2738,7 @@ mod raw_model_context_tests {
 
     #[test]
     fn workspace_result_redacts_only_its_call_after_an_authorized_world_state() {
-        let view = serde_json::json!({
+        let view = mapped_chat_request(serde_json::json!({
             "calls": [
                 {
                     "ordinal": 0,
@@ -2719,7 +2766,7 @@ mod raw_model_context_tests {
                 }
             ],
             "incomplete": false
-        });
+        }));
         let projected = project_model_context(&view, |source| source != "workspace:one").unwrap();
         assert_eq!(projected["calls"][0]["body"], view["calls"][0]["body"]);
         assert_eq!(projected["calls"][1]["ordinal"], 1);
@@ -2870,7 +2917,7 @@ mod raw_model_context_tests {
             &chat.id,
             &negative_source
         ));
-        let view = serde_json::json!({
+        let view = mapped_chat_request(serde_json::json!({
             "calls": [{
                 "ordinal": 0,
                 "body": {"messages": ["matched.txt:1:found"]},
@@ -2881,7 +2928,7 @@ mod raw_model_context_tests {
                 "provenance_complete": true
             }],
             "incomplete": false
-        });
+        }));
         let project = |wb: &Workbench| {
             project_model_context(&view, |source| {
                 source == "runtime"
@@ -2925,7 +2972,7 @@ mod raw_model_context_tests {
             &chat.id,
             &child_source
         ));
-        let view = serde_json::json!({
+        let view = mapped_chat_request(serde_json::json!({
             "calls": [{
                 "ordinal": 0,
                 "body": {"messages": ["child/"]},
@@ -2936,7 +2983,7 @@ mod raw_model_context_tests {
                 "provenance_complete": true
             }],
             "incomplete": false
-        });
+        }));
         let project = |wb: &Workbench| {
             project_model_context(&view, |source| {
                 source == "runtime" || current_workspace_directory_source(wb, &chat.id, source)
@@ -3068,7 +3115,7 @@ mod raw_model_context_tests {
         };
         let image_source =
             gaugedesk_whip_runtime::live_turn_image_source("raw-context-chat", &image).unwrap();
-        let raw = serde_json::json!({
+        let raw = mapped_chat_request(serde_json::json!({
             "calls": [
                 {
                     "ordinal": 0,
@@ -3099,7 +3146,7 @@ mod raw_model_context_tests {
                 }
             ],
             "incomplete": false
-        });
+        }));
         crate::engine::bind_turn_model_context(
             "raw-context-chat",
             std::sync::Arc::new(move || Ok(raw.to_string())),
@@ -3209,10 +3256,10 @@ mod raw_model_context_tests {
         };
         let source = gaugedesk_whip_runtime::live_turn_image_source(chat_id, &image).unwrap();
         crate::engine::bind_turn_image_sources(chat_id, &[image]);
-        let raw = serde_json::json!({
+        let raw = mapped_chat_request(serde_json::json!({
             "calls": [{
                 "ordinal": 0,
-                "body": {"image": "aW1hZ2U="},
+                "body": {"messages": [{"role": "user", "content": [{"type": "image", "data": "aW1hZ2U="}]}]},
                 "ordered_provenance": {
                     "messages": [{"source_handles": [format!("chat:{chat_id}"), source], "complete": true}],
                     "tools": {"source_handles": ["runtime"], "complete": true}
@@ -3220,7 +3267,7 @@ mod raw_model_context_tests {
                 "provenance_complete": true
             }],
             "incomplete": false
-        });
+        }));
         crate::engine::bind_turn_model_context(
             chat_id,
             std::sync::Arc::new(move || Ok(raw.to_string())),
@@ -3251,7 +3298,8 @@ mod raw_model_context_tests {
         );
         crate::engine::bind_turn_image_submitter(chat_id, Some(&AuthorityId::new("alice")));
         assert_eq!(
-            read(wb.clone(), headers).await["calls"][0]["body"]["image"],
+            read(wb.clone(), headers).await["calls"][0]["body"]["messages"][0]["content"][0]
+                ["data"],
             "aW1hZ2U="
         );
         drop(claim);
@@ -3279,7 +3327,7 @@ mod raw_model_context_tests {
             whipplescript_store::stable_hash_bytes_hex(b"retained private notes\n")
         );
         let claim = crate::engine::claim_turn(&chat_id).unwrap();
-        let raw = serde_json::json!({
+        let raw = mapped_chat_request(serde_json::json!({
             "calls": [{
                 "ordinal": 0,
                 "body": {"messages": ["retained private notes"]},
@@ -3290,7 +3338,7 @@ mod raw_model_context_tests {
                 "provenance_complete": true
             }],
             "incomplete": false
-        });
+        }));
         crate::engine::bind_turn_model_context(
             &chat_id,
             std::sync::Arc::new(move || Ok(raw.to_string())),
