@@ -27,7 +27,6 @@ CRATES = {
     "gaugedesk-workspace": ROOT / "crates/workspace/Cargo.toml",
     "gaugedesk-boundary": ROOT / "crates/boundary/Cargo.toml",
     "gaugedesk-harness": ROOT / "crates/harness/Cargo.toml",
-    "gaugedesk-pi-bridge": ROOT / "crates/pi-bridge/Cargo.toml",
     "gaugedesk-tracker": ROOT / "crates/tracker/Cargo.toml",
     "gaugedesk-whip-runtime": ROOT / "crates/whip-runtime/Cargo.toml",
     "gaugedesk-directory-protocol": ROOT / "crates/directory-protocol/Cargo.toml",
@@ -45,7 +44,6 @@ ALLOWED_LOCAL_EDGES = {
     "gaugedesk-workspace": set(),
     "gaugedesk-boundary": {"gaugedesk-core"},
     "gaugedesk-harness": {"gaugedesk-env"},
-    "gaugedesk-pi-bridge": {"gaugedesk-core", "gaugedesk-harness", "gaugedesk-env"},
     "gaugedesk-tracker": set(),
     "gaugedesk-whip-runtime": {"gaugedesk-core", "gaugedesk-harness"},
     "gaugedesk-directory-protocol": {"gaugedesk-core"},
@@ -61,7 +59,6 @@ ALLOWED_LOCAL_EDGES = {
         "gaugedesk-whip-runtime",
         "gaugedesk-directory-protocol",
         "gaugedesk-relay-transport",
-        "gaugedesk-pi-bridge",
     },
     "gaugedesk-ee": {
         "gaugedesk-env",

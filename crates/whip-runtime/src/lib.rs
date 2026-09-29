@@ -5152,7 +5152,6 @@ workflow Method {
             thinking: None,
             system_prompt: None,
             credential_capability: Some(test_credential_capability()),
-            credentials: vec![("OPENAI_API_KEY".to_owned(), "test-key".to_owned())],
             sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree
                 .path()
                 .to_path_buf()])

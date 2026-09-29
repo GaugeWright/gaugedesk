@@ -8,7 +8,7 @@
 //!
 //! Threading (RF-A7): the `Store` is **synchronous** `rusqlite`. fold/append are
 //! fast and run directly inside the control-plane's async handlers; the one
-//! genuinely long operation — a Pi turn (subprocess + multi-step admission) — is
+//! genuinely long operation — a runtime turn (subprocess + multi-step admission) — is
 //! dispatched on `tokio::task::spawn_blocking` (`crates/app/src/lib.rs` `post_task`),
 //! so it never blocks an async worker. Per-scope writes serialize through an
 //! immediate transaction with a `busy_timeout` (see `open`), so concurrent

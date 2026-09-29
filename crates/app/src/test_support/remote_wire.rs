@@ -1,17 +1,16 @@
 //! The remote-harness RPC envelope (`PROTO-1`).
 //!
-//! This is **not** the Pi wire protocol (its parent [`super`]) — that is the
-//! local subprocess's stdio. This is the framing for the *engine ↔ remote
+//! This is the framing for the *engine ↔ remote
 //! harness* boundary: the local orchestrator hands a turn to a [`RemoteHarness`]
 //! living in a different trust authority, reached over the federation relay
-//! ([`crate::RemoteHarness`], ADR 0020/0031). The turn's inputs and outputs must
+//! ([`gaugedesk_harness::RemoteHarness`], DR-0020/0031). The turn's inputs and outputs must
 //! cross that boundary as bytes, so a single turn is one
 //! [`RpcRequest::RunTurn`] line out and one [`RpcResponse::TurnComplete`] line
 //! back.
 //!
 //! Loopback-first (ADR 0020): the envelope is line-delimited JSON, exercised
 //! end-to-end in one process by [`loopback_roundtrip`]. `REMOTE-RPC-1` attaches
-//! the real `RemoteLoopbackHarness` transport behind the same envelope; the
+//! the test `RemoteLoopbackHarness` transport behind the same envelope; the
 //! cross-NAT relay (`RENDEZVOUS-STUB-1`) attaches later with no rearchitecture —
 //! the bytes on the wire never change.
 //!
@@ -23,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextWindowReading, ModelUsage, Observation, ToolInfo, TurnOutcome};
+use gaugedesk_harness::{ContextWindowReading, ModelUsage, Observation, ToolInfo, TurnOutcome};
 
 /// One turn handed to a remote harness — the request line the orchestrator sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +137,7 @@ impl From<&WireTurnOutcome> for TurnOutcome {
 }
 
 /// Map a received observation `kind` back to its `'static` interned form. The
-/// kinds the turn loop emits are a closed set (`crate` `run_turn_streaming`);
+/// kinds the runtime seam emits are a closed set;
 /// anything else is `"other"` so a malformed/extended peer can't widen our
 /// `&'static str` lifetimes nor leak by `Box::leak`.
 pub fn intern_kind(kind: &str) -> &'static str {

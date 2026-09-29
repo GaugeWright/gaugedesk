@@ -131,9 +131,9 @@ pub fn return_observation_via<R: FederationRelay + ?Sized>(
 mod tests {
     use super::*;
     use crate::federation_relay::{self, LoopbackRelay};
+    use crate::test_support::RemoteLoopbackHarness;
     use gaugedesk_core::run::{RunPhase, RunState};
     use gaugedesk_harness::{AllowAllGate, Harness};
-    use gaugedesk_pi_bridge::RemoteLoopbackHarness;
 
     fn running_run(store: &mut Store, scope: &str) {
         store
@@ -212,30 +212,12 @@ mod tests {
         let run_scope = "run-remote";
         running_run(&mut store, run_scope);
 
-        let mut harness = RemoteLoopbackHarness::new(
-            "127.0.0.1:7777",
-            [
-                r#"{"type":"agent_start"}"#,
-                r#"{"type":"text_delta","delta":"remote "}"#,
-                r#"{"type":"text_delta","delta":"reply"}"#,
-                r#"{"type":"agent_end","messages":[]}"#,
-                r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"remote reply"}}"#,
-            ],
-        );
+        let mut harness = RemoteLoopbackHarness::text("127.0.0.1:7777", &["remote ", "reply"]);
 
         // The remote turn streams at least its two text tokens as observations;
         // record how many crossed so the assertions track the harness exactly.
         let expected = {
-            let mut h = RemoteLoopbackHarness::new(
-                "127.0.0.1:7777",
-                [
-                    r#"{"type":"agent_start"}"#,
-                    r#"{"type":"text_delta","delta":"remote "}"#,
-                    r#"{"type":"text_delta","delta":"reply"}"#,
-                    r#"{"type":"agent_end","messages":[]}"#,
-                    r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"remote reply"}}"#,
-                ],
-            );
+            let mut h = RemoteLoopbackHarness::text("127.0.0.1:7777", &["remote ", "reply"]);
             h.run_turn(&AllowAllGate, "go", &[], &mut |_| {})
                 .unwrap()
                 .observations

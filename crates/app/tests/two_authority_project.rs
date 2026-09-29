@@ -45,7 +45,7 @@ fn mint_two_authority_output(store: &mut Store) -> BTreeSet<String> {
     let method = ResourceRecord::new(
         Resource::input(method_id.clone(), ResourceKind::method(), EXPERT.into()),
         ContentLocator::Workspace {
-            path: ".pi/SYSTEM.md".into(),
+            path: ".method/SYSTEM.md".into(),
             commit: "c0".into(),
         },
         |_| EXPERT.into(),

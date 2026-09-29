@@ -5142,7 +5142,7 @@ async fn pre_target_store_is_rejected_instead_of_self_healed() {
         let mut store = Store::open(root.join("gaugewright.db").to_str().unwrap()).unwrap();
         let inst = Instance::init_at(targets_dir.join(DEFAULT_INSTANCE)).unwrap();
         inst.seed_main(&[
-            (".pi/SYSTEM.md", app_support::DEFAULT_AGENT_SYSTEM_MD),
+            (".method/SYSTEM.md", app_support::DEFAULT_AGENT_SYSTEM_MD),
             ("AGENTS.md", app_support::DEFAULT_AGENT_AGENTS_MD),
         ])
         .unwrap();

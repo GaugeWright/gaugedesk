@@ -3,7 +3,7 @@
 //! Nothing here is adapter-shaped: the doubles fabricate the seam's own types
 //! directly, proving the [`Harness`] contract needs no runtime wire behind it.
 //! GaugeDesk's `GAUGEDESK_FAKE_AGENT` path uses this double directly, so its
-//! deterministic acceptance suite does not depend on Pi's wire protocol.
+//! deterministic acceptance suite does not depend on a runtime wire protocol.
 
 use std::collections::VecDeque;
 use std::io;
@@ -47,7 +47,7 @@ enum TurnScript {
 /// A scripted [`Harness`] that fabricates its turn evidence directly: each
 /// queued [`TurnOutcome`] serves exactly one turn, its `observations` streamed
 /// to the sink before the outcome is returned (the order every real adapter
-/// honors). No Pi wire, no subprocess, no runtime — the template for a future
+/// honors). No runtime wire or subprocess — the template for a future
 /// adapter conformance run (SUB-1).
 ///
 /// Running past the script is an error, matching a one-shot transport; a
@@ -201,7 +201,7 @@ mod tests {
     }
 
     /// Neutral scripts still cross the real gate: allowed calls are mediated and
-    /// blocked calls surface as blocked observations without any Pi event parser.
+    /// blocked calls surface as blocked observations without a wire event parser.
     #[test]
     fn neutral_script_classifies_each_tool_through_the_gate() {
         let tool = |name: &str| ScriptedToolCall {

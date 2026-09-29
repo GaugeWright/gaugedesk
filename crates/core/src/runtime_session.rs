@@ -1,7 +1,7 @@
 //! Runtime execution-attempt lifecycle — one *turn* of an engagement, ported
 //! from `specs/models/runtime-session.qnt`.
 //!
-//! This is the reducer the `pi-bridge` shell drives: it materializes the
+//! This is the reducer the runtime shell drives: it materializes the
 //! prerequisites (run admitted, boundary session active, bases granted) and then
 //! prepares → executes → records observations → admits them → mediates egress →
 //! terminates. Discharges:

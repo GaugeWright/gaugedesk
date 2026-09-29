@@ -4,7 +4,7 @@
 //! app-server device-code flow in a short-lived, isolated `CODEX_HOME`, immediately
 //! imports the resulting bundle into the authenticated person's sealed Home scope,
 //! and deletes the temporary Codex store. The browser and Durable Objects receive
-//! only a verification code/status; neither Pi nor WhippleScript owns credentials.
+//! only a verification code/status; WhippleScript does not own credentials.
 
 use axum::{
     extract::State,

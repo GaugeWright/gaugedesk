@@ -2,7 +2,7 @@
 //! as trait objects — the workspace held as `Box<dyn Workspace>` /
 //! `Box<dyn ChatWorkspace>` (constructed through the provider seam) and the
 //! runtime built by a registered `Arc<dyn HarnessFactory>` producing the
-//! neutral [`ScriptedHarness`]. The test itself carries zero Pi and zero
+//! neutral [`ScriptedHarness`]. The test itself carries zero runtime wire and zero
 //! provider-format knowledge: it never touches export bytes, a store path, or a line
 //! name — the template for a future adapter conformance run.
 
@@ -104,7 +104,6 @@ fn full_turn_runs_over_workspace_and_harness_trait_objects() {
         thinking: None,
         system_prompt: None,
         credential_capability: None,
-        credentials: Vec::new(),
         sandbox: SandboxPolicy::new(vec![chat.path().to_path_buf()]),
         roster: Vec::new(),
     };

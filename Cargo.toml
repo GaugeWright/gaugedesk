@@ -5,12 +5,11 @@
 # `store` (SQLite event log + admission), `workspace` (WhippleScript cuts/working sets),
 # `boundary` (egress membrane + .agent-config.json policy), `harness` (the
 # adapter-free runtime seam + OS sandbox), `whip-runtime` (the selected governed
-# runtime), `pi-bridge` (retired protocol/conformance corpus), and `app` (the
-# engine orchestrator + axum control plane).
+# runtime), and `app` (the engine orchestrator + axum control plane).
 # See specs/implementation/backend-stack.md and mvp-plan.md.
 [workspace]
 resolver = "2"
-members = ["crates/env", "crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/pi-bridge", "crates/tracker", "crates/whip-runtime", "crates/relay-transport", "crates/directory-protocol", "crates/app", "ee/app"]
+members = ["crates/env", "crates/core", "crates/store", "crates/workspace", "crates/boundary", "crates/harness", "crates/tracker", "crates/whip-runtime", "crates/relay-transport", "crates/directory-protocol", "crates/app", "ee/app"]
 # The Tauri desktop shell is its own workspace (needs system webkit/CLI to build);
 # excluded so `cargo test` over the backend stays self-contained.
 # third-party/ is reindeer's input for the native third-party targets, not a crate.

@@ -1361,7 +1361,7 @@ When("I attach the context folder {string}", async ({ page }, path: string) => {
     // *contents* (ENTSEC-5), not by a server-local path — browsers hide real paths.
     // Playwright drives the hidden `webkitdirectory` input by handing it a real
     // directory path, which it walks and uploads. `path` is relative to this
-    // checkout; its files (e.g. gaugewright-plugin.ts) are what downstream
+    // checkout; its files (e.g. codex-oauth-login.mjs) are what downstream
     // diff/context assertions look for. No `Add files` click is needed.
     await page.locator("[data-add-folder-input]").setInputFiles(resolve(process.cwd(), "..", path));
 });
@@ -1370,8 +1370,8 @@ When("I drop the file {string} containing {string} on Files", async ({ page }, n
     await dropTextFile(page, "[data-files-drop-target] .files-header", name, content);
 });
 
-When("I reload as the desktop app and add the repository plugin folder", async ({ page }) => {
-    const pluginPath = resolve(process.cwd(), "../plugin");
+When("I reload as the desktop app and add the repository sidecar folder", async ({ page }) => {
+    const selectedPath = resolve(process.cwd(), "../sidecar");
     await page.addInitScript(({ selectedPath }) => {
         Object.defineProperty(window, "__TAURI_INTERNALS__", {
             configurable: true,
@@ -1380,7 +1380,7 @@ When("I reload as the desktop app and add the repository plugin folder", async (
                     command === "plugin:dialog|open" ? selectedPath : null,
             },
         });
-    }, { selectedPath: pluginPath });
+    }, { selectedPath });
     await page.reload();
     await page.getByRole("button", { name: "Files menu" }).click();
     const addFiles = page.getByRole("menuitem", { name: "Import folder…" });

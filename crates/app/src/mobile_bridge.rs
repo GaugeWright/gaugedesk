@@ -416,9 +416,9 @@ mod tests {
         );
     }
 
+    use crate::test_support::RemoteLoopbackHarness;
     use gaugedesk_core::run::{RunPhase, RunState};
     use gaugedesk_harness::AllowAllGate;
-    use gaugedesk_pi_bridge::RemoteLoopbackHarness;
 
     /// MOB-013 end-to-end: the [`TwoAuthorityMobileFixture`] ties the whole mobile
     /// flow together over the two-authority loopback collapse. The owner binds the
@@ -446,16 +446,7 @@ mod tests {
         );
 
         // --- remote authority: a turn flows its observations back to the owner ---
-        let mut harness = RemoteLoopbackHarness::new(
-            "127.0.0.1:7799",
-            [
-                r#"{"type":"agent_start"}"#,
-                r#"{"type":"text_delta","delta":"mobile "}"#,
-                r#"{"type":"text_delta","delta":"reply"}"#,
-                r#"{"type":"agent_end","messages":[]}"#,
-                r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"mobile reply"}}"#,
-            ],
-        );
+        let mut harness = RemoteLoopbackHarness::text("127.0.0.1:7799", &["mobile ", "reply"]);
         let count = fx
             .run_flows_back(&mut store, &mut harness, &AllowAllGate, "go")
             .expect("the remote turn federated its observations into the owner's run");
@@ -517,15 +508,7 @@ mod tests {
         let mut fx = TwoAuthorityMobileFixture::loopback("chat-m13-revoked");
         fx.bind(&mut store).unwrap();
 
-        let mut harness = RemoteLoopbackHarness::new(
-            "127.0.0.1:7799",
-            [
-                r#"{"type":"agent_start"}"#,
-                r#"{"type":"text_delta","delta":"x"}"#,
-                r#"{"type":"agent_end","messages":[]}"#,
-                r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"x"}}"#,
-            ],
-        );
+        let mut harness = RemoteLoopbackHarness::text("127.0.0.1:7799", &["x"]);
         fx.run_flows_back(&mut store, &mut harness, &AllowAllGate, "go")
             .unwrap();
 

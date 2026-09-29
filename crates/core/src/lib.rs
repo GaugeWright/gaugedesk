@@ -3,7 +3,7 @@
 //! Domain types and lifecycle reducers, with **no I/O**: reducers are the
 //! `(decide, evolve)` pairs of ADR 0004, ported from the Quint models in
 //! `specs/models/` and property-tested against the same invariants. The
-//! imperative shell (store / boundary / pi-bridge / api / app) materializes all
+//! imperative shell (store / boundary / harness / api / app) materializes all
 //! non-determinism and authority before these reducers run.
 //!
 //! Contracts at the boundary (`principles.md`): identities are newtypes,

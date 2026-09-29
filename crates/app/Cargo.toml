@@ -94,7 +94,6 @@ whipplescript-kernel = { version = "0.8.0" }
 # Competing connection proves publication holds the content authority's lock.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 whipplescript = { version = "0.8.0", default-features = false }
-gaugedesk-pi-bridge = { path = "../pi-bridge" }
 gaugedesk-relay-transport = { path = "../relay-transport", features = ["test-relay"] }
 # Compiles the shipped gate program in tests. A gate we ship but never parse is
 # the same class of bug as a sealing construction nobody cross-checked: it looks

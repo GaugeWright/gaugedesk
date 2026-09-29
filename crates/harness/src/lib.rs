@@ -4,8 +4,7 @@
 //! the [`Harness`]/[`RemoteHarness`] turn seam (ADR 0031), the [`EgressGate`]
 //! mediation chokepoint, the [`Observation`]/[`TurnOutcome`] turn evidence, the
 //! [`ImageContent`] content block, and the OS [`sandbox`] (ADR 0030). Adapters
-//! (`gaugedesk-pi-bridge` is the Pi one) depend on this crate for the seam;
-//! nothing here is adapter-specific.
+//! depend on this crate for the seam; nothing here is adapter-specific.
 
 use std::io;
 use std::path::PathBuf;
@@ -213,8 +212,7 @@ fn default_image_kind() -> ImageKind {
 /// A neutral image content block: `{ "type":"image", "data":<base64>, "mimeType":… }`
 /// — generic base64 + mime. This serde shape is **frozen** as the blessed
 /// content-block wire (it is part of the public HTTP contract); each adapter maps
-/// it to its runtime's native form (the Pi adapter sends it verbatim over RPC,
-/// verified against `@mariozechner/pi-ai` 0.73).
+/// it to its runtime's native form.
 ///
 /// These are **message-scoped model input**: the base64 bytes are sent to the
 /// runtime but must never be written to the durable transcript / event log
@@ -278,8 +276,7 @@ pub type ExternalToolHandler =
     Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<String, String> + Send + Sync>;
 
 /// The seam between the admission shell and any agent runtime (ADR 0031): drive one
-/// turn → a neutral [`TurnOutcome`]. Pi is one adapter ([`PiProcess`]); Codex /
-/// Claude Code are future adapters — each only implements this trait.
+/// turn → a neutral [`TurnOutcome`]. WhippleScript implements this trait.
 pub trait Harness: Send {
     /// Refresh the GaugeDesk-authenticated actor for the next turn. Persistent
     /// harnesses must not retain the actor from the turn that created them.
@@ -312,26 +309,11 @@ pub trait Harness: Send {
         images: &[ImageContent],
         sink: &mut dyn FnMut(&Observation),
     ) -> io::Result<TurnOutcome>;
-    /// The OS pid of an underlying process, if any. Legacy: survives only to
-    /// feed the default [`interrupt_handle`](Harness::interrupt_handle);
-    /// retired with the Pi adapter.
-    fn process_id(&self) -> Option<u32> {
-        None
-    }
     /// The out-of-band interrupt for a turn in flight (`None` = nothing to
-    /// interrupt). Default: derived from [`process_id`](Harness::process_id) —
-    /// the same `kill -KILL <pid>` the Stop route used to perform against the
-    /// pid registry (SIGKILL is reliable; a runtime may ignore TERM mid-stream).
-    /// A pid-less harness (in-process, remote) overrides this with its own
-    /// cancel, so Stop is never silently impossible.
+    /// interrupt). Runtimes with cancellation override this with their own
+    /// handle.
     fn interrupt_handle(&self) -> Option<InterruptHandle> {
-        let pid = self.process_id()?;
-        Some(Arc::new(move || {
-            let _ = std::process::Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .status();
-        }))
+        None
     }
     fn model_context_handle(&self) -> Option<ModelContextHandle> {
         None
@@ -423,12 +405,9 @@ pub struct HarnessSpec {
     /// Reference-bound provider material for native governed runtimes. Secret
     /// bytes are released only for the exact admitted `credential_ref`.
     pub credential_capability: Option<Arc<dyn CredentialCapability>>,
-    /// Legacy Pi compatibility only. Foreground GaugeDesk turns leave this
-    /// empty; it retires with the Pi adapter.
-    pub credentials: Vec<(String, String)>,
     /// The shell's sandbox POLICY (worktree writable, read-only definition
     /// surface in use mode, provider hosts, egress ack); the adapter EXTENDS it
-    /// with adapter-private needs (e.g. Pi's session dir + `~/.pi`).
+    /// with any runtime-private needs.
     pub sandbox: sandbox::SandboxPolicy,
     /// Who this agent may name, as `(authority, who they are)` (`GATE-3f`).
     /// Offered on the `ask` tool so the choice of a person is made from a list
@@ -527,16 +506,14 @@ pub trait CredentialCapability: Send + Sync + std::fmt::Debug {
 ///
 /// CONTRACT (membrane, adapter-supplied): each adapter must provide in-process
 /// enforcement equivalent to the [`EgressGate`]'s policy — no tool effect may
-/// escape the gate's ruling. Pi meets it with its in-process plugin + the OS
-/// [`sandbox`]; a runtime that mediates every effect by construction meets it
-/// natively (ADR 0071 §3).
+/// escape the gate's ruling. A runtime that mediates every effect by
+/// construction meets it natively (ADR 0071 §3).
 pub trait HarnessFactory: Send + Sync {
-    /// The adapter's stable id (`"pi"`, `"scripted-fake"`, later `"whip"`).
+    /// The adapter's stable id (`"whip"` or `"scripted-fake"`).
     fn kind(&self) -> &'static str;
     fn create(&self, spec: &HarnessSpec) -> io::Result<Box<dyn Harness>>;
     /// Cache the created harness across turns in the workbench's session map?
-    /// Pi: `true` (one persistent subprocess per chat). The scripted fake:
-    /// `false` (today's fresh-transport-per-turn behavior, preserved exactly).
+    /// The scripted fake returns `false` for a fresh harness per turn.
     fn reuse_across_turns(&self) -> bool {
         true
     }
@@ -570,44 +547,3 @@ pub trait HarnessFactory: Send + Sync {
 // Compile-time proof the factory seam stays object-safe — the shell selects a
 // factory per turn and holds it as `Arc<dyn HarnessFactory>`.
 const _: fn(&dyn HarnessFactory) = |_| {};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The default interrupt handle derives strictly from `process_id`: a
-    /// pid-backed harness is interruptible, a pid-less one reports `None`
-    /// (Stop stays a clean no-op) unless it overrides with its own cancel.
-    #[test]
-    fn default_interrupt_handle_derives_from_process_id() {
-        struct WithPid;
-        impl Harness for WithPid {
-            fn run_turn(
-                &mut self,
-                _gate: &dyn EgressGate,
-                _prompt: &str,
-                _images: &[ImageContent],
-                _sink: &mut dyn FnMut(&Observation),
-            ) -> io::Result<TurnOutcome> {
-                unreachable!("not driven in this test")
-            }
-            fn process_id(&self) -> Option<u32> {
-                Some(4242)
-            }
-        }
-        struct PidLess;
-        impl Harness for PidLess {
-            fn run_turn(
-                &mut self,
-                _gate: &dyn EgressGate,
-                _prompt: &str,
-                _images: &[ImageContent],
-                _sink: &mut dyn FnMut(&Observation),
-            ) -> io::Result<TurnOutcome> {
-                unreachable!("not driven in this test")
-            }
-        }
-        assert!(WithPid.interrupt_handle().is_some());
-        assert!(PidLess.interrupt_handle().is_none());
-    }
-}

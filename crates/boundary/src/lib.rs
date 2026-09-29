@@ -1,7 +1,7 @@
 //! gaugewright boundary — GaugeDesk-owned runtime selection and legacy policy.
 //!
-//! The host-side chokepoint every external effect passes through (`pi-rpc.md`,
-//! "Egress Mediation"). It is **not** a bypass: even trust-by-default mediates
+//! The host-side chokepoint every external effect passes through. It is **not**
+//! a bypass: even trust-by-default mediates
 //! every effect — the posture only sets the *default decision* to
 //! allow-and-record vs. block. The pure soundness of release (conjunctive
 //! consent, `INV-22`) lives in [`gaugedesk_core::boundary`]; this crate is the
@@ -44,7 +44,7 @@ pub fn is_control_surface_path(path: &str) -> bool {
         || p.contains(concat!("/", ".gaugedesk-runtime", "/"))
 }
 
-/// Pi's built-in file-mutating tools. This membrane gate gives a fast, clean
+/// runtime file-mutating tools. This membrane gate gives a fast, clean
 /// rejection for these (defense-in-depth + audit); the load-bearing INV-24
 /// enforcement is the OS sandbox, which makes the surface read-only for *every*
 /// write path including a `bash` redirection ([ADR 0030]). So no tool — `bash`

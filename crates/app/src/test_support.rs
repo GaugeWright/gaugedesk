@@ -1,5 +1,9 @@
 use std::sync::{Mutex, MutexGuard};
 
+mod remote_harness;
+pub(crate) mod remote_wire;
+pub(crate) use remote_harness::RemoteLoopbackHarness;
+
 static FAKE_AGENT_ENV_GUARD: Mutex<()> = Mutex::new(());
 
 pub(crate) struct FakeAgentEnvGuard {

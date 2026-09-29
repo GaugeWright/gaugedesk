@@ -1511,7 +1511,6 @@ dependencies = [
  "gaugedesk-directory-protocol",
  "gaugedesk-env",
  "gaugedesk-harness",
- "gaugedesk-pi-bridge",
  "gaugedesk-relay-transport",
  "gaugedesk-store",
  "gaugedesk-tracker",
@@ -1624,20 +1623,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "gaugedesk-pi-bridge"
-version = "0.4.30"
-dependencies = [
- "gaugedesk-core",
- "gaugedesk-env",
- "gaugedesk-harness",
- "proptest",
- "serde",
- "serde_json",
- "tempfile",
  "tracing",
 ]
 

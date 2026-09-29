@@ -1,9 +1,9 @@
-//! OS sandbox that wraps the Pi subprocess (ADR 0030).
+//! OS sandbox for an agent runtime subprocess (ADR 0030).
 //!
 //! Boundary enforcement that an in-process membrane cannot provide: a `bash`
 //! tool (or any exec tool) spawns a child with the same OS authority, whose
-//! syscalls gaugewright never sees. The fix is to run the **whole `pi --mode rpc`
-//! process** — and therefore every child it spawns — under an OS sandbox. One
+//! syscalls gaugewright never sees. The runtime process and every child it
+//! spawns run under an OS sandbox. One
 //! uniform [`SandboxPolicy`]; per-OS [`Sandbox`] backends.
 //!
 //! The key property: the agent's method-definition surface is passed as a
@@ -66,8 +66,8 @@ pub enum Network {
 /// A uniform sandbox policy, mapped to per-OS backends.
 #[derive(Clone, Debug)]
 pub struct SandboxPolicy {
-    /// Roots the process may write (e.g. the engagement worktree, the Pi config
-    /// dir). Everything else is read-only.
+    /// Roots the process may write (e.g. the engagement worktree).
+    /// Everything else is read-only.
     pub writable_roots: Vec<PathBuf>,
     /// Paths re-imposed read-only *on top of* the writable roots — the agent's
     /// definition surface in use mode. Must exist on disk (a bind needs a source).
@@ -150,8 +150,8 @@ impl SandboxPolicy {
 /// blocks all direct egress — non-allowlisted SNI, raw IP, non-443, and even host
 /// **loopback services** (the map is accepted only on the proxy port) — while an
 /// in-sandbox `nft flush` cannot reopen it (no CAP_NET_ADMIN over pasta's netns).
-/// Functional acceptance: the agent runtime (`bun` `fetch`, what the shipped Pi is
-/// compiled with) reaches an allowlisted host through the sandbox, so `Filtered`
+/// Functional acceptance: `bun` `fetch` reaches an allowlisted host through
+/// the sandbox, so `Filtered`
 /// enforces without breaking model access. `can_enforce_filtered()` still gates on
 /// `bwrap` + `pasta` being present, so a host lacking them keeps the open-by-default
 /// posture (no regression). Follow-up: vendor `pasta` into the bundle (SELFHOST-1)
@@ -226,7 +226,7 @@ pub fn effective_network(requested: Network, caps: RoutingCaps) -> Network {
 pub trait Sandbox {
     fn name(&self) -> &'static str;
     /// Build the full argv that runs `program args…` under `policy` with cwd `cwd`.
-    /// `None` means this backend can't wrap here — the caller runs Pi unwrapped
+    /// `None` means this backend can't wrap here — the caller runs unwrapped
     /// (with a visible warning; never a silent downgrade).
     fn wrap(
         &self,
@@ -418,8 +418,8 @@ pub fn filtered_wrap(
 /// Whether this host both *wants* and *can* run [`Network::Filtered`] as the
 /// transparent-egress composition right now — i.e. the effective posture resolves
 /// to `Filtered` (so [`FILTERED_ROUTING_VERIFIED`] is set and the caps are present)
-/// AND the userspace-net helper is pasta (the proven, implemented backend). The Pi
-/// bridge consults this to decide whether to start the SNI proxy and build
+/// AND the userspace-net helper is pasta (the proven, implemented backend). The
+/// caller consults this to decide whether to start the SNI proxy and build
 /// [`filtered_wrap`]; everything else takes the isolated/unfiltered path unchanged.
 pub fn wants_transparent_egress(policy: &SandboxPolicy) -> bool {
     let caps = detect_routing_caps();
@@ -489,14 +489,14 @@ impl Sandbox for Seatbelt {
 /// (RF-B2): unlike the Linux/macOS backends, there is no CLI wrapper to shell out
 /// to, so this must be a Win32 FFI backend and cannot be built or verified on the
 /// Linux-only toolchain/CI this project runs. `wrap` returns `None`, which is now
-/// **safe** because [`PiProcess::spawn`](crate::PiProcess::spawn) fails closed
+/// **safe** because [`wrap_or_refuse`] fails closed
 /// when a protected definition surface cannot be sandboxed (RF-B1) — so the
 /// Windows hole is shut today; this backend is the *enforcement* that lets
 /// use-mode actually run on Windows.
 ///
 /// Design when a Windows host is available:
 /// - create a per-engagement **AppContainer profile** (a capability SID), and
-///   launch Pi with `CreateProcess` + `STARTUPINFOEX`/`PROC_THREAD_ATTRIBUTE_*`
+///   launch the runtime with `CreateProcess` + `STARTUPINFOEX`/`PROC_THREAD_ATTRIBUTE_*`
 ///   carrying the AppContainer SID and an explicit (empty/minimal) capability set;
 /// - grant the AppContainer SID write access only to `writable_roots` (ACLs), and
 ///   add an explicit **deny-write ACE** for the AppContainer SID on each
@@ -591,7 +591,7 @@ pub fn wrap_or_refuse(
                 requested_network = ?policy.network,
                 effective_network = ?effective,
                 read_only_roots = policy.read_only_roots.len(),
-                "pi spawn: sandboxed"
+                "runtime spawn: sandboxed"
             );
             if policy.network == Network::Filtered && effective == Network::Deny {
                 // Honest, loud: the operator asked for filtered egress but this host
@@ -629,7 +629,7 @@ pub fn wrap_or_refuse(
                 ));
             }
             eprintln!(
-                "gaugewright: sandbox backend '{}' unavailable — running Pi UNSANDBOXED \
+                "gaugewright: sandbox backend '{}' unavailable — running UNSANDBOXED \
                  ({}; install a backend to enforce)",
                 backend.name(),
                 if explicit_optout {
@@ -718,7 +718,7 @@ mod tests {
 
     fn policy() -> SandboxPolicy {
         SandboxPolicy::new(vec![PathBuf::from("/home/u/wt")]).read_only(vec![
-            PathBuf::from("/home/u/wt/.pi"),
+            PathBuf::from("/home/u/wt/.method"),
             PathBuf::from("/home/u/wt/AGENTS.md"),
         ])
     }
@@ -728,7 +728,7 @@ mod tests {
         let argv = Bubblewrap
             .wrap(
                 &policy(),
-                "pi",
+                "agent",
                 &["--mode".into(), "rpc".into()],
                 Some(Path::new("/home/u/wt")),
             )
@@ -737,18 +737,18 @@ mod tests {
         // host read-only, worktree writable, definition re-imposed read-only.
         assert!(joined.contains("--ro-bind / /"));
         assert!(joined.contains("--bind /home/u/wt /home/u/wt"));
-        assert!(joined.contains("--ro-bind /home/u/wt/.pi /home/u/wt/.pi"));
+        assert!(joined.contains("--ro-bind /home/u/wt/.method /home/u/wt/.method"));
         assert!(joined.contains("--ro-bind /home/u/wt/AGENTS.md /home/u/wt/AGENTS.md"));
         // the writable bind comes BEFORE the read-only re-impose (later wins).
         let bind = joined.find("--bind /home/u/wt /home/u/wt").unwrap();
-        let robind = joined.find("--ro-bind /home/u/wt/.pi").unwrap();
+        let robind = joined.find("--ro-bind /home/u/wt/.method").unwrap();
         assert!(
             bind < robind,
             "writable worktree must be bound before the RO definition"
         );
         // the wrapped program follows `--`.
         let dd = argv.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&argv[dd + 1..], &["pi", "--mode", "rpc"]);
+        assert_eq!(&argv[dd + 1..], &["agent", "--mode", "rpc"]);
         // chdir into the worktree.
         assert!(joined.contains("--chdir /home/u/wt"));
     }
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn bubblewrap_edit_mode_has_no_readonly_definition() {
         let p = SandboxPolicy::new(vec![PathBuf::from("/home/u/wt")]); // no read_only_roots
-        let argv = Bubblewrap.wrap(&p, "pi", &[], None).unwrap();
+        let argv = Bubblewrap.wrap(&p, "agent", &[], None).unwrap();
         assert!(!argv.join(" ").contains("--ro-bind /home/u/wt"));
     }
 
@@ -768,7 +768,7 @@ mod tests {
             .find("(allow file-write* (subpath \"/home/u/wt\"))")
             .unwrap();
         let deny = prof
-            .find("(deny file-write* (subpath \"/home/u/wt/.pi\"))")
+            .find("(deny file-write* (subpath \"/home/u/wt/.method\"))")
             .unwrap();
         assert!(
             allow < deny,
@@ -782,7 +782,7 @@ mod tests {
         let denied = SandboxPolicy::new(vec![PathBuf::from("/wt")]);
         assert_eq!(denied.network, Network::Deny);
         assert!(denied.allowed_hosts.is_empty());
-        let argv = Bubblewrap.wrap(&denied, "pi", &[], None).unwrap();
+        let argv = Bubblewrap.wrap(&denied, "agent", &[], None).unwrap();
         assert!(
             argv.iter().any(|a| a == "--unshare-net"),
             "deny-by-default must unshare the network namespace"
@@ -798,7 +798,7 @@ mod tests {
             "declaring hosts must not silently open egress"
         );
         assert_eq!(declared.allowed_hosts, vec!["api.openai.com".to_string()]);
-        let argv = Bubblewrap.wrap(&declared, "pi", &[], None).unwrap();
+        let argv = Bubblewrap.wrap(&declared, "agent", &[], None).unwrap();
         assert!(
             argv.iter().any(|a| a == "--unshare-net"),
             "a declared-but-unacknowledged egress need stays network-isolated (fail-closed)"
@@ -809,7 +809,7 @@ mod tests {
             .allow_hosts(vec!["api.openai.com".into()])
             .allow_unfiltered_egress(true);
         assert_eq!(acknowledged.network, Network::Allow);
-        let argv = Bubblewrap.wrap(&acknowledged, "pi", &[], None).unwrap();
+        let argv = Bubblewrap.wrap(&acknowledged, "agent", &[], None).unwrap();
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
             "an acknowledged egress need opens the namespace network"
@@ -886,7 +886,7 @@ mod tests {
         // unenforceable filter is byte-for-byte an isolated run.
         let filtered = SandboxPolicy::new(vec![PathBuf::from("/wt")])
             .filter_egress(vec!["api.openai.com".into()]);
-        let argv = Bubblewrap.wrap(&filtered, "pi", &[], None).unwrap();
+        let argv = Bubblewrap.wrap(&filtered, "agent", &[], None).unwrap();
         assert!(
             argv.iter().any(|a| a == "--unshare-net"),
             "Filtered must isolate the netns (proxy is its sole route)"
@@ -895,7 +895,7 @@ mod tests {
         let allow = SandboxPolicy::new(vec![PathBuf::from("/wt")])
             .filter_egress(vec!["api.openai.com".into()])
             .allow_unfiltered_egress(true);
-        let argv = Bubblewrap.wrap(&allow, "pi", &[], None).unwrap();
+        let argv = Bubblewrap.wrap(&allow, "agent", &[], None).unwrap();
         assert!(
             !argv.iter().any(|a| a == "--unshare-net"),
             "unfiltered Allow shares the host network"
@@ -918,8 +918,8 @@ mod tests {
 
     #[test]
     fn nosandbox_and_windows_stub_return_unwrapped() {
-        assert!(NoSandbox.wrap(&policy(), "pi", &[], None).is_none());
-        assert!(WindowsSandbox.wrap(&policy(), "pi", &[], None).is_none());
+        assert!(NoSandbox.wrap(&policy(), "agent", &[], None).is_none());
+        assert!(WindowsSandbox.wrap(&policy(), "agent", &[], None).is_none());
     }
 
     /// The real property, end-to-end: a `bash`-style write to a read-only root
@@ -942,14 +942,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let wt = dir.path();
-        std::fs::create_dir(wt.join(".pi")).unwrap();
-        std::fs::write(wt.join(".pi/SYSTEM.md"), "ORIGINAL").unwrap();
+        std::fs::create_dir(wt.join(".method")).unwrap();
+        std::fs::write(wt.join(".method/SYSTEM.md"), "ORIGINAL").unwrap();
 
         // worktree writable, the definition surface read-only on top (use mode).
-        let policy = SandboxPolicy::new(vec![wt.to_path_buf()]).read_only(vec![wt.join(".pi")]);
+        let policy = SandboxPolicy::new(vec![wt.to_path_buf()]).read_only(vec![wt.join(".method")]);
         // bash tries to rewrite its own system prompt AND write an ordinary file.
         let script =
-            "echo HACKED > .pi/SYSTEM.md 2>/dev/null; echo ok > work.txt 2>/dev/null; true";
+            "echo HACKED > .method/SYSTEM.md 2>/dev/null; echo ok > work.txt 2>/dev/null; true";
         let argv = Bubblewrap
             .wrap(&policy, "/bin/sh", &["-c".into(), script.into()], Some(wt))
             .unwrap();
@@ -958,7 +958,7 @@ mod tests {
 
         // INV-24: the protected system prompt is unchanged…
         assert_eq!(
-            std::fs::read_to_string(wt.join(".pi/SYSTEM.md")).unwrap(),
+            std::fs::read_to_string(wt.join(".method/SYSTEM.md")).unwrap(),
             "ORIGINAL",
             "bash must not be able to rewrite the read-only definition"
         );
@@ -975,7 +975,8 @@ mod tests {
     /// no protected surface (edit mode) may warn-and-run.
     #[test]
     fn unsandboxed_run_fails_closed_when_definition_surface_is_protected() {
-        let protected = SandboxPolicy::new(vec!["/wt".into()]).read_only(vec!["/wt/.pi".into()]);
+        let protected =
+            SandboxPolicy::new(vec!["/wt".into()]).read_only(vec!["/wt/.method".into()]);
         let unprotected = SandboxPolicy::new(vec!["/wt".into()]);
         assert!(
             !allow_unsandboxed(&protected, false),

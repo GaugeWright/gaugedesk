@@ -482,7 +482,7 @@ mod tests {
 
     /// THE NON-BYPASS PROOF (CORE-5, ADR 0079). Spin the real SNI proxy with a
     /// one-host allowlist and run `curl` **inside the full sandbox**
-    /// (pasta + nft + bwrap) — the transparent composition the Pi bridge builds —
+    /// (pasta + nft + bwrap) — the transparent composition the sandbox builds —
     /// asserting egress is possible ONLY to the allowlisted host, and only via the
     /// proxy: a non-allowlisted SNI is dropped by the proxy, and direct egress that
     /// never reaches the proxy (raw IP, non-443) is dropped by nft. Gated to run
@@ -783,10 +783,10 @@ mod tests {
         }
 
         // (g) FUNCTIONAL ACCEPTANCE: the AGENT RUNTIME reaches an allowlisted host
-        // through the transparent path. The shipped Pi is bun-compiled; because the
+        // through the transparent path. Because the
         // sandbox is transparent (the client just connects to the host normally — no
         // proxy env, no client cooperation), if bun's `fetch` reaches the allowlisted
-        // host here, Pi's model client reaches an allowlisted model endpoint the same
+        // host here, a model client reaches an allowlisted model endpoint the same
         // way. This is the functional gate for FILTERED_ROUTING_VERIFIED. Gated on bun.
         if on_path("bun") {
             allow_path_must_succeed(

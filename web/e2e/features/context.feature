@@ -6,9 +6,9 @@ Feature: Context ingestion
 
   Scenario: attach a folder of context
     Given a new engagement
-    When I attach the context folder "plugin"
+    When I attach the context folder "sidecar"
     When I open the "diff" tab
-    Then the diff shows "gaugewright-plugin.ts"
+    Then the diff shows "codex-oauth-login.mjs"
 
   Scenario: drop a file onto Files
     Given a new engagement
@@ -19,9 +19,9 @@ Feature: Context ingestion
   @transport
   Scenario: the desktop folder picker ingests a local path through the shipped client
     Given a new engagement
-    When I reload as the desktop app and add the repository plugin folder
+    When I reload as the desktop app and add the repository sidecar folder
     When I open the "diff" tab
-    Then the diff shows "gaugewright-plugin.ts"
+    Then the diff shows "codex-oauth-login.mjs"
 
   # streamed-context-upload-production-client
   @transport

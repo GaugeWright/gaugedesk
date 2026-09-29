@@ -689,7 +689,7 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
 ///
 /// WhippleScript owns the provider client, fixes its request URL from the admitted
 /// binding, and refuses redirects. It can therefore enforce the model-endpoint
-/// filter directly without depending on the legacy Pi subprocess/netns routing
+/// filter directly without depending on subprocess/netns routing
 /// capability. Isolation (`Deny`) and the conscious unfiltered opt-in (`Allow`)
 /// remain GaugeDesk product-policy decisions.
 fn egress_posture(
@@ -2167,7 +2167,6 @@ fn run_claimed_engagement_turn(
             thinking: None,
             system_prompt,
             credential_capability: None,
-            credentials: Vec::new(),
             sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree.to_path_buf()]),
             // The fake seam offers no people: this path never reaches a model, so
             // there is no tool schema for a roster to appear on.
@@ -2675,7 +2674,6 @@ fn run_claimed_engagement_turn(
             credential_capability,
             // A linked provider account (ACCT-1), if any — resolved above,
             // nearest-scope-wins (LLM-2, ADR 0062).
-            credentials: Vec::new(),
             sandbox: sandbox_policy,
             // Who this turn's agent may name (`GATE-3f`). Read here, where the
             // workbench is in hand, rather than inside the turn: resolving a person
@@ -3445,9 +3443,8 @@ impl Workbench {
 mod tests {
     use super::*;
     use crate::test_support::fake_agent_env;
-    use gaugedesk_pi_bridge::{run_rpc_turn, RpcTransport, ScriptedTransport};
+    use gaugedesk_harness::testing::{ScriptedHarness, ScriptedToolCall, ScriptedTurn};
     use gaugedesk_workspace::Instance;
-    use std::collections::VecDeque;
     use std::io;
 
     #[derive(Debug)]
@@ -3648,11 +3645,11 @@ mod tests {
     // The BYOK leg is shell policy — the factory is never consulted for it.
     #[test]
     fn byok_provider_requires_its_linked_key() {
-        let pi = gaugedesk_pi_bridge::PiHarnessFactory;
+        let runtime = crate::harness_select::ScriptedFakeFactory;
         let capability = PresentCredential;
-        assert!(llm_credential_status("openai", Some(&capability), &pi).is_ok());
+        assert!(llm_credential_status("openai", Some(&capability), &runtime).is_ok());
         // nothing linked ⇒ refused with an actionable message
-        let err = llm_credential_status("anthropic", None, &pi).unwrap_err();
+        let err = llm_credential_status("anthropic", None, &runtime).unwrap_err();
         assert!(err.contains("anthropic"), "names the provider: {err}");
         assert!(
             err.to_lowercase().contains("account settings"),
@@ -3787,7 +3784,7 @@ mod tests {
     }
 
     // CORE-5: GaugeDesk decides the per-turn egress posture; WhippleScript enforces
-    // the admitted provider endpoint without relying on Pi's netns capability.
+    // the admitted provider endpoint without relying on a netns capability.
     #[test]
     fn egress_posture_filters_provider_calls_unless_policy_overrides() {
         use gaugedesk_harness::sandbox::Network;
@@ -3798,39 +3795,35 @@ mod tests {
         assert_eq!(egress_posture(true, true), Network::Allow);
     }
 
-    /// A scripted Pi transport: canned stdout lines in, sent commands recorded.
-    struct Scripted {
-        out: VecDeque<String>,
-        sent: Vec<String>,
-    }
-    impl Scripted {
-        fn new(lines: &[&str]) -> Self {
-            Self {
-                out: lines.iter().map(|s| s.to_string()).collect(),
-                sent: Vec::new(),
-            }
+    fn scripted_tool(name: &str, target: Option<&str>, result: Option<&str>) -> ScriptedToolCall {
+        ScriptedToolCall {
+            name: name.to_owned(),
+            call_id: format!("{name}-1"),
+            target: target.map(str::to_owned),
+            args: "{}".to_owned(),
+            result: result.map(str::to_owned),
+            ok: true,
         }
     }
-    impl RpcTransport for Scripted {
-        fn send(&mut self, line: &str) -> io::Result<()> {
-            self.sent.push(line.to_string());
-            Ok(())
-        }
-        fn recv(&mut self) -> io::Result<Option<String>> {
-            Ok(self.out.pop_front())
-        }
+
+    #[derive(Default)]
+    struct RecordingHarness {
+        prompt: Option<String>,
     }
-    // The scripted transport is also a Harness (ADR 0031) so tests drive the engine
-    // through the same harness-agnostic seam the real Pi adapter uses.
-    impl Harness for Scripted {
+
+    impl Harness for RecordingHarness {
         fn run_turn(
             &mut self,
-            gate: &dyn EgressGate,
+            _gate: &dyn EgressGate,
             prompt: &str,
-            images: &[ImageContent],
-            sink: &mut dyn FnMut(&Observation),
+            _images: &[ImageContent],
+            _sink: &mut dyn FnMut(&Observation),
         ) -> io::Result<TurnOutcome> {
-            run_rpc_turn(self, gate, prompt, images, sink)
+            self.prompt = Some(prompt.to_owned());
+            Ok(TurnOutcome {
+                assistant_text: "ok".into(),
+                ..TurnOutcome::default()
+            })
         }
     }
 
@@ -3909,7 +3902,7 @@ mod tests {
     }
 
     /// The Phase-2 gate, end-to-end and headless: a default agent works in a
-    /// worktree via (scripted) Pi, auto-commits, produces a diff + output — and
+    /// worktree via a scripted harness, auto-commits, produces a diff + output — and
     /// the membrane blocks an out-of-policy effect.
     #[test]
     fn canonical_loop_works_in_worktree_and_blocks_out_of_policy_effect() {
@@ -3924,19 +3917,22 @@ mod tests {
         .unwrap();
         let gate = MembraneGate::new(&config, BTreeSet::new());
 
-        // Pi: edits a file (in-policy), then attempts bash (blocked), then ends.
-        // The edit's effect on the worktree is simulated by the test writing the
-        // file — the bridge mediates the *decision*, the plugin does the write.
+        // The file effect is simulated by the test; the neutral harness still
+        // asks the real membrane to admit the write and reject bash.
         std::fs::write(eng.path().join("answer.txt"), "42\n").unwrap();
-        let mut transport = Scripted::new(&[
-            r#"{"type":"agent_start"}"#,
-            r#"{"type":"text_delta","delta":"Writing the answer."}"#,
-            r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"write","args":{}}"#,
-            r#"{"type":"tool_execution_end","toolCallId":"t1"}"#,
-            r#"{"type":"tool_execution_start","toolCallId":"t2","toolName":"bash","args":{}}"#,
-            r#"{"type":"agent_end","messages":[]}"#,
-            r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"Done. The answer is 42."}}"#,
-        ]);
+        let mut transport = ScriptedHarness::from_neutral_turns(vec![ScriptedTurn {
+            assistant_text: "Done. The answer is 42.".into(),
+            observations: vec![Observation {
+                kind: "text",
+                detail: "Writing the answer.".into(),
+                tool: None,
+            }],
+            tool_calls: vec![
+                scripted_tool("write", Some("answer.txt"), None),
+                scripted_tool("bash", None, None),
+            ],
+            ..ScriptedTurn::default()
+        }]);
 
         let mut store = Store::open_in_memory().unwrap();
         let result = run_task(
@@ -3983,12 +3979,15 @@ mod tests {
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let eng = inst.create_engagement("e1").unwrap();
         let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
-        let mut transport = Scripted::new(&[
-            r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"write","args":{"path":"answer.txt"}}"#,
-            r#"{"type":"tool_execution_end","toolCallId":"t1","result":"wrote 1 file","isError":false}"#,
-            r#"{"type":"agent_end","messages":[]}"#,
-            r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"ok"}}"#,
-        ]);
+        let mut transport = ScriptedHarness::from_neutral_turns(vec![ScriptedTurn {
+            assistant_text: "ok".into(),
+            tool_calls: vec![scripted_tool(
+                "write",
+                Some("answer.txt"),
+                Some("wrote 1 file"),
+            )],
+            ..ScriptedTurn::default()
+        }]);
         let mut store = Store::open_in_memory().unwrap();
         run_task(&mut store, "eng-1", &eng, &mut transport, &gate, "go", &[]).unwrap();
 
@@ -4021,13 +4020,11 @@ mod tests {
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let eng = inst.create_engagement("e1").unwrap();
         let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
-        // Pi reports a model-level error (e.g. an image to a non-vision model), then ends.
-        let mut transport = Scripted::new(&[
-            r#"{"type":"agent_start"}"#,
-            r#"{"type":"error","error":"model gpt-x does not support image input"}"#,
-            r#"{"type":"agent_end","messages":[]}"#,
-            r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":""}}"#,
-        ]);
+        // The runtime reports a model-level error (e.g. an image to a non-vision model).
+        let mut transport = ScriptedHarness::new(vec![TurnOutcome {
+            error: Some("model gpt-x does not support image input".into()),
+            ..TurnOutcome::default()
+        }]);
         let mut store = Store::open_in_memory().unwrap();
         let result = run_task(
             &mut store,
@@ -4148,12 +4145,16 @@ mod tests {
         let eng = inst.create_engagement("e1").unwrap();
         let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
 
-        let mut transport = Scripted::new(&[
-            r#"{"type":"text_delta","delta":"hi"}"#,
-            r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"read","args":{}}"#,
-            r#"{"type":"agent_end","messages":[]}"#,
-            r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"hi"}}"#,
-        ]);
+        let mut transport = ScriptedHarness::from_neutral_turns(vec![ScriptedTurn {
+            assistant_text: "hi".into(),
+            observations: vec![Observation {
+                kind: "text",
+                detail: "hi".into(),
+                tool: None,
+            }],
+            tool_calls: vec![scripted_tool("read", None, None)],
+            ..ScriptedTurn::default()
+        }]);
         let mut store = Store::open_in_memory().unwrap();
 
         let mut streamed: Vec<String> = Vec::new();
@@ -4375,10 +4376,7 @@ mod tests {
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let eng = inst.create_engagement("e1").unwrap();
         let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
-        let mut transport = Scripted::new(&[
-            r#"{"type":"agent_end","messages":[]}"#,
-            r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"ok"}}"#,
-        ]);
+        let mut transport = RecordingHarness::default();
         let mut store = Store::open_in_memory().unwrap();
         let mut sink = |_: &Observation| {};
         run_task_streaming(
@@ -4394,12 +4392,7 @@ mod tests {
         .unwrap();
 
         // the model receives the raw task, not a persona prefix.
-        assert!(transport.sent[0].contains("tighten the policy"));
-        assert!(
-            !transport.sent[0].contains("You are the editor"),
-            "no framing prefix: {}",
-            transport.sent[0]
-        );
+        assert_eq!(transport.prompt.as_deref(), Some("tighten the policy"));
         // the durable transcript shows the raw task the user typed.
         let user = store
             .records("e1", "transcript")
@@ -4621,10 +4614,10 @@ mod tests {
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let eng = inst.create_engagement("e1").unwrap();
         let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
-        let mut transport = Scripted::new(&[
-            r#"{"type":"agent_end","messages":[]}"#,
-            r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"ok"}}"#,
-        ]);
+        let mut transport = ScriptedHarness::new(vec![TurnOutcome {
+            assistant_text: "ok".into(),
+            ..TurnOutcome::default()
+        }]);
         let mut store = Store::open_in_memory().unwrap();
 
         // A federated scope owned by `acme` (the second `:`-segment).
@@ -4656,7 +4649,7 @@ mod tests {
     /// minted under the scope's owning authority (MINT-1) — no local worktree.
     #[test]
     fn engine_drives_a_remote_placed_turn_and_federates_its_observations() {
-        use gaugedesk_pi_bridge::RemoteLoopbackHarness;
+        use crate::test_support::RemoteLoopbackHarness;
 
         let mut store = Store::open_in_memory().unwrap();
         // A federated scope owned by `acme` (the second `:`-segment), so the minted
@@ -4665,16 +4658,7 @@ mod tests {
         let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
 
         // The remote peer streams two text tokens, so two observations cross back.
-        let mut harness = RemoteLoopbackHarness::new(
-            "127.0.0.1:7788",
-            [
-                r#"{"type":"agent_start"}"#,
-                r#"{"type":"text_delta","delta":"remote "}"#,
-                r#"{"type":"text_delta","delta":"work"}"#,
-                r#"{"type":"agent_end","messages":[]}"#,
-                r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"remote work"}}"#,
-            ],
-        );
+        let mut harness = RemoteLoopbackHarness::text("127.0.0.1:7788", &["remote ", "work"]);
 
         let result =
             run_task_remote(&mut store, scope, &mut harness, &gate, "do it remotely").unwrap();
@@ -4736,7 +4720,7 @@ mod tests {
     /// (INV-4), with no local worktree.
     #[test]
     fn workbench_holds_a_remote_session_and_drives_a_turn_against_it() {
-        use gaugedesk_pi_bridge::RemoteLoopbackHarness;
+        use crate::test_support::RemoteLoopbackHarness;
         use gaugedesk_workspace::Instance;
         use std::sync::{Arc, Mutex};
 
@@ -4754,15 +4738,9 @@ mod tests {
         let scope = "scope:acme:wb-remote";
         wb.lock_unpoisoned().register_remote_session(
             scope,
-            Box::new(RemoteLoopbackHarness::new(
+            Box::new(RemoteLoopbackHarness::text(
                 "127.0.0.1:7799",
-                [
-                    r#"{"type":"agent_start"}"#,
-                    r#"{"type":"text_delta","delta":"remote "}"#,
-                    r#"{"type":"text_delta","delta":"work"}"#,
-                    r#"{"type":"agent_end","messages":[]}"#,
-                    r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"remote work"}}"#,
-                ],
+                &["remote ", "work"],
             )),
         );
 
@@ -4813,12 +4791,12 @@ mod tests {
     #[test]
     #[ignore = "E2E-TEST-1: end-to-end two-authority loopback; run with --ignored"]
     fn e2e_two_authority_loopback_federation_with_signatures() {
+        use crate::test_support::RemoteLoopbackHarness;
         use gaugedesk_core::federated_delivery::{
             Authority, DeliveryCommand, DeliveryEnvelope, DeliveryPhase, DeliveryState,
         };
         use gaugedesk_core::ids::{BridgeGrantId, Nonce, PublicKey};
         use gaugedesk_core::signature::Signature;
-        use gaugedesk_pi_bridge::RemoteLoopbackHarness;
         use gaugedesk_store::AdmitError;
 
         let mut store = Store::open_in_memory().unwrap();
@@ -4828,16 +4806,7 @@ mod tests {
 
         // --- 1. A remote-placed turn whose observations federate back ------------
         // Two streamed text tokens cross the owner's bridge as handle-only facts.
-        let mut harness = RemoteLoopbackHarness::new(
-            "127.0.0.1:7900",
-            [
-                r#"{"type":"agent_start"}"#,
-                r#"{"type":"text_delta","delta":"remote "}"#,
-                r#"{"type":"text_delta","delta":"work"}"#,
-                r#"{"type":"agent_end","messages":[]}"#,
-                r#"{"type":"response","command":"get_last_assistant_text","success":true,"data":{"text":"remote work"}}"#,
-            ],
-        );
+        let mut harness = RemoteLoopbackHarness::text("127.0.0.1:7900", &["remote ", "work"]);
 
         let result =
             run_task_remote(&mut store, scope, &mut harness, &gate, "do it remotely").unwrap();
@@ -5004,10 +4973,7 @@ mod tests {
         let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
         let store = Store::open_in_memory().unwrap();
         let mut wb = crate::Workbench::with_target("inst-test", inst, store);
-        wb.seed_local_session_for_test(
-            "c1",
-            Box::new(ScriptedTransport::new(Vec::<String>::new())),
-        );
+        wb.seed_local_session_for_test("c1", Box::new(ScriptedHarness::new(vec![])));
         let harness = wb.sessions.get("c1").cloned().expect("the seeded session");
         let wb = Arc::new(Mutex::new(wb));
 
@@ -5034,7 +5000,7 @@ mod tests {
     /// session retires any local one under the same id, so the two maps stay disjoint.
     #[test]
     fn registering_a_remote_session_retires_a_local_one() {
-        use gaugedesk_pi_bridge::RemoteLoopbackHarness;
+        use crate::test_support::RemoteLoopbackHarness;
         use gaugedesk_workspace::Instance;
         use std::sync::{Arc, Mutex};
 
@@ -5044,18 +5010,12 @@ mod tests {
         let mut wb = crate::Workbench::with_target("inst-test", inst, store);
 
         // Seed a local session under the chat id, then place it remotely.
-        wb.seed_local_session_for_test(
-            "c1",
-            Box::new(ScriptedTransport::new(Vec::<String>::new())),
-        );
+        wb.seed_local_session_for_test("c1", Box::new(ScriptedHarness::new(vec![])));
         assert!(!wb.is_remote("c1"));
 
         wb.register_remote_session(
             "c1",
-            Box::new(RemoteLoopbackHarness::new(
-                "127.0.0.1:7800",
-                Vec::<String>::new(),
-            )),
+            Box::new(RemoteLoopbackHarness::new("127.0.0.1:7800", vec![])),
         );
         assert!(wb.is_remote("c1"), "now placed remotely");
         assert!(

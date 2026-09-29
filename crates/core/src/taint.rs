@@ -1,7 +1,7 @@
 //! Engagement-scoped taint (M1, ADR 0026). Ported from
 //! `specs/models/engagement-taint.qnt`.
 //!
-//! Because the Pi thread persists across a turn boundary, the agent *remembers*
+//! Because a runtime session persists across a turn boundary, the agent *remembers*
 //! what it read in an earlier run when it produces an output in a later run. So an
 //! output's conservative taint is the owners of everything the **engagement** read
 //! up to production — not just the producing run's reads. Egress of a tainted

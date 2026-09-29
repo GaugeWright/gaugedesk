@@ -10,14 +10,13 @@ This repository is the open-source distribution of the GaugeDesk platform.
 
 - **Core crates** — `crates/core` (pure, property-tested reducers), `crates/store`
   (SQLite event log + admission), `crates/workspace` (git instance/worktrees),
-  `crates/boundary` (the egress membrane), `crates/pi-bridge` (drives
-  `pi --mode rpc`), and `crates/app` (engine orchestrator + axum control plane).
+  `crates/boundary` (the egress membrane), and `crates/app` (engine orchestrator + axum control plane).
 - **Desktop shell** — `src-tauri/` (its own Cargo workspace).
 - **Web** — `web/` (workbench, mobile, `workbench-ui`, `control-plane-client`,
   `gw-embed`) and the enterprise web workspace under `ee/web/`.
 - **Enterprise (`ee/`)** — org/SSO/OIDC/SAML, SCIM, RBAC, enterprise audit
   (`ee/app`), and the SAML verifier sidecar (`ee/sidecar/saml-verify`).
-- **Federation protocol** and the open Pi membrane plugin (`plugin/`).
+- **Federation protocol** for remote runtime observation and admission.
 - **Docs** — `docs/`, rendered to the documentation site.
 
 ## Download
