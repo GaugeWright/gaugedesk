@@ -115,15 +115,16 @@ impl Workbench {
                             gaugedesk_whip_runtime::host_actions::register_native_tracker_package(
                                 &stores.runtime.runtime,
                             )?;
-                            let mut runtime = GovernedHostFacade::from_signed_store_with_verifier(
-                                stores.runtime,
-                                1,
-                                policy.signed_envelope(),
-                                &root,
-                            )
-                            .map_err(|error| {
-                                whipplescript_store::StoreError::Conflict(debug_error(error))
-                            })?;
+                            let mut runtime =
+                                gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
+                                    stores.runtime,
+                                    1,
+                                    policy.signed_envelope(),
+                                    &root,
+                                )
+                                .map_err(|error| {
+                                    whipplescript_store::StoreError::Conflict(debug_error(error))
+                                })?;
                             let verifier = ExactAdmission {
                                 command: &command,
                                 key: signing_key.public_key(),

@@ -461,7 +461,7 @@ impl Workbench {
                     );
                 };
                 let (target, source, history) = prepared.as_ref().ok_or_else(refused)?;
-                let runtime = GovernedHostFacade::from_signed_store_with_verifier(
+                let runtime = gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
                     source.open()?,
                     1,
                     &signed,

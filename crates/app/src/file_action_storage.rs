@@ -203,7 +203,7 @@ impl Workbench {
                     path.join("items.sqlite"),
                 )?;
                 register(&stores.runtime)?;
-                let mut runtime = GovernedHostFacade::from_signed_store_with_verifier(
+                let mut runtime = gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
                     stores,
                     command.policy.epoch,
                     policy.signed_envelope(),

@@ -2002,6 +2002,7 @@ mod native_model_context_tests {
                     source_handles: vec!["runtime".to_owned()],
                     complete: true,
                 },
+                wire: None,
             };
             capture.observe(
                 &serde_json::json!({"messages": ["first", "tool result"]}),
@@ -4643,6 +4644,7 @@ mod tests {
                 source_handles: vec!["runtime".to_owned()],
                 complete: true,
             },
+            wire: None,
         });
         let expected_request = request.clone();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

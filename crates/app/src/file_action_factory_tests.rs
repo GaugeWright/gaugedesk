@@ -697,7 +697,7 @@ pub(super) fn editor_runtime(
 ) -> gaugedesk_whip_runtime::host_actions::facade::GovernedHostFacade<
     gaugedesk_whip_runtime::host_actions::NativeStores,
 > {
-    use gaugedesk_whip_runtime::host_actions::{facade::GovernedHostFacade, NativeStores};
+    use gaugedesk_whip_runtime::host_actions::NativeStores;
     let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
     let root = GovernanceRootVerifier::new(wb.authority().clone(), key.public_key());
     let policy = crate::action_policy::load_action_policy(
@@ -711,7 +711,7 @@ pub(super) fn editor_runtime(
         &root,
     )
     .unwrap();
-    GovernedHostFacade::from_signed_store_with_verifier(
+    gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
         NativeStores::open(
             root_path.join("runtime.sqlite"),
             root_path.join("coord.sqlite"),

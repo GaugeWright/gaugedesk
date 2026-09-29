@@ -250,7 +250,7 @@ impl Workbench {
                 let root =
                     GovernanceRootVerifier::new(issuer, prepared.inspection.key.public_key());
                 let (home_root, store) = source.open()?;
-                let mut runtime = GovernedHostFacade::from_signed_store_with_verifier(
+                let mut runtime = gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
                     store,
                     command.policy.epoch,
                     &prepared.signed_policy,

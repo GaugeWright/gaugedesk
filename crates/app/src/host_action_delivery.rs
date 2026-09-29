@@ -233,7 +233,7 @@ rule echo
             command.input_schema_ref = action.input_schema_ref().into();
             command.inputs.get_mut("content").unwrap().handle = "ledger".into();
             command.resources.clear();
-            let temporary = GovernedHostFacade::from_signed_store_with_verifier(
+            let temporary = gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
                 NativeStores::open_in_memory().unwrap(),
                 7,
                 &signed_policy,
@@ -262,7 +262,7 @@ rule echo
         }
         fn host(&self) -> GovernedHostFacade<NativeStores> {
             let path = self.directory.path();
-            GovernedHostFacade::from_signed_store_with_verifier(
+            gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
                 NativeStores::open(
                     path.join("runtime.sqlite"),
                     path.join("coord.sqlite"),

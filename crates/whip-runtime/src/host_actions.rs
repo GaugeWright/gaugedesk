@@ -16,6 +16,30 @@ pub use whipplescript_kernel::host_protocol::{
 pub use whipplescript_parser::IrWorkflowContractKind;
 pub use whipplescript_store::{log_append::LogAppend, native_stores::NativeStores, RuntimeStore};
 
+/// Open the governed native facade with the identity of the running compiler
+/// artifact. Action admission must bind this executable before it can create
+/// a version or publish a materialized result.
+pub fn open_governed_host_facade<S, V>(
+    store: S,
+    epoch: u64,
+    signed_envelope: &str,
+    verifier: &V,
+) -> Result<facade::GovernedHostFacade<S>, facade::HostFacadeError>
+where
+    S: RuntimeStore,
+    V: whipplescript_kernel::gov::GovernanceAttestationVerifier + ?Sized,
+{
+    let compiler_digest = whipplescript::host_runtime::native_compiler_artifact_digest()
+        .map_err(facade::HostFacadeError::Resolver)?;
+    facade::GovernedHostFacade::from_signed_store_with_verifier(
+        store,
+        epoch,
+        signed_envelope,
+        verifier,
+    )
+    .map(|runtime| runtime.with_compiler_artifact_digest(compiler_digest))
+}
+
 /// Product admission carries the runtime owner's complete command. The shell
 /// authenticates it before calling the product store; this alias grants no
 /// authority and does not create an agent run or turn.

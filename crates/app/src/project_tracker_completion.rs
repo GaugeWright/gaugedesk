@@ -211,7 +211,7 @@ impl Workbench {
                                 .collect::<Vec<_>>(),
                             |_| {
                                 let mut runtime =
-                                    GovernedHostFacade::from_signed_store_with_verifier(
+                                    gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
                                         stores.runtime,
                                         1,
                                         prepared.policy.signed_envelope(),
@@ -566,7 +566,7 @@ impl Workbench {
                                     serde_json::from_str(&resolved[0].content)?,
                                 )]);
                                 let mut runtime =
-                                    GovernedHostFacade::from_signed_store_with_verifier(
+                                    gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
                                         stores.runtime,
                                         1,
                                         prepared.policy.signed_envelope(),

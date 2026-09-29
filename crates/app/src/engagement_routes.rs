@@ -2151,6 +2151,43 @@ fn project_wire_model_context(
             );
         }
     }
+    for key in ["max_tokens", "stream", "store", "parallel_tool_calls"] {
+        if let Some(value) = body.get(key) {
+            let valid = if key == "max_tokens" {
+                value.as_u64().is_some()
+            } else {
+                value.as_bool().is_some()
+            };
+            if !valid {
+                return None;
+            }
+            output.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(options) = body.get("stream_options") {
+        let options = options.as_object()?;
+        if options.len() != 1 || !options.get("include_usage")?.is_boolean() {
+            return None;
+        }
+        output.insert(
+            "stream_options".into(),
+            serde_json::Value::Object(options.clone()),
+        );
+    }
+    let unmapped_field = body
+        .keys()
+        .any(|key| key != "prompt_cache_key" && !output.contains_key(key));
+    if !redacted && !unmapped_field {
+        if let Some(cache_key) = body.get("prompt_cache_key") {
+            output.insert(
+                "prompt_cache_key".into(),
+                serde_json::json!(cache_key.as_str()?),
+            );
+        }
+    }
+    // A new provider field may carry model input without a source label.
+    // Preserve the mapped input planes but never release an unmapped field.
+    redacted |= unmapped_field;
     Some((serde_json::Value::Object(output), redacted))
 }
 
@@ -2391,6 +2428,7 @@ mod raw_model_context_tests {
         });
         let visible = project_model_context(&view, |_| true).unwrap();
         assert_eq!(visible["calls"][0]["body"], view["calls"][0]["body"]);
+
         assert!(!visible.to_string().contains("package:pinned"));
         assert!(!visible.to_string().contains("secret_metadata"));
 
@@ -2478,6 +2516,20 @@ mod raw_model_context_tests {
         }
         let visible = project_model_context(&view, |_| true).unwrap();
         assert_eq!(visible["calls"][0]["body"], view["calls"][0]["body"]);
+
+        let mut extra_field = view.clone();
+        extra_field["calls"][0]["body"]["unmapped_input"] =
+            serde_json::json!("private unclassified instruction");
+        let projected = project_model_context(&extra_field, |_| true).unwrap();
+        assert_eq!(projected["calls"][0]["redacted"], true);
+        assert_eq!(
+            projected["calls"][0]["body"]["messages"],
+            view["calls"][0]["body"]["messages"]
+        );
+        assert!(!projected
+            .to_string()
+            .contains("private unclassified instruction"));
+        assert!(!projected.to_string().contains("private-cache-key"));
 
         let mut unknown = view;
         unknown["calls"][0]["provenance_complete"] = serde_json::json!(false);

@@ -336,7 +336,7 @@ pub(crate) fn load_action_label(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gaugedesk_whip_runtime::host_actions::{facade::GovernedHostFacade, NativeStores};
+    use gaugedesk_whip_runtime::host_actions::NativeStores;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Barrier};
 
@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(replay.signed_envelope(), signed);
         assert_eq!(replay.policy_ref(), &expected);
         let loaded = load_action_policy(&product, &id, &expected, &root).unwrap();
-        let runtime = GovernedHostFacade::from_signed_store_with_verifier(
+        let runtime = gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
             NativeStores::open_in_memory().unwrap(),
             expected.epoch,
             loaded.signed_envelope(),

@@ -391,13 +391,14 @@ impl Workbench {
                         .collect::<Vec<_>>();
                     inputs
                         .with_resolved_many(&retained, |_| {
-                            let mut runtime = GovernedHostFacade::from_signed_store_with_verifier(
-                                stores.runtime,
-                                1,
-                                prepared.policy.signed_envelope(),
-                                &prepared.root,
-                            )
-                            .map_err(runtime_error)?;
+                            let mut runtime =
+                                gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
+                                    stores.runtime,
+                                    1,
+                                    prepared.policy.signed_envelope(),
+                                    &prepared.root,
+                                )
+                                .map_err(runtime_error)?;
                             advance_native(
                                 &mut runtime,
                                 &prepared.action,

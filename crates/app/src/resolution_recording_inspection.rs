@@ -124,7 +124,7 @@ impl CorrectionInspectionPreparation {
         issuer: &gaugedesk_core::ids::AuthorityId,
     ) -> StoreResult<GovernedHostFacade<SqliteStore>> {
         let root = GovernanceRootVerifier::new(issuer.clone(), self.key.public_key());
-        GovernedHostFacade::from_signed_store_with_verifier(
+        gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
             self.source.open()?,
             1,
             &self.signed_policy,
