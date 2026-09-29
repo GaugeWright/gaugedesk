@@ -157,8 +157,12 @@ case "${1:-}" in
   lockfile)
     cargo metadata --locked --format-version 1 >/dev/null
     # The shells pin what they share with the trunk at its versions (DR-0241).
-    node --test scripts/check-shell-lockfiles.test.mjs
-    node scripts/check-shell-lockfiles.mjs ;;
+    if projected; then
+        echo "#unasserted: shell lockfiles are private and are not checked in the public mirror"
+    else
+        node --test scripts/check-shell-lockfiles.test.mjs
+        node scripts/check-shell-lockfiles.mjs
+    fi ;;
   formatting)              cargo fmt --all --check ;;
   lints)                   cargo clippy --workspace --all-targets -- -D warnings ;;
   tests)
@@ -203,7 +207,12 @@ case "${1:-}" in
     fi ;;
   # The native targets are rendered from Cargo.toml (GaugeWright BUILD.md
   # stages 5 and 6); this fails when the rendering has drifted from it.
-  native-crates)           python3 scripts/buckify-crates.py --check ;;
+  native-crates)
+    if projected; then
+        echo "#unasserted: Buck2 target rendering is private and is not checked in the public mirror"
+    else
+        python3 scripts/buckify-crates.py --check
+    fi ;;
   no-default-features)
     # The open build must stay buildable without the enterprise features. Keep
     # this feature graph out of the all-feature test graph's fingerprints:
