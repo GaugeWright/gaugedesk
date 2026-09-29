@@ -92,6 +92,21 @@ export type HomeBootstrapState =
           readonly selectedHome: HomeId | null;
       };
 
+export interface ProjectManagementSession {
+    readonly id: string;
+    readonly generation: string;
+    readonly scope: { readonly kind: "project"; readonly id: string };
+    readonly actor: string;
+    readonly pages: readonly { readonly id: string; readonly resource_basis: string }[];
+    readonly update_cursor: string;
+}
+export interface ProjectManagementMessage {
+    readonly id: string;
+    readonly sequence: number;
+    readonly role: "user" | "assistant";
+    readonly text: string;
+}
+
 /** A Console-safe pointer: the owning workspace and a count, never review data. */
 export interface TenantReviewNotification {
     readonly tenant: string;
@@ -1067,6 +1082,71 @@ export class WorkbenchControlPlane implements ControlPlane {
         }
     }
 
+    private async projectManagementJson(project: ProjectId): Promise<RouteJson> {
+        return (await this.projectTrackerTransport(project)).json;
+    }
+
+    async openProjectManagement(project: ProjectId): Promise<ProjectManagementSession> {
+        const json = await this.projectManagementJson(project);
+        const result = await json("POST", `/projects/${encodeURIComponent(project)}/settings/sessions`) as { session: ProjectManagementSession };
+        return result.session;
+    }
+
+    async projectManagementMessages(project: ProjectId, session: ProjectManagementSession): Promise<readonly ProjectManagementMessage[]> {
+        const json = await this.projectManagementJson(project);
+        const query = new URLSearchParams({ session: session.id, generation: session.generation, scope: session.scope.id });
+        const result = await json("GET", `/projects/${encodeURIComponent(project)}/settings/agent/messages?${query}`) as { thread: { messages: ProjectManagementMessage[] } };
+        return result.thread.messages;
+    }
+
+    async sendProjectManagementMessage(project: ProjectId, session: ProjectManagementSession, message: string, key: string): Promise<void> {
+        const json = await this.projectManagementJson(project);
+        await json("POST", `/projects/${encodeURIComponent(project)}/settings/agent/messages`, {
+            session_id: session.id, generation: session.generation, scope: session.scope,
+            idempotency_key: key, message,
+        }, { idempotencyKey: key });
+    }
+
+    async stopProjectManagement(project: ProjectId, session: ProjectManagementSession): Promise<void> {
+        const json = await this.projectManagementJson(project);
+        await json("POST", `/projects/${encodeURIComponent(project)}/settings/agent/stop`, {
+            session_id: session.id, generation: session.generation, scope: session.scope,
+        });
+    }
+
+    async eraseProjectManagement(project: ProjectId, session: ProjectManagementSession): Promise<void> {
+        const json = await this.projectManagementJson(project);
+        const key = globalThis.crypto.randomUUID();
+        await json("POST", `/projects/${encodeURIComponent(project)}/settings/agent/erase`, {
+            session_id: session.id, generation: session.generation, scope: session.scope,
+            idempotency_key: key,
+        }, { idempotencyKey: key });
+    }
+
+    async setProjectManagementNetworkIsolation(project: ProjectId, isolated: boolean): Promise<void> {
+        const session = await this.openProjectManagement(project);
+        const json = await this.projectManagementJson(project);
+        const key = globalThis.crypto.randomUUID();
+        await json("POST", `/projects/${encodeURIComponent(project)}/settings/commands`, {
+            session_id: session.id, generation: session.generation, app: "project-settings", scope: session.scope,
+            page_id: "overview", command_id: "project.network-isolation.set",
+            expected_basis: session.pages[0]?.resource_basis,
+            idempotency_key: key, payload: { isolated }, client: "web",
+        }, { idempotencyKey: key });
+    }
+
+    async setProjectManagementName(project: ProjectId, name: string): Promise<void> {
+        const session = await this.openProjectManagement(project);
+        const json = await this.projectManagementJson(project);
+        const key = globalThis.crypto.randomUUID();
+        await json("POST", `/projects/${encodeURIComponent(project)}/settings/commands`, {
+            session_id: session.id, generation: session.generation, app: "project-settings", scope: session.scope,
+            page_id: "overview", command_id: "project.name.set",
+            expected_basis: session.pages[0]?.resource_basis,
+            idempotency_key: key, payload: { name }, client: "web",
+        }, { idempotencyKey: key });
+    }
+
     async listProjectTrackers(project: ProjectId) {
         return workbenchClient.listProjectTrackers(await this.projectTrackerTransport(project), project);
     }
@@ -1272,11 +1352,11 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     renameProject(id: ProjectId, name: string): Promise<void> {
-        return workbenchClient.renameProject(this.workbenchTransport(), id, name);
+        return this.setProjectManagementName(id, name);
     }
 
     setProjectNetworkIsolated(id: ProjectId, isolated: boolean): Promise<void> {
-        return workbenchClient.setProjectNetworkIsolated(this.workbenchTransport(), id, isolated);
+        return this.setProjectManagementNetworkIsolation(id, isolated);
     }
 
     deleteProject(id: ProjectId): Promise<void> {
@@ -1630,6 +1710,30 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.getResources(this.workbenchTransport(), id);
     }
 
+    getContextInspection(id: EngagementId, resource: string): Promise<workbenchClient.ContextInspectionStatus> {
+        return workbenchClient.getContextInspection(this.workbenchTransport(), id, resource);
+    }
+
+    requestContextInspection(id: EngagementId, resource: string): Promise<workbenchClient.ContextInspectionStatus> {
+        return workbenchClient.requestContextInspection(this.workbenchTransport(), id, resource);
+    }
+
+    getContextInspectionRequests(id: EngagementId, resource: string): Promise<{readers: string[]; granted: string[]}> {
+        return workbenchClient.getContextInspectionRequests(this.workbenchTransport(), id, resource);
+    }
+
+    approveContextInspection(id: EngagementId, resource: string, reader: string): Promise<void> {
+        return workbenchClient.approveContextInspection(this.workbenchTransport(), id, resource, reader);
+    }
+
+    revokeContextInspection(id: EngagementId, resource: string, reader: string): Promise<void> {
+        return workbenchClient.revokeContextInspection(this.workbenchTransport(), id, resource, reader);
+    }
+
+    revokeOwnContextInspection(id: EngagementId, resource: string): Promise<workbenchClient.ContextInspectionStatus> {
+        return workbenchClient.revokeOwnContextInspection(this.workbenchTransport(), id, resource);
+    }
+
     getResourceContent(id: EngagementId, resource: string, path?: string): Promise<string> {
         return workbenchClient.getResourceContent(this.workbenchTransport(), id, resource, path);
     }
@@ -1703,6 +1807,18 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     getModelContext(id: EngagementId): Promise<workbenchClient.LiveModelContext> {
         return workbenchClient.getModelContext(this.workbenchTransport(), id);
+    }
+
+    getMethodInspection(id: EngagementId): Promise<workbenchClient.MethodInspectionStatus> {
+        return workbenchClient.getMethodInspection(this.workbenchTransport(), id);
+    }
+
+    requestMethodInspection(id: EngagementId): Promise<workbenchClient.MethodInspectionStatus> {
+        return workbenchClient.requestMethodInspection(this.workbenchTransport(), id);
+    }
+
+    revokeMethodInspection(id: EngagementId): Promise<workbenchClient.MethodInspectionStatus> {
+        return workbenchClient.revokeMethodInspection(this.workbenchTransport(), id);
     }
 
     getContextUsage(id: EngagementId): Promise<workbenchClient.ChatContextUsage | null> {
@@ -2003,8 +2119,41 @@ export class WorkbenchControlPlane implements ControlPlane {
         return accountClient.acceptAccountInvitation(this.routeJson(), tenantId);
     }
 
-    createOrganization(displayName: string): Promise<accountClient.AccountTenant> {
-        return accountClient.createOrganization(this.routeJson(), displayName);
+    async createOrganization(displayName: string): Promise<accountClient.AccountTenant> {
+        const account = this.nativeRemote ? this.route : this.routeJson();
+        const tenant = await accountClient.createOrganization(account, displayName);
+        // The Hub has already reserved the identity. A missing or ineligible
+        // Personal Home leaves it pending; a later explicit Host choice can
+        // complete the same project without creating another organization.
+        try {
+            const home = this.usesRemoteHome()
+                ? await this.connectRoutedProject("proj-default" as ProjectId)
+                : this.localWorkTransport;
+            await accountClient.materializeOrganizationSharedProject(home.json, tenant.id, true);
+        } catch {
+            // The pending reservation remains visible at the account route.
+        }
+        try {
+            return {
+                ...tenant,
+                sharedProject: await accountClient.organizationSharedProject(account, tenant.id),
+            };
+        } catch {
+            return tenant;
+        }
+    }
+
+    organizationSharedProject(tenantId: string): Promise<accountClient.OrganizationSharedProject> {
+        return accountClient.organizationSharedProject(
+            this.nativeRemote ? this.route : this.routeJson(), tenantId,
+        );
+    }
+
+    async materializeOrganizationSharedProject(tenantId: string): Promise<string> {
+        const home = this.usesRemoteHome()
+            ? await this.connectSelectedHome()
+            : this.localWorkTransport;
+        return accountClient.materializeOrganizationSharedProject(home.json, tenantId, false);
     }
 
     deleteOrganization(tenantId: string): Promise<void> {

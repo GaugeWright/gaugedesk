@@ -1648,6 +1648,8 @@ pub struct EngagementTurnInput<'a> {
     pub authenticated_actor: Option<&'a gaugedesk_core::ids::AuthorityId>,
     /// Verified request authority, rechecked when a tracker tool executes.
     pub authenticated_context: Option<&'a crate::identity::AuthenticatedActionContext>,
+    /// Set only by the desktop operator listener, never a relay or federation run.
+    pub local_operator: bool,
     /// Authority that drove this turn for workstream contribution attribution.
     /// This is distinct from the runtime actor: a verified federated crossing may
     /// drive a hub-resident chat while the hub still owns runtime execution.
@@ -1857,6 +1859,7 @@ fn run_claimed_engagement_turn(
         mode,
         authenticated_actor,
         authenticated_context,
+        local_operator,
         contribution_by,
         account_scope,
         tenant_scope,
@@ -1864,9 +1867,24 @@ fn run_claimed_engagement_turn(
         runtime_command_id,
         harness_factory,
     } = input;
-    let task_action_context = authenticated_context.cloned().or_else(|| {
-        account_bearer.and_then(|bearer| wb.lock_unpoisoned().authenticate_action_context(bearer))
-    });
+    let task_action_context = authenticated_context
+        .cloned()
+        .or_else(|| {
+            account_bearer
+                .and_then(|bearer| wb.lock_unpoisoned().authenticate_action_context(bearer))
+        })
+        .or_else(|| {
+            if !local_operator
+                || mode != ChatMode::Use
+                || authenticated_actor.is_some()
+                || account_bearer.is_some()
+            {
+                return None;
+            }
+            let g = wb.lock_unpoisoned();
+            let project = g.library_project_of_chat(id)?;
+            g.local_personal_tracker_context(&project)
+        });
     bind_turn_image_submitter(
         id,
         authenticated_actor.or_else(|| task_action_context.as_ref().map(|context| context.actor())),
@@ -3093,7 +3111,7 @@ fn live_sink(sender: &broadcast::Sender<ServerEvent>) -> impl FnMut(&Observation
     }
 }
 
-/// Bound to the authenticated turn; each call rechecks current project authority.
+/// Bound to the admitted turn; each call rechecks current project authority.
 struct CurrentProjectTaskFiler {
     wb: SharedWorkbench,
     context: crate::identity::AuthenticatedActionContext,
@@ -3177,7 +3195,16 @@ fn drive_persistent_turn(
     task_tracker_project: Option<&str>,
 ) -> Result<TaskResult, EngineError> {
     // 1. Check out this turn's resources under a brief lock, then drop it.
-    let (mut store, engagement, harness, persistent, answers, fork_snapshot, pause_project) = {
+    let (
+        mut store,
+        engagement,
+        harness,
+        persistent,
+        answers,
+        answer_sources,
+        fork_snapshot,
+        pause_project,
+    ) = {
         let mut g = wb.lock_unpoisoned();
         if g.chat_project_moving(id) {
             return Err(EngineError::Admit(AdmitError::Rejected(
@@ -3221,7 +3248,12 @@ fn drive_persistent_turn(
         // Answers that arrived since this chat's last turn ride this turn's prompt
         // (ADR 0113 §1). Taken under the same brief lock, and marked delivered as
         // they are taken, so the agent is told each answer exactly once.
-        let answers = crate::agent_question::answers_context(&g.take_undelivered_answers(id));
+        let delivered_answers = g.take_undelivered_answers(id);
+        let answer_sources = delivered_answers
+            .iter()
+            .map(crate::agent_question::answer_source_handle)
+            .collect::<Option<Vec<_>>>();
+        let answers = crate::agent_question::answers_context(&delivered_answers);
         let fork_snapshot = g.turn_fork_snapshot(
             id,
             spec.policy_epoch,
@@ -3234,6 +3266,7 @@ fn drive_persistent_turn(
             harness,
             persistent,
             answers,
+            answer_sources,
             fork_snapshot,
             pause_project,
         )
@@ -3248,7 +3281,7 @@ fn drive_persistent_turn(
         // different authenticated member than the one who created its harness.
         harness.bind_authenticated_actor(actor_ref);
         harness.bind_runtime_command_id(runtime_command_id);
-        harness.bind_user_context_provenance(answers.is_empty());
+        harness.bind_user_context_provenance(answer_sources.as_deref());
         let task_filer: Option<Arc<dyn TaskFiler>> =
             match (task_action_context, task_tracker_project) {
                 (Some(context), Some(project)) => Some(Arc::new(CurrentProjectTaskFiler {
@@ -4414,6 +4447,7 @@ mod tests {
                 mode: ChatMode::Use,
                 authenticated_actor: None,
                 authenticated_context: None,
+                local_operator: false,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
@@ -4485,6 +4519,7 @@ mod tests {
                 mode: ChatMode::Use,
                 authenticated_actor: None,
                 authenticated_context: None,
+                local_operator: false,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
@@ -4558,6 +4593,7 @@ mod tests {
                 mode: ChatMode::Use,
                 authenticated_actor: None,
                 authenticated_context: None,
+                local_operator: false,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,

@@ -26,6 +26,9 @@ enum Source {
 impl Source {
     fn from_request(context: &AuthenticatedActionContext) -> Result<Self, String> {
         match context.authentication() {
+            ActorAuthentication::LocalPersonalTracker => {
+                Err("local tracker authority cannot authorize file dispatch".into())
+            }
             ActorAuthentication::AccountSession { session_ref } => Ok(Self::AccountSession {
                 session_ref: session_ref.clone(),
             }),

@@ -13,7 +13,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, Method, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -38,6 +38,14 @@ pub fn routes() -> Router<SharedWorkbench> {
         // The counterpart to the create above. Without it an organization made
         // by mistake was permanent — see `delete_tenant`.
         .route("/account/tenants/{id}", delete(delete_tenant))
+        .route(
+            "/account/tenants/{id}/shared-project",
+            get(get_organization_shared_project),
+        )
+        .route(
+            "/account/tenants/{id}/shared-project/host",
+            put(put_organization_shared_project_host),
+        )
         // Invitation truth stays in each tenant directory. These account routes
         // expose/accept only the current person's metadata pointer.
         .route("/account/invitations", get(get_invitations))
@@ -123,10 +131,30 @@ pub async fn get_tenants(
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     let scope = wb.account_scope_for(net_http::bearer(&headers));
+    let actor = wb.actor(net_http::bearer(&headers));
     match wb.account_tenancy_in(&scope) {
         Ok(tenancy) => {
-            let list: Vec<_> = tenancy.tenants.values().collect();
-            (StatusCode::OK, Json(json!({ "tenants": list }))).into_response()
+            let list: Result<Vec<_>, gaugedesk_store::AdmitError> = tenancy
+                .tenants
+                .values()
+                .map(|tenant| {
+                    let mut value = serde_json::to_value(tenant).unwrap_or_default();
+                    if !tenant.personal {
+                        if let Some(intent) =
+                            crate::tenancy::organization_project_intent(wb.store_ref(), &tenant.id)?
+                        {
+                            if intent.founding_owner == actor {
+                                value["shared_project"] = json!(intent);
+                            }
+                        }
+                    }
+                    Ok(value)
+                })
+                .collect();
+            match list {
+                Ok(list) => (StatusCode::OK, Json(json!({ "tenants": list }))).into_response(),
+                Err(error) => err_response(error),
+            }
         }
         Err(e) => err_response(e),
     }
@@ -230,6 +258,95 @@ pub async fn post_tenant(
     ) {
         Ok(tenant) => (StatusCode::CREATED, Json(json!({ "tenant": tenant }))).into_response(),
         Err(e) => err_response(e),
+    }
+}
+
+/// The founder's reserved project reference. The Home, not the Hub, supplies
+/// its title, issues and members after placement.
+pub async fn get_organization_shared_project(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if net_http::bearer(&headers).is_none()
+        && crate::account_signin::hub_session_actor(&wb).is_some()
+    {
+        return crate::account_signin::proxy_account_authority(
+            &wb,
+            Method::GET,
+            format!(
+                "/account/tenants/{}/shared-project",
+                url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
+            ),
+            headers,
+            Bytes::new(),
+        )
+        .await;
+    }
+    let wb = wb.lock_unpoisoned();
+    let actor = wb.actor(net_http::bearer(&headers));
+    let account_scope = wb.account_scope_for(net_http::bearer(&headers));
+    let admitted = crate::tenancy::Tenancy::rebuild_in(wb.store_ref(), &account_scope)
+        .is_ok_and(|tenancy| tenancy.contains(&id));
+    let active_owner = crate::org::Org::rebuild_in(wb.store_ref(), &crate::org::tenant_scope(&id))
+        .is_ok_and(|org| org.role_of(&actor) == Some(gaugedesk_core::abac::Role::owner()));
+    let intent = crate::tenancy::organization_project_intent(wb.store_ref(), &id);
+    match intent {
+        Ok(Some(intent)) if admitted && active_owner && intent.founding_owner == actor => {
+            (StatusCode::OK, Json(json!({ "project": intent }))).into_response()
+        }
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => err_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SharedProjectHostBody {
+    home_id: String,
+}
+
+/// Reserve the first Project Host before asking that Home to materialize the
+/// project. A same-Home retry is inert; a different Home requires handoff.
+pub async fn put_organization_shared_project_host(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SharedProjectHostBody>,
+) -> impl IntoResponse {
+    if net_http::bearer(&headers).is_none()
+        && crate::account_signin::hub_session_actor(&wb).is_some()
+    {
+        return crate::account_signin::proxy_account_authority(
+            &wb,
+            Method::PUT,
+            format!(
+                "/account/tenants/{}/shared-project/host",
+                url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
+            ),
+            headers,
+            Bytes::from(json!({ "home_id": body.home_id }).to_string()),
+        )
+        .await;
+    }
+    let mut wb = wb.lock_unpoisoned();
+    let actor = wb.actor(net_http::bearer(&headers));
+    let account_scope = wb.account_scope_for(net_http::bearer(&headers));
+    let admitted = crate::tenancy::Tenancy::rebuild_in(wb.store_ref(), &account_scope)
+        .is_ok_and(|tenancy| tenancy.contains(&id));
+    let active_owner = crate::org::Org::rebuild_in(wb.store_ref(), &crate::org::tenant_scope(&id))
+        .is_ok_and(|org| org.role_of(&actor) == Some(gaugedesk_core::abac::Role::owner()));
+    if actor == "anonymous" || !admitted || !active_owner {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match crate::tenancy::select_organization_project_home(
+        wb.store_mut(),
+        &id,
+        &actor,
+        &body.home_id,
+    ) {
+        Ok(Some(intent)) => (StatusCode::OK, Json(json!({ "project": intent }))).into_response(),
+        Ok(None) => StatusCode::CONFLICT.into_response(),
+        Err(error) => err_response(error),
     }
 }
 
@@ -497,6 +614,46 @@ mod tests {
             value["tenants"].as_array().unwrap().len(),
             3,
             "four creates, three organizations: {listed}",
+        );
+    }
+
+    #[tokio::test]
+    async fn organization_create_exposes_one_pending_project_and_sticky_host_choice() {
+        let app = router();
+        let (status, created) = create_tenant(&app, "Acme", Some("one-create")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = tenant_id(&created);
+        let path = format!("/account/tenants/{}/shared-project", urlencoding(&id));
+        let (status, pending) = send(&app, "GET", &path, None).await;
+        assert_eq!(status, StatusCode::OK, "{pending}");
+        let before: serde_json::Value = serde_json::from_str(&pending).unwrap();
+        assert_eq!(before["project"]["home_id"], serde_json::Value::Null);
+        let expected_id = before["project"]["project_id"].clone();
+        let (_, switcher) = send(&app, "GET", "/account/tenants", None).await;
+        let switcher: serde_json::Value = serde_json::from_str(&switcher).unwrap();
+        assert_eq!(
+            switcher["tenants"][0]["shared_project"]["project_id"],
+            expected_id
+        );
+        let host_path = format!("{path}/host");
+        let (status, placed) = send(&app, "PUT", &host_path, Some(r#"{"home_id":"home-a"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{placed}");
+        let placed: serde_json::Value = serde_json::from_str(&placed).unwrap();
+        assert_eq!(placed["project"]["project_id"], expected_id);
+        assert_eq!(placed["project"]["home_id"], "home-a");
+        let (status, retried) = create_tenant(&app, "Acme", Some("one-create")).await;
+        assert_eq!(status, StatusCode::OK, "{retried}");
+        assert_eq!(tenant_id(&retried), id);
+        let (_, reread) = send(&app, "GET", &path, None).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reread).unwrap(),
+            placed
+        );
+        assert_eq!(
+            send(&app, "PUT", &host_path, Some(r#"{"home_id":"home-b"}"#))
+                .await
+                .0,
+            StatusCode::CONFLICT
         );
     }
 

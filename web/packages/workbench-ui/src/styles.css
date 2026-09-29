@@ -417,7 +417,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
         transparent 40% 60%, var(--gold) 60% 80%, transparent 80%); opacity: .65; }
 .resizer:hover::before, .resizer.dragging::before { opacity: 1; }
 .resizer.disabled { visibility: hidden; pointer-events: none; }
-.run .transcript { flex: 1; overflow: auto; min-height: 0; }
+.run .transcript-frame { flex: 1 1 auto; min-height: 0; }
 /* The work shell wraps the chat pane in a slot so GaugeApps can swap its own
    chat in beside it. The slot has to carry .run's column layout through, or the
    transcript stops absorbing the pane's slack and the composer rides up under
@@ -433,12 +433,12 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* No-selection chat pane (the quick-start on-ramp): same anatomy as a live
    chat — this empty transcript absorbs the slack so the composer docks at the
    bottom, with one quiet line of guidance where the conversation will be. */
-.empty-chat-welcome { display: flex; align-items: flex-end; }
+.empty-chat-welcome { display: flex; flex: 1 1 auto; min-height: 0; align-items: flex-end; }
 .empty-chat-hint { margin: 0 0 4px; color: var(--muted); font-size: var(--fs-ui);
     line-height: 1.5; max-width: 46ch; }
 .embed-chat { display: flex; flex-direction: column; height: 100%; min-height: 0;
     min-width: 0; overflow: hidden; }
-.embed-chat > .transcript { flex: 1 1 auto; overflow: auto; min-height: 0; }
+.embed-chat > .transcript-frame { flex: 1 1 auto; min-height: 0; }
 /* Transcript scroll behavior (transcript-scroll.ts): the spacer under the last
    turn reserves exactly the room a just-sent message needs to anchor at the top
    of the viewport; the pill floats over the seam between transcript and
@@ -450,10 +450,37 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
    streamed token re-renders the open line, and the browser's native scroll
    anchoring reacts to that swap by adjusting scrollTop itself — a jitter the
    hold then visibly corrects. One owner, not two. */
-.transcript { overscroll-behavior: contain; overflow-anchor: none; }
+.transcript-frame { display: flex; position: relative; min-width: 0; }
+.transcript-frame > .transcript { flex: 1 1 auto; min-width: 0; min-height: 0;
+    overflow: auto; overscroll-behavior: contain; overflow-anchor: none; }
+.transcript-frame.has-chat-log-navigation > .transcript { padding-left: 60px; }
+/* One mark for each user turn. The compact rail remains independent of the
+   transcript's scrollbox, so its preview can extend to the right of the marks. */
+.chat-log-navigation { position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+    width: 56px; max-height: min(420px, calc(100% - 16px)); display: flex; z-index: 5; }
+.chat-log-navigation-ticks { width: 56px; min-height: 0; overflow-y: auto; scrollbar-width: none; }
+.chat-log-navigation-ticks::-webkit-scrollbar { display: none; }
+.chat-log-navigation-mark { display: flex; align-items: center; width: 56px; height: 18px;
+    padding: 0 2px; border: 0; background: none; cursor: pointer; }
+.chat-log-navigation-mark:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.chat-log-navigation-bar { display: block; height: 3px; border-radius: 2px;
+    background: var(--muted); opacity: .6; transition: width 100ms ease, opacity 100ms ease; }
+.chat-log-navigation-bar.selected { background: var(--ink); opacity: 1; }
+.chat-log-navigation-preview { position: absolute; left: 66px; transform: translateY(-50%);
+    z-index: 6; width: min(320px, calc(100% - 74px)); max-height: min(150px, calc(100% - 12px));
+    overflow: hidden; padding: 12px 14px; border: 1px solid var(--edge); border-radius: 10px;
+    background: var(--panel); color: var(--ink); box-shadow: 0 8px 24px rgb(0 0 0 / 25%);
+    font-family: var(--font-prose); font-size: var(--fs-body); line-height: 1.45;
+    white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none; }
+/* A content-sized Panel lets its host page scroll. Keep its rail in view while
+   the page moves through the tall transcript; the marks still target that page. */
+.chat-log-navigation.page-sized { position: sticky; top: 16px; transform: none;
+    order: -1; flex: 0 0 0; align-self: flex-start; }
 .raw-model-context { padding: 20px; min-width: 0; }
 .raw-model-context h2 { margin: 0 0 8px; font-size: 13px; letter-spacing: .1em; text-transform: uppercase; }
 .raw-model-context-note, .raw-model-context-status { color: var(--muted); font-size: 13px; }
+.raw-model-context button { margin: 0 0 8px; padding: 7px 10px; border: 1px solid var(--edge); border-radius: 6px; background: var(--panel); color: var(--ink); cursor: pointer; }
+.raw-model-context button:disabled { opacity: .5; cursor: default; }
 .raw-model-context-call { margin-top: 18px; border: 1px solid var(--edge); border-radius: 8px; overflow: hidden; }
 .raw-model-context-call h3 { margin: 0; padding: 9px 12px; border-bottom: 1px solid var(--edge); font-size: 12px; }
 .raw-model-context-call pre { margin: 0; padding: 12px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; }
@@ -1667,18 +1694,6 @@ input {
        directory) and can exceed the viewport; cap it and scroll internally so the head (with
        the close button) stays reachable — same shape as `.devices-modal`. */
     .embed-monitor { max-height: 85vh; overflow-y: auto; }
-    .embed-snippet { background: var(--bg); border: 1px solid var(--edge); border-radius: 4px;
-        padding: 8px; overflow-x: auto; white-space: pre; font-size: var(--fs-small); }
-    .deployment-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    /* The origin allowlist is edited one origin per line, so it is a textarea that
-       dresses like the inputs beside it and never wraps an origin mid-way. */
-    .deployment-origins { display: block; box-sizing: border-box; width: 100%; resize: vertical;
-        font: inherit; white-space: pre; overflow-x: auto; background: var(--bg); color: var(--ink);
-        border: 1px solid var(--edge); border-radius: 4px; }
-    .deployment-preview { min-height: 360px; height: 55vh; border: 1px solid var(--edge);
-        border-radius: 4px; overflow: hidden; margin-top: 8px; }
-    .deployment-preview gw-session { display: block; height: 100%; }
-    .deployment-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .modal-head { display: flex; justify-content: space-between; align-items: center; }
     .modal-head h3 { margin: 0; font-size: var(--fs-body); }
 }
@@ -1724,21 +1739,10 @@ input {
 .agent-settings-page-head h1 { margin: 4px 0 0; font-size: 1.5em; font-weight: 600; line-height: 1.2; }
 .agent-settings-page-head button { flex: none; }
 .agent-settings-content .settings-form { margin-top: 20px; }
-.agent-settings-content [data-panel-public-profile] .settings-checkbox { display: flex; align-items: center; gap: 7px; }
-.agent-settings-content [data-panel-public-profile] .settings-checkbox input[type="checkbox"] { flex: none; width: auto; margin: 0; }
-.agent-settings-content [data-panel-public-profile] .deployment-field-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); }
-.agent-settings-content [data-panel-public-profile] .settings-field { min-width: 0; }
-.agent-settings-content [data-panel-public-profile] .settings-field input,
-.agent-settings-content [data-panel-public-profile] .settings-field select { box-sizing: border-box; min-width: 0; width: 100%; }
 .settings-field { display: flex; flex-direction: column; gap: 4px; border: none; padding: 0;
     margin: 0; }
 .settings-label { font-size: var(--fs-small); color: var(--muted); text-transform: uppercase;
     letter-spacing: 0.05em; }
-.settings-input { font-size: var(--fs-ui); padding: 4px 7px; }
-.settings-checkbox { display: flex; align-items: center; gap: 7px;
-    font-size: var(--fs-ui); cursor: pointer; }
-.settings-checkbox input { cursor: pointer; }
-.settings-checkbox { margin: 2px 0; }
 .settings-advanced-toggle { background: transparent; border: none; color: var(--muted);
     font-size: var(--fs-small); padding: 2px 0; cursor: pointer; text-align: left; }
 .settings-advanced-toggle:hover { color: var(--fg); background: transparent; border: none; }
@@ -1867,6 +1871,9 @@ input {
 .tree-node:hover { background: color-mix(in srgb, var(--accent) 7%, var(--edge)); }
 .tree-node .node-icon { color: var(--muted); font-size: var(--fs-label); cursor: pointer; width: 10px; display: inline-block; text-align: center; }
 .tree-node .node-icon:hover { color: var(--fg); }
+.tree-node .project-caret { flex: 0 0 10px; height: 20px; border: 0; padding: 0;
+    background: none; font: inherit; line-height: 20px; }
+.tree-node.project { cursor: pointer; }
 /* A leaf with no children gets a width-matched spacer instead of a caret, so the
    ▾/▸ no longer promises a fold that expands to nothing (#2 round-9). */
 .tree-node .node-icon-empty { cursor: default; }
@@ -2363,7 +2370,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
    mount needs, for the same reason. */
 .mobile-chat { display: flex; flex-direction: column; height: 100%; min-height: 0;
     padding: 8px 10px; }
-.mobile-chat > .transcript { flex: 1 1 auto; overflow: auto; min-height: 0; }
+.mobile-chat > .transcript-frame { flex: 1 1 auto; min-height: 0; }
 
 /* Enterprise admin console (M3, ADR 0043; surfaces B10–B16). */
 .admin-section { border-top: 1px solid var(--edge); padding: 12px 0; }
@@ -2389,7 +2396,6 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     .member-row .member-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     /* A live deployment's admitted origins are a list, and every entry matters, so
        this one id wraps instead of eliding the rest behind an ellipsis. */
-    .member-row .deployment-origin-list { white-space: normal; overflow-wrap: anywhere; }
     .member-row select { width: auto; }
     .member-status { color: var(--muted); font-size: var(--fs-small); }
     .badge { font-size: var(--fs-label); padding: 1px 5px; border: 1px solid var(--edge); border-radius: 3px; color: var(--muted); }

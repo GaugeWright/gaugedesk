@@ -1,0 +1,234 @@
+/*
+ * The Panel-agent surfaces (PANEL-12): the contract editor, the opened Panel
+ * agent, and the deploy dialog. One vocabulary for all three, because
+ * an owner moves between them in one sitting and a setting should look the same
+ * wherever it is read or changed.
+ *
+ * A section says what it is for before its first control. A choice among a few
+ * named options is a card; a yes/no is a switch; a wire name, where one still
+ * has to be editable, sits under Advanced.
+ */
+
+.pa-root { font-family: var(--font-chrome); color: var(--ink); }
+
+/* --- sections -------------------------------------------------------------- */
+
+.pa-section { display: grid; gap: 10px; padding: 16px 0; }
+.pa-section + .pa-section, .pa-section.divided { border-top: 1px solid color-mix(in srgb, var(--edge) 74%, transparent); }
+.pa-section-head { display: grid; gap: 3px; }
+.pa-section-head h3 { margin: 0; font: 500 var(--fs-body)/1.3 var(--font-chrome); color: var(--ink);
+    letter-spacing: 0; text-transform: none; }
+.pa-section-head p { margin: 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.45; max-width: 110ch; }
+.pa-hint { margin: 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.45; }
+.pa-hint.warn { color: var(--warn); }
+.pa-error { margin: 0; color: var(--bad); font-size: var(--fs-small); line-height: 1.45; }
+
+/* --- options ---------------------------------------------------------------- */
+
+/* Every yes/no and one-of-few choice: the box or dot first, then the name, then
+   a quiet line saying what it does. One row, not a card. */
+.pa-options { display: grid; gap: 1px; }
+.pa-option { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 9px;
+    padding: 4px 0; cursor: pointer; }
+.pa-option input { margin: 0; width: 14px; height: 14px; padding: 0; accent-color: var(--accent);
+    cursor: pointer; transform: translateY(2px); }
+.pa-option > span { min-width: 0; line-height: 1.4; }
+.pa-option strong { margin-right: 8px; font-weight: 400; font-size: var(--fs-ui); color: var(--ink); }
+.pa-option small { color: var(--muted); font-size: var(--fs-small); }
+.pa-option.disabled { cursor: not-allowed; }
+.pa-option.disabled > span { opacity: .55; }
+.pa-option.disabled input { cursor: not-allowed; }
+/* An option that carries its own action (a stored key and its Remove). */
+.pa-option-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pa-option-row > .pa-option { flex: 1 1 auto; min-width: 0; }
+/* Choices that belong to the option above them. */
+.pa-indent { padding-left: 23px; }
+.pa-indent-box { margin-left: 23px; }
+
+/* --- panels ---------------------------------------------------------------- */
+
+/* The panels themselves are the choice: one small toggle each, the box inside it. */
+.pa-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pa-chip { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 11px 0 9px;
+    border: 1px solid var(--edge); border-radius: 999px; background: transparent; color: var(--muted);
+    font-size: var(--fs-ui); cursor: pointer; user-select: none; }
+.pa-chip input { margin: 0; width: 13px; height: 13px; padding: 0; accent-color: var(--accent); cursor: pointer; }
+.pa-chip:hover { border-color: color-mix(in srgb, var(--accent) 60%, var(--edge)); color: var(--ink); }
+.pa-chip:has(input:checked) { border-color: var(--accent); color: var(--ink);
+    background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.pa-chip:has(input:disabled) { cursor: default; }
+.pa-chip:has(input:focus-visible) { outline: 2px solid color-mix(in srgb, var(--accent) 75%, #fff); outline-offset: 2px; }
+/* --- fields ---------------------------------------------------------------- */
+
+.pa-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 10px 12px; }
+.pa-field { display: grid; align-content: start; gap: 5px; min-width: 0; margin: 0; }
+.pa-field > span:first-child { color: var(--ink); font-size: var(--fs-ui); }
+.pa-field > small { color: var(--muted); font-size: var(--fs-small); line-height: 1.35; }
+.pa-fieldset { gap: 8px; min-inline-size: 0; padding: 0; border: 0; }
+.pa-fieldset > legend { float: left; width: 100%; margin-bottom: 8px; padding: 0; color: var(--ink); font-size: var(--fs-ui); }
+/* Agent settings keeps its own page frame; its save row sits under the last section. */
+.agent-settings-save { margin-top: 14px; }
+.pa-input, .pa-root select.pa-input, .pa-root textarea.pa-input {
+    box-sizing: border-box; width: 100%; min-width: 0; height: 30px; margin: 0; padding: 4px 9px;
+    border: 1px solid var(--edge); border-radius: 5px; background: var(--bg); color: var(--ink);
+    font: inherit; font-size: var(--fs-ui); }
+.pa-root textarea.pa-input { height: auto; min-height: 84px; padding: 8px 9px; resize: vertical;
+    font-family: var(--mono); line-height: 1.45; }
+.pa-input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); outline-offset: 0; border-color: var(--accent); }
+.pa-input[aria-invalid="true"] { border-color: var(--bad); }
+/* An input that carries its unit: "$ [ 10 ]", "[ 24 ] hours". */
+.pa-affix { display: flex; align-items: stretch; min-width: 0; border: 1px solid var(--edge);
+    border-radius: 5px; background: var(--bg); overflow: hidden; }
+.pa-affix:focus-within { border-color: var(--accent); outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent); }
+.pa-affix > span { display: grid; place-items: center; padding: 0 8px; color: var(--muted);
+    font-size: var(--fs-small); background: color-mix(in srgb, var(--panel) 70%, transparent); white-space: nowrap; }
+.pa-affix .pa-input, .pa-affix select { height: 28px; border: 0; border-radius: 0; outline: none; }
+.pa-affix select { width: auto; padding: 0 6px; background: color-mix(in srgb, var(--panel) 70%, transparent);
+    color: var(--muted); font: inherit; font-size: var(--fs-small); border-left: 1px solid var(--edge); }
+.pa-affix .pa-input { flex: 1 1 auto; }
+/* A deployment's address: the edge's host, then the part the owner names. */
+.pa-address .pa-input { font-family: var(--mono); }
+
+/* --- advanced disclosure --------------------------------------------------- */
+
+.pa-advanced { border-top: 1px dashed color-mix(in srgb, var(--edge) 80%, transparent); padding-top: 8px; }
+.pa-advanced > summary { width: max-content; color: var(--muted); font-size: var(--fs-small); cursor: pointer;
+    list-style: none; }
+.pa-advanced > summary::-webkit-details-marker { display: none; }
+.pa-advanced > summary::before { content: "▸"; display: inline-block; width: 12px; }
+.pa-advanced[open] > summary::before { content: "▾"; }
+.pa-advanced > summary:hover { color: var(--ink); }
+.pa-advanced > div { display: grid; gap: 10px; padding: 10px 0 2px; }
+
+/* --- lists: starting files, websites, visitors ----------------------------- */
+
+.pa-list { display: grid; margin: 0; padding: 0; list-style: none; border: 1px solid var(--edge); border-radius: 8px; overflow: hidden; }
+.pa-list:empty { display: none; }
+.pa-list > li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px;
+    min-height: 38px; padding: 5px 6px 5px 12px; background: color-mix(in srgb, var(--panel) 40%, transparent); }
+.pa-list > li + li { border-top: 1px solid color-mix(in srgb, var(--edge) 70%, transparent); }
+.pa-list > li > span { display: grid; gap: 1px; min-width: 0; }
+.pa-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; font-size: var(--fs-ui); }
+.pa-list small { color: var(--muted); font-size: var(--fs-small); }
+.pa-list code { font-family: var(--mono); font-size: var(--fs-small); }
+.pa-empty { margin: 0; padding: 12px; border: 1px dashed var(--edge); border-radius: 8px;
+    color: var(--muted); font-size: var(--fs-small); text-align: center; }
+.pa-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.pa-row > .pa-input, .pa-row > .pa-affix { flex: 1 1 220px; }
+.pa-composer { display: grid; gap: 8px; padding: 10px; border: 1px solid var(--edge); border-radius: 8px;
+    background: color-mix(in srgb, var(--panel) 50%, transparent); }
+
+/* --- buttons --------------------------------------------------------------- */
+
+.pa-root button { font-size: var(--fs-ui); }
+.pa-root .pa-button { height: 30px; min-width: 0; padding: 0 12px; border-radius: 5px; white-space: nowrap; }
+.pa-root .pa-button.primary { border-color: var(--accent); background: var(--accent); color: var(--accent-contrast); }
+.pa-root .pa-button.primary:hover:not(:disabled) { background: var(--accent-hover, var(--accent)); filter: brightness(1.08); }
+.pa-root .pa-button.danger { color: var(--bad); }
+.pa-root .pa-button.danger.solid { border-color: var(--bad); background: var(--bad); color: #fff; }
+.pa-root .pa-button:disabled { opacity: .5; cursor: not-allowed; }
+.pa-root .pa-quiet { height: auto; min-width: 0; padding: 3px 7px; border-color: transparent; background: transparent; color: var(--muted);
+    font-size: var(--fs-small); }
+.pa-root .pa-quiet:hover { color: var(--ink); background: var(--edge); border-color: transparent; }
+.pa-root .pa-quiet.danger:hover { color: var(--bad); }
+.pa-root .pa-link { min-width: 0; padding: 0; border: 0; background: none; color: var(--accent); font-size: var(--fs-small);
+    text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.pa-root .pa-link:hover { background: none; border: 0; color: var(--accent-hover, var(--accent)); }
+
+/* --- the contract, read back ----------------------------------------------- */
+
+.pa-facts { display: grid; grid-template-columns: minmax(96px, max-content) minmax(0, 1fr); gap: 7px 16px; margin: 0; }
+.pa-facts dt { color: var(--muted); font-size: var(--fs-small); padding-top: 1px; }
+.pa-facts dd { margin: 0; font-size: var(--fs-ui); line-height: 1.4; }
+
+/* --- status, stats, code --------------------------------------------------- */
+
+.pa-pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px 2px 7px; border-radius: 999px;
+    border: 1px solid var(--edge); font-size: var(--fs-small); color: var(--muted); white-space: nowrap; }
+.pa-pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pa-pill[data-tone="live"] { color: var(--gw-default-success); border-color: color-mix(in srgb, var(--gw-default-success) 45%, transparent); }
+.pa-pill[data-tone="paused"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.pa-pill[data-tone="revoked"] { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+.pa-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 130px), 1fr)); gap: 8px; }
+.pa-stat { display: grid; gap: 3px; padding: 10px 12px; border: 1px solid var(--edge); border-radius: 8px;
+    background: color-mix(in srgb, var(--panel) 50%, transparent); }
+.pa-stat span { color: var(--muted); font-size: var(--fs-small); }
+.pa-stat strong { font: 400 var(--fs-title)/1.2 var(--font-chrome); }
+.pa-stat small { color: var(--muted); font-size: var(--fs-small); }
+.pa-meter { height: 4px; margin-top: 4px; border-radius: 999px; background: var(--edge); overflow: hidden; }
+.pa-meter > span { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
+.pa-meter[data-tone="high"] > span { background: var(--warn); }
+.pa-code { position: relative; }
+.pa-code pre { margin: 0; padding: 10px 76px 10px 12px; border: 1px solid var(--edge); border-radius: 8px;
+    background: var(--bg); font-family: var(--mono); font-size: var(--fs-small); line-height: 1.5;
+    white-space: pre-wrap; overflow-wrap: anywhere; }
+.pa-root .pa-code button { position: absolute; top: 6px; right: 6px; }
+.pa-callout { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid var(--edge);
+    border-left: 3px solid var(--accent); border-radius: 8px; background: color-mix(in srgb, var(--accent) 6%, var(--panel)); }
+.pa-callout.warn { border-left-color: var(--warn); background: color-mix(in srgb, var(--warn) 6%, var(--panel)); }
+.pa-callout.success { border-left-color: var(--gw-default-success); background: color-mix(in srgb, var(--gw-default-success) 6%, var(--panel)); }
+.pa-callout strong { font-weight: 500; }
+.pa-callout p { margin: 0; color: var(--muted); font-size: var(--fs-small); line-height: 1.45; }
+
+/* --- the opened Panel agent ------------------------------------------------ */
+
+/* No frame and no header: the pane is the page. The column keeps a readable
+   width and runs to the foot, where the bar sits. */
+.panel-agent-surface .project-settings-page { display: flex; flex-direction: column; min-height: 100%;
+    width: min(820px, 100%); margin: 0 auto; padding: 0; border: 0; box-shadow: none; }
+.panel-agent-surface .pa-body { flex: 1 0 auto; padding: 4px 18px 0; }
+/* The bar stays in reach at the foot of the pane while the sections scroll. It
+   says which draft or version this is, and carries what the page header did. */
+.pa-savebar { position: sticky; bottom: 0; z-index: 1; display: flex; flex-wrap: wrap; align-items: center;
+    justify-content: space-between; gap: 10px; margin: 8px 0 0; padding: 10px 18px;
+    border-top: 1px solid var(--edge); background: color-mix(in srgb, var(--navy) 55%, var(--panel)); }
+/* Which draft or version this is, then whether it is saved. */
+.pa-savebar-where { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0;
+    font-size: var(--fs-small); }
+.pa-savebar-where .panel-agent-subtitle { color: var(--ink); }
+.pa-savebar-status { display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--muted); font-size: var(--fs-small); }
+.pa-savebar-status[data-dirty="true"] { color: var(--warn); }
+.pa-savebar-status[data-dirty="true"]::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--warn); }
+.pa-savebar-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* --- the deploy dialog ----------------------------------------------------- */
+
+.pa-dialog { box-sizing: border-box; display: flex; flex-direction: column; width: 720px; max-width: 94vw;
+    max-height: min(90vh, 900px); padding: 0; overflow: hidden; border-radius: 12px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, .34); }
+.pa-dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+    padding: 18px 22px 14px; border-bottom: 1px solid var(--edge); }
+.pa-dialog-head > div { display: grid; gap: 4px; min-width: 0; }
+.pa-dialog-kicker { color: var(--accent); font-size: var(--fs-label); letter-spacing: .08em; text-transform: uppercase; }
+.pa-dialog-head h2 { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0; text-transform: none; letter-spacing: 0;
+    font: 400 1.35em/1.2 var(--font-chrome); }
+.pa-dialog-head p { margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.pa-root .pa-dialog-close { border: 0; background: transparent; color: var(--muted); font-size: 1.7em; line-height: 1; padding: 0 2px; }
+.pa-root .pa-dialog-close:hover { color: var(--ink); background: transparent; }
+.pa-dialog-body { flex: 1 1 auto; overflow-y: auto; padding: 4px 22px 8px; scrollbar-gutter: stable; }
+.pa-dialog-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 12px 22px; border-top: 1px solid var(--edge); background: color-mix(in srgb, var(--navy) 45%, var(--panel)); }
+.pa-dialog-foot .pa-error, .pa-dialog-foot .pa-hint { flex: 1 1 240px; min-width: 0; }
+.pa-dialog-foot > div { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.pa-switcher { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 14px; }
+.pa-root .pa-switcher button { height: 28px; padding: 0 10px; border-radius: 999px; font-size: var(--fs-small); }
+.pa-root .pa-switcher button[aria-pressed="true"] { border-color: var(--accent); color: var(--ink);
+    background: color-mix(in srgb, var(--accent) 14%, var(--bg)); }
+.pa-status-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.pa-status-line a { color: var(--accent); font-family: var(--mono); font-size: var(--fs-small); overflow-wrap: anywhere; }
+.pa-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--bad) 50%, var(--edge)); border-radius: 8px;
+    background: color-mix(in srgb, var(--bad) 7%, var(--panel)); font-size: var(--fs-small); }
+.pa-confirm > span { flex: 1 1 220px; }
+
+@media (max-width: 560px) {
+    .pa-dialog-head, .pa-dialog-body, .pa-dialog-foot { padding-inline: 14px; }
+    .pa-facts { grid-template-columns: minmax(0, 1fr); gap: 2px 0; }
+    .pa-facts dd { margin-bottom: 6px; }
+}
+
+@container (max-width: 480px) {
+    .panel-agent-surface .pa-body { padding-inline: 10px; }
+    .pa-facts { grid-template-columns: minmax(0, 1fr); gap: 2px 0; }
+    .pa-facts dd { margin-bottom: 6px; }
+}

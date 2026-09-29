@@ -8,6 +8,86 @@ import { WorkbenchControlPlane } from "./workbench-control-plane";
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("organization shared project creation", () => {
+    it("keeps Desktop organization account calls on the sealed local account route", async () => {
+        const paths: string[] = [];
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            paths.push(url);
+            if (url.endsWith("/account/tenants")) {
+                return new Response(JSON.stringify({ tenant: {
+                    id: "organization:abc", display_name: "Acme", role: "owner", personal: false,
+                } }), { status: 201 });
+            }
+            if (url.endsWith("/account/hub-session/reach")) {
+                return new Response(JSON.stringify({
+                    person: "alice", device: "desktop",
+                    homes: { homes: [], selected_home: null }, routes: { routes: [] },
+                }));
+            }
+            if (url.endsWith("/account/tenants/organization%3Aabc/shared-project")) {
+                return new Response(JSON.stringify({ project: {
+                    id: "shared", project_id: "proj-org-abc", founding_owner: "alice",
+                    display_name: "Acme", home_id: null,
+                } }));
+            }
+            throw new Error(`unexpected account route: ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        api.setNativeRemote(true);
+        await expect(api.createOrganization("Acme")).resolves.toMatchObject({
+            sharedProject: { projectId: "proj-org-abc", homeId: null },
+        });
+        await expect(api.organizationSharedProject("organization:abc")).resolves.toMatchObject({
+            projectId: "proj-org-abc", homeId: null,
+        });
+        expect(paths).toEqual([
+            "http://127.0.0.1:4919/account/tenants",
+            "http://127.0.0.1:4919/account/hub-session/reach",
+            "http://127.0.0.1:4919/account/hub-session/reach",
+            "http://127.0.0.1:4919/account/tenants/organization%3Aabc/shared-project",
+            "http://127.0.0.1:4919/account/tenants/organization%3Aabc/shared-project",
+        ]);
+    });
+
+    it("tries the Personal Home and keeps a pending reservation if that Home is ineligible", async () => {
+        const paths: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            paths.push(url);
+            if (url.endsWith("/account/tenants")) {
+                return new Response(JSON.stringify({ tenant: {
+                    id: "organization:abc", display_name: "Acme", role: "owner", personal: false,
+                } }), { status: 201 });
+            }
+            if (url.endsWith("/organizations/organization%3Aabc/shared-project/materialize")) {
+                return new Response(JSON.stringify({ error: "Personal Home is ineligible" }), { status: 409 });
+            }
+            if (url.endsWith("/account/tenants/organization%3Aabc/shared-project")) {
+                return new Response(JSON.stringify({ project: {
+                    id: "shared", project_id: "proj-org-abc", founding_owner: "alice",
+                    display_name: "Acme", home_id: null,
+                } }));
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        await expect(api.createOrganization("Acme")).resolves.toMatchObject({
+            id: "organization:abc", sharedProject: { projectId: "proj-org-abc", homeId: null },
+        });
+        await expect(api.organizationSharedProject("organization:abc")).resolves.toMatchObject({
+            projectId: "proj-org-abc", homeId: null,
+        });
+        expect(paths).toEqual([
+            "http://127.0.0.1:4919/account/tenants",
+            "http://127.0.0.1:4919/organizations/organization%3Aabc/shared-project/materialize",
+            "http://127.0.0.1:4919/account/tenants/organization%3Aabc/shared-project",
+            "http://127.0.0.1:4919/account/tenants/organization%3Aabc/shared-project",
+        ]);
+    });
+});
+
 describe("selected desktop account outside the local Home", () => {
     it("serves work through the sealed broker and reuses one Home admission", async () => {
         vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });

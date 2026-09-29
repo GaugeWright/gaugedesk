@@ -120,6 +120,24 @@ impl Workbench {
             .command
             .is_some())
     }
+
+    /// Inspect the original command's queue, without reinterpreting a pinned
+    /// run using the current release source.
+    pub(crate) fn project_workflow_uses_tracker(
+        &self,
+        project: &str,
+        actor: &str,
+        request: &str,
+        queue: &str,
+    ) -> Result<bool, String> {
+        let scope = request_scope(project, actor, request)?;
+        Ok(self
+            .store_ref()
+            .fold::<ProductActionAdmission>(&scope)
+            .map_err(debug_error)?
+            .command
+            .is_some_and(|command| command.resources.contains_key(queue)))
+    }
 }
 
 /// The launcher a launch scope was keyed to, or `None` if `scope` is not one.

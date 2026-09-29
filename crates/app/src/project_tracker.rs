@@ -86,6 +86,7 @@ struct ProjectAuthority {
     policy: Policy,
     deadline_ms: Option<u64>,
     org: Org,
+    local_personal: bool,
 }
 
 struct Snapshot {
@@ -194,7 +195,23 @@ fn current_project(
     context: &AuthenticatedActionContext,
     project: &str,
 ) -> Result<ProjectAuthority, AdmitError> {
-    let deadline_ms = crate::identity::revalidate_workflow_context(store, home, context)?;
+    let local_personal = matches!(
+        context.authentication(),
+        crate::identity::ActorAuthentication::LocalPersonalTracker
+    );
+    let deadline_ms = if local_personal {
+        if home.as_str() != "home:local-user"
+            || context.actor().as_str() != crate::LOCAL_AUTHORITY
+            || project != crate::DEFAULT_PROJECT
+        {
+            return Err(refused(
+                "local tracker authority serves only local Personal",
+            ));
+        }
+        None
+    } else {
+        crate::identity::revalidate_workflow_context(store, home, context)?
+    };
     store.retained_events(LIBRARY_SCOPE)?;
     store.retained_events(ORG_SCOPE)?;
     let library = Library::rebuild(store)?;
@@ -211,7 +228,7 @@ fn current_project(
         || &workspace.home_id != home
         || workspace.project_id != project
         || workspace.workspace_id.trim().is_empty()
-        || !org.can_access_project(context.actor().as_str(), project)
+        || (!local_personal && !org.can_access_project(context.actor().as_str(), project))
         || library
             .project_collaboration_workspaces
             .values()
@@ -228,6 +245,7 @@ fn current_project(
         policy: org.policy(),
         deadline_ms,
         org,
+        local_personal,
     })
 }
 
@@ -239,6 +257,15 @@ fn capture(
     queue: &str,
     request_id: Option<&str>,
 ) -> Result<(Snapshot, DispatchReadBasis), AdmitError> {
+    let local_personal = matches!(
+        context.authentication(),
+        crate::identity::ActorAuthentication::LocalPersonalTracker
+    );
+    if local_personal && (queue != PROJECT_TASKS || request_id.is_some()) {
+        return Err(refused(
+            "local Personal admits only ordinary task filing and reads",
+        ));
+    }
     let scope = registry_scope(project, queue)?;
     // A workflow's unattended standing reads its trackers; it never declares,
     // requests or decides access.
@@ -439,6 +466,11 @@ fn commit(
 }
 
 fn permitted(snapshot: &Snapshot, recipient: &str, permission: TrackerPermission) -> bool {
+    if snapshot.authority.local_personal {
+        return snapshot.home_owned
+            && snapshot.project == crate::DEFAULT_PROJECT
+            && recipient == crate::LOCAL_AUTHORITY;
+    }
     if snapshot.home_owned {
         return snapshot
             .authority
@@ -470,6 +502,23 @@ fn check_policy(
 }
 
 impl Workbench {
+    /// The desktop operator's signed-out Personal tracker authority. The
+    /// relay and hosted routers admit their own callers before these methods.
+    pub(crate) fn local_personal_tracker_context(
+        &self,
+        project: &str,
+    ) -> Option<AuthenticatedActionContext> {
+        (!self.hosted_home_mode()
+            && self.home_id().as_str() == "home:local-user"
+            && project == crate::DEFAULT_PROJECT
+            && self
+                .library
+                .projects
+                .get(project)
+                .is_some_and(|record| record.home_id == *self.home_id()))
+        .then(AuthenticatedActionContext::local_personal_tracker)
+    }
+
     /// Declare an empty native tracker resource. Existing names never acquire a
     /// new owner or fresh owner grants from re-opening a source file.
     pub fn declare_project_tracker(

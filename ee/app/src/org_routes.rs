@@ -649,6 +649,21 @@ fn person_account_path(path: &str) -> bool {
         && !path.starts_with("/account/hub-session")
 }
 
+fn native_account_path(path: &str, method: &axum::http::Method) -> bool {
+    path.starts_with("/gaugeapps/account-settings/")
+        || (path == "/account/tenants" && method == axum::http::Method::POST)
+        || (path.starts_with("/account/tenants/")
+            && ((path.ends_with("/shared-project") && method == axum::http::Method::GET)
+                || (path.ends_with("/shared-project/host") && method == axum::http::Method::PUT)))
+        || matches!(
+            path,
+            "/auth/account/authorization/start"
+                | "/auth/account/authorization/finish"
+                | "/auth/account/consumer-oidc/link/start"
+                | "/auth/account/consumer-oidc/avatar/start"
+        )
+}
+
 /// ENTSEC-1 middleware ([ADR 0065]): in **enterprise mode** (an `IdentityProvider` is attached
 /// and the directory is provisioned) every consultant route requires an authenticated active
 /// member; **solo / loopback passes through** (the control-plane API is the local operator's own
@@ -698,20 +713,11 @@ pub async fn enterprise_auth(
     let enforce_software = path != "/admin/software-policy";
     // Creating an organization belongs to the same sealed Hub account as the
     // picker membership projection, even when this desktop selected a Home.
-    let native_account_path = path.starts_with("/gaugeapps/account-settings/")
-        || (path == "/account/tenants" && method == axum::http::Method::POST)
-        || matches!(
-            path.as_str(),
-            "/auth/account/authorization/start"
-                | "/auth/account/authorization/finish"
-                | "/auth/account/consumer-oidc/link/start"
-                | "/auth/account/consumer-oidc/avatar/start"
-        );
     if req
         .extensions()
         .get::<gaugedesk_app::account_signin::NativeAccountPlane>()
         .is_some()
-        && native_account_path
+        && native_account_path(&path, &method)
         && bearer.is_none()
     {
         let Some(actor) = gaugedesk_app::account_signin::hub_session_actor(&wb) else {
@@ -2218,6 +2224,21 @@ mod enterprise_connection_test_tests {
 
 #[cfg(test)]
 mod authenticated_actor_tests {
+    #[test]
+    fn native_shared_project_account_routes_use_the_sealed_hub_session() {
+        assert!(super::native_account_path(
+            "/account/tenants/organization%3Aabc/shared-project",
+            &axum::http::Method::GET,
+        ));
+        assert!(super::native_account_path(
+            "/account/tenants/organization%3Aabc/shared-project/host",
+            &axum::http::Method::PUT,
+        ));
+        assert!(!super::native_account_path(
+            "/account/tenants/organization%3Aabc/shared-project/host",
+            &axum::http::Method::DELETE,
+        ));
+    }
     use std::sync::{Arc, Mutex};
 
     use axum::body::Body;

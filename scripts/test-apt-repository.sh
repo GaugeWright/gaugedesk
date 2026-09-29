@@ -14,6 +14,8 @@ file_size() { echo "$(( $(wc -c < "$1") ))"; }
 
 make_deb() {
   local version="$1"
+  # What tauri-cli writes for a config that lists libc6 alone.
+  local depends="${2:-libc6, libwebkit2gtk-4.1-0, libgtk-3-0}"
   local package_root="$TMP/package-$version"
   mkdir -p "$package_root/DEBIAN" "$package_root/usr/bin" \
     "$package_root/usr/share/applications" \
@@ -25,7 +27,7 @@ make_deb() {
     'Architecture: amd64' \
     'Priority: optional' \
     'Maintainer: GaugeWright <support@gaugewright.com>' \
-    'Depends: libc6' \
+    "Depends: $depends" \
     'Provides: gauge-bench, gaugebench, gauge-desk' \
     'Conflicts: gauge-bench, gaugebench, gauge-desk' \
     'Replaces: gauge-bench, gaugebench, gauge-desk' \
@@ -47,6 +49,16 @@ make_deb() {
 make_deb 0.4.3
 make_deb 0.4.4
 "$ROOT/scripts/check-deb-package.sh" "$TMP/gaugedesk_0.4.4_amd64.deb"
+
+# The shape every package up to 0.4.30 had: the config restating what the CLI
+# appends. It must be refused, or the check that stops it is not there.
+mkdir "$TMP/duplicated"
+make_deb 0.4.5 'libc6, libwebkit2gtk-4.1-0, libgtk-3-0, libwebkit2gtk-4.1-0, libgtk-3-0'
+mv "$TMP/gaugedesk_0.4.5_amd64.deb" "$TMP/duplicated/"
+if "$ROOT/scripts/check-deb-package.sh" "$TMP/duplicated/gaugedesk_0.4.5_amd64.deb" >/dev/null 2>&1; then
+  echo "check-deb-package.sh accepted a package that names a dependency twice" >&2
+  exit 1
+fi
 SOURCE_DATE_EPOCH=1783987200 "$ROOT/scripts/build-apt-repository.sh" \
   "$TMP/repository" "$TMP/gaugedesk_0.4.3_amd64.deb" \
   "$TMP/gaugedesk_0.4.4_amd64.deb"

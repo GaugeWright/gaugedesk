@@ -78,6 +78,7 @@ fn published_archetype_version(
     Ok(ArchetypeVersionRecord {
         package_ref: package.version_ref().to_owned(),
         discipline_ref: discipline.reference,
+        source_owner_authority: None,
         panel_profile: None,
     })
 }
@@ -1347,6 +1348,10 @@ fn migrate_agent_ability_manifests(
                 .versions
                 .get(version)
                 .and_then(|frozen| frozen.panel_profile.clone());
+            resolved.source_owner_authority = archetype
+                .versions
+                .get(version)
+                .and_then(|frozen| frozen.source_owner_authority.clone());
             if updated.versions.get(version) != Some(&resolved) {
                 updated.versions.insert(*version, resolved);
                 references_changed = true;
@@ -2370,6 +2375,7 @@ fn validate_archetype_versions(
             // it lives in. Carry it across so the comparison is about the two
             // refs this validator is named for.
             resolved.panel_profile = expected.panel_profile.clone();
+            resolved.source_owner_authority = expected.source_owner_authority.clone();
             if &resolved != expected {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -5761,6 +5767,7 @@ impl Workbench {
         &mut self,
         name: String,
         agent_kind: AgentKind,
+        source_owner_authority: Option<String>,
     ) -> Result<CreatedArchetype, CreateArchetypeError> {
         let agent_id = library::gen_id("agent");
         let inst_id = library::gen_id("inst");
@@ -5792,6 +5799,7 @@ impl Workbench {
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
         let mut version = published_archetype_version(&self.targets_dir(), &target_id, 1)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
+        version.source_owner_authority = source_owner_authority;
         let panel_profile = (agent_kind == AgentKind::Panel).then(PanelPublicProfile::default);
         version.panel_profile = panel_profile.clone();
         self.targets.insert(target_id.clone(), workspace);
@@ -6201,6 +6209,7 @@ impl Workbench {
         target_id: &str,
         version: u64,
         panel_profile: Option<PanelPublicProfile>,
+        source_owner_authority: Option<&str>,
     ) -> Result<ArchetypeVersionRecord, PublishArchetypeError> {
         let snapshot_chat = library::gen_id("package-freeze");
         let instance = self
@@ -6378,6 +6387,7 @@ impl Workbench {
             let version_record = ArchetypeVersionRecord {
                 package_ref: package.version_ref().to_owned(),
                 discipline_ref: frozen_discipline.reference,
+                source_owner_authority: source_owner_authority.map(str::to_owned),
                 panel_profile: panel_profile.clone(),
             };
             engagement
@@ -6401,6 +6411,7 @@ impl Workbench {
         &mut self,
         id: &str,
         auto_upgrade: Option<bool>,
+        source_owner_authority: Option<&str>,
     ) -> Result<(u64, u64), PublishArchetypeError> {
         let mut agent = self
             .library
@@ -6419,8 +6430,12 @@ impl Workbench {
                 "panel agent has no public profile".to_owned(),
             ));
         }
-        let version_record =
-            self.freeze_archetype_draft(&target_id, new_version, agent.panel_profile.clone())?;
+        let version_record = self.freeze_archetype_draft(
+            &target_id,
+            new_version,
+            agent.panel_profile.clone(),
+            source_owner_authority,
+        )?;
         if let Some(auto_upgrade) = auto_upgrade {
             agent.auto_upgrade = auto_upgrade;
         }

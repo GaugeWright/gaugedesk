@@ -491,6 +491,18 @@ Then("the empty chat composer is ready", async ({ page }) => {
     await expect(page.locator("[data-empty-chat-composer] textarea[aria-label='Message']")).toBeVisible();
 });
 
+Then("the empty chat composer is docked at the bottom", async ({ page }) => {
+    const pane = await page.locator(".panel.run").boundingBox();
+    const composer = await page.locator("[data-empty-chat-composer]").boundingBox();
+    expect(pane).not.toBeNull();
+    expect(composer).not.toBeNull();
+    // The panel has 10px of bottom padding; there must be no unused chat-height
+    // gap under the composer when no conversation is selected.
+    const gap = pane!.y + pane!.height - (composer!.y + composer!.height);
+    expect(gap).toBeGreaterThanOrEqual(0);
+    expect(gap).toBeLessThanOrEqual(12);
+});
+
 // A new engagement is a usable WORK chat: a chat rooted on a placement (an
 // archetype installed on a project), opened and ready to task.
 //
@@ -739,11 +751,11 @@ Then("the Panel agent {string} is in the Workshop", async ({ page }, name: strin
     await expect(row.locator('[data-agent-kind="panel"]')).toHaveAttribute("title", "Panel agent");
 });
 
-// The Preview action opens the Panel-agent draft across the chat and content panes.
+// Opening a Panel agent puts its draft across the chat and content panes.
 When("I open the Panel agent {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Workshop" }).click();
     await page.locator("[data-archetype]", { hasText: name }).locator(".tree-node.archetype [data-row-menu]").click();
-    await page.locator(".menu-item-label", { hasText: "open Preview" }).click();
+    await page.locator(".menu-item-label", { hasText: /^open$/ }).click();
 });
 
 Then("the Panel agent is open as the Workshop draft", async ({ page }) => {
@@ -752,23 +764,13 @@ Then("the Panel agent is open as the Workshop draft", async ({ page }) => {
     await expect(surface).toHaveAttribute("data-panel-agent-scope", "draft");
     await expect(surface.getByText("Workshop draft", { exact: true })).toBeVisible();
     await expect(surface.locator("[data-panel-public-profile]")).toBeVisible();
-    await expect(surface.getByText(/Disposable public session/)).toBeVisible();
 });
 
-Then("the preview says it writes no production Inbox data", async ({ page }) => {
-    await expect(page.getByText(/never enter Personal or a project Inbox/)).toBeVisible();
-});
-
-Then("the preview offers a real disposable Session", async ({ page }) => {
-    const preview = page.locator("[data-panel-preview]");
-    await expect(preview.getByRole("button", { name: "Start real Preview" })).toBeVisible();
-    await expect(preview.getByText("GaugeWright managed inference", { exact: true })).toBeVisible();
-    await expect(preview.getByText("Bring your own provider key", { exact: true })).toBeVisible();
-});
-
-When("I close the opened Panel agent", async ({ page }) => {
-    await page.locator("[data-panel-agent-surface]").getByRole("button", { name: "Close" }).click();
-    await expect(page.locator("[data-panel-agent-surface]")).toHaveCount(0);
+// Trying a Panel agent is a mode of the workbench, not part of its settings.
+Then("its settings offer no way to try it", async ({ page }) => {
+    const surface = page.locator("[data-panel-agent-surface]");
+    await expect(surface.getByRole("button", { name: /preview|try/i })).toHaveCount(0);
+    await expect(page.locator("gw-session")).toHaveCount(0);
 });
 
 When("I open settings for the Panel agent {string}", async ({ page }, name: string) => {
@@ -778,8 +780,8 @@ When("I open settings for the Panel agent {string}", async ({ page }, name: stri
 
 Then("its Panel contract editor is open", async ({ page }) => {
     await expect(page.locator("[data-panel-public-profile]")).toBeVisible();
-    await expect(page.getByText("Published panels", { exact: true })).toBeVisible();
-    await expect(page.getByText("Project Inbox collection", { exact: true })).toBeVisible();
+    await expect(page.getByText("What visitors see", { exact: true })).toBeVisible();
+    await expect(page.getByText("Send results to the project Inbox", { exact: true })).toBeVisible();
 });
 
 When("I close the Agent settings", async ({ page }) => {
@@ -806,14 +808,19 @@ When("I open deployment for the Panel agent in project {string}", async ({ page 
 });
 
 Then("deployment shows the frozen public contract", async ({ page }) => {
-    await expect(page.getByRole("dialog", { name: "Deploy Panel agent" })).toBeVisible();
-    await expect(page.getByText("Frozen public contract", { exact: true })).toBeVisible();
-    await expect(page.getByText(/Deployment operates it; it does not redefine it/)).toBeVisible();
+    const dialog = page.getByRole("dialog", { name: "Deploy Panel agent" });
+    await expect(dialog).toBeVisible();
+    // The frozen contract is read back, folded, under its version.
+    const contract = dialog.locator("[data-deployment-contract]");
+    await expect(contract.locator("summary")).toHaveText(/What visitors get · version \d+/);
+    await contract.locator("summary").click();
+    await expect(contract.locator("[data-panel-contract-summary]")).toBeVisible();
+    await expect(contract.getByText(/To change any of it, edit the Panel agent/)).toBeVisible();
 });
 
 Then("deployment exposes publication and Inbox controls", async ({ page }) => {
     const dialog = page.getByRole("dialog", { name: "Deploy Panel agent" });
-    await expect(dialog.getByRole("button", { name: "Publish deployment" })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Deploy", exact: true })).toBeVisible();
     await expect(dialog.getByRole("button", { name: "Open Inbox" })).toBeVisible();
 });
 
@@ -2500,19 +2507,22 @@ Then("no chat shows a working dot", async ({ page }) => {
 
 // ---- per-project model access (LLM-2) ----
 
-// Enter ordinary Project settings from the project's context menu, then select
-// its Model access page in the right-hand settings menu. The project id comes
-// from the node, never from a typed field.
+// Selecting the project itself opens its settings; the chevron alone folds the
+// tree. The project id comes from the node, never from a typed field.
 When("I open model access for project {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Projects" }).click();
     await page
         .locator("[data-project]", { hasText: name })
         .locator(".tree-node.project")
-        .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "project settings" }).click();
+        .click();
     await page.getByRole("navigation", { name: `Settings for ${name}` })
         .getByRole("button", { name: "Model access", exact: true })
         .click();
+});
+
+Then("project settings do not expose the work chat composer", async ({ page }) => {
+    await expect(page.locator("[data-work-chat-slot]")).toBeHidden();
+    await expect(page.locator(".project-settings-chat-unavailable")).toBeVisible();
 });
 
 Then("the model-access panel is open", async ({ page }) => {

@@ -9,7 +9,7 @@ fn declare(wb: &mut Workbench, context: &AuthenticatedActionContext) {
     wb.declare_project_tracker(
         context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "declare",
         ResourceAttributes::default(),
     )
@@ -23,7 +23,7 @@ fn open_items(
     stores(wb, invocation)
         .runtime
         .items
-        .list_items(Some("tutorials"), Some("open"))
+        .list_items(Some("tasks"), Some("open"))
         .unwrap()
 }
 
@@ -37,7 +37,7 @@ fn close_open_task(
     assert_eq!(pending.len(), 1, "one task is open at a time");
     let close = crate::project_tracker::CompleteTrackerIssue {
         project: invocation.project.clone(),
-        queue: "tutorials".into(),
+        queue: "tasks".into(),
         item_id: pending[0].id.clone(),
         subject_id: stores(wb, invocation)
             .runtime

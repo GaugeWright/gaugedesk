@@ -24,3 +24,15 @@ Feature: The chat log's reading position
     When I jump to the latest
     Then the chat log rests at its end
     And no jump-to-latest button is offered
+
+  Scenario: user-message marks preview and revisit earlier requests
+    Given a new engagement
+    When I task the agent with "first request"
+    And I task the agent with "second request"
+    Then the user-message rail has 2 marks
+    When I hover the first user-message mark
+    Then the message preview shows "first request"
+    And the hovered mark is wider than its neighbor
+    When I jump to the first user message
+    Then the first user message is near the top of the chat log
+    And the first user-message mark shows the reading position

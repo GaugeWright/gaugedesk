@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GaugeDesk — Panel agent lab</title>
+    <style>
+      /* Bench chrome only. Everything inside a stage is the product stylesheet;
+         nothing here may style a product class, or the prototype would flatter
+         itself and the agreed result would not survive the move into the app. */
+      body { margin: 0; background: var(--bg, #0c1a2e); color: var(--ink, #e6ebf2);
+             font-family: var(--ui), sans-serif; }
+      .lab { max-width: 1180px; margin: 0 auto; padding: 32px 24px 96px; }
+      .lab-head h1 { font-size: 20px; margin: 0 0 6px; font-weight: 650; }
+      .lab-head p, .lab-note { color: var(--muted); font-size: var(--fs-body, 13px);
+             max-width: 72ch; line-height: 1.5; margin: 0 0 18px; }
+      .lab-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+      .lab-tab { background: transparent; border: 1px solid var(--edge); color: var(--muted);
+             border-radius: 5px; padding: 6px 10px; font: inherit; font-size: var(--fs-ui, 12px);
+             cursor: pointer; }
+      .lab-tab.active { color: var(--ink); border-color: var(--muted); }
+      /* The stage stands in for the Content pane: a bounded, scrolling column. */
+      .lab-stage { border: 1px solid var(--edge); border-radius: 8px; height: calc(100vh - 200px); min-height: 480px;
+             overflow: hidden; background: var(--bg); }
+      .lab-stage.narrow { width: 520px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/apps/workbench-web/src/panel-agent-lab.tsx"></script>
+  </body>
+</html>

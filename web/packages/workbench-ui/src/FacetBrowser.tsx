@@ -572,6 +572,14 @@ export function FacetBrowser(props: {
         ) : (
             <span class="node-icon node-icon-empty" aria-hidden="true" />
         );
+    const projectCaret = (id: string, name: string) => (
+        <button type="button" class="node-icon project-caret"
+            aria-label={`${isCollapsed(id) ? "Expand" : "Collapse"} ${name}`}
+            aria-expanded={!isCollapsed(id)}
+            onClick={(event) => { event.stopPropagation(); toggleCollapse(id); }}>
+            {isCollapsed(id) ? "▸" : "▾"}
+        </button>
+    );
 
     async function withRefresh(action: () => Promise<unknown>, ok: string) {
         try {
@@ -1106,7 +1114,7 @@ export function FacetBrowser(props: {
 
     // A placement row's menu (shared by right-click and the row's ⋯ button).
     const placementMenuItems = (p: ProjectNode, pl: ProjectNode["placements"][number]): MenuState["items"] => pl.kind === "panel" ? [
-        ...(props.onOpenPanelAgent ? [{ label: "open", hint: "Open this placement: its pinned contract, Preview, and deployments", run: () => {
+        ...(props.onOpenPanelAgent ? [{ label: "open", hint: "Open this placement: its pinned contract and deployments", run: () => {
             const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
             if (agent) props.onOpenPanelAgent?.(agent, p);
         } }] : []),
@@ -1150,7 +1158,7 @@ export function FacetBrowser(props: {
                 role="treeitem"
                 tabindex="0"
                 aria-label={`Panel agent ${pl.archetypeName} on ${p.name}`}
-                title="Open this placement: pinned contract, Preview, deployments, Inbox"
+                title="Open this placement: pinned contract, deployments, Inbox"
                 onClick={() => {
                     const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
                     if (agent) props.onOpenPanelAgent?.(agent, p);
@@ -1198,7 +1206,9 @@ export function FacetBrowser(props: {
         ...(a.kind === "work"
             ? [{ label: "test in a chat", icon: "eye" as const, hint: "Try this Agent in a Personal work chat", run: () => void useArchetype(a.id) }]
             : props.onOpenPanelAgent
-                ? [{ label: "open Preview", icon: "eye" as const, hint: "Open this Panel agent: its edit chat, public contract, and Preview", run: () => props.onOpenPanelAgent?.(a) }]
+                // Opening shows the contract beside the edit chat. The eye is for
+                // trying an Agent, and a Panel agent is tried in the workbench.
+                ? [{ label: "open", hint: "Open this Panel agent: its edit chat and public contract", run: () => props.onOpenPanelAgent?.(a) }]
                 : []),
         { label: "new authoring chat", icon: "page-edit", hint: "Open a chat to edit what this Agent does — you review every change before it's kept", run: () => newEditChat(a.id) },
         { label: "new workstream", icon: "child-branch", hint: "Create a shared auto-sync line over this Agent's edit chats", run: () => startEdit({ kind: "new-workstream", placementId: a.instanceId }) },
@@ -1964,14 +1974,22 @@ export function FacetBrowser(props: {
                                             role="treeitem"
                                             tabindex="0"
                                             aria-expanded={!isCollapsed(p.id)}
-                                            aria-label={`project ${p.name}`}
+                                            aria-label={`Open settings for project ${p.name}`}
                                             onKeyDown={(e) => {
-                                                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); p.product?.kind === "tutorials" ? props.onOpenTutorials?.(p.id) : toggleCollapse(p.id); }
+                                                if (e.target !== e.currentTarget) return;
+                                                if (e.key === "Enter" || e.key === " ") {
+                                                    e.preventDefault();
+                                                    p.product?.kind === "tutorials" ? props.onOpenTutorials?.(p.id) : props.onOpenProjectHome(p.id, p.name);
+                                                } else if (e.key === "ArrowRight" && isCollapsed(p.id)) {
+                                                    e.preventDefault(); toggleCollapse(p.id);
+                                                } else if (e.key === "ArrowLeft" && !isCollapsed(p.id)) {
+                                                    e.preventDefault(); toggleCollapse(p.id);
+                                                }
                                             }}
-                                            onClick={() => { if (p.product?.kind === "tutorials") props.onOpenTutorials?.(p.id); }}
+                                            onClick={() => { p.product?.kind === "tutorials" ? props.onOpenTutorials?.(p.id) : props.onOpenProjectHome(p.id, p.name); }}
                                             onContextMenu={(e) => openMenu(e, projectMenuItems(p))}
                                         >
-                                            {caret(p.id, true)}
+                                            {projectCaret(p.id, p.name)}
                                             <span class="project-kind-mark" title={p.product?.kind === "tutorials" ? "GaugeWright tutorials" : "Project"} aria-label="Project"><Icon name="folder-open" /></span>
                                             <Show
                                                 when={editingIs("rename-project", p.id)}
@@ -2053,7 +2071,7 @@ export function FacetBrowser(props: {
                                                                 ? `Agent ${pl.archetypeName} on ${p.name} — open its chats`
                                                                 : `Agent ${pl.archetypeName} on ${p.name} — start a chat`
                                                         }
-                                                        title={pl.kind === "panel" ? "Open this placement: pinned contract, Preview, deployments, Inbox" : activeChatCount(pl.chats) > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
+                                                        title={pl.kind === "panel" ? "Open this placement: pinned contract, deployments, Inbox" : activeChatCount(pl.chats) > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
                                                         // Clicking the row is the obvious "start working" path: with no
                                                         // chats yet it opens a new work chat; otherwise it reveals the
                                                         // existing ones (the `+ chat` button always adds another).

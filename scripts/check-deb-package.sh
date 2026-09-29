@@ -34,6 +34,19 @@ require_token() {
 }
 [ -n "$(field Description)" ] || { echo "Description is required" >&2; exit 1; }
 require_token Depends libc6
+# tauri-cli appends libwebkit2gtk-4.1-0 and libgtk-3-0 to whatever
+# `bundle.linux.deb.depends` lists, and the appindicator library when the app
+# has a tray, so the config names only what the CLI does not add. It used to
+# name those two as well, and every published package carried them twice. So
+# both are required here, which is what holds the CLI to adding them, and no
+# package may be named twice, which is what holds the config to leaving them out.
+require_token Depends libwebkit2gtk-4.1-0
+require_token Depends libgtk-3-0
+duplicated="$(field Depends | tr ',' '\n' | sed -E 's/^ +| +$//g; s/ +\([^)]*\)$//' | sort | uniq -d | tr '\n' ' ')"
+[ -z "$duplicated" ] || {
+  echo "Depends names a package more than once: $duplicated(found: $(field Depends))" >&2
+  exit 1
+}
 
 for legacy in gauge-bench gaugebench gauge-desk; do
   require_token Provides "$legacy"

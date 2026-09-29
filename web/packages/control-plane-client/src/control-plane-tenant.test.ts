@@ -10,6 +10,8 @@ import {
     accountTenants,
     acceptAccountInvitation,
     createOrganization,
+    materializeOrganizationSharedProject,
+    organizationSharedProject,
     hubSessionTenants,
     parseFacility,
     parseInvitation,
@@ -171,6 +173,33 @@ describe("control-plane-tenant (ADR 0077 §7/§9)", () => {
             providerCommercial: false,
         });
         expect(calls).toEqual([["POST", "/account/tenants", { display_name: "Acme Studio" }]]);
+    });
+
+    it("reads the pending shared project and sends its exact Home materialization request", async () => {
+        expect(parseTenant({
+            id: "organization:ab", display_name: "Acme", role: "owner", personal: false,
+            shared_project: { id: "shared", project_id: "proj-org-ab", founding_owner: "alice",
+                display_name: "Acme", home_id: null },
+        }).sharedProject).toMatchObject({ projectId: "proj-org-ab", homeId: null });
+        const pending = fakeJson({ project: {
+            id: "shared", project_id: "proj-org-ab", founding_owner: "alice",
+            display_name: "Acme", home_id: null,
+        } });
+        await expect(organizationSharedProject(pending.json, "organization:ab")).resolves.toEqual({
+            id: "shared", projectId: "proj-org-ab", foundingOwner: "alice",
+            displayName: "Acme", homeId: null,
+        });
+        expect(pending.calls).toEqual([
+            ["GET", "/account/tenants/organization%3Aab/shared-project", undefined],
+        ]);
+        const home = fakeJson({ project: { id: "proj-org-ab" } });
+        await expect(materializeOrganizationSharedProject(
+            home.json, "organization:ab", true,
+        )).resolves.toBe("proj-org-ab");
+        expect(home.calls).toEqual([[
+            "POST", "/organizations/organization%3Aab/shared-project/materialize",
+            { personal_default: true },
+        ]]);
     });
 
     it("lists and accepts metadata-only tenant invitations", async () => {

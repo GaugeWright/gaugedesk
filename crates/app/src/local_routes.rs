@@ -4,9 +4,9 @@ use axum::{
 };
 
 use crate::{
-    engagement_routes as er, federation, library_routes as lr, lifecycle_routes as life, net_http,
-    project_credential_routes, project_model_selection, resource_store as rs,
-    workstream_routes as wr, SharedWorkbench,
+    engagement_routes as er, federation, library_routes as lr, lifecycle_routes as life,
+    method_access as ma, net_http, project_credential_routes, project_model_selection,
+    resource_store as rs, workstream_routes as wr, SharedWorkbench,
 };
 
 /// Open-source local workbench route surface: health, workspace/library,
@@ -208,6 +208,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         )
         .route("/projects", post(lr::create_project))
         .route(
+            "/organizations/{tenant}/shared-project/materialize",
+            post(lr::post_materialize_organization_shared_project),
+        )
+        .route(
             "/projects/{id}/quarantine",
             get(crate::publisher_routes::list_project_quarantine),
         )
@@ -276,6 +280,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             put(lr::update_project).delete(lr::delete_project),
         )
         .route("/projects/{id}/home", get(lr::project_home))
+        .merge(crate::project_settings_gaugeapp::routes())
         .route("/projects/{id}/whips", get(lr::project_whips))
         .route("/projects/{id}/whip-costs", get(lr::project_whip_costs))
         .route(
@@ -347,6 +352,41 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/chats/{id}/merge-preview", post(er::post_merge_preview))
         .route("/chats/{id}/transcript", get(er::get_transcript))
         .route("/chats/{id}/model-context", get(er::get_model_context))
+        .route(
+            "/chats/{id}/contexts/{rid}/inspection",
+            get(crate::context_inspection::phase),
+        )
+        .route(
+            "/chats/{id}/contexts/{rid}/inspection/request",
+            post(crate::context_inspection::request),
+        )
+        .route(
+            "/chats/{id}/contexts/{rid}/inspection/requests",
+            get(crate::context_inspection::pending_requests),
+        )
+        .route(
+            "/chats/{id}/contexts/{rid}/inspection/revoke",
+            post(crate::context_inspection::revoke_own),
+        )
+        .route(
+            "/chats/{id}/contexts/{rid}/inspection/{reader}/approve",
+            post(crate::context_inspection::approve),
+        )
+        .route(
+            "/chats/{id}/contexts/{rid}/inspection/{reader}/revoke",
+            post(crate::context_inspection::revoke),
+        )
+        .route("/chats/{id}/method-inspection", get(ma::phase))
+        .route("/chats/{id}/method-inspection/request", post(ma::request))
+        .route("/chats/{id}/method-inspection/revoke", post(ma::revoke_own))
+        .route(
+            "/chats/{id}/method-inspection/{reader}/approve",
+            post(ma::approve),
+        )
+        .route(
+            "/chats/{id}/method-inspection/{reader}/revoke",
+            post(ma::revoke),
+        )
         .route("/chats/{id}/choice-cards", get(er::get_choice_cards))
         .route(
             "/chats/{id}/choice-cards/{card_id}/answer",

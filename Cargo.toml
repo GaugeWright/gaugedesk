@@ -24,6 +24,11 @@ exclude = ["src-tauri", "third-party"]
 cell = "gaugedesk"
 checkout = "gaugedesk-src"
 feature-checks = "no-default-features"
+doctests = true
+# The Tauri shells are workspaces of their own that take crates from this one by
+# path; their sections are keyed on what cargo reads of it for each.
+dependents = ["src-tauri", "src-tauri-mobile"]
+wasm = [{ package = "gaugedesk-relay-transport" }, { package = "gaugedesk-directory-protocol", features = ["wasm"] }]
 
 [workspace.package]
 edition = "2021"
@@ -83,7 +88,7 @@ debug = "line-tables-only"
 # source revision to the published contract revision and digest; no project
 # workstream feature may compile against the older crates.io release.
 [patch.crates-io]
-whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7e336e9b8e17a3bbf406cb47c65cf578e68e0dbc" }
-whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7e336e9b8e17a3bbf406cb47c65cf578e68e0dbc" }
-whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7e336e9b8e17a3bbf406cb47c65cf578e68e0dbc" }
-whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7e336e9b8e17a3bbf406cb47c65cf578e68e0dbc" }
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "c499b3790c7144a47a5e4f46e48d591f6cf01f44" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "c499b3790c7144a47a5e4f46e48d591f6cf01f44" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "c499b3790c7144a47a5e4f46e48d591f6cf01f44" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "c499b3790c7144a47a5e4f46e48d591f6cf01f44" }

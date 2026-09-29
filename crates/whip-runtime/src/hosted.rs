@@ -280,7 +280,7 @@ pub(crate) fn create_harness(
         policy,
         chat_id: spec.chat_id.clone(),
         mode: spec.mode,
-        user_context_complete: true,
+        user_context_sources: Some(Vec::new()),
         provider_binding_ref: required_ref(
             spec.provider_binding_ref.as_deref(),
             "provider binding ref",
@@ -524,7 +524,7 @@ struct DoHarness {
     policy: PolicyEpochRef,
     chat_id: String,
     mode: gaugedesk_harness::ChatMode,
-    user_context_complete: bool,
+    user_context_sources: Option<Vec<String>>,
     provider_binding_ref: String,
     credential_ref: String,
     workspace_targets: Vec<gaugedesk_harness::WorkspaceTargetBinding>,
@@ -556,8 +556,8 @@ impl Harness for DoHarness {
         self.runtime_command_id = command_id.map(str::to_owned);
     }
 
-    fn bind_user_context_provenance(&mut self, complete: bool) {
-        self.user_context_complete = complete;
+    fn bind_user_context_provenance(&mut self, sources: Option<&[String]>) {
+        self.user_context_sources = sources.map(|handles| handles.to_vec());
     }
 
     fn run_turn(
@@ -644,7 +644,7 @@ impl Harness for DoHarness {
             images,
             self.mode,
             &self.chat_id,
-            self.user_context_complete,
+            self.user_context_sources.as_deref(),
         )?;
         *self
             .active_command
@@ -923,14 +923,15 @@ fn host_turn_request(
     images: &[ImageContent],
     mode: gaugedesk_harness::ChatMode,
     chat_id: &str,
-    user_context_complete: bool,
+    user_context_sources: Option<&[String]>,
 ) -> io::Result<Value> {
     let mut request = host_request(command, package)?;
     request["initial_model_provenance"] = hosted_initial_model_provenance(
         &command.package_version_ref,
         mode,
         chat_id,
-        user_context_complete && command.input.images.len() == images.len(),
+        user_context_sources,
+        command.input.images.len() == images.len(),
         images,
     );
     request["image_bodies"] = Value::Array(
@@ -951,7 +952,8 @@ fn hosted_initial_model_provenance(
     package_version_ref: &str,
     mode: gaugedesk_harness::ChatMode,
     chat_id: &str,
-    user_context_complete: bool,
+    user_context_sources: Option<&[String]>,
+    images_match: bool,
     images: &[ImageContent],
 ) -> Value {
     let chat = format!("chat:{chat_id}");
@@ -971,6 +973,9 @@ fn hosted_initial_model_provenance(
         .map(|image| live_turn_image_source(chat_id, image))
         .collect::<Option<Vec<_>>>();
     let mut user_sources = vec![chat.clone()];
+    if let Some(sources) = user_context_sources {
+        user_sources.extend(sources.iter().cloned());
+    }
     if let Some(sources) = image_sources.as_ref() {
         user_sources.extend(sources.iter().cloned());
     }
@@ -978,7 +983,7 @@ fn hosted_initial_model_provenance(
         "system": known(vec![package.clone(), chat.clone()]),
         "user": {
             "source_handles": user_sources,
-            "complete": user_context_complete && image_sources.is_some(),
+            "complete": user_context_sources.is_some() && images_match && image_sources.is_some(),
         },
         "world": known(vec![package.clone(), chat.clone()]),
         "tools": known(vec![package, chat]),
@@ -1686,12 +1691,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hosted_labels_keep_private_answers_unknown() {
+    fn hosted_labels_require_and_carry_answer_sources() {
         let labels = hosted_initial_model_provenance(
             "pinned",
             gaugedesk_harness::ChatMode::Use,
             "chat-one",
-            false,
+            None,
+            true,
             &[],
         );
         assert_eq!(
@@ -1711,6 +1717,7 @@ mod tests {
             "editor",
             gaugedesk_harness::ChatMode::Edit,
             "chat-one",
+            Some(&[]),
             true,
             &[],
         );
@@ -1727,6 +1734,7 @@ mod tests {
             "pinned",
             gaugedesk_harness::ChatMode::Use,
             "chat-one",
+            Some(&[]),
             true,
             std::slice::from_ref(&image_body),
         );
@@ -1754,11 +1762,23 @@ mod tests {
                 "pinned",
                 gaugedesk_harness::ChatMode::Use,
                 "chat-one",
+                Some(&[]),
                 true,
                 &[malformed]
             )["user"]["complete"],
             false
         );
+        let answer_sources = ["question-answer:chat-one:q-1:digest".to_owned()];
+        let answered = hosted_initial_model_provenance(
+            "pinned",
+            gaugedesk_harness::ChatMode::Use,
+            "chat-one",
+            Some(&answer_sources),
+            true,
+            &[],
+        );
+        assert_eq!(answered["user"]["complete"], true);
+        assert_eq!(answered["user"]["source_handles"][1], answer_sources[0]);
     }
 
     #[derive(Debug, Default)]

@@ -11,6 +11,7 @@ Feature: Per-project model access (LLM-2)
     Given the workbench is open
     When I create a project named "acme-co"
     And I open model access for project "acme-co"
+    Then project settings do not expose the work chat composer
     Then the model-access panel is open
     When I add the provider "anthropic" to this project
     Then the project holds the provider "anthropic"

@@ -69,13 +69,7 @@ pub struct EngagementTaskContext {
 }
 
 impl Workbench {
-    /// A use chat's installed method is a package payload, even when the
-    /// workspace also carries its runtime mount. Chat/project admission is
-    /// not the separate resource grant needed by an account-backed reader.
-    pub(crate) fn installed_method_read_requires_grant(&self, chat_id: &str, path: &str) -> bool {
-        if self.idp.is_none() && !crate::workbench_auth::web_account_mode() {
-            return false;
-        }
+    pub(crate) fn is_installed_method_path(&self, chat_id: &str, path: &str) -> bool {
         let Some(chat) = self.library.chats.get(chat_id) else {
             return false;
         };
@@ -96,6 +90,23 @@ impl Workbench {
             || path.starts_with("agent/")
             || path == runtime_agent
             || path.starts_with(&format!("{runtime_agent}/"))
+    }
+
+    /// A use chat's installed method is a package payload, even when the
+    /// workspace also carries its runtime mount. Chat/project admission is
+    /// not the separate resource grant needed by an account-backed reader.
+    pub(crate) fn installed_method_read_requires_grant(&self, chat_id: &str, path: &str) -> bool {
+        if self.idp.is_none()
+            && !crate::workbench_auth::web_account_mode()
+            && self
+                .library
+                .chats
+                .get(chat_id)
+                .is_none_or(|chat| chat.owner.is_none())
+        {
+            return false;
+        }
+        self.is_installed_method_path(chat_id, path)
     }
 
     /// A use chat reads its installed Agent definition from the frozen
@@ -160,7 +171,7 @@ impl Workbench {
             .map(|root| format!("targets/{root}"))
     }
 
-    fn engagement_context_target_root(
+    pub(crate) fn engagement_context_target_root(
         &self,
         chat_id: &str,
         requested_target_id: Option<&str>,
@@ -710,9 +721,44 @@ impl Workbench {
         path: &str,
         max_bytes: usize,
     ) -> Option<Result<Option<Vec<u8>>, WorkspaceError>> {
-        if self.installed_method_read_requires_grant(chat_id, path) {
+        self.read_engagement_file_bytes_for_viewer(chat_id, path, max_bytes, None, false)
+    }
+
+    pub(crate) fn read_engagement_file_bytes_for_viewer(
+        &self,
+        chat_id: &str,
+        path: &str,
+        max_bytes: usize,
+        viewer: Option<&str>,
+        account_backed_viewer: bool,
+    ) -> Option<Result<Option<Vec<u8>>, WorkspaceError>> {
+        if (self.installed_method_read_requires_grant(chat_id, path)
+            || (account_backed_viewer && self.is_installed_method_path(chat_id, path)))
+            && !viewer.is_some_and(|viewer| {
+                self.package_selection_for_chat(chat_id)
+                    .is_some_and(|(_, package_ref)| {
+                        self.method_inspection_granted(chat_id, viewer, &package_ref)
+                    })
+            })
+        {
             return Some(Err(WorkspaceError {
                 message: "installed Agent method requires a current resource grant".to_owned(),
+            }));
+        }
+        if account_backed_viewer
+            && !self.is_installed_method_path(chat_id, path)
+            && !viewer.is_some_and(|viewer| {
+                crate::context_inspection::file_readable(
+                    self,
+                    chat_id,
+                    viewer,
+                    &self.engagement_workspace_path(chat_id, path),
+                    None,
+                )
+            })
+        {
+            return Some(Err(WorkspaceError {
+                message: "worktree file requires a current source inspection grant".to_owned(),
             }));
         }
         if let Some(bytes) = self.installed_agent_file(chat_id, path) {
@@ -1482,20 +1528,7 @@ pub(crate) async fn get_model_context(
             .into_response()
     }
     let authorize = |wb: &Workbench| -> Result<String, (StatusCode, &'static str)> {
-        let chat = wb
-            .library
-            .chats
-            .get(&id)
-            .ok_or((StatusCode::NOT_FOUND, "chat not found"))?;
-        let project = wb.library.project_of_chat(&id);
-        let actor = wb.admit_data_request(crate::net_http::bearer(&headers), project)?;
-        if chat.owner.as_deref().is_some_and(|owner| owner != actor)
-            || (chat.owner.is_none()
-                && (wb.idp.is_some() || crate::workbench_auth::web_account_mode()))
-        {
-            return Err((StatusCode::FORBIDDEN, "chat context is unavailable"));
-        }
-        Ok(actor)
+        crate::method_access::chat_reader(wb, &id, &headers)
     };
     let (handle, live) = {
         let wb = shared.lock_unpoisoned();
@@ -1545,9 +1578,13 @@ pub(crate) async fn get_model_context(
         }
     };
     let workspace_contexts_current = std::cell::OnceCell::new();
+    let account_backed = crate::method_access::account_backed_chat(&wb, &id, &headers);
     let projection = project_model_context(&view, |source| {
         if source == "runtime" || source == format!("chat:{id}") {
             return true;
+        }
+        if source.starts_with("question-answer:") {
+            return crate::agent_question::current_answer_source(wb.store_ref(), &id, source);
         }
         if source.starts_with("turn-image:") {
             // The exact image stays bound to this live turn. Account-backed
@@ -1564,18 +1601,29 @@ pub(crate) async fn get_model_context(
             );
         }
         if source.starts_with("workspace-file:") {
-            let contexts_current = *workspace_contexts_current
-                .get_or_init(|| current_workspace_context_grants(&wb, &id));
-            return current_workspace_file_source_with_grants(&wb, &id, source, contexts_current);
+            let contexts_current = account_backed
+                || *workspace_contexts_current
+                    .get_or_init(|| current_workspace_context_grants(&wb, &id));
+            return current_workspace_file_source_with_grants(
+                &wb,
+                &id,
+                source,
+                contexts_current,
+                Some(&viewer),
+                account_backed,
+            );
         }
         if source.starts_with("workspace-dir:") {
-            let contexts_current = *workspace_contexts_current
-                .get_or_init(|| current_workspace_context_grants(&wb, &id));
+            let contexts_current = account_backed
+                || *workspace_contexts_current
+                    .get_or_init(|| current_workspace_context_grants(&wb, &id));
             return current_workspace_directory_source_with_grants(
                 &wb,
                 &id,
                 source,
                 contexts_current,
+                Some(&viewer),
+                account_backed,
             );
         }
         if source.starts_with("workspace:") {
@@ -1584,14 +1632,22 @@ pub(crate) async fn get_model_context(
             // exact source cut and its current erasure state, redact the call.
             return false;
         }
+        if source.starts_with("discipline-skill:") {
+            return current_discipline_skill_source(
+                &wb,
+                &id,
+                &viewer,
+                source,
+                crate::method_access::account_backed_chat(&wb, &id, &headers),
+            );
+        }
         let Some(package_ref) = source.strip_prefix("package:") else {
             return false;
         };
         // A work package can include method bytes outside the chat's grant.
-        // The selected package is readable by the single-user Home owner;
-        // account-backed reads need an explicit current method grant.
-        if wb.idp.is_some() || crate::workbench_auth::web_account_mode() {
-            return false;
+        // Recheck the selected version and the current reader-specific basis.
+        if crate::method_access::account_backed_chat(&wb, &id, &headers) {
+            return wb.method_inspection_granted(&id, &viewer, package_ref);
         }
         let Some((version, selected_ref)) = wb.package_selection_for_chat(&id) else {
             return false;
@@ -1612,6 +1668,84 @@ pub(crate) async fn get_model_context(
     }
 }
 
+/// An installed skill is frozen in the discipline beside the method package.
+/// Its registry hash names exactly the body injected into the model prompt;
+/// the current reader must still hold method access and the frozen discipline
+/// must still carry those same bytes.
+fn current_discipline_skill_source(
+    wb: &Workbench,
+    chat_id: &str,
+    viewer: &str,
+    source: &str,
+    account_backed: bool,
+) -> bool {
+    let prefix = format!("discipline-skill:{chat_id}:");
+    let Some((digest, name)) = source
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    if digest.len() != 32
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return false;
+    }
+    let Some(chat) = wb.library.chats.get(chat_id) else {
+        return false;
+    };
+    let Some(instance) = wb.library.instances.get(&chat.instance_id) else {
+        return false;
+    };
+    if instance.kind != crate::library::InstanceKind::Using {
+        return false;
+    }
+    let Some(agent) = wb.library.agents.get(&instance.agent_id) else {
+        return false;
+    };
+    let Some(version) = agent.versions.get(&instance.version) else {
+        return false;
+    };
+    if account_backed && !wb.method_inspection_granted(chat_id, viewer, &version.package_ref) {
+        return false;
+    }
+    let Some(target) = wb.library.authoring_target_for(&agent.id) else {
+        return false;
+    };
+    let package_root = crate::library_state::published_package_root(
+        &wb.targets_dir(),
+        &target.id,
+        instance.version,
+    );
+    let Ok(package) = gaugedesk_whip_runtime::AuthoredAgentPackage::load(package_root) else {
+        return false;
+    };
+    if package.version_ref() != version.package_ref {
+        return false;
+    }
+    let discipline_root = crate::library_state::published_discipline_root(
+        &wb.targets_dir(),
+        &target.id,
+        instance.version,
+    );
+    let Ok(discipline) =
+        crate::discipline::load(&discipline_root, package.capabilities().iter().cloned())
+    else {
+        return false;
+    };
+    if discipline.reference != version.discipline_ref {
+        return false;
+    }
+    let path = format!("agent-skills/{name}/SKILL.md");
+    discipline.files.iter().any(|(candidate, body)| {
+        candidate == &path && digest == whipplescript_store::stable_hash_hex(body)
+    })
+}
+
 /// A native `read` witness names the full bytes read, even when the model saw
 /// only selected lines. A viewer read must find those same bytes in the chat's
 /// current worktree and its retained head cut. This is deliberately stricter
@@ -1623,6 +1757,8 @@ fn current_workspace_file_source(wb: &Workbench, chat_id: &str, source: &str) ->
         chat_id,
         source,
         current_workspace_context_grants(wb, chat_id),
+        None,
+        false,
     )
 }
 
@@ -1631,6 +1767,8 @@ fn current_workspace_file_source_with_grants(
     chat_id: &str,
     source: &str,
     contexts_current: bool,
+    viewer: Option<&str>,
+    account_backed: bool,
 ) -> bool {
     let prefix = format!("workspace-file:{chat_id}:");
     let Some((digest, path)) = source
@@ -1643,6 +1781,13 @@ fn current_workspace_file_source_with_grants(
         return false;
     }
     if digest.len() != 32 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    if account_backed
+        && !viewer.is_some_and(|viewer| {
+            crate::context_inspection::file_readable(wb, chat_id, viewer, path, Some(digest))
+        })
+    {
         return false;
     }
     let Some(Ok(Some(bytes))) = wb.read_engagement_file_bytes(chat_id, path, 8 * 1024 * 1024)
@@ -1667,6 +1812,8 @@ fn current_workspace_directory_source(wb: &Workbench, chat_id: &str, source: &st
         chat_id,
         source,
         current_workspace_context_grants(wb, chat_id),
+        None,
+        false,
     )
 }
 
@@ -1675,12 +1822,18 @@ fn current_workspace_directory_source_with_grants(
     chat_id: &str,
     source: &str,
     contexts_current: bool,
+    viewer: Option<&str>,
+    account_backed: bool,
 ) -> bool {
     let prefix = format!("workspace-dir:{chat_id}:");
     let Some(path) = source.strip_prefix(&prefix) else {
         return false;
     };
     current_workspace_source_scope(wb, chat_id, path, contexts_current)
+        && (!account_backed
+            || viewer.is_some_and(|viewer| {
+                crate::context_inspection::directory_readable(wb, chat_id, viewer, path)
+            }))
         && wb.engagement_tree(chat_id).is_some_and(|tree| {
             tree.is_ok_and(|entries| {
                 entries
@@ -1700,25 +1853,60 @@ fn current_workspace_context_grants(wb: &Workbench, chat_id: &str) -> bool {
     })
 }
 
-fn current_workspace_source_scope(
+pub(crate) fn current_workspace_source_scope(
     wb: &Workbench,
     chat_id: &str,
     path: &str,
     contexts_current: bool,
 ) -> bool {
-    // Retention proves bytes, not a shared viewer's current target grant.
-    // Account-backed workspaces remain unknown until that grant is bound to
-    // this exact source and rechecked here.
-    if wb.idp.is_some() || crate::workbench_auth::web_account_mode() {
-        return false;
-    }
-    // A file cut does not identify which ingested resource supplied it: the
-    // resource locator can name the original disk folder or a generic upload
-    // label. A tombstone or revoked/ungranted context may therefore leave the
-    // same bytes in the worktree. Until each file witness carries its resource
-    // identity, one uncertain context closes every file-source read in this chat.
+    // Solo worktrees without per-import bindings must treat an uncertain
+    // revoked context as capable of supplying any worktree path. Account-backed
+    // reads check the exact import and reader in context_inspection first.
     if !contexts_current {
         return false;
+    }
+    let Some(chat) = wb.library.chats.get(chat_id) else {
+        return false;
+    };
+    let Some(instance) = wb.library.instances.get(&chat.instance_id) else {
+        return false;
+    };
+    if instance.kind == crate::library::InstanceKind::Authoring {
+        // Edit chats import into the root of their authoring workspace. The
+        // imported file still needs its own exact reader grant; keep the
+        // method and runtime surfaces on their separate authorities.
+        if path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+            || path == "agent"
+            || path.starts_with("agent/")
+            || path == "artifacts"
+            || path.starts_with("artifacts/")
+            || path == "work"
+            || path.starts_with("work/")
+            || path == "targets"
+            || path.starts_with("targets/")
+            || path == ".whipple"
+            || gaugedesk_boundary::is_method_surface_path(path)
+            || gaugedesk_boundary::is_control_surface_path(path)
+        {
+            return false;
+        }
+        let Some(set) = wb.library.current_target_set(chat_id) else {
+            return false;
+        };
+        let [member] = set.members.as_slice() else {
+            return false;
+        };
+        let Some(target) = wb.library.authoring_target_for(&instance.agent_id) else {
+            return false;
+        };
+        return target.id == member.target_id
+            && target.status == crate::library::WorkTargetStatus::Available
+            && member.capability_ceiling.read
+            && target.capabilities.read
+            && path_is_in_scope(path, &member.path_scope)
+            && path_is_in_scope(path, &target.path_scope);
     }
     let Some(rest) = path.strip_prefix("targets/") else {
         return false;
@@ -1727,9 +1915,6 @@ fn current_workspace_source_scope(
     if encoded_target.is_empty() {
         return false;
     }
-    let Some(chat) = wb.library.chats.get(chat_id) else {
-        return false;
-    };
     let Some(member) = wb.library.current_target_set(chat_id).and_then(|set| {
         set.members.iter().find(|member| {
             crate::library::target_id_path_v1(&member.target_id)
@@ -1778,27 +1963,44 @@ fn project_model_context(
             .and_then(serde_json::Value::as_u64)
             .ok_or(())?;
         let body = call.get("body").ok_or(())?;
-        let authorized = call.get("provenance_complete") == Some(&serde_json::Value::Bool(true))
-            && call.get("ordered_provenance").is_some_and(|labels| {
-                let Some(object) = labels.as_object() else {
-                    return false;
-                };
-                if object.len() != 2 {
-                    return false;
-                }
-                let Some(messages) = object.get("messages").and_then(serde_json::Value::as_array)
-                else {
-                    return false;
-                };
-                !messages.is_empty()
-                    && messages
-                        .iter()
-                        .chain(object.get("tools"))
-                        .all(|label| authorized_model_source_label(label, &authorize_cached))
-                    && object.contains_key("tools")
+        let labels = call
+            .get("ordered_provenance")
+            .and_then(serde_json::Value::as_object)
+            .filter(|object| {
+                object.len() == 2 || (object.len() == 3 && object.contains_key("wire"))
             });
-        if authorized {
+        let messages = labels
+            .and_then(|object| object.get("messages"))
+            .and_then(serde_json::Value::as_array)
+            .filter(|messages| !messages.is_empty());
+        let tools = labels.and_then(|object| object.get("tools"));
+        let fully_authorized = call.get("provenance_complete")
+            == Some(&serde_json::Value::Bool(true))
+            && messages.is_some_and(|messages| {
+                messages
+                    .iter()
+                    .all(|label| authorized_model_source_label(label, &authorize_cached))
+            })
+            && tools.is_some_and(|label| authorized_model_source_label(label, &authorize_cached));
+        let wire = labels.and_then(|object| object.get("wire"));
+        let partial = messages.and_then(|messages| {
+            wire.and_then(|wire| {
+                tools.and_then(|tools| {
+                    project_wire_model_context(body, wire, messages, tools, &authorize_cached)
+                })
+            })
+        });
+        if fully_authorized
+            && (wire.is_none() || partial.as_ref().is_some_and(|(_, redacted)| !redacted))
+        {
             projected.push(serde_json::json!({ "ordinal": ordinal, "body": body }));
+        } else if let Some((body, true)) = partial {
+            projected.push(serde_json::json!({
+                "ordinal": ordinal,
+                "body": body,
+                "redacted": true,
+                "reason": "Some model input sources are unavailable to this reader."
+            }));
         } else {
             projected.push(serde_json::json!({
                 "ordinal": ordinal,
@@ -1812,6 +2014,177 @@ fn project_model_context(
         "calls": projected,
         "incomplete": incomplete
     }))
+}
+
+/// Return only input planes whose wire positions the kernel mapped to exact
+/// logical sources. A partial view copies no unrecognized provider fields.
+fn project_wire_model_context(
+    body: &serde_json::Value,
+    wire: &serde_json::Value,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+    authorized_source: &impl Fn(&str) -> bool,
+) -> Option<(serde_json::Value, bool)> {
+    let body = body.as_object()?;
+    let wire = wire.as_object()?;
+    if wire.len() != 3 {
+        return None;
+    }
+    let format = wire.get("format")?.as_str()?;
+    let input_key = if format == "open-ai-responses" {
+        "input"
+    } else if matches!(
+        format,
+        "anthropic-messages" | "open-ai-chat-compat" | "coerced-tools"
+    ) {
+        "messages"
+    } else {
+        return None;
+    };
+    if body.contains_key(if input_key == "input" {
+        "messages"
+    } else {
+        "input"
+    }) {
+        return None;
+    }
+    if format != "anthropic-messages" && body.contains_key("system") {
+        return None;
+    }
+    if format != "coerced-tools" && body.contains_key("response_format") {
+        return None;
+    }
+    let inputs = body.get(input_key)?.as_array()?;
+    let labels = wire.get("items")?.as_array()?;
+    if inputs.len() != labels.len() || inputs.is_empty() {
+        return None;
+    }
+    // A wire map may repeat a source for expanded items, but may not silently
+    // omit a source from the logical conversation it claims to represent.
+    let mut logical_sources = model_source_handles(tools)?;
+    for label in messages {
+        logical_sources.extend(model_source_handles(label)?);
+    }
+    let mut wire_sources = model_source_handles(tools)?;
+    for label in labels {
+        wire_sources.extend(model_source_handles(label)?);
+    }
+    if !wire.get("system")?.is_null() {
+        wire_sources.extend(model_source_handles(wire.get("system")?)?);
+    }
+    if logical_sources != wire_sources {
+        return None;
+    }
+    let mut redacted = false;
+    let items = inputs
+        .iter()
+        .zip(labels)
+        .map(|(item, label)| {
+            if authorized_model_source_label(label, authorized_source) {
+                item.clone()
+            } else {
+                redacted = true;
+                redacted_model_input_item(item)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut output = serde_json::Map::new();
+    if let Some(model) = body.get("model").and_then(serde_json::Value::as_str) {
+        output.insert("model".into(), serde_json::json!(model));
+    }
+    output.insert(input_key.into(), serde_json::Value::Array(items));
+    let system_label = wire.get("system")?;
+    if format == "anthropic-messages" {
+        match (body.get("system"), system_label.is_null()) {
+            (None, true) => {}
+            (Some(system), false)
+                if system
+                    .as_array()
+                    .is_some_and(|blocks| blocks.len() == 1 && blocks[0]["type"] == "text") =>
+            {
+                if authorized_model_source_label(system_label, authorized_source) {
+                    output.insert("system".into(), system.clone());
+                } else {
+                    redacted = true;
+                    output.insert(
+                        "system".into(),
+                        serde_json::json!([{"redacted": true, "type": "text"}]),
+                    );
+                }
+            }
+            _ => return None,
+        }
+    } else if !system_label.is_null() {
+        return None;
+    }
+    if let Some(definitions) = body.get("tools") {
+        let definitions = definitions.as_array()?;
+        if authorized_model_source_label(tools, authorized_source) {
+            output.insert(
+                "tools".into(),
+                serde_json::Value::Array(definitions.clone()),
+            );
+        } else {
+            redacted = true;
+            output.insert(
+                "tools".into(),
+                serde_json::Value::Array(
+                    definitions
+                        .iter()
+                        .map(|_| serde_json::json!({"redacted": true}))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if let Some(schema) = body.get("response_format") {
+        if format != "coerced-tools" {
+            return None;
+        }
+        if authorized_model_source_label(tools, authorized_source) {
+            output.insert("response_format".into(), schema.clone());
+        } else {
+            redacted = true;
+            output.insert(
+                "response_format".into(),
+                serde_json::json!({"redacted": true}),
+            );
+        }
+    }
+    Some((serde_json::Value::Object(output), redacted))
+}
+
+fn model_source_handles(label: &serde_json::Value) -> Option<std::collections::BTreeSet<&str>> {
+    let label = label.as_object()?;
+    if label.len() != 2 || !label.get("complete")?.is_boolean() {
+        return None;
+    }
+    label
+        .get("source_handles")?
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect()
+}
+
+fn redacted_model_input_item(item: &serde_json::Value) -> serde_json::Value {
+    let role = item
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .filter(|role| matches!(*role, "system" | "user" | "assistant" | "tool"));
+    let kind = item
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| matches!(*kind, "function_call" | "function_call_output"));
+    let mut output = serde_json::Map::new();
+    output.insert("redacted".into(), serde_json::Value::Bool(true));
+    if let Some(role) = role {
+        output.insert("role".into(), serde_json::json!(role));
+    }
+    if let Some(kind) = kind {
+        output.insert("type".into(), serde_json::json!(kind));
+    }
+    serde_json::Value::Object(output)
 }
 
 fn authorized_model_source_label(
@@ -1836,8 +2209,10 @@ fn authorized_model_source_label(
 
 #[cfg(test)]
 mod raw_model_context_tests {
+    use super::current_discipline_skill_source;
     use super::{
-        current_workspace_directory_source, current_workspace_file_source, project_model_context,
+        current_workspace_directory_source, current_workspace_file_source,
+        current_workspace_source_scope, project_model_context,
     };
     use crate::{
         library::{ChatRecord, RecordOp, LIBRARY_RECORD_SCHEMA},
@@ -1848,6 +2223,127 @@ mod raw_model_context_tests {
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
     };
+
+    #[tokio::test]
+    async fn frozen_skill_requires_exact_body_and_current_method_access() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let path = "agent-skills/triage/SKILL.md";
+        let (chat_id, discipline_root, source) = {
+            let mut wb = shared.lock_unpoisoned();
+            let chat = wb
+                .create_default_engagement("skill-source-chat".into(), "Skill source".into())
+                .unwrap_or_else(|_| panic!("create work chat"));
+            let instance = wb
+                .library
+                .instances
+                .get(&wb.library.chats.get(&chat.id).unwrap().instance_id)
+                .unwrap()
+                .clone();
+            let target_id = wb
+                .library
+                .authoring_target_for(&instance.agent_id)
+                .unwrap()
+                .id
+                .clone();
+            let discipline_root = crate::library_state::published_discipline_root(
+                &wb.targets_dir(),
+                &target_id,
+                instance.version,
+            );
+            let manifest_path = discipline_root.join(crate::discipline::DISCIPLINE_MANIFEST);
+            let mut manifest: crate::discipline::DisciplineManifest =
+                serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+            manifest.assets.push(crate::discipline::DisciplineAsset {
+                path: path.into(),
+                treatment: crate::discipline::DisciplineTreatment::Runtime,
+            });
+            let skill_body =
+                "---\nname: triage\ndescription: Inspect reports\n---\nRead the report.\n";
+            std::fs::create_dir_all(discipline_root.join("agent-skills/triage")).unwrap();
+            std::fs::write(discipline_root.join(path), skill_body).unwrap();
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+            let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(
+                crate::library_state::published_package_root(
+                    &wb.targets_dir(),
+                    &target_id,
+                    instance.version,
+                ),
+            )
+            .unwrap();
+            let discipline =
+                crate::discipline::load(&discipline_root, package.capabilities().iter().cloned())
+                    .unwrap();
+            let mut agent = wb.library.agents.get(&instance.agent_id).unwrap().clone();
+            agent
+                .versions
+                .get_mut(&instance.version)
+                .unwrap()
+                .discipline_ref = discipline.reference;
+            wb.write_agent_record(agent);
+            let source = format!(
+                "discipline-skill:{}:{}:triage",
+                chat.id,
+                whipplescript_store::stable_hash_hex(skill_body)
+            );
+            assert!(current_discipline_skill_source(
+                &wb, &chat.id, "solo", &source, false
+            ));
+            assert!(!current_discipline_skill_source(
+                &wb, &chat.id, "reader", &source, true
+            ));
+            assert!(!current_discipline_skill_source(
+                &wb,
+                &chat.id,
+                "solo",
+                &format!("{source}/other"),
+                false,
+            ));
+            (chat.id, discipline_root, source)
+        };
+        let turn_claim = crate::engine::claim_turn(&chat_id).unwrap();
+        let raw = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {"messages": ["skill body entered the model"]},
+                "ordered_provenance": {
+                    "messages": [{"source_handles": ["runtime", source], "complete": true}],
+                    "tools": {"source_handles": ["runtime"], "complete": true}
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        crate::engine::bind_turn_model_context(
+            &chat_id,
+            std::sync::Arc::new(move || Ok(raw.to_string())),
+        );
+        let read_raw = |shared: crate::SharedWorkbench| {
+            let chat_id = chat_id.clone();
+            async move {
+                let response =
+                    super::get_model_context(State(shared), Path(chat_id), HeaderMap::new())
+                        .await
+                        .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        assert_eq!(
+            read_raw(shared.clone()).await["calls"][0]["body"]["messages"][0],
+            "skill body entered the model"
+        );
+        std::fs::write(discipline_root.join(path), "erased").unwrap();
+        assert_eq!(read_raw(shared).await["calls"][0]["redacted"], true);
+        drop(turn_claim);
+    }
 
     #[test]
     fn unknown_provenance_releases_no_prompt_or_source_handle() {
@@ -1915,6 +2411,233 @@ mod raw_model_context_tests {
     }
 
     #[test]
+    fn wire_map_redacts_only_hidden_provider_items_and_tool_definitions() {
+        let view = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {
+                    "model": "test-model",
+                    "messages": [
+                        {"role": "system", "content": "private method"},
+                        {"role": "user", "content": "public question"},
+                        {"role": "tool", "tool_call_id": "private-id", "content": "private result"}
+                    ],
+                    "tools": [{"type": "function", "function": {"name": "private_tool"}}],
+                    "prompt_cache_key": "private-cache-key"
+                },
+                "ordered_provenance": {
+                    "messages": [
+                        {"source_handles": ["method"], "complete": true},
+                        {"source_handles": ["chat"], "complete": true},
+                        {"source_handles": ["result"], "complete": true}
+                    ],
+                    "tools": {"source_handles": ["method"], "complete": true},
+                    "wire": {
+                        "format": "open-ai-chat-compat",
+                        "items": [
+                            {"source_handles": ["method"], "complete": true},
+                            {"source_handles": ["chat"], "complete": true},
+                            {"source_handles": ["result"], "complete": true}
+                        ],
+                        "system": null
+                    }
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        let projected = project_model_context(&view, |source| source == "chat").unwrap();
+        let call = &projected["calls"][0];
+        assert_eq!(call["redacted"], true);
+        assert_eq!(
+            call["body"]["messages"][0],
+            serde_json::json!({"redacted": true, "role": "system"})
+        );
+        assert_eq!(
+            call["body"]["messages"][1],
+            view["calls"][0]["body"]["messages"][1]
+        );
+        assert_eq!(
+            call["body"]["messages"][2],
+            serde_json::json!({"redacted": true, "role": "tool"})
+        );
+        assert_eq!(
+            call["body"]["tools"][0],
+            serde_json::json!({"redacted": true})
+        );
+        for secret in [
+            "private method",
+            "private result",
+            "private_tool",
+            "private-id",
+            "private-cache-key",
+            "method",
+            "result",
+        ] {
+            assert!(!projected.to_string().contains(secret), "{secret}");
+        }
+        let visible = project_model_context(&view, |_| true).unwrap();
+        assert_eq!(visible["calls"][0]["body"], view["calls"][0]["body"]);
+
+        let mut unknown = view;
+        unknown["calls"][0]["provenance_complete"] = serde_json::json!(false);
+        unknown["calls"][0]["ordered_provenance"]["messages"][2]["complete"] =
+            serde_json::json!(false);
+        unknown["calls"][0]["ordered_provenance"]["wire"]["items"][2]["complete"] =
+            serde_json::json!(false);
+        let projected = project_model_context(&unknown, |source| source == "chat").unwrap();
+        assert_eq!(
+            projected["calls"][0]["body"]["messages"][1]["content"],
+            "public question"
+        );
+        assert_eq!(
+            projected["calls"][0]["body"]["messages"][2]["redacted"],
+            true
+        );
+        assert!(!projected.to_string().contains("private result"));
+    }
+
+    #[test]
+    fn joined_system_and_unmapped_provider_inputs_fail_closed() {
+        let mut view = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {
+                    "model": "test-model",
+                    "system": [{"type": "text", "text": "hidden system"}],
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "visible"}]},
+                        {"role": "assistant", "content": [{"type": "tool_use", "name": "secret tool"}]}
+                    ],
+                    "tools": []
+                },
+                "ordered_provenance": {
+                    "messages": [
+                        {"source_handles": ["hidden"], "complete": true},
+                        {"source_handles": ["chat"], "complete": true},
+                        {"source_handles": ["hidden"], "complete": true}
+                    ],
+                    "tools": {"source_handles": [], "complete": true},
+                    "wire": {
+                        "format": "anthropic-messages",
+                        "items": [
+                            {"source_handles": ["chat"], "complete": true},
+                            {"source_handles": ["hidden"], "complete": true}
+                        ],
+                        "system": {"source_handles": ["hidden"], "complete": true}
+                    }
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        let projected = project_model_context(&view, |source| source == "chat").unwrap();
+        assert_eq!(projected["calls"][0]["body"]["system"][0]["redacted"], true);
+        assert_eq!(projected["calls"][0]["body"]["messages"][0]["role"], "user");
+        assert_eq!(
+            projected["calls"][0]["body"]["messages"][1],
+            serde_json::json!({"redacted": true, "role": "assistant"})
+        );
+        assert!(!projected.to_string().contains("hidden system"));
+        assert!(!projected.to_string().contains("secret tool"));
+
+        view["calls"][0]["ordered_provenance"]["wire"]["system"] =
+            serde_json::json!({"source_handles": ["chat"], "complete": true});
+        view["calls"][0]["ordered_provenance"]["wire"]["items"][1] =
+            serde_json::json!({"source_handles": ["chat"], "complete": true});
+        let omitted_source = project_model_context(&view, |source| source == "chat").unwrap();
+        assert_eq!(omitted_source["calls"][0]["redacted"], true);
+        assert!(omitted_source["calls"][0].get("body").is_none());
+
+        view["calls"][0]["ordered_provenance"]["wire"]["items"] = serde_json::json!([]);
+        let malformed = project_model_context(&view, |source| source == "chat").unwrap();
+        assert_eq!(malformed["calls"][0]["redacted"], true);
+        assert!(malformed["calls"][0].get("body").is_none());
+    }
+
+    #[test]
+    fn responses_and_coerced_tool_items_keep_only_safe_structure() {
+        let responses = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {
+                    "input": [
+                        {"role": "user", "content": "visible question"},
+                        {"type": "function_call_output", "call_id": "secret-id", "output": "secret result"}
+                    ],
+                    "tools": []
+                },
+                "ordered_provenance": {
+                    "messages": [
+                        {"source_handles": ["chat"], "complete": true},
+                        {"source_handles": ["hidden"], "complete": true}
+                    ],
+                    "tools": {"source_handles": [], "complete": true},
+                    "wire": {
+                        "format": "open-ai-responses",
+                        "items": [
+                            {"source_handles": ["chat"], "complete": true},
+                            {"source_handles": ["hidden"], "complete": true}
+                        ],
+                        "system": null
+                    }
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        let projected = project_model_context(&responses, |source| source == "chat").unwrap();
+        assert_eq!(
+            projected["calls"][0]["body"]["input"][1],
+            serde_json::json!({
+                "redacted": true, "type": "function_call_output"
+            })
+        );
+        assert!(!projected.to_string().contains("secret-id"));
+        assert!(!projected.to_string().contains("secret result"));
+
+        let coerced = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {
+                    "messages": [
+                        {"role": "user", "content": "visible question"},
+                        {"role": "system", "content": "private tool vocabulary"}
+                    ],
+                    "response_format": {"private_schema": "secret schema"}
+                },
+                "ordered_provenance": {
+                    "messages": [{"source_handles": ["chat"], "complete": true}],
+                    "tools": {"source_handles": ["hidden"], "complete": true},
+                    "wire": {
+                        "format": "coerced-tools",
+                        "items": [
+                            {"source_handles": ["chat"], "complete": true},
+                            {"source_handles": ["hidden"], "complete": true}
+                        ],
+                        "system": null
+                    }
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        let projected = project_model_context(&coerced, |source| source == "chat").unwrap();
+        assert_eq!(
+            projected["calls"][0]["body"]["messages"][1],
+            serde_json::json!({
+                "redacted": true, "role": "system"
+            })
+        );
+        assert_eq!(
+            projected["calls"][0]["body"]["response_format"],
+            serde_json::json!({"redacted": true})
+        );
+        assert!(!projected.to_string().contains("private tool vocabulary"));
+        assert!(!projected.to_string().contains("secret schema"));
+    }
+
+    #[test]
     fn workspace_result_redacts_only_its_call_after_an_authorized_world_state() {
         let view = serde_json::json!({
             "calls": [
@@ -1950,6 +2673,39 @@ mod raw_model_context_tests {
         assert_eq!(projected["calls"][1]["ordinal"], 1);
         assert_eq!(projected["calls"][1]["redacted"], true);
         assert!(!projected.to_string().contains("erased file bytes"));
+    }
+
+    #[test]
+    fn authoring_context_scope_admits_imported_files_but_not_method_files() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let mut wb = wb.lock_unpoisoned();
+        let chat = wb
+            .create_chat_under_agent(crate::DEFAULT_AGENT, "Edit context")
+            .unwrap_or_else(|_| panic!("create edit chat"));
+        let chat_id = chat["id"].as_str().unwrap();
+        assert!(current_workspace_source_scope(
+            &wb,
+            chat_id,
+            "context.txt",
+            true
+        ));
+        for path in [
+            "agent/SYSTEM.md",
+            "./agent/SYSTEM.md",
+            "notes/../agent/SYSTEM.md",
+            ".whipple/draft/source.md",
+            ".agent-config.json",
+            "work/output.txt",
+        ] {
+            assert!(!current_workspace_source_scope(&wb, chat_id, path, true));
+        }
+        assert!(!current_workspace_source_scope(
+            &wb,
+            chat_id,
+            "context.txt",
+            false
+        ));
     }
 
     #[test]
@@ -2087,6 +2843,64 @@ mod raw_model_context_tests {
             .get(&chat.id)
             .unwrap()
             .delete_entry(&negative)
+            .unwrap();
+        assert_eq!(project(&wb)["calls"][0]["redacted"], true);
+    }
+
+    #[test]
+    fn directory_listing_checks_each_listed_child_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let mut wb = wb.lock_unpoisoned();
+        let chat = wb
+            .create_default_engagement("listing-witness-chat".into(), "Listing witness".into())
+            .unwrap_or_else(|_| panic!("create listing chat"));
+        let nested = wb.engagement_workspace_path(&chat.id, "child/nested.txt");
+        let child = nested.strip_suffix("/nested.txt").unwrap();
+        let directory = child.strip_suffix("/child").unwrap();
+        let dir_source = format!("workspace-dir:{}:{directory}", chat.id);
+        let child_source = format!("workspace-dir:{}:{child}", chat.id);
+        let engagement = wb.engagements.get(&chat.id).unwrap();
+        engagement.write_file(&nested, "nested\n").unwrap();
+        engagement.commit_turn("retain listed child").unwrap();
+        assert!(current_workspace_directory_source(
+            &wb,
+            &chat.id,
+            &dir_source
+        ));
+        assert!(current_workspace_directory_source(
+            &wb,
+            &chat.id,
+            &child_source
+        ));
+        let view = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {"messages": ["child/"]},
+                "ordered_provenance": {
+                    "messages": [{"source_handles": [dir_source, child_source], "complete": true}],
+                    "tools": {"source_handles": ["runtime"], "complete": true}
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        let project = |wb: &Workbench| {
+            project_model_context(&view, |source| {
+                source == "runtime" || current_workspace_directory_source(wb, &chat.id, source)
+            })
+            .unwrap()
+        };
+        assert_eq!(project(&wb)["calls"][0]["body"], view["calls"][0]["body"]);
+        wb.engagements
+            .get(&chat.id)
+            .unwrap()
+            .delete_entry(child)
+            .unwrap();
+        wb.engagements
+            .get(&chat.id)
+            .unwrap()
+            .commit_turn("remove listed child")
             .unwrap();
         assert_eq!(project(&wb)["calls"][0]["redacted"], true);
     }
@@ -2359,7 +3173,7 @@ mod raw_model_context_tests {
             chat_id,
             std::sync::Arc::new(move || Ok(raw.to_string())),
         );
-        let mut headers = HeaderMap::new();
+        let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::AUTHORIZATION,
             "Bearer alice-token".parse().unwrap(),
@@ -2580,6 +3394,7 @@ pub(crate) async fn post_choice_answer(
                 mode: context.mode,
                 authenticated_actor: Some(&respondent),
                 authenticated_context: authenticated.as_ref(),
+                local_operator: false,
                 contribution_by: None,
                 account_scope: &account_scope,
                 tenant_scope: &tenant_scope,
@@ -2678,8 +3493,13 @@ pub(crate) async fn get_audit(
 pub(crate) async fn get_tree(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
+    let viewer = match crate::method_access::chat_reader(&wb, &id, &headers) {
+        Ok(viewer) => viewer,
+        Err(error) => return error.into_response(),
+    };
     let Some(tree) = wb.engagement_tree(&id) else {
         return (StatusCode::NOT_FOUND, "no such engagement").into_response();
     };
@@ -2687,7 +3507,27 @@ pub(crate) async fn get_tree(
         Ok(entries) => {
             let files: Vec<_> = entries
                 .into_iter()
-                .filter(|e| !wb.installed_method_read_requires_grant(&id, &e.path))
+                .filter(|e| {
+                    !(wb.installed_method_read_requires_grant(&id, &e.path)
+                        || (crate::method_access::account_backed_chat(&wb, &id, &headers)
+                            && wb.is_installed_method_path(&id, &e.path)))
+                        || wb
+                            .package_selection_for_chat(&id)
+                            .is_some_and(|(_, package_ref)| {
+                                wb.method_inspection_granted(&id, &viewer, &package_ref)
+                            })
+                })
+                .filter(|e| {
+                    !crate::method_access::account_backed_chat(&wb, &id, &headers)
+                        || wb.is_installed_method_path(&id, &e.path)
+                        || if e.is_dir {
+                            crate::context_inspection::directory_visible(&wb, &id, &viewer, &e.path)
+                        } else {
+                            crate::context_inspection::file_readable(
+                                &wb, &id, &viewer, &e.path, None,
+                            )
+                        }
+                })
                 .map(|e| serde_json::json!({ "path": e.path, "is_dir": e.is_dir }))
                 .collect();
             (StatusCode::OK, Json(serde_json::json!({ "files": files }))).into_response()
@@ -2759,9 +3599,21 @@ pub(crate) async fn get_file(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
     Query(q): Query<FileQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    let Some(content) = wb.read_engagement_file_bytes(&id, &q.path, MAX_VIEWABLE_FILE_BYTES) else {
+    let viewer = match crate::method_access::chat_reader(&wb, &id, &headers) {
+        Ok(viewer) => viewer,
+        Err(error) => return error.into_response(),
+    };
+    let account_backed = crate::method_access::account_backed_chat(&wb, &id, &headers);
+    let Some(content) = wb.read_engagement_file_bytes_for_viewer(
+        &id,
+        &q.path,
+        MAX_VIEWABLE_FILE_BYTES,
+        Some(&viewer),
+        account_backed,
+    ) else {
         return (StatusCode::NOT_FOUND, "no such engagement").into_response();
     };
     let bytes = match content {
@@ -3098,6 +3950,7 @@ pub(crate) async fn post_task(
     headers: HeaderMap,
     actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     authenticated: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
+    operator: Option<axum::extract::Extension<crate::account_signin::DesktopOperatorPlane>>,
     Json(body): Json<TaskBody>,
 ) -> impl IntoResponse {
     // Brief lock: confirm the engagement and grab its worktree, live sender, mode.
@@ -3122,6 +3975,7 @@ pub(crate) async fn post_task(
     let images = body.images;
     let actor = actor.map(|axum::extract::Extension(actor)| actor.0);
     let authenticated = authenticated.map(|axum::extract::Extension(context)| context);
+    let local_operator = operator.is_some();
     let id2 = id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         engine::run_engagement_turn(
@@ -3135,6 +3989,7 @@ pub(crate) async fn post_task(
                 mode,
                 authenticated_actor: actor.as_ref(),
                 authenticated_context: authenticated.as_ref(),
+                local_operator,
                 contribution_by: None,
                 account_scope: &account_scope,
                 tenant_scope: &tenant_scope,
@@ -3740,11 +4595,32 @@ mod multi_target_edit_authorization_tests {
                 .unwrap()
                 .is_err());
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let worktree = workbench.engagements.get(&chat.id).unwrap().path();
+            let method = worktree.join(".gaugedesk-runtime/agent/AGENTS.md");
+            let agent_dir = worktree.join(".gaugedesk-runtime/agent");
+            symlink(&method, worktree.join("work/method-link.md")).unwrap();
+            symlink(&agent_dir, worktree.join("work/agent-link")).unwrap();
+            for path in ["work/method-link.md", "work/agent-link/AGENTS.md"] {
+                assert!(workbench
+                    .read_engagement_file_bytes(&chat.id, path, 1024 * 1024)
+                    .unwrap()
+                    .is_err());
+                assert!(workbench
+                    .read_engagement_file(&chat.id, path)
+                    .unwrap()
+                    .is_err());
+            }
+        }
         assert!(!workbench.installed_method_read_requires_grant(&chat.id, "work/notes.md"));
     }
 
     #[tokio::test]
     async fn account_backed_tree_omits_installed_method_paths() {
+        use gaugedesk_core::{abac::AuthorityAttributes, ids::AuthorityId};
         let root = tempfile::tempdir().unwrap();
         let workbench = open_workbench(root.path()).unwrap();
         let chat_id = {
@@ -3752,12 +4628,23 @@ mod multi_target_edit_authorization_tests {
             let chat = workbench
                 .create_default_engagement("method-tree-chat".to_owned(), "Method tree".to_owned())
                 .unwrap_or_else(|_| panic!("create Agent work chat"));
-            workbench.set_identity_provider(Some(std::sync::Arc::new(
-                crate::identity::LoopbackIdentityProvider::new(),
-            )));
+            let mut owned = workbench.library.chats.get(&chat.id).unwrap().clone();
+            owned.owner = Some("alice".into());
+            workbench.write_chat_record(owned);
+            let idp = crate::identity::LoopbackIdentityProvider::new().enroll(
+                "alice-token",
+                AuthorityId::new("alice"),
+                AuthorityAttributes::default(),
+            );
+            workbench.set_identity_provider(Some(std::sync::Arc::new(idp)));
             chat.id
         };
-        let response = super::get_tree(State(workbench), Path(chat_id))
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer alice-token".parse().unwrap(),
+        );
+        let response = super::get_tree(State(workbench), Path(chat_id), headers)
             .await
             .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);

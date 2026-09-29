@@ -1,36 +1,43 @@
 /**
  * The opened Panel agent (`experience/navigation.md` Workshop, PANEL-12).
  *
- * Selecting a Panel agent puts its edit chat in the Chat pane and this surface
- * in the Content pane, the way project settings take that pane. It hosts the
- * two things developing a Panel agent is made of, side by side: the public
- * contract, edited in place while it is the Workshop draft, and Preview, the
- * real disposable public session, mounted but not started.
+ * Opening a Panel agent puts its edit chat in the Chat pane and this surface in
+ * the Content pane, the way project settings take that pane. It holds the
+ * public contract, edited in place while it is the Workshop draft. A save bar
+ * stays at the foot of the pane, and publishing an unsaved draft saves it
+ * first, so what is frozen is what the owner is looking at.
+ *
+ * It offers no way to try the agent. Trying one is a mode of the workbench,
+ * where it is built (DR-0245); settings are for what visitors get.
  *
  * A placement pinned to a frozen version opens the same surface. Its contract
- * is shown rather than edited, and Deploy and Inbox take the place of edit and
- * publish, because a project is the durable owner of a deployment (ADR 0143).
- * `panel-agent-opening.ts` decides which of the two this is.
+ * is read back in plain words rather than edited, and Deploy and Inbox take the
+ * place of save and publish, because a project is the durable owner of a
+ * deployment (ADR 0143). `panel-agent-opening.ts` decides which of the two this is.
  */
 
 import { createEffect, createMemo, createResource, createSignal, Show, type JSX } from "solid-js";
 import type {
+    AgentAbility,
     ArchetypeId,
     ArchetypeNode,
     PanelPublicProfile,
     PlacementNode,
     ProjectNode,
 } from "@gaugewright/control-plane-client";
-import { PanelAgentPreview, type PanelAgentPreviewApi } from "./PanelAgentPreview";
 import { PanelContractEditor } from "./PanelContractEditor";
+import { PanelContractSummary } from "./PanelContractSummary";
 import { plainConfigError } from "./AgentSettings";
 import { panelAgentSurfacePlan } from "./panel-agent-opening";
 import "./project-settings.css";
+import "./panel-agent.css";
 
-export interface PanelAgentSurfaceApi extends PanelAgentPreviewApi {
+export interface PanelAgentSurfaceApi {
     getPanelProfile(id: ArchetypeId): Promise<PanelPublicProfile>;
     setPanelProfile(id: ArchetypeId, profile: PanelPublicProfile): Promise<PanelPublicProfile>;
     publishArchetype(id: ArchetypeId, autoUpgrade?: boolean): Promise<{ version: number; autoUpgraded: number }>;
+    /** The authored agent's abilities, which bound what the contract may offer visitors. */
+    getArchetypeAbilities?(id: ArchetypeId): Promise<AgentAbility[]>;
 }
 
 export function PanelAgentSurface(props: {
@@ -39,11 +46,6 @@ export function PanelAgentSurface(props: {
     /** Present when opened from a project placement: the surface is pinned to it. */
     project?: ProjectNode;
     placement?: PlacementNode;
-    defaultEdgeOrigin: string;
-    defaultCredentialRef: string;
-    onClose: () => void;
-    /** Start another edit chat on this agent (the draft scope only). */
-    onNewEditChat?: () => void;
     onDeploy?: () => void;
     onOpenInbox?: () => void;
     /** A new version was frozen from the draft; the nav should pick it up. */
@@ -56,9 +58,14 @@ export function PanelAgentSurface(props: {
         () => plan().scope === "draft" ? props.agent.id : null,
         (id) => props.api.getPanelProfile(id),
     );
+    const [authoredAbilities] = createResource(
+        () => plan().scope === "draft" && props.api.getArchetypeAbilities ? props.agent.id : null,
+        (id) => props.api.getArchetypeAbilities!(id),
+    );
     const [draft, setDraft] = createSignal<PanelPublicProfile | null>(null);
     const [dirty, setDirty] = createSignal(false);
     const [message, setMessage] = createSignal("");
+    const [failed, setFailed] = createSignal(false);
     const [busy, setBusy] = createSignal(false);
     createEffect(() => {
         const profile = loaded();
@@ -70,99 +77,110 @@ export function PanelAgentSurface(props: {
         setDraft(next);
         setDirty(true);
         setMessage("");
+        setFailed(false);
     }
 
-    async function save() {
+    function discard() {
+        setDirty(false);
+        setDraft(loaded() ?? null);
+        setMessage("");
+        setFailed(false);
+    }
+
+    async function save(): Promise<boolean> {
         const profile = draft();
-        if (!profile) return;
+        if (!profile) return false;
         setBusy(true);
         try {
             const saved = await props.api.setPanelProfile(props.agent.id, profile);
             setDraft(saved);
             setDirty(false);
-            setMessage("Contract saved. Preview runs it from the next start.");
+            setFailed(false);
+            setMessage("Saved.");
             await refetch();
+            return true;
         } catch (reason) {
+            setFailed(true);
             setMessage(plainConfigError(String(reason)));
+            return false;
         } finally {
             setBusy(false);
         }
     }
 
     async function publish() {
+        if (dirty() && !await save()) return;
         setBusy(true);
         try {
             const published = await props.api.publishArchetype(props.agent.id);
-            setMessage(`Published v${published.version}.`);
+            setFailed(false);
+            setMessage(`Published version ${published.version}. Projects on an earlier version can upgrade to it.`);
             props.onPublished?.(published.version);
         } catch (reason) {
+            setFailed(true);
             setMessage(String(reason));
         } finally {
             setBusy(false);
         }
     }
 
-    const contractRows = (profile: PanelPublicProfile) => <div class="member-list">
-        <div class="member-row"><span>Panels</span><span class="member-id">{profile.panels.components.join(", ")}</span></div>
-        <div class="member-row"><span>Abilities</span><span class="member-id">{profile.public_abilities.join(", ") || "Chat only"}</span></div>
-        <div class="member-row"><span>Provider</span><span class="member-id">{profile.provider.provider} · {profile.provider.model}</span></div>
-        <div class="member-row"><span>Audience inputs</span><span class="member-id">{profile.audience_inputs.join(", ")}</span></div>
-        <div class="member-row"><span>Initial content</span><span class="member-id">{profile.initial_workspace.length} file(s)</span></div>
-        <div class="member-row"><span>Collection</span><span class="member-id">{profile.collection ? `${profile.collection.schema_ref} → project Inbox` : "Off"}</span></div>
-    </div>;
+    const status = () => message() || (dirty() ? "Unsaved changes" : "All changes saved");
 
-    return <main class="project-settings-content panel-agent-surface" data-panel-agent-surface data-panel-agent-scope={plan().scope}>
-        <article class="project-settings-page">
-            <header class="project-settings-page-head">
-                <div><span>Panel agent</span><h1>{props.agent.name}</h1><p class="muted panel-agent-subtitle">{plan().subtitle}</p></div>
-                <button type="button" onClick={props.onClose}>Close</button>
-            </header>
-            <div class="project-settings-title">
-                <h2>{plan().scope === "draft" ? "Develop" : "Placement"}</h2>
-                <div class="deployment-actions">
-                    <Show when={plan().scope === "draft" && props.onNewEditChat}>
-                        <button type="button" onClick={props.onNewEditChat}>New edit chat</button>
+    // No page header: the nav already says which agent this is, and the pane is
+    // left by selecting something else. What the header carried — which draft or
+    // version this is, and its actions — sits in the bar at the foot.
+    return <main class="project-settings-content panel-agent-surface pa-root" data-panel-agent-surface data-panel-agent-scope={plan().scope}>
+        <article class="project-settings-page" aria-label={`${props.agent.name}, ${plan().subtitle}`}>
+            <div class="pa-body">
+                <Show when={plan().contractEditable} fallback={<section class="pa-section" data-panel-agent-contract>
+                    <div class="pa-section-head">
+                        <h3>What visitors get</h3>
+                        <p>This project runs version {props.placement?.version}, which is frozen. To change it, edit the agent in the
+                            Workshop, publish a new version, and upgrade this placement.</p>
+                    </div>
+                    <Show when={frozen()} fallback={<p class="pa-empty">This placement has no frozen public profile.</p>}>
+                        {(profile) => <PanelContractSummary profile={profile()} />}
                     </Show>
-                    <Show when={plan().actions.includes("publish")}>
-                        <button type="button" class="primary" disabled={busy()} onClick={() => void publish()}>Publish a new version</button>
-                    </Show>
-                    <Show when={plan().actions.includes("deploy") && props.onDeploy}>
-                        <button type="button" class="primary" onClick={props.onDeploy}>{plan().deployLabel}</button>
-                    </Show>
-                    <Show when={plan().actions.includes("inbox") && props.onOpenInbox}>
-                        <button type="button" onClick={props.onOpenInbox}>Inbox</button>
-                    </Show>
-                </div>
+                </section>}>
+                    <div data-panel-agent-contract>
+                        <Show when={draft()} fallback={<section class="pa-section">
+                            <Show when={loaded.error} fallback={<p class="pa-hint">Loading…</p>}>
+                                {(error) => <p class="pa-error">Could not load the settings: {String(error())}</p>}
+                            </Show>
+                        </section>}>
+                            {(profile) => <PanelContractEditor profile={profile()} onChange={edit}
+                                authoredAbilities={authoredAbilities()} />}
+                        </Show>
+                    </div>
+                </Show>
             </div>
 
-            <section class="project-settings-section">
-                <PanelAgentPreview
-                    api={props.api}
-                    agent={props.agent}
-                    project={props.project}
-                    placementId={props.placement?.placementId}
-                    defaultEdgeOrigin={props.defaultEdgeOrigin}
-                    defaultCredentialRef={props.defaultCredentialRef} />
-            </section>
-
-            <section class="project-settings-section" data-panel-agent-contract>
-                <Show when={plan().contractEditable} fallback={<div class="admin-section">
-                    <h3>Frozen public contract</h3>
-                    <p class="settings-hint">This is the pinned version. To change it, edit the Panel agent in the Workshop, publish a new version, and upgrade the placement.</p>
-                    <Show when={frozen()} fallback={<p class="status">This placement has no frozen public profile.</p>}>{(profile) => contractRows(profile())}</Show>
-                </div>}>
-                    <Show when={draft()} fallback={<div class="admin-section"><h3>Public contract</h3>
-                        <Show when={loaded.error} fallback={<p class="status">loading…</p>}>{(error) => <p class="error">Could not load the contract: {String(error())}</p>}</Show>
-                    </div>}>
-                        {(profile) => <div class="settings-form"><PanelContractEditor profile={profile()} onChange={edit} onNotice={setMessage} /></div>}
+            <footer class="pa-savebar">
+                <span class="pa-savebar-where"><span class="panel-agent-subtitle">{plan().subtitle}</span>
+                    <Show when={plan().contractEditable}>
+                        <span class={failed() ? "pa-error" : "pa-savebar-status"} data-dirty={dirty() && !message()}
+                            data-panel-contract-status role="status">{status()}</span>
                     </Show>
-                    <div class="bar">
-                        <button type="button" data-panel-contract-save disabled={busy() || !dirty()} onClick={() => void save()}>Save contract</button>
-                        <span class="status" data-panel-contract-status>{message()}</span>
-                    </div>
-                    <p class="settings-hint">Preview runs the saved contract. Publishing freezes it into a version; deployments cannot redefine it.</p>
-                </Show>
-            </section>
+                </span>
+                <div class="pa-savebar-actions">
+                    <Show when={plan().contractEditable}>
+                        <Show when={dirty()}><button type="button" class="pa-button" disabled={busy()} onClick={discard}>Discard</button></Show>
+                        <button type="button" class="pa-button" data-panel-contract-save disabled={busy() || !dirty()}
+                            onClick={() => void save()}>Save</button>
+                    </Show>
+                    <Show when={plan().actions.includes("publish")}>
+                        <button type="button" class="pa-button primary" disabled={busy() || !draft()}
+                            title="Freeze these settings into a new version that projects can deploy"
+                            onClick={() => void publish()}>{dirty() ? "Save and publish" : "Publish new version"}</button>
+                    </Show>
+                    <Show when={plan().actions.includes("inbox") && props.onOpenInbox}>
+                        <button type="button" class="pa-button" onClick={props.onOpenInbox}>Inbox</button>
+                    </Show>
+                    <Show when={plan().actions.includes("deploy") && props.onDeploy}>
+                        <button type="button" class="pa-button primary" onClick={props.onDeploy}>{plan().deployLabel}</button>
+                    </Show>
+                </div>
+            </footer>
         </article>
     </main>;
 }

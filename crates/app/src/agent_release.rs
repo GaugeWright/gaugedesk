@@ -1098,6 +1098,7 @@ impl Workbench {
         let version = ArchetypeVersionRecord {
             package_ref: preview_package.version_ref().to_owned(),
             discipline_ref: preview_discipline.reference,
+            source_owner_authority: None,
             panel_profile: Some(profile.clone()),
         };
         self.library

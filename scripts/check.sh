@@ -15,7 +15,7 @@
 # the change under test. The sections that never touch the cargo target
 # directory — contracts, web, dependencies — run alongside the ones that do,
 # and their transcripts are replayed in that order once the cargo sections
-# finish. See run_all.
+# finish; under Buck2 they run after them instead. See run_all.
 #
 # The set spans what used to be three workflows: the private Tier-0 lane
 # (architecture, license boundary, contracts, canaries, client calls, spec
@@ -86,21 +86,33 @@ section="${1:-all}"
 # A section whose answer comes from outside this tree is spared nothing: it is
 # a `check_world` target, which refuses to run unless the invocation names the
 # run, so it cannot be answered from a cache by accident.
+#
+# `all` asks once and hands the answer to every section it starts, which is a
+# fresh invocation of this script. Each asking for itself let them disagree:
+# on a host under load the parent's probe failed while its sections' passed,
+# so run_all overlapped the lanes as though there were no daemon while every
+# section built on the shared one — exactly the exposure run_all keeps them
+# apart to avoid (#876).
 via_buck2=""
-if [ -z "${GREEN_BAR_INSIDE_BUCK2:-}" ] && command -v buck2 >/dev/null 2>&1 \
+if [ -n "${GREEN_BAR_INSIDE_BUCK2:-}" ]; then
+  :
+elif [ -n "${GREEN_BAR_VIA_BUCK2+set}" ]; then
+  via_buck2="$GREEN_BAR_VIA_BUCK2"
+elif command -v buck2 >/dev/null 2>&1 \
    && buck2 audit cell 2>/dev/null | grep -qx "gaugedesk: $(pwd -P)"; then
   via_buck2=1
 fi
+export GREEN_BAR_VIA_BUCK2="$via_buck2"
 # One nonce for the whole run, and the prerequisite word beside it: the first
 # is what a world-reading section demands before it will run, the second is part
 # of every action's key, so a run that skipped a section is never served to one
 # that required an answer.
 #
-# EXPORTED, because `all` runs three lanes at once and each is a fresh
-# invocation of this script. Left unexported they mint three different nonces,
-# which are three different Buck2 CONFIGURATIONS arriving at one daemon at
-# once — and the daemon answers by cancelling a transaction, so a lane fails
-# for a reason that has nothing to do with the tree. One run is one nonce.
+# EXPORTED, because `all` runs each section as a fresh invocation of this
+# script, and left unexported each would mint its own nonce. When the lanes
+# overlapped on one daemon those were different Buck2 CONFIGURATIONS arriving
+# at it at once, which it answered by cancelling a transaction; under Buck2 the
+# lanes no longer overlap (see run_all), and one run is still one nonce.
 export GREEN_BAR_RUN="${GREEN_BAR_RUN:-$(date +%s)-$$}"
 
 # What the sections could not establish. Each announces it on stdout as
@@ -209,7 +221,9 @@ run_contracts() {
     # SHOWS and REPORTS was derived separately from the version its bundle is
     # NAMED — so v0.4.6 through v0.4.8 each installed under its own name and
     # then told the user, and every Home it spoke to, that it was 0.4.5. Every
-    # gate was green throughout.
+    # gate was green throughout. It also holds every place the tree states the
+    # product's version — desktop and mobile — to the one Cargo.toml declares,
+    # and CHANGELOG.md to recording it (GaugeWright DR-0170).
     echo "== release version sources =="
     gate_section release-version-sources
 
@@ -267,6 +281,12 @@ run_contracts() {
     # computing, i.e. the first poll — and a bump that was supposed to wait for
     # ten required checks would have merged before one had reported.
     bash scripts/release-routing.test.sh
+
+    # The APT lane's two decisions before it reads the archive key: which
+    # release is newest, and whether the channel already carries it. Wrong, the
+    # fleet job stays green while publishing nothing, or re-signs the channel
+    # every hour for a release it already has.
+    bash scripts/publish-apt.test.sh
 
     # The archive one layer up: that a built package is what the archive will
     # accept, that the indexes and signatures an `apt-get update` reads are the
@@ -401,7 +421,7 @@ run_rust() {
     # recorded pass. Anywhere else -- a Mac, a worktree outside a workspace --
     # the cargo lines run, and assert the same set.
     local native=""
-    if [ -n "$via_buck2" ] && [ "$(uname -s)" = Linux ] && command -v bwrap >/dev/null 2>&1; then
+    if native_targets; then
         native=1
     fi
 
@@ -411,18 +431,24 @@ run_rust() {
     # cargo-nextest, the tmpfs the fixtures write to, and the doctest run
     # nextest does not do are stated once, in scripts/section.sh — including the
     # tmpfs, which a section running as a Buck2 action has to set up itself
-    # because it inherits nothing from this shell. Natively, the doctests are
-    # their own section beside the test runs.
+    # because it inherits nothing from this shell. Natively, each library's
+    # doctests are a cached run of their own beside the test runs.
     echo "== tests =="
     if [ -n "$native" ]; then
         native_section native-tests
-        gate_section doctests
+        native_section native-doctests
     else
         gate_section tests
     fi
 
     echo "== no-default-features =="
     if [ -n "$native" ]; then native_section native-feature-checks; else gate_section no-default-features; fi
+}
+
+# Whether this bar runs on the native targets: the condition the rust lane
+# states, which the web lane shares for its wasm modules.
+native_targets() {
+    [ -n "$via_buck2" ] && [ "$(uname -s)" = Linux ] && command -v bwrap >/dev/null 2>&1
 }
 
 # A native suite: one target over many actions, so there is no one transcript
@@ -432,8 +458,11 @@ native_section() {
 }
 
 
+# Natively, the lane is handed the browser's two wasm modules linked by the
+# native targets rather than building them with cargo (GaugeWright BUILD.md
+# stage 6).
 run_web() {
-    gate_section web
+    if native_targets; then gate_section native-web; else gate_section web; fi
 }
 
 # The dependency audit lives here rather than in a workflow step so that the
@@ -571,7 +600,8 @@ end_alongside() {
 # done, so a failure lands under its own section rather than interleaved with
 # rustc. Measured on the founder's machine, warm tree, under a load average of
 # 15 from other sessions: 110 s sequential, 88 s overlapped — the same sections
-# and the same verdict, a fifth of the wall clock less.
+# and the same verdict, a fifth of the wall clock less. Under Buck2 they run
+# after the cargo sections instead, in the same order; the reason is below.
 #
 # Each background section is its own process group, for the reason
 # `parallel_steps` gives: without job control an asynchronous list inherits an
@@ -579,11 +609,9 @@ end_alongside() {
 # completion. The trap ends every group.
 run_all() {
     # One word for every lane of this run, exported for the same reason the
-    # nonce is: `all` starts three lanes at once, each a fresh invocation of
-    # this script, and the word is part of every Buck2 action's key. Two
-    # different words are two different CONFIGURATIONS arriving at one daemon
-    # together, and the daemon answers by cancelling a transaction — a lane
-    # failing for a reason that has nothing to do with the tree.
+    # nonce is: each lane is a fresh invocation of this script, and the word is
+    # part of every Buck2 action's key, so a run that skipped a step is never
+    # served to one that required it.
     #
     # best-effort is what `all` means: it is a developer's bar, and the lanes
     # that take no word have no prerequisite-guarded step for it to change.
@@ -601,7 +629,33 @@ run_all() {
     local transcripts
     transcripts="$(mktemp -d)"
     local alongside=(contracts web dependencies)
+    local foreground=(rust desktop mobile windows)
     local pids=()
+
+    # Under Buck2 nothing runs alongside: every section is a command on the
+    # workspace's one daemon, and two commands in flight on it at once are
+    # exposed to a Buck2 fault. The daemon learns of source changes through
+    # inotify, the sections' own npm and cargo writes overflow the kernel's
+    # queue (fs.inotify.max_queued_events, 16384 on a stock Linux), and the next
+    # command to start then drops the daemon's whole graph, refusing the result
+    # of every transaction still in flight: the section's action passes and the
+    # build ends `BUILD FAILED` / `The transaction was cancelled`
+    # (DICE_REJECTED), with nothing to say about the change. Proven on the
+    # fleet host legion for gaugewright-cloud (GaugeWright/gaugewright-cloud#398).
+    #
+    # A daemon per lane (`--isolation-dir`) avoids the fault and was tried
+    # (#876), but it breaks what a target's `exclusive` and `cores` declare.
+    # Buck2 schedules those weights inside one daemon's executor, and each
+    # daemon believes it holds the whole machine: check-composition's timing
+    # assertions could run beside the rust `tests` that also declare the whole
+    # executor, and web's twelve cores beside both. One command at a time on one
+    # daemon avoids the fault and keeps every weight meaning what it says; the
+    # scheduler still runs each section's actions in parallel. Off Buck2 there
+    # is no daemon, and the lanes still overlap.
+    if [ -n "$via_buck2" ]; then
+        foreground+=("${alongside[@]}")
+        alongside=()
+    fi
 
     # Ctrl-C used to stop the bar as a side effect of errexit seeing the
     # interrupted section's nonzero status. Collecting that status instead would
@@ -610,10 +664,30 @@ run_all() {
     # it to what bash does with one it received while waiting on a child. The
     # sections running alongside are in their own process groups, which the
     # terminal's interrupt does not reach, so the trap ends them itself.
-    trap 'echo >&2; echo "== gaugedesk green bar INTERRUPTED (all) ==" >&2; end_alongside "${pids[@]}"; rm -rf "$transcripts"; exit 130' INT TERM
+    trap 'echo >&2; echo "== gaugedesk green bar INTERRUPTED (all) ==" >&2; end_alongside ${pids[@]+"${pids[@]}"}; rm -rf "$transcripts"; exit 130' INT TERM
 
+
+    # One command at a time would leave the shells' cargo checks waiting for
+    # the Rust suites to finish, though they read nothing those suites write:
+    # about two minutes, one after the other, on most pull requests (DR-0241).
+    # So under Buck2 one command builds them together first -- the native
+    # suites the rust lane runs, and the desktop, mobile and Windows sections
+    # -- which the executor runs concurrently within each target's declared
+    # cores, as it runs any one section's actions. The lanes below then ask
+    # for each of these in their own commands, with the same configuration,
+    # and are answered from what this one built, printing and failing exactly
+    # as they would have. So this command's own status is nobody's verdict: a
+    # failure in it is reported by the lane that owns the target.
+    if [ -n "$via_buck2" ] && native_targets; then
+        echo "== native Rust suites and the shells, built together =="
+        buck2 build --keep-going //:native-lints //:native-tests //:native-doctests //:native-feature-checks \
+            //:desktop //:mobile //:windows \
+            -c "green_bar.run=$GREEN_BAR_RUN" -c "green_bar.prerequisites=$prerequisites" \
+            > "$transcripts/together" 2>&1 || true
+        grep -E "Commands: [0-9]+" "$transcripts/together" | tail -n 1 || true
+    fi
     set -m
-    for lane in "${alongside[@]}"; do
+    for lane in ${alongside[@]+"${alongside[@]}"}; do
         # Under `all`, `contracts` needs no word here: a section name alone
         # already means best-effort for it, and `all` wants exactly what a
         # developer asking for that section wants. Under `required` the word
@@ -623,10 +697,11 @@ run_all() {
     done
     set +m
 
-    for lane in rust desktop mobile windows; do
+    for lane in "${foreground[@]}"; do
         rc=0
         case "$lane" in
             desktop|mobile) lane_runner "$lane" "$prerequisites" || rc=$? ;;
+            contracts|web|dependencies) lane_runner "$lane" ${word[@]+"${word[@]}"} || rc=$? ;;
             *) lane_runner "$lane" || rc=$? ;;
         esac
 
@@ -636,7 +711,7 @@ run_all() {
         if [ "$rc" -ge 128 ]; then
             echo >&2
             echo "== gaugedesk green bar INTERRUPTED (all) during: $lane ==" >&2
-            end_alongside "${pids[@]}"
+            end_alongside ${pids[@]+"${pids[@]}"}
             rm -rf "$transcripts"
             exit "$rc"
         fi
@@ -645,7 +720,7 @@ run_all() {
     done
 
     index=0
-    for lane in "${alongside[@]}"; do
+    for lane in ${alongside[@]+"${alongside[@]}"}; do
         rc=0
         wait "${pids[$index]}" || rc=$?
         index=$((index + 1))
@@ -656,7 +731,7 @@ run_all() {
         if [ "$rc" -ge 128 ]; then
             echo >&2
             echo "== gaugedesk green bar INTERRUPTED (all) during: $lane ==" >&2
-            end_alongside "${pids[@]}"
+            end_alongside ${pids[@]+"${pids[@]}"}
             rm -rf "$transcripts"
             exit "$rc"
         fi

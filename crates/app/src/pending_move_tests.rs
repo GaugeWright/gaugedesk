@@ -98,6 +98,7 @@ fn every_writer_refuses_while_its_project_is_mid_move_and_works_after_an_abort()
             mode: crate::library::ChatMode::Use,
             authenticated_actor: None,
             authenticated_context: None,
+            local_operator: false,
             contribution_by: None,
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,

@@ -1548,6 +1548,73 @@ export async function getModelContext(
     return (await transport.json("GET", `/chats/${encodeURIComponent(id)}/model-context`)) as LiveModelContext;
 }
 
+export interface MethodInspectionStatus {
+    readonly phase: "init" | "requested" | "granted" | "revoked" | "denied" | "unavailable";
+    readonly package_ref?: string;
+    readonly can_approve?: boolean;
+}
+
+export interface ContextInspectionStatus {
+    readonly phase: "init" | "requested" | "granted" | "revoked" | "denied" | "unavailable";
+    readonly revision?: number;
+    readonly can_approve?: boolean;
+}
+
+export async function getContextInspection(
+    transport: WorkbenchTransport, id: EngagementId, resource: string,
+): Promise<ContextInspectionStatus> {
+    return await transport.json("GET", `/chats/${encodeURIComponent(id)}/contexts/${encodeURIComponent(resource)}/inspection`) as ContextInspectionStatus;
+}
+
+export async function requestContextInspection(
+    transport: WorkbenchTransport, id: EngagementId, resource: string,
+): Promise<ContextInspectionStatus> {
+    return await transport.json("POST", `/chats/${encodeURIComponent(id)}/contexts/${encodeURIComponent(resource)}/inspection/request`, {}) as ContextInspectionStatus;
+}
+
+export async function getContextInspectionRequests(
+    transport: WorkbenchTransport, id: EngagementId, resource: string,
+): Promise<{readers: string[]; granted: string[]}> {
+    const result = await transport.json("GET", `/chats/${encodeURIComponent(id)}/contexts/${encodeURIComponent(resource)}/inspection/requests`) as {readers?: string[]; granted?: string[]};
+    return {readers: result.readers ?? [], granted: result.granted ?? []};
+}
+
+export async function approveContextInspection(
+    transport: WorkbenchTransport, id: EngagementId, resource: string, reader: string,
+): Promise<void> {
+    await transport.json("POST", `/chats/${encodeURIComponent(id)}/contexts/${encodeURIComponent(resource)}/inspection/${encodeURIComponent(reader)}/approve`, {});
+}
+
+export async function revokeContextInspection(
+    transport: WorkbenchTransport, id: EngagementId, resource: string, reader: string,
+): Promise<void> {
+    await transport.json("POST", `/chats/${encodeURIComponent(id)}/contexts/${encodeURIComponent(resource)}/inspection/${encodeURIComponent(reader)}/revoke`, {});
+}
+
+export async function revokeOwnContextInspection(
+    transport: WorkbenchTransport, id: EngagementId, resource: string,
+): Promise<ContextInspectionStatus> {
+    return await transport.json("POST", `/chats/${encodeURIComponent(id)}/contexts/${encodeURIComponent(resource)}/inspection/revoke`, {}) as ContextInspectionStatus;
+}
+
+export async function getMethodInspection(
+    transport: WorkbenchTransport, id: EngagementId,
+): Promise<MethodInspectionStatus> {
+    return await transport.json("GET", `/chats/${encodeURIComponent(id)}/method-inspection`) as MethodInspectionStatus;
+}
+
+export async function requestMethodInspection(
+    transport: WorkbenchTransport, id: EngagementId,
+): Promise<MethodInspectionStatus> {
+    return await transport.json("POST", `/chats/${encodeURIComponent(id)}/method-inspection/request`, {}) as MethodInspectionStatus;
+}
+
+export async function revokeMethodInspection(
+    transport: WorkbenchTransport, id: EngagementId,
+): Promise<MethodInspectionStatus> {
+    return await transport.json("POST", `/chats/${encodeURIComponent(id)}/method-inspection/revoke`, {}) as MethodInspectionStatus;
+}
+
 export interface ChoiceOption {
     readonly id: string;
     readonly label: string;

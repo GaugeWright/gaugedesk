@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 
 use gaugedesk_store::{AdmitError, Store};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::workbench_state::Workbench;
 
@@ -391,6 +392,58 @@ pub fn answers_context(answers: &[AgentQuestion]) -> String {
     out
 }
 
+/// A live model-call witness for one exact answer block. The handle has no
+/// answer text; a viewer must recheck the current record before disclosure.
+pub(crate) fn answer_source_handle(question: &AgentQuestion) -> Option<String> {
+    let QuestionState::Answered {
+        answer,
+        answered_by,
+    } = &question.state
+    else {
+        return None;
+    };
+    if question.chat_id.is_empty() || question.id.is_empty() {
+        return None;
+    }
+    let body = serde_json::to_vec(&(
+        &question.chat_id,
+        &question.id,
+        &question.question,
+        answered_by,
+        answer,
+    ))
+    .ok()?;
+    Some(format!(
+        "question-answer:{}:{}:{}",
+        question.chat_id,
+        question.id,
+        hex::encode(Sha256::digest(body))
+    ))
+}
+
+/// Recheck both the chat lineage and exact current answer. Chat admission is
+/// performed by the Raw context route before this source-specific check.
+pub(crate) fn current_answer_source(store: &Store, chat_id: &str, source: &str) -> bool {
+    let prefix = format!("question-answer:{chat_id}:");
+    let Some((question_id, digest)) = source
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.split_once(':'))
+    else {
+        return false;
+    };
+    if question_id.is_empty()
+        || digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    get(store, chat_id, question_id)
+        .ok()
+        .flatten()
+        .and_then(|question| answer_source_handle(&question))
+        .is_some_and(|current| current == source)
+}
+
 /// Whether an open question declares the agent cannot proceed. Drives the
 /// stronger presentation and suppresses automatic continuation — never a
 /// human's own turn (ADR 0113 §3).
@@ -410,6 +463,116 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(dir.path()).unwrap();
         (dir, wb)
+    }
+
+    #[test]
+    fn answer_source_rechecks_the_exact_current_record() {
+        let (_dir, wb) = workbench();
+        let mut guard = wb.lock_unpoisoned();
+        let id = guard
+            .ask_question("chat-1", "Which region?", &[], None, false)
+            .unwrap();
+        guard
+            .answer_question("chat-1", &id, "east", "alice")
+            .unwrap();
+        let answered = get(guard.store_ref(), "chat-1", &id).unwrap().unwrap();
+        let source = answer_source_handle(&answered).unwrap();
+        assert!(current_answer_source(guard.store_ref(), "chat-1", &source));
+        assert!(!current_answer_source(guard.store_ref(), "chat-2", &source));
+        let changed = AgentQuestion {
+            state: QuestionState::Answered {
+                answer: "west".into(),
+                answered_by: "alice".into(),
+            },
+            ..answered
+        };
+        put(guard.store_mut(), &changed).unwrap();
+        assert!(!current_answer_source(guard.store_ref(), "chat-1", &source));
+    }
+
+    #[tokio::test]
+    async fn raw_context_redacts_an_answer_after_its_record_changes() {
+        use axum::{
+            extract::{Path, State},
+            response::IntoResponse,
+        };
+
+        let (_dir, wb) = workbench();
+        let (chat_id, question_id, source) = {
+            let mut guard = wb.lock_unpoisoned();
+            let chat = guard
+                .create_default_engagement("answer-provenance-chat".into(), "Answer".into())
+                .unwrap_or_else(|_| panic!("create chat"));
+            let question_id = guard
+                .ask_question(&chat.id, "Which region?", &[], None, false)
+                .unwrap();
+            guard
+                .answer_question(&chat.id, &question_id, "east", "alice")
+                .unwrap();
+            let source = answer_source_handle(
+                &get(guard.store_ref(), &chat.id, &question_id)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            (chat.id, question_id, source)
+        };
+        let turn_claim = crate::engine::claim_turn(&chat_id).unwrap();
+        let raw = serde_json::json!({
+            "calls": [{
+                "ordinal": 0,
+                "body": {"messages": ["alice answered: east"]},
+                "ordered_provenance": {
+                    "messages": [{"source_handles": [source], "complete": true}],
+                    "tools": {"source_handles": ["runtime"], "complete": true}
+                },
+                "provenance_complete": true
+            }],
+            "incomplete": false
+        });
+        crate::engine::bind_turn_model_context(
+            &chat_id,
+            std::sync::Arc::new(move || Ok(raw.to_string())),
+        );
+        let read = |wb: crate::SharedWorkbench, id: String| async move {
+            let response = crate::engagement_routes::get_model_context(
+                State(wb),
+                Path(id),
+                axum::http::HeaderMap::new(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        assert_eq!(
+            read(wb.clone(), chat_id.clone()).await["calls"][0]["body"]["messages"][0],
+            "alice answered: east"
+        );
+        {
+            let mut guard = wb.lock_unpoisoned();
+            let previous = get(guard.store_ref(), &chat_id, &question_id)
+                .unwrap()
+                .unwrap();
+            put(
+                guard.store_mut(),
+                &AgentQuestion {
+                    state: QuestionState::Answered {
+                        answer: "west".into(),
+                        answered_by: "alice".into(),
+                    },
+                    ..previous
+                },
+            )
+            .unwrap();
+        }
+        let hidden = read(wb, chat_id).await;
+        assert_eq!(hidden["calls"][0]["redacted"], true);
+        assert!(!hidden.to_string().contains("alice answered: east"));
+        drop(turn_claim);
     }
 
     #[test]

@@ -212,6 +212,10 @@ impl InstanceKind {
 pub struct ArchetypeVersionRecord {
     pub package_ref: String,
     pub discipline_ref: String,
+    /// Publisher authenticated when this frozen source was created. Older
+    /// records have no provable source owner and cannot authorize method reads.
+    #[serde(default)]
+    pub source_owner_authority: Option<String>,
     /// Frozen only for Panel-agent versions. Legacy versions are ordinary work
     /// versions and therefore have no public profile.
     #[serde(default)]

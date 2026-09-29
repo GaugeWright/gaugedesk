@@ -68,13 +68,57 @@ pub(super) fn app(shared: &crate::SharedWorkbench, hosted: bool) -> Router {
 }
 
 #[tokio::test]
+async fn signed_out_desktop_reads_only_personal_tasks_backlog() {
+    let root = tempfile::tempdir().unwrap();
+    let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+    {
+        let mut wb = shared.lock_unpoisoned();
+        wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    }
+    let desktop = crate::open_runtime::desktop_operator_plane(shared.clone());
+    let base = format!("/projects/{DEFAULT_PROJECT}/trackers");
+    let (status, _) = send(&app(&shared, false), "GET", &base, None, None, None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the local admission is desktop-only"
+    );
+    let (status, listed) = send(&desktop, "GET", &base, None, None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["trackers"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["trackers"][0]["queue"], "tasks");
+    let (status, backlog) = send(
+        &desktop,
+        "GET",
+        &format!("{base}/tasks/issues"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{backlog}");
+    let (status, _) = send(
+        &desktop,
+        "GET",
+        &format!("{base}/tutorials/issues"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn desktop_and_hosted_backlog_completion_use_authenticated_native_receipts() {
     for hosted in [false, true] {
         let (_root, shared, _context, invocation, intent) = completion::setup();
         let (token, admission) = auth(&mut shared.lock_unpoisoned());
         let app = app(&shared, hosted);
         let directory = format!("/projects/{DEFAULT_PROJECT}/trackers");
-        let backlog = format!("{directory}/tutorials/issues");
+        let backlog = format!("{directory}/tasks/issues");
         let complete = format!("{backlog}/{}/complete", intent.item_id);
         let (status, data) = send(
             &app,
@@ -100,8 +144,7 @@ async fn desktop_and_hosted_backlog_completion_use_authenticated_native_receipts
         .await;
         assert_eq!(status, StatusCode::OK, "{data}");
         assert_eq!(data["issues"][0]["subject_id"], intent.subject_id);
-        let tasks =
-            format!("{directory}/tutorials/tasks?actor=someone-else&assigned_to=someone-else");
+        let tasks = format!("{directory}/tasks/tasks?actor=someone-else&assigned_to=someone-else");
         let (status, assigned) = send(
             &app,
             "GET",
@@ -208,8 +251,8 @@ async fn tracker_routes_refuse_anonymous_unreadable_and_incomplete_commands() {
         let (token, admission) = auth(&mut shared.lock_unpoisoned());
         let app = app(&shared, hosted);
         let directory = format!("/projects/{DEFAULT_PROJECT}/trackers");
-        let backlog = format!("{directory}/tutorials/issues");
-        let tasks = format!("{directory}/tutorials/tasks");
+        let backlog = format!("{directory}/tasks/issues");
+        let tasks = format!("{directory}/tasks/tasks");
         let complete = format!("{backlog}/{}/complete", intent.item_id);
         let body = serde_json::json!({"subject_id": intent.subject_id, "summary":"done", "claim":{"kind":"override"}});
         for (method, path, payload) in [
@@ -281,7 +324,7 @@ async fn tracker_routes_refuse_anonymous_unreadable_and_incomplete_commands() {
             let mut wb = shared.lock_unpoisoned();
             let scope = format!(
                 "project::{DEFAULT_PROJECT}::tracker::{}",
-                hex::encode("tutorials")
+                hex::encode("tasks")
             );
             let grant = wb
                 .store_ref()
@@ -297,7 +340,7 @@ async fn tracker_routes_refuse_anonymous_unreadable_and_incomplete_commands() {
             wb.decide_project_tracker_access(
                 &context,
                 DEFAULT_PROJECT,
-                "tutorials",
+                "tasks",
                 "revoke-route-read",
                 &grant.id,
                 crate::project_tracker::TrackerAccessDecision::Revoke,
@@ -371,7 +414,7 @@ async fn unavailable_tracker_route_returns_failure_without_an_empty_issue_list()
     let (status, body) = send(
         &app,
         "GET",
-        &format!("/projects/{DEFAULT_PROJECT}/trackers/tutorials/issues"),
+        &format!("/projects/{DEFAULT_PROJECT}/trackers/tasks/issues"),
         Some(&token),
         Some(&admission),
         None,
@@ -396,7 +439,7 @@ async fn interrupted_tracker_http_command_recovers_native_closure_on_same_key() 
     let fault = rusqlite::Connection::open(native_root.join("runtime.sqlite")).unwrap();
     fault.execute_batch("CREATE TRIGGER lose_http_closure_terminal BEFORE INSERT ON events WHEN NEW.event_type = 'effect.terminal' BEGIN SELECT RAISE(ABORT, 'lost closing result'); END;").unwrap();
     let path = format!(
-        "/projects/{DEFAULT_PROJECT}/trackers/tutorials/issues/{}/complete",
+        "/projects/{DEFAULT_PROJECT}/trackers/tasks/issues/{}/complete",
         intent.item_id
     );
     let body = serde_json::json!({"subject_id":intent.subject_id,"summary":intent.summary,"claim":{"kind":"override"}});

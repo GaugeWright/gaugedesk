@@ -3,13 +3,14 @@ import packageManifest from "../../../package.json";
 /** Versioned browser/Home compatibility contract (`ITGOV-4`, ADR 0095). */
 export const CLIENT_PROTOCOL_VERSION = 1;
 
-/** The version a release stamps into the frontend bundle, derived from the git
- * tag by `release.yml`'s resolve step. The in-repo manifest version is a dev
- * default, not a release fact: a released build's bundle name comes from the
- * tag, so a build that reported the manifest reported a version no released
- * artifact ever had. v0.4.6 through v0.4.8 all shipped saying 0.4.5. Unset in
+/** The version a release stamps into the frontend bundle, from the tag its lane
+ * builds — the same resolution the bundle's own version comes from. When the
+ * two were derived separately, v0.4.6 through v0.4.8 all shipped saying 0.4.5.
+ * A release's tag must name the version the trunk declares (GaugeWright
+ * DR-0170), so on a release build the stamp and the manifest agree. Unset in
  * dev, local, and hosted-web builds, which have no tag to speak for and fall
- * back to the manifest. */
+ * back to the manifest: the trunk's declared version, which is the last
+ * release or the one being cut. */
 const STAMPED_RELEASE_VERSION = import.meta.env.VITE_GAUGEDESK_RELEASE_VERSION as
     | string
     | undefined;

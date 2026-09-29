@@ -53,6 +53,91 @@ use crate::{
 
 /// The record kind under which resource metadata is stored in an engagement scope.
 const RESOURCE_KIND: &str = "resource";
+const CONTEXT_IMPORT_KIND: &str = "context-import";
+const UNWITNESSED_IMPORT_HASH: &str = "unwitnessed";
+
+/// A new resource mint first appends an empty revision. The exact imported
+/// paths are attached only after the worktree copy has been checked against
+/// the submitted bytes. A failed attachment therefore leaves the resource
+/// unreadable for inspection instead of reviving an older path claim.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ContextImport {
+    pub resource_id: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub complete: bool,
+    pub files: BTreeMap<String, String>,
+}
+
+fn current_context_import(
+    store: &Store,
+    chat_id: &str,
+    resource_id: &str,
+) -> Result<Option<ContextImport>, AdmitError> {
+    let mut current = None;
+    for row in store.records(chat_id, CONTEXT_IMPORT_KIND)? {
+        let import: ContextImport = serde_json::from_str(&row)?;
+        if import.resource_id == resource_id {
+            current = Some(import);
+        }
+    }
+    Ok(current)
+}
+
+pub(crate) fn context_imports(
+    store: &Store,
+    chat_id: &str,
+) -> Result<BTreeMap<String, ContextImport>, AdmitError> {
+    let mut imports = BTreeMap::new();
+    for row in store.records(chat_id, CONTEXT_IMPORT_KIND)? {
+        let import: ContextImport = serde_json::from_str(&row)?;
+        imports.insert(import.resource_id.clone(), import);
+    }
+    Ok(imports)
+}
+
+fn begin_context_import(
+    store: &mut Store,
+    chat_id: &str,
+    resource_id: &str,
+) -> Result<(), AdmitError> {
+    let revision = current_context_import(store, chat_id, resource_id)?
+        .map_or(1, |previous| previous.revision.saturating_add(1));
+    let import = ContextImport {
+        resource_id: resource_id.to_owned(),
+        revision,
+        complete: false,
+        files: BTreeMap::new(),
+    };
+    store.append_record(
+        chat_id,
+        CONTEXT_IMPORT_KIND,
+        &serde_json::to_string(&import)?,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn bind_context_import(
+    store: &mut Store,
+    chat_id: &str,
+    resource_id: &ResourceId,
+    files: BTreeMap<String, String>,
+) -> Result<(), AdmitError> {
+    let Some(mut current) = current_context_import(store, chat_id, resource_id.as_str())? else {
+        return Ok(());
+    };
+    if current.complete {
+        return Ok(());
+    }
+    current.complete = true;
+    current.files = files;
+    store.append_record(
+        chat_id,
+        CONTEXT_IMPORT_KIND,
+        &serde_json::to_string(&current)?,
+    )?;
+    Ok(())
+}
 
 fn is_target_payload_path(path: &str) -> bool {
     path != gaugedesk_boundary::definition::CONFIG_PATH
@@ -222,6 +307,7 @@ pub fn mint_context_with(
         |_| Authority::from(owner),
     )
     .with_attributes(attributes);
+    begin_context_import(store, engagement, id.as_str())?;
     put(store, engagement, &rec)?;
 
     // Trust-by-default grant: the single local owner requires and approves itself.
@@ -464,6 +550,124 @@ pub fn tombstone(store: &mut Store, engagement: &str, id: &ResourceId) -> Result
 }
 
 impl Workbench {
+    fn checked_import_file(
+        &self,
+        chat_id: &str,
+        path: &str,
+        submitted: &[u8],
+    ) -> Option<(String, String)> {
+        const MAX_WITNESS_BYTES: usize = 8 * 1024 * 1024;
+        if submitted.len() > MAX_WITNESS_BYTES {
+            return None;
+        }
+        let actual = self
+            .read_engagement_file_bytes(chat_id, path, MAX_WITNESS_BYTES)
+            .and_then(Result::ok)
+            .flatten()?;
+        (actual == submitted).then(|| {
+            (
+                path.to_owned(),
+                whipplescript_store::stable_hash_bytes_hex(submitted),
+            )
+        })
+    }
+
+    fn finish_import_binding(
+        &mut self,
+        chat_id: &str,
+        id: &ResourceId,
+        files: BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        bind_context_import(self.store_mut(), chat_id, id, files).map_err(|e| format!("{e:?}"))
+    }
+
+    pub(crate) fn bind_uploaded_context(
+        &mut self,
+        chat_id: &str,
+        id: &ResourceId,
+        files: &[(String, Vec<u8>)],
+        target_id: Option<&str>,
+    ) -> Result<(), String> {
+        let prefix = self.engagement_context_target_root(chat_id, target_id)?;
+        let mut checked = BTreeMap::new();
+        for (name, submitted) in files {
+            let Some(base) = std::path::Path::new(name).file_name() else {
+                continue;
+            };
+            let base = base.to_string_lossy();
+            let path = prefix
+                .as_ref()
+                .map_or_else(|| base.to_string(), |prefix| format!("{prefix}/{base}"));
+            checked.insert(path.clone(), UNWITNESSED_IMPORT_HASH.to_owned());
+            if let Some((path, hash)) = self.checked_import_file(chat_id, &path, submitted) {
+                checked.insert(path, hash);
+            }
+        }
+        self.finish_import_binding(chat_id, id, checked)
+    }
+
+    pub(crate) fn bind_local_context(
+        &mut self,
+        chat_id: &str,
+        id: &ResourceId,
+        source: &std::path::Path,
+        target_id: Option<&str>,
+    ) -> Result<(), String> {
+        fn visit(
+            source: &std::path::Path,
+            relative: &std::path::Path,
+            files: &mut Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        ) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                if entry.file_name() == ".git" {
+                    continue;
+                }
+                let kind = entry.file_type()?;
+                if kind.is_symlink() {
+                    continue;
+                }
+                let next = relative.join(entry.file_name());
+                if kind.is_dir() {
+                    visit(&entry.path(), &next, files)?;
+                } else if kind.is_file() {
+                    files.push((entry.path(), next));
+                }
+            }
+            Ok(())
+        }
+        let prefix = self.engagement_context_target_root(chat_id, target_id)?;
+        let mut sources = Vec::new();
+        if source.is_file() {
+            if let Some(name) = source.file_name() {
+                sources.push((source.to_path_buf(), std::path::PathBuf::from(name)));
+            }
+        } else {
+            visit(source, std::path::Path::new(""), &mut sources).map_err(|e| e.to_string())?;
+        }
+        let mut checked = BTreeMap::new();
+        for (source, relative) in sources {
+            let path = prefix.as_ref().map_or_else(
+                || relative.to_string_lossy().into_owned(),
+                |prefix| format!("{prefix}/{}", relative.to_string_lossy()),
+            );
+            checked.insert(path.clone(), UNWITNESSED_IMPORT_HASH.to_owned());
+            let Ok(metadata) = std::fs::metadata(&source) else {
+                continue;
+            };
+            if metadata.len() > 8 * 1024 * 1024 {
+                continue;
+            }
+            let Ok(submitted) = std::fs::read(&source) else {
+                continue;
+            };
+            if let Some((path, hash)) = self.checked_import_file(chat_id, &path, &submitted) {
+                checked.insert(path, hash);
+            }
+        }
+        self.finish_import_binding(chat_id, id, checked)
+    }
+
     /// Count pending output reviews for one authority without returning any
     /// engagement, resource, review, or content metadata. The Console uses this
     /// only after target-Home admission, then discards that admission.
@@ -686,15 +890,16 @@ pub(crate) fn context_attributes(
 pub(crate) async fn post_context(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     Json(body): Json<ContextBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    // ENTSEC-5: in enterprise mode the control plane is remote — a server-local *path* ingest
+    // ENTSEC-5: in account-backed mode the control plane may be remote — a server-local *path* ingest
     // would read the SERVER's filesystem at a client's request (a confused-deputy /
     // info-disclosure risk), so it is disabled; the client uploads its files instead
     // (`POST /chats/:id/context/upload`). Solo keeps it (the disk is the operator's own).
-    if wb.has_idp() {
+    if crate::method_access::account_backed_chat(&wb, &id, &headers) {
         return (
             StatusCode::FORBIDDEN,
             "server-path context ingest is disabled in enterprise mode; upload the files instead \
@@ -726,6 +931,14 @@ pub(crate) async fn post_context(
         Ok(r) => r,
         Err(e) => return err_response(e),
     };
+    if let Err(error) = wb.bind_local_context(
+        &id,
+        &rec.resource.id,
+        std::path::Path::new(&body.path),
+        body.target_id.as_deref(),
+    ) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
     let handle = rec.resource.id.as_str().to_string();
     wb.publish(
         &id,
@@ -822,6 +1035,7 @@ pub(crate) struct ContextUploadBody {
 pub(crate) async fn post_context_upload(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     Json(body): Json<ContextUploadBody>,
 ) -> impl IntoResponse {
@@ -849,6 +1063,14 @@ pub(crate) async fn post_context_upload(
         files.push((file.name, bytes));
     }
     let mut wb = wb.lock_unpoisoned();
+    let verified_owner = if crate::method_access::account_backed_chat(&wb, &id, &headers) {
+        match crate::method_access::chat_reader(&wb, &id, &headers) {
+            Ok(owner) => Some(owner),
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        None
+    };
     let (n, commit) = match wb.ingest_upload_into_engagement(&id, &files, body.target_id.as_deref())
     {
         Some(Ok(out)) => out,
@@ -862,15 +1084,22 @@ pub(crate) async fn post_context_upload(
     // exactly. Solo is unchanged — with no IdP both sides collapse to the
     // instance authority — while an IdP deployment now agrees instead of
     // minting under the instance and acting-for the signed-in person.
-    let owner = actor
-        .map(|axum::extract::Extension(actor)| actor.0.as_str().to_owned())
-        .unwrap_or_else(|| wb.authority().as_str().to_string());
+    let owner = verified_owner.unwrap_or_else(|| {
+        actor
+            .map(|axum::extract::Extension(actor)| actor.0.as_str().to_owned())
+            .unwrap_or_else(|| wb.authority().as_str().to_string())
+    });
     let attributes = context_attributes(body.classification.as_deref(), body.region.as_deref());
     let label = format!("uploaded: {n} file(s)");
     let rec = match wb.mint_resource_context(&id, &owner, &label, &commit, attributes) {
         Ok(r) => r,
         Err(e) => return err_response(e),
     };
+    if let Err(error) =
+        wb.bind_uploaded_context(&id, &rec.resource.id, &files, body.target_id.as_deref())
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
     let handle = rec.resource.id.as_str().to_string();
     wb.publish(
         &id,
@@ -1107,6 +1336,19 @@ pub(crate) async fn post_context_stream(
         Ok(key) => key,
         Err(response) => return response,
     };
+    let owner = {
+        let guard = wb.lock_unpoisoned();
+        if crate::method_access::account_backed_chat(&guard, &id, &headers) {
+            match crate::method_access::chat_reader(&guard, &id, &headers) {
+                Ok(owner) => owner,
+                Err(error) => return error.into_response(),
+            }
+        } else {
+            actor
+                .map(|axum::extract::Extension(actor)| actor.0.as_str().to_owned())
+                .unwrap_or_else(|| guard.authority().as_str().to_string())
+        }
+    };
     if std::path::Path::new(&query.name).file_name().is_none() {
         return (StatusCode::BAD_REQUEST, "name is not a file name").into_response();
     }
@@ -1247,10 +1489,6 @@ pub(crate) async fn post_context_stream(
     let (scope, command_id) =
         crate::command_idempotency::command_identity(&method, &route, &caller, &key);
 
-    let owner = actor
-        .map(|axum::extract::Extension(actor)| actor.0.as_str().to_owned())
-        .unwrap_or_else(|| wb.lock_unpoisoned().authority().as_str().to_string());
-
     let outcome = {
         let mut guard = wb.lock_unpoisoned();
         match guard
@@ -1373,6 +1611,17 @@ fn admit_streamed_upload(
         Ok(r) => r,
         Err(e) => return err_response(e),
     };
+    let submitted = std::fs::metadata(source)
+        .ok()
+        .filter(|metadata| metadata.len() <= 8 * 1024 * 1024)
+        .and_then(|_| std::fs::read(source).ok())
+        .map(|bytes| vec![(query.name.clone(), bytes)])
+        .unwrap_or_else(|| vec![(query.name.clone(), Vec::new())]);
+    if let Err(error) =
+        wb.bind_uploaded_context(id, &rec.resource.id, &submitted, query.target_id.as_deref())
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
     let handle = rec.resource.id.as_str().to_string();
     wb.publish(
         id,
@@ -1429,8 +1678,14 @@ pub(crate) async fn get_resource_content(
     State(wb): State<SharedWorkbench>,
     Path((id, rid)): Path<(String, String)>,
     Query(q): Query<ContentQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
+    let viewer = match crate::method_access::chat_reader(&wb, &id, &headers) {
+        Ok(viewer) => viewer,
+        Err(error) => return error.into_response(),
+    };
+    let account_backed = crate::method_access::account_backed_chat(&wb, &id, &headers);
     let res_id = ResourceId::new(rid);
     let rec = match wb.resource_context(&id, &res_id) {
         Ok(Some(r)) => r,
@@ -1452,9 +1707,18 @@ pub(crate) async fn get_resource_content(
                 let manifest = entries
                     .into_iter()
                     .filter(|e| {
-                        !e.is_dir
-                            && is_target_payload_path(&e.path)
-                            && !wb.installed_method_read_requires_grant(&id, &e.path)
+                        !(e.is_dir
+                            || !is_target_payload_path(&e.path)
+                            || wb.installed_method_read_requires_grant(&id, &e.path)
+                            || (account_backed && wb.is_installed_method_path(&id, &e.path)))
+                            && (!account_backed
+                                || crate::context_inspection::file_readable_from_resource(
+                                    &wb,
+                                    &id,
+                                    &viewer,
+                                    res_id.as_str(),
+                                    &e.path,
+                                ))
                     })
                     .map(|e| e.path)
                     .collect::<Vec<_>>()
@@ -1464,6 +1728,24 @@ pub(crate) async fn get_resource_content(
             Some(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
         }
     } else {
+        if account_backed && wb.is_installed_method_path(&id, &q.path) {
+            return (
+                StatusCode::FORBIDDEN,
+                "method inspection requires its own grant",
+            )
+                .into_response();
+        }
+        if account_backed
+            && !crate::context_inspection::file_readable_from_resource(
+                &wb,
+                &id,
+                &viewer,
+                res_id.as_str(),
+                &wb.engagement_workspace_path(&id, &q.path),
+            )
+        {
+            return (StatusCode::FORBIDDEN, "source inspection grant required").into_response();
+        }
         match wb.read_engagement_file(&id, &q.path) {
             None => (StatusCode::NOT_FOUND, "no such engagement").into_response(),
             Some(Ok(content)) => (StatusCode::OK, content).into_response(),
@@ -1712,13 +1994,14 @@ pub(crate) struct ExportToDiskBody {
 pub(crate) async fn post_resource_export_to_disk(
     State(wb): State<SharedWorkbench>,
     Path((id, rid)): Path<(String, String)>,
+    headers: HeaderMap,
     Json(body): Json<ExportToDiskBody>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if wb.has_idp() {
+    if crate::method_access::account_backed_chat(&wb, &id, &headers) {
         return (
             StatusCode::FORBIDDEN,
-            "export-to-disk is disabled in enterprise mode (it would write to your endpoint); \
+            "export-to-disk is disabled in account-backed mode (it would write to your endpoint); \
              use the server-side export",
         )
             .into_response();

@@ -48,9 +48,7 @@
       "deb": {
         "desktopTemplate": "deep-link.desktop",
         "depends": [
-          "libc6",
-          "libwebkit2gtk-4.1-0",
-          "libgtk-3-0"
+          "libc6"
         ],
         "section": "utils",
         "files": {

@@ -173,6 +173,17 @@ fn native_file_save_command(method: &Method, path: &str) -> bool {
         ["", "chats", chat, "file-actions", "save"] if !chat.is_empty())
 }
 
+// The Hub's first-Host reservation and the Home's deterministic project
+// materialization each recheck their own authority on every retry. A generic
+// HTTP receipt would cache an interrupted placement instead of repairing it.
+fn organization_project_command(method: &Method, path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    (method == Method::PUT
+        && matches!(parts.as_slice(), ["", "account", "tenants", tenant, "shared-project", "host"] if !tenant.is_empty()))
+        || (method == Method::POST
+            && matches!(parts.as_slice(), ["", "organizations", tenant, "shared-project", "materialize"] if !tenant.is_empty()))
+}
+
 // A streamed upload cannot be hashed before it is read, and this guard hashes
 // by buffering. Leaving the route inside it would cap an upload at the buffer
 // and spend the file's size in memory — which is the whole reason the streaming
@@ -236,6 +247,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         || shipped_tutorial_start_command(&method, request.uri().path())
         || chat_whip_run_command(&method, request.uri().path())
         || native_file_save_command(&method, request.uri().path())
+        || organization_project_command(&method, request.uri().path())
         || streamed_upload_path(&method, request.uri().path())
     {
         return next.run(request).await;
@@ -416,6 +428,23 @@ mod tests {
         assert!(!gaugeapp_command_path(
             "/gaugeapps/administration/pages/people"
         ));
+    }
+
+    #[test]
+    fn organization_project_retries_reach_their_own_lifecycle() {
+        assert!(organization_project_command(
+            &Method::PUT,
+            "/account/tenants/organization%3Aabc/shared-project/host"
+        ));
+        assert!(organization_project_command(
+            &Method::POST,
+            "/organizations/organization%3Aabc/shared-project/materialize"
+        ));
+        assert!(!organization_project_command(
+            &Method::POST,
+            "/account/tenants/organization%3Aabc/shared-project/host"
+        ));
+        assert!(!organization_project_command(&Method::POST, "/projects"));
     }
 
     #[test]

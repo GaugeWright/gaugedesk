@@ -14,6 +14,8 @@
 
 import { createEffect, createMemo, createResource, createSignal, Show } from "solid-js";
 import { PanelContractEditor } from "./PanelContractEditor";
+import { Option } from "./PanelAgentControls";
+import "./panel-agent.css";
 import {
     type AgentAbility,
     type AgentKind,
@@ -179,15 +181,15 @@ export function AgentSettings(props: AgentSettingsProps) {
     }
 
     return (
-        <main class="agent-settings-content" data-config-editor>
+        <main class="agent-settings-content pa-root" data-config-editor>
             <article class="agent-settings-page">
             <header class="agent-settings-page-head">
                 <div><span>Agent settings</span><h1>{props.name}</h1></div>
                 <button type="button" onClick={props.onClose}>Close</button>
             </header>
-            <p class="status" style={{ margin: "0 0 10px" }}>
+            <p class="pa-hint">
                 {props.kind === "panel"
-                    ? "Preview uses this public contract. Publishing freezes it into a version; deployments cannot redefine it."
+                    ? "What visitors get when a project deploys this agent. Publishing freezes these settings into a version that deployments can't change."
                     : "These settings apply to test chats now and are frozen into the next published version."}
             </p>
 
@@ -198,73 +200,63 @@ export function AgentSettings(props: AgentSettingsProps) {
                 }
                 fallback={<div class="status">loading…</div>}
             >
-                <div class="settings-form" data-settings-form>
+                <div data-settings-form>
                     <Show when={props.kind === "panel" && panel()}>
                         {(profile) => <PanelContractEditor
                             profile={profile()}
-                            onChange={(next) => { setPanelDraft(next); setPanelDirty(true); setMsg(""); }}
-                            onNotice={setMsg} />}
+                            authoredAbilities={abilities()}
+                            onChange={(next) => { setPanelDraft(next); setPanelDirty(true); setMsg(""); }} />}
                     </Show>
 
-                    <label class="settings-field">
-                        <span class="settings-label">Preferred model</span>
-                        <input
-                            class="settings-input"
-                            data-settings-model
-                            placeholder="leave blank to use the default"
-                            value={form().model}
-                            onInput={(e) => updateForm({ model: e.currentTarget.value })}
-                        />
-                    </label>
+                    {/* A Panel agent's own model and abilities are not what visitors
+                        get: the contract above is. Say so, and say that the
+                        abilities here bound the ones offered above. */}
+                    <section class={props.kind === "panel" ? "pa-section divided" : "pa-section"}>
+                        <div class="pa-section-head">
+                            <h3>{props.kind === "panel" ? "The agent itself" : "Model and abilities"}</h3>
+                            <p>{props.kind === "panel"
+                                ? "How the agent runs in your own chats with it. Visitors can be given only abilities it has here."
+                                : "The model this agent prefers, and what it may do in a workspace."}</p>
+                        </div>
+                        <label class="pa-field">
+                            <span>Preferred model</span>
+                            <input
+                                class="pa-input"
+                                data-settings-model
+                                placeholder="Leave blank to use your default"
+                                value={form().model}
+                                onInput={(e) => updateForm({ model: e.currentTarget.value })}
+                            />
+                            <Show when={props.kind === "panel"}><small>For your own chats with it. Visitors are answered by the model chosen above.</small></Show>
+                        </label>
 
-                    <fieldset class="settings-field" data-settings-abilities>
-                        <legend class="settings-label">Abilities</legend>
-                        <p class="status" style={{ margin: "2px 0 8px" }}>
-                            Choose the workspace and task abilities this agent receives.
-                        </p>
-                        {AGENT_ABILITY_PRESETS.map((preset) => {
-                            const checked = () =>
-                                JSON.stringify(abilities().filter((ability) => ability !== "tracker.file").sort()) ===
-                                JSON.stringify([...preset.value].sort());
-                            return (
-                                <label
-                                    style={{
-                                        display: "grid",
-                                        "grid-template-columns": "auto 1fr",
-                                        gap: "2px 8px",
-                                        padding: "7px 0",
-                                        cursor: "pointer",
-                                    }}
-                                >
-                                    <input
-                                        type="radio"
-                                        name="agent-abilities"
-                                        checked={checked()}
+                        <fieldset class="pa-field pa-fieldset" data-settings-abilities>
+                            <legend>Abilities</legend>
+                            <div class="pa-options" role="radiogroup" aria-label="Abilities">
+                                {AGENT_ABILITY_PRESETS.map((preset) => {
+                                    const checked = () =>
+                                        JSON.stringify(abilities().filter((ability) => ability !== "tracker.file").sort()) ===
+                                        JSON.stringify([...preset.value].sort());
+                                    return <Option type="radio" name="agent-abilities" checked={checked()}
+                                        label={preset.name} detail={preset.detail}
                                         onChange={() => {
                                             setSelectedAbilities(abilities().includes("tracker.file")
                                                 ? [...preset.value, "tracker.file"] : preset.value);
                                             setMsg("");
-                                        }}
-                                    />
-                                    <span>
-                                        <span style={{ display: "block" }}>{preset.name}</span>
-                                        <span class="status">{preset.detail}</span>
-                                    </span>
-                                </label>
-                            );
-                        })}
-                        <label style={{ display: "flex", gap: "8px", "align-items": "start", margin: "10px 0 0" }}>
-                            <input type="checkbox" checked={abilities().includes("tracker.file")}
-                                onChange={(event) => {
-                                    setSelectedAbilities(event.currentTarget.checked
-                                        ? [...abilities(), "tracker.file"]
-                                        : abilities().filter((ability) => ability !== "tracker.file"));
-                                    setMsg("");
-                                }} />
-                            <span>File project tasks <small class="status" style={{ display: "block" }}>Allows this agent to create real items in the current project’s task bar. Publish the draft to make this available to placed Agents.</small></span>
-                        </label>
-                    </fieldset>
-
+                                        }} />;
+                                })}
+                                <Option type="checkbox" checked={abilities().includes("tracker.file")}
+                                    label="File project tasks"
+                                    detail="Create real items in the current project's task bar. Publish the draft to make this available to placed Agents."
+                                    onChange={(checked) => {
+                                        setSelectedAbilities(checked
+                                            ? [...abilities(), "tracker.file"]
+                                            : abilities().filter((ability) => ability !== "tracker.file"));
+                                        setMsg("");
+                                    }} />
+                            </div>
+                        </fieldset>
+                    </section>
                 </div>
 
                 {/* The raw JSON is now a collapsed power-user surface, not the only
@@ -294,8 +286,8 @@ export function AgentSettings(props: AgentSettingsProps) {
                 </Show>
             </Show>
 
-            <div class="bar">
-                <button data-settings-save onClick={save}>save</button>
+            <div class="bar agent-settings-save">
+                <button type="button" class="pa-button primary" data-settings-save onClick={save}>Save</button>
                 <span class="status" data-config-status>{msg()}</span>
             </div>
             </article>

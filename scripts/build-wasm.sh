@@ -20,6 +20,16 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="$root/web/packages/control-plane-client/src/generated"
 profile="${1:-release}"
 
+# Where the bar hands over both modules already linked (GaugeWright BUILD.md
+# stage 6) -- each library's cdylib built for wasm32 by Buck2's native targets,
+# from the fleet's cache when another host built it -- wasm-bindgen and
+# wasm-opt below take those, and nothing here compiles. So none of the compiler,
+# archiver and standard-library checks that follow applies to them.
+prebuilt=""
+if [ -n "${GAUGEDESK_WASM_TUNNEL:-}" ] && [ -n "${GAUGEDESK_WASM_DIRECTORY:-}" ]; then
+  prebuilt=1
+fi
+
 # Where cargo will actually put the artifact. This script used to assume
 # `$root/target`, which is wrong exactly when the org's own worktree rule is
 # followed: that rule says to give each worktree its own CARGO_TARGET_DIR, and
@@ -79,78 +89,80 @@ targets_wasm32() {
       | "$1" --target=wasm32-unknown-unknown -x c -c -o /dev/null - >/dev/null 2>&1
 }
 
-# An explicit override always wins: a caller naming a tool has a reason, and
-# discovering a different one behind their back is worse than failing. Only the
-# tools that are both unset and unresolvable are discovered, and only those are
-# reported — a message naming a toolchain the build did not actually take sends
-# the next reader to the wrong LLVM.
-discovered=()
-if { [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! targets_wasm32 clang; } \
-  || { [ -z "${AR_wasm32_unknown_unknown:-}" ] && ! command -v llvm-ar >/dev/null; }; then
-  llvm_dir="$(llvm_toolchain_dir || true)"
-  if [ -n "$llvm_dir" ]; then
-    if [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! targets_wasm32 clang; then
-      CC_wasm32_unknown_unknown="$llvm_dir/clang"
-      discovered+=(clang)
-    fi
-    if [ -z "${AR_wasm32_unknown_unknown:-}" ] && ! command -v llvm-ar >/dev/null; then
-      AR_wasm32_unknown_unknown="$llvm_dir/llvm-ar"
-      discovered+=(llvm-ar)
-    fi
-    if [ ${#discovered[@]} -gt 0 ]; then
-      echo "using ${discovered[*]} from $llvm_dir" >&2
+if [ -z "$prebuilt" ]; then
+  # An explicit override always wins: a caller naming a tool has a reason, and
+  # discovering a different one behind their back is worse than failing. Only the
+  # tools that are both unset and unresolvable are discovered, and only those are
+  # reported — a message naming a toolchain the build did not actually take sends
+  # the next reader to the wrong LLVM.
+  discovered=()
+  if { [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! targets_wasm32 clang; } \
+    || { [ -z "${AR_wasm32_unknown_unknown:-}" ] && ! command -v llvm-ar >/dev/null; }; then
+    llvm_dir="$(llvm_toolchain_dir || true)"
+    if [ -n "$llvm_dir" ]; then
+      if [ -z "${CC_wasm32_unknown_unknown:-}" ] && ! targets_wasm32 clang; then
+        CC_wasm32_unknown_unknown="$llvm_dir/clang"
+        discovered+=(clang)
+      fi
+      if [ -z "${AR_wasm32_unknown_unknown:-}" ] && ! command -v llvm-ar >/dev/null; then
+        AR_wasm32_unknown_unknown="$llvm_dir/llvm-ar"
+        discovered+=(llvm-ar)
+      fi
+      if [ ${#discovered[@]} -gt 0 ]; then
+        echo "using ${discovered[*]} from $llvm_dir" >&2
+      fi
     fi
   fi
-fi
 
-: "${CC_wasm32_unknown_unknown:=clang}"
-: "${AR_wasm32_unknown_unknown:=llvm-ar}"
-export CC_wasm32_unknown_unknown AR_wasm32_unknown_unknown
+  : "${CC_wasm32_unknown_unknown:=clang}"
+  : "${AR_wasm32_unknown_unknown:=llvm-ar}"
+  export CC_wasm32_unknown_unknown AR_wasm32_unknown_unknown
 
-# Capability, not presence. A compiler that exists but has no wasm32 target
-# fails ~90 seconds later inside ring's build script, where the error is about C
-# and names neither this variable nor the compiler it chose — which is what
-# every Mac saw, because Apple's clang is present and cannot target wasm32.
-if ! targets_wasm32 "$CC_wasm32_unknown_unknown"; then
-  if command -v "$CC_wasm32_unknown_unknown" >/dev/null; then
-    echo "error: $CC_wasm32_unknown_unknown cannot target wasm32 — ring needs one that can (ADR 0130 §4)" >&2
-    echo "       Apple's clang is built without the wasm32 target; Homebrew's llvm carries it" >&2
-    echo "       install llvm (brew install llvm), or set CC_wasm32_unknown_unknown" >&2
-  else
-    echo "error: $CC_wasm32_unknown_unknown not found — ring needs clang for wasm32 (ADR 0130 §4)" >&2
-    echo "       looked for clang on PATH, for Homebrew's llvm prefix, and for" >&2
+  # Capability, not presence. A compiler that exists but has no wasm32 target
+  # fails ~90 seconds later inside ring's build script, where the error is about C
+  # and names neither this variable nor the compiler it chose — which is what
+  # every Mac saw, because Apple's clang is present and cannot target wasm32.
+  if ! targets_wasm32 "$CC_wasm32_unknown_unknown"; then
+    if command -v "$CC_wasm32_unknown_unknown" >/dev/null; then
+      echo "error: $CC_wasm32_unknown_unknown cannot target wasm32 — ring needs one that can (ADR 0130 §4)" >&2
+      echo "       Apple's clang is built without the wasm32 target; Homebrew's llvm carries it" >&2
+      echo "       install llvm (brew install llvm), or set CC_wasm32_unknown_unknown" >&2
+    else
+      echo "error: $CC_wasm32_unknown_unknown not found — ring needs clang for wasm32 (ADR 0130 §4)" >&2
+      echo "       looked for clang on PATH, for Homebrew's llvm prefix, and for" >&2
+      echo "       /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
+      echo "       install clang and llvm, or set CC_wasm32_unknown_unknown" >&2
+    fi
+    exit 1
+  fi
+  # The archiver is checked alongside the compiler because ring needs both, and
+  # only one of them fails legibly. A missing `llvm-ar` surfaces as a cc-rs error
+  # buried under a page of `cargo:rerun-if-env-changed` lines, which reads as a
+  # broken crate rather than a missing tool — it cost a build in the Console lane
+  # before this check existed.
+  if ! command -v "$AR_wasm32_unknown_unknown" >/dev/null; then
+    echo "error: $AR_wasm32_unknown_unknown not found — ring needs an LLVM archiver for wasm32 (ADR 0130 §4)" >&2
+    echo "       looked for llvm-ar on PATH, for Homebrew's llvm prefix, and for" >&2
     echo "       /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
-    echo "       install clang and llvm, or set CC_wasm32_unknown_unknown" >&2
+    echo "       Debian and Ubuntu ship it as llvm-ar-<version>; the unversioned name comes from the llvm package" >&2
+    echo "       macOS keeps Homebrew's llvm off PATH by design; installing it is enough" >&2
+    echo "       install llvm, or set AR_wasm32_unknown_unknown" >&2
+    exit 1
   fi
-  exit 1
-fi
-# The archiver is checked alongside the compiler because ring needs both, and
-# only one of them fails legibly. A missing `llvm-ar` surfaces as a cc-rs error
-# buried under a page of `cargo:rerun-if-env-changed` lines, which reads as a
-# broken crate rather than a missing tool — it cost a build in the Console lane
-# before this check existed.
-if ! command -v "$AR_wasm32_unknown_unknown" >/dev/null; then
-  echo "error: $AR_wasm32_unknown_unknown not found — ring needs an LLVM archiver for wasm32 (ADR 0130 §4)" >&2
-  echo "       looked for llvm-ar on PATH, for Homebrew's llvm prefix, and for" >&2
-  echo "       /usr/lib/llvm-*/bin holding both clang and llvm-ar" >&2
-  echo "       Debian and Ubuntu ship it as llvm-ar-<version>; the unversioned name comes from the llvm package" >&2
-  echo "       macOS keeps Homebrew's llvm off PATH by design; installing it is enough" >&2
-  echo "       install llvm, or set AR_wasm32_unknown_unknown" >&2
-  exit 1
-fi
-# The standard library for the target, not just the target's name. `rustup
-# target add` applies to the DEFAULT toolchain, while this tree pins its own in
-# rust-toolchain.toml, so adding it in the obvious way leaves the pinned
-# toolchain without it — and the failure is `can't find crate for \`core\``
-# partway through the dependency graph, which names neither the target nor the
-# toolchain that is missing it. It cost the first run of the macOS release lane
-# on a new host.
-if ! rustc --print target-libdir --target wasm32-unknown-unknown >/dev/null 2>&1; then
-  toolchain="$(rustup show active-toolchain 2>/dev/null | cut -d' ' -f1)"
-  echo "error: the active toolchain (${toolchain:-unknown}) has no wasm32-unknown-unknown standard library" >&2
-  echo "       rustup target add wasm32-unknown-unknown --toolchain ${toolchain:-\$(cat rust-toolchain.toml)}" >&2
-  echo "       note that a bare \`rustup target add\` adds it to the default toolchain, not this pinned one" >&2
-  exit 1
+  # The standard library for the target, not just the target's name. `rustup
+  # target add` applies to the DEFAULT toolchain, while this tree pins its own in
+  # rust-toolchain.toml, so adding it in the obvious way leaves the pinned
+  # toolchain without it — and the failure is `can't find crate for \`core\``
+  # partway through the dependency graph, which names neither the target nor the
+  # toolchain that is missing it. It cost the first run of the macOS release lane
+  # on a new host.
+  if ! rustc --print target-libdir --target wasm32-unknown-unknown >/dev/null 2>&1; then
+    toolchain="$(rustup show active-toolchain 2>/dev/null | cut -d' ' -f1)"
+    echo "error: the active toolchain (${toolchain:-unknown}) has no wasm32-unknown-unknown standard library" >&2
+    echo "       rustup target add wasm32-unknown-unknown --toolchain ${toolchain:-\$(cat rust-toolchain.toml)}" >&2
+    echo "       note that a bare \`rustup target add\` adds it to the default toolchain, not this pinned one" >&2
+    exit 1
+  fi
 fi
 if ! command -v wasm-bindgen >/dev/null; then
   echo "error: wasm-bindgen not found — cargo install wasm-bindgen-cli --version 0.2.126" >&2
@@ -192,10 +204,15 @@ mkdir -p "$out"
 # `--crate-type` to this one library build, and still names the artifact after
 # the crate.
 build_module() {
-  local crate="$1" artifact="$2" name="$3"
-  shift 3
-  cargo rustc -p "$crate" --lib --crate-type cdylib --target wasm32-unknown-unknown "${flags[@]}" "$@"
-  local wasm="$target_dir/wasm32-unknown-unknown/$profile/$artifact.wasm"
+  local crate="$1" artifact="$2" name="$3" given="$4"
+  shift 4
+  local wasm
+  if [ -n "$prebuilt" ]; then
+    wasm="$given"
+  else
+    cargo rustc -p "$crate" --lib --crate-type cdylib --target wasm32-unknown-unknown "${flags[@]}" "$@"
+    wasm="$target_dir/wasm32-unknown-unknown/$profile/$artifact.wasm"
+  fi
   if [ ! -f "$wasm" ]; then
     # Name where it looked and why it looked there. The old message named a
     # path and left the reader to work out which of cargo and this script was
@@ -226,5 +243,5 @@ build_module() {
     "$(( after * 100 / before ))"
 }
 
-build_module gaugedesk-relay-transport gaugedesk_relay_transport tunnel
-build_module gaugedesk-directory-protocol gaugedesk_directory_protocol directory --features wasm
+build_module gaugedesk-relay-transport gaugedesk_relay_transport tunnel "${GAUGEDESK_WASM_TUNNEL:-}"
+build_module gaugedesk-directory-protocol gaugedesk_directory_protocol directory "${GAUGEDESK_WASM_DIRECTORY:-}" --features wasm

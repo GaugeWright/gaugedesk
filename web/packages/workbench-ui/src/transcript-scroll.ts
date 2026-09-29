@@ -148,6 +148,8 @@ export interface TranscriptScroll {
     readonly pillVisible: Accessor<boolean>;
     /** Scroll to the bottom and latch the viewport to it. */
     readonly jumpToLatest: () => void;
+    /** Move to a user turn selected in the message-navigation rail. */
+    readonly jumpToUser: (index: number) => void;
     /** Feed the current line list; detects sends and initial history. */
     readonly observeLines: (lines: readonly TranscriptLine[]) => void;
     /** Forget everything positional — the session or chat changed. */
@@ -378,6 +380,23 @@ export function createTranscriptScroll(): TranscriptScroll {
             anchored = false;
             glideUntil = now() + GLIDE_WINDOW_MS;
             el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        },
+        jumpToUser: (index) => {
+            const el = transcriptEl;
+            const target = el?.querySelectorAll<HTMLElement>(".transcript-body .line.user")[index];
+            if (!el || !target) return;
+            // Selecting history is a reader gesture. Release both holds before
+            // moving, so a streaming reply cannot pull the selected turn away.
+            following = false;
+            anchored = false;
+            setSpacer(0);
+            haltGlide();
+            if (!scrollable({ scrollTop: el.scrollTop, scrollHeight: el.scrollHeight, clientHeight: el.clientHeight })) {
+                target.scrollIntoView({ behavior: "smooth", block: "start" });
+                return;
+            }
+            glideUntil = now() + GLIDE_WINDOW_MS;
+            el.scrollTo({ top: Math.max(0, topWithin(target) - ANCHOR_GAP), behavior: "smooth" });
         },
         observeLines: (lines) => {
             const next = gaugeLines(lines);

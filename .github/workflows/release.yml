@@ -313,12 +313,18 @@ jobs:
       # SHOWS and REPORTS came from the in-repo dev default, so v0.4.6, v0.4.7
       # and v0.4.8 each installed as themselves and then identified as 0.4.5 —
       # in the account menu, and in the `x-gaugedesk-client-version`
-      # compatibility header every control-plane request carries (ADR 0095), so
+      # compatibility header every control-plane request carries (DR-0095), so
       # a Home was told the wrong client version by every desktop in the field.
       # Derive once here; the steps below consume what this resolves. A
       # workflow_dispatch tag ref is normalized identically without creating a
       # GitHub Release; a non-tag dry run resolves nothing and every consumer
-      # keeps the in-repo dev default.
+      # keeps the in-repo version.
+      #
+      # And refuse a tag the tree does not declare. The product's version is
+      # declared once, in Cargo.toml's [workspace.package], by the commit that
+      # cuts the release, and the release is tagged at that commit (GaugeWright
+      # DR-0170). A tag naming any other number would build bundles under a
+      # version the source they came from never stated.
       - name: resolve the release version
         if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.ref, 'v') || startsWith(inputs.ref, 'refs/tags/v')
         shell: bash
@@ -330,6 +336,12 @@ jobs:
           RELEASE_NAME="${RELEASE_REF#refs/tags/}"
           VERSION="${RELEASE_NAME#v}"
           BUNDLE_VERSION="$VERSION"
+
+          DECLARED="$(awk '{ sub(/\r$/, "") } /^\[/ { table = $0 } table == "[workspace.package]" && /^version *= *"/ { gsub(/^version *= *"|".*$/, ""); print; exit }' Cargo.toml)"
+          if [[ "$VERSION" != "$DECLARED" ]]; then
+            echo "::error::$RELEASE_NAME names $VERSION but this tree declares ${DECLARED:-no version} in Cargo.toml [workspace.package]; a release is built from the commit that declares its version (GaugeWright DR-0170)"
+            exit 1
+          fi
 
           # WiX only accepts a single numeric prerelease identifier, so Windows
           # maps alpha.N/beta.N/rc.N to ordered numeric bands that retain SemVer

@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 
+use gaugedesk_core::{Lifecycle, Rejection};
 use gaugedesk_store::{AdmitError, CommandRecordFact, Store};
 
 use crate::account::ACCOUNT_SCOPE;
@@ -298,6 +299,114 @@ pub fn provision_personal_tenant(
 /// idempotency key to the organization that key created.
 pub const TENANT_CLAIM_KIND: &str = "tenant_claim";
 
+/// The Hub holds only this placement intent; the selected Home owns the
+/// project's name, files, members, and tracker. One record is reserved in the
+/// organization transaction, before a Home is reachable.
+pub const ORGANIZATION_PROJECT_KIND: &str = "organization_project";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct OrganizationProjectIntent {
+    pub id: String,
+    pub project_id: String,
+    pub founding_owner: String,
+    pub display_name: String,
+    pub home_id: Option<String>,
+}
+
+struct OrganizationProjectPlacement;
+
+impl Lifecycle for OrganizationProjectPlacement {
+    type State = Option<OrganizationProjectIntent>;
+    type Command = OrganizationProjectIntent;
+    type Event = OrganizationProjectIntent;
+
+    const KIND: &'static str = ORGANIZATION_PROJECT_KIND;
+
+    fn decide(state: &Self::State, command: Self::Command) -> Result<Vec<Self::Event>, Rejection> {
+        let Some(existing) = state else {
+            return Err(Rejection {
+                reason: "organization project was not reserved",
+            });
+        };
+        if existing.project_id != command.project_id
+            || existing.founding_owner != command.founding_owner
+            || existing
+                .home_id
+                .as_ref()
+                .is_some_and(|home| command.home_id.as_ref() != Some(home))
+        {
+            return Err(Rejection {
+                reason: "organization project is already bound",
+            });
+        }
+        Ok((existing != &command)
+            .then_some(command)
+            .into_iter()
+            .collect())
+    }
+
+    fn evolve(_state: &Self::State, event: Self::Event) -> Self::State {
+        Some(event)
+    }
+}
+
+pub fn organization_project_intent(
+    store: &Store,
+    tenant_id: &str,
+) -> Result<Option<OrganizationProjectIntent>, AdmitError> {
+    let scope = tenant_scope(tenant_id);
+    let mut current = None;
+    for row in store.records(&scope, ORGANIZATION_PROJECT_KIND)? {
+        let intent: OrganizationProjectIntent = serde_json::from_str(&row)?;
+        current = Some(intent);
+    }
+    Ok(current)
+}
+
+/// The first Project Host choice is sticky: retrying the same choice repairs
+/// interrupted Home setup, while a different host must use project handoff.
+pub fn select_organization_project_home(
+    store: &mut Store,
+    tenant_id: &str,
+    founding_owner: &str,
+    home_id: &str,
+) -> Result<Option<OrganizationProjectIntent>, AdmitError> {
+    if home_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let scope = tenant_scope(tenant_id);
+    let request = (founding_owner, home_id);
+    let admitted = store.admit_request::<OrganizationProjectPlacement, _>(
+        &scope,
+        "shared-project-first-host",
+        &request,
+        |state| {
+            if state
+                .as_ref()
+                .is_some_and(|intent| intent.founding_owner == founding_owner)
+            {
+                Ok(())
+            } else {
+                Err(Rejection {
+                    reason: "organization project founder is unavailable",
+                })
+            }
+        },
+        |state| {
+            let mut intent = state.clone().ok_or(Rejection {
+                reason: "organization project was not reserved",
+            })?;
+            intent.home_id = Some(home_id.to_owned());
+            Ok(intent)
+        },
+    );
+    match admitted {
+        Ok(admission) => Ok(admission.state),
+        Err(AdmitError::Rejected(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// One key → organization binding, so a retried create returns the organization
 /// the first attempt made instead of making a second one.
 ///
@@ -410,10 +519,22 @@ pub fn provision_organization(
             })
         })
         .transpose()?;
+    let project_intent_json = serde_json::to_string(&OrganizationProjectIntent {
+        id: "shared".into(),
+        project_id: format!("proj-org-{}", id.trim_start_matches("organization:")),
+        founding_owner: root.to_owned(),
+        display_name: display.trim().to_owned(),
+        home_id: None,
+    })?;
 
     let mut records: Vec<(&str, &str, &str)> = vec![
         (scope.as_str(), "org", org_json.as_str()),
         (scope.as_str(), "membership", owner_json.as_str()),
+        (
+            scope.as_str(),
+            ORGANIZATION_PROJECT_KIND,
+            project_intent_json.as_str(),
+        ),
         (account_scope, TENANT_REF_KIND, tenant_json.as_str()),
     ];
     if let Some(claim_json) = &claim_json {
@@ -889,6 +1010,87 @@ mod tests {
         let tenancy = Tenancy::rebuild_in(&s, &crate::account::account_scope(ROOT)).unwrap();
         assert_eq!(tenancy.list().count(), 1);
         assert!(tenancy.contains(&created.id));
+
+        let intent = organization_project_intent(&s, &created.id)
+            .unwrap()
+            .expect("one project reserved in the create transaction");
+        assert_eq!(intent.project_id.len(), "proj-org-".len() + 32);
+        assert_eq!(intent.display_name, "Acme Studio");
+        assert_eq!(intent.founding_owner, ROOT);
+        assert_eq!(intent.home_id, None, "no Project Host has been selected");
+        let selected = select_organization_project_home(&mut s, &created.id, ROOT, "home-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.home_id.as_deref(), Some("home-a"));
+        let before_retry = s
+            .records(&tenant_scope(&created.id), ORGANIZATION_PROJECT_KIND)
+            .unwrap()
+            .len();
+        assert_eq!(
+            select_organization_project_home(&mut s, &created.id, ROOT, "home-a").unwrap(),
+            Some(selected.clone())
+        );
+        assert!(
+            select_organization_project_home(&mut s, &created.id, ROOT, "home-b")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_organization_project_home(&mut s, &created.id, "stranger", "home-a")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.records(&tenant_scope(&created.id), ORGANIZATION_PROJECT_KIND)
+                .unwrap()
+                .len(),
+            before_retry
+        );
+    }
+
+    #[test]
+    fn racing_first_host_choices_cannot_split_one_organization_project() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("organization.sqlite");
+        let path = path.to_str().unwrap().to_owned();
+        let mut setup = Store::open(&path).unwrap();
+        let tenant = provision_organization(
+            &mut setup,
+            ROOT,
+            &crate::account::account_scope(ROOT),
+            "Acme",
+            None,
+        )
+        .unwrap();
+        drop(setup);
+        let choices = ["home-a", "home-b"]
+            .into_iter()
+            .map(|home| {
+                let path = path.clone();
+                let tenant = tenant.id.clone();
+                std::thread::spawn(move || {
+                    let mut store = Store::open(&path).unwrap();
+                    select_organization_project_home(&mut store, &tenant, ROOT, home)
+                        .unwrap()
+                        .is_some()
+                })
+            })
+            .collect::<Vec<_>>();
+        let winners = choices
+            .into_iter()
+            .map(|choice| choice.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .records(&tenant_scope(&tenant.id), ORGANIZATION_PROJECT_KIND)
+                .unwrap()
+                .len(),
+            2,
+            "one reservation and one first-Host event"
+        );
     }
 
     #[test]

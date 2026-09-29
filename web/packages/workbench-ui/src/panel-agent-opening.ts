@@ -48,7 +48,7 @@ export function panelAgentSurfacePlan(
     }
     return {
         scope: "pinned",
-        subtitle: `${projectName ?? "Project"} · pinned v${placement.version}`,
+        subtitle: `${projectName ?? "Project"} · version ${placement.version}`,
         contractEditable: false,
         actions: ["deploy", "inbox"],
         deployLabel: placement.deployments.length ? "Manage deployments…" : "Deploy…",

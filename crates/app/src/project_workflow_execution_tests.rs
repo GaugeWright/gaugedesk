@@ -6,7 +6,7 @@ fn declare(wb: &mut Workbench, context: &AuthenticatedActionContext) {
     wb.declare_project_tracker(
         context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "declare",
         ResourceAttributes::default(),
     )
@@ -34,7 +34,7 @@ fn product_execution_files_basics_once_and_parks_without_a_provider_run() {
     let items = stores(&wb, &invocation)
         .runtime
         .items
-        .list_items(Some("tutorials"), None)
+        .list_items(Some("tasks"), None)
         .unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].title, "Create a chat in Personal");
@@ -74,7 +74,7 @@ fn product_execution_files_basics_once_and_parks_without_a_provider_run() {
         stores(&wb, &invocation)
             .runtime
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .unwrap()
             .len(),
         1
@@ -112,7 +112,7 @@ fn product_steps_follow_native_closings_across_restart_through_all_four_tasks() 
         let items = native
             .runtime
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .unwrap();
         assert_eq!(items.len(), index + 1);
         let pending: Vec<_> = items.iter().filter(|item| item.status == "open").collect();
@@ -120,7 +120,7 @@ fn product_steps_follow_native_closings_across_restart_through_all_four_tasks() 
         assert_eq!(pending[0].title, title);
         let close = crate::project_tracker::CompleteTrackerIssue {
             project: request.project.clone(),
-            queue: "tutorials".into(),
+            queue: "tasks".into(),
             item_id: pending[0].id.clone(),
             subject_id: native
                 .runtime
@@ -173,7 +173,7 @@ fn product_steps_follow_native_closings_across_restart_through_all_four_tasks() 
         stores(&wb, &invocation)
             .runtime
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .unwrap()
             .len(),
         4
@@ -226,7 +226,7 @@ fn assignment_requires_recipient_read_access_even_for_an_administrator() {
     assert!(stores(&wb, &invocation)
         .runtime
         .items
-        .list_items(Some("tutorials"), None)
+        .list_items(Some("tasks"), None)
         .unwrap()
         .is_empty());
     assert!(stores(&wb, &invocation)
@@ -238,7 +238,7 @@ fn assignment_requires_recipient_read_access_even_for_an_administrator() {
         .request_project_tracker_access(
             &context,
             DEFAULT_PROJECT,
-            "tutorials",
+            "tasks",
             "colleague-read",
             "colleague",
             TrackerPermission::Read,
@@ -247,7 +247,7 @@ fn assignment_requires_recipient_read_access_even_for_an_administrator() {
     wb.decide_project_tracker_access(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "approve-colleague",
         &access.id,
         TrackerAccessDecision::Approve,
@@ -257,7 +257,7 @@ fn assignment_requires_recipient_read_access_even_for_an_administrator() {
     let items = stores(&wb, &invocation)
         .runtime
         .items
-        .list_items(Some("tutorials"), None)
+        .list_items(Some("tasks"), None)
         .unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].assigned_to.as_deref(), Some("colleague"));
@@ -294,7 +294,7 @@ fn revoked_membership_prevents_rule_observation_and_filing() {
     assert!(stores(&wb, &invocation)
         .runtime
         .items
-        .list_items(Some("tutorials"), None)
+        .list_items(Some("tasks"), None)
         .unwrap()
         .is_empty());
 }
@@ -325,7 +325,7 @@ fn interrupted_filing_recovers_its_receipt_without_a_second_issue_or_attempt() {
             native
                 .runtime
                 .items
-                .list_items(Some("tutorials"), None)
+                .list_items(Some("tasks"), None)
                 .unwrap()
                 .len(),
             1
@@ -355,7 +355,7 @@ fn interrupted_filing_recovers_its_receipt_without_a_second_issue_or_attempt() {
         native
             .runtime
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .unwrap()
             .len(),
         1
@@ -423,7 +423,7 @@ fn interrupted_filing_without_a_receipt_is_unresolved_and_never_retried() {
     assert!(native
         .runtime
         .items
-        .list_items(Some("tutorials"), None)
+        .list_items(Some("tasks"), None)
         .unwrap()
         .is_empty());
     assert_eq!(
@@ -476,7 +476,7 @@ fn expired_native_wait_fails_the_workflow_without_filing_the_next_task() {
         stores(&wb, &invocation)
             .runtime
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .unwrap()
             .len(),
         1
@@ -493,7 +493,7 @@ fn revoked_contribution_grant_prevents_execution_after_admission() {
         .unwrap();
     let scope = format!(
         "project::{DEFAULT_PROJECT}::tracker::{}",
-        hex::encode("tutorials")
+        hex::encode("tasks")
     );
     let grant = wb
         .store_ref()
@@ -510,7 +510,7 @@ fn revoked_contribution_grant_prevents_execution_after_admission() {
     wb.decide_project_tracker_access(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "revoke-contribute",
         &grant.id,
         TrackerAccessDecision::Revoke,
@@ -534,7 +534,7 @@ fn revoked_contribution_grant_prevents_execution_after_admission() {
     assert!(native
         .runtime
         .items
-        .list_items(Some("tutorials"), None)
+        .list_items(Some("tasks"), None)
         .unwrap()
         .is_empty());
 }
@@ -571,7 +571,7 @@ fn a_pending_handoff_pauses_every_step_of_a_folder_run() {
         stores(&wb, &invocation)
             .runtime
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .unwrap()
             .is_empty(),
         "nothing was filed while paused"

@@ -1,7 +1,8 @@
 //! GaugeVault credential standing (VAULT-2; GaugeWright DR-0150).
 //!
 //! This pure reducer orders candidates, activation, revocation and erasure for
-//! one opaque owner scope. It holds exact backing references, never material.
+//! one opaque owner scope. It holds a distinct object name and exact backing
+//! reference per candidate, never material.
 //! The admitting shell authenticates capabilities and Key Vault observations.
 //! The dispatch ledger orders one-use final effects against rotation and
 //! revocation. The shell still must verify grants, the independent recovery
@@ -10,9 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ids::{
-    AuthorityId, ObservationId, ScopeId, SecretHandleId, VaultBackingVersionId, VaultCandidateId,
-    VaultCredentialId, VaultDispatchId, VaultIntakeMarkerId, VaultOperationId, VaultSubjectId,
-    VaultTargetId,
+    AuthorityId, ObservationId, ScopeId, VaultBackingVersionId, VaultCandidateId,
+    VaultCredentialId, VaultDispatchId, VaultIntakeMarkerId, VaultOperationId, VaultStorageNameId,
+    VaultSubjectId, VaultTargetId, VaultTenantPrefixId,
 };
 use crate::{Lifecycle, Rejection};
 
@@ -61,6 +62,8 @@ pub enum Candidate {
     },
     Cleaned {
         evidence: ObservationId,
+        /// Retained so cleanup and restore still know which exact object was used.
+        reference: Option<VaultBackingVersionId>,
     },
 }
 
@@ -72,6 +75,10 @@ impl Candidate {
             | Self::Retired { reference } => Some(reference),
             Self::CleanupRequired {
                 reference: Some(reference),
+            }
+            | Self::Cleaned {
+                reference: Some(reference),
+                ..
             } => Some(reference),
             _ => None,
         }
@@ -111,7 +118,7 @@ pub enum Outcome {
     NoEffectObserved,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DispatchRecord {
     pub effect: Effect,
     pub reference: VaultBackingVersionId,
@@ -122,13 +129,17 @@ pub struct DispatchRecord {
     pub outcome_evidence: Option<ObservationId>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub binding: Option<Binding>,
     pub revision: u64,
     pub last_at: u64,
     pub status: Status,
-    pub storage_name: Option<SecretHandleId>,
+    /// The shell proves this opaque namespace belongs to the authenticated
+    /// Personal or organization account; the prefix is not Azure isolation.
+    pub tenant_prefix: Option<VaultTenantPrefixId>,
+    /// Bound before `set` and retained through cleanup and recovery.
+    pub candidate_storage_names: BTreeMap<VaultCandidateId, VaultStorageNameId>,
     pub candidates: BTreeMap<VaultCandidateId, Candidate>,
     /// Retained through cleanup so an ambiguous write always reconciles under
     /// the marker durably bound to its original candidate before the PUT.
@@ -142,6 +153,21 @@ pub struct State {
     pub dispatches: BTreeMap<VaultDispatchId, DispatchRecord>,
 }
 
+/// Whitelisted metadata for a credential's Administration status. The caller
+/// must first prove current access to the owner account; this projection does
+/// not authorize an account read or a credential use. It deliberately omits
+/// backing references, storage names, intake markers and effect evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AdministrationStatus {
+    pub status: Status,
+    pub revision: u64,
+    pub last_at: u64,
+    pub pending_intakes: usize,
+    pub cleanup_required: usize,
+    pub unsettled_uses: usize,
+    pub unknown_outcomes: usize,
+}
+
 impl State {
     /// Metadata standing only. A use also needs current grant, dispatch and
     /// recovery-fence checks at the final boundary.
@@ -152,6 +178,42 @@ impl State {
         match self.candidates.get(self.current.as_ref()?)? {
             Candidate::Active { reference } => Some(reference),
             _ => None,
+        }
+    }
+
+    /// A secret-free status for an already-authorized Administration read.
+    /// These counts describe this credential's ordered product state, not the
+    /// health or freshness of Key Vault, grants or the independent fence.
+    pub fn administration_status(&self) -> AdministrationStatus {
+        AdministrationStatus {
+            status: self.status,
+            revision: self.revision,
+            last_at: self.last_at,
+            pending_intakes: self
+                .candidates
+                .values()
+                .filter(|candidate| {
+                    matches!(
+                        candidate,
+                        Candidate::AwaitingStore { .. } | Candidate::Stored { .. }
+                    )
+                })
+                .count(),
+            cleanup_required: self
+                .candidates
+                .values()
+                .filter(|candidate| matches!(candidate, Candidate::CleanupRequired { .. }))
+                .count(),
+            unsettled_uses: self
+                .dispatches
+                .values()
+                .filter(|dispatch| dispatch.phase != DispatchPhase::Settled)
+                .count(),
+            unknown_outcomes: self
+                .dispatches
+                .values()
+                .filter(|dispatch| dispatch.phase == DispatchPhase::Unknown)
+                .count(),
         }
     }
 }
@@ -182,11 +244,12 @@ pub struct Command {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Operation {
     Create {
-        storage_name: SecretHandleId,
+        tenant_prefix: VaultTenantPrefixId,
     },
     BeginCandidate {
         id: VaultCandidateId,
         marker: VaultIntakeMarkerId,
+        storage_name: VaultStorageNameId,
         deadline: u64,
     },
     RecordStored {
@@ -241,11 +304,12 @@ pub struct Event {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Change {
     Created {
-        storage_name: SecretHandleId,
+        tenant_prefix: VaultTenantPrefixId,
     },
     CandidateBegun {
         id: VaultCandidateId,
         marker: VaultIntakeMarkerId,
+        storage_name: VaultStorageNameId,
         deadline: u64,
     },
     CandidateStored {
@@ -298,6 +362,21 @@ fn canonical_intake_marker(marker: &VaultIntakeMarkerId) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+fn canonical_hex_128(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn candidate_name_matches_prefix(name: &VaultStorageNameId, prefix: &VaultTenantPrefixId) -> bool {
+    name.as_str()
+        .strip_prefix("gv-")
+        .and_then(|rest| rest.strip_prefix(prefix.as_str()))
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(canonical_hex_128)
+}
+
 pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> {
     if state.revision != command.expected_revision {
         return refuse("GaugeVault: stale revision");
@@ -313,25 +392,37 @@ pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> 
         return refuse("GaugeVault: wrong authority, owner or credential");
     }
     let change = match command.operation {
-        Operation::Create { storage_name }
-            if command.capability == Capability::Manage && state.status == Status::Absent =>
+        Operation::Create { tenant_prefix }
+            if command.capability == Capability::Manage
+                && state.status == Status::Absent
+                && canonical_hex_128(tenant_prefix.as_str()) =>
         {
-            Change::Created { storage_name }
+            Change::Created { tenant_prefix }
         }
         Operation::BeginCandidate {
             id,
             marker,
+            storage_name,
             deadline,
         } if command.capability == Capability::Manage
             && matches!(state.status, Status::Pending | Status::Active)
             && deadline > command.now
             && !state.candidates.contains_key(&id)
             && canonical_intake_marker(&marker)
-            && !state.intake_markers.values().any(|used| used == &marker) =>
+            && !state.intake_markers.values().any(|used| used == &marker)
+            && state
+                .tenant_prefix
+                .as_ref()
+                .is_some_and(|prefix| candidate_name_matches_prefix(&storage_name, prefix))
+            && !state
+                .candidate_storage_names
+                .values()
+                .any(|used| used == &storage_name) =>
         {
             Change::CandidateBegun {
                 id,
                 marker,
+                storage_name,
                 deadline,
             }
         }
@@ -510,16 +601,19 @@ pub fn evolve(state: &State, event: Event) -> State {
     next.revision += 1;
     next.last_at = event.at;
     match event.change {
-        Change::Created { storage_name } => {
-            next.storage_name = Some(storage_name);
+        Change::Created { tenant_prefix } => {
+            next.tenant_prefix = Some(tenant_prefix);
             next.status = Status::Pending;
         }
         Change::CandidateBegun {
             id,
             marker,
+            storage_name,
             deadline,
         } => {
             next.intake_markers.insert(id.clone(), marker);
+            next.candidate_storage_names
+                .insert(id.clone(), storage_name);
             next.candidates
                 .insert(id, Candidate::AwaitingStore { deadline });
         }
@@ -563,7 +657,18 @@ pub fn evolve(state: &State, event: Event) -> State {
             next.status = Status::Active;
         }
         Change::CandidateCleaned { id, evidence } => {
-            next.candidates.insert(id, Candidate::Cleaned { evidence });
+            let reference = next
+                .candidates
+                .get(&id)
+                .and_then(Candidate::reference)
+                .cloned();
+            next.candidates.insert(
+                id,
+                Candidate::Cleaned {
+                    evidence,
+                    reference,
+                },
+            );
         }
         Change::Revoked => {
             next.status = Status::Revoked;
@@ -649,6 +754,10 @@ mod tests {
         VaultIntakeMarkerId::from(format!("{number:032x}"))
     }
 
+    fn name(number: u8) -> VaultStorageNameId {
+        VaultStorageNameId::from(format!("gv-{}-{number:032x}", "1".repeat(32)))
+    }
+
     fn binding() -> Binding {
         Binding {
             authority: AuthorityId::from("hub"),
@@ -678,7 +787,7 @@ mod tests {
             Capability::Manage,
             1,
             Operation::Create {
-                storage_name: SecretHandleId::from("opaque-name"),
+                tenant_prefix: VaultTenantPrefixId::from("1".repeat(32)),
             },
         );
         apply(
@@ -688,6 +797,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
                 marker: marker(1),
+                storage_name: name(1),
                 deadline: 20,
             },
         );
@@ -712,6 +822,122 @@ mod tests {
     }
 
     #[test]
+    fn administration_status_reports_obligations_without_exposing_custody_metadata() {
+        let mut state = active();
+        apply(
+            &mut state,
+            Capability::Manage,
+            5,
+            Operation::BeginCandidate {
+                id: VaultCandidateId::from("pending-candidate"),
+                marker: marker(2),
+                storage_name: name(2),
+                deadline: 20,
+            },
+        );
+        apply(
+            &mut state,
+            Capability::Manage,
+            6,
+            Operation::BeginCandidate {
+                id: VaultCandidateId::from("cleanup-candidate"),
+                marker: marker(3),
+                storage_name: name(3),
+                deadline: 20,
+            },
+        );
+        apply(
+            &mut state,
+            Capability::Manage,
+            7,
+            Operation::CancelCandidate {
+                id: VaultCandidateId::from("cleanup-candidate"),
+            },
+        );
+        apply(
+            &mut state,
+            Capability::AdmitFinalUse,
+            8,
+            dispatch("dispatch-1", UseMode::AuthenticateEffect, "exact-version-1"),
+        );
+        apply(
+            &mut state,
+            Capability::ConfirmFinalUse,
+            9,
+            Operation::OutcomeUnknown {
+                id: VaultDispatchId::from("dispatch-1"),
+                evidence: ObservationId::from("unknown-outcome-evidence"),
+            },
+        );
+
+        let status = state.administration_status();
+        assert_eq!(status.status, Status::Active);
+        assert_eq!(status.revision, state.revision);
+        assert_eq!(status.last_at, 9);
+        assert_eq!(status.pending_intakes, 1);
+        assert_eq!(status.cleanup_required, 1);
+        assert_eq!(status.unsettled_uses, 1);
+        assert_eq!(status.unknown_outcomes, 1);
+
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&status, &mut encoded).unwrap();
+        let value: ciborium::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
+        let ciborium::Value::Map(entries) = value else {
+            panic!("administration status must serialize as a map");
+        };
+        let fields: BTreeSet<_> = entries
+            .iter()
+            .map(|(key, _)| key.as_text().unwrap())
+            .collect();
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "status",
+                "revision",
+                "last_at",
+                "pending_intakes",
+                "cleanup_required",
+                "unsettled_uses",
+                "unknown_outcomes",
+            ])
+        );
+        for private in [
+            binding().owner_scope.as_str(),
+            "exact-version-1",
+            name(1).as_str(),
+            marker(1).as_str(),
+            "request-1",
+            "grant-1",
+            "fence-1",
+            "unknown-outcome-evidence",
+        ] {
+            assert!(
+                !encoded
+                    .windows(private.len())
+                    .any(|window| window == private.as_bytes()),
+                "projected {private}"
+            );
+        }
+
+        apply(&mut state, Capability::Manage, 10, Operation::Revoke);
+        apply(
+            &mut state,
+            Capability::ConfirmFinalUse,
+            11,
+            Operation::SettleDispatch {
+                id: VaultDispatchId::from("dispatch-1"),
+                outcome: Outcome::NoEffectObserved,
+                evidence: ObservationId::from("settled-outcome-evidence"),
+            },
+        );
+        let closed = state.administration_status();
+        assert_eq!(closed.status, Status::Revoked);
+        assert_eq!(closed.unsettled_uses, 0);
+        assert_eq!(closed.unknown_outcomes, 0);
+        assert_eq!(closed.cleanup_required, 1);
+    }
+
+    #[test]
     fn stored_candidate_is_not_active_and_rotation_selects_exact_version() {
         let mut state = active();
         assert_eq!(
@@ -725,6 +951,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
                 marker: marker(2),
+                storage_name: name(2),
                 deadline: 30,
             },
         );
@@ -753,6 +980,10 @@ mod tests {
             state.active_reference().unwrap().as_str(),
             "exact-version-2"
         );
+        assert_ne!(
+            state.candidate_storage_names[&VaultCandidateId::from("candidate-1")],
+            state.candidate_storage_names[&VaultCandidateId::from("candidate-2")]
+        );
         assert!(matches!(
             state.candidates[&VaultCandidateId::from("candidate-1")],
             Candidate::Retired { .. }
@@ -767,7 +998,7 @@ mod tests {
             Capability::Manage,
             1,
             Operation::Create {
-                storage_name: SecretHandleId::from("opaque-name"),
+                tenant_prefix: VaultTenantPrefixId::from("1".repeat(32)),
             },
         );
         let event = decide(
@@ -780,6 +1011,7 @@ mod tests {
                 operation: Operation::BeginCandidate {
                     id: VaultCandidateId::from("candidate-1"),
                     marker: marker(1),
+                    storage_name: name(1),
                     deadline: 20,
                 },
             },
@@ -793,6 +1025,10 @@ mod tests {
         assert_eq!(
             state.intake_markers[&VaultCandidateId::from("candidate-1")],
             marker(1)
+        );
+        assert_eq!(
+            state.candidate_storage_names[&VaultCandidateId::from("candidate-1")],
+            name(1)
         );
         apply(
             &mut state,
@@ -815,6 +1051,10 @@ mod tests {
             state.intake_markers[&VaultCandidateId::from("candidate-1")],
             marker(1)
         );
+        assert_eq!(
+            state.candidate_storage_names[&VaultCandidateId::from("candidate-1")],
+            name(1)
+        );
         for reused in [marker(1), VaultIntakeMarkerId::from("invalid-marker")] {
             assert!(decide(
                 &state,
@@ -826,6 +1066,28 @@ mod tests {
                     operation: Operation::BeginCandidate {
                         id: VaultCandidateId::from("candidate-2"),
                         marker: reused,
+                        storage_name: name(2),
+                        deadline: 20,
+                    },
+                },
+            )
+            .is_err());
+        }
+        for invalid_name in [
+            name(1),
+            VaultStorageNameId::from(format!("gv-{}-{:032x}", "2".repeat(32), 2)),
+        ] {
+            assert!(decide(
+                &state,
+                Command {
+                    binding: binding(),
+                    capability: Capability::Manage,
+                    expected_revision: state.revision,
+                    now: 5,
+                    operation: Operation::BeginCandidate {
+                        id: VaultCandidateId::from("candidate-2"),
+                        marker: marker(2),
+                        storage_name: invalid_name,
                         deadline: 20,
                     },
                 },
@@ -848,6 +1110,7 @@ mod tests {
             operation: Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
                 marker: marker(2),
+                storage_name: name(2),
                 deadline: 30,
             },
         };
@@ -882,7 +1145,7 @@ mod tests {
             Capability::Manage,
             1,
             Operation::Create {
-                storage_name: SecretHandleId::from("opaque-name"),
+                tenant_prefix: VaultTenantPrefixId::from("1".repeat(32)),
             },
         );
         apply(
@@ -892,6 +1155,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
                 marker: marker(1),
+                storage_name: name(1),
                 deadline: 5,
             },
         );
@@ -932,7 +1196,7 @@ mod tests {
             Capability::Manage,
             1,
             Operation::Create {
-                storage_name: SecretHandleId::from("opaque-name"),
+                tenant_prefix: VaultTenantPrefixId::from("1".repeat(32)),
             },
         );
         apply(
@@ -942,6 +1206,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
                 marker: marker(1),
+                storage_name: name(1),
                 deadline: 10,
             },
         );
@@ -1052,6 +1317,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
                 marker: marker(2),
+                storage_name: name(2),
                 deadline: 10,
             },
         );
@@ -1081,6 +1347,13 @@ mod tests {
                 evidence: ObservationId::from("cleanup-2"),
             },
         );
+        assert_eq!(
+            state.candidates[&VaultCandidateId::from("candidate-2")]
+                .reference()
+                .unwrap()
+                .as_str(),
+            "exact-version-2"
+        );
         apply(
             &mut state,
             Capability::Manage,
@@ -1088,6 +1361,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-3"),
                 marker: marker(3),
+                storage_name: name(3),
                 deadline: 20,
             },
         );
@@ -1181,6 +1455,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
                 marker: marker(2),
+                storage_name: name(2),
                 deadline: 20,
             },
         );
@@ -1288,5 +1563,30 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn serialized_state_preserves_terminal_fences_and_consumed_dispatches() {
+        let mut state = active();
+        apply(
+            &mut state,
+            Capability::AdmitFinalUse,
+            5,
+            dispatch("dispatch-1", UseMode::AuthenticateEffect, "exact-version-1"),
+        );
+        apply(&mut state, Capability::Manage, 6, Operation::Revoke);
+        apply(&mut state, Capability::Manage, 7, Operation::FenceErasure);
+
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&state, &mut encoded).unwrap();
+        let restored: State = ciborium::de::from_reader(encoded.as_slice()).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.status, Status::ErasureFenced);
+        assert!(restored
+            .dispatches
+            .contains_key(&VaultDispatchId::from("dispatch-1")));
+        assert!(restored
+            .used_references
+            .contains(&VaultBackingVersionId::from("exact-version-1")));
     }
 }

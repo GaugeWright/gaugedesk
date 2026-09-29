@@ -840,11 +840,32 @@ pub fn organization_model_request_digest(
 ) -> io::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
 
+    // The same request crosses Cargo and Buck builds. A transitive
+    // `serde_json/preserve_order` feature must not change its identity.
+    fn sorted_json(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(object) => {
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|(key, _)| *key);
+                let mut sorted = serde_json::Map::new();
+                for (key, value) in entries {
+                    sorted.insert(key.clone(), sorted_json(value));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(sorted_json).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    let body = sorted_json(&request.body);
     let bytes = serde_json::to_vec(&(
         "gaugewright:whipplescript-provider-request:v1",
         &request.url,
         &request.headers,
-        &request.body,
+        &body,
     ))
     .map_err(io::Error::other)?;
     if bytes.len() > 9 * 1024 * 1024 {
@@ -1648,7 +1669,6 @@ impl WhipHarnessFactory {
             workspace,
             chat_id: spec.chat_id.clone(),
             mode: spec.mode,
-            runtime_store_path: chat_runtime_database(&self.runtime_root, &spec.chat_id),
             provider_binding_ref: spec.provider_binding_ref.clone().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1666,7 +1686,7 @@ impl WhipHarnessFactory {
                 )
             })?,
             respondent_ref: self.authority.as_str().to_owned(),
-            user_context_complete: true,
+            user_context_sources: Some(Vec::new()),
             turn_sequence: 0,
             next_command_id: None,
             task_filer: None,
@@ -1865,13 +1885,12 @@ struct WhipHarness {
     workspace: NativeWorkspaceResolver,
     chat_id: String,
     mode: gaugedesk_harness::ChatMode,
-    runtime_store_path: PathBuf,
     provider_binding_ref: String,
     credential_ref: String,
     workspace_targets: Vec<gaugedesk_harness::WorkspaceTargetBinding>,
     placement_ceiling_ref: String,
     respondent_ref: String,
-    user_context_complete: bool,
+    user_context_sources: Option<Vec<String>>,
     turn_sequence: u64,
     next_command_id: Option<String>,
     task_filer: Option<Arc<dyn TaskFiler>>,
@@ -2015,8 +2034,8 @@ impl Harness for WhipHarness {
         self.next_command_id = command_id.map(str::to_owned);
     }
 
-    fn bind_user_context_provenance(&mut self, complete: bool) {
-        self.user_context_complete = complete;
+    fn bind_user_context_provenance(&mut self, sources: Option<&[String]>) {
+        self.user_context_sources = sources.map(|handles| handles.to_vec());
     }
 
     fn bind_task_filer(&mut self, filer: Option<Arc<dyn TaskFiler>>) {
@@ -2050,6 +2069,7 @@ impl Harness for WhipHarness {
         let resources = TurnResources {
             workspace: &self.workspace,
             chat_id: &self.chat_id,
+            mode: self.mode,
             images,
             task_filer: self.task_filer.as_deref(),
             asked: std::cell::RefCell::new(Vec::new()),
@@ -2078,6 +2098,7 @@ impl Harness for WhipHarness {
         };
         let package = ProjectTaskPackage {
             inner: &self.package,
+            task_filing_admitted: self.task_filer.is_some(),
             recipients: self
                 .task_filer
                 .as_ref()
@@ -2198,6 +2219,38 @@ impl Harness for WhipHarness {
     }
 }
 
+fn registered_agent_skill_sources(
+    skills: &[whipplescript_store::SkillView],
+    chat_id: &str,
+    mode: gaugedesk_harness::ChatMode,
+) -> Option<Vec<String>> {
+    let mut sources = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let expected_path = format!(".gaugedesk-runtime/agent/skills/{}/SKILL.md", skill.name);
+        if mode != gaugedesk_harness::ChatMode::Use
+            || skill.source != "gaugedesk-agent"
+            || skill.name.is_empty()
+            || !skill
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            || skill.source_path != expected_path
+            || skill.content_hash.len() != 32
+            || !skill
+                .content_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        sources.push(format!(
+            "discipline-skill:{chat_id}:{}:{}",
+            skill.content_hash, skill.name
+        ));
+    }
+    Some(sources)
+}
+
 impl WhipHarness {
     fn initial_model_provenance(
         &self,
@@ -2214,27 +2267,23 @@ impl WhipHarness {
             source_handles: handles,
             complete: true,
         };
-        let mut system = known(vec![package.clone(), chat.clone()]);
-        // The runtime can add catalogue entries to the system context. Until
-        // each entry has its own source witness, an installed skill makes the
-        // whole system plane unknown.
-        let skills_known_empty =
-            whipplescript_store::SqliteStore::open_read_only(&self.runtime_store_path)
-                .and_then(|store| store.list_skills())
-                .is_ok_and(|skills| skills.is_empty());
-        if !skills_known_empty {
-            system.complete = false;
-        }
+        // The runtime labels the actual skill catalogue after reading the
+        // registry for this model request. A pre-turn store read cannot attest
+        // the bytes that went into the provider-bound system prompt.
+        let system = known(vec![package.clone(), chat.clone()]);
         let image_sources = images
             .iter()
             .map(|image| live_turn_image_source(&self.chat_id, image))
             .collect::<Option<Vec<_>>>();
         let images_known = command.input.images.len() == images.len() && image_sources.is_some();
         let mut user = known(vec![chat.clone()]);
+        if let Some(sources) = &self.user_context_sources {
+            user.source_handles.extend(sources.iter().cloned());
+        }
         if let Some(sources) = image_sources {
             user.source_handles.extend(sources);
         }
-        user.complete = self.user_context_complete && images_known;
+        user.complete = self.user_context_sources.is_some() && images_known;
         InitialModelProvenance {
             system,
             user,
@@ -2542,12 +2591,16 @@ struct StaticPackages {
 /// host projection only tells the model who this Home currently permits.
 struct ProjectTaskPackage<'a> {
     inner: &'a AuthoredAgentPackage,
+    task_filing_admitted: bool,
     recipients: Vec<(String, String)>,
 }
 
 impl PackageResolver for ProjectTaskPackage<'_> {
     fn resolve_package(&self, version_ref: &str) -> Result<ResolvedPackage, String> {
         let mut package = self.inner.resolve_package(version_ref)?;
+        if !self.task_filing_admitted {
+            package.tools.retain(|tool| tool.name != "add_todo");
+        }
         describe_task_recipients(&mut package.tools, &self.recipients);
         Ok(package)
     }
@@ -2568,7 +2621,7 @@ fn describe_task_recipients(
     let mut assignee = serde_json::json!({
         "type": "string",
         "description": format!(
-            "Assign to an eligible person by authority. Omit for the person asking. Eligible people: {people}"
+            "Assign to an eligible person by authority. Omit to leave the issue unassigned. Eligible people: {people}"
         )
     });
     if !recipients.is_empty() {
@@ -3117,6 +3170,7 @@ impl SecretResolver for ProviderConfig {
 struct TurnResources<'a> {
     workspace: &'a NativeWorkspaceResolver,
     chat_id: &'a str,
+    mode: gaugedesk_harness::ChatMode,
     images: &'a [ImageContent],
     task_filer: Option<&'a dyn TaskFiler>,
     /// Questions asked during this turn. Interior mutability because
@@ -3137,6 +3191,19 @@ struct TurnResources<'a> {
 }
 
 impl ResourceResolver for TurnResources<'_> {
+    fn model_skill_catalogue_provenance(
+        &self,
+        skills: &[whipplescript_store::SkillView],
+    ) -> ModelContentProvenance {
+        match registered_agent_skill_sources(skills, self.chat_id, self.mode) {
+            Some(source_handles) => ModelContentProvenance {
+                source_handles,
+                complete: true,
+            },
+            None => ModelContentProvenance::default(),
+        }
+    }
+
     fn model_output_provenance(
         &self,
         _admitted_resources: &[ResourceRef],
@@ -3149,11 +3216,11 @@ impl ResourceResolver for TurnResources<'_> {
                 source_handles: vec!["runtime".to_owned()],
                 complete: true,
             }
-        } else if matches!(call.name.as_str(), "read" | "grep") {
-            // The resolver witnessed the exact full file bytes for this call.
-            // A directory grep carries the searched root and every traversed
-            // file, including negative matches. An incomplete scan falls back
-            // to the coarse source, which cannot authorize an individual cut.
+        } else if matches!(call.name.as_str(), "read" | "grep" | "find" | "ls") {
+            // The resolver witnessed the exact source set for this call.
+            // A bounded directory search or listing carries its root and
+            // every source behind its result. An incomplete witness falls
+            // back to the coarse source, which cannot authorize a cut.
             if let Some(witness) = self.workspace.take_model_read_witness(&call.id) {
                 ModelContentProvenance {
                     source_handles: vec![format!(
@@ -3170,6 +3237,11 @@ impl ResourceResolver for TurnResources<'_> {
                         self.chat_id, file.content_hash, file.path
                     )
                 }));
+                handles.extend(
+                    scan.directories
+                        .into_iter()
+                        .map(|path| format!("workspace-dir:{}:{path}", self.chat_id)),
+                );
                 ModelContentProvenance {
                     source_handles: handles,
                     complete: true,
@@ -3180,10 +3252,7 @@ impl ResourceResolver for TurnResources<'_> {
                     complete: true,
                 }
             }
-        } else if matches!(
-            call.name.as_str(),
-            "write" | "edit" | "ls" | "find" | "bash"
-        ) {
+        } else if matches!(call.name.as_str(), "write" | "edit" | "bash") {
             // These tools may combine several workspace sources. Keep the
             // coarse label until they can attest exact file cuts too.
             ModelContentProvenance {
@@ -3632,6 +3701,69 @@ mod tests {
         assert_eq!(registered.len(), 1);
         assert_eq!(registered[0].name, "triage");
         assert_eq!(registered[0].description, "Inspect reports");
+        assert_eq!(
+            registered_agent_skill_sources(
+                &registered,
+                "chat-one",
+                gaugedesk_harness::ChatMode::Use,
+            ),
+            Some(vec![format!(
+                "discipline-skill:chat-one:{}:triage",
+                registered[0].content_hash
+            )])
+        );
+        assert!(registered_agent_skill_sources(
+            &registered,
+            "chat-one",
+            gaugedesk_harness::ChatMode::Edit,
+        )
+        .is_none());
+        let workspace = NativeWorkspaceResolver::new(&worktree).unwrap();
+        let mut sink = |_observation: &gaugedesk_harness::Observation| {};
+        let resources = TurnResources {
+            workspace: &workspace,
+            chat_id: "chat-one",
+            mode: gaugedesk_harness::ChatMode::Use,
+            images: &[],
+            task_filer: None,
+            asked: std::cell::RefCell::new(Vec::new()),
+            external_tool_handler: None,
+            command_id: "test-turn".to_owned(),
+            live: std::cell::RefCell::new(&mut sink),
+            streamed: std::cell::Cell::new(false),
+        };
+        assert!(
+            resources
+                .model_skill_catalogue_provenance(&registered)
+                .complete
+        );
+        store
+            .register_skill(whipplescript_store::SkillRegistration {
+                skill_id: "skill:external",
+                name: "external",
+                version: "1.0.0",
+                source: "external",
+                source_path: "external/SKILL.md",
+                body: "unclassified skill",
+                description: "unclassified",
+                required_capabilities_json: "[]",
+                metadata_json: "{}",
+            })
+            .unwrap();
+        assert!(registered_agent_skill_sources(
+            &store.list_skills().unwrap(),
+            "chat-one",
+            gaugedesk_harness::ChatMode::Use,
+        )
+        .is_none());
+        assert!(
+            !resources
+                .model_skill_catalogue_provenance(&store.list_skills().unwrap())
+                .complete
+        );
+        store
+            .remove_unattached_skills_from_source("external")
+            .unwrap();
         std::fs::remove_dir_all(skill).unwrap();
         factory
             .refresh_agent_skill_catalogue("chat-one", &worktree)
@@ -3665,6 +3797,7 @@ mod tests {
         let resources = super::TurnResources {
             workspace: &workspace,
             chat_id: "test-chat",
+            mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
             task_filer: Some(&filer),
             asked: std::cell::RefCell::new(Vec::new()),
@@ -3754,7 +3887,7 @@ mod tests {
     }
 
     #[test]
-    fn native_read_and_single_file_grep_use_their_own_file_witness() {
+    fn native_read_and_search_use_exact_file_witnesses() {
         use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
 
         let root = tempfile::tempdir().unwrap();
@@ -3767,6 +3900,7 @@ mod tests {
         let resources = super::TurnResources {
             workspace: &workspace,
             chat_id: "test-chat",
+            mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
             task_filer: None,
             asked: std::cell::RefCell::new(Vec::new()),
@@ -3847,6 +3981,89 @@ mod tests {
             )));
         }
         assert!(scan.complete);
+        let find = super::ToolCall {
+            id: "find-directory".into(),
+            name: "find".into(),
+            arguments: serde_json::json!({
+                "path": "targets/t-one", "pattern": "*first*"
+            }),
+        };
+        assert_eq!(
+            resources.execute_tool(&admitted, &find).unwrap(),
+            "targets/t-one/first.txt"
+        );
+        let found = resources.model_output_provenance(&admitted, &find);
+        assert_eq!(found.source_handles.len(), 3);
+        assert!(found.complete);
+        assert!(found
+            .source_handles
+            .contains(&"workspace-dir:test-chat:targets/t-one".to_owned()));
+        assert!(
+            found.source_handles.contains(&format!(
+                "workspace-file:test-chat:{}:targets/t-one/second.txt",
+                whipplescript_store::stable_hash_bytes_hex(b"second\n")
+            )),
+            "a negative filename match contributes its source"
+        );
+        assert_eq!(
+            resources
+                .model_output_provenance(&admitted, &find)
+                .source_handles,
+            vec!["workspace:test-chat".to_owned()],
+            "the exact find witness is consumed only once"
+        );
+        let single_find = super::ToolCall {
+            id: "find-file".into(),
+            name: "find".into(),
+            arguments: serde_json::json!({
+                "path": "targets/t-one/first.txt", "pattern": "*second*"
+            }),
+        };
+        assert_eq!(resources.execute_tool(&admitted, &single_find).unwrap(), "");
+        assert_eq!(
+            resources
+                .model_output_provenance(&admitted, &single_find)
+                .source_handles,
+            vec![format!(
+                "workspace-file:test-chat:{}:targets/t-one/first.txt",
+                whipplescript_store::stable_hash_bytes_hex(b"first\n")
+            )]
+        );
+        std::fs::create_dir(target.join("child")).unwrap();
+        std::fs::write(target.join("child/nested.txt"), "nested\n").unwrap();
+        let ls = super::ToolCall {
+            id: "list-directory".into(),
+            name: "ls".into(),
+            arguments: serde_json::json!({"path": "targets/t-one"}),
+        };
+        assert!(resources
+            .execute_tool(&admitted, &ls)
+            .unwrap()
+            .contains("child/"));
+        let listed = resources.model_output_provenance(&admitted, &ls);
+        assert!(listed.complete);
+        assert_eq!(listed.source_handles.len(), 4);
+        assert!(listed
+            .source_handles
+            .contains(&"workspace-dir:test-chat:targets/t-one".to_owned()));
+        assert!(listed
+            .source_handles
+            .contains(&"workspace-dir:test-chat:targets/t-one/child".to_owned()));
+        assert!(listed.source_handles.contains(&format!(
+            "workspace-file:test-chat:{}:targets/t-one/first.txt",
+            whipplescript_store::stable_hash_bytes_hex(b"first\n")
+        )));
+        assert!(listed.source_handles.contains(&format!(
+            "workspace-file:test-chat:{}:targets/t-one/second.txt",
+            whipplescript_store::stable_hash_bytes_hex(b"second\n")
+        )));
+        assert_eq!(
+            resources
+                .model_output_provenance(&admitted, &ls)
+                .source_handles,
+            vec!["workspace:test-chat".to_owned()],
+            "a listing witness is consumed only once"
+        );
     }
 
     #[test]
@@ -3995,6 +4212,7 @@ mod tests {
             let resources = super::TurnResources {
                 workspace: &workspace,
                 chat_id: "test-chat",
+                mode: gaugedesk_harness::ChatMode::Use,
                 images: &[],
                 task_filer: None,
                 asked: std::cell::RefCell::new(Vec::new()),
@@ -4306,6 +4524,28 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn organization_request_digest_ignores_json_object_insertion_order() {
+        let mut nested = serde_json::Map::new();
+        nested.insert("b".into(), serde_json::json!(2));
+        nested.insert("a".into(), serde_json::json!(1));
+        let mut body = serde_json::Map::new();
+        body.insert("z".into(), serde_json::Value::Object(nested));
+        body.insert("a".into(), serde_json::json!(0));
+        let request = |body| sansio_types::HttpRequest {
+            url: "https://api.openai.com/v1/responses".into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body,
+            model_provenance: None,
+        };
+        let reversed = request(serde_json::Value::Object(body));
+        let ordered = request(serde_json::json!({"a": 0, "z": {"a": 1, "b": 2}}));
+        assert_eq!(
+            organization_model_request_digest(&reversed).unwrap(),
+            organization_model_request_digest(&ordered).unwrap(),
+        );
     }
 
     #[test]
@@ -4931,6 +5171,17 @@ workflow Method {
             .tools
             .iter()
             .any(|tool| tool.name == "add_todo"));
+        let unavailable = super::ProjectTaskPackage {
+            inner: &first.package,
+            task_filing_admitted: false,
+            recipients: Vec::new(),
+        };
+        assert!(!unavailable
+            .resolve_package(first.package.version_ref())
+            .unwrap()
+            .tools
+            .iter()
+            .any(|tool| tool.name == "add_todo"));
         assert!(!first
             .new_turn_command("question", &[], 1, None)
             .resources
@@ -4958,6 +5209,19 @@ workflow Method {
                 .user
                 .complete
         );
+        let answer_sources = ["question-answer:chat-1:q-1:digest".to_owned()];
+        first.bind_user_context_provenance(Some(&answer_sources));
+        let answered = first.initial_model_provenance(&task_turn, &[]);
+        assert!(answered.user.complete);
+        assert_eq!(answered.user.source_handles[1], answer_sources[0]);
+        first.bind_user_context_provenance(None);
+        assert!(
+            !first
+                .initial_model_provenance(&task_turn, &[])
+                .user
+                .complete
+        );
+        first.bind_user_context_provenance(Some(&[]));
         let mut image_turn = task_turn.clone();
         image_turn.input.images.push(ResourceRef {
             handle: "turn_images".to_owned(),

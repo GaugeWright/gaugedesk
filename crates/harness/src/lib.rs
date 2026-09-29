@@ -292,9 +292,10 @@ pub trait Harness: Send {
     /// command and receipt instead of minting a second effect.
     fn bind_runtime_command_id(&mut self, _command_id: Option<&str>) {}
 
-    /// The shell may prepend answer context to this turn's user text. The
-    /// runtime cannot attest that input as chat-owned when that happens.
-    fn bind_user_context_provenance(&mut self, _complete: bool) {}
+    /// The shell may prepend answer context to this turn's user text. Each
+    /// exact answer needs a source handle for the server's current read check;
+    /// `None` means the shell cannot attest the full added context.
+    fn bind_user_context_provenance(&mut self, _sources: Option<&[String]>) {}
 
     /// Bind the Home's current, authenticated project-task filing operation for
     /// this turn. The adapter never derives tracker authority from a package.

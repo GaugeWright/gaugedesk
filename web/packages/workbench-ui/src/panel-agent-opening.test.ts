@@ -30,7 +30,7 @@ describe("opening a Panel agent", () => {
     it("shows a pinned placement's frozen contract and deploys it", () => {
         const plan = panelAgentSurfacePlan({ version: 3, deployments: [] }, "Customer site");
         expect(plan.scope).toBe("pinned");
-        expect(plan.subtitle).toBe("Customer site · pinned v3");
+        expect(plan.subtitle).toBe("Customer site · version 3");
         expect(plan.contractEditable).toBe(false);
         expect(plan.actions).toEqual(["deploy", "inbox"]);
         expect(plan.deployLabel).toBe("Deploy…");

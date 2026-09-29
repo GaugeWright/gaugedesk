@@ -57,6 +57,14 @@ Given("a block embedded chat sized by the panel min-height token is open", async
     await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
 });
 
+Given("a content-sized embedded chat is open", async ({ page }) => {
+    await page.goto("/embed-example.html?fixture=1&panels=chat&delay=250");
+    await page.locator("gw-chat").evaluate((element) => {
+        element.style.setProperty("--gw-panel-height", "auto");
+    });
+    await expect(page.locator("[data-embed-composer]")).toBeVisible({ timeout: 15_000 });
+});
+
 Given("all embedded panels are open under broad hostile host styles", async ({ page }) => {
     await page.goto("/embed-example.html?fixture=1&panels=chat,viewer,files,chats");
     await page.locator("gw-session").evaluate((session) => {
@@ -325,6 +333,36 @@ Then("the embedded transcript shows {string}", async ({ page }, text: string) =>
     // The optimistic echo lands the instant the turn starts — end-to-end proof that
     // the embedded composer drives the remote Session's send.
     await expect(page.locator("[data-embed-transcript]")).toContainText(text, { timeout: 15_000 });
+});
+
+Then("the embedded agent finishes a reply", async ({ page }) => {
+    // The configured opening line is also an assistant row.
+    await expect(page.locator("[data-embed-transcript] .line.assistant")).toHaveCount(2);
+    await expect(page.getByRole("button", { name: "Stop the running turn" })).toHaveCount(0);
+});
+
+Then("the embedded chat has {int} user-message marks", async ({ page }, count: number) => {
+    await expect(page.locator("gw-chat [data-chat-message-mark]")).toHaveCount(count);
+    const internalOverflow = await page.locator("[data-embed-transcript]").evaluate(
+        (element) => element.scrollHeight - element.clientHeight,
+    );
+    expect(internalOverflow).toBeLessThanOrEqual(1);
+});
+
+When("I hover the first embedded user-message mark", async ({ page }) => {
+    await page.locator("gw-chat [data-chat-message-mark='0']").hover();
+});
+
+Then("the embedded message preview shows {string}", async ({ page }, text: string) => {
+    await expect(page.locator("gw-chat [data-chat-message-preview]")).toContainText(text);
+});
+
+When("I jump to the first embedded user message", async ({ page }) => {
+    await page.locator("gw-chat [data-chat-message-mark='0']").click();
+});
+
+Then("the first embedded user message is in view", async ({ page }) => {
+    await expect(page.locator("[data-embed-transcript] .line.user").first()).toBeInViewport();
 });
 
 Then("the embedded chat is themed by the workbench palette", async ({ page }) => {

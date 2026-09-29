@@ -7,7 +7,7 @@
  * Session-backed composer. The panel shell and transcript are shared either way.
  */
 import {createEffect, createSignal, For, on, onCleanup, Show, type JSX} from "solid-js";
-import type { LiveModelContext } from "@gaugewright/control-plane-client";
+import type { LiveModelContext, MethodInspectionStatus } from "@gaugewright/control-plane-client";
 import { ChatComposer, type ComposerMode } from "./ChatComposer";
 import { createTranscriptScroll } from "./transcript-scroll";
 import { Icon } from "./icons";
@@ -20,6 +20,7 @@ import {
 import { type FilterPrefs } from "./transcript-filter";
 import { type TranscriptLine } from "./transcript";
 import { TranscriptView } from "./TranscriptView";
+import { ChatLogNavigation } from "./ChatLogNavigation";
 import {
     type Session,
     type TurnActivity as Activity,
@@ -108,6 +109,11 @@ export interface ChatPanelProps {
     readonly context?: ContextUsage;
     readonly rawMode?: boolean;
     readonly rawContext?: LiveModelContext;
+    readonly methodInspection?: MethodInspectionStatus;
+    readonly methodInspectionBusy?: boolean;
+    readonly onRequestMethodInspection?: () => void;
+    readonly onRevokeMethodInspection?: () => void;
+    readonly onOpenContextSources?: () => void;
 }
 
 export function SessionComposer(props: {
@@ -307,6 +313,8 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
     // bottom by hand) latches the viewport to the live end, and any manual
     // scroll releases it. One instance here covers every mount of the panel.
     const scroll = createTranscriptScroll();
+    let transcriptElement: HTMLElement | undefined;
+    let transcriptFrame: HTMLDivElement | undefined;
     onCleanup(scroll.dispose);
     createEffect(on(() => session().engagementId(), scroll.reset));
     createEffect(() => scroll.observeLines(lines()));
@@ -324,12 +332,17 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                 </div>
             </Show>
             <div
-                class="transcript"
-                ref={scroll.transcriptRef}
-                data-embed-transcript={props.audience ? "" : undefined}
-                data-pending-send={props.pendingSend}
+                class="transcript-frame"
+                ref={transcriptFrame}
+                classList={{ "has-chat-log-navigation": !props.rawMode && (props.prefs?.messages.user ?? true) && lines().some((line) => line.kind === "user") }}
             >
-                <div class="transcript-body" ref={scroll.bodyRef}>
+                <div
+                    class="transcript"
+                    ref={(element) => { transcriptElement = element; scroll.transcriptRef(element); }}
+                    data-embed-transcript={props.audience ? "" : undefined}
+                    data-pending-send={props.pendingSend}
+                >
+                    <div class="transcript-body" ref={scroll.bodyRef}>
                     <Show when={props.rawMode} fallback={
                         <>
                             <TranscriptView
@@ -349,6 +362,23 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                         <section class="raw-model-context" aria-label="Raw model context">
                             <h2>Raw context</h2>
                             <p class="raw-model-context-note">Live provider requests. This view clears when the turn ends.</p>
+                            <Show when={props.methodInspection?.phase === "init"}>
+                                <button type="button" disabled={props.methodInspectionBusy} onClick={props.onRequestMethodInspection}>
+                                    Request access to this Agent method
+                                </button>
+                            </Show>
+                            <Show when={props.methodInspection?.phase === "requested"}>
+                                <p class="raw-model-context-status">Method access is awaiting its source owner’s approval.</p>
+                            </Show>
+                            <Show when={props.methodInspection?.phase === "granted"}>
+                                <p class="raw-model-context-status">This method version is available to you in Files and Raw context.</p>
+                                <button type="button" disabled={props.methodInspectionBusy} onClick={props.onRevokeMethodInspection}>
+                                    Revoke method access
+                                </button>
+                            </Show>
+                            <Show when={props.methodInspection?.phase === "revoked"}>
+                                <p class="raw-model-context-status">Method access was revoked for this version.</p>
+                            </Show>
                             <Show when={props.rawContext?.available} fallback={
                                 <p class="raw-model-context-status" role="status">
                                     {props.rawContext?.reason ?? "Checking for a live provider request…"}
@@ -359,13 +389,21 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                                 </Show>
                                 <Show when={props.rawContext?.calls?.some((call) => call.redacted)}>
                                     <p class="raw-model-context-status">This view is incomplete because some model input is redacted.</p>
+                                    <Show when={props.onOpenContextSources}>
+                                        <button type="button" onClick={() => props.onOpenContextSources?.()}>
+                                            Review access to attached files
+                                        </button>
+                                    </Show>
                                 </Show>
                                 <For each={props.rawContext?.calls ?? []}>{(call) =>
                                     <article class="raw-model-context-call">
                                         <h3>Model call {call.ordinal + 1}</h3>
-                                        <Show when={!call.redacted} fallback={
+                                        <Show when={call.body !== undefined} fallback={
                                             <p class="raw-model-context-redacted">[Redacted] {call.reason}</p>
                                         }>
+                                            <Show when={call.redacted}>
+                                                <p class="raw-model-context-redacted">[Partially redacted] {call.reason}</p>
+                                            </Show>
                                             <pre>{JSON.stringify(call.body, null, 2)}</pre>
                                         </Show>
                                     </article>
@@ -376,8 +414,17 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                             </Show>
                         </section>
                     </Show>
+                    </div>
+                    <div class="transcript-spacer" ref={scroll.spacerRef} aria-hidden="true" />
                 </div>
-                <div class="transcript-spacer" ref={scroll.spacerRef} aria-hidden="true" />
+                <Show when={!props.rawMode && (props.prefs?.messages.user ?? true)}>
+                    <ChatLogNavigation
+                        lines={lines()}
+                        scroller={() => transcriptElement}
+                        frame={() => transcriptFrame}
+                        onJump={scroll.jumpToUser}
+                    />
+                </Show>
             </div>
             <Show when={scroll.pillVisible()}>
                 <div class="jump-latest-wrap">

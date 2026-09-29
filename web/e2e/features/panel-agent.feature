@@ -1,16 +1,14 @@
 @transport
 Feature: Panel agents belong to the Workshop and deploy through projects
 
-  Scenario: author, preview, place, and reach deployment custody
+  Scenario: author, place, and reach deployment custody
     Given the workbench is open
     When I create a Panel agent named "Public intake"
     Then the Panel agent "Public intake" is in the Workshop
     When I open the Panel agent "Public intake"
     Then the Panel agent is open as the Workshop draft
-    And the preview says it writes no production Inbox data
-    And the preview offers a real disposable Session
-    When I close the opened Panel agent
-    And I open settings for the Panel agent "Public intake"
+    And its settings offer no way to try it
+    When I open settings for the Panel agent "Public intake"
     Then its Panel contract editor is open
     When I close the Agent settings
     And I create a project named "Customer site"

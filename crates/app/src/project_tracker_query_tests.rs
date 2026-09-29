@@ -2,6 +2,49 @@ use super::*;
 use crate::project_tracker::{CompleteTrackerIssue, TrackerAccessDecision, TrackerPermission};
 
 #[test]
+fn signed_out_local_personal_files_unassigned_into_its_only_exposed_tracker() {
+    let root = tempfile::tempdir().unwrap();
+    let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+    let mut wb = shared.lock_unpoisoned();
+    wb.create_default_engagement("local-chat".into(), "Local task".into())
+        .unwrap_or_else(|_| panic!("local chat in Personal"));
+    wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    let context = wb.local_personal_tracker_context(DEFAULT_PROJECT).unwrap();
+    let id = wb
+        .file_agent_project_task(
+            &context,
+            DEFAULT_PROJECT,
+            "local-chat",
+            "local-call-1",
+            "Test",
+            None,
+        )
+        .unwrap();
+    let backlog = wb
+        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tasks")
+        .unwrap();
+    assert_eq!(backlog.issues[0].id, id);
+    assert_eq!(backlog.issues[0].assigned_to, None);
+    assert_eq!(
+        wb.list_project_trackers(&context, DEFAULT_PROJECT)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(wb
+        .read_project_tracker(
+            &context,
+            DEFAULT_PROJECT,
+            "tutorials",
+            TrackerPermission::Read
+        )
+        .is_err());
+    assert!(
+        crate::identity::revalidate_action_context(wb.store_ref(), wb.home_id(), &context).is_err()
+    );
+}
+
+#[test]
 fn agent_task_tool_files_a_real_personal_issue_once_under_current_authority() {
     let (_root, shared, context, _request) = fixture(ECHO);
     let mut wb = shared.lock_unpoisoned();
@@ -48,17 +91,21 @@ fn agent_task_tool_files_a_real_personal_issue_once_under_current_authority() {
         .is_err(),
         "one tool call cannot acquire a different meaning"
     );
-    let tasks = wb
-        .read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tasks")
+    let backlog = wb
+        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tasks")
         .unwrap();
-    assert_eq!(tasks.backlog.issues.len(), 1);
-    assert_eq!(tasks.backlog.issues[0].id, id);
-    assert_eq!(tasks.backlog.issues[0].title, "Test task");
-    assert_eq!(tasks.backlog.issues[0].body, "Verify the app works");
-    assert_eq!(
-        tasks.backlog.issues[0].filed_by.as_deref(),
-        Some(LOCAL_AUTHORITY)
-    );
+    assert_eq!(backlog.issues.len(), 1);
+    assert_eq!(backlog.issues[0].id, id);
+    assert_eq!(backlog.issues[0].title, "Test task");
+    assert_eq!(backlog.issues[0].body, "Verify the app works");
+    assert_eq!(backlog.issues[0].assigned_to, None);
+    assert_eq!(backlog.issues[0].filed_by.as_deref(), Some(LOCAL_AUTHORITY));
+    assert!(wb
+        .read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tasks")
+        .unwrap()
+        .backlog
+        .issues
+        .is_empty());
     let outsider_token = wb
         .mint_account_session("outsider", "passkey", 3600)
         .unwrap();
@@ -93,13 +140,13 @@ fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
     // Native/imported work deliberately mixes assignments and statuses. These
     // fixture writes are not an alternate product assignment path.
     for (queue, title, assigned_to, status) in [
-        ("tutorials", "shared", None, "open"),
-        ("tutorials", "reader task", Some("reader"), "open"),
-        ("tutorials", "agent task", Some("agent:helper"), "open"),
-        ("tutorials", "started", Some(LOCAL_AUTHORITY), "in_progress"),
-        ("tutorials", "closed", Some(LOCAL_AUTHORITY), "closed"),
-        ("tutorials", "canceled", Some(LOCAL_AUTHORITY), "canceled"),
-        ("tutorials", "archived", Some(LOCAL_AUTHORITY), "archived"),
+        ("tasks", "shared", None, "open"),
+        ("tasks", "reader task", Some("reader"), "open"),
+        ("tasks", "agent task", Some("agent:helper"), "open"),
+        ("tasks", "started", Some(LOCAL_AUTHORITY), "in_progress"),
+        ("tasks", "closed", Some(LOCAL_AUTHORITY), "closed"),
+        ("tasks", "canceled", Some(LOCAL_AUTHORITY), "canceled"),
+        ("tasks", "archived", Some(LOCAL_AUTHORITY), "archived"),
         ("private", "other queue", Some(LOCAL_AUTHORITY), "open"),
     ] {
         let item = native
@@ -128,7 +175,7 @@ fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
         .unwrap();
     let before = native.runtime.items.export_events().unwrap();
     let own = wb
-        .read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tasks")
         .unwrap();
     assert_eq!(own.actor, LOCAL_AUTHORITY);
     assert_eq!(own.backlog.issues.len(), 2);
@@ -148,13 +195,13 @@ fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
         .any(|issue| issue.title == "started"));
     // Having an assignment (and even being an admin) cannot grant a read.
     assert!(wb
-        .read_project_tracker_tasks(&reader, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_tasks(&reader, DEFAULT_PROJECT, "tasks")
         .is_err());
     let grant = wb
         .request_project_tracker_access(
             &context,
             DEFAULT_PROJECT,
-            "tutorials",
+            "tasks",
             "reader-tasks-access",
             "reader",
             TrackerPermission::Read,
@@ -163,14 +210,14 @@ fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
     wb.decide_project_tracker_access(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "approve-reader-tasks",
         &grant.id,
         TrackerAccessDecision::Approve,
     )
     .unwrap();
     let theirs = wb
-        .read_project_tracker_tasks(&reader, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_tasks(&reader, DEFAULT_PROJECT, "tasks")
         .unwrap();
     assert_eq!(theirs.actor, "reader");
     assert_eq!(theirs.backlog.issues.len(), 1);
@@ -184,7 +231,7 @@ fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
         .assign_item(&request.item_id, Some("reader"))
         .unwrap();
     assert_eq!(
-        wb.read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tutorials")
+        wb.read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tasks")
             .unwrap()
             .backlog
             .issues
@@ -192,7 +239,7 @@ fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
         1
     );
     assert_eq!(
-        wb.read_project_tracker_tasks(&reader, DEFAULT_PROJECT, "tutorials")
+        wb.read_project_tracker_tasks(&reader, DEFAULT_PROJECT, "tasks")
             .unwrap()
             .backlog
             .issues
@@ -202,18 +249,18 @@ fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
     wb.decide_project_tracker_access(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "revoke-reader-tasks",
         &grant.id,
         TrackerAccessDecision::Revoke,
     )
     .unwrap();
     assert!(wb
-        .read_project_tracker_tasks(&reader, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_tasks(&reader, DEFAULT_PROJECT, "tasks")
         .is_err());
     // The ordinary backlog still carries every issue in this readable queue.
     assert_eq!(
-        wb.read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tutorials")
+        wb.read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tasks")
             .unwrap()
             .issues
             .len(),
@@ -236,7 +283,7 @@ fn backlog_keeps_unassigned_other_people_and_completed_work_with_native_identity
             .runtime
             .items
             .file_item(
-                "tutorials",
+                "tasks",
                 title,
                 "Task details",
                 &[],
@@ -262,10 +309,10 @@ fn backlog_keeps_unassigned_other_people_and_completed_work_with_native_identity
     let before = native.runtime.items.export_events().unwrap();
     let discovered = wb.list_project_trackers(&context, DEFAULT_PROJECT).unwrap();
     assert_eq!(discovered.len(), 1);
-    assert_eq!(discovered[0].queue, "tutorials");
+    assert_eq!(discovered[0].queue, "tasks");
     assert!(discovered[0].can_complete);
     let backlog = wb
-        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tasks")
         .unwrap();
     assert_eq!(backlog.issues.len(), 4);
     assert!(backlog.issues.iter().any(|item| item.assigned_to.is_none()));
@@ -316,7 +363,7 @@ fn backlog_keeps_unassigned_other_people_and_completed_work_with_native_identity
     wb.complete_project_tracker_issue(&context, &close, LIMITS)
         .unwrap();
     let backlog = wb
-        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tasks")
         .unwrap();
     assert_eq!(backlog.issues.len(), 4);
     assert_eq!(
@@ -342,13 +389,13 @@ fn discovery_and_backlog_require_current_read_grant_not_administrator_membership
         .unwrap()
         .is_empty());
     assert!(wb
-        .read_project_tracker_backlog(&reader, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_backlog(&reader, DEFAULT_PROJECT, "tasks")
         .is_err());
     let grant = wb
         .request_project_tracker_access(
             &context,
             DEFAULT_PROJECT,
-            "tutorials",
+            "tasks",
             "reader-access",
             "reader",
             TrackerPermission::Read,
@@ -357,7 +404,7 @@ fn discovery_and_backlog_require_current_read_grant_not_administrator_membership
     wb.decide_project_tracker_access(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "approve-reader",
         &grant.id,
         TrackerAccessDecision::Approve,
@@ -367,7 +414,7 @@ fn discovery_and_backlog_require_current_read_grant_not_administrator_membership
     assert_eq!(directory.len(), 1);
     assert!(!directory[0].can_complete);
     let backlog = wb
-        .read_project_tracker_backlog(&reader, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_backlog(&reader, DEFAULT_PROJECT, "tasks")
         .unwrap();
     assert_eq!(backlog.issues.len(), 1);
     assert!(!backlog.tracker.can_complete);
@@ -377,7 +424,7 @@ fn discovery_and_backlog_require_current_read_grant_not_administrator_membership
     wb.decide_project_tracker_access(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "revoke-reader",
         &grant.id,
         TrackerAccessDecision::Revoke,
@@ -388,7 +435,7 @@ fn discovery_and_backlog_require_current_read_grant_not_administrator_membership
         .unwrap()
         .is_empty());
     assert!(wb
-        .read_project_tracker_backlog(&reader, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_backlog(&reader, DEFAULT_PROJECT, "tasks")
         .is_err());
 }
 
@@ -416,12 +463,12 @@ fn unavailable_backlog_never_becomes_empty_or_recreates_native_authority() {
             _ => unreachable!(),
         }
         assert!(
-            wb.read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tutorials")
+            wb.read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tasks")
                 .is_err(),
             "{fault}"
         );
         assert!(
-            wb.read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tutorials")
+            wb.read_project_tracker_tasks(&context, DEFAULT_PROJECT, "tasks")
                 .is_err(),
             "{fault}"
         );
@@ -480,7 +527,7 @@ fn backlog_remains_readable_during_pending_handoff_but_completion_is_unavailable
     let directory = wb.list_project_trackers(&context, DEFAULT_PROJECT).unwrap();
     assert!(!directory[0].can_complete);
     let backlog = wb
-        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tutorials")
+        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, "tasks")
         .unwrap();
     assert_eq!(backlog.issues.len(), 1);
     assert!(!backlog.tracker.can_complete);

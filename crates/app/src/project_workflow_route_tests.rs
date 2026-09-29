@@ -92,7 +92,7 @@ async fn a_launch_over_http_is_driven_by_the_home() {
             .declare_project_tracker(
                 &context,
                 DEFAULT_PROJECT,
-                "tutorials",
+                "tasks",
                 "declare",
                 ResourceAttributes::default(),
             )
@@ -173,7 +173,7 @@ async fn a_launch_over_http_is_driven_by_the_home() {
         let items = stores(&shared.lock_unpoisoned(), &invocation)
             .runtime
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .unwrap();
         assert_eq!(items.len(), 1, "hosted={hosted}");
         assert_eq!(items[0].title, "Create a chat in Personal");

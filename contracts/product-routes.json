@@ -10168,6 +10168,20 @@
     },
     {
       "method": "GET",
+      "path": "/account/tenants/{id}/shared-project",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "PUT",
+      "path": "/account/tenants/{id}/shared-project/host",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "GET",
       "path": "/account/tenants/{tenant}/project-share-candidates",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
@@ -10258,8 +10272,85 @@
       "expires": "2026-10-31"
     },
     {
+      "method": "GET",
+      "path": "/chats/{id}/contexts/{rid}/inspection",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/chats/{id}/contexts/{rid}/inspection/{reader}/approve",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/chats/{id}/contexts/{rid}/inspection/{reader}/revoke",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/chats/{id}/contexts/{rid}/inspection/request",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "GET",
+      "path": "/chats/{id}/contexts/{rid}/inspection/requests",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/chats/{id}/contexts/{rid}/inspection/revoke",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
       "method": "POST",
       "path": "/chats/{id}/files/command",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "GET",
+      "path": "/chats/{id}/method-inspection",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/chats/{id}/method-inspection/{reader}/approve",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/chats/{id}/method-inspection/{reader}/revoke",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/chats/{id}/method-inspection/request",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/chats/{id}/method-inspection/revoke",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"
@@ -10274,6 +10365,13 @@
     {
       "method": "POST",
       "path": "/gaugeapps/administration/enterprise-identity/credential",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/organizations/{tenant}/shared-project/materialize",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

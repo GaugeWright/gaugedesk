@@ -3,12 +3,14 @@
 //! This is an internal admission seam, not an HTTP route. Its caller must
 //! authenticate the manager, derive the binding and request key from the
 //! selected owner, and provide the current authorization check. The candidate
-//! and its random Azure metadata marker commit in one Store transaction before
-//! any Key Vault `set`. A replay can only reconcile the original attempt; it
+//! its random Azure object name and metadata marker commit in one Store
+//! transaction before any Key Vault `set`. A replay can only reconcile the original attempt; it
 //! must never issue another `set` under the same marker.
 
 use gaugedesk_core::gaugevault::{self, Binding, Capability, Command, Operation};
-use gaugedesk_core::ids::{VaultCandidateId, VaultIntakeMarkerId, VaultSubjectId};
+use gaugedesk_core::ids::{
+    VaultCandidateId, VaultIntakeMarkerId, VaultStorageNameId, VaultSubjectId,
+};
 use gaugedesk_core::Rejection;
 use gaugedesk_store::{AdmitError, Store};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -28,8 +30,14 @@ pub struct BeginCandidateRequest {
 /// outcome or a replay must query version metadata and settle that candidate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BeginCandidateAdmission {
-    NewlyCommitted { marker: VaultIntakeMarkerId },
-    ReconcileOnly { marker: VaultIntakeMarkerId },
+    NewlyCommitted {
+        marker: VaultIntakeMarkerId,
+        storage_name: VaultStorageNameId,
+    },
+    ReconcileOnly {
+        marker: VaultIntakeMarkerId,
+        storage_name: VaultStorageNameId,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -92,12 +100,18 @@ pub fn admit_candidate_begin(
                 .ok_or(Rejection {
                     reason: "GaugeVault: invalid intake deadline",
                 })?;
-            let mut bytes = [0u8; 16];
-            SystemRandom::new()
-                .fill(&mut bytes)
-                .map_err(|_| Rejection {
-                    reason: "GaugeVault: marker randomness unavailable",
-                })?;
+            let prefix = state.tenant_prefix.as_ref().ok_or(Rejection {
+                reason: "GaugeVault: owner namespace unavailable",
+            })?;
+            let mut marker_bytes = [0u8; 16];
+            let mut name_bytes = [0u8; 16];
+            let rng = SystemRandom::new();
+            rng.fill(&mut marker_bytes).map_err(|_| Rejection {
+                reason: "GaugeVault: intake randomness unavailable",
+            })?;
+            rng.fill(&mut name_bytes).map_err(|_| Rejection {
+                reason: "GaugeVault: intake randomness unavailable",
+            })?;
             Ok(Command {
                 binding: request.binding.clone(),
                 capability: Capability::Manage,
@@ -105,7 +119,12 @@ pub fn admit_candidate_begin(
                 now: request.now,
                 operation: Operation::BeginCandidate {
                     id: request.candidate.clone(),
-                    marker: VaultIntakeMarkerId::from(hex::encode(bytes)),
+                    marker: VaultIntakeMarkerId::from(hex::encode(marker_bytes)),
+                    storage_name: VaultStorageNameId::from(format!(
+                        "gv-{}-{}",
+                        prefix.as_str(),
+                        hex::encode(name_bytes)
+                    )),
                     deadline,
                 },
             })
@@ -117,10 +136,22 @@ pub fn admit_candidate_begin(
         .get(&request.candidate)
         .cloned()
         .ok_or_else(|| AdmitError::Codec("GaugeVault intake receipt has no marker".into()))?;
+    let storage_name = admission
+        .state
+        .candidate_storage_names
+        .get(&request.candidate)
+        .cloned()
+        .ok_or_else(|| AdmitError::Codec("GaugeVault intake receipt has no storage name".into()))?;
     Ok(if admission.replayed {
-        BeginCandidateAdmission::ReconcileOnly { marker }
+        BeginCandidateAdmission::ReconcileOnly {
+            marker,
+            storage_name,
+        }
     } else {
-        BeginCandidateAdmission::NewlyCommitted { marker }
+        BeginCandidateAdmission::NewlyCommitted {
+            marker,
+            storage_name,
+        }
     })
 }
 
@@ -128,7 +159,7 @@ pub fn admit_candidate_begin(
 mod tests {
     use super::*;
     use gaugedesk_core::gaugevault::Status;
-    use gaugedesk_core::ids::{AuthorityId, ScopeId, SecretHandleId, VaultCredentialId};
+    use gaugedesk_core::ids::{AuthorityId, ScopeId, VaultCredentialId, VaultTenantPrefixId};
 
     fn binding() -> Binding {
         Binding {
@@ -165,7 +196,7 @@ mod tests {
                     expected_revision: 0,
                     now: 1,
                     operation: Operation::Create {
-                        storage_name: SecretHandleId::from("opaque-azure-name"),
+                        tenant_prefix: VaultTenantPrefixId::from("1".repeat(32)),
                     },
                 },
             )
@@ -182,11 +213,18 @@ mod tests {
         assert_eq!(denied_state.revision, 1);
         assert!(denied_state.intake_markers.is_empty());
         let first = admit_candidate_begin(&mut store, &request(2), 600, |_| Ok(())).unwrap();
-        let BeginCandidateAdmission::NewlyCommitted { marker } = first else {
+        let BeginCandidateAdmission::NewlyCommitted {
+            marker,
+            storage_name,
+        } = first
+        else {
             panic!("first admit did not open one backing write");
         };
         assert_eq!(marker.as_str().len(), 32);
         assert!(marker.as_str().bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(storage_name
+            .as_str()
+            .starts_with(&format!("gv-{}-", "1".repeat(32))));
         drop(store);
 
         let mut store = Store::open(path.to_str().unwrap()).unwrap();
@@ -196,7 +234,8 @@ mod tests {
         assert_eq!(
             replay,
             BeginCandidateAdmission::ReconcileOnly {
-                marker: marker.clone()
+                marker: marker.clone(),
+                storage_name: storage_name.clone(),
             }
         );
         let state = store.fold::<gaugevault::State>(&scope).unwrap();
@@ -205,6 +244,10 @@ mod tests {
         assert_eq!(
             state.intake_markers[&VaultCandidateId::from("candidate-one")],
             marker
+        );
+        assert_eq!(
+            state.candidate_storage_names[&VaultCandidateId::from("candidate-one")],
+            storage_name
         );
 
         let changed = BeginCandidateRequest {

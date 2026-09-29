@@ -453,6 +453,8 @@ function PeoplePage(props: {
     readonly page: AdministrationGaugeAppPage<"people">;
     readonly commands: readonly string[];
     readonly onSubmit: SubmitPageCommand;
+    readonly projectFocus?: string | null;
+    readonly onClearProjectFocus?: () => void;
 }): JSX.Element {
     const model = () => props.page.model;
     const members = () => model().members;
@@ -492,6 +494,15 @@ function PeoplePage(props: {
         const project = projects().find((candidate) => candidate.id === id);
         return project ? project.name : id;
     };
+    const focusedProject = createMemo(() => projects().find((project) => project.id === props.projectFocus));
+    const projectMembers = createMemo(() => {
+        const project = focusedProject();
+        if (!project) return [];
+        return members().filter((member) => member.status === "active").map((member) => ({
+            member,
+            explicit: grants().some((grant) => grant.project_id === project.id && grant.authority === member.authority),
+        }));
+    });
     const selectedGrants = createMemo(() => {
         const member = selected();
         if (!member) return [];
@@ -544,6 +555,16 @@ function PeoplePage(props: {
         </div>
     </Show>;
     return <>
+        <Show when={focusedProject()}>{(project) => <section class="gaugeapp-panel gaugeapp-section-stack">
+            <div class="gaugeapp-section-head"><div><span class="gaugeapp-eyebrow">Project access</span><h2>{project().name}</h2><p>Organization roles and explicit grants are shown separately.</p></div><button type="button" onClick={props.onClearProjectFocus}>All people</button></div>
+            <div class="gaugeapp-people-list"><For each={projectMembers()}>{({ member, explicit }) => <div class="gaugeapp-person-row">
+                <div class="gaugeapp-person-identity"><strong>{memberName(member)}</strong><span>{member.role}</span></div>
+                <span class="gaugeapp-person-role">{["owner", "admin"].includes(member.role) ? "Organization role" : explicit ? "Explicit grant" : "No explicit grant"}</span>
+                <div class="gaugeapp-row-actions"><Show when={!project().is_personal && !["owner", "admin"].includes(member.role)}>
+                    <CommandButton command={explicit ? "project-access.revoke" : "project-access.grant"} commands={props.commands} label={explicit ? "Revoke" : "Grant"} danger={explicit} payload={{ authority: member.authority, project_id: project().id }} onSubmit={props.onSubmit} />
+                </Show></div>
+            </div>}</For></div>
+        </section>}</Show>
         <Notice tone="neutral">{props.page.model.members.some((member: { readonly managed_by_scim: boolean }) => member.managed_by_scim)
             ? "People managed by your identity provider are configured in Enterprise Identity."
             : "Direct invitations and fixed roles are included. Identity-provider-managed membership requires Enterprise controls."}</Notice>
@@ -883,7 +904,7 @@ function OrganizationPageReady(props: {
     </>;
 }
 
-function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppSession; commands: readonly string[]; onSubmit: SubmitPageCommand; api: EnterpriseControlPlane; onRefresh: () => Promise<void>; onOpenProject?: (project: { readonly id: string; readonly name: string }) => void; onOpenGaugeApp?: (app: GaugeAppKind, page: string) => void }): JSX.Element {
+function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppSession; commands: readonly string[]; onSubmit: SubmitPageCommand; api: EnterpriseControlPlane; onRefresh: () => Promise<void>; onOpenProject?: (project: { readonly id: string; readonly name: string }) => void; onOpenGaugeApp?: (app: GaugeAppKind, page: string) => void; projectFocus?: string | null; onOpenProjectAccess?: (projectId: string) => void; onClearProjectFocus?: () => void }): JSX.Element {
     const typedPage = createMemo(() => parseAdministrationGaugeAppPage(props.page));
     const page = () => typedPage().id;
     const organization = () => { const value = typedPage(); return value.id === "organization" ? value : undefined; };
@@ -913,7 +934,7 @@ function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppS
 
         <Show when={billing()}>{(value) => <BillingPage model={value().model} commands={props.commands} onSubmit={props.onSubmit} />}</Show>
 
-        <Show when={people()}>{(value) => <PeoplePage page={value()} commands={props.commands} onSubmit={props.onSubmit} />}</Show>
+        <Show when={people()}>{(value) => <PeoplePage page={value()} commands={props.commands} onSubmit={props.onSubmit} projectFocus={props.projectFocus} onClearProjectFocus={props.onClearProjectFocus} />}</Show>
 
         <Show when={sessions()}>{(value) => <SessionsPage page={value()} commands={props.commands} onSubmit={props.onSubmit} />}</Show>
 
@@ -924,6 +945,10 @@ function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppS
             commands={props.commands}
             onSubmit={props.onSubmit}
             onOpenProject={props.onOpenProject}
+            onOpenAccess={props.onOpenProjectAccess}
+            onOpenPage={props.onOpenGaugeApp
+                ? (page) => props.onOpenGaugeApp?.("administration", page)
+                : undefined}
         />}</Show>
 
         <Show when={providers()}>{(value) => <ModelProvidersPage {...props} page={value()} />}</Show>
@@ -943,6 +968,8 @@ function ProjectsPage(props: {
     readonly commands: readonly string[];
     readonly onSubmit: SubmitPageCommand;
     readonly onOpenProject?: (project: { readonly id: string; readonly name: string }) => void;
+    readonly onOpenAccess?: (projectId: string) => void;
+    readonly onOpenPage?: (page: "people" | "organization-policy") => void;
 }): JSX.Element {
     const model = () => props.page.model;
     const [creating, setCreating] = createSignal(false);
@@ -961,7 +988,7 @@ function ProjectsPage(props: {
         await props.onSubmit("project.create", { name: value });
     };
     return <section class="gaugeapp-panel gaugeapp-section-stack">
-        <Notice tone="neutral">Administration discovers and inspects the projects this organization governs. Every change still resolves to the project’s authoritative Home; this page does not become a second project authority.</Notice>
+        <Notice tone="neutral">Organization-wide project governance. Project-specific changes resolve to each project's authoritative Home.</Notice>
         <div class="gaugeapp-section-head">
             <div>
                 <h2>Projects <small>{model().projects.length}</small></h2>
@@ -1016,7 +1043,9 @@ function ProjectsPage(props: {
             </div>
             <div class="gaugeapp-project-detail-foot">
                 <span>{project().freshness === "home-live" ? "Live from the Project Host" : "Project Host data is not current"}</span>
-                <Show when={props.onOpenProject}><button type="button" class="primary" onClick={() => props.onOpenProject?.({ id: project().id, name: project().name })}>Open</button></Show>
+                <Show when={props.onOpenAccess && !project().is_personal}><button type="button" onClick={() => props.onOpenAccess?.(project().id)}>Manage access</button></Show>
+                <Show when={props.onOpenPage}><button type="button" onClick={() => props.onOpenPage?.("organization-policy")}>Organization policy</button></Show>
+                <Show when={props.onOpenProject}><button type="button" class="primary" onClick={() => props.onOpenProject?.({ id: project().id, name: project().name })}>Project settings</button></Show>
             </div>
         </div>}</Show>
     </section>;
@@ -3386,10 +3415,13 @@ function GaugeAppPage(props: {
     openExternal?: (url: string) => Promise<boolean>;
     onOpenProject?: (project: { readonly id: string; readonly name: string }) => void;
     onOpenGaugeApp?: (app: GaugeAppKind, page: string) => void;
+    projectFocus?: string | null;
+    onOpenProjectAccess?: (projectId: string) => void;
+    onClearProjectFocus?: () => void;
 }): JSX.Element {
     if (props.app === "account-settings") return <AccountPage page={props.page} commands={props.commands} onSubmit={props.onSubmit} onSubmitSecret={props.onSubmitSecret} api={props.api} onRefresh={props.onRefresh} deviceLinkInvitation={props.deviceLinkInvitation} onDeviceLinkClaimed={props.onDeviceLinkClaimed} organizationInvitation={props.organizationInvitation} onOrganizationInvitationResponded={props.onOrganizationInvitationResponded} openExternal={props.openExternal} />;
     if (props.app === "commercial-operations") return <CommercialPage page={props.page} commands={props.commands} onSubmit={props.onSubmit} />;
-    return <AdministrationPage page={props.page} session={props.session} commands={props.commands} onSubmit={props.onSubmit} api={props.api} onRefresh={props.onRefresh} onOpenProject={props.onOpenProject} onOpenGaugeApp={props.onOpenGaugeApp} />;
+    return <AdministrationPage page={props.page} session={props.session} commands={props.commands} onSubmit={props.onSubmit} api={props.api} onRefresh={props.onRefresh} onOpenProject={props.onOpenProject} onOpenGaugeApp={props.onOpenGaugeApp} projectFocus={props.projectFocus} onOpenProjectAccess={props.onOpenProjectAccess} onClearProjectFocus={props.onClearProjectFocus} />;
 }
 
 function ProposalList(props: {
@@ -3471,6 +3503,14 @@ export function createGaugeAppWorkspace(options: {
     updateRetryMs?: number;
 }): GaugeAppWorkspaceController {
     const [selectedPage, setSelectedPage] = createSignal("");
+    const [projectFocus, setProjectFocus] = createSignal<string | null>(null);
+    let projectFocusScope: string | undefined;
+    createEffect(() => {
+        const scope = options.scope();
+        const key = scope ? `${scope.kind}:${scope.id}` : "";
+        if (projectFocusScope !== undefined && projectFocusScope !== key) setProjectFocus(null);
+        projectFocusScope = key;
+    });
     const [statusResult, setStatusResult] = createSignal<{ owner: GaugeAppOperation; value: string }>();
     const [transientResult, setTransientResult] = createSignal<{ owner: GaugeAppOperation; value: unknown }>();
     const status = () => { const result = statusResult(); return result?.owner.current() ? result.value : ""; };
@@ -4079,6 +4119,9 @@ export function createGaugeAppWorkspace(options: {
                         openExternal={options.openExternal}
                         onOpenProject={options.onOpenProject}
                         onOpenGaugeApp={options.onOpenGaugeApp}
+                        projectFocus={projectFocus()}
+                        onOpenProjectAccess={(projectId) => { setProjectFocus(projectId); openPage("people"); }}
+                        onClearProjectFocus={() => setProjectFocus(null)}
                     />
                     <ProposalList
                         proposals={proposals() ?? []}

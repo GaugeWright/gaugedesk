@@ -2080,15 +2080,19 @@ impl Engagement {
     }
 
     pub fn read_file(&self, relative: &str) -> Result<String> {
+        use std::io::Read;
         self.ensure_selected_path(relative)?;
-        std::fs::read_to_string(safe_path(&self.path, relative)?).map_err(WorkspaceError::io)
+        let mut file = safe_read_file(&self.path, relative)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .map_err(WorkspaceError::io)?;
+        Ok(content)
     }
 
     pub fn read_file_capped(&self, relative: &str, max_bytes: usize) -> Result<Option<String>> {
         use std::io::Read;
         self.ensure_selected_path(relative)?;
-        let file =
-            std::fs::File::open(safe_path(&self.path, relative)?).map_err(WorkspaceError::io)?;
+        let file = safe_read_file(&self.path, relative)?;
         let mut bytes = Vec::new();
         file.take(max_bytes as u64)
             .read_to_end(&mut bytes)
@@ -3737,8 +3741,11 @@ impl ChatWorkspace for Engagement {
         self.read_file_capped(relative, max_bytes)
     }
     fn read_file_bytes_capped(&self, relative: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+        use std::io::Read;
         self.ensure_selected_path(relative)?;
-        let bytes = std::fs::read(safe_path(&self.path, relative)?).map_err(WorkspaceError::io)?;
+        let mut file = safe_read_file(&self.path, relative)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(WorkspaceError::io)?;
         Ok((bytes.len() <= max_bytes).then_some(bytes))
     }
     fn recorded_file_cut(&self, relative: &str, served: &[u8]) -> Result<Option<String>> {
@@ -3903,6 +3910,45 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
         )));
     }
     Ok(root.join(path))
+}
+
+/// A read must not follow a workspace symlink into a mounted Agent method or
+/// outside the selected file tree. File-manager writes already make this check.
+fn safe_read_path(root: &Path, relative: &str) -> Result<PathBuf> {
+    let path = safe_path(root, relative)?;
+    let mut cursor = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        cursor.push(component);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(WorkspaceError::msg("file reads cannot follow symlinks"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorkspaceError::io(error)),
+        }
+    }
+    Ok(path)
+}
+
+/// Keep the opened inode bound to the path that passed the symlink check.
+/// A workspace writer may replace an entry between checking and opening it.
+fn safe_read_file(root: &Path, relative: &str) -> Result<std::fs::File> {
+    let path = safe_read_path(root, relative)?;
+    let file = std::fs::File::open(&path).map_err(WorkspaceError::io)?;
+    safe_read_path(root, relative)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata().map_err(WorkspaceError::io)?;
+        let current = std::fs::symlink_metadata(&path).map_err(WorkspaceError::io)?;
+        if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+            return Err(WorkspaceError::msg(
+                "file changed during read authorization",
+            ));
+        }
+    }
+    Ok(file)
 }
 
 fn safe_manage_path(root: &Path, relative: &str) -> Result<PathBuf> {

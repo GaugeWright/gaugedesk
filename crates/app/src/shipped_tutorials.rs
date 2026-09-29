@@ -44,6 +44,12 @@ pub fn tutorial_target_id(learner: &str) -> String {
     format!("target-{}", tutorial_project_id(learner))
 }
 
+/// New runs read this Home-owned release source. The original learner-owned
+/// target remains available to runs admitted before the `tasks` migration.
+pub fn tutorial_tasks_source_id(learner: &str) -> String {
+    format!("{}-tasks-source", tutorial_target_id(learner))
+}
+
 pub fn is_tutorial_project(project: &ProjectRecord) -> bool {
     project
         .extra
@@ -202,6 +208,57 @@ impl Workbench {
             .seed_main_exactly(SHIPPED, "whip")
             .map_err(|e| e.to_string())?
             .0;
+        let tasks_source_id = tutorial_tasks_source_id(learner);
+        if !self.targets.contains_key(&tasks_source_id) {
+            let workspace = self
+                .workspace_provider(&tasks_source_id)
+                .init_at(&self.targets_dir().join(&tasks_source_id))
+                .map_err(|e| e.to_string())?;
+            self.targets.insert(tasks_source_id.clone(), workspace);
+        }
+        let tasks_before = self.targets[&tasks_source_id]
+            .current_main_cut()
+            .map_err(|e| e.to_string())?;
+        let tasks_head = self.targets[&tasks_source_id]
+            .seed_main_exactly(SHIPPED, "whip")
+            .map_err(|e| e.to_string())?
+            .0;
+        let tasks_current = self
+            .library
+            .work_targets
+            .get(&tasks_source_id)
+            .is_some_and(|target| {
+                target.current_basis.as_deref() == Some(tasks_head.as_str())
+                    && target.owner
+                        == WorkTargetOwner::Project {
+                            project_id: project_id.clone(),
+                        }
+                    && target.authority == self.home_id().as_str()
+                    && target.parties == vec![self.home_id().as_str().to_owned()]
+                    && target.capabilities.read
+                    && !target.capabilities.propose
+                    && !target.capabilities.apply
+            })
+            && tasks_before.as_deref() == Some(tasks_head.as_str());
+        if !tasks_current {
+            let mut record = crate::library_state::managed_target_record(
+                tasks_source_id,
+                "Tutorials release source".into(),
+                WorkTargetOwner::Project {
+                    project_id: project_id.clone(),
+                },
+                self.home_id(),
+                tasks_head.clone(),
+            );
+            record.capabilities = TargetCapabilities {
+                read: true,
+                propose: false,
+                apply: false,
+                publish: false,
+                release: false,
+            };
+            self.write_work_target_record(record);
+        }
         let current = self
             .library
             .work_targets
@@ -218,8 +275,8 @@ impl Workbench {
                     && !target.capabilities.apply
             })
             && before.as_deref() == Some(head.as_str());
-        if current {
-            return Ok(ShippedTutorials::Current(head));
+        if current && tasks_current {
+            return Ok(ShippedTutorials::Current(tasks_head));
         }
         let mut record = crate::library_state::managed_target_record(
             target_id.clone(),
@@ -252,7 +309,7 @@ impl Workbench {
                 .map_err(|e| e.to_string())?,
             )
             .map_err(|e| format!("{e:?}"))?;
-        Ok(ShippedTutorials::Updated(head))
+        Ok(ShippedTutorials::Updated(tasks_head))
     }
 }
 
@@ -297,7 +354,7 @@ impl Workbench {
         }
         let target = self
             .targets
-            .get(&tutorial_target_id(actor))
+            .get(&tutorial_tasks_source_id(actor))
             .ok_or("Tutorials source is unavailable")?;
         let source = target
             .read_main_file(&file)
@@ -307,8 +364,20 @@ impl Workbench {
         let legacy = self.project_workflow_launched(DEFAULT_PROJECT, actor, &request_id)?;
         let launched = legacy || self.project_workflow_launched(&project, actor, &request_id)?;
         let run_project = if legacy { DEFAULT_PROJECT } else { &project };
+        let queue = if legacy
+            || (launched
+                && self.project_workflow_uses_tracker(
+                    run_project,
+                    actor,
+                    &request_id,
+                    "tutorials",
+                )?) {
+            "tutorials"
+        } else {
+            "tasks"
+        };
         let open_tasks = if launched {
-            self.read_project_tracker_tasks(context, run_project, "tutorials")
+            self.read_project_tracker_tasks(context, run_project, queue)
                 .map(|tasks| tasks.backlog.issues.len())
                 .unwrap_or(0)
         } else {
@@ -317,7 +386,7 @@ impl Workbench {
         let completed = launched
             && open_tasks == 0
             && self
-                .read_project_tracker_backlog(context, run_project, "tutorials")
+                .read_project_tracker_backlog(context, run_project, queue)
                 .is_ok_and(|backlog| {
                     !backlog.issues.is_empty()
                         && backlog.issues.iter().all(|issue| issue.status == "closed")
@@ -359,29 +428,12 @@ impl Workbench {
             ShippedTutorials::NoOwner => return Err("this Home has no owner yet".into()),
             ShippedTutorials::Current(cut) | ShippedTutorials::Updated(cut) => cut,
         };
-        if self
-            .prepare_project_tracker_read(
-                context,
-                &project,
-                "tutorials",
-                crate::project_tracker::TrackerPermission::Contribute,
-            )
-            .is_err()
-        {
-            self.declare_project_tracker(
-                context,
-                &project,
-                "tutorials",
-                "shipped-tutorials",
-                gaugedesk_core::abac::ResourceAttributes::default(),
-            )
-            .map_err(|e| format!("{e:?}"))?;
-        }
+        self.ensure_project_tasks_tracker(&project)?;
         self.launch_project_workflow(
             context,
             &ProjectWorkflowLaunch {
                 project,
-                target: tutorial_target_id(&actor),
+                target: tutorial_tasks_source_id(&actor),
                 path: file,
                 cut,
                 request_id,

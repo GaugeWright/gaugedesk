@@ -35,6 +35,48 @@ export interface MenuState {
     readonly items: MenuItem[];
 }
 
+/**
+ * Swallows the rest of the press that opened a menu.
+ *
+ * WebKit on macOS — the desktop app's webview — reports a Control-click as
+ * `contextmenu` and then, from the same press, an ordinary primary `click`.
+ * Chromium sends no such click, and no engine sends one for a secondary-button
+ * press. Left alone, that click activates whatever the menu was opened on (a nav
+ * chat row opens its chat and moves the cursor to the composer) and reaches the
+ * menu's own outside-click dismissal, closing the menu as it opens.
+ *
+ * `arm` marks a menu as just opened. Until the next press begins, a pointer click
+ * is the tail of the opening press, and it is cancelled in the capture phase,
+ * before Solid's delegated handlers or any document listener can see it. A click
+ * from the keyboard or a script counts no presses (`detail` 0) and always passes,
+ * so a key never has to disarm the guard: a keystroke landing between the
+ * `contextmenu` and its trailing click would otherwise let that click through.
+ */
+export function openingPressGuard(target: EventTarget): { arm: () => void; dispose: () => void } {
+    let armed = false;
+    const settle = () => {
+        armed = false;
+    };
+    const swallow = (event: Event) => {
+        if (!armed || !((event as MouseEvent).detail > 0)) return;
+        armed = false;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+    };
+    const capture = { capture: true };
+    target.addEventListener("pointerdown", settle, capture);
+    target.addEventListener("click", swallow, capture);
+    return {
+        arm: () => {
+            armed = true;
+        },
+        dispose: () => {
+            target.removeEventListener("pointerdown", settle, capture);
+            target.removeEventListener("click", swallow, capture);
+        },
+    };
+}
+
 export function ContextMenu(props: { menu: MenuState | null; onClose: () => void }) {
     const [confirming, setConfirming] = createSignal<number | null>(null);
     // The on-screen position. We open at the cursor, then clamp so the menu never
@@ -43,12 +85,14 @@ export function ContextMenu(props: { menu: MenuState | null; onClose: () => void
     // unclickable (a forgiveness/self-evident-actions defect, not just a test snag).
     const [pos, setPos] = createSignal<{ x: number; y: number } | null>(null);
     let menuEl: HTMLDivElement | undefined;
+    const openingPress = openingPressGuard(window);
     // A freshly opened (or closed) menu starts unarmed, and is re-clamped to fit.
     createEffect(() => {
         const m = props.menu;
         setConfirming(null);
         setPos(m ? { x: m.x, y: m.y } : null);
         if (!m || typeof window === "undefined") return;
+        openingPress.arm();
         // Measure after the menu has painted, then nudge it fully on-screen.
         queueMicrotask(() => {
             if (!menuEl) return;
@@ -71,6 +115,7 @@ export function ContextMenu(props: { menu: MenuState | null; onClose: () => void
     document.addEventListener("click", onDocClick);
     document.addEventListener("keydown", onKey);
     onCleanup(() => {
+        openingPress.dispose();
         document.removeEventListener("click", onDocClick);
         document.removeEventListener("keydown", onKey);
     });

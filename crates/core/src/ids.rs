@@ -175,6 +175,14 @@ id_newtype!(
     VaultCandidateId
 );
 id_newtype!(
+    /// Opaque, stable Azure namespace assigned to one GaugeVault owner account.
+    VaultTenantPrefixId
+);
+id_newtype!(
+    /// One random Azure secret object name bound to a GaugeVault candidate.
+    VaultStorageNameId
+);
+id_newtype!(
     /// Random marker persisted before one GaugeVault intake write and stored
     /// with its Azure version for metadata-only reconciliation.
     VaultIntakeMarkerId

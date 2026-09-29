@@ -66,3 +66,4 @@ Feature: Mobile projection client — pair, navigate, send (offline + online)
     When I go online
     Then the offline banner is gone
     And I can send "do the work"
+    And the mobile chat has a user-message mark

@@ -9,7 +9,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -26,7 +26,7 @@ use crate::library_state::{
     CreateArchetypeChatError, CreateArchetypeError, ForkArchetypeError, ForkChatError,
     ForkDestination, PublishArchetypeError, PullArchetypeError, UpgradePlacementError,
 };
-use crate::{LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT};
+use crate::{net_http, LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT, DEFAULT_PROJECT};
 use gaugedesk_store::AdmitError;
 use gaugedesk_workspace::MergeOutcome;
 
@@ -85,6 +85,41 @@ pub(crate) fn workspace_actor(wb: &Workbench, headers: &axum::http::HeaderMap) -
             .map(|actor| actor.as_str().to_owned()),
         None => wb.home_owner_account(),
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn admit_agent_source_owner(
+    wb: &Workbench,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<String, axum::response::Response> {
+    let actor = match wb.admit_data_request(net_http::bearer(headers), None) {
+        Ok(actor) if actor != "anonymous" => actor,
+        Ok(_) => {
+            return Err((StatusCode::UNAUTHORIZED, "authenticate to edit an Agent").into_response())
+        }
+        Err(error) => return Err(error.into_response()),
+    };
+    if crate::method_access::account_backed(wb, headers) {
+        let agent = wb
+            .library
+            .agents
+            .get(id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "no such Agent").into_response())?;
+        if agent
+            .versions
+            .get(&agent.current_version)
+            .and_then(|version| version.source_owner_authority.as_deref())
+            != Some(actor.as_str())
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Agent source ownership is unverified",
+            )
+                .into_response());
+        }
+    }
+    Ok(actor)
 }
 
 /// **ENTSEC-2** ([ADR 0065]): prune a workspace projection to what the caller may see — drop
@@ -499,10 +534,20 @@ pub struct CreateAgent {
 /// Create an agent + its authoring instance (a fresh repo).
 pub async fn create_agent(
     State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
     Json(body): Json<CreateAgent>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    match wb.create_archetype(body.name, body.kind) {
+    let bearer = net_http::bearer(&headers);
+    let owner = match wb.admit_data_request(bearer, None) {
+        Ok(actor) if actor != "anonymous" => actor,
+        Ok(_) => {
+            return (StatusCode::UNAUTHORIZED, "authenticate to publish an Agent").into_response()
+        }
+        Err(error) => return error.into_response(),
+    };
+    let verified_owner = crate::method_access::account_backed(&wb, &headers).then_some(owner);
+    match wb.create_archetype(body.name, body.kind, verified_owner) {
         Ok(archetype) => (
             StatusCode::CREATED,
             Json(json!({ "id": archetype.id, "name": archetype.name, "kind": body.kind })),
@@ -526,9 +571,13 @@ pub struct ForkArchetype {
 pub async fn copy_agent_as_panel(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<ForkArchetype>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_source_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.copy_agent_as_panel(&id, body.name) {
         Ok(agent) => (
             StatusCode::CREATED,
@@ -563,9 +612,13 @@ pub async fn copy_agent_as_panel(
 pub async fn fork_archetype(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<ForkArchetype>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_source_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.fork_archetype(&id, body.name) {
         Ok(archetype) => (
             StatusCode::CREATED,
@@ -597,8 +650,12 @@ pub async fn fork_archetype(
 pub async fn post_pull_from_source(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_source_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.pull_archetype_from_source(&id) {
         Ok(MergeOutcome::Clean) => (StatusCode::OK, Json(json!({ "outcome": "clean" }))).into_response(),
         Ok(MergeOutcome::Conflict) => (
@@ -919,6 +976,173 @@ pub fn create_named_project(
     id: &str,
     requested_name: &str,
 ) -> Result<serde_json::Value, String> {
+    create_named_project_with_extra(wb, id, requested_name, Default::default())
+}
+
+/// Complete the Hub's reserved organization project on this exact Home. The
+/// caller has already revalidated the reservation against the Hub; this Home
+/// checks its own authority and keeps all project facts here.
+pub fn materialize_organization_shared_project(
+    wb: &mut Workbench,
+    tenant_id: &str,
+    intent: &crate::tenancy::OrganizationProjectIntent,
+) -> Result<serde_json::Value, String> {
+    use crate::org::{MemberGrantRecord, Org, ORG_SCOPE};
+    let expected = tenant_id
+        .strip_prefix("organization:")
+        .filter(|suffix| suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|suffix| format!("proj-org-{suffix}"))
+        .ok_or("invalid organization identity")?;
+    if intent.id != "shared"
+        || intent.project_id != expected
+        || intent.home_id.as_deref() != Some(wb.home_id().as_str())
+    {
+        return Err("organization project intent belongs to another Home or project".into());
+    }
+    let org = Org::rebuild(wb.store_ref()).map_err(|error| format!("{error:?}"))?;
+    let role = org.role_of(&intent.founding_owner);
+    if role != Some(gaugedesk_core::abac::Role::owner())
+        && role != Some(gaugedesk_core::abac::Role::admin())
+    {
+        return Err("the founding owner cannot create projects on this Home".into());
+    }
+    if wb.library.projects.values().any(|project| {
+        project.id != intent.project_id
+            && project
+                .extra
+                .get("organization")
+                .and_then(serde_json::Value::as_str)
+                == Some(tenant_id)
+    }) {
+        return Err("the organization already has a shared project on this Home".into());
+    }
+    let project = create_named_project_with_extra(
+        wb,
+        &intent.project_id,
+        &intent.display_name,
+        std::collections::BTreeMap::from([(
+            "organization".into(),
+            serde_json::Value::String(tenant_id.to_owned()),
+        )]),
+    )?;
+    let grant_id = MemberGrantRecord::make_id(&intent.founding_owner, &intent.project_id);
+    if !org.grants.contains_key(&grant_id) {
+        let grant = MemberGrantRecord {
+            id: grant_id,
+            op: RecordOp::Upsert,
+            authority: intent.founding_owner.clone(),
+            project_id: intent.project_id.clone(),
+        };
+        wb.store_mut()
+            .append_record(
+                ORG_SCOPE,
+                "member_grant",
+                &serde_json::to_string(&grant).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+    }
+    wb.ensure_project_tasks_tracker(&intent.project_id)?;
+    Ok(project)
+}
+
+#[derive(Deserialize)]
+pub struct MaterializeOrganizationProjectBody {
+    #[serde(default)]
+    personal_default: bool,
+}
+
+/// The first Home chosen for an organization project completes the Hub's
+/// metadata-only reservation. The Home verifies the founder against its own
+/// directory before the Hub is asked to bind this Home, then rechecks the Hub
+/// intent immediately before project creation.
+pub async fn post_materialize_organization_shared_project(
+    State(wb): State<SharedWorkbench>,
+    Path(tenant): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<MaterializeOrganizationProjectBody>,
+) -> impl IntoResponse {
+    let bearer = net_http::bearer(&headers)
+        .map(str::to_owned)
+        .or_else(|| crate::account_signin::hub_session_token(&wb));
+    let Some(bearer) = bearer else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "sign in first" })),
+        )
+            .into_response();
+    };
+    let desktop_actor = if net_http::bearer(&headers).is_none() {
+        crate::account_signin::hub_session_actor(&wb)
+    } else {
+        None
+    };
+    let actor = {
+        let guard = wb.lock_unpoisoned();
+        let actor = if net_http::bearer(&headers).is_some() {
+            guard.actor(Some(&bearer))
+        } else {
+            desktop_actor.unwrap_or_else(|| "anonymous".into())
+        };
+        let org = crate::org::Org::rebuild(guard.store_ref());
+        let allowed = org.is_ok_and(|org| {
+            let role = org.role_of(&actor);
+            role == Some(gaugedesk_core::abac::Role::owner())
+                || role == Some(gaugedesk_core::abac::Role::admin())
+        });
+        let personal = guard.home_owner_account().as_deref() == Some(&actor)
+            && guard
+                .library
+                .projects
+                .get(DEFAULT_PROJECT)
+                .is_some_and(|project| &project.home_id == guard.home_id());
+        if actor == "anonymous" || !allowed || (body.personal_default && !personal) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "this Project Host cannot serve the organization project" })),
+            )
+                .into_response();
+        }
+        actor
+    };
+    let home = wb.lock_unpoisoned().home_id().as_str().to_owned();
+    let reserved = tokio::task::spawn_blocking(move || {
+        crate::account_signin::reserve_organization_project_home(&bearer, &tenant, &home)
+            .map(|intent| (tenant, home, intent))
+    })
+    .await;
+    let (tenant, home, intent) = match reserved {
+        Ok(Ok(result)) => result,
+        Ok(Err(message)) => {
+            return (StatusCode::CONFLICT, Json(json!({ "error": message }))).into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "organization project reservation failed" })),
+            )
+                .into_response()
+        }
+    };
+    if intent.founding_owner != actor || intent.home_id.as_deref() != Some(home.as_str()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "project owner mismatch" })),
+        )
+            .into_response();
+    }
+    let mut guard = wb.lock_unpoisoned();
+    match materialize_organization_shared_project(&mut guard, &tenant, &intent) {
+        Ok(project) => (StatusCode::OK, Json(json!({ "project": project }))).into_response(),
+        Err(message) => (StatusCode::CONFLICT, Json(json!({ "error": message }))).into_response(),
+    }
+}
+
+fn create_named_project_with_extra(
+    wb: &mut Workbench,
+    id: &str,
+    requested_name: &str,
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let name = requested_name.trim();
     if wb
         .library
@@ -945,6 +1169,12 @@ pub fn create_named_project(
     if let Some(existing) = &existing {
         if existing.get("name").and_then(serde_json::Value::as_str) != Some(name)
             || existing.get("home_id").and_then(serde_json::Value::as_str) != Some(home_id.as_str())
+            || (!extra.is_empty()
+                && wb
+                    .library
+                    .projects
+                    .get(id)
+                    .is_none_or(|record| record.extra != extra))
         {
             return Err(
                 "project operation identity is already bound to another project".to_owned(),
@@ -955,7 +1185,7 @@ pub fn create_named_project(
             wb,
             ProjectRecord {
                 schema: crate::library::LIBRARY_RECORD_SCHEMA,
-                extra: Default::default(),
+                extra,
                 id: id.to_owned(),
                 op: RecordOp::Upsert,
                 name: name.to_owned(),
@@ -1221,10 +1451,16 @@ pub struct PublishArchetype {
 pub async fn post_publish_archetype(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<PublishArchetype>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    match wb.publish_archetype_version(&id, body.auto_upgrade) {
+    let owner = match admit_agent_source_owner(&wb, &id, &headers) {
+        Ok(owner) => owner,
+        Err(error) => return error,
+    };
+    let verified_owner = crate::method_access::account_backed(&wb, &headers).then_some(owner);
+    match wb.publish_archetype_version(&id, body.auto_upgrade, verified_owner.as_deref()) {
         Ok((new_version, auto_upgraded)) => (
             StatusCode::OK,
             Json(json!({ "version": new_version, "auto_upgraded": auto_upgraded })),
@@ -1360,11 +1596,25 @@ fn default_title() -> String {
 pub async fn create_chat_under_agent(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<CreateChat>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    let creator = if crate::method_access::account_backed(&wb, &headers) {
+        match admit_agent_source_owner(&wb, &id, &headers) {
+            Ok(actor) => Some(actor),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
     match wb.create_chat_under_agent(&id, &body.title) {
-        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Ok(v) => {
+            if let (Some(creator), Some(chat)) = (creator, v["id"].as_str()) {
+                wb.claim_chat_owner(chat, &creator);
+            }
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
         Err(CreateArchetypeChatError::ArchetypeNotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such agent" })),
@@ -1462,11 +1712,28 @@ pub async fn revise_chat_targets(
 pub async fn use_archetype(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<CreateChat>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    let creator = if crate::method_access::account_backed(&wb, &headers) {
+        match wb.admit_data_request(net_http::bearer(&headers), Some(DEFAULT_PROJECT)) {
+            Ok(actor) if actor != "anonymous" => Some(actor),
+            Ok(_) => {
+                return (StatusCode::UNAUTHORIZED, "authenticate to use an Agent").into_response()
+            }
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        None
+    };
     match wb.use_archetype_chat(&id, &body.title) {
-        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Ok(v) => {
+            if let (Some(creator), Some(chat)) = (creator, v["id"].as_str()) {
+                wb.claim_chat_owner(chat, &creator);
+            }
+            (StatusCode::CREATED, Json(v)).into_response()
+        }
         Err(CreateArchetypeChatError::ArchetypeNotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such archetype" })),
@@ -1940,7 +2207,7 @@ mod tests {
     //! compose the open control plane; the attested **operator** surface tests
     //! live with `gaugewright-cloud-attestation` (SPLIT-1).
     use super::UpdateProject;
-    use crate::{open_control_plane, Workbench, LOCAL_AUTHORITY};
+    use crate::{open_control_plane, LockUnpoisoned, Workbench, LOCAL_AUTHORITY};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::Router;
@@ -1959,6 +2226,79 @@ mod tests {
     const PARTICIPANT_B: &str = "B";
     const MEASUREMENT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const NONCE: &str = "challenge-1";
+
+    #[test]
+    fn organization_shared_project_materializes_once_with_one_tasks_tracker() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::workbench_state::open_workbench_with_content_keywrap(root.path(), |_| {
+            Ok(Box::new(crate::at_rest::LoopbackKeyWrap::new([63; 32])))
+        })
+        .unwrap();
+        crate::account_signin::store_session_for_test(&wb);
+        crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+        let mut guard = wb.lock_unpoisoned();
+        let tenant = format!("organization:{}", "a".repeat(32));
+        let project_id = format!("proj-org-{}", "a".repeat(32));
+        let intent = crate::tenancy::OrganizationProjectIntent {
+            id: "shared".into(),
+            project_id: project_id.clone(),
+            founding_owner: "account-root".into(),
+            display_name: "Acme Studio".into(),
+            home_id: Some(guard.home_id().as_str().into()),
+        };
+        let first =
+            super::materialize_organization_shared_project(&mut guard, &tenant, &intent).unwrap();
+        assert_eq!(first["id"], project_id);
+        assert_eq!(
+            guard.library.projects[&project_id].extra["organization"],
+            tenant
+        );
+        assert!(!guard.ensure_project_tasks_tracker(&project_id).unwrap());
+        let grant_id = crate::org::MemberGrantRecord::make_id("account-root", &project_id);
+        let before = guard
+            .store_ref()
+            .records(crate::org::ORG_SCOPE, "member_grant")
+            .unwrap()
+            .len();
+        assert!(crate::org::Org::rebuild(guard.store_ref())
+            .unwrap()
+            .grants
+            .contains_key(&grant_id));
+        assert_eq!(
+            super::materialize_organization_shared_project(&mut guard, &tenant, &intent).unwrap(),
+            first
+        );
+        assert_eq!(
+            guard
+                .store_ref()
+                .records(crate::org::ORG_SCOPE, "member_grant")
+                .unwrap()
+                .len(),
+            before
+        );
+        let member = crate::org::MembershipRecord {
+            id: "other".into(),
+            op: crate::org::RecordOp::Upsert,
+            org_id: crate::org::ORG_ID.into(),
+            authority: "other".into(),
+            email: String::new(),
+            role: "member".into(),
+            status: crate::org::MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        guard
+            .store_mut()
+            .append_record(
+                crate::org::ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&member).unwrap(),
+            )
+            .unwrap();
+        assert!(!crate::org::Org::rebuild(guard.store_ref())
+            .unwrap()
+            .can_access_project("other", &project_id));
+    }
 
     #[test]
     fn project_run_purpose_distinguishes_omission_set_and_revocation() {

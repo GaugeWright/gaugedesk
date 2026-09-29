@@ -850,6 +850,71 @@ fn small_json_response(response: AccountAuthorityResponse, what: &str) -> Result
     serde_json::from_slice(&bytes).map_err(|_| format!("{what} is malformed"))
 }
 
+/// Read the Hub's durable organization-project reservation and bind its first
+/// Home. The account bearer stays on the Hub origin and redirects are refused
+/// by `open_account_authority_request`.
+pub(crate) fn reserve_organization_project_home(
+    bearer: &str,
+    tenant: &str,
+    home: &str,
+) -> Result<crate::tenancy::OrganizationProjectIntent, String> {
+    let hub = hub_base().ok_or("account Hub is not configured")?;
+    reserve_organization_project_home_at(&hub, bearer, tenant, home)
+}
+
+fn reserve_organization_project_home_at(
+    hub: &str,
+    bearer: &str,
+    tenant: &str,
+    home: &str,
+) -> Result<crate::tenancy::OrganizationProjectIntent, String> {
+    let read_url = hub_tenant_url(hub, tenant, &["shared-project"])?;
+    let read = small_json_response(
+        open_account_authority_request("GET", &read_url, bearer, &[], &[])?,
+        "organization project reservation",
+    )?;
+    let before: crate::tenancy::OrganizationProjectIntent = serde_json::from_value(
+        read.get("project")
+            .cloned()
+            .ok_or("organization project reservation is missing")?,
+    )
+    .map_err(|_| "organization project reservation is malformed")?;
+    if before
+        .home_id
+        .as_deref()
+        .is_some_and(|selected| selected != home)
+    {
+        return Err("organization project is bound to another Home".into());
+    }
+    let select_url = hub_tenant_url(hub, tenant, &["shared-project", "host"])?;
+    let selected = small_json_response(
+        open_account_authority_request(
+            "PUT",
+            &select_url,
+            bearer,
+            &[("content-type".into(), "application/json".into())],
+            serde_json::json!({ "home_id": home })
+                .to_string()
+                .as_bytes(),
+        )?,
+        "organization Project Host selection",
+    )?;
+    let after: crate::tenancy::OrganizationProjectIntent = serde_json::from_value(
+        selected
+            .get("project")
+            .cloned()
+            .ok_or("organization Project Host selection is missing")?,
+    )
+    .map_err(|_| "organization Project Host selection is malformed")?;
+    if after.project_id != before.project_id
+        || after.founding_owner != before.founding_owner
+        || after.home_id.as_deref() != Some(home)
+    {
+        return Err("organization Project Host selection changed its intent".into());
+    }
+    Ok(after)
+}
+
 /// Mint a fresh Hub entitlement through the desktop's sealed account session.
 /// Hosted compositions mint in their browser-authenticated Hub plane and pass
 /// the same public envelope to the Home; this is the native/Desktop crossing.
@@ -2252,6 +2317,69 @@ pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_home_binds_only_the_hubs_exact_reserved_project() {
+        use axum::{
+            extract::Path,
+            routing::{get, put},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new()
+            .route(
+                "/account/tenants/{tenant}/shared-project",
+                get(
+                    |Path(tenant): Path<String>, headers: axum::http::HeaderMap| async move {
+                        assert_eq!(tenant, "organization:abcd");
+                        assert_eq!(
+                            headers.get("authorization").unwrap(),
+                            "Bearer founder-token"
+                        );
+                        Json(json!({ "project": {
+                        "id": "shared", "project_id": "proj-org-abcd",
+                        "founding_owner": "account-root", "display_name": "Acme",
+                        "home_id": Value::Null,
+                    } }))
+                    },
+                ),
+            )
+            .route(
+                "/account/tenants/{tenant}/shared-project/host",
+                put(
+                    |Path(tenant): Path<String>,
+                     headers: axum::http::HeaderMap,
+                     Json(body): Json<Value>| async move {
+                        assert_eq!(tenant, "organization:abcd");
+                        assert_eq!(
+                            headers.get("authorization").unwrap(),
+                            "Bearer founder-token"
+                        );
+                        assert_eq!(body["home_id"], "home-a");
+                        Json(json!({ "project": {
+                        "id": "shared", "project_id": "proj-org-abcd",
+                        "founding_owner": "account-root", "display_name": "Acme",
+                        "home_id": "home-a",
+                    } }))
+                    },
+                ),
+            );
+        let service = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let result = tokio::task::spawn_blocking(move || {
+            reserve_organization_project_home_at(
+                &hub,
+                "founder-token",
+                "organization:abcd",
+                "home-a",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        service.abort();
+        assert_eq!(result.project_id, "proj-org-abcd");
+        assert_eq!(result.home_id.as_deref(), Some("home-a"));
+    }
 
     #[test]
     fn sign_in_does_not_claim_or_publish_existing_local_projects() {

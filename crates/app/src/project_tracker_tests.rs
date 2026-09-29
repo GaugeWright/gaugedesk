@@ -743,7 +743,7 @@ fn a_new_home_owned_tracker_reads_as_empty_without_creating_native_storage() {
 }
 
 #[test]
-fn a_desktop_account_turn_binds_the_real_task_filer() {
+fn desktop_account_and_local_turns_bind_the_real_task_filer() {
     use gaugedesk_harness::{
         EgressGate, Harness, HarnessFactory, HarnessSpec, ImageContent, Observation, TaskFiler,
         TurnOutcome,
@@ -840,6 +840,7 @@ fn a_desktop_account_turn_binds_the_real_task_filer() {
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,
             account_bearer: Some(&token),
+            local_operator: false,
             runtime_command_id: None,
             harness_factory: Some(Arc::new(FilingFactory(observed.clone()))),
         },
@@ -847,9 +848,50 @@ fn a_desktop_account_turn_binds_the_real_task_filer() {
     let (actor, id) = observed.lock().unwrap().clone().unwrap();
     assert_eq!(actor, "signed-in-owner");
     let wb = shared.lock_unpoisoned();
-    let tasks = wb
-        .read_project_tracker_tasks(&context, DEFAULT_PROJECT, PROJECT_TASKS)
+    let backlog = wb
+        .read_project_tracker_backlog(&context, DEFAULT_PROJECT, PROJECT_TASKS)
         .unwrap();
-    assert_eq!(tasks.backlog.issues[0].id, id);
-    assert_eq!(tasks.backlog.issues[0].title, "Test task");
+    assert_eq!(backlog.issues[0].id, id);
+    assert_eq!(backlog.issues[0].title, "Test task");
+    assert_eq!(backlog.issues[0].assigned_to, None);
+
+    drop(wb);
+    let local_turn = {
+        let mut wb = shared.lock_unpoisoned();
+        wb.create_default_engagement("chat-local-task".into(), "Local task chat".into())
+            .unwrap_or_else(|_| panic!("create local task chat"));
+        wb.engagement_task_context("chat-local-task").unwrap()
+    };
+    let local_observed = Arc::new(Mutex::new(None));
+    let _ = crate::engine::run_engagement_turn(
+        &shared,
+        "chat-local-task",
+        &local_turn.worktree,
+        &local_turn.sender,
+        crate::engine::EngagementTurnInput {
+            task: "file the local task",
+            images: &[],
+            mode: local_turn.mode,
+            authenticated_actor: None,
+            authenticated_context: None,
+            contribution_by: None,
+            account_scope: crate::account::ACCOUNT_SCOPE,
+            tenant_scope: crate::org::ORG_SCOPE,
+            account_bearer: None,
+            local_operator: true,
+            runtime_command_id: None,
+            harness_factory: Some(Arc::new(FilingFactory(local_observed.clone()))),
+        },
+    );
+    let (actor, id) = local_observed.lock().unwrap().clone().unwrap();
+    assert_eq!(actor, crate::LOCAL_AUTHORITY);
+    let wb = shared.lock_unpoisoned();
+    let local = wb.local_personal_tracker_context(DEFAULT_PROJECT).unwrap();
+    let backlog = wb
+        .read_project_tracker_backlog(&local, DEFAULT_PROJECT, PROJECT_TASKS)
+        .unwrap();
+    assert!(backlog
+        .issues
+        .iter()
+        .any(|issue| issue.id == id && issue.assigned_to.is_none()));
 }

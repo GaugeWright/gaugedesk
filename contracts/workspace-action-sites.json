@@ -1114,7 +1114,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::read_engagement_file_bytes",
+        "callable": "impl inherent for Workbench::read_engagement_file_bytes_for_viewer",
         "capability": "read_file_bytes_capped",
         "count": 1,
         "expression": "eng . read_file_bytes_capped (& path , max_bytes)",
@@ -4875,6 +4875,16 @@
     {
       "site": {
         "callable": "impl inherent for Workbench::ensure_tutorial_project",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "self . targets [& tasks_source_id] . current_main_cut ()",
+        "file": "crates/app/src/shipped_tutorials.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_tutorial_project",
         "capability": "init_at",
         "count": 1,
         "expression": "self . workspace_provider (& target_id) . init_at (& self . targets_dir () . join (& target_id))",
@@ -4885,9 +4895,29 @@
     {
       "site": {
         "callable": "impl inherent for Workbench::ensure_tutorial_project",
+        "capability": "init_at",
+        "count": 1,
+        "expression": "self . workspace_provider (& tasks_source_id) . init_at (& self . targets_dir () . join (& tasks_source_id))",
+        "file": "crates/app/src/shipped_tutorials.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_tutorial_project",
         "capability": "seed_main_exactly",
         "count": 1,
         "expression": "self . targets [& target_id] . seed_main_exactly (SHIPPED , \"whip\")",
+        "file": "crates/app/src/shipped_tutorials.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::ensure_tutorial_project",
+        "capability": "seed_main_exactly",
+        "count": 1,
+        "expression": "self . targets [& tasks_source_id] . seed_main_exactly (SHIPPED , \"whip\")",
         "file": "crates/app/src/shipped_tutorials.rs"
       },
       "profile": "startup-and-migration"

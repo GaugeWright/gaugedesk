@@ -50,6 +50,7 @@ import {
     turnStopped,
     type EngagementId,
     type LiveModelContext,
+    type MethodInspectionStatus,
     type ProjectId,
     type ProjectNode,
     type PlacementNode,
@@ -72,6 +73,7 @@ import {
     beginWorkEmailLogin,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
+import { ProjectManagementChat } from "./ProjectManagementChat";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
 import { desktopUpdateAllowed, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
@@ -790,7 +792,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // UX-2: the per-project home panel (recent runs, outputs under review, audit rollup).
     const [projectHome, setProjectHome] = createSignal<{ id: ProjectId; name: string } | null>(null);
     const [projectSettings, setProjectSettings] = createSignal<{ id: ProjectId; name: string } | null>(null);
-    const [projectSettingsPage, setProjectSettingsPage] = createSignal<ProjectSettingsPage>("people");
+    const [projectSettingsPage, setProjectSettingsPage] = createSignal<ProjectSettingsPage>("overview");
     const [routedProject, setRoutedProject] = createSignal<ProjectId | null>(null);
     createEffect(() => {
         const request = props.gaugeApps?.projectRequest?.();
@@ -803,7 +805,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         api.setCurrentProject(id);
         props.gaugeApps?.close();
         setProjectSettings({ id, name: request.name });
-        setProjectSettingsPage("people");
+        setProjectSettingsPage("overview");
         props.gaugeApps?.clearProjectRequest?.();
     });
     const [projectTasks, setProjectTasks] = createSignal<{ id: ProjectId; name: string; queue?: string; subject?: string } | null>(null);
@@ -868,12 +870,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     };
     createEffect(() => {
         if (currentProjectSettingsWorkspace()?.project.isPersonal && projectSettingsPage() === "people") {
-            setProjectSettingsPage("work-data");
+            setProjectSettingsPage("overview");
         }
     });
     const closeProjectSettings = () => {
         setProjectSettings(null);
-        setProjectSettingsPage("people");
+        setProjectSettingsPage("overview");
         setRoutedProject(null);
     };
     const refreshProjectSettings = async () => {
@@ -1467,6 +1469,46 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const busy = () => runToneOf(selected()) === "working";
     const [rawMode, setRawMode] = createSignal(false);
     const [rawContext, setRawContext] = createSignal<LiveModelContext | undefined>();
+    const [methodInspection, setMethodInspection] = createSignal<MethodInspectionStatus | undefined>();
+    const [methodInspectionBusy, setMethodInspectionBusy] = createSignal(false);
+    createEffect(() => {
+        const chat = selected();
+        const enabled = rawMode();
+        setMethodInspection(undefined);
+        if (!chat || !enabled) return;
+        let current = true;
+        const refresh = () => {
+            void api.getMethodInspection(chat).then(
+                (status) => { if (current) setMethodInspection(status); },
+                () => { if (current) setMethodInspection({phase: "unavailable"}); },
+            );
+        };
+        refresh();
+        const timer = window.setInterval(refresh, 2000);
+        onCleanup(() => { current = false; window.clearInterval(timer); });
+    });
+    const changeMethodInspection = async (action: "request" | "revoke") => {
+        const chat = selected();
+        if (!chat || methodInspectionBusy()) return;
+        setMethodInspectionBusy(true);
+        try {
+            const status = action === "request"
+                ? await api.requestMethodInspection(chat)
+                : await api.revokeMethodInspection(chat);
+            if (selected() === chat) {
+                setMethodInspection(status);
+                try {
+                    setRawContext(await api.getModelContext(chat));
+                } catch {
+                    setRawContext({available: false, reason: "Raw context could not be loaded for this chat."});
+                }
+            }
+        } catch (error) {
+            if (selected() === chat) setMethodInspection({phase: "unavailable"});
+        } finally {
+            setMethodInspectionBusy(false);
+        }
+    };
     createEffect(() => {
         const chat = selected();
         const enabled = rawMode();
@@ -1680,12 +1722,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
         setOpenedPanelAgent({ agent, project, placement });
         workbenchShell.openPane("content");
-    }
-    async function newEditChatFor(opened: { agent: ArchetypeNode; project?: ProjectNode; placement?: PlacementNode }) {
-        const chat = await api.createChatUnderArchetype(opened.agent.id, "edit chat");
-        bumpNav();
-        openChat(chat);
-        setOpenedPanelAgent(opened);
     }
 
     // UX-4: mirror the in-chat file selection into the URL (`?chat=<id>&file=<path>`) so a
@@ -2193,11 +2229,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
             onOpenProjectHome={(id, name) => {
+                props.gaugeApps?.close();
                 setOpenedPanelAgent(null);
                 setRoutedProject(id);
                 api.setCurrentProject(id);
                 setProjectSettings({ id, name });
-                setProjectSettingsPage("people");
+                setProjectSettingsPage("overview");
+                workbenchShell.openPane("content", { chatSelected: selected() !== null, fileSelected: true });
             }}
             onOpenProjectTasks={(id, name) => setProjectTasks({ id, name })}
             onOpenTutorials={(id) => {
@@ -2700,10 +2738,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 agent={opened().agent}
                 project={opened().project}
                 placement={opened().placement}
-                defaultEdgeOrigin={import.meta.env.VITE_PUBLIC_EDGE_ORIGIN || PUBLIC_EDGE_ORIGIN}
-                defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF || "credential:production:openai:v1"}
-                onClose={() => setOpenedPanelAgent(null)}
-                onNewEditChat={() => void newEditChatFor(opened())}
                 onDeploy={opened().project && opened().placement?.panelProfile
                     ? () => setDeployment({
                         projectId: opened().project!.id,
@@ -2883,6 +2917,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     prefs={filterPrefs()}
                     rawMode={rawMode()}
                     rawContext={rawContext()}
+                    methodInspection={methodInspection()}
+                    methodInspectionBusy={methodInspectionBusy()}
+                    onRequestMethodInspection={() => void changeMethodInspection("request")}
+                    onRevokeMethodInspection={() => void changeMethodInspection("revoke")}
+                    onOpenContextSources={() => setShowSources(true)}
                     pendingSend={pendingSend()?.id === selected() ? pendingSend()?.rid : undefined}
                     onResolveCredential={() => setAccountRequest((n) => n + 1)}
                     transcriptTail={
@@ -3083,7 +3122,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         api,
         engagementId: () => id,
         project: () => currentProject()?.id ?? null,
-        worktreeRev: status,
+        worktreeRev: () => `${status()}:${methodInspection()?.phase ?? ""}:${methodInspection()?.package_ref ?? ""}`,
         selectedFile,
         selectFile: (path) => setSelectedFile(path),
         canEditFile: (path) => {
@@ -3846,7 +3885,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     navFooter={navFooter}
                     chat={() => <>
                         <div
-                            hidden={props.gaugeApps?.active()}
+                            hidden={props.gaugeApps?.active() || !!projectSettings()}
                             data-work-chat-slot
                             data-chat-drop-target
                             onDragEnter={chatFileDrop.enter}
@@ -3859,6 +3898,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 <div class="file-drop-overlay" aria-hidden="true">Drop files to attach to your message</div>
                             </Show>
                         </div>
+                        <Show when={!props.gaugeApps?.active()}>
+                            <Show when={projectSettings()} keyed>{(project) => <ProjectManagementChat
+                                api={api} project={project.id} name={project.name}
+                                mobile={workbenchShell.isMobile()}
+                                onCollapse={() => workbenchShell.setCollapsed("chat", true)}
+                                onChanged={refreshProjectSettings}
+                            />}</Show>
+                        </Show>
                         <Show when={props.gaugeApps?.active()}>{props.gaugeApps?.chat({
                             mobile: workbenchShell.isMobile(),
                             onCollapse: () => workbenchShell.setCollapsed("chat", true),
@@ -3880,6 +3927,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                         project={workspace().project}
                                         library={workspace().library}
                                         page={projectSettingsPage()}
+                                        onSelectPage={setProjectSettingsPage}
                                         onClose={closeProjectSettings}
                                         onChanged={refreshProjectSettings}
                                         onAttachTarget={isTauri()

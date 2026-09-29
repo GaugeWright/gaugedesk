@@ -85,6 +85,9 @@ export interface MobileSessionOptions {
     readonly engagementId: Accessor<EngagementId | null>;
     /** The host's fold of the durable snapshot plus live SSE. */
     readonly transcript: Accessor<Transcript>;
+    /** The same admitted fold with a locally pending user send shown until the
+     *  next snapshot reconciles it. Registration checks still read `transcript`. */
+    readonly visibleTranscript?: Accessor<Transcript>;
     /** The addressed Home's connection status (MOB-018). Its `canCommand`
      *  reading becomes the Session's, so the composer's refusal and the
      *  connection banner provably share one predicate. */
@@ -94,7 +97,8 @@ export interface MobileSessionOptions {
     /** Bumped by the host when the worktree may have changed. */
     readonly worktreeRev: Accessor<unknown>;
     /** A turn settled: re-derive the sibling task-queue and files projections. */
-    readonly onSettled: () => void;
+    readonly onSettled: (id: EngagementId) => void | Promise<void>;
+    readonly onPendingUser?: (id: EngagementId, text: string | null) => void;
     /** Put the text of a failed send back in the draft. The shared controller
      *  reports the failure but does not restore the text, and the retired mobile
      *  composer did — a phone loses more by dropping a message typed with thumbs
@@ -144,11 +148,11 @@ export function createMobileSession(options: MobileSessionOptions): Session {
         const id = options.engagementId();
         if (id === null) throw new Error("Open a chat before sending.");
         setDispatched({ seq: ++dispatches, lines: options.transcript().lines.length });
+        options.onPendingUser?.(id, text);
         options.onStatus(`send: ${text}`);
         try {
             await api.runTask(id, text, []);
             options.onStatus("turn complete");
-            options.onSettled();
         } catch (cause) {
             // A stopped turn is not a failed send. Handing the text back is
             // right for a dropped relay and wrong here: the reader cancelled
@@ -157,14 +161,18 @@ export function createMobileSession(options: MobileSessionOptions): Session {
             // projections are re-derived exactly as they are for a completed one.
             if (turnStopped(cause)) {
                 options.onStatus("turn stopped");
-                options.onSettled();
                 throw cause;
             }
             options.onStatus(`turn error: ${String(cause)}`);
             options.onSendFailed(text);
             throw cause;
         } finally {
-            setDispatched(null);
+            try {
+                await options.onSettled(id);
+            } finally {
+                options.onPendingUser?.(id, null);
+                setDispatched(null);
+            }
         }
     };
 
@@ -174,7 +182,7 @@ export function createMobileSession(options: MobileSessionOptions): Session {
         worktreeRev: options.worktreeRev,
         selectedFile: options.selectedFile,
         selectFile: options.selectFile,
-        transcript: options.transcript,
+        transcript: options.visibleTranscript ?? options.transcript,
         busy,
         turnActivity: localTurnActivity(busy, options.transcript),
         composerCapabilities: () => MOBILE_COMPOSER_CAPABILITIES,

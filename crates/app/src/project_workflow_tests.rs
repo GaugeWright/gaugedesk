@@ -194,7 +194,7 @@ fn basics_uses_the_same_launcher_and_requires_its_existing_tracker_grant() {
     wb.declare_project_tracker(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "declare",
         ResourceAttributes::default(),
     )
@@ -203,22 +203,22 @@ fn basics_uses_the_same_launcher_and_requires_its_existing_tracker_grant() {
         .launch_project_workflow(&context, &request, LIMITS)
         .unwrap();
     assert_eq!(
-        invocation.command.resources["tutorials"]
+        invocation.command.resources["tasks"]
             .resource
             .selector
             .as_deref(),
-        Some("tutorials")
+        Some("tasks")
     );
     let tracker = wb
         .read_project_tracker(
             &context,
             DEFAULT_PROJECT,
-            "tutorials",
+            "tasks",
             crate::project_tracker::TrackerPermission::Read,
         )
         .unwrap();
     assert_eq!(
-        invocation.command.resources["tutorials"].resource.handle,
+        invocation.command.resources["tasks"].resource.handle,
         tracker.resource.resource.id.as_str()
     );
     assert_eq!(invocation.workspace, tracker.workspace_id);
@@ -302,7 +302,7 @@ fn source_ownership_is_not_discarded_when_filing_into_another_party_tracker() {
     wb.declare_project_tracker(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "declare",
         ResourceAttributes::default(),
     )

@@ -7,6 +7,7 @@ Feature: Personal-project "just start typing" quick-start
   Scenario: the empty chat pane starts a Personal chat with the first message
     Given the workbench is open
     Then the empty chat composer is ready
+    And the empty chat composer is docked at the bottom
     When I task the agent with "draft a welcome note"
     Then the active chat is a work chat
     And I see a chat in Personal

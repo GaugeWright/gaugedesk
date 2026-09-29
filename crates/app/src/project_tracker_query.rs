@@ -150,9 +150,10 @@ impl Workbench {
             )
             .map_err(query_error)?;
         let recipient = match assigned_to.map(str::trim) {
-            None | Some("me" | "myself") => context.actor().as_str().to_owned(),
+            None => None,
+            Some("me" | "myself") => Some(context.actor().as_str().to_owned()),
             Some("") => return Err("task assignee is empty".to_owned()),
-            Some(requested) if recipients.contains(requested) => requested.to_owned(),
+            Some(requested) if recipients.contains(requested) => Some(requested.to_owned()),
             Some(requested) => {
                 let mut matches = choices
                     .iter()
@@ -164,10 +165,13 @@ impl Workbench {
                 if matches.next().is_some() {
                     return Err("task assignee is ambiguous".to_owned());
                 }
-                recipient.clone()
+                Some(recipient.clone())
             }
         };
-        if !recipients.contains(&recipient) {
+        if recipient
+            .as_ref()
+            .is_some_and(|recipient| !recipients.contains(recipient))
+        {
             return Err("task assignee cannot currently read this project tracker".to_owned());
         }
         crate::federation::require_project_writes_available(self.store_ref(), project)
@@ -192,7 +196,7 @@ impl Workbench {
             body: body.to_owned(),
             labels: Vec::new(),
             metadata: serde_json::json!({"source": "agent"}),
-            assigned_to: Some(recipient),
+            assigned_to: recipient,
         };
         let mut writer = self.store_ref().sibling().map_err(query_error)?;
         let item_id = writer
@@ -238,6 +242,19 @@ impl Workbench {
         context: &AuthenticatedActionContext,
         project: &str,
     ) -> Result<Vec<ReadableProjectTracker>, String> {
+        if matches!(
+            context.authentication(),
+            crate::identity::ActorAuthentication::LocalPersonalTracker
+        ) {
+            return Ok(vec![
+                self.read_project_tracker_backlog(
+                    context,
+                    project,
+                    crate::project_tracker::PROJECT_TASKS,
+                )?
+                .tracker,
+            ]);
+        }
         let (authority, mut basis) = self
             .store_ref()
             .read_for_dispatch(

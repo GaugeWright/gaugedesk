@@ -13,7 +13,7 @@
  */
 
 import { createResource, createSignal, For, Show } from "solid-js";
-import type { EngagementId, ResourceView } from "@gaugewright/control-plane-client";
+import type { ContextInspectionStatus, EngagementId, ResourceView } from "@gaugewright/control-plane-client";
 import {
     availabilityLabel,
     availabilityOf,
@@ -27,6 +27,107 @@ export interface ContextResourceApi {
     getResources(id: EngagementId): Promise<ResourceView[]>;
     requestResourceAccess(id: EngagementId, resource: string): Promise<unknown>;
     approveResourceAccess(id: EngagementId, resource: string): Promise<unknown>;
+    getContextInspection(id: EngagementId, resource: string): Promise<ContextInspectionStatus>;
+    requestContextInspection(id: EngagementId, resource: string): Promise<ContextInspectionStatus>;
+    getContextInspectionRequests(id: EngagementId, resource: string): Promise<{readers: string[]; granted: string[]}>;
+    approveContextInspection(id: EngagementId, resource: string, reader: string): Promise<void>;
+    revokeContextInspection(id: EngagementId, resource: string, reader: string): Promise<void>;
+    revokeOwnContextInspection(id: EngagementId, resource: string): Promise<ContextInspectionStatus>;
+}
+
+function SourceInspection(props: { api: ContextResourceApi; id: EngagementId; resource: string }) {
+    const [status, { refetch }] = createResource(
+        () => [props.id, props.resource] as const,
+        ([id, resource]) => props.api.getContextInspection(id, resource),
+    );
+    const [requests, { refetch: refetchRequests }] = createResource(
+        () => [props.id, props.resource] as const,
+        ([id, resource]) => props.api.getContextInspectionRequests(id, resource).catch(() => ({readers: [], granted: []})),
+    );
+    const [busy, setBusy] = createSignal(false);
+    const [error, setError] = createSignal("");
+    const request = async () => {
+        setBusy(true);
+        setError("");
+        try {
+            await props.api.requestContextInspection(props.id, props.resource);
+            await refetch();
+            await refetchRequests();
+        } catch (reason) {
+            setError(reason instanceof Error ? reason.message : "source request failed");
+        } finally {
+            setBusy(false);
+        }
+    };
+    const approve = async (reader: string) => {
+        setBusy(true);
+        setError("");
+        try {
+            await props.api.approveContextInspection(props.id, props.resource, reader);
+            await refetchRequests();
+            await refetch();
+        } catch (reason) {
+            setError(reason instanceof Error ? reason.message : "source approval failed");
+        } finally {
+            setBusy(false);
+        }
+    };
+    const revoke = async (reader: string) => {
+        setBusy(true);
+        setError("");
+        try {
+            await props.api.revokeContextInspection(props.id, props.resource, reader);
+            await refetchRequests();
+            await refetch();
+        } catch (reason) {
+            setError(reason instanceof Error ? reason.message : "source revocation failed");
+        } finally {
+            setBusy(false);
+        }
+    };
+    const revokeOwn = async () => {
+        setBusy(true);
+        setError("");
+        try {
+            await props.api.revokeOwnContextInspection(props.id, props.resource);
+            await refetchRequests();
+            await refetch();
+        } catch (reason) {
+            setError(reason instanceof Error ? reason.message : "source revocation failed");
+        } finally {
+            setBusy(false);
+        }
+    };
+    return <>
+        <Show when={status()?.phase === "init"}>
+            <button type="button" class="link-btn" disabled={busy()} onClick={() => void request()}>
+                request inspection
+            </button>
+        </Show>
+        <Show when={status()?.phase === "requested"}>
+            <span class="resource-availability">inspection awaiting source approval</span>
+        </Show>
+        <Show when={status()?.phase === "granted"}>
+            <span class="resource-availability">inspection granted</span>
+            <button type="button" class="link-btn" disabled={busy()} onClick={() => void revokeOwn()}>
+                revoke my inspection
+            </button>
+        </Show>
+        <Show when={status()?.phase === "revoked"}>
+            <span class="resource-availability">inspection revoked</span>
+        </Show>
+        <For each={requests()?.readers ?? []}>{(reader) =>
+            <button type="button" class="link-btn" disabled={busy()} onClick={() => void approve(reader)}>
+                approve inspection for {reader}
+            </button>
+        }</For>
+        <For each={requests()?.granted ?? []}>{(reader) =>
+            <button type="button" class="link-btn" disabled={busy()} onClick={() => void revoke(reader)}>
+                revoke inspection for {reader}
+            </button>
+        }</For>
+        <Show when={error()}><span class="status error">{error()}</span></Show>
+    </>;
 }
 
 export function ContextPanel(props: {
@@ -98,6 +199,9 @@ export function ContextPanel(props: {
                                             >
                                                 {availabilityLabel(avail)}
                                             </span>
+                                            <Show when={r.kind === "context" && !r.tombstoned}>
+                                                <SourceInspection api={props.api} id={props.id} resource={r.id} />
+                                            </Show>
                                             <Show when={r.access === "Init" || r.access === "Revoked"}>
                                                 <button
                                                     type="button"

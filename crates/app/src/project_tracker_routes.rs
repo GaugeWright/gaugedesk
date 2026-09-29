@@ -1,4 +1,4 @@
-//! Authenticated backlog reads and the native, retryable human completion command.
+//! Project backlog reads and the native, retryable human completion command.
 use crate::{
     identity::AuthenticatedActionContext,
     project_tracker::{CompleteTrackerIssue, TrackerCompletionClaim, TrackerPermission},
@@ -40,9 +40,16 @@ pub async fn list_trackers(
     Path(project): Path<String>,
     headers: HeaderMap,
     authenticated: Option<Extension<AuthenticatedActionContext>>,
+    operator: Option<Extension<crate::account_signin::DesktopOperatorPlane>>,
 ) -> Response {
     let mut wb = wb.lock_unpoisoned();
-    let Some(context) = context(&mut wb, &headers, authenticated) else {
+    let Some(context) = context(&mut wb, &headers, authenticated).or_else(|| {
+        (operator.is_some()
+            && crate::net_http::bearer(&headers).is_none()
+            && crate::mobile_machine_session::session_token(&headers).is_none())
+        .then(|| wb.local_personal_tracker_context(&project))
+        .flatten()
+    }) else {
         return problem(StatusCode::UNAUTHORIZED, "Sign in to read project tasks");
     };
     match wb.list_project_trackers(&context, &project) {
@@ -56,9 +63,16 @@ pub async fn read_backlog(
     Path((project, queue)): Path<(String, String)>,
     headers: HeaderMap,
     authenticated: Option<Extension<AuthenticatedActionContext>>,
+    operator: Option<Extension<crate::account_signin::DesktopOperatorPlane>>,
 ) -> Response {
     let mut wb = wb.lock_unpoisoned();
-    let Some(context) = context(&mut wb, &headers, authenticated) else {
+    let Some(context) = context(&mut wb, &headers, authenticated).or_else(|| {
+        (operator.is_some()
+            && crate::net_http::bearer(&headers).is_none()
+            && crate::mobile_machine_session::session_token(&headers).is_none())
+        .then(|| wb.local_personal_tracker_context(&project))
+        .flatten()
+    }) else {
         return problem(StatusCode::UNAUTHORIZED, "Sign in to read project tasks");
     };
     if wb
@@ -78,9 +92,16 @@ pub async fn read_tasks(
     Path((project, queue)): Path<(String, String)>,
     headers: HeaderMap,
     authenticated: Option<Extension<AuthenticatedActionContext>>,
+    operator: Option<Extension<crate::account_signin::DesktopOperatorPlane>>,
 ) -> Response {
     let mut wb = wb.lock_unpoisoned();
-    let Some(context) = context(&mut wb, &headers, authenticated) else {
+    let Some(context) = context(&mut wb, &headers, authenticated).or_else(|| {
+        (operator.is_some()
+            && crate::net_http::bearer(&headers).is_none()
+            && crate::mobile_machine_session::session_token(&headers).is_none())
+        .then(|| wb.local_personal_tracker_context(&project))
+        .flatten()
+    }) else {
         return problem(StatusCode::UNAUTHORIZED, "Sign in to read project tasks");
     };
     if wb

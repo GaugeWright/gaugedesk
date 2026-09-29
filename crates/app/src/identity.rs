@@ -27,6 +27,9 @@ pub struct AuthenticatedActor(pub AuthorityId);
 /// The native dispatch variant additionally requires its exact admitted grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActorAuthentication {
+    /// Local desktop authority for Personal's task tracker only. General
+    /// action revalidation deliberately refuses it.
+    LocalPersonalTracker,
     AccountSession {
         session_ref: String,
     },
@@ -49,7 +52,8 @@ pub enum ActorAuthentication {
 }
 
 /// Source-specific request facts for action construction (ACTION-3). The Home
-/// boundary constructs these only after verifying the corresponding credential.
+/// boundary constructs account contexts after verifying their credential; the
+/// local Personal tracker variant is a narrower operator-listener admission.
 /// Factories still admit current directory, target and delegation authority;
 /// these claims are neither a signed policy nor permission to dispatch later.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +64,14 @@ pub struct AuthenticatedActionContext {
 }
 
 impl AuthenticatedActionContext {
+    pub(crate) fn local_personal_tracker() -> Self {
+        Self {
+            actor: AuthorityId::new(crate::LOCAL_AUTHORITY),
+            authentication: ActorAuthentication::LocalPersonalTracker,
+            claims: AuthorityAttributes::default(),
+        }
+    }
+
     pub fn actor(&self) -> &AuthorityId {
         &self.actor
     }
@@ -165,7 +177,8 @@ pub(crate) fn revalidate_action_context(
             }
         }
         ActorAuthentication::IdentityProvider => {}
-        ActorAuthentication::NativeEditorDispatchGrant { .. }
+        ActorAuthentication::LocalPersonalTracker
+        | ActorAuthentication::NativeEditorDispatchGrant { .. }
         | ActorAuthentication::ProjectWorkflowInvocation { .. } => {
             return Err(invalid(
                 "action-scoped authority requires its exact admitted command",

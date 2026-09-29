@@ -3,6 +3,13 @@
     font-family: var(--font-chrome);
 }
 
+.project-management-chat { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+.project-management-chat-loading { margin: 36px auto; color: var(--muted); font-family: var(--font-chrome); }
+.project-management-chat-menu { border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 20px; line-height: 1; }
+.project-management-chat-confirm { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--edge); font: var(--fs-small) var(--font-chrome); }
+.project-management-chat-confirm span { flex: 1; }
+.project-management-chat-error { margin: 0; padding: 8px 12px; color: var(--danger, #e88); font: var(--fs-small) var(--font-chrome); }
+
 .project-settings-content {
     box-sizing: border-box;
     height: 100%;
@@ -76,6 +83,51 @@
 .project-settings-section-head h2 {
     margin: 0;
     font: 400 var(--fs-ui)/1.25 var(--font-chrome);
+}
+
+.project-settings-overview {
+    padding: 12px 14px 16px;
+}
+
+.project-settings-overview > p {
+    margin: 0 0 14px;
+    color: var(--muted);
+    font-size: var(--fs-small);
+    line-height: 1.4;
+}
+
+.project-settings-overview-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.project-settings-page .project-settings-overview-grid button {
+    display: grid;
+    align-content: start;
+    gap: 7px;
+    min-height: 88px;
+    padding: 13px;
+    border: 1px solid var(--edge);
+    background: color-mix(in srgb, var(--panel) 78%, transparent);
+    color: var(--ink);
+    text-align: left;
+}
+
+.project-settings-overview-grid button:hover,
+.project-settings-overview-grid button:focus-visible {
+    border-color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 7%, var(--panel));
+}
+
+.project-settings-overview-grid strong {
+    font-weight: 500;
+}
+
+.project-settings-overview-grid span {
+    color: var(--muted);
+    font-size: var(--fs-small);
+    line-height: 1.3;
 }
 
 .project-settings-section-head p,
@@ -406,5 +458,9 @@ div.project-settings-empty p {
     .project-settings-section-head {
         align-items: start;
         flex-direction: column;
+    }
+
+    .project-settings-overview-grid {
+        grid-template-columns: minmax(0, 1fr);
     }
 }

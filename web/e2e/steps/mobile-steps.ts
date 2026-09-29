@@ -93,19 +93,19 @@ Then("the paired environment is shown", async ({ page }) => {
 When("I open Personal project settings on the device", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     const project = page.locator("[data-project]", { hasText: "Personal" });
-    await project.locator("[data-row-menu]").click();
-    await page.locator(".menu-item-label", { hasText: /^project settings…$/ }).click();
+    await project.locator(".tree-node.project").click();
 });
 
 Then("the device shows the Personal project settings", async ({ page }) => {
     await expect(page.locator(".mobile-project-settings")).toBeVisible();
     await expect(page.getByRole("heading", { name: "Personal", exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Work & data", exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Overview", exact: true })).toBeVisible();
 });
 
 Then("Personal project settings do not offer sharing", async ({ page }) => {
     const picker = page.getByLabel("Settings page for Personal");
     await expect(picker.locator("option")).toHaveText([
+        "Overview",
         "Work & data",
         "Agents & placements",
         "Model access",
@@ -203,6 +203,10 @@ When("I send {string} from the device", async ({ page }, text: string) => {
 
 Then("the device shows a stop control", async ({ page }) => {
     await expect(page.locator(".mobile-chat [data-testid='stop-turn']")).toBeVisible();
+});
+
+Then("the mobile chat has a user-message mark", async ({ page }) => {
+    await expect(page.locator(".mobile-chat [data-chat-message-mark]")).toHaveCount(1);
 });
 
 // The desktop's delivery menu overhung its stop button and swallowed clicks

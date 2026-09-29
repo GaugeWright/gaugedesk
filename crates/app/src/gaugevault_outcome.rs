@@ -146,8 +146,8 @@ mod tests {
     use crate::gaugevault_dispatch::{admit_dispatch, BeginDispatchRequest, DispatchEvidence};
     use gaugedesk_core::gaugevault::{Status, UseMode};
     use gaugedesk_core::ids::{
-        AuthorityId, ScopeId, SecretHandleId, VaultCandidateId, VaultCredentialId,
-        VaultIntakeMarkerId, VaultOperationId, VaultSubjectId, VaultTargetId,
+        AuthorityId, ScopeId, VaultCandidateId, VaultCredentialId, VaultIntakeMarkerId,
+        VaultOperationId, VaultStorageNameId, VaultSubjectId, VaultTargetId, VaultTenantPrefixId,
     };
 
     fn binding() -> Binding {
@@ -157,6 +157,10 @@ mod tests {
             credential_scope: ScopeId::from("synthetic-owner:vault:one"),
             credential: VaultCredentialId::from("credential-one"),
         }
+    }
+
+    fn storage(marker: &str) -> VaultStorageNameId {
+        VaultStorageNameId::from(format!("gv-{}-{marker}", "1".repeat(32)))
     }
 
     fn effect() -> Effect {
@@ -216,7 +220,7 @@ mod tests {
             1,
             Capability::Manage,
             Operation::Create {
-                storage_name: SecretHandleId::from("opaque-storage-name"),
+                tenant_prefix: VaultTenantPrefixId::from("1".repeat(32)),
             },
         );
         append(
@@ -226,6 +230,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-one"),
                 marker: VaultIntakeMarkerId::from("abcdef0123456789abcdef0123456789"),
+                storage_name: storage("abcdef0123456789abcdef0123456789"),
                 deadline: 100,
             },
         );

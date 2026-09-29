@@ -261,9 +261,10 @@ mod tests {
     #[test]
     fn result_summary_falls_back_to_json_when_no_text_content() {
         let v: serde_json::Value = serde_json::json!({ "exit": 0, "details": {} });
+        let summary = result_summary(&v).expect("JSON fallback");
         assert_eq!(
-            result_summary(&v).as_deref(),
-            Some(r#"{"details":{},"exit":0}"#)
+            serde_json::from_str::<serde_json::Value>(&summary).unwrap(),
+            v
         );
         assert_eq!(result_summary(&serde_json::Value::Null), None);
         assert_eq!(

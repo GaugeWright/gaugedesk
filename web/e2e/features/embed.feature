@@ -121,6 +121,17 @@ Feature: Embedded panels (EMBED-2)
     Then the embedded chat uses the shared docked composer
     And the embedded message field grows with multiline text
 
+  Scenario: a content-sized Panel can preview and revisit user messages
+    Given a content-sized embedded chat is open
+    When I send "first Panel request" in the embedded chat
+    Then the embedded agent finishes a reply
+    When I send "second Panel request" in the embedded chat
+    Then the embedded chat has 2 user-message marks
+    When I hover the first embedded user-message mark
+    Then the embedded message preview shows "first Panel request"
+    When I jump to the first embedded user message
+    Then the first embedded user message is in view
+
   Scenario: every panel has resilient drop-in styling with deliberate overrides
     Given all embedded panels are open under broad hostile host styles
     Then every embedded panel keeps its structural defaults

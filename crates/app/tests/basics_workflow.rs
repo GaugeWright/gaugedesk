@@ -157,7 +157,7 @@ fn run_basics(protected: bool) {
         let issues = kernel
             .store()
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .expect("tasks");
         assert_eq!(issues.len(), step + 1);
         let pending: Vec<_> = issues
@@ -180,7 +180,7 @@ fn run_basics(protected: bool) {
         let waiting = kernel
             .store()
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .expect("retained tasks");
         assert_eq!(waiting.len(), step + 1);
         assert_eq!(
@@ -213,7 +213,7 @@ fn run_basics(protected: bool) {
         kernel
             .store()
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .expect("tasks")
             .len(),
         4
@@ -244,7 +244,7 @@ fn run_basics(protected: bool) {
         assert!(kernel
             .store()
             .items
-            .list_items(Some("tutorials"), None)
+            .list_items(Some("tasks"), None)
             .is_err());
         assert!(vault.prepare_scope_key("personal:learner").is_err());
     }

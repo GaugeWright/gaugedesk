@@ -77,6 +77,7 @@ import {
     ProjectSettingsContent,
     ProjectSettingsMenu,
     type PairingState,
+    pendingUserAfterSnapshot,
     type ProjectSettingsPage,
     QueueSheet,
     reduceCarousel,
@@ -1253,6 +1254,30 @@ function MobileSession(props: {
     // plus the live SSE, exactly the desktop chat pane's source — so the mobile
     // Chat stop shows what the agent actually did, not just the consent surface.
     const [transcript, setTranscript] = createSignal<Transcript>(emptyTranscript);
+    const [pendingUser, setPendingUser] = createSignal<{
+        id: EngagementId;
+        text: string;
+        baselineLines: number;
+    } | null>(null);
+    const visibleTranscript = (): Transcript => {
+        const admitted = transcript();
+        const pending = pendingUser();
+        if (!pending || pending.id !== engagement()) return admitted;
+        const echo = pendingUserAfterSnapshot(admitted, pending.text, pending.baselineLines);
+        if (echo.lines.length === 0) return admitted;
+        const at = Math.min(pending.baselineLines, admitted.lines.length);
+        const lines = [
+            ...admitted.lines.slice(0, at),
+            ...echo.lines,
+            ...admitted.lines.slice(at),
+        ].map((line, seq) => line.seq === seq ? line : { ...line, seq });
+        return {
+            lines,
+            openText: admitted.openText === null || admitted.openText < at
+                ? admitted.openText
+                : admitted.openText + echo.lines.length,
+        };
+    };
     let unsubscribe: (() => void) | null = null;
     onCleanup(() => unsubscribe?.());
 
@@ -1265,7 +1290,7 @@ function MobileSession(props: {
         readonly name: string;
     } | null>(null);
     const [projectSettingsPage, setProjectSettingsPage] =
-        createSignal<ProjectSettingsPage>("people");
+        createSignal<ProjectSettingsPage>("overview");
     const [projectSettingsWorkspace, { refetch: refetchProjectSettings }] = createResource(
         () => {
             const request = projectSettings();
@@ -1289,16 +1314,16 @@ function MobileSession(props: {
             currentProjectSettingsWorkspace()?.project.isPersonal
             && projectSettingsPage() === "people"
         ) {
-            setProjectSettingsPage("work-data");
+            setProjectSettingsPage("overview");
         }
     });
     const closeProjectSettings = () => {
         setProjectSettings(null);
-        setProjectSettingsPage("people");
+        setProjectSettingsPage("overview");
     };
     const openProjectSettings = (id: ProjectId, name: string) => {
         setProjectSettings({ id, name });
-        setProjectSettingsPage("people");
+        setProjectSettingsPage("overview");
     };
     const refreshProjectSettings = () => {
         setWsKey((key) => key + 1);
@@ -1499,6 +1524,7 @@ function MobileSession(props: {
         setDraftText(savedDraft ?? "");
         setSelectedFile(null);
         setTranscript(emptyTranscript);
+        setPendingUser(null);
         setApproval(null);
         // A chat is selected → un-grey the chat/files panes and land on Chat.
         setCarousel((c) => applySelection(c, { chatSelected: true, fileSelected: false }));
@@ -1847,11 +1873,27 @@ function MobileSession(props: {
         api,
         engagementId: engagement,
         transcript,
+        visibleTranscript,
         connection: status,
         selectedFile,
         selectFile: (path) => (path === null ? setSelectedFile(null) : openFile(path)),
         worktreeRev: filesKey,
-        onSettled: () => {
+        onPendingUser: (id, text) => {
+            if (text === null) {
+                setPendingUser((pending) => pending?.id === id ? null : pending);
+            } else if (engagement() === id) {
+                setPendingUser({ id, text, baselineLines: transcript().lines.length });
+            }
+        },
+        onSettled: async (id) => {
+            if (engagement() === id) {
+                try {
+                    const events = await api.getTranscript(id);
+                    if (engagement() === id) setTranscript(fromSnapshot(events));
+                } catch (cause) {
+                    append(`transcript error: ${String(cause)}`);
+                }
+            }
             setWsKey((k) => k + 1); // settle changes the sibling task-queue projection
             setFilesKey((k) => k + 1); // the turn may have changed the worktree
         },
@@ -1973,6 +2015,7 @@ function MobileSession(props: {
                                 project={workspace().project}
                                 library={workspace().library}
                                 page={projectSettingsPage()}
+                                onSelectPage={setProjectSettingsPage}
                                 onClose={closeProjectSettings}
                                 onChanged={refreshProjectSettings}
                             />

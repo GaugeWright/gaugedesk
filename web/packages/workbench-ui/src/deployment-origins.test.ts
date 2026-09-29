@@ -1,15 +1,15 @@
 /**
- * The origin allowlist round trip (PANEL-11).
+ * The origin allowlist (PANEL-11).
  *
  * Deploy Config once read `allowed_origins[0]` and published `[origin]`, so
  * reopening a deployment admitted at four origins and publishing it again cut
- * the list to one. These pin that what an active deployment admits is exactly
- * what a republish sends back, through the same two functions the panel calls
- * when it loads a deployment and when it builds the publish request.
+ * the list to one. The panel now holds the admitted list itself; these pin that
+ * adding to it never drops or reorders what is there, and that what the owner
+ * types becomes the exact origin a visitor's browser sends.
  */
 
 import { describe, expect, it } from "vitest";
-import { originsDraftFrom, originsFromDraft } from "./deployment-origins";
+import { normalizeOrigin, withOrigin, wwwCounterpart } from "./deployment-origins";
 
 // An apex and its `www` form, twice over: the edge compares `Origin` exactly,
 // so each is its own entry and none may be dropped.
@@ -20,43 +20,38 @@ const ADMITTED = [
     "https://www.example.org",
 ];
 
-describe("the origin allowlist round trip", () => {
-    it("a republished deployment keeps every admitted origin", () => {
-        // Load: the admitted list becomes the draft. Publish: the untouched draft
-        // becomes the request. Nothing in between may narrow it.
-        const republished = originsFromDraft(originsDraftFrom(ADMITTED));
-        expect(republished).toEqual(ADMITTED);
+describe("the origin allowlist", () => {
+    it("keeps every admitted origin, in order, when one is added", () => {
+        expect(withOrigin(ADMITTED, "https://example.net")).toEqual([...ADMITTED, "https://example.net"]);
     });
 
-    it("shows the owner one origin per line", () => {
-        expect(originsDraftFrom(ADMITTED)).toBe(
-            "https://example.com\nhttps://www.example.com\nhttps://example.org\nhttps://www.example.org",
-        );
-        expect(originsDraftFrom([])).toBe("");
+    it("keeps a repeated origin once", () => {
+        expect(withOrigin(ADMITTED, "https://www.example.com")).toEqual(ADMITTED);
     });
 
-    it("treats whitespace and blank lines as editing, not as origins", () => {
-        expect(originsFromDraft("  https://example.com \r\n\n\thttps://www.example.com\n\n")).toEqual([
-            "https://example.com",
-            "https://www.example.com",
-        ]);
+    it("reads a bare host as its HTTPS origin", () => {
+        expect(normalizeOrigin("  theorya.com ")).toEqual({ origin: "https://theorya.com" });
     });
 
-    it("sends a repeated origin once, in first-seen order", () => {
-        expect(originsFromDraft("https://example.com\nhttps://www.example.com\nhttps://example.com")).toEqual([
-            "https://example.com",
-            "https://www.example.com",
-        ]);
+    it("drops a pasted page's path, query, and trailing slash", () => {
+        expect(normalizeOrigin("https://www.theorya.com/contact?ref=1")).toEqual({ origin: "https://www.theorya.com" });
+        expect(normalizeOrigin("https://theorya.com/")).toEqual({ origin: "https://theorya.com" });
     });
 
-    it("publishes no origins from an emptied draft, so the publisher refuses it", () => {
-        expect(originsFromDraft("")).toEqual([]);
-        expect(originsFromDraft(" \n \n")).toEqual([]);
+    it("keeps a port, which is part of the origin", () => {
+        expect(normalizeOrigin("https://staging.theorya.com:8443/")).toEqual({ origin: "https://staging.theorya.com:8443" });
     });
 
-    it("leaves what an origin is to the publisher", () => {
-        // The exact-HTTPS-origin rule and its message live in the publisher; the
-        // panel passes the entry through so that message, not a second one, is shown.
-        expect(originsFromDraft("http://example.com/")).toEqual(["http://example.com/"]);
+    it("refuses what a public deployment will not admit, in the owner's terms", () => {
+        expect(normalizeOrigin("http://theorya.com")).toEqual({ error: "The website must use https://." });
+        expect(normalizeOrigin("")).toEqual({ error: "Enter a website address." });
+        expect(normalizeOrigin("localhost")).toEqual({ error: "“localhost” isn't a website address." });
+        expect("error" in normalizeOrigin("https://exa mple.com")).toBe(true);
+    });
+
+    it("offers the www form of an apex and the apex of a www form", () => {
+        expect(wwwCounterpart("https://theorya.com")).toBe("https://www.theorya.com");
+        expect(wwwCounterpart("https://www.theorya.com")).toBe("https://theorya.com");
+        expect(wwwCounterpart("https://app.theorya.com")).toBeNull();
     });
 });

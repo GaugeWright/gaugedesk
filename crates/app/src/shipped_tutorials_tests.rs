@@ -65,7 +65,12 @@ fn the_owner_gets_a_read_only_gaugewright_tutorials_project() {
         !target.capabilities.propose && !target.capabilities.apply,
         "read-only"
     );
-    assert_eq!(target.current_basis.as_deref(), Some(head.as_str()));
+    assert_eq!(
+        guard.library.work_targets[&tutorial_tasks_source_id("account-root")]
+            .current_basis
+            .as_deref(),
+        Some(head.as_str())
+    );
     assert_eq!(
         guard.targets[&target_id]
             .read_main_file("basics.whip")
@@ -138,7 +143,12 @@ fn a_release_reconciles_the_folder_to_what_it_ships() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(last.cut, head);
+    assert_eq!(
+        guard.library.work_targets[&tutorial_tasks_source_id("account-root")]
+            .current_basis
+            .as_deref(),
+        Some(head.as_str())
+    );
     assert_eq!(last.version, env!("CARGO_PKG_VERSION"));
 }
 
@@ -169,7 +179,7 @@ fn basics_starts_once_from_the_tutorials_folder() {
         .unwrap();
     assert!(step.executed_effect.is_some(), "the first task is filed");
     let tasks = guard
-        .read_project_tracker_tasks(&context, &tutorial_project_id("account-root"), "tutorials")
+        .read_project_tracker_tasks(&context, &tutorial_project_id("account-root"), "tasks")
         .unwrap();
     let titles: Vec<_> = tasks
         .backlog
@@ -178,10 +188,88 @@ fn basics_starts_once_from_the_tutorials_folder() {
         .map(|issue| issue.title.as_str())
         .collect();
     assert_eq!(titles, vec!["Create a chat in Personal"]);
+    assert!(
+        guard
+            .read_project_tracker_backlog(
+                &context,
+                &tutorial_project_id("account-root"),
+                "tutorials",
+            )
+            .is_err(),
+        "new runs do not declare a second built-in tracker"
+    );
 
     assert!(guard
         .start_shipped_tutorial(&context, "nonexistent")
         .is_err());
+}
+
+#[test]
+fn an_older_project_run_keeps_its_pinned_tutorials_tracker() {
+    let (_root, wb) = owned();
+    let context = owner_context(&wb);
+    let mut guard = wb.lock_unpoisoned();
+    guard.ensure_shipped_tutorials().unwrap();
+    let project = tutorial_project_id("account-root");
+    let target_id = tutorial_target_id("account-root");
+    let legacy_source = include_str!("tutorials/basics.whip")
+        .replace("tracker tasks", "tracker tutorials")
+        .replace("into tasks", "into tutorials");
+    let cut = guard.targets[&target_id]
+        .seed_main_exactly(&[("basics.whip", legacy_source.as_str())], "whip")
+        .unwrap()
+        .0;
+    let mut record = guard.library.work_targets[&target_id].clone();
+    record.current_basis = Some(cut.clone());
+    guard.write_work_target_record(record);
+    guard
+        .declare_project_tracker(
+            &context,
+            &project,
+            "tutorials",
+            "shipped-tutorials",
+            gaugedesk_core::abac::ResourceAttributes::default(),
+        )
+        .unwrap();
+    let original = guard
+        .launch_project_workflow(
+            &context,
+            &crate::project_workflow::ProjectWorkflowLaunch {
+                project: project.clone(),
+                target: target_id,
+                path: "basics.whip".into(),
+                cut,
+                request_id: tutorial_request_id("basics"),
+                inputs: std::collections::BTreeMap::from([(
+                    "learner".into(),
+                    serde_json::json!({"authority":"account-root"}),
+                )]),
+            },
+            crate::project_workflow::ProjectWorkflowLimits::PRODUCT,
+        )
+        .unwrap();
+    guard.ensure_shipped_tutorials().unwrap();
+    let resumed = guard.start_shipped_tutorial(&context, "basics").unwrap();
+    assert_eq!(original.product_scope, resumed.product_scope);
+    assert!(resumed.command.resources.contains_key("tutorials"));
+    let step = guard
+        .step_project_workflow_unattended(
+            &resumed.product_scope,
+            crate::project_workflow::ProjectWorkflowLimits::PRODUCT,
+        )
+        .unwrap();
+    assert!(step.executed_effect.is_some());
+    let info = guard.shipped_tutorial_info(&context, "basics").unwrap();
+    assert_eq!(info["open_tasks"], 1);
+    assert_eq!(
+        guard
+            .read_project_tracker_tasks(&context, &project, "tutorials")
+            .unwrap()
+            .backlog
+            .issues
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -449,8 +537,11 @@ fn an_older_personal_run_resumes_without_starting_a_second_basics() {
         .init_at(&guard.targets_dir().join(TUTORIALS_TARGET))
         .unwrap();
     guard.targets.insert(TUTORIALS_TARGET.into(), workspace);
+    let legacy_source = include_str!("tutorials/basics.whip")
+        .replace("tracker tasks", "tracker tutorials")
+        .replace("into tasks", "into tutorials");
     let cut = guard.targets[TUTORIALS_TARGET]
-        .seed_main_exactly(SHIPPED, "whip")
+        .seed_main_exactly(&[("basics.whip", legacy_source.as_str())], "whip")
         .unwrap()
         .0;
     let mut record = crate::library_state::managed_target_record(

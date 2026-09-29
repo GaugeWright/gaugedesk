@@ -16,7 +16,7 @@ pub(super) fn setup() -> (
     wb.declare_project_tracker(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "declare",
         ResourceAttributes::default(),
     )
@@ -29,13 +29,13 @@ pub(super) fn setup() -> (
     let item = stores(&wb, &invocation)
         .runtime
         .items
-        .list_items(Some("tutorials"), None)
+        .list_items(Some("tasks"), None)
         .unwrap()
         .remove(0);
     drop(wb);
     let close = CompleteTrackerIssue {
         project: DEFAULT_PROJECT.into(),
-        queue: "tutorials".into(),
+        queue: "tasks".into(),
         subject_id: stores(&shared.lock_unpoisoned(), &invocation)
             .runtime
             .items
@@ -238,7 +238,7 @@ fn completion_refuses_wrong_queue_and_revoked_grant_before_new_native_evidence()
         .unwrap();
     let scope = format!(
         "project::{DEFAULT_PROJECT}::tracker::{}",
-        hex::encode("tutorials")
+        hex::encode("tasks")
     );
     let grant = wb
         .store_ref()
@@ -255,7 +255,7 @@ fn completion_refuses_wrong_queue_and_revoked_grant_before_new_native_evidence()
     wb.decide_project_tracker_access(
         &context,
         DEFAULT_PROJECT,
-        "tutorials",
+        "tasks",
         "revoke-completion",
         &grant.id,
         TrackerAccessDecision::Revoke,
@@ -353,7 +353,7 @@ fn readable_contributor_can_close_an_away_assignees_task_as_themselves() {
             .request_project_tracker_access(
                 &context,
                 DEFAULT_PROJECT,
-                "tutorials",
+                "tasks",
                 &id,
                 "colleague",
                 permission,
@@ -362,7 +362,7 @@ fn readable_contributor_can_close_an_away_assignees_task_as_themselves() {
         wb.decide_project_tracker_access(
             &context,
             DEFAULT_PROJECT,
-            "tutorials",
+            "tasks",
             &format!("approve-{id}"),
             &basis.id,
             TrackerAccessDecision::Approve,

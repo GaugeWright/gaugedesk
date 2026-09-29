@@ -18,9 +18,10 @@ import type { DeploymentSelection } from "./DeploymentPanel";
 import { availableProjectShareCandidates } from "./project-sharing";
 import "./project-settings.css";
 
-export type ProjectSettingsPage = "people" | "work-data" | "agents" | "model-access";
+export type ProjectSettingsPage = "overview" | "people" | "work-data" | "agents" | "model-access";
 
 const PAGE_LABELS: Readonly<Record<ProjectSettingsPage, string>> = {
+    overview: "Overview",
     people: "People & sharing",
     "work-data": "Work & data",
     agents: "Agents & placements",
@@ -51,6 +52,7 @@ interface ProjectSettingsProps {
     readonly project: ProjectNode;
     readonly library: readonly ArchetypeNode[];
     readonly page: ProjectSettingsPage;
+    readonly onSelectPage: (page: ProjectSettingsPage) => void;
     readonly onClose: () => void;
     readonly onChanged: () => Promise<void> | void;
     readonly onAttachTarget?: (kind: "external-vcs" | "external-folder") => void;
@@ -313,6 +315,19 @@ export function ProjectSettingsContent(props: ProjectSettingsProps): JSX.Element
                 <button type="button" onClick={props.onClose}>Close</button>
             </header>
             <div class="project-settings-title"><h2>{PAGE_LABELS[props.page]}</h2></div>
+            <Show when={props.page === "overview"}>
+                <section class="project-settings-overview" aria-label={`Settings for ${props.project.name}`}>
+                    <p>Choose what to manage in this project. Organization rules still apply to every change.</p>
+                    <div class="project-settings-overview-grid">
+                        <Show when={!props.project.isPersonal}>
+                            <button type="button" onClick={() => props.onSelectPage("people")}><strong>People & sharing</strong><span>Participants and project access</span></button>
+                        </Show>
+                        <button type="button" onClick={() => props.onSelectPage("work-data")}><strong>Work & data</strong><span>{props.project.targets.length} work {props.project.targets.length === 1 ? "target" : "targets"} · {props.project.networkIsolated ? "network isolated" : "network open"}</span></button>
+                        <button type="button" onClick={() => props.onSelectPage("agents")}><strong>Agents & placements</strong><span>{props.project.placements.filter((placement) => !placement.isDefault).length} placed</span></button>
+                        <button type="button" onClick={() => props.onSelectPage("model-access")}><strong>Model access</strong><span>Connections, models, and usage</span></button>
+                    </div>
+                </section>
+            </Show>
             <Show when={props.page === "people"}><PeopleAndSharing {...props} /></Show>
             <Show when={props.page === "work-data"}><WorkAndData {...props} /></Show>
             <Show when={props.page === "agents"}><AgentsAndPlacements {...props} /></Show>
@@ -338,8 +353,8 @@ export function ProjectSettingsMenu(props: {
     const pages = (): readonly ProjectSettingsPage[] => props.isPersonal === undefined
         ? []
         : props.isPersonal
-            ? ["work-data", "agents", "model-access"]
-            : ["people", "work-data", "agents", "model-access"];
+            ? ["overview", "work-data", "agents", "model-access"]
+            : ["overview", "people", "work-data", "agents", "model-access"];
     if (props.compact) return <nav class="project-settings-menu project-settings-menu-compact" aria-label={`Settings for ${props.projectName}`}>
         <button type="button" class="project-settings-menu-close" onClick={props.onClose}>{props.closeLabel ?? "Back to files"}</button>
         <label>

@@ -1029,6 +1029,7 @@ fn engine_peer_turn(
             mode: crate::library::ChatMode::Use,
             authenticated_actor: None,
             authenticated_context: None,
+            local_operator: false,
             contribution_by,
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,
@@ -6141,7 +6142,7 @@ pub(crate) fn distribution_operator_authorized(
 
 /// The project's participants, folded latest-wins per (authority, owns) so a later
 /// revoke supersedes the grant.
-fn participants_of(store: &Store, project: &str) -> Vec<serde_json::Value> {
+pub(crate) fn participants_of(store: &Store, project: &str) -> Vec<serde_json::Value> {
     let mut by_key: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for payload in store
         .records(&project_participants_scope(project), "participant")

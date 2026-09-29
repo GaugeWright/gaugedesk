@@ -70,6 +70,8 @@ pub const AGENT_PROPOSABLE_IMMEDIATE_COMMANDS: &[&str] = &[
     "commercial-engagement.invoice.issue",
     "commercial-payments.invoice.issue",
     "enterprise-identity.connection.validate",
+    "project.name.set",
+    "project.network-isolation.set",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -543,6 +545,7 @@ fn gaugeapp_agent_thread_owner_scope(session: &GaugeAppSession) -> String {
         GaugeAppKind::Administration | GaugeAppKind::CommercialOperations => {
             crate::org::tenant_scope(&session.scope.id)
         }
+        GaugeAppKind::ProjectSettings => crate::account::project_scope(&session.scope.id),
     }
 }
 
@@ -683,6 +686,7 @@ pub fn migrate_legacy_gaugeapp_agent_transcript(
         GaugeAppKind::AccountSettings => LegacyEnvironmentKind::Hub,
         GaugeAppKind::Administration => LegacyEnvironmentKind::Administration,
         GaugeAppKind::CommercialOperations => LegacyEnvironmentKind::Vend,
+        GaugeAppKind::ProjectSettings => return Ok(false),
     };
     let legacy_scope = format!(
         "environment-agent:{}:{}:{}",
@@ -2644,6 +2648,26 @@ mod tests {
             }],
             update_cursor: "cursor-1".into(),
         }
+    }
+
+    #[test]
+    fn project_management_threads_are_project_owned_and_separate() {
+        let mut first = gaugeapp();
+        first.app = GaugeAppKind::ProjectSettings;
+        first.scope = GaugeAppScope {
+            kind: "project".into(),
+            id: "project-one".into(),
+        };
+        assert_eq!(
+            gaugeapp_agent_thread_owner_scope(&first),
+            crate::account::project_scope("project-one")
+        );
+        let mut second = first.clone();
+        second.scope.id = "project-two".into();
+        assert_ne!(gaugeapp_thread_id(&first), gaugeapp_thread_id(&second));
+        second.scope = first.scope.clone();
+        second.app = GaugeAppKind::Administration;
+        assert_ne!(gaugeapp_thread_id(&first), gaugeapp_thread_id(&second));
     }
 
     #[test]

@@ -157,8 +157,8 @@ mod tests {
     use super::*;
     use gaugedesk_core::gaugevault::UseMode;
     use gaugedesk_core::ids::{
-        AuthorityId, ScopeId, SecretHandleId, VaultCandidateId, VaultCredentialId,
-        VaultIntakeMarkerId, VaultOperationId, VaultSubjectId, VaultTargetId,
+        AuthorityId, ScopeId, VaultCandidateId, VaultCredentialId, VaultIntakeMarkerId,
+        VaultOperationId, VaultStorageNameId, VaultSubjectId, VaultTargetId, VaultTenantPrefixId,
     };
 
     fn binding() -> Binding {
@@ -168,6 +168,10 @@ mod tests {
             credential_scope: ScopeId::from("owner:synthetic:vault:one"),
             credential: VaultCredentialId::from("credential-one"),
         }
+    }
+
+    fn storage(marker: &str) -> VaultStorageNameId {
+        VaultStorageNameId::from(format!("gv-{}-{marker}", "1".repeat(32)))
     }
 
     fn request(now: u64) -> BeginDispatchRequest {
@@ -219,7 +223,7 @@ mod tests {
             0,
             1,
             Operation::Create {
-                storage_name: SecretHandleId::from("opaque-storage-name"),
+                tenant_prefix: VaultTenantPrefixId::from("1".repeat(32)),
             },
         );
         admit_operation(
@@ -229,6 +233,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-one"),
                 marker: VaultIntakeMarkerId::from("0123456789abcdef0123456789abcdef"),
+                storage_name: storage("0123456789abcdef0123456789abcdef"),
                 deadline: 100,
             },
         );
@@ -324,7 +329,7 @@ mod tests {
             0,
             1,
             Operation::Create {
-                storage_name: SecretHandleId::from("opaque-storage-name"),
+                tenant_prefix: VaultTenantPrefixId::from("1".repeat(32)),
             },
         );
         assert!(matches!(
@@ -375,6 +380,7 @@ mod tests {
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-two"),
                 marker: VaultIntakeMarkerId::from("fedcba9876543210fedcba9876543210"),
+                storage_name: storage("fedcba9876543210fedcba9876543210"),
                 deadline: 100,
             },
         );

@@ -609,6 +609,9 @@ Then("the shipped desktop updater reads the tenant software policy", async () =>
 
 When("I ask the Administration agent to propose inviting {string}", async ({ page }, authority: string) => {
     const composer = page.getByPlaceholder("ask administration…");
+    if (!await composer.isVisible()) {
+        await page.getByRole("button", { name: /Administration agent/ }).click();
+    }
     await composer.fill(`/propose people.invitation.create ${JSON.stringify({ emails: [authority], role: "member" })}`);
     // ⏎ follows the composer's mode; see `sendDraft` in steps.ts for why the
     // primary button is not clicked here.
@@ -622,4 +625,9 @@ Then("the Administration agent opens a reviewable member proposal for {string}",
     )).toBeVisible();
     await expect(page.getByRole("region", { name: "Pending changes" })).toContainText(authority);
     await expect(page.locator(".gaugeapp-people-list").getByText(authority, { exact: true })).toHaveCount(0);
+    // Management conversations mount the same user-turn rail as work chats.
+    const mark = page.locator("[data-chat-message-mark='0']");
+    await expect(mark).toBeVisible();
+    await mark.hover();
+    await expect(page.locator("[data-chat-message-preview]")).toContainText("people.invitation.create");
 });

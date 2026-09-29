@@ -22,6 +22,59 @@ export interface AccountTenant {
     readonly personal: boolean;
     /** Server-derived from active Commercial Operations standing. */
     readonly providerCommercial: boolean;
+    /** Founder-only reservation; `homeId: null` is a pending project. */
+    readonly sharedProject?: OrganizationSharedProject;
+}
+
+/** Hub reservation only. Project content and membership live on the selected Home. */
+export interface OrganizationSharedProject {
+    readonly id: "shared";
+    readonly projectId: string;
+    readonly foundingOwner: string;
+    readonly displayName: string;
+    readonly homeId: string | null;
+}
+
+function parseOrganizationSharedProject(value: unknown): OrganizationSharedProject {
+    const record = (value ?? {}) as Record<string, unknown>;
+    if (record.id !== "shared"
+        || typeof record.project_id !== "string"
+        || typeof record.founding_owner !== "string"
+        || typeof record.display_name !== "string"
+        || !(record.home_id === null || typeof record.home_id === "string")) {
+        throw new Error("organization shared project reservation is malformed");
+    }
+    return {
+        id: "shared",
+        projectId: record.project_id,
+        foundingOwner: record.founding_owner,
+        displayName: record.display_name,
+        homeId: record.home_id,
+    };
+}
+
+/** Read a founder-visible pending or placed organization project. */
+export async function organizationSharedProject(
+    json: RouteJson,
+    tenantId: string,
+): Promise<OrganizationSharedProject> {
+    const reply = (await json("GET", `/account/tenants/${encodeURIComponent(tenantId)}/shared-project`)) as Record<string, unknown>;
+    return parseOrganizationSharedProject(reply.project);
+}
+
+/** Ask the exact selected Home to complete the Hub's stable reservation. */
+export async function materializeOrganizationSharedProject(
+    homeJson: RouteJson,
+    tenantId: string,
+    personalDefault: boolean,
+): Promise<string> {
+    const reply = (await homeJson(
+        "POST",
+        `/organizations/${encodeURIComponent(tenantId)}/shared-project/materialize`,
+        { personal_default: personalDefault },
+    )) as { project?: { id?: unknown } };
+    if (typeof reply.project?.id !== "string") throw new Error("organization Home returned no project");
+    return reply.project.id;
 }
 
 /** A metadata-only pointer to a pending tenant invitation. The directory owns
@@ -63,12 +116,18 @@ export function parseFacility(v: unknown): AccountFacility {
 /** Parse one tenant switcher entry (total; never throws). */
 export function parseTenant(v: unknown): AccountTenant {
     const o = (v ?? {}) as Record<string, unknown>;
+    let sharedProject: OrganizationSharedProject | undefined;
+    if (o.shared_project !== undefined) {
+        try { sharedProject = parseOrganizationSharedProject(o.shared_project); }
+        catch { /* A malformed optional projection grants nothing. */ }
+    }
     return {
         id: typeof o.id === "string" ? o.id : "",
         displayName: typeof o.display_name === "string" ? o.display_name : "",
         role: typeof o.role === "string" ? o.role : "",
         personal: o.personal === true,
         providerCommercial: o.provider_commercial === true,
+        ...(sharedProject ? { sharedProject } : {}),
     };
 }
 

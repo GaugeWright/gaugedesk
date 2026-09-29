@@ -84,10 +84,13 @@ case "${1:-}" in
     node scripts/check-tokenwright-environment.mjs
     node scripts/check-tokenwright-carried-surface.mjs ;;
   updater-endpoint)        node scripts/check-updater-endpoint.mjs ;;
-  release-version-sources) python3 scripts/check-release-version-sources.py ;;
+  release-version-sources)
+    python3 scripts/check-release-version-sources.py
+    python3 scripts/test-release-version-sources.py ;;
   app-icons)               node scripts/check-app-icons.mjs ;;
   release-identity)        node --test scripts/build-release-identity.test.mjs \
-                                      scripts/check-updater-signature.test.mjs ;;
+                                      scripts/check-updater-signature.test.mjs \
+                                      scripts/release-updater-manifest.test.mjs ;;
   codex-login-helper)      node --test sidecar/codex-oauth-login.test.mjs ;;
   production-canary-contract)
     node scripts/check-production-canaries.mjs
@@ -151,7 +154,11 @@ case "${1:-}" in
   # freely and writes the lock on its way past. `--locked` refuses instead, so
   # the drift fails where `cargo metadata` alone repairs it, rather than after
   # a round trip through the fleet.
-  lockfile)                cargo metadata --locked --format-version 1 >/dev/null ;;
+  lockfile)
+    cargo metadata --locked --format-version 1 >/dev/null
+    # The shells pin what they share with the trunk at its versions (DR-0241).
+    node --test scripts/check-shell-lockfiles.test.mjs
+    node scripts/check-shell-lockfiles.mjs ;;
   formatting)              cargo fmt --all --check ;;
   lints)                   cargo clippy --workspace --all-targets -- -D warnings ;;
   tests)
@@ -194,9 +201,6 @@ case "${1:-}" in
     else
         cargo test --workspace
     fi ;;
-  # What the tests section runs after nextest, alone: the native test runs, like
-  # nextest, do not run doctests.
-  doctests)                cargo test --workspace --doc ;;
   # The native targets are rendered from Cargo.toml (GaugeWright BUILD.md
   # stages 5 and 6); this fails when the rendering has drifted from it.
   native-crates)           python3 scripts/buckify-crates.py --check ;;
@@ -218,7 +222,10 @@ case "${1:-}" in
     # node_modules above is: a developer pays once, CI pays every run because
     # its checkout is always fresh.
     # Both modules, because either one missing fails the build the same way.
-    { [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
+    # Handed both already linked (the native bar), it always packages them: a
+    # generated tree an earlier cargo run left is not what this bar built.
+    { [ -z "${GAUGEDESK_WASM_TUNNEL:-}" ] \
+        && [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
         && [ -f web/packages/control-plane-client/src/generated/directory.js ]; } \
         || scripts/build-wasm.sh
     [ -d ee/web/node_modules ] || npm --prefix ee/web ci

@@ -215,7 +215,6 @@ export type {
     DeploymentPanelApi,
     DeploymentSelection,
 } from "./DeploymentPanel";
-export { PanelAgentPreview } from "./PanelAgentPreview";
 export { PanelAgentSurface } from "./PanelAgentSurface";
 export type { PanelAgentSurfaceApi } from "./PanelAgentSurface";
 export { PanelContractEditor } from "./PanelContractEditor";

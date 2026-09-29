@@ -67,3 +67,42 @@ Then("the chat log rests at its end", async ({ page }) => {
         })
         .toBeLessThanOrEqual(24);
 });
+
+Then("the user-message rail has {int} marks", async ({ page }, count: number) => {
+    await expect(page.locator("[data-chat-message-mark]")).toHaveCount(count);
+});
+
+When("I hover the first user-message mark", async ({ page }) => {
+    await page.locator("[data-chat-message-mark='0']").hover();
+});
+
+Then("the message preview shows {string}", async ({ page }, text: string) => {
+    await expect(page.locator("[data-chat-message-preview]")).toContainText(text);
+});
+
+Then("the hovered mark is wider than its neighbor", async ({ page }) => {
+    await expect.poll(async () => {
+        const widths = await page.locator("[data-chat-message-mark]").evaluateAll((marks) =>
+            marks.slice(0, 2).map((mark) => mark.querySelector("span")?.getBoundingClientRect().width ?? 0),
+        );
+        return widths[0] > widths[1];
+    }).toBe(true);
+});
+
+When("I jump to the first user message", async ({ page }) => {
+    await page.locator("[data-chat-message-mark='0']").click();
+});
+
+Then("the first user message is near the top of the chat log", async ({ page }) => {
+    await expect.poll(async () => {
+        const log = await transcript(page).boundingBox();
+        const message = await transcript(page).locator(".line.user").first().boundingBox();
+        if (!log || !message) return "detached";
+        const offset = message.y - log.y;
+        return offset >= -1 && offset <= 48 ? "placed" : `off by ${Math.round(offset)}px`;
+    }).toBe("placed");
+});
+
+Then("the first user-message mark shows the reading position", async ({ page }) => {
+    await expect(page.locator("[data-chat-message-mark='0']")).toHaveAttribute("aria-current", "location");
+});
