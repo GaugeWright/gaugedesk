@@ -797,6 +797,40 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
     }
     const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string; kind: AgentKind } | null>(null);
+    const [preparedImproveCampaign, setPreparedImproveCampaign] = createSignal<{
+        agentId: ArchetypeId;
+        account: string | null;
+        campaignRef: string;
+        openSource: string;
+    } | null>(null);
+    const [latestImprovePool] = createResource(
+        () => {
+            const id = agentSettings()?.id;
+            return isTauri() && homeState()?.kind === "direct" && id
+                ? { id, account: bearer() } : null;
+        },
+        async ({ id }) => {
+            try {
+                const { invoke } = await import("@tauri-apps/api/core");
+                const pool = await invoke<{ campaign_ref: string; open_source: string } | null>(
+                    "latest_agent_improve_pool", { agentId: id },
+                );
+                return pool ? { agentId: id, campaignRef: pool.campaign_ref, openSource: pool.open_source } : null;
+            } catch (error) {
+                return { agentId: id, error: String(error) };
+            }
+        },
+    );
+    const preparedImproveFor = (id: ArchetypeId) => {
+        const local = preparedImproveCampaign();
+        if (local?.agentId === id && local.account === bearer()) return local;
+        const retained = latestImprovePool();
+        return retained?.agentId === id && "campaignRef" in retained ? retained : null;
+    };
+    const improveRecoveryErrorFor = (id: ArchetypeId) => {
+        const retained = latestImprovePool();
+        return retained?.agentId === id && "error" in retained ? retained.error : undefined;
+    };
     let agentSettingsOpenSequence = 0;
     // The per-project Engagement pane (FED-7), opened from a project node.
     const [engagement, setEngagement] = createSignal<{ id: ProjectId; name: string } | null>(null);
@@ -1717,6 +1751,53 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 setStatus(`Couldn't open ${name} settings: ${String(error)}`);
             }
         }
+    }
+
+    async function prepareAgentImprovePool(id: ArchetypeId, poolJson: string) {
+        const chat = selected();
+        if (!isTauri() || homeState()?.kind !== "direct" || agentSettings()?.id !== id || !chat) {
+            throw new Error("Open this Agent in the desktop Workshop first.");
+        }
+        if (draft().trim()) {
+            throw new Error("Send or clear the current edit-chat draft before preparing cases.");
+        }
+        const { invoke } = await import("@tauri-apps/api/core");
+        const prepared = await invoke<{ campaign_ref: string; open_source: string }>(
+            "start_agent_improve_pool",
+            { agentId: id, poolJson },
+        );
+        if (typeof prepared.open_source !== "string" || !prepared.open_source) {
+            throw new Error("Home did not return the open cases.");
+        }
+        if (typeof prepared.campaign_ref !== "string" || !prepared.campaign_ref) {
+            throw new Error("Home did not return the retained campaign reference.");
+        }
+        setPreparedImproveCampaign({
+            agentId: id, account: bearer(),
+            campaignRef: prepared.campaign_ref, openSource: prepared.open_source,
+        });
+        if (selected() !== chat || draft().trim()) {
+            throw new Error("Pool saved in Home. Return to this Agent's empty edit-chat draft to place the open cases.");
+        }
+        placePreparedImproveCases(id);
+    }
+
+    function placePreparedImproveCases(id: ArchetypeId) {
+        const prepared = preparedImproveFor(id);
+        if (!prepared || prepared.agentId !== id || agentSettings()?.id !== id || !selected()) {
+            throw new Error("Open this Agent's edit chat to place its prepared cases.");
+        }
+        if (draft().trim()) throw new Error("Send or clear the current edit-chat draft first.");
+        // The pool's exact checks and sampled sealed cases never enter the
+        // composer. Keep the private campaign reference in Home/UI custody.
+        const openPrompt =
+            "Propose one improvement to this Agent's authored files using the open cases below. " +
+            "You may edit agent/, .whipple/draft/, and .whipple/discipline/draft/. " +
+            "Treat these as examples, not a complete rubric. Leave the changes for comparison; do not claim held-out success.\n\n" +
+            `Open cases:\n\`\`\`json\n${prepared.openSource}\n\`\`\``;
+        setDraft(openPrompt);
+        workbenchShell.openPane("chat", { chatSelected: true, fileSelected: false });
+        queueMicrotask(() => composerEl?.focus());
     }
 
     // Opening a Panel agent is one movement across the panes (navigation.md,
@@ -3979,6 +4060,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 refreshKey={navRefresh()}
                                 onClose={() => setAgentSettings(null)}
                                 onSaved={bumpNav}
+                                onPrepareImprove={isTauri() && homeState()?.kind === "direct"
+                                    ? (poolJson) => prepareAgentImprovePool(a.id, poolJson) : undefined}
+                                preparedImproveRef={preparedImproveFor(a.id)?.campaignRef}
+                                onUsePreparedImprove={() => placePreparedImproveCases(a.id)}
+                                improveRecoveryError={improveRecoveryErrorFor(a.id)}
                             />}
                         </Show>
                     }>

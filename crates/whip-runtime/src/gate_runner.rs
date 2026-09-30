@@ -29,7 +29,7 @@ use whipplescript_kernel::coerce_native::{
 };
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{run_file_effect_generic, run_queue_effect_generic};
-use whipplescript_kernel::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
+use whipplescript_kernel::import_coverage::{self, CheckedImportBasis, NO_LOCK_DIGEST};
 use whipplescript_kernel::instance_machine::{
     EffectStep, InstanceDriver, InstanceOutcome, InstanceStepMachine,
 };
@@ -41,9 +41,10 @@ use whipplescript_kernel::sansio::{
 use whipplescript_kernel::{CoerceExecution, ProgramVersionInput, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::native_stores::NativeStores;
+use whipplescript_store::program_imports::ProgramImportOperationKind;
 use whipplescript_store::{
     stable_hash_hex, ClaimableEffect, InstanceView, ProgramVersionRecord, RunStart, RuntimeStore,
-    StoreError,
+    SqliteStore, StoreError,
 };
 
 #[path = "gate_files.rs"]
@@ -438,6 +439,107 @@ pub struct GateNewAdmissionBasis<'a> {
     pub compiler_artifact_digest: &'a str,
     pub lock_digest: &'a str,
     pub envelope_digest: &'a str,
+}
+
+/// Exact checked target evidence for Home completion or a retained-use pin.
+/// The caller still checks this against the Home's registered basis and item
+/// binding; this readback alone does not certify the Home's accepting roster.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateImportEvidence {
+    pub operation_id: String,
+    pub program_id: String,
+    pub program_name: String,
+    pub version_id: String,
+    pub witness_digest: String,
+    pub source_digest: String,
+    pub ir_digest: String,
+    pub compiler_artifact_digest: String,
+    pub lock_digest: String,
+    pub envelope_digest: String,
+}
+
+/// Re-read one checked operation without creating or repairing its target
+/// store. A retained item uses the source and IR pinned by its historical
+/// version, under the Home's current governance envelope; an edit to the
+/// project's next gate does not silently substitute for that version.
+pub fn verify_gate_import_operation(
+    current: &GateProgram,
+    state_dir: &Path,
+    operation_id: &str,
+) -> Result<GateImportEvidence, GateRunError> {
+    let repair = |detail: &str| {
+        GateRunError::NoDisposition(format!(
+        "gate import operation {operation_id} cannot be used: {detail}; preserve the item and repair its exact Home/target evidence"
+    ))
+    };
+    let path = state_dir.join("runtime.sqlite");
+    if !path.is_file() {
+        return Err(repair("target runtime store is missing"));
+    }
+    let store = SqliteStore::open_read_only(&path)?;
+    let operation = store
+        .program_import_operation(operation_id)?
+        .ok_or_else(|| repair("target operation is missing"))?;
+    if operation.kind != ProgramImportOperationKind::Checked {
+        return Err(repair("target operation is not checked"));
+    }
+    let witness_digest = operation
+        .witness_digest
+        .as_deref()
+        .ok_or_else(|| repair("checked target operation has no witness digest"))?;
+    let witness = store
+        .program_import_witness(&operation.version_id, witness_digest)?
+        .ok_or_else(|| repair("target import witness is missing"))?;
+    let version = store
+        .get_program_version(&operation.version_id)?
+        .ok_or_else(|| repair("target program version is missing"))?;
+    let source = store
+        .get_content(&version.source_hash)?
+        .ok_or_else(|| repair("retained program source is missing"))?;
+    let snapshot = store
+        .get_content(&version.ir_hash)?
+        .ok_or_else(|| repair("retained IR snapshot is missing"))?;
+    if stable_hash_hex(&source) != version.source_hash
+        || stable_hash_hex(&snapshot) != version.ir_hash
+    {
+        return Err(repair("retained source or IR differs from its version"));
+    }
+    let retained = GateProgram::compile(&source, &current.envelope)?;
+    if retained.ir.workflow != version.program_name
+        || whipplescript_parser::snapshot::identity_projection(&retained.ir.to_snapshot())
+            != snapshot
+    {
+        return Err(repair(
+            "current compiler does not reproduce the retained program",
+        ));
+    }
+    let source_digest = whipplescript_kernel::exec_http::sha256_hex(source.as_bytes());
+    let compiler_artifact_digest = whipplescript::host_runtime::native_compiler_artifact_digest()
+        .map_err(GateRunError::NoDisposition)?;
+    let basis = CheckedImportBasis {
+        program_source_digest: &source_digest,
+        version_source_digest: None,
+        lock_digest: NO_LOCK_DIGEST,
+        compiler_artifact_digest: &compiler_artifact_digest,
+        packages: &[],
+    };
+    if !import_coverage::current_basis(&witness, &retained.ir, &basis) {
+        return Err(repair(
+            "import witness differs from the retained current basis",
+        ));
+    }
+    Ok(GateImportEvidence {
+        operation_id: operation.operation_id,
+        program_id: version.program_id,
+        program_name: version.program_name,
+        version_id: operation.version_id,
+        witness_digest: witness_digest.to_owned(),
+        source_digest,
+        ir_digest: version.ir_hash,
+        compiler_artifact_digest,
+        lock_digest: NO_LOCK_DIGEST.to_owned(),
+        envelope_digest: whipplescript_kernel::exec_http::sha256_hex(current.envelope.as_bytes()),
+    })
 }
 
 /// Call `check_use` after version selection and before instance creation,

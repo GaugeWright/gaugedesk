@@ -7,10 +7,35 @@
 import { describe, expect, it } from "vitest";
 import {
     AGENT_ABILITY_PRESETS,
+    buildImprovePool,
     plainConfigError,
     readFormConfig,
     writeFormConfig,
 } from "./AgentSettings";
+
+describe("Agent improvement case pool", () => {
+    it("submits a complete unsampled pool with host-owned text checks", () => {
+        const cases = ["alpha", "beta", "gamma", "delta"].map((word) => ({
+            prompt: `Return ${word}`,
+            expected: word,
+        }));
+        const pool = JSON.parse(buildImprovePool(cases));
+        expect(pool.schema).toBe("gaugedesk.agent-improve.pool.v1");
+        expect(pool.selection).toEqual({ ascend: { quality: null } });
+        expect(pool.scenarios).toHaveLength(4);
+        expect(pool.scenarios[0]).toEqual({
+            id: "case-1",
+            prompt: "Return alpha",
+            checks: { quality: { kind: "assistant-contains", text: "alpha" } },
+        });
+        expect(JSON.stringify(pool)).not.toContain("sealed_scenarios");
+    });
+
+    it("refuses a too-small or incomplete pool before Home intake", () => {
+        expect(() => buildImprovePool([{ prompt: "one", expected: "one" }])).toThrow(/four cases/);
+        expect(() => buildImprovePool(Array.from({ length: 4 }, () => ({ prompt: "", expected: "x" })))).toThrow(/prompt/);
+    });
+});
 
 describe("agent ability presets", () => {
     it("exposes the four ordered ceilings without ask_human", () => {

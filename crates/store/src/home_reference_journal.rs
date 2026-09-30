@@ -267,6 +267,26 @@ fn use_pin(
     }))
 }
 
+fn completed_through_epoch(
+    conn: &Connection,
+    epoch: i64,
+) -> Result<Vec<ReferenceOperation>, JournalError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT operation_id FROM home_reference_operations \
+         WHERE completed_epoch <= ?1 ORDER BY operation_id",
+    )?;
+    let ids = stmt
+        .query_map([epoch], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.into_iter()
+        .map(|id| {
+            operation(conn, &id)?.ok_or(JournalError::Conflict(
+                "sealed reference operation disappeared",
+            ))
+        })
+        .collect()
+}
+
 fn completed_in_epoch(
     conn: &Connection,
     epoch: i64,
@@ -294,6 +314,43 @@ fn digest(operations: &[ReferenceOperation]) -> Result<String, JournalError> {
 }
 
 impl Store {
+    /// Give one logical checked-program request a recoverable target operation
+    /// identity. The request key is chosen and retained by the authenticated
+    /// Home, not by the runtime store. It deliberately excludes the basis:
+    /// retrying the same request after a source or policy change must conflict
+    /// with its original registration instead of silently creating a second
+    /// operation. A changed target is a different request and needs explicit
+    /// disposition of the first one.
+    pub fn register_checked_program_request(
+        &mut self,
+        home_id: &str,
+        target_store: &str,
+        request_key: &str,
+        basis_digest: &str,
+    ) -> Result<ReferenceOperation, JournalError> {
+        for value in [home_id, target_store, request_key, basis_digest] {
+            required(value)?;
+        }
+        let identity = serde_json::to_vec(&(
+            "gaugedesk.checked-program-request.v1",
+            home_id,
+            target_store,
+            request_key,
+        ))
+        .map_err(|error| JournalError::Verification(error.to_string()))?;
+        let hash = Sha256::digest(identity);
+        let operation_id = format!("imp_{}", hex::encode(&hash[..16]));
+        self.register_reference_operation(
+            home_id,
+            &NewReferenceOperation {
+                operation_id: &operation_id,
+                target_store,
+                kind: "checked-program",
+                basis_digest,
+            },
+        )
+    }
+
     /// Register before the target runtime store writes. An exact retry returns
     /// the same row; an identity reused for different meaning is refused.
     pub fn register_reference_operation(
@@ -666,9 +723,10 @@ impl Store {
         Ok(pinned)
     }
 
-    /// Atomically freeze the completed roster and advance admission to the
-    /// next epoch. Pending rows remain owed. The seal is an exact cut, but it
-    /// cannot claim completeness until the accepting-path inventory is proved.
+    /// Atomically freeze every operation completed through this epoch and
+    /// advance admission to the next. Pending rows remain owed. The seal is
+    /// an exact cut, but cannot claim completeness until the accepting-path
+    /// inventory is proved.
     pub fn seal_reference_epoch(
         &mut self,
         home_id: &str,
@@ -683,12 +741,13 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let epoch = bind_home(&tx, home_id)?;
-        let operations = completed_in_epoch(&tx, epoch)?;
+        let operations = completed_through_epoch(&tx, epoch)?;
         let roster_digest = digest(&operations)?;
         tx.execute(
             "INSERT INTO home_reference_seals \
              (epoch, home_id, registry_basis, policy_basis, structural_basis, \
-              roster_digest, operation_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              roster_digest, operation_count, roster_scope) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'through_epoch')",
             params![
                 epoch,
                 home_id,
@@ -722,11 +781,11 @@ impl Store {
         &self,
         epoch: i64,
     ) -> Result<Option<ReferenceSeal>, JournalError> {
-        let seal: Option<(String, String, String, String, String, i64)> = self
+        let seal: Option<(String, String, String, String, String, i64, String)> = self
             .conn
             .query_row(
                 "SELECT home_id, registry_basis, policy_basis, structural_basis, \
-                        roster_digest, operation_count \
+                        roster_digest, operation_count, roster_scope \
                  FROM home_reference_seals WHERE epoch = ?1",
                 [epoch],
                 |row| {
@@ -737,16 +796,32 @@ impl Store {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((home_id, registry_basis, policy_basis, structural_basis, roster_digest, count)) =
-            seal
+        let Some((
+            home_id,
+            registry_basis,
+            policy_basis,
+            structural_basis,
+            roster_digest,
+            count,
+            roster_scope,
+        )) = seal
         else {
             return Ok(None);
         };
-        let operations = completed_in_epoch(&self.conn, epoch)?;
+        let operations = match roster_scope.as_str() {
+            "epoch" => completed_in_epoch(&self.conn, epoch)?,
+            "through_epoch" => completed_through_epoch(&self.conn, epoch)?,
+            _ => {
+                return Err(JournalError::Conflict(
+                    "unknown reference seal roster scope",
+                ))
+            }
+        };
         if operations.len() as i64 != count || digest(&operations)? != roster_digest {
             return Err(JournalError::Conflict(
                 "sealed reference roster differs from its durable cut",
@@ -807,6 +882,59 @@ mod tests {
             evidence_ref: "operation:one".into(),
             witness_digest: "witness:one".into(),
         })
+    }
+
+    #[test]
+    fn checked_program_request_recovers_one_operation_and_refuses_changed_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("home.db");
+        let path = path.to_str().unwrap();
+        let mut store = Store::open(path).unwrap();
+        let first = store
+            .register_checked_program_request(
+                "home:one",
+                "gates/project:one/runtime.sqlite",
+                "item:one:first-admission",
+                "source+lock+compiler+policy:one",
+            )
+            .unwrap();
+        assert!(first.operation_id.starts_with("imp_"));
+        assert_eq!(first.operation_id.len(), 36);
+        assert_eq!(first.registered_epoch, 0);
+        drop(store);
+
+        let mut reopened = Store::open(path).unwrap();
+        let retry = reopened
+            .register_checked_program_request(
+                "home:one",
+                "gates/project:one/runtime.sqlite",
+                "item:one:first-admission",
+                "source+lock+compiler+policy:one",
+            )
+            .unwrap();
+        assert_eq!(retry, first);
+        assert!(matches!(
+            reopened.register_checked_program_request(
+                "home:one",
+                "gates/project:one/runtime.sqlite",
+                "item:one:first-admission",
+                "source+lock+compiler+policy:two",
+            ),
+            Err(JournalError::Conflict(_))
+        ));
+        let other = reopened
+            .register_checked_program_request(
+                "home:one",
+                "gates/project:one/runtime.sqlite",
+                "item:two:first-admission",
+                "source+lock+compiler+policy:one",
+            )
+            .unwrap();
+        assert_ne!(other.operation_id, first.operation_id);
+        assert_eq!(
+            reopened.reference_operation(&first.operation_id).unwrap(),
+            Some(first)
+        );
     }
 
     #[test]
@@ -1038,6 +1166,43 @@ mod tests {
     }
 
     #[test]
+    fn later_seal_retains_every_earlier_completed_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("home.db");
+        let path = path.to_str().unwrap();
+        let mut store = Store::open(path).unwrap();
+        store
+            .register_reference_operation("home:one", &input("one"))
+            .unwrap();
+        store
+            .complete_reference_operation("home:one", "one", evidence)
+            .unwrap();
+        let first = store
+            .seal_reference_epoch("home:one", "registry:1", "policy:1", "tree:1")
+            .unwrap();
+        store
+            .register_reference_operation("home:one", &input("two"))
+            .unwrap();
+        store
+            .complete_reference_operation("home:one", "two", evidence)
+            .unwrap();
+        let second = store
+            .seal_reference_epoch("home:one", "registry:2", "policy:2", "tree:2")
+            .unwrap();
+        let ids: Vec<_> = second
+            .operations
+            .iter()
+            .map(|operation| operation.operation_id.as_str())
+            .collect();
+        assert_eq!(ids, ["one", "two"]);
+        assert_ne!(first.roster_digest, second.roster_digest);
+        drop(store);
+        let reopened = Store::open(path).unwrap();
+        assert_eq!(reopened.sealed_reference_epoch(0).unwrap(), Some(first));
+        assert_eq!(reopened.sealed_reference_epoch(1).unwrap(), Some(second));
+    }
+
+    #[test]
     fn exact_retries_survive_reopen_and_identity_reuse_refuses() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("home.db");
@@ -1212,16 +1377,32 @@ mod tests {
         conn.execute_batch(
             "DROP TABLE home_reference_use_pins; \
              DROP TABLE home_reference_refusals; \
-             DELETE FROM schema_migrations WHERE version IN (4, 5);",
+             ALTER TABLE home_reference_seals DROP COLUMN roster_scope; \
+             DELETE FROM schema_migrations WHERE version IN (4, 5, 6);",
         )
         .unwrap();
         drop(conn);
-        let upgraded = Store::open(path).unwrap();
+        let mut upgraded = Store::open(path).unwrap();
         assert_eq!(upgraded.sealed_reference_epoch(0).unwrap(), Some(sealed));
         assert_eq!(
             upgraded.schema_version().unwrap(),
             crate::SUPPORTED_SCHEMA_VERSION
         );
+        upgraded
+            .register_reference_operation("home:one", &input("two"))
+            .unwrap();
+        upgraded
+            .complete_reference_operation("home:one", "two", evidence)
+            .unwrap();
+        let next = upgraded
+            .seal_reference_epoch("home:one", "registry:2", "policy:2", "tree:2")
+            .unwrap();
+        let ids: Vec<_> = next
+            .operations
+            .iter()
+            .map(|operation| operation.operation_id.as_str())
+            .collect();
+        assert_eq!(ids, ["one", "two"]);
     }
 
     #[test]

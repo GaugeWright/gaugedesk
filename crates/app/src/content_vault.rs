@@ -57,6 +57,8 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     // private field is additionally sealed with the Home account key.
     "agent_improve_campaign_source",
     "agent_improve_campaign_evidence",
+    "agent_improve_selected_candidate",
+    "agent_improve_sealed_exposure",
     // GaugeApp management conversations and their generation pointer. The
     // transcript has an independent per-thread key; the pointer lives under
     // its owning account/tenant key so parent erasure reaches both layers.

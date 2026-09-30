@@ -22,8 +22,8 @@ use gaugedesk_app::gate::{
 };
 use gaugedesk_whip_runtime::gate_runner::{
     deliver_verdict, deliver_verdict_with_use_check, reviews_awaiting_a_person, run_gate,
-    run_gate_with_home_admission, run_gate_with_use_check, Disposition, GateCoercionConfig,
-    GateProgram, GateRunError, GateTransport, GateVersionUse,
+    run_gate_with_home_admission, run_gate_with_use_check, verify_gate_import_operation,
+    Disposition, GateCoercionConfig, GateProgram, GateRunError, GateTransport, GateVersionUse,
 };
 use gaugedesk_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
 use whipplescript_kernel::coerce_native::CoerceProvider;
@@ -293,6 +293,107 @@ fn a_home_operation_is_registered_before_new_gate_target_evidence() {
         1
     );
     assert!(stores.list_instances().unwrap().is_empty());
+}
+
+#[test]
+fn home_readback_revalidates_the_exact_retained_gate_import_operation() {
+    const OPERATION_ID: &str = "imp_44444444444444444444444444444444";
+    let quarantine = staged(r#"{"q1":"the coffee was cold"}"#);
+    let state = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("keep");
+    assert!(verify_gate_import_operation(&compiled(), state.path(), OPERATION_ID).is_err());
+    assert!(!state.path().join("runtime.sqlite").exists());
+    let registered = RefCell::new(None);
+    let result = run_gate_with_home_admission(
+        &compiled(),
+        &config(),
+        ITEM,
+        quarantine.path(),
+        state.path(),
+        &provider,
+        |basis| {
+            *registered.borrow_mut() = Some((
+                basis.program_name.to_owned(),
+                basis.source_digest.to_owned(),
+                basis.ir_digest.to_owned(),
+                basis.compiler_artifact_digest.to_owned(),
+                basis.lock_digest.to_owned(),
+                basis.envelope_digest.to_owned(),
+            ));
+            Ok(OPERATION_ID.into())
+        },
+        |_| Err(GateRunError::NoDisposition("Home pointer pending".into())),
+    );
+    assert!(matches!(result, Err(GateRunError::NoDisposition(_))));
+    assert!(provider.seen.borrow().is_empty());
+
+    let evidence = verify_gate_import_operation(&compiled(), state.path(), OPERATION_ID)
+        .expect("exact checked operation can be completed by its Home");
+    let (name, source, ir, compiler, lock, envelope) = registered.into_inner().unwrap();
+    assert_eq!(
+        (
+            evidence.program_name.as_str(),
+            evidence.source_digest.as_str(),
+            evidence.ir_digest.as_str(),
+            evidence.compiler_artifact_digest.as_str(),
+            evidence.lock_digest.as_str(),
+            evidence.envelope_digest.as_str()
+        ),
+        (
+            name.as_str(),
+            source.as_str(),
+            ir.as_str(),
+            compiler.as_str(),
+            lock.as_str(),
+            envelope.as_str()
+        )
+    );
+    assert_eq!(evidence.operation_id, OPERATION_ID);
+    assert!(verify_gate_import_operation(
+        &compiled(),
+        state.path(),
+        "imp_99999999999999999999999999999999"
+    )
+    .is_err());
+
+    // A later edit selects a new gate for new arrivals. A retained item still
+    // presents its historical operation and source under current governance.
+    let edited_source = format!("{COERCE_SCREEN_GATE}\n");
+    let edited = GateProgram::compile(&edited_source, COERCE_SCREEN_ENVELOPE).unwrap();
+    assert_ne!(
+        evidence.source_digest,
+        whipplescript_kernel::exec_http::sha256_hex(edited_source.as_bytes())
+    );
+    assert_eq!(
+        verify_gate_import_operation(&edited, state.path(), OPERATION_ID).unwrap(),
+        evidence
+    );
+
+    // A structurally valid target witness claiming a different compiler is
+    // still stale against this running host and must not complete the pointer.
+    let runtime_path = state.path().join("runtime.sqlite");
+    let store = whipplescript_store::SqliteStore::open_read_only(&runtime_path).unwrap();
+    let mut forged = store
+        .program_import_witness(&evidence.version_id, &evidence.witness_digest)
+        .unwrap()
+        .unwrap();
+    drop(store);
+    forged.compiler_artifact_digest = "a".repeat(64);
+    let (forged_digest, forged_json) =
+        whipplescript_store::program_imports::encode(&forged).unwrap();
+    let conn = rusqlite::Connection::open(&runtime_path).unwrap();
+    conn.execute(
+        "INSERT INTO program_import_admissions (version_id, witness_digest, witness_json) VALUES (?1, ?2, ?3)",
+        rusqlite::params![evidence.version_id, forged_digest, forged_json],
+    ).unwrap();
+    conn.execute(
+        "UPDATE program_import_operations SET witness_digest = ?1 WHERE operation_id = ?2",
+        rusqlite::params![forged_digest, OPERATION_ID],
+    )
+    .unwrap();
+    let refused = verify_gate_import_operation(&compiled(), state.path(), OPERATION_ID)
+        .expect_err("changed compiler premise must invalidate the target witness");
+    assert!(format!("{refused}").contains("import witness differs"));
 }
 
 #[test]

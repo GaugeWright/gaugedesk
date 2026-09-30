@@ -175,6 +175,16 @@ impl PreparedShadowPair {
     pub fn scenario_ref(&self) -> &str {
         &self.scenario_ref
     }
+
+    pub(crate) fn evaluated_candidate_definition(
+        &self,
+        evidence: &ShadowPair,
+    ) -> Result<AgentDefinitionSnapshot, String> {
+        if !evidence_matches(self, evidence) {
+            return Err("shadow evidence does not identify the evaluated Agent pair".to_owned());
+        }
+        Ok(self.candidate_definition.clone())
+    }
 }
 
 /// Prepare two exact Agent/discipline snapshots from separate authoring cuts.

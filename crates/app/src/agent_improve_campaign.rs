@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use whipplescript_core::improve_holdout;
 use whipplescript_core::improve_selection::{
     self, Bar, Campaign, Delta, GaugeEvidence, Reach, Reading, Role, Verdict,
 };
@@ -22,13 +23,14 @@ use crate::agent_improve::{
 
 const OPEN_SCHEMA: &str = "gaugedesk.agent-improve.open.v1";
 const PRIVATE_SCHEMA: &str = "gaugedesk.agent-improve.private.v1";
+const POOL_SCHEMA: &str = "gaugedesk.agent-improve.pool.v1";
 const MAX_SOURCE_BYTES: usize = 512 * 1024;
 const MAX_SCENARIOS: usize = 64;
 const MAX_GAUGES: usize = 32;
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_CHECK_BYTES: usize = 8 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OpenSource {
     schema: String,
@@ -37,7 +39,7 @@ struct OpenSource {
     scenarios: Vec<OpenScenario>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct GaugeSource {
     name: String,
@@ -45,7 +47,7 @@ struct GaugeSource {
     minimum_pass_rate: Option<f64>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Deserialize, Default, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct SelectionSource {
     ascend: BTreeMap<String, Option<Threshold>>,
@@ -55,21 +57,21 @@ struct SelectionSource {
     repair: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Threshold {
     ge: bool,
     value: f64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OpenScenario {
     id: String,
     prompt: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PrivateSource {
     schema: String,
@@ -79,7 +81,7 @@ struct PrivateSource {
     sealed_scenarios: Vec<PrivateScenario>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PrivateScenario {
     id: String,
@@ -87,7 +89,7 @@ struct PrivateScenario {
     checks: BTreeMap<String, TextCheck>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum TextCheck {
     #[serde(rename = "assistant-contains")]
@@ -96,6 +98,202 @@ enum TextCheck {
     Excludes { text: String },
     #[serde(rename = "assistant-equals")]
     Equals { text: String },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolSource {
+    schema: String,
+    gauges: Vec<GaugeSource>,
+    selection: SelectionSource,
+    scenarios: Vec<PoolScenario>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolScenario {
+    id: String,
+    prompt: String,
+    checks: BTreeMap<String, TextCheck>,
+}
+
+struct FingerprintedScenario {
+    scenario: PoolScenario,
+    fingerprint: String,
+    retired: bool,
+    wear_before: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PoolAssignment {
+    pub schema: String,
+    pub campaign_id: String,
+    pub pool_ref: String,
+    pub cases: Vec<CaseAssignment>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CaseAssignment {
+    pub id: String,
+    pub fingerprint: String,
+    pub exposure: String,
+    pub wear_before: i64,
+}
+
+/// The two source projections and a private assignment are made in one host
+/// operation. A sampled partition alone is not a held-out evidence claim.
+pub(super) struct SampledPool {
+    pub open_json: String,
+    pub private_json: String,
+    pub assignment_json: String,
+}
+
+pub(super) fn sample_pool(
+    pool_bytes: &[u8],
+    campaign_id: &str,
+    account_key: &[u8; 32],
+    wear: impl Fn(&str) -> i64,
+) -> Result<SampledPool, String> {
+    if pool_bytes.is_empty() || pool_bytes.len() > MAX_SOURCE_BYTES {
+        return Err("Agent improve case pool is missing or too large".to_owned());
+    }
+    let pool: PoolSource = serde_json::from_slice(pool_bytes)
+        .map_err(|error| format!("invalid Agent improve case pool: {error}"))?;
+    if pool.schema != POOL_SCHEMA {
+        return Err("unsupported Agent improve case pool schema".to_owned());
+    }
+    // Validate all prompts and checks before sampling, including the cases
+    // that will be hidden from the proposer.
+    let all_open = OpenSource {
+        schema: OPEN_SCHEMA.to_owned(),
+        gauges: pool.gauges.clone(),
+        selection: pool.selection.clone(),
+        scenarios: pool
+            .scenarios
+            .iter()
+            .map(|case| OpenScenario {
+                id: case.id.clone(),
+                prompt: case.prompt.clone(),
+            })
+            .collect(),
+    };
+    let all_private = PrivateSource {
+        schema: PRIVATE_SCHEMA.to_owned(),
+        open_checks: pool
+            .scenarios
+            .iter()
+            .map(|case| (case.id.clone(), case.checks.clone()))
+            .collect(),
+        sealed_scenarios: Vec::new(),
+    };
+    validate(&all_open, &all_private)?;
+
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, account_key);
+    let mut fingerprints = BTreeSet::new();
+    let scenarios = pool
+        .scenarios
+        .into_iter()
+        .map(|scenario| {
+            // IDs are intentionally absent: a rename must not reset wear.
+            let canonical = serde_json::to_vec(&(&scenario.prompt, &scenario.checks))
+                .map_err(|_| "Agent improve case could not be fingerprinted")?;
+            let mut material = b"gaugedesk.agent-improve.case.v1\0".to_vec();
+            material.extend_from_slice(&canonical);
+            let fingerprint = hex::encode(ring::hmac::sign(&key, &material).as_ref());
+            if !fingerprints.insert(fingerprint.clone()) {
+                return Err("Agent improve case pool repeats a prompt and checks".to_owned());
+            }
+            let wear_before = wear(&fingerprint);
+            if wear_before < 0 {
+                return Err("Agent improve case wear is invalid".to_owned());
+            }
+            Ok(FingerprintedScenario {
+                scenario,
+                fingerprint,
+                retired: wear_before >= improve_holdout::WEAR_OUT_AT,
+                wear_before,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let (open, sealed, _) = improve_holdout::seal_scenarios(
+        campaign_id,
+        &scenarios,
+        |case| case.fingerprint.as_str(),
+        |case| case.retired,
+    );
+    if open.is_empty() {
+        return Err("all Agent improve cases are retired".to_owned());
+    }
+    let open_source = OpenSource {
+        schema: OPEN_SCHEMA.to_owned(),
+        gauges: pool.gauges,
+        selection: pool.selection,
+        scenarios: open
+            .iter()
+            .map(|case| OpenScenario {
+                id: case.scenario.id.clone(),
+                prompt: case.scenario.prompt.clone(),
+            })
+            .collect(),
+    };
+    let private_source = PrivateSource {
+        schema: PRIVATE_SCHEMA.to_owned(),
+        open_checks: open
+            .iter()
+            .map(|case| (case.scenario.id.clone(), case.scenario.checks.clone()))
+            .collect(),
+        sealed_scenarios: sealed
+            .iter()
+            .map(|case| PrivateScenario {
+                id: case.scenario.id.clone(),
+                prompt: case.scenario.prompt.clone(),
+                checks: case.scenario.checks.clone(),
+            })
+            .collect(),
+    };
+    let open_json = serde_json::to_string(&open_source)
+        .map_err(|_| "Agent improve open source could not be encoded")?;
+    let private_json = serde_json::to_string(&private_source)
+        .map_err(|_| "Agent improve private source could not be encoded")?;
+    // Apply the same encoded-source size and roster checks as manual intake.
+    CampaignSnapshot::parse(open_json.as_bytes(), private_json.as_bytes())?;
+    let sealed_ids = sealed
+        .iter()
+        .map(|case| case.scenario.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let assignment = PoolAssignment {
+        schema: POOL_SCHEMA.to_owned(),
+        campaign_id: campaign_id.to_owned(),
+        pool_ref: format!(
+            "agent-pool:sha256:{}",
+            hex::encode(Sha256::digest(pool_bytes))
+        ),
+        cases: scenarios
+            .iter()
+            .map(|case| CaseAssignment {
+                id: case.scenario.id.clone(),
+                fingerprint: case.fingerprint.clone(),
+                exposure: if case.retired {
+                    "retired"
+                } else if sealed_ids.contains(case.scenario.id.as_str()) {
+                    "sealed"
+                } else {
+                    "open"
+                }
+                .to_owned(),
+                wear_before: case.wear_before,
+            })
+            .collect(),
+    };
+    let assignment_json = serde_json::to_string(&assignment)
+        .map_err(|_| "Agent improve pool assignment could not be encoded")?;
+    Ok(SampledPool {
+        open_json,
+        private_json,
+        assignment_json,
+    })
 }
 
 impl TextCheck {
@@ -123,6 +321,7 @@ pub struct CampaignSnapshot {
     open_ref: String,
     private_ref: String,
     reference: String,
+    sampled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +353,17 @@ pub struct SelectedCampaign {
     open_verdict: Verdict,
     verdict: Verdict,
     sealed_available: usize,
+    reservation_id: Option<String>,
+}
+
+/// The only evaluation projection an edit-chat optimizer may receive. It is
+/// deliberately built from the open-stage verdict, even after a sealed gate
+/// has run, so repeated revisions cannot probe hidden checks through feedback.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptimizerFeedback {
+    pub open_scenario_ids: Vec<String>,
+    pub open_verdict: ReviewVerdict,
 }
 
 /// Immutable reviewer evidence. It contains aggregate judge outputs and exact
@@ -175,9 +385,11 @@ pub struct CampaignEvidenceCard {
     pub open_count: usize,
     pub sealed_available: usize,
     pub sealed_evaluated: usize,
-    /// Remains `unheld-out` until random assignment and exposure accounting
-    /// can support a stronger claim.
+    /// `held-out` only after Home verifies the sampled assignment and complete
+    /// sealed reservation receipt when retaining this reviewer card.
     pub holdout_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_ref: Option<String>,
     pub open_verdict: ReviewVerdict,
     pub final_verdict: ReviewVerdict,
 }
@@ -242,6 +454,22 @@ impl From<&Verdict> for ReviewVerdict {
 }
 
 impl SelectedCampaign {
+    pub(crate) fn adoption_definition(
+        &self,
+    ) -> Result<Option<crate::agent_improve_adoption::AgentDefinitionSnapshot>, String> {
+        if !self.verdict.proposable {
+            return Ok(None);
+        }
+        let first = self
+            .scenarios
+            .first()
+            .ok_or("Agent improve campaign has no evaluated scenarios")?;
+        first
+            .prepared
+            .evaluated_candidate_definition(first.selected.evidence())
+            .map(Some)
+    }
+
     pub fn target_id(&self) -> &str {
         &self.target_id
     }
@@ -261,6 +489,17 @@ impl SelectedCampaign {
         &self.open_verdict
     }
 
+    pub fn optimizer_feedback(&self) -> OptimizerFeedback {
+        OptimizerFeedback {
+            open_scenario_ids: self
+                .open_scenario_ids()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            open_verdict: ReviewVerdict::from(&self.open_verdict),
+        }
+    }
+
     pub fn sealed_available(&self) -> usize {
         self.sealed_available
     }
@@ -278,6 +517,18 @@ impl SelectedCampaign {
             .iter()
             .filter(|scenario| scenario.exposure == Exposure::Sealed)
             .count()
+    }
+
+    pub fn sealed_scenario_ids(&self) -> Vec<&str> {
+        self.scenarios
+            .iter()
+            .filter(|scenario| scenario.exposure == Exposure::Sealed)
+            .map(|scenario| scenario.id.as_str())
+            .collect()
+    }
+
+    pub fn reservation_id(&self) -> Option<&str> {
+        self.reservation_id.as_deref()
     }
 
     pub fn reviewer_card(
@@ -311,6 +562,7 @@ impl SelectedCampaign {
             sealed_available: self.sealed_available,
             sealed_evaluated: self.sealed_count(),
             holdout_status: "unheld-out".to_owned(),
+            reservation_ref: None,
             open_verdict: ReviewVerdict::from(&self.open_verdict),
             final_verdict: ReviewVerdict::from(&self.verdict),
         })
@@ -330,6 +582,9 @@ pub fn run_native_campaign(
     campaign: &CampaignSnapshot,
     gate: &dyn EgressGate,
 ) -> Result<SelectedCampaign, String> {
+    if campaign.sampled {
+        return Err("sampled Agent improve campaign requires Home exposure reservation".to_owned());
+    }
     run_campaign_with(
         template,
         target_id,
@@ -342,13 +597,76 @@ pub fn run_native_campaign(
     )
 }
 
+/// Host-held sampled campaigns use this entrypoint. The caller reserves the
+/// complete sealed set in Home custody after open dominance, before the first
+/// sealed input reaches either execution arm. A failed reservation stops the
+/// gate. The callback must reserve through Home's durable ledger; this routine
+/// never treats a callback as held-out evidence by itself.
+pub struct NativeCampaignGate<'a> {
+    pub egress: &'a dyn EgressGate,
+    pub reserve_sealed: &'a mut dyn FnMut() -> Result<String, String>,
+}
+
+pub fn run_native_campaign_with_reservation(
+    factory: &gaugedesk_whip_runtime::WhipHarnessFactory,
+    template: &HarnessSpec,
+    target_id: &str,
+    workspace: &dyn Workspace,
+    candidate_repo: &Path,
+    campaign: &CampaignSnapshot,
+    gate: NativeCampaignGate<'_>,
+) -> Result<SelectedCampaign, String> {
+    if !campaign.sampled {
+        return Err("Agent improve campaign has no sampled Home assignment".to_owned());
+    }
+    run_campaign_with_reservation(
+        template,
+        target_id,
+        workspace,
+        candidate_repo,
+        campaign,
+        |prepared, judge, selection, prompt| {
+            run_native_shadow_selection(factory, prepared, gate.egress, prompt, judge, selection)
+        },
+        &mut || (gate.reserve_sealed)().map(Some),
+    )
+}
+
 fn run_campaign_with<F>(
     template: &HarnessSpec,
     target_id: &str,
     workspace: &dyn Workspace,
     candidate_repo: &Path,
     campaign: &CampaignSnapshot,
+    run: F,
+) -> Result<SelectedCampaign, String>
+where
+    F: FnMut(
+        &PreparedShadowPair,
+        &dyn HostJudge,
+        &HostSelection,
+        &str,
+    ) -> Result<SelectedShadowPair, String>,
+{
+    run_campaign_with_reservation(
+        template,
+        target_id,
+        workspace,
+        candidate_repo,
+        campaign,
+        run,
+        &mut || Ok(None),
+    )
+}
+
+fn run_campaign_with_reservation<F>(
+    template: &HarnessSpec,
+    target_id: &str,
+    workspace: &dyn Workspace,
+    candidate_repo: &Path,
+    campaign: &CampaignSnapshot,
     mut run: F,
+    reserve: &mut dyn FnMut() -> Result<Option<String>, String>,
 ) -> Result<SelectedCampaign, String>
 where
     F: FnMut(
@@ -363,6 +681,7 @@ where
     let mut readings: BTreeMap<String, GaugeEvidence> = BTreeMap::new();
     let mut lineage: Option<(String, String, String, String, String, String, String)> = None;
     let mut open_verdict = None;
+    let mut reservation_id = None;
     for scenario in campaign.evaluation_scenarios() {
         if scenario.exposure == Exposure::Sealed && open_verdict.is_none() {
             let verdict = aggregate_verdict(
@@ -379,9 +698,11 @@ where
                     open_verdict: verdict.clone(),
                     verdict,
                     sealed_available: campaign.private.sealed_scenarios.len(),
+                    reservation_id,
                 });
             }
             open_verdict = Some(verdict);
+            reservation_id = reserve()?;
         }
         let scenario_root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let prepared = prepare_native_shadow_pair_from_authoring(
@@ -467,6 +788,7 @@ where
         open_verdict: open_verdict.unwrap_or_else(|| verdict.clone()),
         verdict,
         sealed_available: campaign.private.sealed_scenarios.len(),
+        reservation_id,
     })
 }
 
@@ -551,7 +873,13 @@ impl CampaignSnapshot {
             open_ref,
             private_ref,
             reference,
+            sampled: false,
         })
+    }
+
+    pub(super) fn with_sampled_assignment(mut self) -> Self {
+        self.sampled = true;
+        self
     }
 
     pub fn reference(&self) -> &str {
@@ -1079,16 +1407,27 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].contains("Return beta"));
+        assert!(!rows[0].contains("selected method"));
         drop(guard);
         drop(workbench);
         let reopened = crate::open_workbench(root.path()).unwrap();
-        let guard = reopened.lock_unpoisoned();
+        let mut guard = reopened.lock_unpoisoned();
         let evidence = guard
             .agent_improve_evidence(crate::DEFAULT_AGENT, &evidence_id)
             .unwrap();
         assert_eq!(evidence.card.campaign_ref, source.reference());
         assert_eq!(evidence.card.holdout_status, "unheld-out");
         assert!(evidence.card.final_verdict.proposable);
+        assert!(
+            guard
+                .adopt_agent_improve_evidence_for_source_owner(
+                    crate::DEFAULT_AGENT,
+                    &evidence_id,
+                    None,
+                )
+                .unwrap_err()
+                .contains("sealed evaluation is incomplete")
+        );
     }
 
     #[test]
@@ -1105,7 +1444,8 @@ mod tests {
             .unwrap();
         std::fs::write(candidate_repo.join("agent/AGENTS.md"), "selected method\n").unwrap();
         let source = CampaignSnapshot::parse(OPEN.as_bytes(), PRIVATE.as_bytes()).unwrap();
-        let selected = run_campaign_with(
+        let mut reservations = 0;
+        let selected = run_campaign_with_reservation(
             &template(root.path()),
             &target_id,
             workspace.as_ref(),
@@ -1124,9 +1464,14 @@ mod tests {
                     selection,
                 )
             },
+            &mut || {
+                reservations += 1;
+                Ok(Some("test-reservation".to_owned()))
+            },
         )
         .unwrap();
         assert!(!selected.open_verdict().proposable);
+        assert_eq!(reservations, 0);
         assert!(!selected.reviewer_verdict().proposable);
         assert_eq!(selected.sealed_count(), 0);
         assert_eq!(selected.sealed_available(), 1);
@@ -1147,7 +1492,8 @@ mod tests {
             .unwrap();
         std::fs::write(candidate_repo.join("agent/AGENTS.md"), "selected method\n").unwrap();
         let source = CampaignSnapshot::parse(OPEN.as_bytes(), PRIVATE.as_bytes()).unwrap();
-        let selected = run_campaign_with(
+        let mut reservations = 0;
+        let selected = run_campaign_with_reservation(
             &template(root.path()),
             &target_id,
             workspace.as_ref(),
@@ -1166,11 +1512,222 @@ mod tests {
                     selection,
                 )
             },
+            &mut || {
+                reservations += 1;
+                Ok(Some("test-reservation".to_owned()))
+            },
         )
         .unwrap();
         assert!(selected.open_verdict().proposable);
+        assert_eq!(reservations, 1);
         assert!(!selected.reviewer_verdict().proposable);
         assert_eq!(selected.sealed_count(), 1);
         assert!(adopt_selected_campaign(workspace.as_ref(), &selected).is_err());
+
+        let failed_feedback = serde_json::to_value(selected.optimizer_feedback()).unwrap();
+        let passed = run_campaign_with_reservation(
+            &template(root.path()),
+            &target_id,
+            workspace.as_ref(),
+            &candidate_repo,
+            &source,
+            |prepared, judge, selection, prompt| {
+                crate::agent_improve::run_shadow_selection_with_factory(
+                    &FakeFactory {
+                        open_passes: true,
+                        sealed_passes: true,
+                    },
+                    prepared,
+                    &AllowAllGate,
+                    prompt,
+                    judge,
+                    selection,
+                )
+            },
+            &mut || Ok(Some("another-test-reservation".to_owned())),
+        )
+        .unwrap();
+        assert!(passed.reviewer_verdict().proposable);
+        assert_eq!(
+            failed_feedback,
+            serde_json::to_value(passed.optimizer_feedback()).unwrap()
+        );
+        let feedback_text = failed_feedback.to_string();
+        assert!(!feedback_text.contains("sealed-1"));
+        assert!(!feedback_text.contains("Return beta"));
+        assert!(!feedback_text.contains("reservation"));
+    }
+
+    #[test]
+    fn failed_reservation_stops_before_a_sealed_input_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let guard = workbench.lock_unpoisoned();
+        let target_id = crate::library_state::authoring_target_id(crate::DEFAULT_AGENT);
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let candidate_repo = root.path().join("candidate");
+        crate::agent_improve_adoption::AgentDefinitionSnapshot::from_main(workspace.as_ref())
+            .unwrap()
+            .materialize(&candidate_repo)
+            .unwrap();
+        std::fs::write(candidate_repo.join("agent/AGENTS.md"), "selected method\n").unwrap();
+        let source = CampaignSnapshot::parse(OPEN.as_bytes(), PRIVATE.as_bytes()).unwrap();
+        let mut ran_sealed = false;
+        let result = run_campaign_with_reservation(
+            &template(root.path()),
+            &target_id,
+            workspace.as_ref(),
+            &candidate_repo,
+            &source,
+            |prepared, judge, selection, prompt| {
+                if prompt == "Return beta" {
+                    ran_sealed = true;
+                }
+                crate::agent_improve::run_shadow_selection_with_factory(
+                    &FakeFactory {
+                        open_passes: true,
+                        sealed_passes: true,
+                    },
+                    prepared,
+                    &AllowAllGate,
+                    prompt,
+                    judge,
+                    selection,
+                )
+            },
+            &mut || Err("sealed exposure exhausted".to_owned()),
+        );
+        assert_eq!(result.err().as_deref(), Some("sealed exposure exhausted"));
+        assert!(!ran_sealed);
+    }
+
+    #[test]
+    fn home_receipt_promotes_only_complete_sampled_evaluation_to_held_out_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        let pool = serde_json::to_vec(&serde_json::json!({
+            "schema": "gaugedesk.agent-improve.pool.v1",
+            "gauges": [{"name":"quality", "description":"Return alpha"}],
+            "selection": {"ascend":{"quality":null}},
+            "scenarios": (0..4).map(|index| serde_json::json!({
+                "id": format!("case-{index}"),
+                "prompt": format!("Return alpha case-{index}"),
+                "checks": {"quality":{"kind":"assistant-contains", "text":"alpha"}}
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap();
+        let reference = guard
+            .register_agent_improve_pool(crate::DEFAULT_AGENT, &pool)
+            .unwrap();
+        let campaign = guard
+            .load_agent_improve_campaign(crate::DEFAULT_AGENT, &reference)
+            .unwrap();
+        let target_id = crate::library_state::authoring_target_id(crate::DEFAULT_AGENT);
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let candidate_repo = root.path().join("candidate");
+        crate::agent_improve_adoption::AgentDefinitionSnapshot::from_main(workspace.as_ref())
+            .unwrap()
+            .materialize(&candidate_repo)
+            .unwrap();
+        std::fs::write(candidate_repo.join("agent/AGENTS.md"), "selected method\n").unwrap();
+        let reservation_home = crate::open_workbench(root.path()).unwrap();
+        let selected = run_campaign_with_reservation(
+            &template(root.path()),
+            &target_id,
+            workspace.as_ref(),
+            &candidate_repo,
+            &campaign,
+            |prepared, judge, selection, prompt| {
+                crate::agent_improve::run_shadow_selection_with_factory(
+                    &FakeFactory {
+                        open_passes: true,
+                        sealed_passes: true,
+                    },
+                    prepared,
+                    &AllowAllGate,
+                    prompt,
+                    judge,
+                    selection,
+                )
+            },
+            &mut || {
+                reservation_home
+                    .lock_unpoisoned()
+                    .reserve_agent_improve_sealed_exposure(crate::DEFAULT_AGENT, &reference)
+                    .map(Some)
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.sealed_count(), 2);
+        assert_eq!(
+            selected.reviewer_card(&campaign).unwrap().holdout_status,
+            "unheld-out"
+        );
+        let evidence_id = guard
+            .append_agent_improve_evidence(crate::DEFAULT_AGENT, &campaign, &selected)
+            .unwrap();
+        let candidates = guard
+            .store
+            .records(
+                crate::library::LIBRARY_SCOPE,
+                "agent_improve_selected_candidate",
+            )
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].contains("selected method"));
+        let evidence = guard
+            .agent_improve_evidence(crate::DEFAULT_AGENT, &evidence_id)
+            .unwrap();
+        assert_eq!(evidence.card.holdout_status, "held-out");
+        assert_eq!(
+            evidence.card.reservation_ref.as_deref(),
+            selected.reservation_id()
+        );
+        assert!(guard
+            .adopt_agent_improve_evidence_for_source_owner(
+                crate::DEFAULT_AGENT,
+                &evidence_id,
+                Some("another-person"),
+            )
+            .unwrap_err()
+            .contains("source owner"));
+        assert!(guard
+            .append_agent_improve_evidence(crate::DEFAULT_AGENT, &campaign, &selected)
+            .unwrap_err()
+            .contains("already recorded"));
+        drop(selected);
+        drop(guard);
+        drop(reservation_home);
+        drop(workbench);
+
+        let reopened = crate::open_workbench(root.path()).unwrap();
+        let mut guard = reopened.lock_unpoisoned();
+        let review = guard
+            .agent_improve_evidence(crate::DEFAULT_AGENT, &evidence_id)
+            .unwrap();
+        assert!(!serde_json::to_string(&review)
+            .unwrap()
+            .contains("selected method"));
+        assert_eq!(
+            guard
+                .adopt_agent_improve_evidence_for_source_owner(
+                    crate::DEFAULT_AGENT,
+                    &evidence_id,
+                    None,
+                )
+                .unwrap(),
+            vec!["agent/AGENTS.md"]
+        );
+        assert!(
+            guard
+                .adopt_agent_improve_evidence_for_source_owner(
+                    crate::DEFAULT_AGENT,
+                    &evidence_id,
+                    None,
+                )
+                .unwrap_err()
+                .contains("draft changed")
+        );
     }
 }

@@ -107,6 +107,19 @@ impl AgentDefinitionSnapshot {
         })
     }
 
+    /// Persist only the editable definition bytes. Recompute their identity on
+    /// read so a retained candidate cannot claim an evaluated reference for
+    /// different files.
+    pub(crate) fn retained_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.files).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn from_retained_json(json: &str) -> Result<Self, String> {
+        let files = serde_json::from_str(json)
+            .map_err(|_| "retained Agent improvement candidate is invalid".to_owned())?;
+        Self::from_files(files)
+    }
+
     pub(crate) fn changed_paths(&self, candidate: &Self) -> Vec<String> {
         self.files
             .keys()

@@ -22,11 +22,11 @@ path = "src/main.rs"
 # contract as the backend workspace. This nested Cargo workspace has its own
 # resolver and lockfile, so the root patch does not apply here.
 [patch.crates-io]
-whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "46735bdc8fb2aa51f6a33490ffe71f40c478f076" }
-whipplescript-core = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "46735bdc8fb2aa51f6a33490ffe71f40c478f076" }
-whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "46735bdc8fb2aa51f6a33490ffe71f40c478f076" }
-whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "46735bdc8fb2aa51f6a33490ffe71f40c478f076" }
-whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "46735bdc8fb2aa51f6a33490ffe71f40c478f076" }
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "babfa4fcbf33f09454787c695ba5760d3e832a57" }
+whipplescript-core = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "babfa4fcbf33f09454787c695ba5760d3e832a57" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "babfa4fcbf33f09454787c695ba5760d3e832a57" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "babfa4fcbf33f09454787c695ba5760d3e832a57" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "babfa4fcbf33f09454787c695ba5760d3e832a57" }
 
 [profile.release]
 strip = "symbols"

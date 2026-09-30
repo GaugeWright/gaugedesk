@@ -16,6 +16,7 @@
 //! scale-time change behind this same API — not needed for the single-process,
 //! single-user shape — and would not alter the admission semantics above.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -240,7 +241,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 5;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 6;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -440,6 +441,15 @@ const MIGRATIONS: &[Migration] = &[
              );
              CREATE INDEX IF NOT EXISTS home_reference_use_pins_operation
                  ON home_reference_use_pins(operation_id);",
+    },
+    Migration {
+        version: 6,
+        name: "home-reference-cumulative-seals",
+        // Existing seals retain their exact v3-v5 epoch-local rosters. New
+        // seals include every completed operation through the cut, so a later
+        // candidate cannot silently omit a still-admitted earlier operation.
+        sql: "ALTER TABLE home_reference_seals ADD COLUMN roster_scope TEXT NOT NULL
+                 DEFAULT 'epoch' CHECK (roster_scope IN ('epoch', 'through_epoch'));",
     },
 ];
 
@@ -1669,6 +1679,70 @@ impl Store {
         Ok(positions)
     }
 
+    /// Reserve several at-most-once record keys as one transition. A key
+    /// already present in the store (or repeated in this batch) refuses the
+    /// entire batch without appending any record. The immediate transaction
+    /// makes a competing connection's reservation visible before it checks.
+    pub fn append_records_with_keys_atomically(
+        &mut self,
+        records: &[(&str, &str, &str, &str)],
+    ) -> Result<Option<Vec<i64>>, AdmitError> {
+        let mut keys = BTreeSet::new();
+        if records
+            .iter()
+            .any(|(scope, key, _, _)| !keys.insert((*scope, *key)))
+        {
+            return Ok(None);
+        }
+        let stored: Result<Vec<(&str, &str, &str, String)>, AdmitError> = records
+            .iter()
+            .map(|(scope, key, kind, payload)| {
+                let payload = match &self.codec {
+                    Some(codec) => codec
+                        .encode(scope, kind, payload)
+                        .map_err(AdmitError::Codec)?,
+                    None => (*payload).to_owned(),
+                };
+                Ok((*scope, *key, *kind, payload))
+            })
+            .collect();
+        let stored = stored?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (scope, key, _, _) in &stored {
+            let exists = tx
+                .prepare_cached(
+                    "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
+                )?
+                .query_row(params![scope, key], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if exists {
+                return Ok(None);
+            }
+        }
+        let mut positions = Vec::with_capacity(stored.len());
+        for (scope, key, kind, payload) in stored {
+            let position: i64 = tx
+                .prepare_cached(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+                )?
+                .query_row(params![scope], |row| row.get(0))?;
+            tx.prepare_cached(
+                "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![scope, position, kind, payload])?;
+            tx.prepare_cached(
+                "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![scope, key, position])?;
+            positions.push(position);
+        }
+        tx.commit()?;
+        Ok(Some(positions))
+    }
+
     /// Atomically append one non-lifecycle record under an idempotency key.
     /// The returned tuple is `(position, inserted)`: a replay returns the
     /// original assigned position and `false` without duplicating the pointer.
@@ -2105,7 +2179,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5],
+            vec![1, 2, 3, 4, 5, 6],
             "each migration recorded exactly once"
         );
         let created_at: String = store
@@ -2181,7 +2255,13 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DELETE FROM schema_migrations WHERE version > 1; DROP TABLE store_meta;",
+                    "DELETE FROM schema_migrations WHERE version > 1; \
+                     DROP TABLE store_meta; \
+                     DROP TABLE home_reference_use_pins; \
+                     DROP TABLE home_reference_refusals; \
+                     DROP TABLE home_reference_seals; \
+                     DROP TABLE home_reference_operations; \
+                     DROP TABLE home_reference_state;",
                 )
                 .unwrap();
             assert_eq!(store.schema_version().unwrap(), 1);
@@ -2711,6 +2791,39 @@ mod tests {
         assert_eq!(
             store.records("chat-1", "runtime_pointer").unwrap(),
             vec!["pointer-a"]
+        );
+    }
+
+    #[test]
+    fn keyed_batch_reservation_is_all_or_nothing() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            store
+                .append_records_with_keys_atomically(&[
+                    ("home", "case-a:1", "exposure", "a"),
+                    ("home", "case-b:1", "exposure", "b"),
+                ])
+                .unwrap(),
+            Some(vec![0, 1])
+        );
+        assert_eq!(
+            store
+                .append_records_with_keys_atomically(&[
+                    ("home", "case-a:1", "exposure", "collision"),
+                    ("home", "case-c:1", "exposure", "must-not-append"),
+                ])
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.records("home", "exposure").unwrap(), vec!["a", "b"]);
+        assert_eq!(
+            store
+                .append_records_with_keys_atomically(&[
+                    ("home", "same", "exposure", "x"),
+                    ("home", "same", "exposure", "y"),
+                ])
+                .unwrap(),
+            None
         );
     }
 

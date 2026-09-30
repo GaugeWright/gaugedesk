@@ -12,7 +12,7 @@
  * package draft is edited in an edit chat and frozen by Publish.
  */
 
-import { createEffect, createMemo, createResource, createSignal, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, Index, Show } from "solid-js";
 import { PanelContractEditor } from "./PanelContractEditor";
 import { Option } from "./PanelAgentControls";
 import "./panel-agent.css";
@@ -80,6 +80,42 @@ export interface AgentSettingsProps {
     refreshKey?: number;
     onClose: () => void;
     onSaved?: () => void;
+    onPrepareImprove?: (poolJson: string) => Promise<void>;
+    preparedImproveRef?: string;
+    onUsePreparedImprove?: () => void;
+    improveRecoveryError?: string;
+}
+
+export interface ImproveCaseDraft {
+    prompt: string;
+    expected: string;
+}
+
+/** One intentionally narrow first gauge. Home does the sampling; this form
+ * never decides which cases are open or sealed. */
+export function buildImprovePool(cases: readonly ImproveCaseDraft[]): string {
+    if (cases.length < 4) throw new Error("Add at least four cases for a sampled holdout.");
+    if (cases.length > 64) throw new Error("A campaign can contain at most 64 cases.");
+    if (cases.some((entry) => !entry.prompt.trim() || !entry.expected.trim())) {
+        throw new Error("Every case needs a prompt and expected text.");
+    }
+    if (new Set(cases.map((entry) => JSON.stringify([entry.prompt.trim(), entry.expected.trim()]))).size !== cases.length) {
+        throw new Error("The same prompt and expected text cannot appear twice.");
+    }
+    return JSON.stringify({
+        schema: "gaugedesk.agent-improve.pool.v1",
+        gauges: [{
+            name: "quality",
+            description: "The assistant reply includes the expected text",
+            minimum_pass_rate: 1,
+        }],
+        selection: { ascend: { quality: null } },
+        scenarios: cases.map((entry, index) => ({
+            id: `case-${index + 1}`,
+            prompt: entry.prompt.trim(),
+            checks: { quality: { kind: "assistant-contains", text: entry.expected.trim() } },
+        })),
+    });
 }
 
 export const AGENT_ABILITY_PRESETS: ReadonlyArray<{
@@ -133,6 +169,11 @@ export function AgentSettings(props: AgentSettingsProps) {
     );
     const [panelDraft, setPanelDraft] = createSignal<PanelPublicProfile | null>(null);
     const [panelDirty, setPanelDirty] = createSignal(false);
+    const [improveCases, setImproveCases] = createSignal<ImproveCaseDraft[]>(
+        Array.from({ length: 4 }, () => ({ prompt: "", expected: "" })),
+    );
+    const [improveBusy, setImproveBusy] = createSignal(false);
+    const [improveMessage, setImproveMessage] = createSignal("");
     const text = () => raw() ?? loaded() ?? "{}";
 
     // Parse the current text for the form. If the raw JSON is mid-edit and invalid,
@@ -177,6 +218,26 @@ export function AgentSettings(props: AgentSettingsProps) {
             props.onSaved?.();
         } catch (e) {
             setMsg(plainConfigError(String(e)));
+        }
+    }
+
+    function updateImproveCase(index: number, patch: Partial<ImproveCaseDraft>) {
+        setImproveCases((entries) => entries.map((entry, i) => i === index ? { ...entry, ...patch } : entry));
+        setImproveMessage("");
+    }
+
+    async function prepareImprove() {
+        if (!props.onPrepareImprove) return;
+        try {
+            const pool = buildImprovePool(improveCases());
+            setImproveBusy(true);
+            await props.onPrepareImprove(pool);
+            setImproveCases(Array.from({ length: 4 }, () => ({ prompt: "", expected: "" })));
+            setImproveMessage("Home saved the case pool. The edit chat now has only the open cases.");
+        } catch (error) {
+            setImproveMessage(String(error).replace(/^Error:\s*/, ""));
+        } finally {
+            setImproveBusy(false);
         }
     }
 
@@ -290,6 +351,47 @@ export function AgentSettings(props: AgentSettingsProps) {
                 <button type="button" class="pa-button primary" data-settings-save onClick={save}>Save</button>
                 <span class="status" data-config-status>{msg()}</span>
             </div>
+            <Show when={props.onPrepareImprove}>
+                <section class="pa-section divided" data-agent-improve-cases>
+                    <div class="pa-section-head">
+                        <h3>Prepare improvement cases</h3>
+                        <p>Write examples of what this Agent should answer. Home will set aside cases before the edit chat sees the rest. These first checks look for exact text in the reply.</p>
+                    </div>
+                    <Index each={improveCases()}>{(entry, index) => <div class="pa-field">
+                        <strong>Case {index + 1}</strong>
+                        <label class="pa-field"><span>Prompt</span><textarea class="config-text"
+                            value={entry().prompt}
+                            onInput={(event) => updateImproveCase(index, { prompt: event.currentTarget.value })}
+                        /></label>
+                        <label class="pa-field"><span>Reply must include</span><input class="pa-input"
+                            value={entry().expected}
+                            onInput={(event) => updateImproveCase(index, { expected: event.currentTarget.value })}
+                        /></label>
+                    </div>}</Index>
+                    <div class="bar">
+                        <button type="button" class="pa-button" disabled={improveCases().length >= 64}
+                            onClick={() => setImproveCases((entries) => [...entries, { prompt: "", expected: "" }])}>Add case</button>
+                        <button type="button" class="pa-button primary" disabled={improveBusy()} onClick={() => void prepareImprove()}>
+                            {improveBusy() ? "Preparing…" : "Prepare in Home"}
+                        </button>
+                    </div>
+                    <Show when={improveMessage()}><p class="status" role="status">{improveMessage()}</p></Show>
+                    <Show when={props.improveRecoveryError}>
+                        <p class="status" role="alert">Couldn't recover the last Home campaign: {props.improveRecoveryError}</p>
+                    </Show>
+                    <Show when={props.preparedImproveRef}>
+                        <p class="status">Pool saved in Home. Send the open-case draft in the edit chat to propose changes. Evaluation and draft adoption are separate steps.</p>
+                        <button type="button" class="pa-button" onClick={() => {
+                            try {
+                                props.onUsePreparedImprove?.();
+                                setImproveMessage("");
+                            } catch (error) {
+                                setImproveMessage(String(error).replace(/^Error:\s*/, ""));
+                            }
+                        }}>Put open cases in chat</button>
+                    </Show>
+                </section>
+            </Show>
             </article>
         </main>
     );

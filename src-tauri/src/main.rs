@@ -4,8 +4,9 @@
 //! **co-resident control plane** runs on loopback. The webview talks to it over
 //! **HTTP, not Tauri IPC** — so the exact same client works as a browser/web
 //! build and (later) against a remote. Tauri here is packaging + a window, not a
-//! second transport. The one exception is the credential the webview presents to
-//! that control plane (DR-0188), which must not be fetchable from loopback HTTP.
+//! second general transport. Operator-only inputs use IPC when a loopback
+//! caller could impersonate the UI: the Home credential (DR-0188) and a
+//! private Agent improvement pool (DR-0257).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -75,6 +76,34 @@ async fn home_session() -> Option<String> {
         .flatten()
 }
 
+/// Private campaign intake crosses the desktop's UI IPC boundary. The local
+/// HTTP listener is reachable by other processes, so it cannot distinguish a
+/// person configuring a pool from an Agent trying to plant its own holdout.
+#[tauri::command]
+async fn start_agent_improve_pool(
+    agent_id: String,
+    pool_json: String,
+) -> Result<gaugedesk_app::AgentImprovePoolStart, String> {
+    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        gaugedesk_app::start_agent_improve_pool_from_desktop(&wb, &agent_id, pool_json.as_bytes())
+    })
+    .await
+    .map_err(|_| "Agent improve pool intake did not complete".to_owned())?
+}
+
+#[tauri::command]
+async fn latest_agent_improve_pool(
+    agent_id: String,
+) -> Result<Option<gaugedesk_app::AgentImprovePoolStart>, String> {
+    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        gaugedesk_app::latest_agent_improve_pool_from_desktop(&wb, &agent_id)
+    })
+    .await
+    .map_err(|_| "Agent improve pool read did not complete".to_owned())?
+}
+
 fn main() {
     // Must run before Tauri builds the webview: WebKitGTK reads the variable when
     // its web process starts, and nothing re-reads it afterwards.
@@ -91,7 +120,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             restart_app,
             open_external,
-            home_session
+            home_session,
+            start_agent_improve_pool,
+            latest_agent_improve_pool
         ])
         // LOGIN-7: the system-browser opener behind `open_external`. Sign-in and
         // "manage in the Hub" leave through it; the webview itself cannot open
