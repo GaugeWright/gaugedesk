@@ -240,7 +240,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 4;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 5;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -416,6 +416,30 @@ const MIGRATIONS: &[Migration] = &[
                  refused_epoch INTEGER NOT NULL CHECK (refused_epoch >= 0),
                  reason_code TEXT NOT NULL CHECK (length(reason_code) > 0)
              );",
+    },
+    Migration {
+        version: 5,
+        name: "home-reference-use-pins",
+        // A retained runtime version is insufficient to identify the exact
+        // accepting operation when a version has multiple admissions. Keep
+        // the item's Home binding immutable and distinguish historical gaps.
+        sql: "CREATE TABLE IF NOT EXISTS home_reference_use_pins (
+                 home_id TEXT NOT NULL CHECK (length(home_id) > 0),
+                 target_store TEXT NOT NULL CHECK (length(target_store) > 0),
+                 use_key TEXT NOT NULL CHECK (length(use_key) > 0),
+                 version_id TEXT NOT NULL CHECK (length(version_id) > 0),
+                 classification TEXT NOT NULL
+                     CHECK (classification IN ('exact', 'legacy_unknown')),
+                 operation_id TEXT REFERENCES home_reference_operations(operation_id),
+                 bound_epoch INTEGER NOT NULL CHECK (bound_epoch >= 0),
+                 PRIMARY KEY (home_id, target_store, use_key),
+                 CHECK (
+                     (classification = 'exact' AND operation_id IS NOT NULL) OR
+                     (classification = 'legacy_unknown' AND operation_id IS NULL)
+                 )
+             );
+             CREATE INDEX IF NOT EXISTS home_reference_use_pins_operation
+                 ON home_reference_use_pins(operation_id);",
     },
 ];
 
@@ -2081,7 +2105,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4],
+            vec![1, 2, 3, 4, 5],
             "each migration recorded exactly once"
         );
         let created_at: String = store

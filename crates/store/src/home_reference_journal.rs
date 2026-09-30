@@ -73,6 +73,33 @@ pub struct ReferenceRefusal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceUseClassification {
+    Exact,
+    LegacyUnknown,
+}
+
+/// One immutable item-to-admission binding. A retained version alone cannot
+/// choose among several accepting operations for the same version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceUsePin {
+    pub home_id: String,
+    pub target_store: String,
+    pub use_key: String,
+    pub version_id: String,
+    pub operation_id: Option<String>,
+    pub classification: ReferenceUseClassification,
+    pub bound_epoch: i64,
+}
+
+/// The target store's read of the exact immutable operation and witness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceUseEvidence {
+    pub version_id: String,
+    pub evidence_ref: String,
+    pub witness_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceEvidence {
     /// Immutable identity in the target runtime store, not a moving version row.
     pub evidence_ref: String,
@@ -190,6 +217,54 @@ fn operation(
             },
         )
         .optional()?)
+}
+
+fn use_pin(
+    conn: &Connection,
+    home_id: &str,
+    target_store: &str,
+    use_key: &str,
+) -> Result<Option<ReferenceUsePin>, JournalError> {
+    let row: Option<(String, String, Option<String>, i64)> = conn
+        .query_row(
+            "SELECT version_id, classification, operation_id, bound_epoch \
+             FROM home_reference_use_pins \
+             WHERE home_id = ?1 AND target_store = ?2 AND use_key = ?3",
+            params![home_id, target_store, use_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((version_id, classification, operation_id, bound_epoch)) = row else {
+        return Ok(None);
+    };
+    let classification = match (classification.as_str(), operation_id.as_deref()) {
+        ("exact", Some(id)) => {
+            let operation = operation(conn, id)?.ok_or(JournalError::Conflict(
+                "exact reference use pin has no target operation",
+            ))?;
+            if operation.home_id != home_id
+                || operation.target_store != target_store
+                || operation.completed_epoch.is_none()
+                || operation.refusal.is_some()
+            {
+                return Err(JournalError::Conflict(
+                    "exact reference use pin has no completed Home operation",
+                ));
+            }
+            ReferenceUseClassification::Exact
+        }
+        ("legacy_unknown", None) => ReferenceUseClassification::LegacyUnknown,
+        _ => return Err(JournalError::Conflict("malformed reference use pin")),
+    };
+    Ok(Some(ReferenceUsePin {
+        home_id: home_id.to_owned(),
+        target_store: target_store.to_owned(),
+        use_key: use_key.to_owned(),
+        version_id,
+        operation_id,
+        classification,
+        bound_epoch,
+    }))
 }
 
 fn completed_in_epoch(
@@ -499,6 +574,98 @@ impl Store {
         Ok(refused)
     }
 
+    /// Bind one item to its exact completed admission before runtime arrival
+    /// or effects. The caller reads immutable target evidence outside the Home
+    /// write transaction; this transaction then checks the Home pointer and
+    /// keeps a competing admission from replacing an existing item pin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_exact_reference_use<F>(
+        &mut self,
+        home_id: &str,
+        target_store: &str,
+        use_key: &str,
+        version_id: &str,
+        operation_id: &str,
+        verify: F,
+    ) -> Result<ReferenceUsePin, JournalError>
+    where
+        F: FnOnce(&ReferenceOperation) -> Result<ReferenceUseEvidence, String>,
+    {
+        for value in [home_id, target_store, use_key, version_id, operation_id] {
+            required(value)?;
+        }
+        let before = operation(&self.conn, operation_id)?.ok_or(JournalError::Conflict(
+            "reference use operation was not registered",
+        ))?;
+        if before.home_id != home_id || before.target_store != target_store {
+            return Err(JournalError::Conflict(
+                "reference use operation belongs to another Home or target",
+            ));
+        }
+        if before.completed_epoch.is_none() || before.refusal.is_some() {
+            return Err(JournalError::Conflict(
+                "reference use operation is not completed",
+            ));
+        }
+        let evidence = verify(&before).map_err(JournalError::Verification)?;
+        for value in [
+            &evidence.version_id,
+            &evidence.evidence_ref,
+            &evidence.witness_digest,
+        ] {
+            required(value)?;
+        }
+        if evidence.version_id != version_id
+            || before.evidence_ref.as_deref() != Some(&evidence.evidence_ref)
+            || before.witness_digest.as_deref() != Some(&evidence.witness_digest)
+        {
+            return Err(JournalError::Conflict(
+                "reference use target evidence differs from its Home pointer",
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let epoch = bind_home(&tx, home_id)?;
+        let now = operation(&tx, operation_id)?.ok_or(JournalError::Conflict(
+            "reference use operation disappeared during target verification",
+        ))?;
+        if now != before {
+            return Err(JournalError::Conflict(
+                "reference use operation changed during target verification",
+            ));
+        }
+        if let Some(existing) = use_pin(&tx, home_id, target_store, use_key)? {
+            if existing.classification != ReferenceUseClassification::Exact
+                || existing.operation_id.as_deref() != Some(operation_id)
+                || existing.version_id != version_id
+            {
+                return Err(JournalError::Conflict(
+                    "reference use already has a different immutable pin",
+                ));
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        tx.execute(
+            "INSERT INTO home_reference_use_pins \
+             (home_id, target_store, use_key, version_id, classification, \
+              operation_id, bound_epoch) VALUES (?1, ?2, ?3, ?4, 'exact', ?5, ?6)",
+            params![
+                home_id,
+                target_store,
+                use_key,
+                version_id,
+                operation_id,
+                epoch
+            ],
+        )?;
+        let pinned = use_pin(&tx, home_id, target_store, use_key)?
+            .ok_or(JournalError::Conflict("new reference use pin disappeared"))?;
+        tx.commit()?;
+        Ok(pinned)
+    }
+
     /// Atomically freeze the completed roster and advance admission to the
     /// next epoch. Pending rows remain owed. The seal is an exact cut, but it
     /// cannot claim completeness until the accepting-path inventory is proved.
@@ -603,6 +770,15 @@ impl Store {
     ) -> Result<Option<ReferenceOperation>, JournalError> {
         operation(&self.conn, operation_id)
     }
+
+    pub fn reference_use_pin(
+        &self,
+        home_id: &str,
+        target_store: &str,
+        use_key: &str,
+    ) -> Result<Option<ReferenceUsePin>, JournalError> {
+        use_pin(&self.conn, home_id, target_store, use_key)
+    }
 }
 
 #[cfg(test)]
@@ -623,6 +799,191 @@ mod tests {
             evidence_ref: "operation:one".into(),
             witness_digest: "witness:one".into(),
         })
+    }
+
+    fn exact_use_evidence(_: &ReferenceOperation) -> Result<ReferenceUseEvidence, String> {
+        Ok(ReferenceUseEvidence {
+            version_id: "version:one".into(),
+            evidence_ref: "operation:one".into(),
+            witness_digest: "witness:one".into(),
+        })
+    }
+
+    #[test]
+    fn exact_item_pin_requires_completed_target_and_survives_seal_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("home.db");
+        let path = path.to_str().unwrap();
+        let mut store = Store::open(path).unwrap();
+        store
+            .register_reference_operation("home:one", &input("one"))
+            .unwrap();
+        assert!(store
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:one",
+                "version:one",
+                "one",
+                |_| panic!("a pending Home pointer cannot verify a use"),
+            )
+            .is_err());
+        store
+            .complete_reference_operation("home:one", "one", evidence)
+            .unwrap();
+        let pinned = store
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:one",
+                "version:one",
+                "one",
+                exact_use_evidence,
+            )
+            .unwrap();
+        assert_eq!(pinned.classification, ReferenceUseClassification::Exact);
+        assert_eq!(pinned.operation_id.as_deref(), Some("one"));
+        assert_eq!(pinned.bound_epoch, 0);
+        assert_eq!(
+            store
+                .reference_use_pin("home:one", "chats/one.sqlite", "item:one")
+                .unwrap(),
+            Some(pinned.clone()),
+        );
+        store
+            .seal_reference_epoch("home:one", "registry:1", "policy:1", "tree:1")
+            .unwrap();
+        drop(store);
+        let mut reopened = Store::open(path).unwrap();
+        assert_eq!(
+            reopened
+                .bind_exact_reference_use(
+                    "home:one",
+                    "chats/one.sqlite",
+                    "item:one",
+                    "version:one",
+                    "one",
+                    exact_use_evidence,
+                )
+                .unwrap(),
+            pinned,
+        );
+        assert!(reopened
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:one",
+                "version:changed",
+                "one",
+                exact_use_evidence,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn competing_or_corrupt_item_pins_cannot_switch_target_operations() {
+        let mut store = Store::open_in_memory().unwrap();
+        for id in ["one", "two"] {
+            store
+                .register_reference_operation("home:one", &input(id))
+                .unwrap();
+            store
+                .complete_reference_operation("home:one", id, evidence)
+                .unwrap();
+        }
+        store
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:one",
+                "version:one",
+                "one",
+                exact_use_evidence,
+            )
+            .unwrap();
+        assert!(store
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:one",
+                "version:one",
+                "two",
+                exact_use_evidence,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .reference_use_pin("home:one", "chats/one.sqlite", "item:one")
+                .unwrap()
+                .unwrap()
+                .operation_id
+                .as_deref(),
+            Some("one"),
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE home_reference_use_pins SET operation_id = 'two' \
+                 WHERE use_key = 'item:one'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:one",
+                "version:one",
+                "one",
+                exact_use_evidence,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn a_legacy_unknown_pin_cannot_become_an_exact_pin_by_retry() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_reference_operation("home:one", &input("one"))
+            .unwrap();
+        store
+            .complete_reference_operation("home:one", "one", evidence)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO home_reference_use_pins \
+                 (home_id, target_store, use_key, version_id, classification, bound_epoch) \
+                 VALUES ('home:one', 'chats/one.sqlite', 'old-item', 'old-version', \
+                         'legacy_unknown', 0)",
+                [],
+            )
+            .unwrap();
+        let legacy = store
+            .reference_use_pin("home:one", "chats/one.sqlite", "old-item")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            legacy.classification,
+            ReferenceUseClassification::LegacyUnknown
+        );
+        assert!(legacy.operation_id.is_none());
+        assert!(store
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "old-item",
+                "version:one",
+                "one",
+                exact_use_evidence,
+            )
+            .is_err());
+        assert!(
+            !store
+                .seal_reference_epoch("home:one", "registry:1", "policy:1", "tree:1")
+                .unwrap()
+                .inventory_complete
+        );
     }
 
     #[test]
@@ -849,14 +1210,18 @@ mod tests {
         drop(store);
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch(
-            "DROP TABLE home_reference_refusals; \
-             DELETE FROM schema_migrations WHERE version = 4;",
+            "DROP TABLE home_reference_use_pins; \
+             DROP TABLE home_reference_refusals; \
+             DELETE FROM schema_migrations WHERE version IN (4, 5);",
         )
         .unwrap();
         drop(conn);
         let upgraded = Store::open(path).unwrap();
         assert_eq!(upgraded.sealed_reference_epoch(0).unwrap(), Some(sealed));
-        assert_eq!(upgraded.schema_version().unwrap(), 4);
+        assert_eq!(
+            upgraded.schema_version().unwrap(),
+            crate::SUPPORTED_SCHEMA_VERSION
+        );
     }
 
     #[test]
