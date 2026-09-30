@@ -915,6 +915,27 @@ async fn a_projects_own_gate_screens_a_drained_item_into_the_workspace() {
         .expect("the project's gate runs")
         .expect("a kept item lands in the workspace");
 
+    // The production caller registered before the target import and pinned
+    // this item to the completed Home operation before the gate used it.
+    let guard = workbench.lock_unpoisoned();
+    let home = guard.home_id().as_str();
+    let target = format!("project-gate:{PROJECT}");
+    let pin = guard
+        .store_ref()
+        .reference_use_pin(home, &target, ARTIFACT)
+        .unwrap()
+        .expect("the item has an exact Home use pin");
+    let operation_id = pin.operation_id.as_deref().expect("an exact operation");
+    let operation = guard
+        .store_ref()
+        .reference_operation(operation_id)
+        .unwrap()
+        .expect("the Home remembers the operation");
+    assert_eq!(operation.completed_epoch, Some(0));
+    assert_eq!(operation.evidence_ref.as_deref(), Some(operation_id));
+    assert!(operation.witness_digest.is_some());
+    drop(guard);
+
     // The bytes are in the project-owned target, and the record says so.
     let worktree = project_repo(dir.path());
     assert!(worktree.join(&landed).is_file());
@@ -929,6 +950,60 @@ async fn a_projects_own_gate_screens_a_drained_item_into_the_workspace() {
         "the gate's verdict settled the record: {:?}",
         item.status,
     );
+}
+
+#[tokio::test]
+async fn a_pre_journal_gate_item_is_recorded_unknown_before_product_use() {
+    let (_dir, workbench, app, edge, _log) = setup();
+    drain(&workbench, &edge, PROJECT);
+    let chat = a_chat(&app).await;
+    let coerce = gaugedesk_app::gate_service::unusable_coercion_config();
+    struct NoModel;
+    impl gaugedesk_whip_runtime::gate_runner::GateTransport for NoModel {
+        fn fetch(
+            &self,
+            _: &gaugedesk_whip_runtime::sansio_types::HttpRequest,
+        ) -> Result<
+            gaugedesk_whip_runtime::sansio_types::HttpResponse,
+            gaugedesk_whip_runtime::sansio_types::TransportError,
+        > {
+            panic!("review-by-hand never reaches a provider")
+        }
+    }
+    {
+        let guard = workbench.lock_unpoisoned();
+        let program =
+            gaugedesk_app::gate_service::project_gate(&guard.root_path().join("targets"), PROJECT)
+                .unwrap();
+        let payload = guard.read_quarantined_item(PROJECT, ARTIFACT).unwrap();
+        assert!(gaugedesk_app::gate_service::screen_item(
+            &program,
+            &coerce,
+            &guard.root_path(),
+            PROJECT,
+            ARTIFACT,
+            &payload,
+            &NoModel,
+        )
+        .unwrap()
+        .is_none());
+    }
+    let mut guard = workbench.lock_unpoisoned();
+    let refusal = guard
+        .run_project_gate(PROJECT, ARTIFACT, &chat, &coerce, &NoModel)
+        .unwrap_err();
+    assert!(refusal.to_string().contains("legacy unknown"));
+    let target = format!("project-gate:{PROJECT}");
+    let pin = guard
+        .store_ref()
+        .reference_use_pin(guard.home_id().as_str(), &target, ARTIFACT)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pin.classification,
+        gaugedesk_store::home_reference_journal::ReferenceUseClassification::LegacyUnknown
+    );
+    assert!(pin.operation_id.is_none());
 }
 
 /// A reviewer's answer settles an item *through* the gate, not around it.

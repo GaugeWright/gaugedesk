@@ -16,14 +16,23 @@
 //! Each arrival still stages into its **own** root directory, so two concurrent
 //! screenings on one project cannot overwrite each other's item (GATE-3i).
 
+use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use gaugedesk_store::home_reference_journal::{
+    ReferenceCompletion, ReferenceEvidence, ReferenceOperation, ReferenceUseEvidence,
+    RevalidatedReferenceEvidence,
+};
+use gaugedesk_store::Store;
 use gaugedesk_whip_runtime::gate_runner::{
-    deliver_verdict, run_gate, CoerceBackend, Disposition, GateCoercionConfig, GateProgram,
-    GateRunError, GateTransport,
+    deliver_verdict_with_use_check, run_gate, run_gate_with_home_admission,
+    verify_gate_import_operation, CoerceBackend, Disposition, GateCoercionConfig,
+    GateImportEvidence, GateNewAdmissionBasis, GateProgram, GateRunError, GateTransport,
+    GateVersionUse,
 };
 use gaugedesk_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
+use sha2::{Digest, Sha256};
 
 use crate::app_support::LockUnpoisoned;
 use crate::workbench_state::SharedWorkbench;
@@ -150,12 +159,251 @@ fn slug(value: &str) -> String {
     slug.trim_matches('-').to_owned()
 }
 
-/// Run the project's own gate over one quarantined item.
+fn gate_target_store(project_id: &str) -> String {
+    format!("project-gate:{project_id}")
+}
+
+fn gate_basis_digest(home_id: &str, project_id: &str, evidence: &GateImportEvidence) -> String {
+    let encoded = serde_json::to_vec(&(
+        "gaugedesk.project-gate-home-basis.v1",
+        home_id,
+        project_id,
+        &evidence.program_name,
+        &evidence.source_digest,
+        &evidence.ir_digest,
+        &evidence.compiler_artifact_digest,
+        &evidence.lock_digest,
+        &evidence.envelope_digest,
+    ))
+    .expect("a fixed tuple of strings serializes");
+    hex::encode(Sha256::digest(encoded))
+}
+
+fn registration_basis_digest(
+    home_id: &str,
+    project_id: &str,
+    basis: &GateNewAdmissionBasis<'_>,
+) -> String {
+    let encoded = serde_json::to_vec(&(
+        "gaugedesk.project-gate-home-basis.v1",
+        home_id,
+        project_id,
+        basis.program_name,
+        basis.source_digest,
+        basis.ir_digest,
+        basis.compiler_artifact_digest,
+        basis.lock_digest,
+        basis.envelope_digest,
+    ))
+    .expect("a fixed tuple of strings serializes");
+    hex::encode(Sha256::digest(encoded))
+}
+
+fn gate_evidence(
+    program: &GateProgram,
+    state: &Path,
+    operation: &ReferenceOperation,
+) -> Result<GateImportEvidence, String> {
+    let evidence = verify_gate_import_operation(program, state, &operation.operation_id)
+        .map_err(|error| error.to_string())?;
+    if evidence.operation_id != operation.operation_id {
+        return Err("gate target returned a different import operation".into());
+    }
+    Ok(evidence)
+}
+
+#[allow(clippy::too_many_arguments)] // Home, project, target and selected item are separate authority keys.
+fn home_gate_use(
+    store: &mut Store,
+    home_id: &str,
+    project_id: &str,
+    item_id: &str,
+    program: &GateProgram,
+    targets_dir: &Path,
+    state: &Path,
+    selected: GateVersionUse<'_>,
+) -> Result<(), GateRunError> {
+    let target = gate_target_store(project_id);
+    let (operation_id, version_id, newly_admitted) = match selected {
+        GateVersionUse::NewlyAdmitted {
+            operation_id,
+            version_id,
+            ..
+        } => (operation_id.to_owned(), version_id.to_owned(), true),
+        GateVersionUse::Retained { version_id } => {
+            let pinned = store
+                .reference_use_pin(home_id, &target, item_id)
+                .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
+            let operation_id = if let Some(pinned) = pinned {
+                if pinned.version_id != version_id {
+                    return Err(GateRunError::NoDisposition(
+                        "gate item has a different immutable Home version pin".into(),
+                    ));
+                }
+                pinned.operation_id.ok_or_else(|| {
+                    GateRunError::NoDisposition(
+                        "legacy gate item has no exact Home operation; preserve it for explicit readmission".into(),
+                    )
+                })?
+            } else {
+                let origin = store
+                    .exact_reference_origin_for_version(home_id, &target, version_id)
+                    .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
+                match origin {
+                    Some(operation_id) => operation_id,
+                    None => {
+                        store
+                            .classify_legacy_reference_use_unknown(
+                                home_id, &target, item_id, version_id,
+                            )
+                            .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
+                        return Err(GateRunError::NoDisposition(
+                            "retained gate version has no exact Home origin; item recorded as legacy unknown".into(),
+                        ));
+                    }
+                }
+            };
+            (operation_id, version_id.to_owned(), false)
+        }
+    };
+
+    if newly_admitted {
+        let completion = store
+            .complete_reference_operation(home_id, &operation_id, |operation| {
+                if operation.target_store != target || operation.kind != "checked-program" {
+                    return Err("Home gate operation has a different target or kind".into());
+                }
+                let evidence = gate_evidence(program, state, operation)?;
+                if gate_basis_digest(home_id, project_id, &evidence) != operation.basis_digest {
+                    return Err("gate target differs from registered Home basis".into());
+                }
+                Ok(ReferenceEvidence {
+                    evidence_ref: evidence.operation_id,
+                    witness_digest: evidence.witness_digest,
+                })
+            })
+            .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
+        if matches!(completion, ReferenceCompletion::NeedsRevalidation { .. }) {
+            // A seal may race a target write. Re-read the project's current
+            // envelope and the exact retained target before completing in the
+            // later epoch. Repeated seals keep the operation pending.
+            let current = project_gate(targets_dir, project_id)
+                .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
+            let completed = store
+                .complete_revalidated_reference_operation(
+                    home_id,
+                    &operation_id,
+                    |operation, _epoch| {
+                        let evidence = gate_evidence(&current, state, operation)?;
+                        Ok(RevalidatedReferenceEvidence {
+                            evidence: ReferenceEvidence {
+                                evidence_ref: evidence.operation_id.clone(),
+                                witness_digest: evidence.witness_digest.clone(),
+                            },
+                            current_basis_digest: gate_basis_digest(home_id, project_id, &evidence),
+                        })
+                    },
+                )
+                .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
+            if matches!(completed, ReferenceCompletion::NeedsRevalidation { .. }) {
+                return Err(GateRunError::NoDisposition(
+                    "Home epoch advanced during gate revalidation; retry the same item".into(),
+                ));
+            }
+        }
+    }
+
+    let current = project_gate(targets_dir, project_id)
+        .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
+    store
+        .bind_exact_reference_use(
+            home_id,
+            &target,
+            item_id,
+            &version_id,
+            &operation_id,
+            |operation| {
+                let evidence = gate_evidence(&current, state, operation)?;
+                let current_basis = gate_basis_digest(home_id, project_id, &evidence);
+                let admitted_basis = operation
+                    .revalidated_basis_digest
+                    .as_deref()
+                    .unwrap_or(&operation.basis_digest);
+                if current_basis != admitted_basis {
+                    return Err(
+                        "current gate basis differs from its completed Home admission".into(),
+                    );
+                }
+                Ok(ReferenceUseEvidence {
+                    version_id: evidence.version_id,
+                    evidence_ref: evidence.operation_id,
+                    witness_digest: evidence.witness_digest,
+                })
+            },
+        )
+        .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn screen_item_with_home<T: GateTransport>(
+    store: &mut Store,
+    home_id: &str,
+    ir: &GateProgram,
+    coerce: &GateCoercionConfig,
+    state_root: &Path,
+    targets_dir: &Path,
+    project_id: &str,
+    item_id: &str,
+    payload: &[u8],
+    transport: &T,
+) -> io::Result<Option<Disposition>> {
+    let root = arrival_root(state_root, project_id, item_id);
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(root.join("item.json"), payload)?;
+    let state = gate_state_dir(state_root, project_id);
+    let target = gate_target_store(project_id);
+    let request = format!("gate-item:{project_id}:{item_id}");
+    let shared = RefCell::new(store);
+    match run_gate_with_home_admission(
+        ir,
+        coerce,
+        item_id,
+        &root,
+        &state,
+        transport,
+        |basis| {
+            let digest = registration_basis_digest(home_id, project_id, &basis);
+            shared
+                .borrow_mut()
+                .register_checked_program_request(home_id, &target, &request, &digest)
+                .map(|operation| operation.operation_id)
+                .map_err(|error| GateRunError::NoDisposition(error.to_string()))
+        },
+        |selected| {
+            home_gate_use(
+                &mut shared.borrow_mut(),
+                home_id,
+                project_id,
+                item_id,
+                ir,
+                targets_dir,
+                &state,
+                selected,
+            )
+        },
+    ) {
+        Ok(disposition) => Ok(Some(disposition)),
+        Err(GateRunError::AwaitingReview) => Ok(None),
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
+/// Run an unjournaled gate fixture over one quarantined item.
 ///
-/// Returns the disposition when the gate ruled, and `None` when it parked on a
-/// person — which is not a failure but the review-by-hand path working. The
-/// caller applies a ruling; a parked item stays `Pending` and its question waits
-/// in the project's `review` tracker.
+/// Production callers use `Workbench::run_project_gate`, which registers and
+/// verifies the Home operation before any version is used. This narrow helper
+/// remains for runtime fixtures and pre-journal migration tests.
 pub fn screen_item<T: GateTransport>(
     ir: &GateProgram,
     coerce: &GateCoercionConfig,
@@ -225,10 +473,15 @@ impl crate::Workbench {
         let ir = project_gate(&self.targets_dir(), project_id).map_err(io::Error::other)?;
         let payload = self.read_quarantined_item(project_id, item_id)?;
         let state_root = self.root_path();
-        let Some(disposition) = screen_item(
+        let targets_dir = self.targets_dir();
+        let home_id = self.home_id().as_str().to_owned();
+        let Some(disposition) = screen_item_with_home(
+            self.store_mut(),
+            &home_id,
             &ir,
             coerce,
             &state_root,
+            &targets_dir,
             project_id,
             item_id,
             &payload,
@@ -265,6 +518,8 @@ impl crate::Workbench {
     ) -> io::Result<Option<String>> {
         let ir = project_gate(&self.targets_dir(), project_id).map_err(io::Error::other)?;
         let state_root = self.root_path();
+        let targets_dir = self.targets_dir();
+        let home_id = self.home_id().as_str().to_owned();
         let root = arrival_root(&state_root, project_id, item_id);
         let state = gate_state_dir(&state_root, project_id);
         // `screen_item` creates these on the screening path; review-by-hand
@@ -278,8 +533,28 @@ impl crate::Workbench {
             crate::gate::Verdict::Keep => Disposition::Keep,
             crate::gate::Verdict::Flag => Disposition::Flag,
         };
-        let ruled = deliver_verdict(&ir, coerce, item_id, disposition, &root, &state, transport)
-            .map_err(io::Error::other)?;
+        let ruled = deliver_verdict_with_use_check(
+            &ir,
+            coerce,
+            item_id,
+            disposition,
+            &root,
+            &state,
+            transport,
+            |selected| {
+                home_gate_use(
+                    self.store_mut(),
+                    &home_id,
+                    project_id,
+                    item_id,
+                    &ir,
+                    &targets_dir,
+                    &state,
+                    selected,
+                )
+            },
+        )
+        .map_err(io::Error::other)?;
         // An answer needs a question. `deliver_verdict` finds none when nothing
         // has screened this project yet — no instance, so no parked request the
         // verdict could correlate against — and returns `None`, which the caller
@@ -296,20 +571,41 @@ impl crate::Workbench {
             Some(ruled) => Some(ruled),
             None => {
                 let payload = self.read_quarantined_item(project_id, item_id)?;
-                match screen_item(
+                match screen_item_with_home(
+                    self.store_mut(),
+                    &home_id,
                     &ir,
                     coerce,
                     &state_root,
+                    &targets_dir,
                     project_id,
                     item_id,
                     &payload,
                     transport,
                 )? {
                     Some(screened) => Some(screened),
-                    None => {
-                        deliver_verdict(&ir, coerce, item_id, disposition, &root, &state, transport)
-                            .map_err(io::Error::other)?
-                    }
+                    None => deliver_verdict_with_use_check(
+                        &ir,
+                        coerce,
+                        item_id,
+                        disposition,
+                        &root,
+                        &state,
+                        transport,
+                        |selected| {
+                            home_gate_use(
+                                self.store_mut(),
+                                &home_id,
+                                project_id,
+                                item_id,
+                                &ir,
+                                &targets_dir,
+                                &state,
+                                selected,
+                            )
+                        },
+                    )
+                    .map_err(io::Error::other)?,
                 }
             }
         };
@@ -327,6 +623,8 @@ impl crate::Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use gaugedesk_whip_runtime::sansio_types::TransportError;
 
     #[test]
     fn one_project_shares_a_state_dir_and_arrivals_do_not() {
@@ -351,5 +649,82 @@ mod tests {
             "a traversal-shaped id stays inside: {escaped:?}",
         );
         assert!(!escaped.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn a_seal_between_registration_and_target_write_revalidates_before_use() {
+        struct NoTransport;
+        impl GateTransport for NoTransport {
+            fn fetch(&self, _: &HttpRequest) -> Result<HttpResponse, TransportError> {
+                panic!("review-by-hand cannot call a provider")
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let targets = dir.path().join("targets");
+        let project = "project-one";
+        let item = "item-one";
+        let repo = targets
+            .join(crate::library_state::managed_project_target_id(project))
+            .join("repo");
+        crate::gate::install(&repo, crate::gate::GateKind::ReviewByHand).unwrap();
+        let program = project_gate(&targets, project).unwrap();
+        let state = gate_state_dir(dir.path(), project);
+        let arrival = arrival_root(dir.path(), project, item);
+        std::fs::create_dir_all(&arrival).unwrap();
+        std::fs::write(arrival.join("item.json"), br#"{"text":"review me"}"#).unwrap();
+        let home = "home-one";
+        let target = gate_target_store(project);
+        let store = RefCell::new(Store::open_in_memory().unwrap());
+        let result = run_gate_with_home_admission(
+            &program,
+            &unusable_coercion_config(),
+            item,
+            &arrival,
+            &state,
+            &NoTransport,
+            |basis| {
+                let digest = registration_basis_digest(home, project, &basis);
+                let mut store = store.borrow_mut();
+                let operation = store
+                    .register_checked_program_request(
+                        home,
+                        &target,
+                        "gate-item:project-one:item-one",
+                        &digest,
+                    )
+                    .unwrap();
+                store
+                    .seal_reference_epoch(home, "registry:1", "policy:1", "tree:1")
+                    .unwrap();
+                Ok(operation.operation_id)
+            },
+            |selected| {
+                home_gate_use(
+                    &mut store.borrow_mut(),
+                    home,
+                    project,
+                    item,
+                    &program,
+                    &targets,
+                    &state,
+                    selected,
+                )
+            },
+        );
+        assert!(matches!(result, Err(GateRunError::AwaitingReview)));
+        let pin = store
+            .borrow()
+            .reference_use_pin(home, &target, item)
+            .unwrap()
+            .unwrap();
+        let operation = store
+            .borrow()
+            .reference_operation(pin.operation_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.registered_epoch, 0);
+        assert_eq!(operation.completed_epoch, Some(1));
+        assert!(operation.revalidated_basis_digest.is_some());
     }
 }

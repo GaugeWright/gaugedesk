@@ -4,13 +4,15 @@
 use std::path::PathBuf;
 
 use gaugedesk_boundary::AgentConfig;
-use gaugedesk_harness::{sandbox::Network, ChatMode, HarnessSpec};
+use gaugedesk_harness::{sandbox::Network, ChatMode, HarnessFactory, HarnessSpec};
 use gaugedesk_workspace::Instance;
 use serde::Serialize;
 
 use crate::agent_improve_adoption::AgentDefinitionSnapshot;
 use crate::agent_improve_campaign::{
-    run_native_campaign_with_reservation, CampaignSnapshot, NativeCampaignGate, OptimizerFeedback,
+    run_hosted_managed_campaign_with_reservation, run_native_campaign_with_reservation,
+    CampaignSnapshot, HostedCampaignExecution, ManagedCampaignFunding, NativeCampaignGate,
+    OptimizerFeedback,
 };
 use crate::agent_improve_custody::{desktop_improve_actor, desktop_improve_bearer};
 use crate::agent_improve_evidence::AgentImproveEvidenceRecord;
@@ -39,6 +41,12 @@ struct NativeImprovePrepared {
     template: HarnessSpec,
     factory: gaugedesk_whip_runtime::WhipHarnessFactory,
     gate: MembraneGate,
+    funding: Option<ManagedCampaignFunding>,
+}
+
+enum ImproveExecution {
+    Native,
+    Hosted(crate::managed_funding::FundingAuthority, String),
 }
 
 /// The desktop IPC caller supplies identities, never paths, policy or secret
@@ -57,9 +65,40 @@ pub fn evaluate_agent_improve_from_desktop(
     };
     let _claim = crate::engine::claim_turn(edit_chat_id)
         .ok_or("Finish the edit-chat turn before evaluating this Agent")?;
-    let prepared =
-        NativeImprovePrepared::prepare(wb, agent_id, edit_chat_id, campaign_ref, actor.as_deref())?;
+    let prepared = NativeImprovePrepared::prepare(
+        wb,
+        agent_id,
+        edit_chat_id,
+        campaign_ref,
+        actor.as_deref(),
+        ImproveExecution::Native,
+    )?;
     prepared.run(wb, actor.as_deref())
+}
+
+/// Home-only hosted evaluation. The caller must have authenticated the actor
+/// and tenant before this boundary; it may supply identities, never candidate
+/// paths, private cases, policy bytes, placement ids, or funding references.
+pub fn evaluate_agent_improve_from_hosted(
+    wb: &SharedWorkbench,
+    agent_id: &str,
+    edit_chat_id: &str,
+    campaign_ref: &str,
+    actor: &str,
+    tenant_scope: &str,
+    funding_authority: crate::managed_funding::FundingAuthority,
+) -> Result<NativeImproveResult, String> {
+    let _claim = crate::engine::claim_turn(edit_chat_id)
+        .ok_or("Finish the edit-chat turn before evaluating this Agent")?;
+    let prepared = NativeImprovePrepared::prepare(
+        wb,
+        agent_id,
+        edit_chat_id,
+        campaign_ref,
+        Some(actor),
+        ImproveExecution::Hosted(funding_authority, tenant_scope.to_owned()),
+    )?;
+    prepared.run(wb, Some(actor))
 }
 
 pub fn adopt_agent_improve_from_desktop(
@@ -91,6 +130,7 @@ impl NativeImprovePrepared {
         edit_chat_id: &str,
         campaign_ref: &str,
         actor: Option<&str>,
+        execution: ImproveExecution,
     ) -> Result<Self, String> {
         let (
             target_id,
@@ -185,7 +225,11 @@ impl NativeImprovePrepared {
             let factory = guard
                 .whip_harness_factory()
                 .map_err(|error| error.to_string())?;
-            let org = crate::org::Org::rebuild_in(guard.store_ref(), crate::org::ORG_SCOPE)
+            let org_scope = match &execution {
+                ImproveExecution::Native => crate::org::ORG_SCOPE,
+                ImproveExecution::Hosted(_, tenant_scope) => tenant_scope.as_str(),
+            };
+            let org = crate::org::Org::rebuild_in(guard.store_ref(), org_scope)
                 .map_err(|error| format!("{error:?}"))?;
             let actor_attributes = guard.idp.as_ref().map_or_else(
                 || gaugedesk_core::abac::AuthorityAttributes {
@@ -251,21 +295,63 @@ impl NativeImprovePrepared {
                 isolated,
             )
         };
-        // The native adapter has no managed-inference usage reservation yet;
-        // running a funded model without one would bypass the ordinary meter.
-        if matches!(
-            provider.as_str(),
-            "cloudflare-ai-gateway" | "cloudflare-workers-ai"
-        ) {
-            return Err(
-                "Native Agent improve needs managed-inference funding admission".to_owned(),
-            );
-        }
+        let funding = match execution {
+            ImproveExecution::Native => {
+                // Native model connections have no managed usage reservation.
+                if matches!(
+                    provider.as_str(),
+                    "cloudflare-ai-gateway" | "cloudflare-workers-ai"
+                ) {
+                    return Err(
+                        "Native Agent improve needs managed-inference funding admission".to_owned(),
+                    );
+                }
+                None
+            }
+            ImproveExecution::Hosted(funding_authority, tenant_scope) => {
+                if provider != crate::managed_inference::METERED_GATEWAY_PROVIDER
+                    || factory.kind() != "whip-do"
+                {
+                    return Err(
+                        "Hosted Agent improve needs the metered WhippleScript DO placement"
+                            .to_owned(),
+                    );
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|error| error.to_string())?
+                    .as_secs();
+                let guard = wb.lock_unpoisoned();
+                guard.verify_agent_improve_source_owner(agent_id, actor)?;
+                let account_scope = guard.account_scope_for_actor(&actor_name);
+                let grant = crate::managed_funding::resolve_plan(
+                    guard.store_ref(),
+                    &gaugedesk_core::ids::ScopeId::new(&account_scope),
+                    &gaugedesk_core::ids::ScopeId::new(&tenant_scope),
+                    &funding_authority.context(now),
+                )
+                .map_err(|error| format!("{error:?}"))?
+                .map_err(|denial| format!("Hosted Agent improve funding refused: {denial:?}"))?;
+                let billing_scope = grant.evidence().scope.as_str().to_owned();
+                credential_ref = grant.reference();
+                Some(ManagedCampaignFunding {
+                    account_scope,
+                    tenant_scope,
+                    billing_scope,
+                    funding_ref: credential_ref.clone(),
+                    provider: provider.clone(),
+                    funding_authority,
+                })
+            }
+        };
         let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
-        factory
-            .isolated_native_shadow(scratch.path().join("native-check"))
-            .map_err(|error| error.to_string())?;
-        if provider == "openai-codex"
+        if funding.is_none() {
+            factory
+                .isolated_native_shadow(scratch.path().join("native-check"))
+                .map_err(|error| error.to_string())?;
+        }
+        if funding.is_none()
+            && provider == "openai-codex"
             && class == crate::account::ModelExecutionClass::LocalInteractive
         {
             crate::codex_oauth::ensure_local_credential_record(wb)?;
@@ -276,7 +362,9 @@ impl NativeImprovePrepared {
                 class,
             );
         }
-        let capability = if provider == "openai-codex" {
+        let capability = if funding.is_some() {
+            None
+        } else if provider == "openai-codex" {
             crate::codex_oauth::resolve_turn_credential(wb, &actor_name, class)?.map(|credential| {
                 crate::account::resolved_credential_capability(
                     credential_ref.clone(),
@@ -301,14 +389,39 @@ impl NativeImprovePrepared {
                     class,
                 )
         };
-        llm_credential_status(&provider, capability.as_deref(), &factory)
-            .map_err(|error| format!("Agent improve model access: {error}"))?;
-        let descriptor = gaugedesk_whip_runtime::native_provider_descriptor(
-            &provider,
-            model.as_deref(),
-            base_url_override.as_deref(),
-        )
-        .map_err(|error| error.to_string())?;
+        if funding.is_none() {
+            llm_credential_status(&provider, capability.as_deref(), &factory)
+                .map_err(|error| format!("Agent improve model access: {error}"))?;
+        }
+        let (model, policy_base_url, wire, endpoint_host, template_base_url) = if funding.is_some()
+        {
+            let model = model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or("Hosted Agent improve needs an exact managed model")?;
+            let route = crate::managed_inference::hosted_metered_route(model);
+            (
+                route.model,
+                route.base_url.clone(),
+                route.wire.to_owned(),
+                "gateway.ai.cloudflare.com".to_owned(),
+                Some(route.base_url),
+            )
+        } else {
+            let descriptor = gaugedesk_whip_runtime::native_provider_descriptor(
+                &provider,
+                model.as_deref(),
+                base_url_override.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+            (
+                descriptor.model,
+                descriptor.base_url,
+                descriptor.wire.to_owned(),
+                descriptor.endpoint_host,
+                base_url_override,
+            )
+        };
         let candidate = AgentDefinitionSnapshot::capture(&candidate_path)?;
         if baseline.changed_paths(&candidate).is_empty() {
             return Err(
@@ -330,8 +443,8 @@ impl NativeImprovePrepared {
             isolated,
             gaugedesk_env::var("ALLOW_UNFILTERED_EGRESS").as_deref() == Some("1"),
         );
-        let hosts = if provider == "openai-generic" {
-            vec![descriptor.endpoint_host.clone()]
+        let hosts = if funding.is_some() || provider == "openai-generic" {
+            vec![endpoint_host]
         } else {
             model_endpoint_hosts(Some(&provider))
         };
@@ -374,12 +487,12 @@ impl NativeImprovePrepared {
                 turn_purpose: None,
                 package_capabilities: baseline_package.capabilities().iter().cloned().collect(),
                 provider: provider.clone(),
-                model: descriptor.model.clone(),
-                base_url: descriptor.base_url.clone(),
+                model: model.clone(),
+                base_url: policy_base_url.clone(),
                 credential_ref: credential_ref.clone(),
                 private_model_broker: None,
-                wire: descriptor.wire.to_owned(),
-                placement_kind: "local".to_owned(),
+                wire,
+                placement_kind: if funding.is_some() { "do" } else { "local" }.to_owned(),
                 command_network: sandbox.network != Network::Deny,
                 resources: Vec::new(),
                 task_tracker: None,
@@ -399,10 +512,10 @@ impl NativeImprovePrepared {
             credential_ref: Some(compiled.credential_ref),
             placement_ceiling_ref: Some(compiled.placement_ceiling_ref),
             workspace_targets: Vec::new(),
-            runtime_placement_id: None,
+            runtime_placement_id: funding.as_ref().map(|_| gen_id("agent-improve-placement")),
             provider: Some(provider),
-            model: Some(descriptor.model),
-            base_url: base_url_override,
+            model: Some(model),
+            base_url: template_base_url,
             thinking: config.thinking.clone(),
             system_prompt: None,
             credential_capability: capability,
@@ -420,6 +533,7 @@ impl NativeImprovePrepared {
             template,
             factory,
             gate: MembraneGate::new(&config, default_external_tools()).with_mode(ChatMode::Use),
+            funding,
         })
     }
 
@@ -437,18 +551,36 @@ impl NativeImprovePrepared {
             wb.lock_unpoisoned()
                 .reserve_agent_improve_sealed_exposure(&self.agent_id, self.campaign.reference())
         };
-        let selected = run_native_campaign_with_reservation(
-            &self.factory,
-            &self.template,
-            &self.target_id,
-            &workspace,
-            &self.candidate_repo,
-            &self.campaign,
-            NativeCampaignGate {
-                egress: &self.gate,
-                reserve_sealed: &mut reserve,
-            },
-        )?;
+        let selected = match self.funding {
+            Some(funding) => run_hosted_managed_campaign_with_reservation(
+                wb,
+                HostedCampaignExecution {
+                    factory: &self.factory,
+                    template: &self.template,
+                    target_id: &self.target_id,
+                    workspace: &workspace,
+                    candidate_repo: &self.candidate_repo,
+                    campaign: &self.campaign,
+                },
+                NativeCampaignGate {
+                    egress: &self.gate,
+                    reserve_sealed: &mut reserve,
+                },
+                funding,
+            )?,
+            None => run_native_campaign_with_reservation(
+                &self.factory,
+                &self.template,
+                &self.target_id,
+                &workspace,
+                &self.candidate_repo,
+                &self.campaign,
+                NativeCampaignGate {
+                    egress: &self.gate,
+                    reserve_sealed: &mut reserve,
+                },
+            )?,
+        };
         let optimizer_feedback = selected.optimizer_feedback();
         let reviewer = {
             let mut guard = wb.lock_unpoisoned();
@@ -612,6 +744,7 @@ mod tests {
             &chat_id,
             &campaign_ref,
             None,
+            ImproveExecution::Native,
         )
         .and_then(|prepared| prepared.run(&wb, None));
         stop.store(true, Ordering::Relaxed);
@@ -684,6 +817,7 @@ mod tests {
             &chat_id,
             &campaign_ref,
             None,
+            ImproveExecution::Native,
         )
         .unwrap();
         assert_eq!(prepared.campaign.reference(), campaign_ref);

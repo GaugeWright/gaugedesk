@@ -870,6 +870,90 @@ impl Store {
     ) -> Result<Option<ReferenceUsePin>, JournalError> {
         use_pin(&self.conn, home_id, target_store, use_key)
     }
+
+    /// Preserve a pre-journal item's unresolved lineage without inventing an
+    /// accepting operation. It remains unusable until its lifecycle is chosen
+    /// explicitly; an exact retry cannot silently upgrade this classification.
+    pub fn classify_legacy_reference_use_unknown(
+        &mut self,
+        home_id: &str,
+        target_store: &str,
+        use_key: &str,
+        version_id: &str,
+    ) -> Result<ReferenceUsePin, JournalError> {
+        for value in [home_id, target_store, use_key, version_id] {
+            required(value)?;
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let epoch = bind_home(&tx, home_id)?;
+        if let Some(existing) = use_pin(&tx, home_id, target_store, use_key)? {
+            if existing.version_id != version_id
+                || existing.classification != ReferenceUseClassification::LegacyUnknown
+            {
+                return Err(JournalError::Conflict(
+                    "legacy reference use already has a different immutable pin",
+                ));
+            }
+            tx.commit()?;
+            return Ok(existing);
+        }
+        tx.execute(
+            "INSERT INTO home_reference_use_pins \
+             (home_id, target_store, use_key, version_id, classification, bound_epoch) \
+             VALUES (?1, ?2, ?3, ?4, 'legacy_unknown', ?5)",
+            params![home_id, target_store, use_key, version_id, epoch],
+        )?;
+        let pinned = use_pin(&tx, home_id, target_store, use_key)?.ok_or(
+            JournalError::Conflict("legacy reference use pin disappeared"),
+        )?;
+        tx.commit()?;
+        Ok(pinned)
+    }
+
+    /// Recover the one Home operation already used by this retained version.
+    /// A version row alone is insufficient: separate checked imports may have
+    /// produced the same version. Never choose one by ordering or by a target
+    /// store's local roster.
+    pub fn exact_reference_origin_for_version(
+        &self,
+        home_id: &str,
+        target_store: &str,
+        version_id: &str,
+    ) -> Result<Option<String>, JournalError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT operation_id FROM home_reference_use_pins \
+             WHERE home_id = ?1 AND target_store = ?2 AND version_id = ?3 \
+               AND classification = 'exact' ORDER BY operation_id LIMIT 2",
+        )?;
+        let ids = stmt
+            .query_map(params![home_id, target_store, version_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() > 1 {
+            return Err(JournalError::Conflict(
+                "retained version has multiple Home admission origins",
+            ));
+        }
+        let Some(id) = ids.into_iter().next() else {
+            return Ok(None);
+        };
+        let origin = operation(&self.conn, &id)?.ok_or(JournalError::Conflict(
+            "retained version Home admission origin disappeared",
+        ))?;
+        if origin.home_id != home_id
+            || origin.target_store != target_store
+            || origin.completed_epoch.is_none()
+            || origin.refusal.is_some()
+        {
+            return Err(JournalError::Conflict(
+                "retained version Home admission origin is not completed",
+            ));
+        }
+        Ok(Some(id))
+    }
 }
 
 #[cfg(test)]
@@ -1077,6 +1161,102 @@ mod tests {
                 "home:one",
                 "chats/one.sqlite",
                 "item:one",
+                "version:one",
+                "one",
+                exact_use_evidence,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn retained_version_origin_requires_one_exact_home_pin() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            store
+                .exact_reference_origin_for_version("home:one", "chats/one.sqlite", "version:one")
+                .unwrap(),
+            None
+        );
+        for id in ["one", "two"] {
+            store
+                .register_reference_operation("home:one", &input(id))
+                .unwrap();
+            store
+                .complete_reference_operation("home:one", id, evidence)
+                .unwrap();
+        }
+        store
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:one",
+                "version:one",
+                "one",
+                exact_use_evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .exact_reference_origin_for_version("home:one", "chats/one.sqlite", "version:one")
+                .unwrap(),
+            Some("one".into())
+        );
+        store
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:two",
+                "version:one",
+                "two",
+                exact_use_evidence,
+            )
+            .unwrap();
+        assert!(store
+            .exact_reference_origin_for_version("home:one", "chats/one.sqlite", "version:one")
+            .is_err());
+    }
+
+    #[test]
+    fn legacy_unknown_is_durable_and_cannot_be_upgraded_by_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("home.db");
+        let mut store = Store::open(path.to_str().unwrap()).unwrap();
+        let unknown = store
+            .classify_legacy_reference_use_unknown(
+                "home:one",
+                "chats/one.sqlite",
+                "old-item",
+                "version:one",
+            )
+            .unwrap();
+        assert_eq!(
+            unknown.classification,
+            ReferenceUseClassification::LegacyUnknown
+        );
+        drop(store);
+        let mut reopened = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            reopened
+                .classify_legacy_reference_use_unknown(
+                    "home:one",
+                    "chats/one.sqlite",
+                    "old-item",
+                    "version:one",
+                )
+                .unwrap(),
+            unknown
+        );
+        reopened
+            .register_reference_operation("home:one", &input("one"))
+            .unwrap();
+        reopened
+            .complete_reference_operation("home:one", "one", evidence)
+            .unwrap();
+        assert!(reopened
+            .bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "old-item",
                 "version:one",
                 "one",
                 exact_use_evidence,

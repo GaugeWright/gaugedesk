@@ -2487,6 +2487,25 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 
 /* Hosted Home bootstrap (ADR 0084): account truth is on the Hub; work begins
    only after an explicit target Home is selected and admitted. */
+/* Account work for a person with no Home yet (DR-0260): the open GaugeApp on
+   the page's own ground, in the three columns it has inside the workbench —
+   its pages, the page, its conversation — without the workbench around them.
+   It replaces the first-run card rather than sitting over it, so it takes the
+   card's layer. On a narrow screen the columns stack, pages list first. */
+.account-surface { position: fixed; inset: 0; z-index: 1100; display: flex;
+    flex-direction: column; background: var(--bg); color: var(--ink); }
+.account-surface-header { display: flex; align-items: baseline; justify-content: space-between;
+    gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--edge); }
+.account-surface-title { margin: 0; font-size: 18px; color: var(--ink); }
+.account-surface-body { flex: 1; min-height: 0; display: grid;
+    grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) minmax(260px, 360px); }
+.account-surface-menu, .account-surface-content, .account-surface-chat { min-height: 0; overflow: auto; }
+.account-surface-menu { border-right: 1px solid var(--edge); background: var(--panel); }
+.account-surface-chat { position: relative; border-left: 1px solid var(--edge); background: var(--panel); }
+@media (max-width: 760px) {
+    .account-surface-body { display: flex; flex-direction: column; overflow: auto; }
+    .account-surface-menu, .account-surface-chat { border: 0; border-top: 1px solid var(--edge); }
+}
 .homegate-scrim { position: fixed; inset: 0; z-index: 1100; display: flex;
     align-items: center; justify-content: center; padding: 24px;
     background: var(--bg); }

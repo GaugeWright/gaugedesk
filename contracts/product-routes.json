@@ -6692,6 +6692,42 @@
       }
     },
     {
+      "id": "home.archetype.improve.evaluate",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/archetypes/:id/improve/evaluate",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "Authenticated Agent authoring client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-archetype-authoring-chat",
+      "capability": "evaluate-owned-archetype-candidate",
+      "requestSchema": "rust:gaugedesk-app/agent_improve_routes/EvaluateAgentImprove",
+      "responseSchema": "rust:gaugedesk-app/agent_improve_runtime/NativeImproveResult",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/agent_improve_campaign.rs#hosted_campaign_runs_both_arms_under_one_placement_and_turn_meter"
+        ],
+        "authority": [
+          "crates/app/src/agent_improve_routes.rs#hosted_entry_requires_verified_human_home_and_server_funding"
+        ],
+        "journey": [
+          "crates/app/src/agent_improve_campaign.rs#hosted_campaign_runs_both_arms_under_one_placement_and_turn_meter"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/agent_improve.rs#hosted_shadow_uses_do_transport_and_discards_both_identities"
+        ]
+      }
+    },
+    {
       "id": "home.archetype.publish",
       "jurisdiction": "private-home",
       "transport": "http-json",

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gaugedesk_harness::{
-    ChatMode, EgressGate, HarnessFactory, HarnessSpec, Observation, TurnOutcome,
+    ChatMode, EgressGate, HarnessContinuitySpec, HarnessFactory, HarnessSpec, Observation,
+    TurnOutcome,
 };
 use gaugedesk_workspace::Workspace;
 use sha2::{Digest, Sha256};
@@ -101,6 +102,15 @@ pub trait HostJudge {
         turn: &ShadowTurn,
         worktree: &Path,
     ) -> Result<Reading, String>;
+}
+
+/// Home-owned admission around each shadow turn. A managed provider must
+/// reserve before its runtime can call the model and settle even when the
+/// transport fails. The candidate package never receives this authority.
+pub(crate) trait ShadowTurnMeter {
+    fn reserve(&mut self, spec: &HarnessSpec) -> Result<String, String>;
+    fn settle(&mut self, reservation_id: &str, outcome: Option<&TurnOutcome>)
+        -> Result<(), String>;
 }
 
 /// Selection intent is pinned independently from the editable Agent package.
@@ -425,6 +435,33 @@ pub fn run_native_shadow_selection(
     run_shadow_selection_with_factory(&isolated, prepared, gate, prompt, judge, selection)
 }
 
+/// A hosted Home supplies an admitted disposable placement and a funding
+/// meter. Both arms share the signed policy and placement ceiling but open
+/// distinct WhippleScript instances and workspaces through their distinct
+/// chat identities. Placement provisioning and retirement stay with Home.
+pub(crate) fn run_hosted_shadow_selection(
+    factory: &dyn HarnessFactory,
+    prepared: &PreparedShadowPair,
+    gate: &dyn EgressGate,
+    prompt: &str,
+    judge: &dyn HostJudge,
+    selection: &HostSelection,
+    meter: &mut dyn ShadowTurnMeter,
+) -> Result<SelectedShadowPair, String> {
+    if factory.kind() != "whip-do" {
+        return Err("hosted shadow comparison requires the WhippleScript DO host".to_owned());
+    }
+    run_shadow_selection_with_meter(
+        factory,
+        prepared,
+        gate,
+        prompt,
+        judge,
+        selection,
+        Some(meter),
+    )
+}
+
 pub(crate) fn run_shadow_selection_with_factory(
     factory: &dyn HarnessFactory,
     prepared: &PreparedShadowPair,
@@ -433,10 +470,22 @@ pub(crate) fn run_shadow_selection_with_factory(
     judge: &dyn HostJudge,
     selection: &HostSelection,
 ) -> Result<SelectedShadowPair, String> {
+    run_shadow_selection_with_meter(factory, prepared, gate, prompt, judge, selection, None)
+}
+
+pub(crate) fn run_shadow_selection_with_meter(
+    factory: &dyn HarnessFactory,
+    prepared: &PreparedShadowPair,
+    gate: &dyn EgressGate,
+    prompt: &str,
+    judge: &dyn HostJudge,
+    selection: &HostSelection,
+    meter: Option<&mut dyn ShadowTurnMeter>,
+) -> Result<SelectedShadowPair, String> {
     let judge_ref = judge.reference().to_owned();
     let gauge_ref = gauge_identity(judge.gauges());
     let selection = selection.clone();
-    let pair = run_shadow_pair_with_factory(factory, prepared, gate, prompt)
+    let pair = run_shadow_pair_with_meter(factory, prepared, gate, prompt, meter)
         .map_err(|error| error.to_string())?;
     if judge.reference() != judge_ref || gauge_identity(judge.gauges()) != gauge_ref {
         return Err("host judge changed while the shadow pair was running".to_owned());
@@ -624,6 +673,16 @@ fn run_shadow_pair_with_factory(
     gate: &dyn EgressGate,
     prompt: &str,
 ) -> io::Result<ShadowPair> {
+    run_shadow_pair_with_meter(factory, prepared, gate, prompt, None)
+}
+
+fn run_shadow_pair_with_meter(
+    factory: &dyn HarnessFactory,
+    prepared: &PreparedShadowPair,
+    gate: &dyn EgressGate,
+    prompt: &str,
+    mut meter: Option<&mut dyn ShadowTurnMeter>,
+) -> io::Result<ShadowPair> {
     let baseline = &prepared.baseline;
     let candidate = &prepared.candidate;
     validate_pair(factory, baseline, candidate)?;
@@ -640,6 +699,7 @@ fn run_shadow_pair_with_factory(
         &prepared.baseline_discipline_ref,
         gate,
         prompt,
+        meter.as_deref_mut(),
     )?;
     let candidate_turn = run_one(
         factory,
@@ -647,6 +707,7 @@ fn run_shadow_pair_with_factory(
         &prepared.candidate_discipline_ref,
         gate,
         prompt,
+        meter,
     )?;
     Ok(ShadowPair {
         baseline: baseline_turn,
@@ -665,13 +726,71 @@ fn run_one(
     discipline_ref: &str,
     gate: &dyn EgressGate,
     prompt: &str,
+    meter: Option<&mut (dyn ShadowTurnMeter + '_)>,
+) -> io::Result<ShadowTurn> {
+    let result = execute_one(factory, spec, discipline_ref, gate, prompt, meter);
+    if factory.kind() != "whip-do" {
+        return result;
+    }
+    let continuity = HarnessContinuitySpec {
+        chat_id: spec.chat_id.clone(),
+        runtime_placement_id: spec.runtime_placement_id.clone(),
+        worktree: spec.worktree.clone(),
+        mode: spec.mode,
+        package_root: spec.package_root.clone(),
+        package_version_ref: spec.package_version_ref.clone(),
+        system_prompt: spec.system_prompt.clone(),
+        policy_epoch: spec.policy_epoch,
+        signed_policy_envelope: spec.signed_policy_envelope.clone(),
+        source_position: None,
+    };
+    let discarded = factory.discard_continuity(&continuity);
+    match (result, discarded) {
+        (Ok(turn), Ok(())) => Ok(turn),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(discard_error)) => Err(io::Error::other(format!(
+            "{error}; hosted shadow continuity discard failed: {discard_error}"
+        ))),
+    }
+}
+
+fn execute_one(
+    factory: &dyn HarnessFactory,
+    spec: &HarnessSpec,
+    discipline_ref: &str,
+    gate: &dyn EgressGate,
+    prompt: &str,
+    meter: Option<&mut (dyn ShadowTurnMeter + '_)>,
 ) -> io::Result<ShadowTurn> {
     let mut harness = factory.create(spec)?;
     let mut observations = Vec::new();
-    let outcome = harness.run_turn(gate, prompt, &[], &mut |event| {
+    let mut meter = meter;
+    let reservation = match meter
+        .as_deref_mut()
+        .map(|meter| meter.reserve(spec).map_err(io::Error::other))
+        .transpose()
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            let _ = harness.shutdown();
+            return Err(error);
+        }
+    };
+    let turn = harness.run_turn(gate, prompt, &[], &mut |event| {
         observations.push(event.clone());
-    })?;
-    harness.shutdown()?;
+    });
+    let settlement = if let (Some(meter), Some(reservation)) = (meter, reservation.as_deref()) {
+        meter
+            .settle(reservation, turn.as_ref().ok())
+            .map_err(io::Error::other)
+    } else {
+        Ok(())
+    };
+    let shutdown = harness.shutdown();
+    settlement?;
+    let outcome = turn?;
+    shutdown?;
     Ok(ShadowTurn {
         package_ref: spec.package_version_ref.clone().expect("validated package"),
         discipline_ref: discipline_ref.to_owned(),
@@ -743,10 +862,18 @@ fn validate_pair(
     baseline: &HarnessSpec,
     candidate: &HarnessSpec,
 ) -> io::Result<()> {
-    if factory.kind() != "whip" {
-        return Err(invalid(
-            "shadow comparison requires the native governed WhippleScript host",
-        ));
+    match factory.kind() {
+        "whip" if baseline.runtime_placement_id.is_none() => {}
+        "whip-do"
+            if baseline
+                .runtime_placement_id
+                .as_deref()
+                .is_some_and(|placement| !placement.trim().is_empty()) => {}
+        _ => {
+            return Err(invalid(
+                "shadow comparison requires an admitted native or hosted WhippleScript placement",
+            ));
+        }
     }
     if baseline.mode != ChatMode::Use
         || candidate.mode != ChatMode::Use
@@ -897,6 +1024,9 @@ mod tests {
     use super::*;
     use crate::app_support::LockUnpoisoned;
     use gaugedesk_harness::{sandbox::SandboxPolicy, AllowAllGate, Harness, Observation};
+    use gaugedesk_whip_runtime::{DoHostConfig, DoHostRequest, DoHostResponse, DoHostTransport};
+    use serde_json::{json, Value};
+    use std::sync::Mutex;
 
     struct FakeFactory;
     struct FakeHarness;
@@ -937,6 +1067,431 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    struct MeteredFactory {
+        events: Arc<Mutex<Vec<String>>>,
+        fail_candidate: bool,
+    }
+
+    struct MeteredHarness {
+        id: String,
+        events: Arc<Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl HarnessFactory for MeteredFactory {
+        fn kind(&self) -> &'static str {
+            "whip"
+        }
+
+        fn create(&self, spec: &HarnessSpec) -> io::Result<Box<dyn Harness>> {
+            let candidate = spec.chat_id.ends_with(":candidate");
+            Ok(Box::new(MeteredHarness {
+                id: if candidate { "candidate" } else { "baseline" }.to_owned(),
+                events: Arc::clone(&self.events),
+                fail: candidate && self.fail_candidate,
+            }))
+        }
+
+        fn credential_status(
+            &self,
+            _provider: &str,
+            _capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
+        ) -> gaugedesk_harness::CredentialProbe {
+            gaugedesk_harness::CredentialProbe::Ready
+        }
+    }
+
+    impl Harness for MeteredHarness {
+        fn run_turn(
+            &mut self,
+            _gate: &dyn EgressGate,
+            _prompt: &str,
+            _images: &[gaugedesk_harness::ImageContent],
+            _sink: &mut dyn FnMut(&Observation),
+        ) -> io::Result<TurnOutcome> {
+            self.events.lock().unwrap().push(format!("run:{}", self.id));
+            if self.fail {
+                return Err(io::Error::other("transport failed"));
+            }
+            Ok(TurnOutcome {
+                managed_usage: Some(gaugedesk_harness::ModelUsage {
+                    usage_ref: format!("usage:{}", self.id),
+                    provider: "managed".to_owned(),
+                    model: "model".to_owned(),
+                    input_tokens: 3,
+                    output_tokens: 2,
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct RecordingMeter {
+        events: Arc<Mutex<Vec<String>>>,
+        refuse_candidate: bool,
+    }
+
+    impl ShadowTurnMeter for RecordingMeter {
+        fn reserve(&mut self, spec: &HarnessSpec) -> Result<String, String> {
+            let arm = if spec.chat_id.ends_with(":candidate") {
+                "candidate"
+            } else {
+                "baseline"
+            };
+            self.events.lock().unwrap().push(format!("reserve:{arm}"));
+            if arm == "candidate" && self.refuse_candidate {
+                return Err("funding refused".to_owned());
+            }
+            Ok(arm.to_owned())
+        }
+
+        fn settle(
+            &mut self,
+            reservation_id: &str,
+            outcome: Option<&TurnOutcome>,
+        ) -> Result<(), String> {
+            let usage = outcome
+                .and_then(|outcome| outcome.managed_usage.as_ref())
+                .map(|usage| usage.usage_ref.as_str())
+                .unwrap_or("released");
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("settle:{reservation_id}:{usage}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn shadow_meter_reserves_before_each_arm_and_settles_transport_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline_repo = root.path().join("baseline-repo");
+        let candidate_repo = root.path().join("candidate-repo");
+        authored_repo(&baseline_repo, "baseline instructions");
+        authored_repo(&candidate_repo, "candidate instructions");
+        let scenario = root.path().join("scenario");
+        std::fs::create_dir(&scenario).unwrap();
+        let template = shadow_spec(root.path(), "template", "template instructions");
+        let prepared =
+            prepare_native_shadow_pair(&template, &baseline_repo, &candidate_repo, &scenario)
+                .unwrap();
+        for (fail_candidate, refuse_candidate, expected) in [
+            (
+                false,
+                false,
+                vec![
+                    "reserve:baseline",
+                    "run:baseline",
+                    "settle:baseline:usage:baseline",
+                    "reserve:candidate",
+                    "run:candidate",
+                    "settle:candidate:usage:candidate",
+                ],
+            ),
+            (
+                true,
+                false,
+                vec![
+                    "reserve:baseline",
+                    "run:baseline",
+                    "settle:baseline:usage:baseline",
+                    "reserve:candidate",
+                    "run:candidate",
+                    "settle:candidate:released",
+                ],
+            ),
+            (
+                false,
+                true,
+                vec![
+                    "reserve:baseline",
+                    "run:baseline",
+                    "settle:baseline:usage:baseline",
+                    "reserve:candidate",
+                ],
+            ),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let factory = MeteredFactory {
+                events: Arc::clone(&events),
+                fail_candidate,
+            };
+            let mut meter = RecordingMeter {
+                events: Arc::clone(&events),
+                refuse_candidate,
+            };
+            let result = run_shadow_pair_with_meter(
+                &factory,
+                &prepared,
+                &AllowAllGate,
+                "same prompt",
+                Some(&mut meter),
+            );
+            assert_eq!(result.is_err(), fail_candidate || refuse_candidate);
+            assert_eq!(*events.lock().unwrap(), expected);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ShadowDoTransport {
+        state: Mutex<ShadowDoState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct ShadowDoState {
+        files: BTreeMap<String, BTreeMap<String, String>>,
+        results: BTreeMap<String, Value>,
+        turns: Vec<(String, String, String)>,
+        discarded: Vec<String>,
+        fail_candidate_turn: bool,
+    }
+
+    fn decode_host_path(path: &str) -> io::Result<String> {
+        let bytes = path.as_bytes();
+        let mut decoded = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                let hex =
+                    std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(io::Error::other)?;
+                decoded.push(u8::from_str_radix(hex, 16).map_err(io::Error::other)?);
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8(decoded).map_err(io::Error::other)
+    }
+
+    impl DoHostTransport for ShadowDoTransport {
+        fn send(&self, request: DoHostRequest) -> io::Result<DoHostResponse> {
+            if request.placement_id != "improve-placement" || request.tenant_id != "tenant" {
+                return Err(io::Error::other("shadow DO placement changed"));
+            }
+            let body: Value = if request.body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&request.body).map_err(io::Error::other)?
+            };
+            let mut state = self.state.lock().unwrap();
+            let path = request.path.as_str();
+            let response = match (request.method.as_str(), path) {
+                ("POST", "/host/policy") => json!({
+                    "epoch": 1, "envelope_hash": "sha256:shadow-policy", "signer": "home"
+                }),
+                ("POST", "/host/instances/open") => {
+                    let request_id = body["command"]["request_id"]
+                        .as_str()
+                        .ok_or_else(|| io::Error::other("DO open has no request id"))?;
+                    let arm = if request_id.contains(":baseline:") {
+                        "baseline"
+                    } else if request_id.contains(":candidate:") {
+                        "candidate"
+                    } else {
+                        return Err(io::Error::other("unexpected shadow DO identity"));
+                    };
+                    state.files.entry(arm.to_owned()).or_default();
+                    json!({ "instance_ref": arm })
+                }
+                ("POST", "/host/turns") => {
+                    let arm = body["command"]["instance_ref"]
+                        .as_str()
+                        .ok_or_else(|| io::Error::other("DO turn has no instance"))?;
+                    if arm == "candidate" && state.fail_candidate_turn {
+                        return Err(io::Error::other("DO turn transport failed"));
+                    }
+                    let prompt = body["command"]["input"]["text"]
+                        .as_str()
+                        .ok_or_else(|| io::Error::other("DO turn has no prompt"))?;
+                    let context = state.files[arm]
+                        .get(".gaugedesk-runtime/agent/AGENTS.md")
+                        .ok_or_else(|| io::Error::other("DO turn has no mounted Agent context"))?
+                        .clone();
+                    state
+                        .turns
+                        .push((arm.to_owned(), prompt.to_owned(), context));
+                    state.results.insert(
+                        arm.to_owned(),
+                        json!({
+                            "run_status": "completed",
+                            "receipt": {"terminal_position": {"instance_ref": arm, "sequence": 1}},
+                            "usage_observation": {
+                                "usage_ref": format!("usage:{arm}"),
+                                "input_tokens": 3, "output_tokens": 2
+                            },
+                            "messages": [{"role": "assistant", "text": if arm == "candidate" {prompt} else {"wrong"}, "tool_calls": []}]
+                        }),
+                    );
+                    json!({ "outcome": "terminal" })
+                }
+                _ => {
+                    let rest = path.strip_prefix("/host/instances/").ok_or_else(|| {
+                        io::Error::other(format!("unexpected shadow DO route {path}"))
+                    })?;
+                    let (arm, suffix) = rest
+                        .split_once('/')
+                        .ok_or_else(|| io::Error::other("DO route has no suffix"))?;
+                    match (request.method.as_str(), suffix) {
+                        ("POST", "files/sync") => {
+                            let files = state.files.entry(arm.to_owned()).or_default();
+                            for file in body["files"].as_array().into_iter().flatten() {
+                                let path = file["path"]
+                                    .as_str()
+                                    .ok_or_else(|| io::Error::other("DO sync path missing"))?;
+                                let content = file["content"]
+                                    .as_str()
+                                    .ok_or_else(|| io::Error::other("DO sync content missing"))?;
+                                files.insert(path.to_owned(), content.to_owned());
+                            }
+                            if let Some(retained) = body["retain_paths"].as_array() {
+                                let retained = retained
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<BTreeSet<_>>();
+                                files.retain(|path, _| retained.contains(path.as_str()));
+                            }
+                            json!({"ok": true})
+                        }
+                        ("GET", "position") => {
+                            json!({"instance_ref": arm, "sequence": 0})
+                        }
+                        ("GET", "files") => json!({
+                            "files": state.files[arm].keys().map(|path| json!({"path": path})).collect::<Vec<_>>()
+                        }),
+                        ("GET", route) if route.starts_with("files?path=") => {
+                            let file = decode_host_path(&route[11..])?;
+                            return Ok(DoHostResponse {
+                                status: 200,
+                                body: state.files[arm][&file].as_bytes().to_vec(),
+                            });
+                        }
+                        ("GET", route) if route.ends_with("/result") => state.results[arm].clone(),
+                        ("POST", "discard") => {
+                            state.discarded.push(arm.to_owned());
+                            state.files.remove(arm);
+                            json!({"instance_ref": arm, "discarded_at": {"instance_ref": arm, "sequence": 2}})
+                        }
+                        _ => {
+                            return Err(io::Error::other(format!(
+                                "unexpected shadow DO route {path}"
+                            )))
+                        }
+                    }
+                }
+            };
+            Ok(DoHostResponse {
+                status: 200,
+                body: serde_json::to_vec(&response).map_err(io::Error::other)?,
+            })
+        }
+    }
+
+    #[test]
+    fn hosted_shadow_uses_do_transport_and_discards_both_identities() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline_repo = root.path().join("baseline-repo");
+        let candidate_repo = root.path().join("candidate-repo");
+        authored_repo(&baseline_repo, "baseline instructions");
+        authored_repo(&candidate_repo, "candidate instructions");
+        let scenario = root.path().join("scenario");
+        std::fs::create_dir(&scenario).unwrap();
+        let mut template = shadow_spec(root.path(), "template", "template instructions");
+        template.runtime_placement_id = Some("improve-placement".to_owned());
+        template.provider = Some("cloudflare-ai-gateway".to_owned());
+        template.credential_ref = Some("funding-ref".to_owned());
+        let prepared =
+            prepare_native_shadow_pair(&template, &baseline_repo, &candidate_repo, &scenario)
+                .unwrap();
+        let transport = Arc::new(ShadowDoTransport::default());
+        let config = DoHostConfig::with_transport("tenant", transport.clone(), false).unwrap();
+        let factory = gaugedesk_whip_runtime::WhipHarnessFactory::new(
+            gaugedesk_core::ids::AuthorityId::new("authority:owner"),
+            gaugedesk_core::signature::SigningKey::from_seed(&[7u8; 32]).unwrap(),
+            root.path().join("runtimes"),
+        )
+        .with_do_host(config);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut meter = RecordingMeter {
+            events: Arc::clone(&events),
+            refuse_candidate: false,
+        };
+        let pair = run_shadow_pair_with_meter(
+            &factory,
+            &prepared,
+            &AllowAllGate,
+            "Return alpha",
+            Some(&mut meter),
+        )
+        .unwrap();
+        assert_eq!(pair.baseline.outcome.assistant_text, "wrong");
+        assert_eq!(pair.candidate.outcome.assistant_text, "Return alpha");
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "reserve:baseline",
+                "settle:baseline:usage:baseline",
+                "reserve:candidate",
+                "settle:candidate:usage:candidate",
+            ]
+        );
+        let state = transport.state.lock().unwrap();
+        assert_eq!(state.discarded, ["baseline", "candidate"]);
+        assert_eq!(state.turns.len(), 2);
+        assert_eq!(state.turns[0].0, "baseline");
+        assert_eq!(state.turns[0].2, "baseline instructions");
+        assert_eq!(state.turns[1].0, "candidate");
+        assert_eq!(state.turns[1].2, "candidate instructions");
+        assert!(state.files.is_empty());
+        drop(state);
+
+        let mut refused = RecordingMeter {
+            events: Arc::new(Mutex::new(Vec::new())),
+            refuse_candidate: true,
+        };
+        let error = run_one(
+            &factory,
+            prepared.candidate_spec(),
+            &prepared.candidate_discipline_ref,
+            &AllowAllGate,
+            "Return alpha",
+            Some(&mut refused),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("funding refused"));
+        let state = transport.state.lock().unwrap();
+        assert_eq!(state.discarded, ["baseline", "candidate", "candidate"]);
+        assert_eq!(state.turns.len(), 2);
+        assert!(state.files.is_empty());
+        drop(state);
+
+        transport.state.lock().unwrap().fail_candidate_turn = true;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut interrupted = RecordingMeter {
+            events: Arc::clone(&events),
+            refuse_candidate: false,
+        };
+        let error = run_one(
+            &factory,
+            prepared.candidate_spec(),
+            &prepared.candidate_discipline_ref,
+            &AllowAllGate,
+            "Return alpha",
+            Some(&mut interrupted),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("DO turn transport failed"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["reserve:candidate", "settle:candidate:released"]
+        );
+        let state = transport.state.lock().unwrap();
+        assert_eq!(state.discarded.len(), 4);
+        assert!(state.files.is_empty());
     }
 
     fn shadow_spec(root: &Path, id: &str, context: &str) -> HarnessSpec {

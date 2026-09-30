@@ -26,15 +26,18 @@ pub mod agent_improve;
 mod agent_improve_adoption;
 pub mod agent_improve_campaign;
 mod agent_improve_custody;
+mod agent_improve_funding;
 pub use agent_improve_custody::{
     latest_agent_improve_pool_from_desktop, start_agent_improve_pool_from_desktop,
     AgentImprovePoolStart,
 };
 pub mod agent_improve_evidence;
+mod agent_improve_routes;
 mod agent_improve_runtime;
 pub use agent_improve_runtime::{
     adopt_agent_improve_from_desktop, evaluate_agent_improve_from_desktop,
-    latest_agent_improve_evidence_from_desktop, NativeImproveResult,
+    evaluate_agent_improve_from_hosted, latest_agent_improve_evidence_from_desktop,
+    NativeImproveResult,
 };
 pub mod agent_question;
 pub mod agent_release;

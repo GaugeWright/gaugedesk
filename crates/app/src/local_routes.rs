@@ -115,6 +115,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             get(lr::get_archetype_abilities).put(lr::put_archetype_abilities),
         )
         .route("/archetypes/{id}/chats", post(lr::create_chat_under_agent))
+        .route(
+            "/archetypes/{id}/improve/evaluate",
+            post(crate::agent_improve_routes::evaluate),
+        )
         .route("/archetypes/{id}/use", post(lr::use_archetype))
         .route("/archetypes/{id}/fork", post(lr::fork_archetype))
         .route(

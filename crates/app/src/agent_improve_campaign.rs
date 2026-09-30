@@ -12,14 +12,16 @@ use whipplescript_core::improve_selection::{
     self, Bar, Campaign, Delta, GaugeEvidence, Reach, Reading, Role, Verdict,
 };
 
-use gaugedesk_harness::{EgressGate, HarnessSpec};
+use gaugedesk_harness::{EgressGate, HarnessFactory, HarnessSpec};
 use gaugedesk_workspace::Workspace;
 
 use crate::agent_improve::{
     adopt_evaluated_candidate, prepare_native_shadow_pair_from_authoring,
-    run_native_shadow_selection, HostGauge, HostJudge, HostSelection, PreparedShadowPair,
-    SelectedShadowPair, ShadowTurn,
+    run_hosted_shadow_selection, run_native_shadow_selection, HostGauge, HostJudge, HostSelection,
+    PreparedShadowPair, SelectedShadowPair, ShadowTurn,
 };
+use crate::agent_improve_funding::ManagedShadowMeter;
+use crate::{library::gen_id, SharedWorkbench};
 
 const OPEN_SCHEMA: &str = "gaugedesk.agent-improve.open.v1";
 const PRIVATE_SCHEMA: &str = "gaugedesk.agent-improve.private.v1";
@@ -630,6 +632,75 @@ pub fn run_native_campaign_with_reservation(
         },
         &mut || (gate.reserve_sealed)().map(Some),
     )
+}
+
+/// Run a sampled campaign at a Home-provisioned hosted placement. Home retains
+/// the sampled sources and sealed exposure ledger, supplies one exact signed
+/// policy in the template, and meters each baseline/candidate model turn.
+/// This entrypoint never provisions a placement or grants a funding plan.
+pub fn run_hosted_managed_campaign_with_reservation(
+    wb: &SharedWorkbench,
+    execution: HostedCampaignExecution<'_>,
+    gate: NativeCampaignGate<'_>,
+    funding: ManagedCampaignFunding,
+) -> Result<SelectedCampaign, String> {
+    let HostedCampaignExecution {
+        factory,
+        template,
+        target_id,
+        workspace,
+        candidate_repo,
+        campaign,
+    } = execution;
+    if !campaign.sampled {
+        return Err("Agent improve campaign has no sampled Home assignment".to_owned());
+    }
+    if factory.kind() != "whip-do"
+        || template
+            .runtime_placement_id
+            .as_deref()
+            .is_none_or(|placement| placement.trim().is_empty())
+    {
+        return Err("hosted Agent improve needs an admitted WhippleScript placement".to_owned());
+    }
+    let mut meter = ManagedShadowMeter::new(wb, gen_id("agent-improve-attempt"), funding);
+    run_campaign_with_reservation(
+        template,
+        target_id,
+        workspace,
+        candidate_repo,
+        campaign,
+        |prepared, judge, selection, prompt| {
+            run_hosted_shadow_selection(
+                factory,
+                prepared,
+                gate.egress,
+                prompt,
+                judge,
+                selection,
+                &mut meter,
+            )
+        },
+        &mut || (gate.reserve_sealed)().map(Some),
+    )
+}
+
+pub struct HostedCampaignExecution<'a> {
+    pub factory: &'a dyn HarnessFactory,
+    pub template: &'a HarnessSpec,
+    pub target_id: &'a str,
+    pub workspace: &'a dyn Workspace,
+    pub candidate_repo: &'a Path,
+    pub campaign: &'a CampaignSnapshot,
+}
+
+pub struct ManagedCampaignFunding {
+    pub account_scope: String,
+    pub tenant_scope: String,
+    pub billing_scope: String,
+    pub funding_ref: String,
+    pub provider: String,
+    pub funding_authority: crate::managed_funding::FundingAuthority,
 }
 
 fn run_campaign_with<F>(
@@ -1274,6 +1345,239 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    struct HostedFakeFactory;
+
+    impl HarnessFactory for HostedFakeFactory {
+        fn kind(&self) -> &'static str {
+            "whip-do"
+        }
+
+        fn create(&self, spec: &HarnessSpec) -> io::Result<Box<dyn Harness>> {
+            if spec.runtime_placement_id.as_deref() != Some("improve-placement") {
+                return Err(io::Error::other("wrong hosted placement"));
+            }
+            let candidate = spec.chat_id.ends_with(":candidate");
+            let context =
+                std::fs::read_to_string(spec.worktree.join(".gaugedesk-runtime/agent/AGENTS.md"))?;
+            if context.contains("hosted candidate") != candidate {
+                return Err(io::Error::other("hosted Agent context crossed arms"));
+            }
+            Ok(Box::new(HostedFakeHarness { candidate }))
+        }
+
+        fn credential_status(
+            &self,
+            _provider: &str,
+            _capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
+        ) -> gaugedesk_harness::CredentialProbe {
+            gaugedesk_harness::CredentialProbe::Ready
+        }
+    }
+
+    struct HostedFakeHarness {
+        candidate: bool,
+    }
+
+    impl Harness for HostedFakeHarness {
+        fn run_turn(
+            &mut self,
+            _gate: &dyn EgressGate,
+            prompt: &str,
+            _images: &[gaugedesk_harness::ImageContent],
+            _sink: &mut dyn FnMut(&Observation),
+        ) -> io::Result<TurnOutcome> {
+            Ok(TurnOutcome {
+                assistant_text: if self.candidate {
+                    prompt.replace("Return ", "")
+                } else {
+                    "wrong".to_owned()
+                },
+                managed_usage: Some(gaugedesk_harness::ModelUsage {
+                    usage_ref: gen_id("hosted-usage"),
+                    provider: "cloudflare-ai-gateway".to_owned(),
+                    model: "test-model".to_owned(),
+                    input_tokens: 2,
+                    output_tokens: 1,
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[test]
+    fn hosted_campaign_runs_both_arms_under_one_placement_and_turn_meter() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        let billing_scope = crate::account::ACCOUNT_SCOPE.to_owned();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let funding_authority = crate::managed_funding::FundingAuthority::new(
+            gaugedesk_core::ids::AuthorityId::new("test-funding-service"),
+            crate::managed_funding::FundingEnvironment::Test,
+        );
+        let plan = crate::managed_inference::ManagedInferencePlan {
+            plan: "hosted-test".to_owned(),
+            status: crate::managed_inference::ManagedPlanStatus::Active,
+            included_tokens: 0,
+        };
+        let record = crate::managed_funding::FundingRecord {
+            record: crate::managed_inference::ManagedPlanRecord {
+                id: "managed-inference".to_owned(),
+                op: crate::library::RecordOp::Upsert,
+                subscription: plan,
+            },
+            provenance: Some(crate::managed_funding::FundingEvidence {
+                v: 1,
+                issuer: gaugedesk_core::ids::AuthorityId::new("test-funding-service"),
+                scope: gaugedesk_core::ids::ScopeId::new(&billing_scope),
+                source_id: "test-subscription".to_owned(),
+                environment: crate::managed_funding::FundingEnvironment::Test,
+                verified_at: now - 10,
+                valid_from: now - 100,
+                valid_until: now + 1000,
+            }),
+        };
+        let funding_ref = crate::managed_funding::decide(
+            &gaugedesk_core::ids::ScopeId::new(&billing_scope),
+            std::slice::from_ref(&record),
+            &funding_authority.context(now),
+        )
+        .unwrap()
+        .reference();
+        guard
+            .store
+            .append_record(
+                &billing_scope,
+                crate::managed_inference::MANAGED_PLAN_KIND,
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+        let target_id = crate::library_state::authoring_target_id(crate::DEFAULT_AGENT);
+        let target_root = guard.targets_dir().join(&target_id);
+        let workspace = gaugedesk_workspace::Instance::open_at(&target_root);
+        let candidate_repo = root.path().join("candidate");
+        crate::agent_improve_adoption::AgentDefinitionSnapshot::from_main(&workspace)
+            .unwrap()
+            .materialize(&candidate_repo)
+            .unwrap();
+        drop(guard);
+        std::fs::write(candidate_repo.join("agent/AGENTS.md"), "hosted candidate\n").unwrap();
+        let campaign = CampaignSnapshot::parse(OPEN.as_bytes(), PRIVATE.as_bytes())
+            .unwrap()
+            .with_sampled_assignment();
+        let mut hosted_template = template(root.path());
+        hosted_template.runtime_placement_id = Some("improve-placement".to_owned());
+        hosted_template.provider = Some("cloudflare-ai-gateway".to_owned());
+        hosted_template.credential_ref = Some(funding_ref.clone());
+        let mut exposures = 0;
+        let mut reserve_sealed = || {
+            exposures += 1;
+            Ok("sealed-reservation".to_owned())
+        };
+        let selected = run_hosted_managed_campaign_with_reservation(
+            &workbench,
+            HostedCampaignExecution {
+                factory: &HostedFakeFactory,
+                template: &hosted_template,
+                target_id: &target_id,
+                workspace: &workspace,
+                candidate_repo: &candidate_repo,
+                campaign: &campaign,
+            },
+            NativeCampaignGate {
+                egress: &AllowAllGate,
+                reserve_sealed: &mut reserve_sealed,
+            },
+            ManagedCampaignFunding {
+                account_scope: billing_scope.clone(),
+                tenant_scope: crate::org::ORG_SCOPE.to_owned(),
+                billing_scope: billing_scope.clone(),
+                funding_ref: funding_ref.clone(),
+                provider: "cloudflare-ai-gateway".to_owned(),
+                funding_authority: funding_authority.clone(),
+            },
+        )
+        .unwrap();
+        assert!(selected.reviewer_verdict().proposable);
+        assert_eq!(selected.sealed_count(), 1);
+        assert_eq!(exposures, 1);
+        let guard = workbench.lock_unpoisoned();
+        let reservations =
+            crate::managed_inference::fold_reservations(guard.store_ref(), &billing_scope).unwrap();
+        assert_eq!(reservations.reserved, 4);
+        assert_eq!(reservations.settled, 4);
+        assert_eq!(reservations.outstanding, 0);
+        assert!(!guard
+            .store_ref()
+            .records(&billing_scope, crate::managed_inference::MANAGED_USAGE_KIND)
+            .unwrap()
+            .iter()
+            .any(|row| row.contains("Return beta")));
+        assert_eq!(
+            crate::managed_inference::fold_usage(guard.store_ref(), &billing_scope, 0)
+                .unwrap()
+                .total_tokens,
+            12
+        );
+        drop(guard);
+        let mut meter = ManagedShadowMeter::new(
+            &workbench,
+            gen_id("agent-improve-attempt"),
+            ManagedCampaignFunding {
+                account_scope: billing_scope.clone(),
+                tenant_scope: crate::org::ORG_SCOPE.to_owned(),
+                billing_scope: billing_scope.clone(),
+                funding_ref,
+                provider: "cloudflare-ai-gateway".to_owned(),
+                funding_authority,
+            },
+        );
+        let interrupted =
+            crate::agent_improve::ShadowTurnMeter::reserve(&mut meter, &hosted_template).unwrap();
+        crate::agent_improve::ShadowTurnMeter::settle(&mut meter, &interrupted, None).unwrap();
+        let missing_usage =
+            crate::agent_improve::ShadowTurnMeter::reserve(&mut meter, &hosted_template).unwrap();
+        assert!(crate::agent_improve::ShadowTurnMeter::settle(
+            &mut meter,
+            &missing_usage,
+            Some(&TurnOutcome::default()),
+        )
+        .unwrap_err()
+        .contains("without usage evidence"));
+        let mut guard = workbench.lock_unpoisoned();
+        let mut suspended = record;
+        suspended.record.subscription.status =
+            crate::managed_inference::ManagedPlanStatus::Suspended;
+        guard
+            .store
+            .append_record(
+                &billing_scope,
+                crate::managed_inference::MANAGED_PLAN_KIND,
+                &serde_json::to_string(&suspended).unwrap(),
+            )
+            .unwrap();
+        drop(guard);
+        assert!(
+            crate::agent_improve::ShadowTurnMeter::reserve(&mut meter, &hosted_template)
+                .unwrap_err()
+                .contains("Suspended")
+        );
+        let guard = workbench.lock_unpoisoned();
+        let reservations =
+            crate::managed_inference::fold_reservations(guard.store_ref(), &billing_scope).unwrap();
+        assert_eq!(
+            (
+                reservations.reserved,
+                reservations.settled,
+                reservations.released
+            ),
+            (6, 4, 2)
+        );
     }
 
     fn template(root: &Path) -> HarnessSpec {

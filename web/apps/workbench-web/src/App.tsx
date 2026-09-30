@@ -3482,12 +3482,55 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             >
                 {gateSignOutBusy() ? "Signing out…" : "Sign out"}
             </button>
+            {/* Account work needs no Home (DR-0260), so a page that stands in
+                front of the workbench still leads to it. */}
+            <Show when={props.gaugeApps?.accountActions()[0]}>
+                {(action) => <>
+                    {" · "}
+                    <button
+                        type="button"
+                        class="homegate-link"
+                        data-home-account-settings
+                        onClick={() => action().open()}
+                    >
+                        Account settings
+                    </button>
+                </>}
+            </Show>
             <Show when={gateSignOutError()}>
                 <span class="homegate-error" role="alert">{gateSignOutError()}</span>
             </Show>
         </p>
         {retainedAccountChoices(showLocal)}
     </>);
+    /** Account work for a person with no Home yet (DR-0260): the open
+     * GaugeApp's pages, page and management conversation, without the
+     * workbench around them, whose navigation and chat read a Home. */
+    const NoHomeAccountSurface = (): JSX.Element => {
+        const apps = props.gaugeApps!;
+        return (
+            <div class="account-surface" data-no-home-account-surface>
+                <header class="account-surface-header">
+                    <h1 class="account-surface-title">{apps.titles().content}</h1>
+                    <button
+                        type="button"
+                        class="homegate-link"
+                        data-account-surface-close
+                        onClick={() => apps.close()}
+                    >
+                        Back
+                    </button>
+                </header>
+                <div class="account-surface-body">
+                    <nav class="account-surface-menu" aria-label={apps.titles().files}>{apps.menu()}</nav>
+                    <main class="account-surface-content">{apps.content()}</main>
+                    <aside class="account-surface-chat" aria-label={apps.titles().chat}>
+                        {apps.chat({ mobile: false, onCollapse: () => undefined })}
+                    </aside>
+                </div>
+            </div>
+        );
+    };
     const claimCard = (): JSX.Element => (
         <section class="homegate-card" aria-labelledby="home-claim-title" data-home-claim>
             <div class="homegate-card-inner">
@@ -3942,7 +3985,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 </div>
             </Show>
             <Show when={!homeState.loading && !homeFailure()}>
-                <HomeSetup />
+                {/* A GaugeApp or proposal opened by a person with no Home replaces
+                    the first-run card rather than waiting behind it: the account
+                    service answers all of it (DR-0260). */}
+                <Show when={!(noHomeState() && props.gaugeApps?.active())} fallback={<NoHomeAccountSurface />}>
+                    <HomeSetup />
+                </Show>
             </Show>
             {/* First-run gate (ADR 0075 Phase 0): overlays both shells until
                 there is a working app, then dismisses itself. Either half is
