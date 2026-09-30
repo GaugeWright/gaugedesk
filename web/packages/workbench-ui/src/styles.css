@@ -1699,6 +1699,11 @@ input {
 }
 
 .project-tasks { width: 920px; max-height: 85vh; display: flex; flex-direction: column; }
+.privacy-analytics-modal { max-height: 85vh; overflow-y: auto; }
+.privacy-analytics-modal .modal-head { margin-bottom: 14px; }
+.privacy-analytics-modal p { line-height: 1.45; }
+.privacy-analytics-modal label { display: flex; align-items: flex-start; gap: 8px; margin: 14px 0; line-height: 1.35; }
+.privacy-analytics-modal label input { margin-top: 2px; flex: none; }
 .project-tasks-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; padding: 16px 0; }
 .project-tasks-controls label { display: flex; align-items: center; gap: 8px; }
 .project-tasks-controls > button { margin-left: auto; }

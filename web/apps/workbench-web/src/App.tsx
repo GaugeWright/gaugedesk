@@ -435,6 +435,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [selected, setSelected] = createSignal<EngagementId | null>(null);
     const [status, setStatus] = createSignal("ready");
     const clientBuild = reportedClientBuild();
+    const recordFeature = (feature: "chat.create" | "chat.turn", outcome: "completed" | "failed") => {
+        const tenant = props.gaugeApps?.selectedTenant()?.id;
+        if (!tenant) return;
+        // Product analytics is best effort and has no authority over work.
+        void api.recordProductEvent({
+            version: 1,
+            tenant,
+            feature,
+            outcome,
+            platform: "web",
+            release: clientBuild.version,
+        }, () => !switchingAccount() && props.gaugeApps?.selectedTenant()?.id === tenant).catch(() => undefined);
+    };
     const [desktopUpdate, setDesktopUpdate] = createSignal<{
         readonly kind: "checking" | "current" | "available" | "restricted" | "error" | "installing";
         readonly version?: string;
@@ -1770,6 +1783,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         setStatus("new chat");
         bumpNav();
         openChat(id);
+        recordFeature("chat.create", "completed");
         if (prompt) {
             // Let the selected-chat effect subscribe before the first turn starts;
             // otherwise an eager turn can race the fresh transcript reset.
@@ -1805,6 +1819,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             const eng = await api.createEngagement();
             await finishNewChat(eng.id, prompt, images);
         } catch (e) {
+            recordFeature("chat.create", "failed");
             setStatus(`couldn't start a chat — ${String(e)}`);
         }
     }
@@ -1831,6 +1846,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             );
             await finishNewChat(id, choice.prompt, choice.images);
         } catch (error) {
+            recordFeature("chat.create", "failed");
             setStatus(`couldn't start a chat — ${String(error)}`);
         }
     }
@@ -1935,6 +1951,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 if (typeof res?.diff === "string") setDiff(res.diff);
             }
             if (failed) throw new Error(res?.error || "The turn failed.");
+            recordFeature("chat.turn", "completed");
         } catch (e) {
             // A turn someone stopped did not go wrong: it reached the end they
             // chose for it. Marking the chat with the error tone and announcing
@@ -1942,6 +1959,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // repair below still runs, because an interrupted turn leaves the
             // same dangling optimistic echo a failed one does.
             const stopped = turnStopped(e);
+            if (!stopped) recordFeature("chat.turn", "failed");
             setRunTone(id, stopped ? null : "error");
             if (isCurrent()) {
                 // A rejection (INV-2) surfaces its reason; either way repair from the
@@ -2315,6 +2333,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 openAccount={accountRequest}
                 openModels={modelsRequest}
                 onAccountChanged={refreshModelAccess}
+                analyticsAvailable={Boolean(props.gaugeApps)}
+                analyticsTenant={props.gaugeApps?.selectedTenant}
                 openInvite={inviteDeepLink}
                 // Never `undefined` on a core build any more. A desktop signs
                 // in against its own control plane through the card; only the

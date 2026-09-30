@@ -73,7 +73,7 @@ pub mod definition {
     pub const SOURCE_FILE: &str = "method.whip";
     pub const GENERATED_CHAT_SOURCE_FILE: &str = "__gaugedesk_default_chat.whip";
     pub const PERSONA_FILE: &str = "persona.md";
-    pub const HUMAN_GUIDE: &str = "# Agent files\n\nAGENTS.md contains the standing instructions the Agent receives at the start of a fresh turn. Edit it to change how this Agent works.\n\nPut reusable skills in skills/<name>/SKILL.md, with a name and description in the skill frontmatter. Descriptions are discoverable at turn start; full instructions are read when needed. SYSTEM.md is optional and adds expert-authored system instructions. Other files are references until a workflow explicitly uses them.\n\nPublishing freezes these files. A work chat or Panel session uses that pinned version; draft edits do not change a running placement. Each run has its own artifacts/ for results people should find and work/ for notes and intermediate files. These are separate from attached work targets.\n\nThe .whipple/ folder contains generated packages and frozen versions. It is available in the advanced file view.\n";
+    pub const HUMAN_GUIDE: &str = "# Agent files\n\nSYSTEM.md contains the Agent's editable system-level method instructions. AGENTS.md contains standing developer guidance. Edit either in an edit chat to change how this Agent works. Runtime rules and effective tools are supplied automatically.\n\nPut reusable skills in skills/<name>/SKILL.md, with a name and description in the skill frontmatter. Descriptions are discoverable at turn start; full instructions are read when needed. Other files are references until a workflow explicitly uses them.\n\nPublishing freezes these files. A work chat or Panel session uses that pinned version; draft edits do not change a running placement. Each run has its own artifacts/ for results people should find and work/ for notes and intermediate files. These are separate from attached work targets.\n\nThe .whipple/ folder contains generated packages and frozen versions. It is available in the advanced file view.\n";
     /// GaugeDesk-owned provider/model/thinking selection. Authentication and
     /// credentials never enter the authored package.
     pub const CONFIG_PATH: &str = ".agent-config.json";
@@ -244,9 +244,9 @@ workflow GaugeDeskMethod {
     /// The neutral authored definition materialized as a native WhippleScript
     /// agent package.
     pub struct AgentDefinition {
-        /// Persona included in the package-owned system context.
+        /// Persona seeded into editable SYSTEM.md and the package's system document.
         pub system: String,
-        /// Method conventions included in the same package-owned context.
+        /// Standing conventions seeded into AGENTS.md as developer context.
         pub instructions: String,
         /// GaugeDesk runtime selection, when the definition carries one.
         pub config: Option<String>,
@@ -262,9 +262,11 @@ workflow GaugeDeskMethod {
             &self,
             capabilities: PackageCapabilities,
         ) -> Vec<(String, String)> {
-            let agents = format!("{}\n\n{}", self.system.trim(), self.instructions.trim());
+            let agents = self.instructions.trim().to_owned();
+            let system = self.system.trim().to_owned();
             let mut files = vec![
                 (format!("{AUTHORING_ROOT}/{AGENTS_FILE}"), agents.clone()),
+                (format!("{AUTHORING_ROOT}/{SYSTEM_FILE}"), system.clone()),
                 (
                     format!("{AUTHORING_ROOT}/{HUMANS_FILE}"),
                     HUMAN_GUIDE.to_owned(),
@@ -275,7 +277,7 @@ workflow GaugeDeskMethod {
                 ),
             ];
             for root in [DRAFT_ROOT.to_owned(), version_root(1)] {
-                files.extend(package_documents_v1(&root, &agents, "", capabilities));
+                files.extend(package_documents_v1(&root, &agents, &system, capabilities));
                 files.push((format!("{root}/{HUMANS_FILE}"), HUMAN_GUIDE.to_owned()));
             }
             if let Some(config) = &self.config {
@@ -636,15 +638,17 @@ mod tests {
             config: None,
         };
         let seeded = def.seed_files();
-        assert_eq!(seeded.len(), 13);
+        assert_eq!(seeded.len(), 14);
         assert!(seeded
             .iter()
-            .any(|(path, body)| { path == "agent/AGENTS.md" && body == "persona\n\nconventions" }));
+            .any(|(path, body)| { path == "agent/AGENTS.md" && body == "conventions" }));
+        assert!(seeded
+            .iter()
+            .any(|(path, body)| { path == "agent/SYSTEM.md" && body == "persona" }));
         assert!(seeded.iter().any(|(path, _)| path == "agent/HUMANS.md"));
         assert!(seeded
             .iter()
             .any(|(path, _)| path == "agent/skills/.gaugedesk-folder"));
-        assert!(!seeded.iter().any(|(path, _)| path == "agent/SYSTEM.md"));
         for root in [
             definition::DRAFT_ROOT.to_owned(),
             definition::version_root(1),
@@ -661,11 +665,11 @@ mod tests {
                     && !body.contains("Run the selected GaugeDesk method")
                     && !body.contains("when started")
             }));
-            assert!(seeded
-                .iter()
-                .any(|(path, body)| { path == &format!("{root}/persona.md") && body.is_empty() }));
             assert!(seeded.iter().any(|(path, body)| {
-                path == &format!("{root}/AGENTS.md") && body == "persona\n\nconventions"
+                path == &format!("{root}/persona.md") && body == "persona"
+            }));
+            assert!(seeded.iter().any(|(path, body)| {
+                path == &format!("{root}/AGENTS.md") && body == "conventions"
             }));
             assert!(seeded
                 .iter()

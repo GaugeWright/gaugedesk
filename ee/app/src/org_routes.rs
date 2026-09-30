@@ -41,6 +41,15 @@ use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 /// ([`crate::auth_oidc::activate_configured_idp`]): the persisted Org SSO
 /// connection attaches the OIDC verifier before any request is served — the
 /// same pre-request timing the pre-split workbench-open activation had.
+///
+/// The hosted Hub is not this composition. gaugewright-cloud's
+/// `server/src/runtime.rs` composes its own server and calls, by name, its
+/// custody migration and then `activate_configured_idp` — never this function.
+/// Startup work added here therefore runs on the enterprise server alone. Work
+/// the Hub needs belongs inside a function `runtime.rs` already calls, or in
+/// `runtime.rs` as well: the legacy consumer back-link was called only from
+/// here, so on the Hub it never ran until it moved into
+/// `activate_configured_idp`.
 pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
     {
         let mut guard = wb.lock_unpoisoned();

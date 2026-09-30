@@ -19,6 +19,13 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Hosted GaugeDesk now offers Privacy & analytics controls: people can opt out
+  per account, and organization owners can disable feature usage collection
+  for their organization. The first measured actions are chat creation and
+  chat turns, with no work content in events.
+- New Agents seed an editable `SYSTEM.md` for their system-level method text;
+  `AGENTS.md` carries standing developer guidance. Provider requests preserve
+  those roles, while effective tools and environment come from the runtime.
 - Raw context keeps authorized provider input items visible when another input
   is hidden, marking the hidden item's role in place. Unknown wire shapes hide
   the whole call even when every logical source is readable, and unmapped

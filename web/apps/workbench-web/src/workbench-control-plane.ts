@@ -2222,6 +2222,25 @@ export class WorkbenchControlPlane implements ControlPlane {
         return accountClient.accountSetSetting(this.routeJson(), key, value);
     }
 
+    productAnalyticsPolicy(tenant: string): Promise<accountClient.ProductAnalyticsPolicy> {
+        return accountClient.productAnalyticsPolicy(this.route, tenant);
+    }
+
+    productAnalyticsSetTenantDisabled(tenant: string, disabled: boolean): Promise<void> {
+        return accountClient.productAnalyticsSetTenantDisabled(this.route, tenant, disabled);
+    }
+
+    async recordProductEvent(event: Omit<accountClient.ProductEvent, "id">, maySend?: () => boolean): Promise<void> {
+        // The first release collects from authenticated hosted GaugeDesk only.
+        // A desktop's co-resident account plane has no collector.
+        if (!this.splitHomes || this.nativeShell) return;
+        const bearer = this.bearer;
+        await accountClient.productAnalyticsRecord(this.route, {
+            ...event,
+            id: globalThis.crypto.randomUUID(),
+        }, () => this.bearer === bearer && (maySend?.() ?? true));
+    }
+
     accountCredentials(): Promise<accountClient.LinkedProvider[]> {
         return this.runtimeAccountJson().then((json) => accountClient.accountCredentials(json));
     }

@@ -10,13 +10,16 @@
  */
 
 import { createEffect, createSignal, ErrorBoundary, on, Show, type Accessor, type JSX } from "solid-js";
-import type { PlacementPolicy } from "@gaugewright/control-plane-client";
+import { PRODUCT_ANALYTICS_SETTING, type PlacementPolicy, type ProductAnalyticsPolicy } from "@gaugewright/control-plane-client";
 import { AccountMenu, type AccountMenuItem, type MenuComposition } from "./AccountMenu";
 import { SettingsPanel, type SettingsPanelApi } from "./SettingsPanel";
 import type { SettingsRoom } from "./SettingsSurface";
 import { DevicesModal, type DevicesModalApi } from "./DevicesModal";
 
-export interface SettingsMenuApi extends SettingsPanelApi, DevicesModalApi {}
+export interface SettingsMenuApi extends SettingsPanelApi, DevicesModalApi {
+    productAnalyticsPolicy?(tenant: string): Promise<ProductAnalyticsPolicy>;
+    productAnalyticsSetTenantDisabled?(tenant: string, disabled: boolean): Promise<void>;
+}
 
 /** Optional product Environment supplied by a composing application. The open
  *  workbench owns the menu seam but knows nothing about enterprise modules. */
@@ -125,6 +128,9 @@ export function SettingsMenu(props: {
     accountSwitchError?: Accessor<string>;
     /** Authenticated org floor supplied only by an enrolled composition. */
     placementPolicy?: Accessor<PlacementPolicy | undefined>;
+    /** Hosted product analytics is anchored to the selected account and tenant. */
+    analyticsAvailable?: boolean;
+    analyticsTenant?: Accessor<{ readonly id: string; readonly personal: boolean } | null>;
     /** How this runtime opens a URL in the person's browser — the desktop shell's
      *  seam, since its webview silently drops `window.open`. Passed through to
      *  Settings; absent means `window.open` (right for browser builds). */
@@ -134,6 +140,43 @@ export function SettingsMenu(props: {
     const [accountPickerOpen, setAccountPickerOpen] = createSignal(false);
     const [devicesOpen, setDevicesOpen] = createSignal(false);
     const [settingsOpen, setSettingsOpen] = createSignal(false);
+    const [privacyOpen, setPrivacyOpen] = createSignal(false);
+    const [privacyPolicy, setPrivacyPolicy] = createSignal<ProductAnalyticsPolicy | null>(null);
+    const [privacyBusy, setPrivacyBusy] = createSignal(false);
+    const [privacyError, setPrivacyError] = createSignal("");
+    const loadPrivacy = async () => {
+        const tenant = props.analyticsTenant?.();
+        if (!tenant || !props.api.productAnalyticsPolicy) return;
+        setPrivacyBusy(true);
+        setPrivacyError("");
+        setPrivacyPolicy(null);
+        try {
+            setPrivacyPolicy(await props.api.productAnalyticsPolicy(tenant.id));
+        } catch {
+            setPrivacyPolicy(null);
+            setPrivacyError("Privacy settings are unavailable. Try again.");
+        } finally {
+            setPrivacyBusy(false);
+        }
+    };
+    const changePrivacy = async (kind: "person" | "tenant", enabled: boolean) => {
+        const tenant = props.analyticsTenant?.();
+        if (!tenant || !props.api.productAnalyticsPolicy || !props.api.productAnalyticsSetTenantDisabled) return;
+        setPrivacyBusy(true);
+        setPrivacyError("");
+        try {
+            if (kind === "person") {
+                await props.api.accountSetSetting(PRODUCT_ANALYTICS_SETTING, enabled ? "true" : "false");
+            } else {
+                await props.api.productAnalyticsSetTenantDisabled(tenant.id, !enabled);
+            }
+            setPrivacyPolicy(await props.api.productAnalyticsPolicy(tenant.id));
+        } catch {
+            setPrivacyError("Could not change the privacy setting. Try again.");
+        } finally {
+            setPrivacyBusy(false);
+        }
+    };
     // Which room Settings lands in for *this* opening. Held here because the opener knows
     // the reason: the menu's own row means Account, an in-chat model refusal means Model
     // access. Remounting Settings each time is what makes the seed take.
@@ -248,6 +291,19 @@ export function SettingsMenu(props: {
                     },
                 },
             ];
+        if (accountAvailable() && props.analyticsAvailable && props.analyticsTenant?.()
+            && props.api.productAnalyticsPolicy && props.api.productAnalyticsSetTenantDisabled) {
+            rows.push({
+                id: "privacy-analytics",
+                label: "Privacy & analytics",
+                submenu: true,
+                run: () => {
+                    setMenuOpen(false);
+                    setPrivacyOpen(true);
+                    void loadPrivacy();
+                },
+            });
+        }
         if (props.environmentAction?.available()) {
             rows.push({
                 id: "environment",
@@ -311,6 +367,15 @@ export function SettingsMenu(props: {
             { defer: true },
         ),
     );
+
+    createEffect(on(
+        () => props.analyticsTenant?.()?.id,
+        () => {
+            setPrivacyOpen(false);
+            setPrivacyPolicy(null);
+        },
+        { defer: true },
+    ));
 
     createEffect(
         on(
@@ -398,6 +463,48 @@ export function SettingsMenu(props: {
                         onChanged={props.onAccountChanged}
                         onClose={() => setSettingsOpen(false)}
                     />
+                </SettingsModalBoundary>
+            </Show>
+            <Show when={privacyOpen()}>
+                <SettingsModalBoundary surface="Privacy & analytics" onClose={() => setPrivacyOpen(false)}>
+                    <div class="modal-overlay" onClick={() => setPrivacyOpen(false)}>
+                        <div class="modal privacy-analytics-modal" onClick={(event) => event.stopPropagation()}>
+                            <div class="modal-head">
+                                <h3>Privacy & analytics</h3>
+                                <button type="button" onClick={() => setPrivacyOpen(false)}>close</button>
+                            </div>
+                            <p>GaugeDesk measures feature use and whether actions complete or fail to improve the product. Events include your account, selected organization, app version, and platform. They do not include your chats, prompts, files, names, or credentials.</p>
+                            <Show when={privacyPolicy()} fallback={<p role="status">{privacyBusy() ? "Loading privacy settings…" : privacyError()}</p>}>
+                                {(policy) => <>
+                                    <label>
+                                        <input
+                                            type="checkbox"
+                                            checked={policy().person_enabled}
+                                            disabled={privacyBusy()}
+                                            onChange={(event) => void changePrivacy("person", event.currentTarget.checked)}
+                                        />
+                                        Share product usage from this account
+                                    </label>
+                                    <Show when={!props.analyticsTenant?.()?.personal && policy().can_manage_tenant}>
+                                        <label>
+                                            <input
+                                                type="checkbox"
+                                                checked={!policy().tenant_disabled}
+                                                disabled={privacyBusy() || policy().tenant_locked_off}
+                                                onChange={(event) => void changePrivacy("tenant", event.currentTarget.checked)}
+                                            />
+                                            Allow product analytics for this organization
+                                        </label>
+                                    </Show>
+                                    <Show when={policy().tenant_disabled}>
+                                        <p>Product analytics is off for this organization, regardless of your account setting.{policy().tenant_locked_off ? " This setting is locked by GaugeWright for a regulated organization." : ""}</p>
+                                    </Show>
+                                </>}
+                            </Show>
+                            <Show when={privacyPolicy() && privacyError()}><p role="alert">{privacyError()}</p></Show>
+                            <p><a href="https://gaugewright.com/privacy" target="_blank" rel="noopener noreferrer">Privacy notice</a></p>
+                        </div>
+                    </div>
                 </SettingsModalBoundary>
             </Show>
         </>
