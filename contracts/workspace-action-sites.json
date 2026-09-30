@@ -5765,6 +5765,26 @@
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::append_agent_improve_evidence",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/agent_improve_evidence.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::append_agent_improve_evidence",
+        "capability": "cut_descends_from",
+        "count": 1,
+        "expression": "workspace . cut_descends_from (& current , & card . baseline_main_cut)",
+        "file": "crates/app/src/agent_improve_evidence.rs"
+      },
+      "profile": "authoring"
     }
   ]
 }

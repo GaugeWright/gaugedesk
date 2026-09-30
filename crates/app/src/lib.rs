@@ -26,6 +26,7 @@ pub mod agent_improve;
 mod agent_improve_adoption;
 pub mod agent_improve_campaign;
 mod agent_improve_custody;
+pub mod agent_improve_evidence;
 pub mod agent_question;
 pub mod agent_release;
 pub mod app_support;

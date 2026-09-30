@@ -56,6 +56,7 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     // Native Agent improve inputs may contain private scenario text. The
     // private field is additionally sealed with the Home account key.
     "agent_improve_campaign_source",
+    "agent_improve_campaign_evidence",
     // GaugeApp management conversations and their generation pointer. The
     // transcript has an independent per-thread key; the pointer lives under
     // its owning account/tenant key so parent erasure reaches both layers.

@@ -23,7 +23,7 @@ struct SourceRecord {
 }
 
 impl Workbench {
-    fn improve_authoring_target(&self, agent_id: &str) -> Result<String, String> {
+    pub(crate) fn improve_authoring_target(&self, agent_id: &str) -> Result<String, String> {
         let target = self
             .library
             .authoring_target_for(agent_id)

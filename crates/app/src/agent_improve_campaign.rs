@@ -5,10 +5,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use whipplescript_core::improve_selection::{
-    self, Bar, Campaign, GaugeEvidence, Reach, Reading, Verdict,
+    self, Bar, Campaign, Delta, GaugeEvidence, Reach, Reading, Role, Verdict,
 };
 
 use gaugedesk_harness::{EgressGate, HarnessSpec};
@@ -148,6 +148,7 @@ struct EvaluatedScenario {
 /// one pinned open/private campaign. Sealed scenarios are skipped when the
 /// open stage fails. Raw sealed turns remain private.
 pub struct SelectedCampaign {
+    target_id: String,
     reference: String,
     scenarios: Vec<EvaluatedScenario>,
     open_verdict: Verdict,
@@ -155,7 +156,96 @@ pub struct SelectedCampaign {
     sealed_available: usize,
 }
 
+/// Immutable reviewer evidence. It contains aggregate judge outputs and exact
+/// execution identities, but no sealed scenario inputs, checks, or raw turns.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignEvidenceCard {
+    pub target_id: String,
+    pub campaign_ref: String,
+    pub open_source_ref: String,
+    pub private_source_ref: String,
+    pub baseline_main_cut: String,
+    pub baseline_definition_ref: String,
+    pub candidate_definition_ref: String,
+    pub baseline_package_ref: String,
+    pub candidate_package_ref: String,
+    pub baseline_discipline_ref: String,
+    pub candidate_discipline_ref: String,
+    pub open_count: usize,
+    pub sealed_available: usize,
+    pub sealed_evaluated: usize,
+    /// Remains `unheld-out` until random assignment and exposure accounting
+    /// can support a stronger claim.
+    pub holdout_status: String,
+    pub open_verdict: ReviewVerdict,
+    pub final_verdict: ReviewVerdict,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewVerdict {
+    pub proposable: bool,
+    pub tradeoff: bool,
+    pub reasons: Vec<String>,
+    pub lines: Vec<ReviewGaugeLine>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewGaugeLine {
+    pub gauge: String,
+    pub role: String,
+    pub delta: String,
+    pub baseline: Option<f64>,
+    pub candidate: Option<f64>,
+    pub band: f64,
+    pub bar_met: Option<bool>,
+    pub reach_met: Option<bool>,
+    pub direction_up: bool,
+}
+
+impl From<&Verdict> for ReviewVerdict {
+    fn from(verdict: &Verdict) -> Self {
+        Self {
+            proposable: verdict.proposable,
+            tradeoff: verdict.tradeoff,
+            reasons: verdict.reasons.clone(),
+            lines: verdict
+                .lines
+                .iter()
+                .map(|line| ReviewGaugeLine {
+                    gauge: line.gauge.clone(),
+                    role: match line.role {
+                        Role::Ascend => "ascend",
+                        Role::Sacrifice => "sacrifice",
+                        Role::Guard => "guard",
+                    }
+                    .to_owned(),
+                    delta: match line.delta {
+                        Delta::Better => "better",
+                        Delta::InBand => "in-band",
+                        Delta::Worse => "worse",
+                        Delta::Unmeasured => "unmeasured",
+                    }
+                    .to_owned(),
+                    baseline: line.baseline,
+                    candidate: line.candidate,
+                    band: line.band,
+                    bar_met: line.bar_met,
+                    reach_met: line.reach_met,
+                    direction_up: line.direction_up,
+                })
+                .collect(),
+        }
+    }
+}
+
 impl SelectedCampaign {
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+
     pub fn reference(&self) -> &str {
         &self.reference
     }
@@ -189,6 +279,42 @@ impl SelectedCampaign {
             .filter(|scenario| scenario.exposure == Exposure::Sealed)
             .count()
     }
+
+    pub fn reviewer_card(
+        &self,
+        campaign: &CampaignSnapshot,
+    ) -> Result<CampaignEvidenceCard, String> {
+        if self.reference != campaign.reference {
+            return Err("Agent improve evidence names another campaign cut".to_owned());
+        }
+        let first = self
+            .scenarios
+            .first()
+            .ok_or("Agent improve campaign has no evaluated scenarios")?;
+        let pair = first.selected.evidence();
+        Ok(CampaignEvidenceCard {
+            target_id: self.target_id.clone(),
+            campaign_ref: self.reference.clone(),
+            open_source_ref: campaign.open_ref().to_owned(),
+            private_source_ref: campaign.private_ref().to_owned(),
+            baseline_main_cut: pair
+                .baseline_main_cut()
+                .ok_or("Agent improve evidence has no authoring Main cut")?
+                .to_owned(),
+            baseline_definition_ref: pair.baseline_definition_ref().to_owned(),
+            candidate_definition_ref: pair.candidate_definition_ref().to_owned(),
+            baseline_package_ref: pair.baseline().package_ref().to_owned(),
+            candidate_package_ref: pair.candidate().package_ref().to_owned(),
+            baseline_discipline_ref: pair.baseline().discipline_ref().to_owned(),
+            candidate_discipline_ref: pair.candidate().discipline_ref().to_owned(),
+            open_count: self.open_scenario_ids().len(),
+            sealed_available: self.sealed_available,
+            sealed_evaluated: self.sealed_count(),
+            holdout_status: "unheld-out".to_owned(),
+            open_verdict: ReviewVerdict::from(&self.open_verdict),
+            final_verdict: ReviewVerdict::from(&self.verdict),
+        })
+    }
 }
 
 /// Evaluate a text-scenario campaign through the same governed native harness
@@ -198,6 +324,7 @@ impl SelectedCampaign {
 pub fn run_native_campaign(
     factory: &gaugedesk_whip_runtime::WhipHarnessFactory,
     template: &HarnessSpec,
+    target_id: &str,
     workspace: &dyn Workspace,
     candidate_repo: &Path,
     campaign: &CampaignSnapshot,
@@ -205,6 +332,7 @@ pub fn run_native_campaign(
 ) -> Result<SelectedCampaign, String> {
     run_campaign_with(
         template,
+        target_id,
         workspace,
         candidate_repo,
         campaign,
@@ -216,6 +344,7 @@ pub fn run_native_campaign(
 
 fn run_campaign_with<F>(
     template: &HarnessSpec,
+    target_id: &str,
     workspace: &dyn Workspace,
     candidate_repo: &Path,
     campaign: &CampaignSnapshot,
@@ -244,6 +373,7 @@ where
             )?;
             if !verdict.proposable {
                 return Ok(SelectedCampaign {
+                    target_id: target_id.to_owned(),
                     reference: campaign.reference.clone(),
                     scenarios,
                     open_verdict: verdict.clone(),
@@ -331,6 +461,7 @@ where
         campaign.open.gauges.len(),
     )?;
     Ok(SelectedCampaign {
+        target_id: target_id.to_owned(),
         reference: campaign.reference.clone(),
         scenarios,
         open_verdict: open_verdict.unwrap_or_else(|| verdict.clone()),
@@ -850,7 +981,7 @@ mod tests {
     fn campaign_aggregates_open_and_sealed_pairs_before_stale_safe_adoption() {
         let root = tempfile::tempdir().unwrap();
         let workbench = crate::open_workbench(root.path()).unwrap();
-        let guard = workbench.lock_unpoisoned();
+        let mut guard = workbench.lock_unpoisoned();
         let target_id = crate::library_state::authoring_target_id(crate::DEFAULT_AGENT);
         let workspace = guard.targets.get(&target_id).unwrap();
         let candidate_repo = root.path().join("candidate");
@@ -863,6 +994,7 @@ mod tests {
         let run = || {
             run_campaign_with(
                 &template(root.path()),
+                &target_id,
                 workspace.as_ref(),
                 &candidate_repo,
                 &source,
@@ -888,6 +1020,13 @@ mod tests {
         assert!(selected.open_verdict().proposable);
         assert_eq!(selected.sealed_available(), 1);
         assert!(selected.reviewer_verdict().proposable);
+        let card = selected.reviewer_card(&source).unwrap();
+        let serialized = serde_json::to_string(&card).unwrap();
+        assert_eq!(card.holdout_status, "unheld-out");
+        assert_eq!(card.sealed_evaluated, 1);
+        assert_eq!(card.open_verdict.lines[0].delta, "better");
+        assert!(!serialized.contains("Return beta"));
+        assert!(!serialized.contains("assistant-contains"));
         assert_eq!(selected.reviewer_verdict().lines[0].baseline, Some(0.0));
         assert_eq!(selected.reviewer_verdict().lines[0].candidate, Some(1.0));
         let unrelated_id = crate::library::gen_id("unrelated-improve-edit");
@@ -907,6 +1046,49 @@ mod tests {
             adopt_selected_campaign(workspace.as_ref(), &selected).unwrap(),
             vec!["agent/AGENTS.md"]
         );
+        assert_eq!(
+            guard
+                .register_agent_improve_campaign(
+                    crate::DEFAULT_AGENT,
+                    OPEN.as_bytes(),
+                    PRIVATE.as_bytes(),
+                )
+                .unwrap(),
+            source.reference()
+        );
+        let other = guard
+            .create_archetype("Other".to_owned(), crate::library::AgentKind::Work, None)
+            .ok()
+            .expect("second Agent is created");
+        guard
+            .register_agent_improve_campaign(&other.id, OPEN.as_bytes(), PRIVATE.as_bytes())
+            .unwrap();
+        assert!(guard
+            .append_agent_improve_evidence(&other.id, &source, &selected)
+            .unwrap_err()
+            .contains("another authoring target"));
+        let evidence_id = guard
+            .append_agent_improve_evidence(crate::DEFAULT_AGENT, &source, &selected)
+            .unwrap();
+        let rows = guard
+            .store
+            .records(
+                crate::library::LIBRARY_SCOPE,
+                "agent_improve_campaign_evidence",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].contains("Return beta"));
+        drop(guard);
+        drop(workbench);
+        let reopened = crate::open_workbench(root.path()).unwrap();
+        let guard = reopened.lock_unpoisoned();
+        let evidence = guard
+            .agent_improve_evidence(crate::DEFAULT_AGENT, &evidence_id)
+            .unwrap();
+        assert_eq!(evidence.card.campaign_ref, source.reference());
+        assert_eq!(evidence.card.holdout_status, "unheld-out");
+        assert!(evidence.card.final_verdict.proposable);
     }
 
     #[test]
@@ -925,6 +1107,7 @@ mod tests {
         let source = CampaignSnapshot::parse(OPEN.as_bytes(), PRIVATE.as_bytes()).unwrap();
         let selected = run_campaign_with(
             &template(root.path()),
+            &target_id,
             workspace.as_ref(),
             &candidate_repo,
             &source,
@@ -966,6 +1149,7 @@ mod tests {
         let source = CampaignSnapshot::parse(OPEN.as_bytes(), PRIVATE.as_bytes()).unwrap();
         let selected = run_campaign_with(
             &template(root.path()),
+            &target_id,
             workspace.as_ref(),
             &candidate_repo,
             &source,
