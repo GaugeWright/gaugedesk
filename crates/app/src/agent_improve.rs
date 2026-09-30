@@ -168,9 +168,21 @@ pub struct PreparedShadowPair {
 /// Home admits the two exact prepared arm snapshots before their first host
 /// operation, then records the terminal outcome of their managed commands.
 /// A failure to admit or finish the pair cannot become campaign evidence.
+pub struct HostedImprovePairContext<'a> {
+    pub actor: &'a str,
+    pub tenant_id: &'a str,
+    pub agent_id: &'a str,
+    pub target_id: &'a str,
+    pub target_main_basis: &'a str,
+    pub campaign_ref: &'a str,
+    pub scenario_ref: &'a str,
+    pub prompt_ref: &'a str,
+}
+
 pub trait HostedImprovePairAdmission: Send + Sync {
     fn with_pair(
         &self,
+        context: &HostedImprovePairContext<'_>,
         prepared: &PreparedShadowPair,
         run: Box<dyn FnOnce() -> Result<SelectedShadowPair, String> + '_>,
     ) -> Result<SelectedShadowPair, String>;
@@ -195,6 +207,18 @@ impl PreparedShadowPair {
 
     pub fn scenario_ref(&self) -> &str {
         &self.scenario_ref
+    }
+
+    pub fn baseline_main_cut(&self) -> Option<&str> {
+        self.baseline_main_cut.as_deref()
+    }
+
+    pub fn baseline_discipline_ref(&self) -> &str {
+        &self.baseline_discipline_ref
+    }
+
+    pub fn candidate_discipline_ref(&self) -> &str {
+        &self.candidate_discipline_ref
     }
 
     pub(crate) fn evaluated_candidate_definition(

@@ -184,6 +184,37 @@ impl Workbench {
         Ok(target.id.clone())
     }
 
+    /// Recheck the source owner's authority and the exact library target cut
+    /// immediately before a hosted managed command is acknowledged. The
+    /// Cloud adapter may inspect this answer but cannot synthesize it.
+    pub fn verify_hosted_improve_pair_subject(
+        &self,
+        actor: &str,
+        agent_id: &str,
+        target_id: &str,
+        target_main_basis: &str,
+        campaign_ref: &str,
+    ) -> Result<(), String> {
+        self.verify_agent_improve_source_owner(agent_id, Some(actor))?;
+        if self.improve_authoring_target(agent_id)? != target_id {
+            return Err("hosted improve command names another Agent authoring target".to_owned());
+        }
+        let workspace = self
+            .targets
+            .get(target_id)
+            .ok_or("Agent improve authoring target is unavailable")?;
+        if workspace
+            .current_main_cut()
+            .map_err(|error| error.to_string())?
+            .as_deref()
+            != Some(target_main_basis)
+        {
+            return Err("hosted improve command names a stale Agent Main cut".to_owned());
+        }
+        self.load_agent_improve_campaign(agent_id, campaign_ref)?;
+        Ok(())
+    }
+
     /// Admit one exact source revision under Home custody. A retry with the
     /// same target and source is idempotent; a source edit creates a new cut.
     pub fn register_agent_improve_campaign(
@@ -769,6 +800,48 @@ mod tests {
             )
             .unwrap();
         assert_ne!(local.campaign_ref, signed_in.campaign_ref);
+    }
+
+    #[test]
+    fn hosted_pair_subject_requires_owner_target_main_cut_and_campaign() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let mut guard = wb.lock_unpoisoned();
+        let agent_id = crate::DEFAULT_AGENT;
+        let agent = guard.library.agents.get_mut(agent_id).unwrap();
+        agent
+            .versions
+            .get_mut(&agent.current_version)
+            .unwrap()
+            .source_owner_authority = Some("person-1".to_owned());
+        let campaign_ref = guard
+            .register_agent_improve_campaign(agent_id, OPEN.as_bytes(), PRIVATE.as_bytes())
+            .unwrap();
+        let target_id = guard.improve_authoring_target(agent_id).unwrap();
+        let main_cut = guard
+            .targets
+            .get(&target_id)
+            .unwrap()
+            .current_main_cut()
+            .unwrap()
+            .unwrap();
+
+        let verify = |actor: &str, target: &str, cut: &str, campaign: &str| {
+            guard.verify_hosted_improve_pair_subject(actor, agent_id, target, cut, campaign)
+        };
+        assert!(verify("person-1", &target_id, &main_cut, &campaign_ref).is_ok());
+        assert!(verify("person-2", &target_id, &main_cut, &campaign_ref)
+            .unwrap_err()
+            .contains("source owner"));
+        assert!(
+            verify("person-1", "another-target", &main_cut, &campaign_ref)
+                .unwrap_err()
+                .contains("another Agent authoring target")
+        );
+        assert!(verify("person-1", &target_id, "stale-cut", &campaign_ref)
+            .unwrap_err()
+            .contains("stale Agent Main cut"));
+        assert!(verify("person-1", &target_id, &main_cut, "unknown-campaign").is_err());
     }
 
     #[tokio::test]

@@ -18,7 +18,8 @@ use gaugedesk_workspace::Workspace;
 use crate::agent_improve::{
     adopt_evaluated_candidate, prepare_native_shadow_pair_from_authoring,
     run_hosted_shadow_selection, run_native_shadow_selection, HostGauge, HostJudge, HostSelection,
-    HostedImprovePairAdmission, PreparedShadowPair, SelectedShadowPair, ShadowTurn,
+    HostedImprovePairAdmission, HostedImprovePairContext, PreparedShadowPair, SelectedShadowPair,
+    ShadowTurn,
 };
 use crate::agent_improve_funding::ManagedShadowMeter;
 use crate::{library::gen_id, SharedWorkbench};
@@ -648,6 +649,8 @@ pub fn run_hosted_managed_campaign_with_reservation(
         factory,
         pair_admission,
         template,
+        agent_id,
+        actor,
         target_id,
         workspace,
         candidate_repo,
@@ -664,6 +667,7 @@ pub fn run_hosted_managed_campaign_with_reservation(
     {
         return Err("hosted Agent improve needs an admitted WhippleScript placement".to_owned());
     }
+    let tenant_id = funding.tenant_scope.clone();
     let mut meter = ManagedShadowMeter::new(wb, gen_id("agent-improve-attempt"), funding);
     run_campaign_with_reservation(
         template,
@@ -672,7 +676,25 @@ pub fn run_hosted_managed_campaign_with_reservation(
         candidate_repo,
         campaign,
         |prepared, judge, selection, prompt| {
+            let target_main_basis = prepared
+                .baseline_main_cut()
+                .ok_or("hosted Agent improve has no authoring Main basis")?;
+            let prompt_ref = format!(
+                "agent-prompt:sha256:{}",
+                hex::encode(Sha256::digest(prompt.as_bytes()))
+            );
+            let context = HostedImprovePairContext {
+                actor,
+                tenant_id: &tenant_id,
+                agent_id,
+                target_id,
+                target_main_basis,
+                campaign_ref: campaign.reference(),
+                scenario_ref: prepared.scenario_ref(),
+                prompt_ref: &prompt_ref,
+            };
             pair_admission.with_pair(
+                &context,
                 prepared,
                 Box::new(|| {
                     run_hosted_shadow_selection(
@@ -695,6 +717,8 @@ pub struct HostedCampaignExecution<'a> {
     pub factory: &'a dyn HarnessFactory,
     pub pair_admission: &'a dyn HostedImprovePairAdmission,
     pub template: &'a HarnessSpec,
+    pub agent_id: &'a str,
+    pub actor: &'a str,
     pub target_id: &'a str,
     pub workspace: &'a dyn Workspace,
     pub candidate_repo: &'a Path,
@@ -1363,9 +1387,21 @@ mod tests {
     impl HostedImprovePairAdmission for RecordingPairAdmission {
         fn with_pair(
             &self,
+            context: &HostedImprovePairContext<'_>,
             prepared: &PreparedShadowPair,
             run: Box<dyn FnOnce() -> Result<SelectedShadowPair, String> + '_>,
         ) -> Result<SelectedShadowPair, String> {
+            if context.actor.is_empty()
+                || context.tenant_id.is_empty()
+                || context.campaign_ref.is_empty()
+                || context.agent_id.is_empty()
+                || context.target_id.is_empty()
+                || context.target_main_basis != prepared.baseline_main_cut().unwrap_or("")
+                || context.scenario_ref != prepared.scenario_ref()
+                || !context.prompt_ref.starts_with("agent-prompt:sha256:")
+            {
+                return Err("hosted pair identity is incomplete".to_owned());
+            }
             let baseline = prepared
                 .baseline_spec()
                 .runtime_placement_id
@@ -1534,6 +1570,8 @@ mod tests {
                 factory: &HostedFakeFactory,
                 pair_admission: &pair_admission,
                 template: &hosted_template,
+                agent_id: "agent:hosted-test",
+                actor: "authority:hosted-test",
                 target_id: &target_id,
                 workspace: &workspace,
                 candidate_repo: &candidate_repo,

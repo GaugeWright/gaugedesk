@@ -5768,6 +5768,16 @@
     },
     {
       "site": {
+        "callable": "impl inherent for Workbench::verify_hosted_improve_pair_subject",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/agent_improve_custody.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
         "callable": "impl inherent for Workbench::append_agent_improve_evidence",
         "capability": "current_main_cut",
         "count": 1,

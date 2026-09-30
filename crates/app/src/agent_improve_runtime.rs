@@ -86,10 +86,11 @@ pub fn evaluate_agent_improve_from_desktop(
     prepared.run(wb, actor.as_deref())
 }
 
-/// Home-only hosted evaluation. The caller must have authenticated the actor
-/// and tenant and admitted the exact managed Machine command before this
-/// boundary; it may supply identities and its admitted host factory, never
-/// candidate paths, private cases, policy bytes, placement ids, or funding refs.
+/// Home-only hosted evaluation. The caller authenticates the actor and tenant
+/// and supplies a pair admission authority. That authority admits both exact
+/// managed commands after Home prepares the two arms and before either runs.
+/// The caller never supplies candidate paths, private cases, policy bytes,
+/// placement ids, or funding refs.
 pub fn evaluate_agent_improve_from_hosted(
     wb: &SharedWorkbench,
     agent_id: &str,
@@ -581,6 +582,8 @@ impl NativeImprovePrepared {
                         .as_deref()
                         .ok_or("Hosted Agent improve has no pair admission authority")?,
                     template: &self.template,
+                    agent_id: &self.agent_id,
+                    actor: actor.ok_or("Hosted Agent improve has no source-owner actor")?,
                     target_id: &self.target_id,
                     workspace: &workspace,
                     candidate_repo: &self.candidate_repo,
