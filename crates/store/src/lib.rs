@@ -2735,6 +2735,7 @@ mod tests {
             tenant_id: "tenant-a".into(),
             project_id: "project-a".into(),
             work_target_basis: "basis:abc".into(),
+            agent_authoring: None,
             command_id: "command-a".into(),
             payload_digest: "sha256:payload-a".into(),
             profile: ExecutionProfile::IsolatedWorkspace,
@@ -2765,7 +2766,7 @@ mod tests {
                 .admit_with_key::<ManagedExecutionState>(
                     scope,
                     "prepare:command-a",
-                    ManagedExecutionCommand::Prepare(workspace_execution_request()),
+                    ManagedExecutionCommand::Prepare(Box::new(workspace_execution_request())),
                 )
                 .unwrap();
             store

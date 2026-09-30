@@ -83,11 +83,35 @@ impl ExecutionResourceBounds {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct AgentAuthoringExecutionSubject {
+    pub agent_id: String,
+    pub target_id: String,
+    pub target_main_basis: String,
+}
+
+impl AgentAuthoringExecutionSubject {
+    fn valid(&self) -> bool {
+        [&self.agent_id, &self.target_id, &self.target_main_basis]
+            .into_iter()
+            .all(|value| valid_identity(value))
+    }
+}
+
+fn valid_identity(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ExecutionRequest {
     pub home_id: String,
     pub tenant_id: String,
+    /// Historical project commands retain these fields in their event wire
+    /// format. An Agent-authoring command leaves both empty and names its
+    /// subject explicitly below; the two shapes cannot be mixed.
     pub project_id: String,
     pub work_target_basis: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_authoring: Option<AgentAuthoringExecutionSubject>,
     pub command_id: String,
     /// Digest of the complete immutable provider payload. Retries may advance
     /// only their worker epoch, never substitute input bytes.
@@ -100,17 +124,25 @@ pub struct ExecutionRequest {
 
 impl ExecutionRequest {
     fn valid(&self) -> bool {
+        let subject_valid = match &self.agent_authoring {
+            None => valid_identity(&self.project_id) && valid_identity(&self.work_target_basis),
+            Some(subject) => {
+                self.project_id.is_empty()
+                    && self.work_target_basis.is_empty()
+                    && self.profile == ExecutionProfile::DurableWorkflow
+                    && subject.valid()
+            }
+        };
         [
             &self.home_id,
             &self.tenant_id,
-            &self.project_id,
-            &self.work_target_basis,
             &self.command_id,
             &self.payload_digest,
             &self.credential_class,
         ]
         .into_iter()
-        .all(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .all(|value| valid_identity(value))
+            && subject_valid
             && !self.required_capabilities.is_empty()
             && self.bounds.valid()
     }
@@ -213,7 +245,7 @@ pub struct ManagedExecutionState {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ManagedExecutionCommand {
-    Prepare(ExecutionRequest),
+    Prepare(Box<ExecutionRequest>),
     AuthorizeWorkspace(WorkspaceAuthorization),
     Acknowledge,
     Start(WorkerGrant),
@@ -229,7 +261,7 @@ pub enum ManagedExecutionCommand {
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ManagedExecutionEvent {
-    ExecutionPrepared(ExecutionRequest),
+    ExecutionPrepared(Box<ExecutionRequest>),
     WorkspaceAuthorized(WorkspaceAuthorization),
     CommandAcknowledged,
     WorkerStarted(WorkerGrant),
@@ -466,7 +498,7 @@ pub fn evolve(
     match event {
         E::ExecutionPrepared(request) => {
             next.phase = P::Prepared;
-            next.request = Some(request);
+            next.request = Some(*request);
         }
         E::WorkspaceAuthorized(authorization) => {
             next.workspace_authorization = Some(authorization);
@@ -562,6 +594,7 @@ mod tests {
             tenant_id: "tenant-a".into(),
             project_id: "project-a".into(),
             work_target_basis: "basis:abc".into(),
+            agent_authoring: None,
             command_id: "command-a".into(),
             payload_digest: "sha256:payload-a".into(),
             profile,
@@ -603,7 +636,7 @@ mod tests {
         let request = request(profile);
         let mut state = apply(
             &ManagedExecutionState::default(),
-            ManagedExecutionCommand::Prepare(request),
+            ManagedExecutionCommand::Prepare(Box::new(request)),
         )
         .unwrap();
         if profile == ExecutionProfile::IsolatedWorkspace {
@@ -617,6 +650,67 @@ mod tests {
             .unwrap();
         }
         apply(&state, ManagedExecutionCommand::Acknowledge).unwrap()
+    }
+
+    #[test]
+    fn agent_authoring_command_has_one_exact_non_project_subject() {
+        let mut authoring = request(ExecutionProfile::DurableWorkflow);
+        authoring.project_id.clear();
+        authoring.work_target_basis.clear();
+        authoring.agent_authoring = Some(AgentAuthoringExecutionSubject {
+            agent_id: "agent:one".into(),
+            target_id: "authoring-target:one".into(),
+            target_main_basis: "cut:one".into(),
+        });
+        let prepared = apply(
+            &ManagedExecutionState::default(),
+            ManagedExecutionCommand::Prepare(Box::new(authoring.clone())),
+        )
+        .unwrap();
+        assert_eq!(prepared.request.as_ref(), Some(&authoring));
+        assert_eq!(
+            apply(&prepared, ManagedExecutionCommand::Acknowledge)
+                .unwrap()
+                .phase,
+            ExecutionPhase::Acknowledged
+        );
+
+        let mut mixed = authoring.clone();
+        mixed.project_id = "project:invented".into();
+        assert!(apply(
+            &ManagedExecutionState::default(),
+            ManagedExecutionCommand::Prepare(Box::new(mixed))
+        )
+        .is_err());
+        let mut incomplete = authoring.clone();
+        incomplete
+            .agent_authoring
+            .as_mut()
+            .unwrap()
+            .target_main_basis
+            .clear();
+        assert!(apply(
+            &ManagedExecutionState::default(),
+            ManagedExecutionCommand::Prepare(Box::new(incomplete))
+        )
+        .is_err());
+        let mut workspace = authoring;
+        workspace.profile = ExecutionProfile::IsolatedWorkspace;
+        assert!(apply(
+            &ManagedExecutionState::default(),
+            ManagedExecutionCommand::Prepare(Box::new(workspace))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn historical_project_command_decodes_without_authoring_field() {
+        let project = request(ExecutionProfile::DurableWorkflow);
+        let mut old_wire = Vec::new();
+        ciborium::into_writer(&project, &mut old_wire).unwrap();
+        let decoded: ExecutionRequest = ciborium::from_reader(old_wire.as_slice()).unwrap();
+        assert_eq!(decoded, project);
+        assert!(decoded.valid());
     }
 
     #[test]
@@ -664,7 +758,7 @@ mod tests {
         let request = request(ExecutionProfile::IsolatedWorkspace);
         let prepared = apply(
             &ManagedExecutionState::default(),
-            ManagedExecutionCommand::Prepare(request.clone()),
+            ManagedExecutionCommand::Prepare(Box::new(request.clone())),
         )
         .unwrap();
         assert!(apply(&prepared, ManagedExecutionCommand::Acknowledge).is_err());
@@ -730,7 +824,7 @@ mod tests {
         let request = request(ExecutionProfile::DedicatedCompute);
         let state = apply(
             &ManagedExecutionState::default(),
-            ManagedExecutionCommand::Prepare(request),
+            ManagedExecutionCommand::Prepare(Box::new(request)),
         )
         .unwrap();
         assert!(apply(&state, ManagedExecutionCommand::Acknowledge).is_err());
