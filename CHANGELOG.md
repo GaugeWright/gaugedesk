@@ -19,6 +19,19 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.4.31] — 2026-09-30
+
+- Workshop Agents and top-level project groups start collapsed; expand a group
+  with its caret to see its children.
+
+- Native Agent improvement now reads streamed answers from OpenAI-compatible
+  model connections and runs both comparison arms before opening held-out cases.
+
+- The desktop Agent Workshop can evaluate an edited Agent against its sampled
+  case pool, show a regularized reviewer result, send open-case feedback back
+  to the edit chat, and apply a selected candidate to an unchanged draft.
+  Held-out cases and checks stay in Home custody; publishing remains separate.
+
 - A chat's changes name each target folder instead of showing its internal
   id, and a folder renamed in the chat shows as a rename. When two chats
   rename one folder differently, the conflicted chat offers keeping its name

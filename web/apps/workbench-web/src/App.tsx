@@ -81,6 +81,7 @@ import "@gaugewright/gw-embed";
 import {
     SignInCard,
     AgentSettings,
+    type AgentImproveEvidence,
     BASIC_COMPOSER_CAPABILITIES,
     ChatPanel,
     ChatPaneHeader,
@@ -803,6 +804,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         campaignRef: string;
         openSource: string;
     } | null>(null);
+    const [evaluatedImproveCampaign, setEvaluatedImproveCampaign] = createSignal<{
+        agentId: ArchetypeId;
+        account: string | null;
+        campaignRef: string;
+        evidence: AgentImproveEvidence;
+    } | null>(null);
     const [latestImprovePool] = createResource(
         () => {
             const id = agentSettings()?.id;
@@ -821,14 +828,55 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }
         },
     );
-    const preparedImproveFor = (id: ArchetypeId) => {
+    const preparedImproveFor = (id: ArchetypeId): {
+        agentId: ArchetypeId;
+        campaignRef: string;
+        openSource: string;
+    } | null => {
         const local = preparedImproveCampaign();
         if (local?.agentId === id && local.account === bearer()) return local;
         const retained = latestImprovePool();
-        return retained?.agentId === id && "campaignRef" in retained ? retained : null;
+        return retained?.agentId === id && "campaignRef" in retained
+            && typeof retained.campaignRef === "string"
+            && "openSource" in retained && typeof retained.openSource === "string"
+            ? { agentId: id, campaignRef: retained.campaignRef, openSource: retained.openSource }
+            : null;
     };
     const improveRecoveryErrorFor = (id: ArchetypeId) => {
         const retained = latestImprovePool();
+        return retained?.agentId === id && "error" in retained ? retained.error : undefined;
+    };
+    const [latestImproveEvidence] = createResource(
+        () => {
+            const id = agentSettings()?.id;
+            const prepared = id ? preparedImproveFor(id) : null;
+            return isTauri() && homeState()?.kind === "direct" && id && prepared
+                ? { id, campaignRef: prepared.campaignRef, account: bearer() } : null;
+        },
+        async ({ id, campaignRef }) => {
+            try {
+                const { invoke } = await import("@tauri-apps/api/core");
+                const evidence = await invoke<AgentImproveEvidence | null>(
+                    "latest_agent_improve_evidence", { agentId: id, campaignRef },
+                );
+                return { agentId: id, campaignRef, evidence };
+            } catch (error) {
+                return { agentId: id, campaignRef, error: String(error) };
+            }
+        },
+    );
+    const improveEvidenceFor = (id: ArchetypeId) => {
+        const prepared = preparedImproveFor(id);
+        if (!prepared) return null;
+        const local = evaluatedImproveCampaign();
+        if (local?.agentId === id && local.account === bearer()
+            && local.campaignRef === prepared.campaignRef) return local.evidence;
+        const retained = latestImproveEvidence();
+        return retained?.agentId === id && retained.campaignRef === prepared.campaignRef
+            && "evidence" in retained ? retained.evidence : null;
+    };
+    const improveEvidenceErrorFor = (id: ArchetypeId) => {
+        const retained = latestImproveEvidence();
         return retained?.agentId === id && "error" in retained ? retained.error : undefined;
     };
     let agentSettingsOpenSequence = 0;
@@ -1798,6 +1846,57 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         setDraft(openPrompt);
         workbenchShell.openPane("chat", { chatSelected: true, fileSelected: false });
         queueMicrotask(() => composerEl?.focus());
+    }
+
+    async function evaluateAgentImprove(id: ArchetypeId) {
+        const prepared = preparedImproveFor(id);
+        const chat = selected();
+        if (!prepared || !chat || agentSettings()?.id !== id || !isTauri()
+            || homeState()?.kind !== "direct") {
+            throw new Error("Open this Agent's desktop Workshop and edit chat first.");
+        }
+        if (draft().trim()) {
+            throw new Error("Send or clear the edit-chat draft before evaluating its candidate.");
+        }
+        const { invoke } = await import("@tauri-apps/api/core");
+        const result = await invoke<{ reviewer: AgentImproveEvidence }>(
+            "evaluate_agent_improve",
+            { agentId: id, editChatId: chat, campaignRef: prepared.campaignRef },
+        );
+        setEvaluatedImproveCampaign({
+            agentId: id, account: bearer(), campaignRef: prepared.campaignRef,
+            evidence: result.reviewer,
+        });
+    }
+
+    function placeOpenImproveFeedback(id: ArchetypeId) {
+        const prepared = preparedImproveFor(id);
+        const review = improveEvidenceFor(id);
+        if (!prepared || !review || agentSettings()?.id !== id || !selected()) {
+            throw new Error("Open this Agent's edit chat and reviewer evidence first.");
+        }
+        if (draft().trim()) throw new Error("Send or clear the current edit-chat draft first.");
+        const source = JSON.parse(prepared.openSource) as { scenarios?: Array<{ id?: string }> };
+        const feedback = {
+            open_scenario_ids: (source.scenarios ?? []).map((scenario) => scenario.id),
+            open_verdict: review.card.open_verdict,
+        };
+        setDraft("Revise this Agent's authored files using only the open evaluation feedback below. " +
+            "Do not infer hidden cases or claim held-out success. Leave the revised candidate for another comparison.\n\n" +
+            `Open feedback:\n\`\`\`json\n${JSON.stringify(feedback, null, 2)}\n\`\`\``);
+        workbenchShell.openPane("chat", { chatSelected: true, fileSelected: false });
+        queueMicrotask(() => composerEl?.focus());
+    }
+
+    async function adoptAgentImprove(id: ArchetypeId, evidenceId: string) {
+        if (!isTauri() || homeState()?.kind !== "direct" || agentSettings()?.id !== id) {
+            throw new Error("Open this Agent's desktop Workshop first.");
+        }
+        const { invoke } = await import("@tauri-apps/api/core");
+        const changed = await invoke<string[]>("adopt_agent_improve", { agentId: id, evidenceId });
+        bumpNav();
+        void Promise.all([refetchDiff(), refetchMerge(), refetchChatInfo()]);
+        return changed;
     }
 
     // Opening a Panel agent is one movement across the panes (navigation.md,
@@ -4065,6 +4164,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 preparedImproveRef={preparedImproveFor(a.id)?.campaignRef}
                                 onUsePreparedImprove={() => placePreparedImproveCases(a.id)}
                                 improveRecoveryError={improveRecoveryErrorFor(a.id)}
+                                onEvaluateImprove={isTauri() && homeState()?.kind === "direct" && preparedImproveFor(a.id)
+                                    ? () => evaluateAgentImprove(a.id) : undefined}
+                                improveEvidence={improveEvidenceFor(a.id)}
+                                improveEvidenceError={improveEvidenceErrorFor(a.id)}
+                                onUseOpenFeedback={improveEvidenceFor(a.id)
+                                    ? () => placeOpenImproveFeedback(a.id) : undefined}
+                                onAdoptImprove={isTauri() && homeState()?.kind === "direct"
+                                    ? (evidenceId) => adoptAgentImprove(a.id, evidenceId) : undefined}
                             />}
                         </Show>
                     }>

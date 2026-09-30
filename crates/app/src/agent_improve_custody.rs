@@ -48,7 +48,7 @@ pub fn latest_agent_improve_pool_from_desktop(
     guard.latest_agent_improve_pool_for_source_owner(agent_id, actor.as_deref())
 }
 
-fn desktop_improve_bearer(wb: &SharedWorkbench) -> Result<Option<String>, String> {
+pub(crate) fn desktop_improve_bearer(wb: &SharedWorkbench) -> Result<Option<String>, String> {
     let bearer = crate::desktop_session::home_session(wb);
     if bearer.is_none() && !crate::account_signin::local_operator_selected(wb) {
         return Err("Select an admitted Home account or the local operator".to_owned());
@@ -56,7 +56,10 @@ fn desktop_improve_bearer(wb: &SharedWorkbench) -> Result<Option<String>, String
     Ok(bearer)
 }
 
-fn desktop_improve_actor(wb: &Workbench, bearer: Option<&str>) -> Result<Option<String>, String> {
+pub(crate) fn desktop_improve_actor(
+    wb: &Workbench,
+    bearer: Option<&str>,
+) -> Result<Option<String>, String> {
     bearer
         .map(|token| {
             wb.authenticate_bearer(token)

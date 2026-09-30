@@ -5785,6 +5785,46 @@
         "file": "crates/app/src/agent_improve_evidence.rs"
       },
       "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeImprovePrepared::prepare",
+        "capability": "current_main_cut",
+        "count": 2,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/agent_improve_runtime.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeImprovePrepared::run",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "guard . targets . get (& self . target_id) . ok_or (\"Agent improve authoring target is unavailable\") ? . current_main_cut ()",
+        "file": "crates/app/src/agent_improve_runtime.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeImprovePrepared::run",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/agent_improve_runtime.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeImprovePrepared::run",
+        "capability": "open_at",
+        "count": 1,
+        "expression": "Instance :: open_at (& self . target_root)",
+        "file": "crates/app/src/agent_improve_runtime.rs"
+      },
+      "profile": "authoring"
     }
   ]
 }

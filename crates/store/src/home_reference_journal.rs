@@ -431,12 +431,19 @@ impl Store {
                 "terminally refused reference operation cannot complete",
             ));
         }
-        if before.completed_epoch.is_some() {
-            return Ok(ReferenceCompletion::Completed(Box::new(before)));
-        }
         let evidence = verify(&before).map_err(JournalError::Verification)?;
         required(&evidence.evidence_ref)?;
         required(&evidence.witness_digest)?;
+        if before.completed_epoch.is_some() {
+            if before.evidence_ref.as_deref() != Some(&evidence.evidence_ref)
+                || before.witness_digest.as_deref() != Some(&evidence.witness_digest)
+            {
+                return Err(JournalError::Conflict(
+                    "completed reference operation differs from current target evidence",
+                ));
+            }
+            return Ok(ReferenceCompletion::Completed(Box::new(before)));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -514,11 +521,8 @@ impl Store {
                 "terminally refused reference operation cannot revalidate",
             ));
         }
-        if before.completed_epoch.is_some() {
-            return Ok(ReferenceCompletion::Completed(Box::new(before)));
-        }
         let (_, checked_epoch, _) = state(&self.conn)?;
-        if checked_epoch == before.registered_epoch {
+        if before.completed_epoch.is_none() && checked_epoch == before.registered_epoch {
             return Err(JournalError::Conflict(
                 "reference operation has not crossed a seal",
             ));
@@ -527,6 +531,18 @@ impl Store {
         required(&checked.evidence.evidence_ref)?;
         required(&checked.evidence.witness_digest)?;
         required(&checked.current_basis_digest)?;
+        if before.completed_epoch.is_some() {
+            if before.evidence_ref.as_deref() != Some(&checked.evidence.evidence_ref)
+                || before.witness_digest.as_deref() != Some(&checked.evidence.witness_digest)
+            {
+                return Err(JournalError::Conflict(
+                    "completed revalidated reference operation differs from current target evidence",
+                ));
+            }
+            // The recorded epoch and basis remain historical facts. A later
+            // basis belongs to the use door, not a rewrite of this completion.
+            return Ok(ReferenceCompletion::Completed(Box::new(before)));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1220,11 +1236,31 @@ mod tests {
         assert!(matches!(completed, ReferenceCompletion::Completed(_)));
         assert_eq!(
             store
-                .complete_reference_operation("home:one", "one", |_| panic!(
-                    "retry must not rewrite evidence"
-                ))
+                .complete_reference_operation("home:one", "one", evidence)
                 .unwrap(),
             completed
+        );
+        assert!(matches!(
+            store.complete_reference_operation("home:one", "one", |_| {
+                Err("target operation or witness is missing".into())
+            }),
+            Err(JournalError::Verification(_))
+        ));
+        assert!(matches!(
+            store.complete_reference_operation("home:one", "one", |_| {
+                Ok(ReferenceEvidence {
+                    evidence_ref: "operation:one".into(),
+                    witness_digest: "witness:changed".into(),
+                })
+            }),
+            Err(JournalError::Conflict(_))
+        ));
+        assert_eq!(
+            store.reference_operation("one").unwrap(),
+            match completed {
+                ReferenceCompletion::Completed(operation) => Some(*operation),
+                ReferenceCompletion::NeedsRevalidation { .. } => unreachable!(),
+            }
         );
         let changed = NewReferenceOperation {
             basis_digest: "changed",
@@ -1433,9 +1469,50 @@ mod tests {
             operation.revalidated_basis_digest.as_deref(),
             Some("source+lock+compiler+policy:two")
         );
+        assert_eq!(
+            store
+                .complete_revalidated_reference_operation("home:one", "one", |old, epoch| {
+                    assert_eq!(epoch, 1);
+                    Ok(RevalidatedReferenceEvidence {
+                        evidence: evidence(old)?,
+                        current_basis_digest: "source+lock+compiler+policy:two".into(),
+                    })
+                })
+                .unwrap(),
+            ReferenceCompletion::Completed(operation.clone()),
+        );
+        assert!(matches!(
+            store.complete_revalidated_reference_operation("home:one", "one", |_, _| {
+                Err("target operation or witness is missing".into())
+            }),
+            Err(JournalError::Verification(_))
+        ));
         let next = store
             .seal_reference_epoch("home:one", "registry:2", "policy:2", "tree:2")
             .unwrap();
+        assert_eq!(
+            store
+                .complete_revalidated_reference_operation("home:one", "one", |old, epoch| {
+                    assert_eq!(epoch, 2);
+                    Ok(RevalidatedReferenceEvidence {
+                        evidence: evidence(old)?,
+                        current_basis_digest: "source+lock+compiler+policy:changed".into(),
+                    })
+                })
+                .unwrap(),
+            ReferenceCompletion::Completed(operation.clone()),
+        );
+        assert!(matches!(
+            store.complete_revalidated_reference_operation("home:one", "one", |old, _| {
+                let mut changed = evidence(old)?;
+                changed.witness_digest = "witness:changed".into();
+                Ok(RevalidatedReferenceEvidence {
+                    evidence: changed,
+                    current_basis_digest: "source+lock+compiler+policy:changed".into(),
+                })
+            }),
+            Err(JournalError::Conflict(_))
+        ));
         assert_eq!(next.operations, vec![*operation]);
     }
 

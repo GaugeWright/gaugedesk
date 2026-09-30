@@ -408,12 +408,12 @@ export function FacetBrowser(props: {
     // Current-first rank for the flat `chats` lens, derived from the same server
     // projection Recent renders; chats absent from it sink to the end in tree order.
     const recentRank = createMemo(() => new Map((tree()?.recent ?? []).map((c, i) => [c.id, i] as const)));
-    // Collapsed tree groups (project / archetype ids). Click a node's ▾/▸ icon to
-    // fold its children; local UI state, like facet/selection.
-    const [collapsed, setCollapsed] = createSignal<Set<string>>(new Set());
-    const isCollapsed = (id: string) => collapsed().has(id);
+    // Tree groups start collapsed, including groups arriving after the first load.
+    // Explicit expansions are local UI state, like facet/selection.
+    const [expanded, setExpanded] = createSignal<Set<string>>(new Set());
+    const isCollapsed = (id: string) => !expanded().has(id);
     const toggleCollapse = (id: string) =>
-        setCollapsed((s) => {
+        setExpanded((s) => {
             const next = new Set(s);
             if (next.has(id)) next.delete(id);
             else next.add(id);

@@ -1142,6 +1142,93 @@ mod tests {
     }
 
     #[test]
+    fn both_shadow_arms_open_in_the_native_host_with_one_signed_home_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let baseline_repo = root.path().join("baseline-repo");
+        let candidate_repo = root.path().join("candidate-repo");
+        authored_repo(&baseline_repo, "baseline instructions");
+        authored_repo(&candidate_repo, "candidate instructions");
+        let scenario = root.path().join("scenario");
+        std::fs::create_dir(&scenario).unwrap();
+        std::fs::write(scenario.join("task.txt"), "same task").unwrap();
+        let mut template = shadow_spec(root.path(), "improve-template", "template instructions");
+        template.sandbox = template
+            .sandbox
+            .filter_egress(vec!["api.openai.com".to_owned()]);
+        let credential_ref = "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned();
+        template.credential_ref = Some(credential_ref.clone());
+        template.credential_capability = Some(crate::account::resolved_credential_capability(
+            credential_ref.clone(),
+            "sk-test".to_owned(),
+            None,
+        ));
+        let mut prepared =
+            prepare_native_shadow_pair(&template, &baseline_repo, &candidate_repo, &scenario)
+                .unwrap();
+        let baseline_package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(
+            prepared.baseline_spec().package_root.as_deref().unwrap(),
+        )
+        .unwrap();
+        let descriptor =
+            gaugedesk_whip_runtime::native_provider_descriptor("openai", Some("test-model"), None)
+                .unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        let actor = guard.authority().as_str().to_owned();
+        let compiled = guard
+            .compile_whipple_policy(crate::policy_compiler::PolicyCompilationInput {
+                chat_id: template.chat_id.clone(),
+                project_id: None,
+                actor,
+                actor_attributes: gaugedesk_core::abac::AuthorityAttributes::default(),
+                org_policy: gaugedesk_core::abac::Policy::default(),
+                turn_purpose: None,
+                package_capabilities: baseline_package.capabilities().iter().cloned().collect(),
+                provider: "openai".to_owned(),
+                model: descriptor.model.clone(),
+                base_url: descriptor.base_url.clone(),
+                credential_ref,
+                private_model_broker: None,
+                wire: descriptor.wire.to_owned(),
+                placement_kind: "local".to_owned(),
+                command_network: true,
+                resources: Vec::new(),
+                task_tracker: None,
+                target_bindings: Vec::new(),
+                advancement_scopes: Vec::new(),
+            })
+            .unwrap();
+        for spec in [&mut prepared.baseline, &mut prepared.candidate] {
+            spec.policy_epoch = Some(compiled.epoch);
+            spec.signed_policy_envelope = Some(compiled.signed_envelope.clone());
+            spec.provider_binding_ref = Some(compiled.provider_binding_ref.clone());
+            spec.credential_ref = Some(compiled.credential_ref.clone());
+            spec.placement_ceiling_ref = Some(compiled.placement_ceiling_ref.clone());
+        }
+        let factory = guard.whip_harness_factory().unwrap();
+        drop(guard);
+        let isolated = factory
+            .isolated_native_shadow(root.path().join("shadow-runtimes"))
+            .unwrap();
+        validate_pair(
+            &isolated,
+            prepared.baseline_spec(),
+            prepared.candidate_spec(),
+        )
+        .unwrap();
+        isolated
+            .create(prepared.baseline_spec())
+            .unwrap()
+            .shutdown()
+            .unwrap();
+        isolated
+            .create(prepared.candidate_spec())
+            .unwrap()
+            .shutdown()
+            .unwrap();
+    }
+
+    #[test]
     fn evaluated_pair_adopts_only_its_exact_candidate_definition() {
         let root = tempfile::tempdir().unwrap();
         let workbench = crate::open_workbench(root.path()).unwrap();

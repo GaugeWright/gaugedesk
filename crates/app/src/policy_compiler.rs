@@ -14,7 +14,7 @@ use gaugedesk_core::abac::{
 use gaugedesk_core::resource::ResourceRecord;
 use gaugedesk_whip_runtime::{
     sign_policy_envelope, HostGovernancePolicy, ProviderBindingPolicy, ResourcePolicy,
-    WhipplePlacementPolicy, TARGET_MANIFEST_RESOURCE,
+    WhipplePlacementPolicy, QUESTION_ASK_CAPABILITY, QUESTION_RESOURCE, TARGET_MANIFEST_RESOURCE,
 };
 
 use crate::library::RecordOp;
@@ -271,6 +271,11 @@ fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy
         ("owned".to_owned(), "provider:owned".to_owned()),
         (PLACEMENT_HANDLE.to_owned(), placement_address),
     ]);
+    if input.package_capabilities.contains(QUESTION_ASK_CAPABILITY) {
+        let address = format!("question:chat:{}", input.chat_id);
+        policy_resources.insert(address.clone(), labeled(true));
+        policy_bindings.insert(QUESTION_RESOURCE.to_owned(), address);
+    }
     if let Some(tracker) = &input.task_tracker {
         if !input.package_capabilities.contains("tracker.file") {
             return Err("task tracker requires the package tracker.file capability".to_owned());
@@ -647,6 +652,24 @@ mod tests {
             target_bindings: Vec::new(),
             advancement_scopes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn question_resource_is_governed_only_for_an_admitted_asking_agent() {
+        let mut turn = input();
+        let without = compile_policy(&turn).expect("policy without asking");
+        assert!(!without.bindings.contains_key(QUESTION_RESOURCE));
+
+        turn.package_capabilities
+            .insert(QUESTION_ASK_CAPABILITY.to_owned());
+        let with = compile_policy(&turn).expect("policy with asking");
+        let address = with
+            .bindings
+            .get(QUESTION_RESOURCE)
+            .expect("governed question binding");
+        let resource = with.resources.get(address).expect("question label");
+        assert!(resource.principal);
+        assert_eq!(resource, with.resources.get("human:operator-1").unwrap());
     }
 
     #[test]

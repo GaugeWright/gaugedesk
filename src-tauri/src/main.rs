@@ -104,6 +104,48 @@ async fn latest_agent_improve_pool(
     .map_err(|_| "Agent improve pool read did not complete".to_owned())?
 }
 
+#[tauri::command]
+async fn evaluate_agent_improve(
+    agent_id: String,
+    edit_chat_id: String,
+    campaign_ref: String,
+) -> Result<gaugedesk_app::NativeImproveResult, String> {
+    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        gaugedesk_app::evaluate_agent_improve_from_desktop(
+            &wb, &agent_id, &edit_chat_id, &campaign_ref,
+        )
+    })
+    .await
+    .map_err(|_| "Agent improve evaluation did not complete".to_owned())?
+}
+
+#[tauri::command]
+async fn latest_agent_improve_evidence(
+    agent_id: String,
+    campaign_ref: String,
+) -> Result<Option<gaugedesk_app::agent_improve_evidence::AgentImproveEvidenceRecord>, String> {
+    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        gaugedesk_app::latest_agent_improve_evidence_from_desktop(&wb, &agent_id, &campaign_ref)
+    })
+    .await
+    .map_err(|_| "Agent improve reviewer evidence read did not complete".to_owned())?
+}
+
+#[tauri::command]
+async fn adopt_agent_improve(
+    agent_id: String,
+    evidence_id: String,
+) -> Result<Vec<String>, String> {
+    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        gaugedesk_app::adopt_agent_improve_from_desktop(&wb, &agent_id, &evidence_id)
+    })
+    .await
+    .map_err(|_| "Agent improvement adoption did not complete".to_owned())?
+}
+
 fn main() {
     // Must run before Tauri builds the webview: WebKitGTK reads the variable when
     // its web process starts, and nothing re-reads it afterwards.
@@ -122,7 +164,10 @@ fn main() {
             open_external,
             home_session,
             start_agent_improve_pool,
-            latest_agent_improve_pool
+            latest_agent_improve_pool,
+            evaluate_agent_improve,
+            latest_agent_improve_evidence,
+            adopt_agent_improve
         ])
         // LOGIN-7: the system-browser opener behind `open_external`. Sign-in and
         // "manage in the Hub" leave through it; the webview itself cannot open

@@ -197,6 +197,35 @@ impl Workbench {
         Err("Agent improve evidence record is unavailable".to_owned())
     }
 
+    /// Recover the newest review card for the currently selected source. The
+    /// same source-owner check as pool intake applies before any aggregate
+    /// held-out readings reach the desktop operator surface.
+    pub fn latest_agent_improve_evidence_for_source_owner(
+        &self,
+        agent_id: &str,
+        campaign_ref: &str,
+        actor: Option<&str>,
+    ) -> Result<Option<AgentImproveEvidenceRecord>, String> {
+        self.verify_agent_improve_source_owner(agent_id, actor)?;
+        self.load_agent_improve_campaign(agent_id, campaign_ref)?;
+        let target_id = self.improve_authoring_target(agent_id)?;
+        let rows = self
+            .store
+            .records(LIBRARY_SCOPE, RECORD_KIND)
+            .map_err(|_| "Agent improve evidence records are unavailable")?;
+        for row in rows.into_iter().rev() {
+            let record: AgentImproveEvidenceRecord = serde_json::from_str(&row)
+                .map_err(|_| "Agent improve evidence record is invalid")?;
+            if record.schema != RECORD_SCHEMA {
+                return Err("Agent improve evidence record schema is unsupported".to_owned());
+            }
+            if record.target_id == target_id && record.card.campaign_ref == campaign_ref {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
     fn selected_agent_improve_candidate(
         &self,
         target_id: &str,

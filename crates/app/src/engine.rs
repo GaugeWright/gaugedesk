@@ -590,7 +590,7 @@ impl EgressGate for MembraneGate {
 
 /// Tools known to leave the workspace (network). The membrane treats everything
 /// else as an in-workspace effect.
-fn default_external_tools() -> BTreeSet<String> {
+pub(crate) fn default_external_tools() -> BTreeSet<String> {
     ["fetch", "web", "curl", "http", "download"]
         .iter()
         .map(|s| s.to_string())
@@ -658,7 +658,7 @@ pub(crate) fn resolve_turn_model(
         .or(config_model.filter(|s| !s.is_empty()))
 }
 
-fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
+pub(crate) fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
     let hosts: &[&str] = match provider.unwrap_or("openai-codex") {
         // Managed-Home providers egress only to their gateway endpoint;
         // provider-token details live in the private managed-service host.
@@ -692,7 +692,7 @@ fn model_endpoint_hosts(provider: Option<&str>) -> Vec<String> {
 /// filter directly without depending on subprocess/netns routing
 /// capability. Isolation (`Deny`) and the conscious unfiltered opt-in (`Allow`)
 /// remain GaugeDesk product-policy decisions.
-fn egress_posture(
+pub(crate) fn egress_posture(
     project_isolated: bool,
     forced_unfiltered: bool,
 ) -> gaugedesk_harness::sandbox::Network {
@@ -706,7 +706,10 @@ fn egress_posture(
     }
 }
 
-fn method_surface_readonly_roots(worktree: &Path, mode: ChatMode) -> Vec<std::path::PathBuf> {
+pub(crate) fn method_surface_readonly_roots(
+    worktree: &Path,
+    mode: ChatMode,
+) -> Vec<std::path::PathBuf> {
     let package_roots = match mode {
         ChatMode::Use => definition::READONLY_ROOTS,
         ChatMode::Edit => definition::EDIT_READONLY_ROOTS,
@@ -1471,7 +1474,7 @@ pub fn run_task_remote(
 /// The refusal POLICY — whether a turn runs — stays here; the adapter only reports
 /// its own state. Returns an **actionable** error when nothing resolves, so a real
 /// run refuses up front instead of letting the runtime fail opaquely on a missing key.
-fn llm_credential_status(
+pub(crate) fn llm_credential_status(
     provider: &str,
     credential_capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
     factory: &dyn HarnessFactory,

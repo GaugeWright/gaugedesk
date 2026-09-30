@@ -31,6 +31,11 @@ pub use agent_improve_custody::{
     AgentImprovePoolStart,
 };
 pub mod agent_improve_evidence;
+mod agent_improve_runtime;
+pub use agent_improve_runtime::{
+    adopt_agent_improve_from_desktop, evaluate_agent_improve_from_desktop,
+    latest_agent_improve_evidence_from_desktop, NativeImproveResult,
+};
 pub mod agent_question;
 pub mod agent_release;
 pub mod app_support;
