@@ -29,6 +29,7 @@ use whipplescript_kernel::coerce_native::{
 };
 use whipplescript_kernel::effect_config::EffectConfig;
 use whipplescript_kernel::effect_handlers::{run_file_effect_generic, run_queue_effect_generic};
+use whipplescript_kernel::import_coverage::{CheckedImportBasis, NO_LOCK_DIGEST};
 use whipplescript_kernel::instance_machine::{
     EffectStep, InstanceDriver, InstanceOutcome, InstanceStepMachine,
 };
@@ -41,7 +42,8 @@ use whipplescript_kernel::{CoerceExecution, ProgramVersionInput, RuntimeKernel};
 use whipplescript_parser::IrProgram;
 use whipplescript_store::native_stores::NativeStores;
 use whipplescript_store::{
-    stable_hash_hex, ClaimableEffect, InstanceView, RunStart, RuntimeStore, StoreError,
+    stable_hash_hex, ClaimableEffect, InstanceView, ProgramVersionRecord, RunStart, RuntimeStore,
+    StoreError,
 };
 
 #[path = "gate_files.rs"]
@@ -400,6 +402,116 @@ pub fn run_gate<T: GateTransport>(
     state_dir: &Path,
     transport: &T,
 ) -> Result<Disposition, GateRunError> {
+    run_gate_with_use_check(
+        program,
+        coerce,
+        item,
+        store_root,
+        state_dir,
+        transport,
+        |_| Ok(()),
+    )
+}
+
+/// The exact version selected for a gate use. A newly written version carries
+/// its checked import witness; a retained version must be resolved through its
+/// historical Home admission before the caller permits another use.
+pub enum GateVersionUse<'a> {
+    NewlyAdmitted {
+        operation_id: &'a str,
+        program_id: &'a str,
+        version_id: &'a str,
+        witness_digest: &'a str,
+    },
+    Retained {
+        version_id: &'a str,
+    },
+}
+
+/// The exact inputs available before a new gate admission writes its program
+/// content, version, or import operation. The Home includes these and its own
+/// current policy/structural premises in the registration basis.
+pub struct GateNewAdmissionBasis<'a> {
+    pub program_name: &'a str,
+    pub source_digest: &'a str,
+    pub ir_digest: &'a str,
+    pub compiler_artifact_digest: &'a str,
+    pub lock_digest: &'a str,
+    pub envelope_digest: &'a str,
+}
+
+/// Call `check_use` after version selection and before instance creation,
+/// start events, arrivals, or effects. The Home journal caller uses this seam
+/// to complete an exact pointer and fence use of pending target evidence.
+pub fn run_gate_with_use_check<
+    T: GateTransport,
+    F: FnOnce(GateVersionUse<'_>) -> Result<(), GateRunError>,
+>(
+    program: &GateProgram,
+    coerce: &GateCoercionConfig,
+    item: &str,
+    store_root: &Path,
+    state_dir: &Path,
+    transport: &T,
+    check_use: F,
+) -> Result<Disposition, GateRunError> {
+    run_gate_inner(
+        program,
+        coerce,
+        item,
+        store_root,
+        state_dir,
+        transport,
+        |_| Ok(None),
+        check_use,
+    )
+}
+
+/// Register an operation ID at the Home before a new gate writes target
+/// evidence, then require its exact Home pointer before use. A retained item
+/// skips registration and presents its historical version to `check_use`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_gate_with_home_admission<
+    T: GateTransport,
+    P: FnOnce(GateNewAdmissionBasis<'_>) -> Result<String, GateRunError>,
+    F: FnOnce(GateVersionUse<'_>) -> Result<(), GateRunError>,
+>(
+    program: &GateProgram,
+    coerce: &GateCoercionConfig,
+    item: &str,
+    store_root: &Path,
+    state_dir: &Path,
+    transport: &T,
+    register: P,
+    check_use: F,
+) -> Result<Disposition, GateRunError> {
+    run_gate_inner(
+        program,
+        coerce,
+        item,
+        store_root,
+        state_dir,
+        transport,
+        |basis| register(basis).map(Some),
+        check_use,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gate_inner<
+    T: GateTransport,
+    P: FnOnce(GateNewAdmissionBasis<'_>) -> Result<Option<String>, GateRunError>,
+    F: FnOnce(GateVersionUse<'_>) -> Result<(), GateRunError>,
+>(
+    program: &GateProgram,
+    coerce: &GateCoercionConfig,
+    item: &str,
+    store_root: &Path,
+    state_dir: &Path,
+    transport: &T,
+    register: P,
+    check_use: F,
+) -> Result<Disposition, GateRunError> {
     std::fs::create_dir_all(state_dir)
         .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
     let store = NativeStores::open(
@@ -411,6 +523,9 @@ pub fn run_gate<T: GateTransport>(
     let mut kernel = RuntimeKernel::new(store);
     let (instance_id, retained) = if let Some(instance) = instance_for_item(&kernel, item)? {
         let retained = retained_program(&kernel, &instance, program)?;
+        check_use(GateVersionUse::Retained {
+            version_id: &instance.version_id,
+        })?;
         (instance.instance_id, retained)
     } else {
         // The version's identity is the snapshot with its source offsets
@@ -419,22 +534,64 @@ pub fn run_gate<T: GateTransport>(
         // version, and a snapshot the kernel would not reproduce is refused.
         let snapshot =
             whipplescript_parser::snapshot::identity_projection(&program.ir.to_snapshot());
-        let source_hash = kernel.store().put_content(&program.source)?;
         let ir_hash = stable_hash_hex(&snapshot);
-        let version = kernel.create_program_version_for_program(
-            ProgramVersionInput {
-                // The kernel refuses a version whose name is not the workflow
-                // it captures, so the gate is recorded under the name its
-                // author gave it. What makes an instance a gate's is the
-                // store it lives in: `state_dir` holds one program.
-                program_name: &program.ir.workflow,
-                source_hash: &source_hash,
-                ir_hash: &ir_hash,
-                compiler_version: concat!("gaugedesk-whip-runtime/", env!("CARGO_PKG_VERSION")),
-                ir_snapshot: Some(&snapshot),
-            },
-            &program.ir,
-        )?;
+        let source_digest = whipplescript_kernel::exec_http::sha256_hex(program.source.as_bytes());
+        let compiler_digest = whipplescript::host_runtime::native_compiler_artifact_digest()
+            .map_err(GateRunError::NoDisposition)?;
+        let envelope_digest =
+            whipplescript_kernel::exec_http::sha256_hex(program.envelope.as_bytes());
+        let home_operation_id = register(GateNewAdmissionBasis {
+            program_name: &program.ir.workflow,
+            source_digest: &source_digest,
+            ir_digest: &ir_hash,
+            compiler_artifact_digest: &compiler_digest,
+            lock_digest: NO_LOCK_DIGEST,
+            envelope_digest: &envelope_digest,
+        })?;
+        if let Some(operation_id) = &home_operation_id {
+            whipplescript_store::program_imports::validate_operation_id(operation_id)?;
+        }
+        let source_hash = kernel.store().put_content(&program.source)?;
+        // This compiler has no local package resolver. Any non-std import in
+        // the checked IR must refuse rather than create an unwitnessed gate.
+        let input = ProgramVersionInput {
+            // The kernel refuses a version whose name is not the workflow
+            // it captures, so the gate is recorded under the name its
+            // author gave it. What makes an instance a gate's is the
+            // store it lives in: `state_dir` holds one program.
+            program_name: &program.ir.workflow,
+            source_hash: &source_hash,
+            ir_hash: &ir_hash,
+            compiler_version: concat!("gaugedesk-whip-runtime/", env!("CARGO_PKG_VERSION")),
+            ir_snapshot: Some(&snapshot),
+        };
+        let basis = CheckedImportBasis {
+            program_source_digest: &source_digest,
+            version_source_digest: None,
+            lock_digest: NO_LOCK_DIGEST,
+            compiler_artifact_digest: &compiler_digest,
+            packages: &[],
+        };
+        let admission = if let Some(operation_id) = home_operation_id {
+            kernel.create_program_version_for_program_with_imports_at_id(
+                input,
+                &program.ir,
+                &basis,
+                &operation_id,
+            )?
+        } else {
+            kernel.create_program_version_for_program_with_imports(input, &program.ir, &basis)?
+        };
+        check_use(GateVersionUse::NewlyAdmitted {
+            operation_id: &admission.operation_id,
+            program_id: &admission.program_id,
+            version_id: &admission.version_id,
+            witness_digest: &admission.witness_digest,
+        })?;
+        let version = ProgramVersionRecord {
+            program_id: admission.program_id,
+            version_id: admission.version_id,
+        };
         let mut existing = gate_instances(&kernel)?
             .into_iter()
             .filter(|instance| instance.version_id == version.version_id);
@@ -728,6 +885,33 @@ pub fn deliver_verdict<T: GateTransport>(
     state_dir: &Path,
     transport: &T,
 ) -> Result<Option<Disposition>, GateRunError> {
+    deliver_verdict_with_use_check(
+        program,
+        coerce,
+        item,
+        verdict,
+        store_root,
+        state_dir,
+        transport,
+        |_| Ok(()),
+    )
+}
+
+/// Check retained Home admission before a reviewer claim enters the queue.
+#[allow(clippy::too_many_arguments)] // The existing review call plus one Home use check.
+pub fn deliver_verdict_with_use_check<
+    T: GateTransport,
+    F: FnOnce(GateVersionUse<'_>) -> Result<(), GateRunError>,
+>(
+    program: &GateProgram,
+    coerce: &GateCoercionConfig,
+    item: &str,
+    verdict: Disposition,
+    store_root: &Path,
+    state_dir: &Path,
+    transport: &T,
+    check_use: F,
+) -> Result<Option<Disposition>, GateRunError> {
     let store = NativeStores::open(
         state_dir.join("runtime.sqlite"),
         state_dir.join("coord.sqlite"),
@@ -745,6 +929,9 @@ pub fn deliver_verdict<T: GateTransport>(
     // Verify/re-admit before filing an answer. Missing legacy evidence may
     // not enqueue a verdict that some replacement workflow could consume.
     let retained = retained_program(&kernel, &instance, program)?;
+    check_use(GateVersionUse::Retained {
+        version_id: &instance.version_id,
+    })?;
 
     // The reviewer's answer is the only vouched input. The program matches its
     // request to Pending and emits public correlation in the same firing as the

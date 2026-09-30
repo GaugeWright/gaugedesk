@@ -27,6 +27,7 @@ import {
 } from "./transcript-filter";
 import { friendlyToolVerb, toolTargetOpensViewer } from "./tool-verb";
 import { isBoilerplateResult, partitionedToolTarget, toolDetail, toolHeaderTarget } from "./tool-detail";
+import { targetNameForRoot, type TargetName } from "./target-names";
 import type { ChoiceCard, ChoiceSelection } from "@gaugewright/control-plane-client";
 import { ChoiceCardView } from "./ChoiceCardView";
 
@@ -104,6 +105,8 @@ export function friendlyLine(kind: string, text: string): string {
 export function ToolLineView(props: {
     line: TranscriptLine;
     onOpen: (path: string) => void;
+    /** The chat's targets, to name a target instead of its encoded partition. */
+    targets?: readonly TargetName[];
     /** Render expanded on first paint (the tool category's "expanded by default"
      *  pref). The reader can still collapse it with the caret. */
     defaultOpen?: boolean;
@@ -151,8 +154,8 @@ export function ToolLineView(props: {
                                     props.onOpen(target());
                                 }}
                             >
-                                <Show when={partition()?.targetRoot}>
-                                    {(root) => <span class="tool-target-root">Target {root()} · </span>}
+                                <Show when={partition()?.targetRoot ? targetNameForRoot(partition()!.targetRoot!, props.targets ?? []) : null}>
+                                    {(name) => <span class="tool-target-root">Target {name()} · </span>}
                                 </Show>
                                 {partition()?.relativePath ?? target()}
                             </button>
@@ -198,6 +201,8 @@ function LineView(props: {
     line: TranscriptLine;
     agentName: string;
     onOpen: (path: string) => void;
+    /** The chat's targets, to name a target instead of its encoded partition. */
+    targets?: readonly TargetName[];
     prefs: FilterPrefs;
     /** Fired by the action on a `code: "no_credential"` error line — opens settings. */
     onResolveCredential?: () => void;
@@ -267,7 +272,7 @@ function LineView(props: {
                 </Show>
             }
         >
-            <ToolLineView line={props.line} onOpen={props.onOpen} defaultOpen={toolExpanded(props.line, props.prefs)} />
+            <ToolLineView line={props.line} onOpen={props.onOpen} targets={props.targets} defaultOpen={toolExpanded(props.line, props.prefs)} />
         </Show>
         }>
             <ChoiceCardView
@@ -295,6 +300,8 @@ function TurnView(props: {
     agentName: string;
     prefs: FilterPrefs;
     onOpen: (path: string) => void;
+    /** The chat's targets, to name a target instead of its encoded partition. */
+    targets?: readonly TargetName[];
     onResolveCredential?: () => void;
     onFork?: (entryId: number, origin?: string) => void;
     choiceCards?: readonly ChoiceCard[];
@@ -321,7 +328,7 @@ function TurnView(props: {
                             <LineView
                                 line={line}
                                 agentName={props.agentName}
-                                onOpen={props.onOpen}
+                                onOpen={props.onOpen} targets={props.targets}
                                 prefs={props.prefs}
                                 onResolveCredential={props.onResolveCredential}
                                 onFork={props.onFork}
@@ -346,6 +353,8 @@ export function TranscriptView(props: {
     /** Human-readable assistant name. Defaults to the generic "Agent" label. */
     agentName?: string;
     onOpen: (path: string) => void;
+    /** The chat's targets, to name a target instead of its encoded partition. */
+    targets?: readonly TargetName[];
     prefs?: FilterPrefs;
     fallback?: JSX.Element;
     /** Fired by the in-log action on a model-credential refusal (LLM-1) — opens settings. */
@@ -413,7 +422,7 @@ export function TranscriptView(props: {
                             lines={seg.lines}
                             agentName={agentName()}
                             prefs={prefs()}
-                            onOpen={props.onOpen}
+                            onOpen={props.onOpen} targets={props.targets}
                             onResolveCredential={props.onResolveCredential}
                             onFork={props.onFork}
                             choiceCards={props.choiceCards}
@@ -423,7 +432,7 @@ export function TranscriptView(props: {
                         <LineView
                             line={seg.line}
                             agentName={agentName()}
-                            onOpen={props.onOpen}
+                            onOpen={props.onOpen} targets={props.targets}
                             prefs={prefs()}
                             onResolveCredential={props.onResolveCredential}
                             onFork={props.onFork}

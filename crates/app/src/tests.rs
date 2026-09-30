@@ -1320,6 +1320,7 @@ async fn export_source_required_is_derived_from_the_resource_stakeholders() {
 async fn export_to_disk_is_gated_then_writes_bytes_and_records_egress() {
     let _fake_agent = fake_agent_env();
     let (dir, wb) = workbench();
+    let inspect = Arc::clone(&wb);
     let app = open_control_plane(wb);
     send(&app, "POST", "/chats", Some(r#"{"id":"d1"}"#)).await;
     // A turn produces the engagement's output (the fake agent writes a note).
@@ -1371,13 +1372,19 @@ async fn export_to_disk_is_gated_then_writes_bytes_and_records_egress() {
         b.contains("agent-note.txt"),
         "the deliverable file is reported: {b}"
     );
-    let exported_note = dest
-        .join("targets")
-        .join(crate::library::target_id_path_v1("inst-test").unwrap())
-        .join("agent-note.txt");
+    // DR-0248: a target leaves under the name the chat shows it by.
+    let name = inspect
+        .lock_unpoisoned()
+        .chat_target_name("d1", "inst-test");
+    assert!(!name.is_empty());
+    let exported_note = dest.join(&name).join("agent-note.txt");
     assert!(
         exported_note.exists(),
-        "the partitioned bytes actually landed on disk"
+        "the target's bytes landed under its name on disk"
+    );
+    assert!(
+        !dest.join("targets").exists(),
+        "no encoded partition leaves"
     );
     let (_, state) = send(
         &app,
@@ -6730,7 +6737,9 @@ async fn project_binds_an_agent_and_hosts_a_chat() {
         let manifest =
             std::fs::read_to_string(engagement.path().join(".gaugedesk-runtime/target-set.json"))
                 .unwrap();
-        assert!(manifest.contains(&target_id));
+        // DR-0248: the agent knows the target by its name, never its id.
+        assert!(!manifest.contains(&target_id), "{manifest}");
+        assert!(manifest.contains("client-site files"), "{manifest}");
         assert!(engagement.path().join("targets").is_dir());
     }
     let (_, body) = send(&app, "GET", "/workspace", None).await;
@@ -7554,4 +7563,274 @@ async fn cmp17_busy_under_steer_pressure() {
             .collect::<Vec<_>>()
             .join("\n"),
     );
+}
+
+/// DR-0248: a target is a folder named after it, and a rename is a change on
+/// the chat's line that reaches the project when the line reaches Main.
+#[tokio::test]
+async fn a_target_is_a_named_folder_and_a_rename_travels_on_the_chat_line() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = lean_workbench();
+    let inspect = wb.clone();
+    let app = open_control_plane(wb);
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("guide.md"), "guide\n").unwrap();
+
+    let (_, body) = send(&app, "POST", "/projects", Some(r#"{"name":"client/site"}"#)).await;
+    let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let pid = project["id"].as_str().unwrap().to_string();
+    let target_id = project["target_id"].as_str().unwrap().to_string();
+    let placement = project["placement"].as_str().unwrap().to_string();
+    let attach = |name: &str| {
+        serde_json::json!({
+            "name": name,
+            "kind": "external-folder",
+            "path": source.path(),
+            "path_scope": ["."],
+        })
+        .to_string()
+    };
+    // A proposed name that breaks the folder rules is made valid, and a
+    // name another target already holds is refused.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{pid}/targets"),
+        Some(&attach("CLIENT-SITE FILES")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a taken name: {body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{pid}/targets"),
+        Some(&attach("Docs")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "attached: {body}");
+
+    let (status, chat_body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{pid}/placements/{placement}/chats"),
+        Some(&format!(
+            r#"{{"title":"triage","target_id":"{target_id}"}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "chat: {chat_body}");
+    let chat: serde_json::Value = serde_json::from_str(&chat_body).unwrap();
+    let chat_id = chat["id"].as_str().unwrap().to_string();
+    let encoded = crate::library::target_id_path_v1(&target_id).unwrap();
+    let root = format!("targets/{encoded}");
+
+    {
+        let guard = inspect.lock_unpoisoned();
+        assert_eq!(
+            guard.library.work_targets[&target_id].name,
+            "client-site files"
+        );
+        assert_eq!(
+            guard.main_target_name(&pid, &target_id).as_deref(),
+            Some("client-site files")
+        );
+        let manifest = std::fs::read_to_string(
+            guard.engagements[&chat_id]
+                .path()
+                .join(".gaugedesk-runtime/target-set.json"),
+        )
+        .unwrap();
+        assert!(!manifest.contains(&target_id), "no stable id: {manifest}");
+        assert!(!manifest.contains(&encoded), "no encoded id: {manifest}");
+        assert!(
+            manifest.contains(r#""root": "client-site files""#),
+            "{manifest}"
+        );
+    }
+
+    let command = format!("/chats/{chat_id}/files/command");
+    let rename = |to: &str| {
+        serde_json::json!({ "action": "rename", "path": root, "to": format!("targets/{to}") })
+            .to_string()
+    };
+    for refused in ["a/b", ".hidden", "Docs", "docs"] {
+        let (status, body) = send(&app, "POST", &command, Some(&rename(refused))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}: {body}");
+    }
+    let (status, body) = send(&app, "POST", &command, Some(&rename("Site"))).await;
+    assert_eq!(status, StatusCode::OK, "rename: {body}");
+
+    // The chat sees the new name at once; the project does not yet.
+    let (_, workspace) = send(&app, "GET", "/workspace", None).await;
+    assert!(workspace.contains(r#""name":"Site""#), "{workspace}");
+    let (_, tree) = send(&app, "GET", &format!("/chats/{chat_id}/tree"), None).await;
+    assert!(!tree.contains(".gaugedesk-names"), "{tree}");
+    // The pending rename is in the chat's diff, for the client to show as one.
+    let (_, diff) = send(&app, "GET", &format!("/chats/{chat_id}/diff"), None).await;
+    assert!(
+        diff.contains(&format!("diff --git a/.gaugedesk-names/{encoded}"))
+            && diff.contains("-client-site files")
+            && diff.contains("+Site"),
+        "{diff}"
+    );
+    {
+        let guard = inspect.lock_unpoisoned();
+        assert_eq!(guard.chat_target_name(&chat_id, &target_id), "Site");
+        assert_eq!(
+            guard.library.work_targets[&target_id].name,
+            "client-site files"
+        );
+        let process = guard
+            .prepare_turn_process_declaration(&chat_id, "whip", None, 0, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(process.bindings[0].name, "Site");
+        assert_eq!(process.bindings[0].root, root, "storage does not move");
+    }
+
+    // A clean turn syncs the line into Main, and the project follows.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{chat_id}/task"),
+        Some(r#"{"prompt":"go"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "turn: {body}");
+    let mut guard = inspect.lock_unpoisoned();
+    assert_eq!(
+        guard.main_target_name(&pid, &target_id).as_deref(),
+        Some("Site")
+    );
+    assert_eq!(guard.library.work_targets[&target_id].name, "Site");
+
+    // An agent's `mv` of the folder reaches the same rename by its root.
+    assert!(guard
+        .rename_chat_target_root(&chat_id, &root, "Docs")
+        .is_err());
+    assert!(guard
+        .rename_chat_target_root(&chat_id, "targets/t-other", "x")
+        .is_err());
+    guard
+        .rename_chat_target_root(&chat_id, &root, "Api")
+        .unwrap();
+    assert_eq!(guard.chat_target_name(&chat_id, &target_id), "Api");
+    assert_eq!(guard.library.work_targets[&target_id].name, "Site");
+}
+
+/// DR-0248: two chats that rename one target differently meet as a name
+/// conflict, which a person settles by keeping the chat's name or the line's.
+#[tokio::test]
+async fn a_target_renamed_differently_in_two_chats_is_settled_as_a_conflict() {
+    settle_a_target_name_conflict("chat", "Beta").await;
+    settle_a_target_name_conflict("line", "Alpha").await;
+}
+
+async fn settle_a_target_name_conflict(keep: &str, settled: &str) {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = lean_workbench();
+    let inspect = wb.clone();
+    let app = open_control_plane(wb);
+    let (_, body) = send(&app, "POST", "/projects", Some(r#"{"name":"Acme"}"#)).await;
+    let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let pid = project["id"].as_str().unwrap().to_string();
+    let target_id = project["target_id"].as_str().unwrap().to_string();
+    let placement = project["placement"].as_str().unwrap().to_string();
+    let root = format!(
+        "targets/{}",
+        crate::library::target_id_path_v1(&target_id).unwrap()
+    );
+    let mut chats = Vec::new();
+    for title in ["alpha", "beta"] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            &format!("/projects/{pid}/placements/{placement}/chats"),
+            Some(&format!(
+                r#"{{"title":"{title}","target_id":"{target_id}"}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "chat: {body}");
+        let chat: serde_json::Value = serde_json::from_str(&body).unwrap();
+        chats.push(chat["id"].as_str().unwrap().to_string());
+    }
+    let command = |chat: &str, body: serde_json::Value| {
+        (format!("/chats/{chat}/files/command"), body.to_string())
+    };
+    for (chat, name) in [(&chats[0], "Alpha"), (&chats[1], "Beta")] {
+        let (uri, body) = command(
+            chat,
+            serde_json::json!({ "action": "rename", "path": root, "to": format!("targets/{name}") }),
+        );
+        let (status, body) = send(&app, "POST", &uri, Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "rename {name}: {body}");
+    }
+    // The first chat's turn lands its rename on Main.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{}/task", chats[0]),
+        Some(r#"{"prompt":"[no-write] go"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "alpha turn: {body}");
+    assert_eq!(
+        inspect
+            .lock_unpoisoned()
+            .main_target_name(&pid, &target_id)
+            .as_deref(),
+        Some("Alpha")
+    );
+    // The second chat's turn meets it as a conflict on the name.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/chats/{}/task", chats[1]),
+        Some(r#"{"prompt":"[no-write] go"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "beta turn: {body}");
+    let (_, workspace) = send(&app, "GET", "/workspace", None).await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
+    let beta = workspace["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|project| project["placements"].as_array().unwrap().iter())
+        .flat_map(|placement| placement["chats"].as_array().unwrap().iter())
+        .find(|chat| chat["id"] == chats[1].as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(beta["conflict"], true, "{beta}");
+    assert_eq!(
+        beta["target_name_disagreements"],
+        serde_json::json!([{ "root": root, "chat_name": "Beta", "line_name": "Alpha" }])
+    );
+
+    // The chosen side applies to the retried merge.
+    let (uri, body) = command(
+        &chats[1],
+        serde_json::json!({ "action": "settle_target_name", "path": root, "keep": keep }),
+    );
+    let (status, body) = send(&app, "POST", &uri, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "settle: {body}");
+    for action in ["repair", "retry"] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            &format!("/chats/{}/merge/command", chats[1]),
+            Some(&serde_json::json!({ "action": action }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{action}: {body}");
+    }
+    let guard = inspect.lock_unpoisoned();
+    assert_eq!(
+        guard.main_target_name(&pid, &target_id).as_deref(),
+        Some(settled)
+    );
+    assert_eq!(guard.library.work_targets[&target_id].name, settled);
+    assert_eq!(guard.chat_target_name(&chats[1], &target_id), settled);
+    assert!(guard.target_name_disagreements(&chats[1]).is_empty());
 }

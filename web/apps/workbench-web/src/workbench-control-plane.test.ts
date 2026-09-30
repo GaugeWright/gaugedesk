@@ -240,6 +240,40 @@ describe("hosted Home bootstrap", () => {
         expect(workHeaders.get("x-gaugewright-home-admission")).toBe("home-token");
     });
 
+    it("reuses the selected Home admission when switching unrouted projects", async () => {
+        const calls: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            calls.push(`${init?.method ?? "GET"} ${url}`);
+            if (url === "https://hub.example/account/homes") {
+                return new Response(JSON.stringify({
+                    homes: [{ id: "home:cloud", kind: "cloud", endpoint: "https://home.example" }],
+                    selected_home: "home:cloud",
+                }));
+            }
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({ routes: [] }));
+            }
+            if (url === "https://home.example/home/admissions") {
+                return new Response(JSON.stringify({ home: "home:cloud", admission: "home-token" }), { status: 201 });
+            }
+            if (url === "https://home.example/workspace") {
+                return new Response(JSON.stringify({
+                    archetypes: [], projects: [], recent: [], workstreams: [], work_targets: [], personal_placement: null,
+                }));
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("account-token");
+        api.setCurrentProject("project:a" as never);
+        await api.getWorkspace();
+        api.setCurrentProject("project:b" as never);
+        await api.getWorkspace();
+        expect(calls.filter((call) => call === "POST https://home.example/home/admissions")).toHaveLength(1);
+        expect(calls.filter((call) => call === "GET https://home.example/workspace")).toHaveLength(2);
+    });
+
     it("reports an honest no-Home state instead of falling back to Hub work routes", async () => {
         const fetch = vi.fn(async (input: RequestInfo | URL) => {
             const url = String(input);

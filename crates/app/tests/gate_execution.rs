@@ -15,17 +15,19 @@
 //! since 0.2.2 the admission gate is real for `std.files`, so an unseeded store
 //! blocks the `file.read` as `blocked_by_capability` rather than running it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use gaugedesk_app::gate::{
     COERCE_SCREEN_ENVELOPE, COERCE_SCREEN_GATE, REVIEW_BY_HAND_ENVELOPE, REVIEW_BY_HAND_GATE,
 };
 use gaugedesk_whip_runtime::gate_runner::{
-    deliver_verdict, reviews_awaiting_a_person, run_gate, Disposition, GateCoercionConfig,
-    GateProgram, GateRunError, GateTransport,
+    deliver_verdict, deliver_verdict_with_use_check, reviews_awaiting_a_person, run_gate,
+    run_gate_with_home_admission, run_gate_with_use_check, Disposition, GateCoercionConfig,
+    GateProgram, GateRunError, GateTransport, GateVersionUse,
 };
 use gaugedesk_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
 use whipplescript_kernel::coerce_native::CoerceProvider;
+use whipplescript_store::RuntimeStore;
 
 /// A provider that answers with one scripted disposition and records what it
 /// was asked, so a test can assert the item's text actually reached the model.
@@ -121,6 +123,251 @@ fn the_gate_runs_and_returns_a_keep() {
     );
 }
 
+#[test]
+fn a_pending_home_pointer_stops_a_new_gate_before_instance_start_or_effects() {
+    let quarantine = staged(r#"{"q1":"the coffee was cold"}"#);
+    let state = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("keep");
+    let checked = Cell::new(false);
+    let result = run_gate_with_use_check(
+        &compiled(),
+        &config(),
+        ITEM,
+        quarantine.path(),
+        state.path(),
+        &provider,
+        |selected| {
+            let GateVersionUse::NewlyAdmitted {
+                operation_id,
+                program_id: _,
+                version_id,
+                witness_digest,
+            } = selected
+            else {
+                panic!("a new gate must present its checked admission");
+            };
+            let stores = whipplescript_store::native_stores::NativeStores::open(
+                state.path().join("runtime.sqlite"),
+                state.path().join("coord.sqlite"),
+                state.path().join("items.sqlite"),
+            )
+            .unwrap();
+            let roster = stores.program_import_operation_roster().unwrap();
+            assert_eq!(roster.operations.len(), 1);
+            assert_eq!(roster.operations[0].version_id, version_id);
+            assert_eq!(roster.operations[0].operation_id, operation_id);
+            assert_eq!(
+                roster.operations[0].witness_digest.as_deref(),
+                Some(witness_digest),
+            );
+            checked.set(true);
+            Err(GateRunError::NoDisposition(
+                "Home pointer remains pending".into(),
+            ))
+        },
+    );
+    assert!(checked.get());
+    assert!(matches!(result, Err(GateRunError::NoDisposition(_))));
+    assert!(provider.seen.borrow().is_empty());
+    let stores = whipplescript_store::native_stores::NativeStores::open(
+        state.path().join("runtime.sqlite"),
+        state.path().join("coord.sqlite"),
+        state.path().join("items.sqlite"),
+    )
+    .unwrap();
+    assert!(stores.list_instances().unwrap().is_empty());
+}
+
+#[test]
+fn a_home_operation_is_registered_before_new_gate_target_evidence() {
+    const OPERATION_ID: &str = "imp_33333333333333333333333333333333";
+    let quarantine = staged(r#"{"q1":"the coffee was cold"}"#);
+    let state = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new("keep");
+    let registered = Cell::new(false);
+    let refused = run_gate_with_home_admission(
+        &compiled(),
+        &config(),
+        ITEM,
+        quarantine.path(),
+        state.path(),
+        &provider,
+        |_| {
+            Err(GateRunError::NoDisposition(
+                "Home registration unavailable".into(),
+            ))
+        },
+        |_| panic!("a refused registration cannot reach the use check"),
+    );
+    assert!(matches!(refused, Err(GateRunError::NoDisposition(_))));
+    let malformed = run_gate_with_home_admission(
+        &compiled(),
+        &config(),
+        ITEM,
+        quarantine.path(),
+        state.path(),
+        &provider,
+        |_| Ok("not-an-import-operation".into()),
+        |_| panic!("an invalid Home identity cannot reach the use check"),
+    );
+    assert!(matches!(malformed, Err(GateRunError::Store(_))));
+    let result = run_gate_with_home_admission(
+        &compiled(),
+        &config(),
+        ITEM,
+        quarantine.path(),
+        state.path(),
+        &provider,
+        |basis| {
+            assert_eq!(
+                basis.lock_digest,
+                whipplescript_kernel::import_coverage::NO_LOCK_DIGEST
+            );
+            assert_eq!(basis.ir_digest.len(), 32);
+            for digest in [
+                basis.source_digest,
+                basis.compiler_artifact_digest,
+                basis.envelope_digest,
+            ] {
+                assert_eq!(digest.len(), 64);
+            }
+            assert!(!basis.program_name.is_empty());
+            let stores = whipplescript_store::native_stores::NativeStores::open(
+                state.path().join("runtime.sqlite"),
+                state.path().join("coord.sqlite"),
+                state.path().join("items.sqlite"),
+            )
+            .unwrap();
+            assert!(stores
+                .program_import_operation_roster()
+                .unwrap()
+                .operations
+                .is_empty());
+            registered.set(true);
+            Ok(OPERATION_ID.into())
+        },
+        |selected| {
+            let GateVersionUse::NewlyAdmitted { operation_id, .. } = selected else {
+                panic!("the first use must present the new target operation");
+            };
+            assert!(registered.get());
+            assert_eq!(operation_id, OPERATION_ID);
+            Err(GateRunError::NoDisposition(
+                "Home pointer remains pending".into(),
+            ))
+        },
+    );
+    assert!(matches!(result, Err(GateRunError::NoDisposition(_))));
+    let retry = run_gate_with_home_admission(
+        &compiled(),
+        &config(),
+        ITEM,
+        quarantine.path(),
+        state.path(),
+        &provider,
+        |_| Ok(OPERATION_ID.into()),
+        |selected| {
+            let GateVersionUse::NewlyAdmitted { operation_id, .. } = selected else {
+                panic!("the interrupted first run has no retained instance yet");
+            };
+            assert_eq!(operation_id, OPERATION_ID);
+            Err(GateRunError::NoDisposition(
+                "Home pointer remains pending".into(),
+            ))
+        },
+    );
+    assert!(matches!(retry, Err(GateRunError::NoDisposition(_))));
+    assert!(provider.seen.borrow().is_empty());
+    let stores = whipplescript_store::native_stores::NativeStores::open(
+        state.path().join("runtime.sqlite"),
+        state.path().join("coord.sqlite"),
+        state.path().join("items.sqlite"),
+    )
+    .unwrap();
+    assert_eq!(
+        stores
+            .program_import_operation_roster()
+            .unwrap()
+            .operations
+            .len(),
+        1
+    );
+    assert!(stores.list_instances().unwrap().is_empty());
+}
+
+#[test]
+fn a_retained_gate_and_reviewer_answer_recheck_before_use() {
+    let quarantine = staged(r#"{"q1":"the coffee was cold"}"#);
+    let state = tempfile::tempdir().unwrap();
+    let program = GateProgram::compile(REVIEW_BY_HAND_GATE, REVIEW_BY_HAND_ENVELOPE).unwrap();
+    assert!(matches!(
+        run_gate(
+            &program,
+            &config(),
+            ITEM,
+            quarantine.path(),
+            state.path(),
+            &ScriptedProvider::new("keep"),
+        ),
+        Err(GateRunError::AwaitingReview)
+    ));
+    let rejected = Cell::new(0);
+    assert!(matches!(
+        run_gate_with_home_admission(
+            &program,
+            &config(),
+            ITEM,
+            quarantine.path(),
+            state.path(),
+            &ScriptedProvider::new("keep"),
+            |_| panic!("a retained item must not register an unused operation"),
+            |selected| {
+                assert!(matches!(selected, GateVersionUse::Retained { .. }));
+                rejected.set(rejected.get() + 1);
+                Err(GateRunError::NoDisposition(
+                    "Home admission is unavailable".into(),
+                ))
+            },
+        ),
+        Err(GateRunError::NoDisposition(_))
+    ));
+    assert!(matches!(
+        deliver_verdict_with_use_check(
+            &program,
+            &config(),
+            ITEM,
+            Disposition::Keep,
+            quarantine.path(),
+            state.path(),
+            &ScriptedProvider::new("keep"),
+            |selected| {
+                assert!(matches!(selected, GateVersionUse::Retained { .. }));
+                rejected.set(rejected.get() + 1);
+                Err(GateRunError::NoDisposition(
+                    "Home admission is unavailable".into(),
+                ))
+            },
+        ),
+        Err(GateRunError::NoDisposition(_))
+    ));
+    assert_eq!(rejected.get(), 2);
+    assert_eq!(reviews_awaiting_a_person(state.path()).unwrap(), 1);
+    assert_eq!(
+        deliver_verdict(
+            &program,
+            &config(),
+            ITEM,
+            Disposition::Keep,
+            quarantine.path(),
+            state.path(),
+            &ScriptedProvider::new("keep"),
+        )
+        .unwrap(),
+        Some(Disposition::Keep),
+        "refused use leaves the review claim available",
+    );
+}
+
 /// A screener's `flag` escalates to a person; it does not settle the item.
 ///
 /// This test used to assert the opposite — that a flagged item comes straight
@@ -174,6 +421,85 @@ fn a_gate_that_ran_is_projected_as_an_instance_of_its_workflow() {
     // run created is attributed to a node of the program, so the absences the
     // view reports are findings and not artefacts of a mis-keyed join.
     assert_eq!(instance.view["unattributed_effects"], serde_json::json!([]));
+
+    let stores = whipplescript_store::native_stores::NativeStores::open(
+        state.path().join("runtime.sqlite"),
+        state.path().join("coord.sqlite"),
+        state.path().join("items.sqlite"),
+    )
+    .unwrap();
+    let operations = stores.program_import_operation_roster().unwrap();
+    assert_eq!(
+        operations.operations.len(),
+        1,
+        "the gate has one accepting operation"
+    );
+    let operation = &operations.operations[0];
+    assert_eq!(
+        operation.kind,
+        whipplescript_store::program_imports::ProgramImportOperationKind::Checked,
+    );
+    let witness = stores
+        .program_import_witness(
+            &operation.version_id,
+            operation.witness_digest.as_deref().expect("checked digest"),
+        )
+        .unwrap()
+        .expect("the admitted gate retains its exact witness");
+    assert!(witness.examined.is_empty());
+    assert!(witness.edges.is_empty());
+    assert_eq!(
+        witness.program_source_digest,
+        whipplescript_kernel::exec_http::sha256_hex(COERCE_SCREEN_GATE.as_bytes()),
+    );
+    assert_eq!(
+        witness.lock_digest,
+        whipplescript_kernel::import_coverage::NO_LOCK_DIGEST,
+    );
+    assert_eq!(
+        witness.compiler_artifact_digest,
+        whipplescript::host_runtime::native_compiler_artifact_digest().unwrap(),
+    );
+}
+
+#[test]
+fn an_unresolved_gate_import_leaves_no_admitted_version() {
+    let source = format!("use missing_gate_package\n\n{COERCE_SCREEN_GATE}");
+    let program = GateProgram::compile(&source, COERCE_SCREEN_ENVELOPE)
+        .expect("the syntax and governance checks do not resolve packages");
+    let quarantine = staged(r#"{"q1":"the coffee was cold"}"#);
+    let state = tempfile::tempdir().unwrap();
+    let result = run_gate(
+        &program,
+        &config(),
+        ITEM,
+        quarantine.path(),
+        state.path(),
+        &ScriptedProvider::new("keep"),
+    );
+    assert!(
+        result.is_err(),
+        "an unresolved import cannot receive a gate version"
+    );
+    let stores = whipplescript_store::native_stores::NativeStores::open(
+        state.path().join("runtime.sqlite"),
+        state.path().join("coord.sqlite"),
+        state.path().join("items.sqlite"),
+    )
+    .unwrap();
+    assert!(stores
+        .program_import_operation_roster()
+        .unwrap()
+        .operations
+        .is_empty());
+    let versions: i64 = rusqlite::Connection::open(state.path().join("runtime.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM program_versions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(versions, 0);
+    assert!(stores.list_instances().unwrap().is_empty());
 }
 
 #[test]

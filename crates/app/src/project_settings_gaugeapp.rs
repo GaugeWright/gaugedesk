@@ -177,7 +177,7 @@ fn build(
             "work-data",
             work_data,
             if can_manage {
-                vec!["project.network-isolation.set"]
+                vec!["project.network-isolation.set", "project.target.name.set"]
             } else {
                 vec![]
             },
@@ -210,7 +210,11 @@ fn build(
         },
         pages: grants.clone(),
         commands: (if can_manage {
-            vec!["project.name.set", "project.network-isolation.set"]
+            vec![
+                "project.name.set",
+                "project.network-isolation.set",
+                "project.target.name.set",
+            ]
         } else {
             vec![]
         })
@@ -395,9 +399,17 @@ async fn erase(
         Err(reason) => agent_error(reason),
     }
 }
-fn payload(
-    envelope: &GaugeAppCommandEnvelope,
-) -> Result<(Option<String>, Option<bool>), Box<Response>> {
+/// What a project settings command changes.
+enum SettingsChange {
+    Project {
+        name: Option<String>,
+        isolated: Option<bool>,
+    },
+    /// A target's name, recorded on collaboration Main (DR-0248).
+    TargetName { target_id: String, name: String },
+}
+
+fn payload(envelope: &GaugeAppCommandEnvelope) -> Result<SettingsChange, Box<Response>> {
     let object = envelope.payload.as_object().ok_or_else(|| {
         boxed_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -417,12 +429,34 @@ fn payload(
                     "name must be 1–120 printable characters",
                 ));
             }
-            Ok((Some(name.into()), None))
+            Ok(SettingsChange::Project {
+                name: Some(name.into()),
+                isolated: None,
+            })
+        }
+        "project.target.name.set" if object.len() == 2 => {
+            let text = |key: &str| object.get(key).and_then(Value::as_str).unwrap_or("");
+            let target_id = text("target_id");
+            if target_id.is_empty() {
+                return Err(boxed_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "target_id is required",
+                ));
+            }
+            // The folder rules and project-wide uniqueness are the target
+            // name's own (DR-0248), checked when the rename is applied.
+            Ok(SettingsChange::TargetName {
+                target_id: target_id.into(),
+                name: text("name").into(),
+            })
         }
         "project.network-isolation.set" if object.len() == 1 => object
             .get("isolated")
             .and_then(Value::as_bool)
-            .map(|isolated| (None, Some(isolated)))
+            .map(|isolated| SettingsChange::Project {
+                name: None,
+                isolated: Some(isolated),
+            })
             .ok_or_else(|| {
                 boxed_error(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -481,19 +515,32 @@ fn apply(
             crate::federation::PAUSED_FOR_MOVE,
         ));
     }
-    let (name, isolated) = payload(envelope)?;
     let mut project = wb
         .library
         .projects
         .get(id)
         .cloned()
         .ok_or_else(|| boxed_error(StatusCode::NOT_FOUND, "project is unavailable"))?;
-    if let Some(name) = name {
-        project.name = name;
-    }
-    if let Some(isolated) = isolated {
-        project.network_isolated = isolated;
-    }
+    let mut synced_chats = Vec::new();
+    let project_changed = match payload(envelope)? {
+        SettingsChange::Project { name, isolated } => {
+            if let Some(name) = name {
+                project.name = name;
+            }
+            if let Some(isolated) = isolated {
+                project.network_isolated = isolated;
+            }
+            true
+        }
+        SettingsChange::TargetName { target_id, name } => {
+            // The name lives on collaboration Main, which the target record
+            // then projects; the receipt below records the command.
+            synced_chats = wb
+                .rename_project_target(id, &target_id, &name)
+                .map_err(|reason| boxed_error(StatusCode::CONFLICT, reason))?;
+            false
+        }
+    };
     let receipt = gaugeapp_receipt(session, envelope, "applied");
     let change = GaugeAppChangeRecord {
         id: change_id,
@@ -509,22 +556,22 @@ fn apply(
         reviewed_by: Some(session.actor.clone()),
         receipt_id: receipt.id.clone(),
     };
-    let facts = [
-        CommandRecordFact {
+    let mut facts = Vec::new();
+    if project_changed {
+        facts.push(CommandRecordFact {
             scope_id: LIBRARY_SCOPE.into(),
             kind: "project".into(),
             payload: serde_json::to_string(&project).map_err(|reason| {
                 boxed_error(StatusCode::INTERNAL_SERVER_ERROR, reason.to_string())
             })?,
-        },
-        CommandRecordFact {
-            scope_id: scope.clone(),
-            kind: GAUGEAPP_CHANGE_KIND.into(),
-            payload: serde_json::to_string(&change).map_err(|reason| {
-                boxed_error(StatusCode::INTERNAL_SERVER_ERROR, reason.to_string())
-            })?,
-        },
-    ];
+        });
+    }
+    facts.push(CommandRecordFact {
+        scope_id: scope.clone(),
+        kind: GAUGEAPP_CHANGE_KIND.into(),
+        payload: serde_json::to_string(&change)
+            .map_err(|reason| boxed_error(StatusCode::INTERNAL_SERVER_ERROR, reason.to_string()))?,
+    });
     let tenant_scope = req_scope(headers);
     let audit_scope = crate::audit::scope_for(&tenant_scope);
     let audit_link = crate::audit::link(&session.actor, &envelope.command_id, id);
@@ -544,8 +591,13 @@ fn apply(
             )
         })?;
     if !result.replayed {
-        wb.library.apply_project(project);
+        if project_changed {
+            wb.library.apply_project(project);
+        }
         wb.notify_library_changed("project", id, "upsert");
+        for chat in &synced_chats {
+            wb.notify_library_changed("chat", chat, "upsert");
+        }
         if let Some(entry) = crate::audit::committed_entry(result.chained_payload.as_deref()) {
             crate::audit::finish_committed_in(wb, &tenant_scope, &entry);
         }
@@ -707,6 +759,67 @@ mod tests {
         assert!(!can_manage_project(Some(Role::viewer()), true));
         assert!(!can_manage_project(Some(Role::new("auditor")), true));
         assert!(!can_manage_project(None, true));
+    }
+
+    #[test]
+    fn a_target_is_renamed_on_main_from_project_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let headers = HeaderMap::new();
+        let project = {
+            let mut wb = shared.lock_unpoisoned();
+            crate::library_routes::create_named_project(&mut wb, "proj-rename", "Site").unwrap()
+                ["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let (session, target_id) = {
+            let wb = shared.lock_unpoisoned();
+            let target_id = wb
+                .library
+                .work_targets
+                .values()
+                .find(|target| matches!(&target.owner, WorkTargetOwner::Project { project_id } if project_id == &project))
+                .unwrap()
+                .id
+                .clone();
+            (build(&wb, &headers, &project).unwrap().session, target_id)
+        };
+        let work_data = session
+            .pages
+            .iter()
+            .find(|page| page.id == "work-data")
+            .unwrap();
+        assert!(work_data
+            .commands
+            .iter()
+            .any(|command| command == "project.target.name.set"));
+        let envelope = |key: &str, name: &str| GaugeAppCommandEnvelope {
+            session_id: session.id.clone(),
+            generation: session.generation.clone(),
+            app: APP,
+            scope: session.scope.clone(),
+            page_id: "work-data".into(),
+            command_id: "project.target.name.set".into(),
+            expected_basis: work_data.resource_basis.clone(),
+            idempotency_key: key.into(),
+            payload: json!({ "target_id": target_id, "name": name }),
+            client: GaugeAppClient::Web,
+        };
+        let mut wb = shared.lock_unpoisoned();
+        for invalid in [".hidden", "a/b", ""] {
+            assert!(apply(&mut wb, &headers, &project, &envelope(invalid, invalid)).is_err());
+        }
+        let renamed = envelope("rename-website", "website");
+        assert!(apply(&mut wb, &headers, &project, &renamed).is_ok());
+        assert_eq!(wb.library.work_targets[&target_id].name, "website");
+        assert_eq!(
+            wb.main_target_name(&project, &target_id).as_deref(),
+            Some("website")
+        );
+        // A replay applies nothing twice.
+        assert!(apply(&mut wb, &headers, &project, &renamed).is_ok());
     }
 
     #[test]

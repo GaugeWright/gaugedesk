@@ -293,9 +293,9 @@ impl Workbench {
         if self.project_moving(project_id) {
             return Err(crate::federation::PAUSED_FOR_MOVE.to_owned());
         }
-        if body.name.trim().is_empty() {
-            return Err("target name is required".to_owned());
-        }
+        // DR-0248: the name is the target's folder in every chat that selects
+        // it, so it follows folder rules and is unique in the project.
+        self.validate_new_target_name(project_id, None, &body.name)?;
         if !matches!(
             body.kind,
             WorkTargetKind::ExternalVcs | WorkTargetKind::ExternalFolder
@@ -393,6 +393,7 @@ impl Workbench {
             return Err(error);
         }
         self.write_work_target_record(target.clone());
+        self.ensure_main_target_name(project_id, &target_id)?;
         let placement_ids = self
             .library
             .using_instances_of(project_id)

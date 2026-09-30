@@ -139,6 +139,11 @@ impl Workbench {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut grouped = BTreeMap::<String, Vec<(String, String)>>::new();
         for full_path in &reservation.changed_paths {
+            // A renamed target (DR-0248) promotes with the line; its name is
+            // not target content and settles nowhere.
+            if crate::target_names::is_target_name_path(full_path) {
+                continue;
+            }
             let mut parts = full_path.splitn(3, '/');
             if parts.next() != Some("targets") {
                 return Err(format!(
@@ -175,84 +180,89 @@ impl Workbench {
             .get(&root.workspace_id)
             .ok_or_else(|| "project collaboration workspace is unavailable".to_owned())?;
         let temporary_id = crate::library::gen_id("promotion-manifest");
-        let view = workspace
-            .fork_engagement_subset_at(
-                &temporary_id,
-                &reservation.line_branch_id,
-                workspace.mainline(),
-                &reservation.expected_line_cut,
-                &roots,
-            )
-            .map_err(|error| error.to_string())?;
-        let materialized = (|| {
-            let existing = view
-                .tree()
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|entry| !entry.is_dir)
-                .map(|entry| entry.path)
-                .collect::<BTreeSet<_>>();
-            let mut partitions = Vec::new();
-            for (target_id, paths) in &grouped {
-                let target = self
-                    .library
-                    .work_targets
-                    .get(target_id)
-                    .ok_or_else(|| "promotion target disappeared".to_owned())?;
-                let mut files = Vec::new();
-                let mut changed_paths = Vec::new();
-                for (full_path, relative) in paths {
-                    let body = if existing.contains(full_path) {
-                        Some(
-                            view.read_file_bytes_capped(full_path, usize::MAX)
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| {
-                                    "promotion candidate file exceeds addressable size".to_owned()
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
-                    files.push((relative.clone(), body));
-                    changed_paths.push(relative.clone());
+        let partitions = if grouped.is_empty() {
+            // Only names changed: there is no target content to snapshot.
+            Vec::new()
+        } else {
+            let view = workspace
+                .fork_engagement_subset_at(
+                    &temporary_id,
+                    &reservation.line_branch_id,
+                    workspace.mainline(),
+                    &reservation.expected_line_cut,
+                    &roots,
+                )
+                .map_err(|error| error.to_string())?;
+            let materialized = (|| {
+                let existing = view
+                    .tree()
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .filter(|entry| !entry.is_dir)
+                    .map(|entry| entry.path)
+                    .collect::<BTreeSet<_>>();
+                let mut partitions = Vec::new();
+                for (target_id, paths) in &grouped {
+                    let target = self
+                        .library
+                        .work_targets
+                        .get(target_id)
+                        .ok_or_else(|| "promotion target disappeared".to_owned())?;
+                    let mut files = Vec::new();
+                    let mut changed_paths = Vec::new();
+                    for (full_path, relative) in paths {
+                        let body = if existing.contains(full_path) {
+                            Some(
+                                view.read_file_bytes_capped(full_path, usize::MAX)
+                                    .map_err(|error| error.to_string())?
+                                    .ok_or_else(|| {
+                                        "promotion candidate file exceeds addressable size"
+                                            .to_owned()
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
+                        files.push((relative.clone(), body));
+                        changed_paths.push(relative.clone());
+                    }
+                    files.sort_by(|left, right| left.0.cmp(&right.0));
+                    changed_paths.sort();
+                    let candidate_digest = snapshot_digest(&files);
+                    partitions.push(TargetCandidateSnapshot {
+                        target_id: target_id.clone(),
+                        native_basis: target.current_basis.clone().ok_or_else(|| {
+                            "promotion target has no exact native basis".to_owned()
+                        })?,
+                        candidate_workspace_id: root.workspace_id.clone(),
+                        candidate_line_ref: reservation.line_branch_id.clone(),
+                        candidate_identity: format!(
+                            "promotion-cut:{}:{}#target:{}",
+                            workstream_id, reservation.expected_line_cut, target_id
+                        ),
+                        candidate_cut: reservation.expected_line_cut.clone(),
+                        candidate_digest,
+                        path_scope: target.path_scope.clone(),
+                        adapter_family: target.adapter_family.clone(),
+                        changed_paths,
+                        checks: vec!["collaboration-promotion=reserved".to_owned()],
+                        policy_decision_handles: vec![format!(
+                            "workstream-promotion-policy:{}",
+                            reservation.reservation_id
+                        )],
+                    });
                 }
-                files.sort_by(|left, right| left.0.cmp(&right.0));
-                changed_paths.sort();
-                let candidate_digest = snapshot_digest(&files);
-                partitions.push(TargetCandidateSnapshot {
-                    target_id: target_id.clone(),
-                    native_basis: target
-                        .current_basis
-                        .clone()
-                        .ok_or_else(|| "promotion target has no exact native basis".to_owned())?,
-                    candidate_workspace_id: root.workspace_id.clone(),
-                    candidate_line_ref: reservation.line_branch_id.clone(),
-                    candidate_identity: format!(
-                        "promotion-cut:{}:{}#target:{}",
-                        workstream_id, reservation.expected_line_cut, target_id
-                    ),
-                    candidate_cut: reservation.expected_line_cut.clone(),
-                    candidate_digest,
-                    path_scope: target.path_scope.clone(),
-                    adapter_family: target.adapter_family.clone(),
-                    changed_paths,
-                    checks: vec!["collaboration-promotion=reserved".to_owned()],
-                    policy_decision_handles: vec![format!(
-                        "workstream-promotion-policy:{}",
-                        reservation.reservation_id
-                    )],
-                });
+                partitions.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+                Ok(partitions)
+            })();
+            drop(view);
+            let cleanup = workspace
+                .remove_engagement(&temporary_id)
+                .map_err(|error| error.to_string());
+            match (materialized, cleanup) {
+                (Ok(partitions), Ok(())) => partitions,
+                (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
             }
-            partitions.sort_by(|left, right| left.target_id.cmp(&right.target_id));
-            Ok(partitions)
-        })();
-        drop(view);
-        let cleanup = workspace
-            .remove_engagement(&temporary_id)
-            .map_err(|error| error.to_string());
-        let partitions = match (materialized, cleanup) {
-            (Ok(partitions), Ok(())) => partitions,
-            (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
         };
         let mut manifest = WorkstreamPromotionManifest {
             schema: "gaugedesk.workstream-promotion-manifest.v1".to_owned(),

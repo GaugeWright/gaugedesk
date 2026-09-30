@@ -1688,7 +1688,9 @@ export async function getTree(transport: WorkbenchTransport, id: EngagementId): 
 
 export type FileManagerCommand =
     | { readonly action: "create_file" | "create_folder" | "delete"; readonly path: string }
-    | { readonly action: "rename"; readonly path: string; readonly to: string };
+    | { readonly action: "rename"; readonly path: string; readonly to: string }
+    /** Settle a target name the chat and its line disagree on (DR-0248). */
+    | { readonly action: "settle_target_name"; readonly path: string; readonly keep: "chat" | "line" };
 
 export async function manageFile(
     transport: WorkbenchTransport,

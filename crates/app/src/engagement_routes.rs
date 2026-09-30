@@ -4,7 +4,7 @@
 //! reads/writes, transcript/events, merge/revert/sync, task
 //! turns, and e2e reset hooks.
 
-use std::{collections::BTreeSet, convert::Infallible};
+use std::convert::Infallible;
 
 use axum::{
     extract::{Path, Query, State},
@@ -289,11 +289,10 @@ impl Workbench {
         else {
             return Err(EngagementCreateError::NoDefaultInstance);
         };
-        let root = crate::library::target_id_path_v1(&target.id)
-            .map(|encoded| format!("targets/{encoded}"))
+        let roots = crate::target_names::chat_target_roots([target.id.as_str()])
             .map_err(EngagementCreateError::Git)?;
         let eng = workspace
-            .create_engagement_subset(&id, workspace.mainline(), &BTreeSet::from([root]))
+            .create_engagement_subset(&id, workspace.mainline(), &roots)
             .map_err(|e| EngagementCreateError::Git(e.to_string()))?;
         let basis = target.current_basis.clone().ok_or_else(|| {
             EngagementCreateError::Git("default work target has no exact basis".into())
@@ -375,6 +374,9 @@ impl Workbench {
         self.engagements.keys().cloned().collect()
     }
 
+    /// The chat's diff against its line. A pending target rename (DR-0248)
+    /// stays in it as the change to that target's name file, which the client
+    /// shows as the rename rather than as a file.
     pub(crate) fn engagement_diff(&self, id: &str) -> Option<Result<String, WorkspaceError>> {
         self.engagements.get(id).map(|eng| eng.diff_against_main())
     }
@@ -636,6 +638,8 @@ impl Workbench {
     pub fn engagement_tree(&self, chat_id: &str) -> Option<Result<Vec<FileEntry>, WorkspaceError>> {
         self.engagements.get(chat_id).map(|eng| {
             let mut entries = eng.tree()?;
+            // A target's name is shown as its folder's name, never as a file.
+            entries.retain(|entry| !crate::target_names::is_target_name_path(&entry.path));
             if self.installed_agent_view(chat_id).is_some() {
                 let runtime_agent = format!(
                     "{}/agent/",
@@ -838,8 +842,41 @@ impl Workbench {
             ));
         }
         let source = command.path();
+        if let FileManagerCommand::Rename { path, to } = command {
+            if let Some(target_id) = self.chat_target_for_root(chat_id, path) {
+                return self.rename_target_folder(chat_id, &target_id, to);
+            }
+        }
+        if let FileManagerCommand::SettleTargetName { path, keep } = command {
+            let target_id = self
+                .chat_target_for_root(chat_id, path)
+                .ok_or_else(|| (StatusCode::NOT_FOUND, "no such target folder".to_owned()))?;
+            let keep_chat = match keep.as_str() {
+                "chat" => true,
+                "line" => false,
+                _ => {
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "keep must be `chat` or `line`".to_owned(),
+                    ))
+                }
+            };
+            let name = self
+                .settle_target_name(chat_id, &target_id, keep_chat)
+                .map_err(|error| (StatusCode::CONFLICT, error))?;
+            let event = ServerEvent::Admitted {
+                kind: "edit".into(),
+                text: format!("settled the folder name {name}"),
+            };
+            let _ = self
+                .store_mut()
+                .append_record(chat_id, "transcript", &event.to_json());
+            self.publish(chat_id, event);
+            return Ok(());
+        }
         let file_manager_protected = |path: &str| {
             path == "targets"
+                || crate::target_names::is_target_name_path(path)
                 || path == "artifacts"
                 || path == "work"
                 || path == ".whipple"
@@ -903,6 +940,11 @@ impl Workbench {
                 workspace_destination.as_deref().unwrap_or_default(),
             ),
             FileManagerCommand::Delete { .. } => eng.delete_entry(&workspace_source),
+            // Handled before any path authorization, above.
+            FileManagerCommand::SettleTargetName { .. } => Err(WorkspaceError {
+                message: "a target name is settled only for one of this chat's target folders"
+                    .to_owned(),
+            }),
         }
         .and_then(|_| {
             eng.commit_turn(&format!("{} {source}", command.verb()))
@@ -912,6 +954,53 @@ impl Workbench {
         let event = ServerEvent::Admitted {
             kind: "edit".into(),
             text: format!("{} {source}", command.verb()),
+        };
+        let _ = self
+            .store_mut()
+            .append_record(chat_id, "transcript", &event.to_json());
+        self.publish(chat_id, event);
+        Ok(())
+    }
+
+    /// The member target whose stored root a chat's Files pane shows at
+    /// `path`, `targets/<target-id-path-v1>`.
+    fn chat_target_for_root(&self, chat_id: &str, path: &str) -> Option<String> {
+        self.library
+            .current_target_set(chat_id)?
+            .members
+            .iter()
+            .find_map(|member| {
+                let encoded = crate::library::target_id_path_v1(&member.target_id).ok()?;
+                (path == format!("targets/{encoded}")).then(|| member.target_id.clone())
+            })
+    }
+
+    /// Renaming a target's folder in the Files pane renames the target on the
+    /// chat's line, as the agent's `mv` does (DR-0248). The folder's storage
+    /// does not move; `to` is the folder as it would be shown, beside the
+    /// others.
+    fn rename_target_folder(
+        &mut self,
+        chat_id: &str,
+        target_id: &str,
+        to: &str,
+    ) -> Result<(), (StatusCode, String)> {
+        let name = to.strip_prefix("targets/").unwrap_or(to);
+        let from = self.chat_target_name(chat_id, target_id);
+        self.rename_chat_target(chat_id, target_id, name)
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+        if name == from {
+            return Ok(());
+        }
+        let text = format!("renamed {from} to {name}");
+        self.engagements
+            .get(chat_id)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "no such chat".to_owned()))?
+            .commit_turn(&text)
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        let event = ServerEvent::Admitted {
+            kind: "edit".into(),
+            text,
         };
         let _ = self
             .store_mut()
@@ -1125,6 +1214,7 @@ impl Workbench {
             .lines()
             .filter_map(|line| line.strip_prefix("diff --git a/"))
             .filter_map(|line| line.split_once(" b/").map(|(path, _)| path))
+            .filter(|path| !crate::target_names::is_target_name_path(path))
             .find_map(|path| {
                 self.resolve_file_edit_target(chat_id, path)
                     .err()
@@ -3644,10 +3734,25 @@ pub(crate) struct FileQuery {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub(crate) enum FileManagerCommand {
-    CreateFile { path: String },
-    CreateFolder { path: String },
-    Rename { path: String, to: String },
-    Delete { path: String },
+    CreateFile {
+        path: String,
+    },
+    CreateFolder {
+        path: String,
+    },
+    Rename {
+        path: String,
+        to: String,
+    },
+    Delete {
+        path: String,
+    },
+    /// Settle a target name the chat and its line disagree on (DR-0248):
+    /// `keep` is `chat` or `line`. `path` is the target's folder.
+    SettleTargetName {
+        path: String,
+        keep: String,
+    },
 }
 
 impl FileManagerCommand {
@@ -3656,7 +3761,8 @@ impl FileManagerCommand {
             Self::CreateFile { path }
             | Self::CreateFolder { path }
             | Self::Rename { path, .. }
-            | Self::Delete { path } => path,
+            | Self::Delete { path }
+            | Self::SettleTargetName { path, .. } => path,
         }
     }
 
@@ -3666,6 +3772,7 @@ impl FileManagerCommand {
             Self::CreateFolder { .. } => "created folder",
             Self::Rename { .. } => "renamed",
             Self::Delete { .. } => "deleted",
+            Self::SettleTargetName { .. } => "settled the name of",
         }
     }
 }

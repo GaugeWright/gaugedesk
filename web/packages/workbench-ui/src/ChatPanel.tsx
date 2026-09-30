@@ -20,6 +20,7 @@ import {
 import { type FilterPrefs } from "./transcript-filter";
 import { type TranscriptLine } from "./transcript";
 import { TranscriptView } from "./TranscriptView";
+import { storedTargetPath } from "./target-names";
 import { ChatLogNavigation } from "./ChatLogNavigation";
 import {
     type Session,
@@ -348,7 +349,8 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                             <TranscriptView
                                 lines={lines()}
                                 agentName={props.agentName}
-                                onOpen={session().selectFile}
+                                onOpen={(path) => session().selectFile(storedTargetPath(path, session().targets?.() ?? []))}
+                                targets={session().targets?.() ?? []}
                                 prefs={props.prefs}
                                 onResolveCredential={props.onResolveCredential}
                                 onFork={session().forkAt}

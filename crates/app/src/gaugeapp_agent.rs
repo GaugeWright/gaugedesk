@@ -72,6 +72,7 @@ pub const AGENT_PROPOSABLE_IMMEDIATE_COMMANDS: &[&str] = &[
     "enterprise-identity.connection.validate",
     "project.name.set",
     "project.network-isolation.set",
+    "project.target.name.set",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

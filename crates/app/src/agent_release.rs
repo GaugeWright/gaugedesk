@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gaugedesk_core::agent_release::{
@@ -572,6 +573,88 @@ struct PackageManifestPaths {
     max_steps: usize,
 }
 
+/// Materialize the same package bytes for a disposable evaluation as for a
+/// Panel draft preview. `agent/` is authoritative for v1 context; the draft
+/// package supplies the generated wrapper and manifest. The caller owns the
+/// destination's lifetime and must keep it outside any published version.
+pub(crate) fn snapshot_authored_package(
+    repo: &Path,
+    package_root: &Path,
+) -> io::Result<gaugedesk_whip_runtime::AuthoredAgentPackage> {
+    let draft_package_root = repo.join(gaugedesk_boundary::definition::DRAFT_ROOT);
+    let manifest: PackageManifestPaths = serde_json::from_str(&std::fs::read_to_string(
+        draft_package_root.join("package.json"),
+    )?)
+    .map_err(invalid)?;
+    let mut package_names = vec![
+        "package.json",
+        manifest.source.as_str(),
+        manifest.system_prompt.as_str(),
+    ];
+    package_names.sort_unstable();
+    package_names.dedup();
+    std::fs::create_dir_all(package_root)?;
+    for file in package_names {
+        if !matches!(
+            Path::new(file).components().collect::<Vec<_>>().as_slice(),
+            [std::path::Component::Normal(_)]
+        ) {
+            return Err(invalid(format!(
+                "snapshot package file `{file}` must be a direct child"
+            )));
+        }
+        std::fs::copy(draft_package_root.join(file), package_root.join(file))?;
+    }
+    if manifest.schema == "whipplescript.agent_package.v1" {
+        let agents = std::fs::read(repo.join("agent/AGENTS.md"))?;
+        std::fs::write(package_root.join("AGENTS.md"), agents)?;
+        std::fs::copy(repo.join("agent/HUMANS.md"), package_root.join("HUMANS.md"))?;
+        let system = match std::fs::read(repo.join("agent/SYSTEM.md")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        std::fs::write(package_root.join(&manifest.system_prompt), system)?;
+        let authored_source = repo.join("agent").join(&manifest.source);
+        if manifest.source != gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
+            && authored_source.is_file()
+        {
+            std::fs::copy(authored_source, package_root.join(&manifest.source))?;
+        }
+    }
+    gaugedesk_whip_runtime::AuthoredAgentPackage::load(package_root).map_err(invalid)
+}
+
+/// Snapshot the corresponding discipline, including authored skills and
+/// definition files, under the same rules as an immutable version.
+pub(crate) fn snapshot_authored_discipline(
+    repo: &Path,
+    discipline_root: &Path,
+    package: &gaugedesk_whip_runtime::AuthoredAgentPackage,
+) -> io::Result<crate::discipline::DisciplineBundle> {
+    let draft = crate::discipline::load(
+        &repo.join(crate::discipline::DISCIPLINE_DRAFT_ROOT),
+        package.capabilities().iter().cloned(),
+    )
+    .map_err(invalid)?;
+    std::fs::create_dir_all(discipline_root)?;
+    for (path, body) in draft.files {
+        let destination = discipline_root.join(path);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(destination, body)?;
+    }
+    let manifest: PackageManifestPaths =
+        serde_json::from_str(package.manifest_document()).map_err(invalid)?;
+    if manifest.schema == "whipplescript.agent_package.v1" {
+        crate::discipline::materialize_agent_definition(&repo.join("agent"), discipline_root)
+            .map_err(invalid)?;
+    }
+    crate::discipline::load(discipline_root, package.capabilities().iter().cloned())
+        .map_err(invalid)
+}
+
 /// Everything a publisher round trip needs, owned.
 ///
 /// Checked out under a brief workbench lock and used entirely outside it
@@ -1010,7 +1093,7 @@ impl Workbench {
         let draft_package_root = repo.join(gaugedesk_boundary::definition::DRAFT_ROOT);
         let draft_package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(&draft_package_root)
             .map_err(invalid)?;
-        let draft_discipline = crate::discipline::load(
+        crate::discipline::load(
             &repo.join(crate::discipline::DISCIPLINE_DRAFT_ROOT),
             draft_package.capabilities().iter().cloned(),
         )
@@ -1033,66 +1116,9 @@ impl Workbench {
         let _snapshot = PreviewSnapshot {
             roots: vec![package_root.clone(), discipline_root.clone()],
         };
-        let preview_manifest: PackageManifestPaths = serde_json::from_str(
-            &std::fs::read_to_string(draft_package_root.join("package.json"))?,
-        )
-        .map_err(invalid)?;
-        let mut package_names = vec![
-            "package.json",
-            preview_manifest.source.as_str(),
-            preview_manifest.system_prompt.as_str(),
-        ];
-        package_names.sort_unstable();
-        package_names.dedup();
-        for file in package_names {
-            if !matches!(
-                std::path::Path::new(file)
-                    .components()
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-                [std::path::Component::Normal(_)]
-            ) {
-                return Err(invalid(format!(
-                    "preview package file `{file}` must be a direct child"
-                )));
-            }
-            std::fs::copy(draft_package_root.join(file), package_root.join(file))?;
-        }
-        if preview_manifest.schema == "whipplescript.agent_package.v1" {
-            let agents = std::fs::read(repo.join("agent/AGENTS.md"))?;
-            std::fs::write(package_root.join("AGENTS.md"), agents)?;
-            std::fs::copy(repo.join("agent/HUMANS.md"), package_root.join("HUMANS.md"))?;
-            let system = match std::fs::read(repo.join("agent/SYSTEM.md")) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => return Err(error),
-            };
-            std::fs::write(package_root.join(&preview_manifest.system_prompt), system)?;
-            let authored_source = repo.join("agent").join(&preview_manifest.source);
-            if preview_manifest.source != gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
-                && authored_source.is_file()
-            {
-                std::fs::copy(authored_source, package_root.join(&preview_manifest.source))?;
-            }
-        }
-        let preview_package =
-            gaugedesk_whip_runtime::AuthoredAgentPackage::load(&package_root).map_err(invalid)?;
-        for (path, body) in &draft_discipline.files {
-            let destination = discipline_root.join(path);
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(destination, body)?;
-        }
-        if preview_manifest.schema == "whipplescript.agent_package.v1" {
-            crate::discipline::materialize_agent_definition(&repo.join("agent"), &discipline_root)
-                .map_err(invalid)?;
-        }
-        let preview_discipline = crate::discipline::load(
-            &discipline_root,
-            preview_package.capabilities().iter().cloned(),
-        )
-        .map_err(invalid)?;
+        let preview_package = snapshot_authored_package(&repo, &package_root)?;
+        let preview_discipline =
+            snapshot_authored_discipline(&repo, &discipline_root, &preview_package)?;
 
         let preview_instance_id = crate::library::gen_id("panel-preview-instance");
         let version = ArchetypeVersionRecord {
@@ -2755,6 +2781,54 @@ fn not_found(message: &'static str) -> io::Error {
 mod publisher_tests {
     use super::*;
     use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
+
+    #[test]
+    fn authored_snapshot_binds_external_context_without_mutating_the_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("authoring");
+        let draft = repo.join(gaugedesk_boundary::definition::DRAFT_ROOT);
+        std::fs::create_dir_all(&draft).unwrap();
+        std::fs::create_dir_all(repo.join("agent")).unwrap();
+        for (path, body) in gaugedesk_boundary::definition::package_documents_v1(
+            gaugedesk_boundary::definition::DRAFT_ROOT,
+            "draft context",
+            "draft system",
+            gaugedesk_boundary::definition::PackageCapabilities::default(),
+        ) {
+            std::fs::write(repo.join(path), body).unwrap();
+        }
+        std::fs::write(repo.join("agent/AGENTS.md"), "baseline context").unwrap();
+        std::fs::write(repo.join("agent/HUMANS.md"), "Human guide").unwrap();
+        std::fs::write(repo.join("agent/SYSTEM.md"), "baseline system").unwrap();
+        let baseline_root = root.path().join("baseline");
+        let baseline = snapshot_authored_package(&repo, &baseline_root).unwrap();
+        assert_eq!(
+            baseline
+                .project_context_document()
+                .map(|context| context.content.as_str()),
+            Some("baseline context")
+        );
+        assert_eq!(baseline.system_prompt_document(), "baseline system");
+
+        std::fs::write(repo.join("agent/AGENTS.md"), "candidate context").unwrap();
+        let candidate_root = root.path().join("candidate");
+        let candidate = snapshot_authored_package(&repo, &candidate_root).unwrap();
+        assert_ne!(candidate.version_ref(), baseline.version_ref());
+        assert_eq!(
+            candidate
+                .project_context_document()
+                .map(|context| context.content.as_str()),
+            Some("candidate context")
+        );
+        assert_eq!(
+            std::fs::read_to_string(draft.join("AGENTS.md")).unwrap(),
+            "draft context"
+        );
+        assert_eq!(
+            std::fs::read_to_string(baseline_root.join("AGENTS.md")).unwrap(),
+            "baseline context"
+        );
+    }
 
     #[test]
     fn new_panel_collection_only_selects_artifacts() {

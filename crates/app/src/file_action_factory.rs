@@ -518,6 +518,7 @@ impl Workbench {
                                 .map_err(|error| format!("{error:?}"))?,
                             ),
                             writable: Some(true),
+                            presented_as: None,
                         },
                         basis: ActionBasis::Version {
                             version_ref: target.base().into(),

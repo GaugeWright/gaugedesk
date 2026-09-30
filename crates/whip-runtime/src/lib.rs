@@ -23,8 +23,10 @@ use gaugedesk_harness::sandbox::Network;
 use gaugedesk_harness::{
     ContextWindowReading, CredentialCapability, CredentialProbe, EgressGate, Harness,
     HarnessContinuitySpec, HarnessFactory, HarnessSpec, ImageContent, ModelContextHandle,
-    Observation, OutputFieldFlow, RuntimePosition, TaskFiler, ToolInfo, TurnOutcome,
+    Observation, OutputFieldFlow, RuntimePosition, TargetRenamer, TaskFiler, ToolInfo, TurnOutcome,
 };
+
+type TargetRenamerSlot = Arc<Mutex<Option<Arc<dyn TargetRenamer>>>>;
 pub use whipplescript::gov::{
     external_signing_bytes, external_signing_bytes_v2, ExternalAttestation,
     GovernanceAttestationVerifier, SignedEnvelope,
@@ -78,17 +80,58 @@ pub fn compile_whip_program(source: &str) -> CompiledWhipProgram {
     }
 }
 
+/// The native workspace a turn's tools run in: the chat's worktree with its
+/// read-only roots, each target presented under its name (DR-0248), and a
+/// rename of a target's folder admitted by the Home's renamer bound for the
+/// running turn.
+fn workspace_resolver(
+    worktree: &Path,
+    sandbox_read_only: &[PathBuf],
+    targets: &[gaugedesk_harness::WorkspaceTargetBinding],
+    renamer: &TargetRenamerSlot,
+) -> io::Result<NativeWorkspaceResolver> {
+    let mut read_only = sandbox_read_only.to_vec();
+    read_only.extend(
+        targets
+            .iter()
+            .filter(|target| !target.writable)
+            .map(|target| PathBuf::from(&target.root)),
+    );
+    if !targets.is_empty() {
+        read_only.push(PathBuf::from(TARGET_MANIFEST_SELECTOR));
+    }
+    let renamer = Arc::clone(renamer);
+    Ok(NativeWorkspaceResolver::new(worktree)
+        .and_then(|resolver| resolver.read_only(read_only))
+        .map_err(invalid_data)?
+        .with_root_rename_admission(move |rename| {
+            let bound = renamer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            match bound {
+                Some(renamer) => renamer.rename_target(&rename.selector, &rename.from, &rename.to),
+                None => Err(format!(
+                    "renaming `{}` is not available in this conversation",
+                    rename.from
+                )),
+            }
+        }))
+}
+
 pub(crate) fn validate_workspace_targets(
     targets: &[gaugedesk_harness::WorkspaceTargetBinding],
 ) -> Result<(), String> {
     let mut ids = BTreeSet::new();
     let mut handles = BTreeSet::new();
     let mut roots = BTreeSet::new();
+    let mut names = BTreeSet::new();
     for target in targets {
         if target.target_id.is_empty()
             || !ids.insert(target.target_id.as_str())
             || !handles.insert(target.resource_handle.as_str())
             || !roots.insert(target.root.as_str())
+            || (!target.name.is_empty() && !names.insert(target.name.as_str()))
         {
             return Err("workspace target declaration has an empty or duplicate identity".into());
         }
@@ -116,6 +159,7 @@ pub(crate) fn workspace_resource_refs(
             kind: "file_store".to_owned(),
             selector: None,
             writable: None,
+            presented_as: None,
         }]
     } else {
         let mut resources = targets
@@ -125,6 +169,9 @@ pub(crate) fn workspace_resource_refs(
                 kind: "file_store".to_owned(),
                 selector: Some(target.root.clone()),
                 writable: Some(target.writable),
+                // DR-0248: the agent sees the target as a folder named after
+                // it; the selector stays the stable-ID partition.
+                presented_as: (!target.name.is_empty()).then(|| target.name.clone()),
             })
             .collect::<Vec<_>>();
         resources.push(ResourceRef {
@@ -132,6 +179,7 @@ pub(crate) fn workspace_resource_refs(
             kind: "file_store".to_owned(),
             selector: Some(TARGET_MANIFEST_SELECTOR.to_owned()),
             writable: Some(false),
+            presented_as: None,
         });
         resources
     }
@@ -1386,6 +1434,21 @@ impl WhipHarnessFactory {
         self
     }
 
+    /// Keep improvement evaluation's continuity database in the caller's
+    /// disposable workspace while retaining the same authority and model
+    /// broker configuration as an ordinary native work chat.
+    pub fn isolated_native_shadow(&self, runtime_root: impl Into<PathBuf>) -> io::Result<Self> {
+        if self.hosted.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hosted placements need their own improvement binding",
+            ));
+        }
+        let mut isolated = self.clone();
+        isolated.runtime_root = runtime_root.into();
+        Ok(isolated)
+    }
+
     /// Route WhippleScript-built provider requests through one exact
     /// organization final-fetch authority for this turn factory. Hosted DO
     /// placements have their own Home callback and therefore reject this
@@ -1632,7 +1695,7 @@ impl WhipHarnessFactory {
             .map_err(invalid_data)?;
 
         validate_workspace_targets(&spec.workspace_targets).map_err(invalid_data)?;
-        let mut read_only = spec
+        let sandbox_read_only = spec
             .sandbox
             .read_only_roots
             .iter()
@@ -1647,18 +1710,13 @@ impl WhipHarnessFactory {
                     })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        read_only.extend(
-            spec.workspace_targets
-                .iter()
-                .filter(|target| !target.writable)
-                .map(|target| PathBuf::from(&target.root)),
-        );
-        if !spec.workspace_targets.is_empty() {
-            read_only.push(PathBuf::from(TARGET_MANIFEST_SELECTOR));
-        }
-        let workspace = NativeWorkspaceResolver::new(&spec.worktree)
-            .and_then(|resolver| resolver.read_only(read_only))
-            .map_err(invalid_data)?;
+        let target_renamer: TargetRenamerSlot = Arc::new(Mutex::new(None));
+        let workspace = workspace_resolver(
+            &spec.worktree,
+            &sandbox_read_only,
+            &spec.workspace_targets,
+            &target_renamer,
+        )?;
 
         Ok(WhipHarness {
             runtime,
@@ -1690,6 +1748,9 @@ impl WhipHarnessFactory {
             turn_sequence: 0,
             next_command_id: None,
             task_filer: None,
+            target_renamer,
+            worktree: spec.worktree.clone(),
+            sandbox_read_only,
             external_tool_handler: None,
             cancellation: Arc::new(Mutex::new(None)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -1894,6 +1955,14 @@ struct WhipHarness {
     turn_sequence: u64,
     next_command_id: Option<String>,
     task_filer: Option<Arc<dyn TaskFiler>>,
+    /// The Home's recorder of target-folder renames for the running turn
+    /// (DR-0248). Shared with the workspace resolver's rename admission,
+    /// which outlives any one turn's binding.
+    target_renamer: TargetRenamerSlot,
+    /// What the workspace resolver is rebuilt from when a turn's targets
+    /// differ from the last turn's.
+    worktree: PathBuf,
+    sandbox_read_only: Vec<PathBuf>,
     external_tool_handler: Option<gaugedesk_harness::ExternalToolHandler>,
     cancellation: Arc<Mutex<Option<HostCancellationHandle>>>,
     /// That a cancellation has been asked for, held separately from the handle
@@ -2041,6 +2110,32 @@ impl Harness for WhipHarness {
 
     fn bind_task_filer(&mut self, filer: Option<Arc<dyn TaskFiler>>) {
         self.task_filer = filer;
+    }
+    fn bind_workspace_targets(
+        &mut self,
+        targets: Vec<gaugedesk_harness::WorkspaceTargetBinding>,
+    ) -> io::Result<()> {
+        if targets == self.workspace_targets {
+            return Ok(());
+        }
+        validate_workspace_targets(&targets).map_err(invalid_data)?;
+        // A fresh resolver drops renames it admitted in an earlier turn: the
+        // new bindings already carry the names the Home recorded (DR-0248),
+        // and a later rename back must not be overridden by an old one.
+        self.workspace = workspace_resolver(
+            &self.worktree,
+            &self.sandbox_read_only,
+            &targets,
+            &self.target_renamer,
+        )?;
+        self.workspace_targets = targets;
+        Ok(())
+    }
+    fn bind_target_renamer(&mut self, renamer: Option<Arc<dyn TargetRenamer>>) {
+        *self
+            .target_renamer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = renamer;
     }
     fn bind_external_tool_handler(
         &mut self,
@@ -2320,6 +2415,7 @@ impl WhipHarness {
                 kind: "command".to_owned(),
                 selector: None,
                 writable: None,
+                presented_as: None,
             });
         }
         // ADR 0113: asking is a governed ability. An archetype whose ceiling
@@ -2331,6 +2427,7 @@ impl WhipHarness {
                 kind: QUESTION_RESOURCE.to_owned(),
                 selector: None,
                 writable: None,
+                presented_as: None,
             });
         }
         if has("tracker.file") && self.task_filer.is_some() {
@@ -2341,6 +2438,7 @@ impl WhipHarness {
                 // `writable` attenuates file_store writes only. The tracker
                 // tool is admitted by this resource and the bound TaskFiler.
                 writable: None,
+                presented_as: None,
             });
         }
         StartTurnCommand {
@@ -2361,6 +2459,7 @@ impl WhipHarness {
                         kind: "image".to_owned(),
                         selector: Some(index.to_string()),
                         writable: None,
+                        presented_as: None,
                     })
                     .collect(),
             },
@@ -3832,6 +3931,7 @@ mod tests {
             kind: "tracker".into(),
             selector: None,
             writable: None,
+            presented_as: None,
         };
         assert_eq!(
             resources.execute_tool(&[admitted], &call).unwrap(),
@@ -3854,6 +3954,7 @@ mod tests {
                         kind: "tracker".into(),
                         selector: None,
                         writable: None,
+                        presented_as: None,
                     }],
                     &assigned
                 )
@@ -3880,6 +3981,7 @@ mod tests {
                     kind: "tracker".into(),
                     selector: None,
                     writable: None,
+                    presented_as: None,
                 }],
                 &invalid
             )
@@ -3915,6 +4017,7 @@ mod tests {
             kind: "file_store".into(),
             selector: Some("targets/t-one".into()),
             writable: Some(false),
+            presented_as: None,
         }];
         let read = |id: &str, path: &str| super::ToolCall {
             id: id.into(),
@@ -4102,6 +4205,7 @@ mod tests {
                 readable: true,
                 writable: true,
                 output: true,
+                name: "api".to_owned(),
             },
             gaugedesk_harness::WorkspaceTargetBinding {
                 target_id: "target-b".to_owned(),
@@ -4110,6 +4214,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 output: false,
+                name: "web".to_owned(),
             },
         ];
         super::validate_workspace_targets(&targets).expect("valid sparse targets");
@@ -4118,6 +4223,10 @@ mod tests {
         assert_eq!(resources[0].handle, "target:t-a");
         assert_eq!(resources[0].selector.as_deref(), Some("targets/t-a"));
         assert_eq!(resources[0].writable, Some(true));
+        // DR-0248: the agent sees each target at its name.
+        assert_eq!(resources[0].presented_as.as_deref(), Some("api"));
+        assert_eq!(resources[1].presented_as.as_deref(), Some("web"));
+        assert_eq!(resources[2].presented_as, None);
         assert_eq!(resources[1].handle, "target:t-b");
         assert_eq!(resources[1].selector.as_deref(), Some("targets/t-b"));
         assert_eq!(resources[1].writable, Some(false));
@@ -4133,6 +4242,9 @@ mod tests {
 
         let duplicate = vec![targets[0].clone(), targets[0].clone()];
         assert!(super::validate_workspace_targets(&duplicate).is_err());
+        let mut same_name = targets[1].clone();
+        same_name.name = "api".to_owned();
+        assert!(super::validate_workspace_targets(&[targets[0].clone(), same_name]).is_err());
         let mut impossible = targets[1].clone();
         impossible.output = true;
         assert!(super::validate_workspace_targets(&[impossible]).is_err());
@@ -4165,6 +4277,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 output: false,
+                name: String::new(),
             },
             gaugedesk_harness::WorkspaceTargetBinding {
                 target_id: "writable".to_owned(),
@@ -4173,6 +4286,7 @@ mod tests {
                 readable: true,
                 writable: true,
                 output: true,
+                name: String::new(),
             },
         ]);
         let write = |path: &str| super::ToolCall {
@@ -5022,6 +5136,7 @@ mod tests {
                 kind: "file_store".to_owned(),
                 selector: None,
                 writable: None,
+                presented_as: None,
             }],
             provider_binding: ProviderBindingRef {
                 binding_id: "gaugedesk:provider:primary".to_owned(),
@@ -5229,6 +5344,7 @@ workflow Method {
             kind: "image".to_owned(),
             selector: Some("0".to_owned()),
             writable: None,
+            presented_as: None,
         });
         assert!(
             !first

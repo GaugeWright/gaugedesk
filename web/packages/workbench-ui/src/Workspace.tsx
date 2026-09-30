@@ -62,6 +62,7 @@ export function Workspace(props: WorkspaceProps = {}) {
     const isProtected = (path: string) =>
         (session.chatKind() !== "edit" && (path === "agent" || path.startsWith("agent/")))
         || path === "targets" || path === ".whipple" || path.startsWith(".whipple/")
+        || path === ".gaugedesk-names" || path.startsWith(".gaugedesk-names/")
         || path === ".gaugedesk-runtime"
         || path.startsWith(".gaugedesk-runtime/") || path.includes("/.gaugedesk-runtime/")
         || path.startsWith("builder_only/")
@@ -140,7 +141,9 @@ export function Workspace(props: WorkspaceProps = {}) {
         props.onCreationHandled?.();
     });
     const openRename = (entry: FileEntry) => {
-        setName(leafOf(entry.path));
+        // A target's folder shows the target's name (DR-0248); renaming it
+        // renames the target, and its storage path never changes.
+        setName(isRoot(entry.path) ? displayName(entry.path) : leafOf(entry.path));
         setError("");
         setDialog({ kind: "rename", path: entry.path, isDir: entry.isDir });
     };
@@ -172,6 +175,13 @@ export function Workspace(props: WorkspaceProps = {}) {
             return;
         }
         if (current.kind === "rename") {
+            if (isRoot(current.path)) {
+                if (trimmed === displayName(current.path)) { setDialog(null); return; }
+                void apply({ action: "rename", path: current.path, to: joinPath(parentOf(current.path), trimmed) },
+                    session.selectedFile(),
+                    `renamed ${displayName(current.path)} to ${trimmed}`);
+                return;
+            }
             const to = joinPath(parentOf(current.path), trimmed);
             if (to === current.path) { setDialog(null); return; }
             const selected = session.selectedFile();
@@ -200,6 +210,9 @@ export function Workspace(props: WorkspaceProps = {}) {
         if (entry.isDir && canManage(entry.path)) {
             items.push({ label: "New file here", run: () => openCreate("file", entry.path) });
             items.push({ label: "New folder here", run: () => openCreate("folder", entry.path) });
+        }
+        if (canManage(entry.path) && isRoot(entry.path) && !!rootFor(entry.path)?.path.startsWith("targets/")) {
+            items.push({ label: "Rename", run: () => openRename(entry) });
         }
         if (canManage(entry.path) && !isRoot(entry.path)) {
             items.push({ label: "Rename", run: () => openRename(entry) });

@@ -121,6 +121,7 @@ impl Workbench {
                     kind: "tracker".into(),
                     selector: Some(queue.clone()),
                     writable: Some(true),
+                    presented_as: None,
                 },
                 basis: ActionBasis::Version {
                     version_ref: whipplescript_store::stable_hash_hex(

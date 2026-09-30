@@ -1286,6 +1286,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         // The gem's inputs, read from the same projection fields the
                         // navigation row reads, so the two cannot disagree.
                         conflict: c.conflict,
+                        targetNameDisagreements: c.targetNameDisagreements,
                         // The line this chat's work lands on: its workstream when it is
                         // homed to one, else project collaboration Main. Target identity
                         // is a separate execution-scope axis and is rendered below.
@@ -2846,7 +2847,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             onCreationHandled={() => setFileCreateRequest(null)}
                             onChanged={(message) => {
                                 setStatus(message);
-                                void Promise.all([refetchDiff(), refetchMerge()]);
+                                // A renamed target changes the chat's target names (DR-0248).
+                                void Promise.all([refetchDiff(), refetchMerge(), refetchChatInfo()]);
                             }}
                         />
                     </SessionProvider>
@@ -3163,6 +3165,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         diff: () => diff() ?? "",
         mergePhase: () => merge()?.phase ?? null,
         mergeConflicted: () => merge()?.phase === "Rejected" && merge()?.git_outcome === "Conflict",
+        targets: () => (chatInfo()?.targets ?? []).map((target) => ({ root: target.root, name: target.name })),
+        targetNameDisagreements: () => chatInfo()?.targetNameDisagreements ?? [],
+        settleTargetName: async (root, keep) => {
+            // Settle the name, then retry the merge the conflict held back.
+            await api.manageFile?.(id, { action: "settle_target_name", path: root, keep });
+            if (merge()?.phase === "Rejected") await onMerge("repair", id);
+            await onMerge("retry", id);
+            await refetchChatInfo();
+        },
         chatKind,
         methodName,
         transcript,

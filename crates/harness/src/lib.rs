@@ -253,6 +253,10 @@ pub struct WorkspaceTargetBinding {
     pub target_id: String,
     pub resource_handle: String,
     pub root: String,
+    /// The target's name on the chat's line: the folder the agent sees
+    /// instead of `root` (DR-0248). Empty keeps the root visible as itself.
+    #[serde(default)]
+    pub name: String,
     pub readable: bool,
     pub writable: bool,
     pub output: bool,
@@ -297,6 +301,18 @@ pub trait Harness: Send {
     /// Bind the Home's current, authenticated project-task filing operation for
     /// this turn. The adapter never derives tracker authority from a package.
     fn bind_task_filer(&mut self, _filer: Option<Arc<dyn TaskFiler>>) {}
+    /// Bind this turn's target roots, with the names the chat shows them under
+    /// (DR-0248). A persistent harness keeps the ones it was created with
+    /// unless its adapter rebinds them here.
+    fn bind_workspace_targets(
+        &mut self,
+        _targets: Vec<WorkspaceTargetBinding>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+    /// Bind the Home's recorder of target-folder renames for this turn. An
+    /// adapter without one refuses every rename.
+    fn bind_target_renamer(&mut self, _renamer: Option<Arc<dyn TargetRenamer>>) {}
     fn bind_external_tool_handler(&mut self, _handler: Option<ExternalToolHandler>) {}
 
     /// Deliver `prompt` (+ any native `images` for this turn), mediate every tool
@@ -326,6 +342,18 @@ pub trait Harness: Send {
 
 /// A product-authorized operation that returns a tracker issue id only after
 /// the issue has committed. Each call id is stable within its turn.
+/// Records an agent's rename of a target's folder on the chat's line
+/// (DR-0248). `root` is the target's stored root, `targets/t-...`; a refusal
+/// refuses the whole command that renamed it, before any file changes.
+pub trait TargetRenamer: Send + Sync {
+    fn rename_target(&self, root: &str, from: &str, to: &str) -> Result<(), String>;
+    /// A rename the Home refused after the command that made it had already
+    /// finished, as on a hosted placement that admits a rename itself and
+    /// hands it back for ratification (DR-0248). The chat is told; the target
+    /// keeps its old name from the next turn.
+    fn report_refused(&self, _from: &str, _to: &str, _reason: &str) {}
+}
+
 pub trait TaskFiler: Send + Sync {
     fn file_task(
         &self,

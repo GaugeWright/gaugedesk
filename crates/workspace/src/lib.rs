@@ -34,7 +34,7 @@ use whipplescript_store::materialize::MaterializedScratch;
 use whipplescript_store::stat_cache::{CachedEntry, StatCache};
 use whipplescript_store::vcs::{
     GateCommit, GateVerdict, MainlineGate, MergeProbeOutcome, NativeWorkspaceVcs, ReconcileOutcome,
-    RestoreOutcome, VcsMergeOutcome, VcsWriteOutcome,
+    ResolutionChoice, ResolveOutcome, RestoreOutcome, VcsMergeOutcome, VcsWriteOutcome,
 };
 use whipplescript_store::workstreams::{
     ArchiveOutcome, BoundaryReservation, CreateStreamOutcome, ReserveBoundaryOutcome,
@@ -1944,6 +1944,18 @@ impl Engagement {
     /// because it adopted the content, ours because the line rebased onto
     /// the merge cut (folding anything the target had that we lacked).
     pub fn merge_into_main(&self) -> Result<MergeOutcome> {
+        self.merge_into_main_if_cut(None)
+    }
+
+    /// Merge only while the target is still at the cut the caller evaluated.
+    /// The comparison occurs under the same two writer locks as the merge, so
+    /// an unrelated target edit cannot be silently folded into an improvement
+    /// candidate between its stale check and adoption.
+    pub fn merge_into_main_if_target_cut(&self, expected_cut: &str) -> Result<MergeOutcome> {
+        self.merge_into_main_if_cut(Some(expected_cut))
+    }
+
+    fn merge_into_main_if_cut(&self, expected_cut: Option<&str>) -> Result<MergeOutcome> {
         // A fold is a read-modify-write across TWO heads — it advances the
         // target and then rebases this line onto the merge cut — so it holds
         // both writers for the whole verb, import through projection. Held
@@ -1960,6 +1972,17 @@ impl Engagement {
         // landing after this import is work no import has considered yet, not
         // content the merge decided against.
         let sides = self.import_sides_under_writer(&mut vcs)?;
+        if let Some(expected_cut) = expected_cut {
+            let actual = vcs
+                .get_branch(&self.target)?
+                .and_then(|branch| branch.head_cut_id)
+                .ok_or_else(|| WorkspaceError::msg("improvement target has no recorded cut"))?;
+            if actual != expected_cut {
+                return Err(WorkspaceError::msg(
+                    "improvement baseline is stale: target changed before adoption",
+                ));
+            }
+        }
         match vcs.merge_keeping(
             &self.branch,
             &fresh_cut_id("keep"),
@@ -1981,6 +2004,65 @@ impl Engagement {
             }
             VcsMergeOutcome::Conflicted { .. } => Ok(MergeOutcome::Conflict),
             other => Err(WorkspaceError::msg(format!("merge refused: {other:?}"))),
+        }
+    }
+
+    /// One file as the head of the line this chat merges into records it,
+    /// or `None` when the head has no such file. Nothing is imported or
+    /// materialized to read it.
+    pub fn read_line_file(&self, relative: &str) -> Result<Option<String>> {
+        Ok(NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?
+        .read(&self.target, relative)?)
+    }
+
+    /// Resolve this chat's conflict with its line on one path by taking this
+    /// chat's side (`ours`) or the line's. The branch is first reconciled
+    /// with its line, which records the conflict if a merge has not; the
+    /// store then records the resolution, so the next merge applies it
+    /// verbatim while the line's side is unchanged. Returns whether a
+    /// conflict on the path was resolved: `false` when reconciling found none.
+    pub fn resolve_conflict_taking(&self, relative: &str, ours: bool) -> Result<bool> {
+        self.ensure_selected_path(relative)?;
+        let writers = self.line_writers(&[]);
+        let _holding = hold_writers(&writers);
+        let mut vcs = self.store()?;
+        let sides = self.import_sides_under_writer(&mut vcs)?;
+        let recorded = vcs
+            .open_conflicts(&self.branch)?
+            .iter()
+            .any(|row| row.path == relative);
+        if !recorded {
+            match vcs.reconcile_branch(&self.branch, true, &fresh_cut_id("sync"), &now_at())? {
+                ReconcileOutcome::Rebased { .. } | ReconcileOutcome::UpToDate => {
+                    self.project_branch_observing(&mut vcs, Some(&sides.branch))?;
+                    return Ok(false);
+                }
+                ReconcileOutcome::Conflicts { .. } => {}
+                other => return Err(WorkspaceError::msg(format!("sync refused: {other:?}"))),
+            }
+        }
+        let choice = if ours {
+            ResolutionChoice::TakeOurs
+        } else {
+            ResolutionChoice::TakeTheirs
+        };
+        let outcome = vcs.resolve_conflict(
+            &self.branch,
+            relative,
+            choice,
+            &fresh_cut_id("resolve"),
+            &now_at(),
+        )?;
+        self.project_branch_observing(&mut vcs, Some(&sides.branch))?;
+        match outcome {
+            ResolveOutcome::Resolved { .. } => Ok(true),
+            ResolveOutcome::NoOpenConflict => Ok(false),
+            other => Err(WorkspaceError::msg(format!(
+                "conflict on `{relative}` could not be resolved: {other:?}"
+            ))),
         }
     }
 
@@ -3362,9 +3444,27 @@ pub trait ChatWorkspace: Send {
         ))
     }
     fn revert_to_main(&self) -> Result<()>;
+    /// One file at the head of the line this chat merges into.
+    fn read_line_file(&self, _relative: &str) -> Result<Option<String>> {
+        Err(WorkspaceError::msg(
+            "this workspace adapter cannot read its line's head",
+        ))
+    }
+    /// Resolve this chat's conflict with its line on one path by taking one
+    /// side; `false` when there was none.
+    fn resolve_conflict_taking(&self, _relative: &str, _ours: bool) -> Result<bool> {
+        Err(WorkspaceError::msg(
+            "this workspace adapter cannot resolve a conflict by side",
+        ))
+    }
     fn sync_from_main(&self) -> Result<MergeOutcome>;
     fn merge_probe(&self) -> Result<MergeOutcome>;
     fn merge_into_main(&self) -> Result<MergeOutcome>;
+    fn merge_into_main_if_target_cut(&self, _expected_cut: &str) -> Result<MergeOutcome> {
+        Err(WorkspaceError::msg(
+            "this workspace cannot condition adoption on an exact target cut",
+        ))
+    }
     fn ingest(&self, source: &Path) -> Result<usize>;
     fn ingest_into(&self, prefix: &str, source: &Path) -> Result<usize> {
         if prefix.is_empty() {
@@ -3710,6 +3810,12 @@ impl ChatWorkspace for Engagement {
     fn revert_to_main(&self) -> Result<()> {
         self.revert_to_main()
     }
+    fn read_line_file(&self, relative: &str) -> Result<Option<String>> {
+        self.read_line_file(relative)
+    }
+    fn resolve_conflict_taking(&self, relative: &str, ours: bool) -> Result<bool> {
+        self.resolve_conflict_taking(relative, ours)
+    }
     fn sync_from_main(&self) -> Result<MergeOutcome> {
         self.sync_from_main()
     }
@@ -3718,6 +3824,9 @@ impl ChatWorkspace for Engagement {
     }
     fn merge_into_main(&self) -> Result<MergeOutcome> {
         self.merge_into_main()
+    }
+    fn merge_into_main_if_target_cut(&self, expected_cut: &str) -> Result<MergeOutcome> {
+        self.merge_into_main_if_target_cut(expected_cut)
     }
     fn ingest(&self, source: &Path) -> Result<usize> {
         self.ingest(source)
@@ -4796,6 +4905,46 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(instance.repo().join("same.txt")).expect("unchanged"),
             "from a"
+        );
+    }
+
+    #[test]
+    fn conditional_merge_refuses_even_an_unrelated_mainline_advance() {
+        let (_directory, instance) = instance();
+        instance
+            .seed_main(&[("agent/AGENTS.md", "baseline")])
+            .expect("seed");
+        let baseline_cut = instance.current_main_cut().unwrap().unwrap();
+        let candidate = instance.create_engagement("candidate").expect("candidate");
+        candidate
+            .write_file("agent/AGENTS.md", "improved")
+            .expect("candidate edit");
+        candidate.commit_turn("candidate").expect("candidate cut");
+
+        let other = instance.create_engagement("other").expect("other");
+        other.write_file("notes.md", "human edit").expect("edit");
+        other.commit_turn("human edit").expect("cut");
+        assert_eq!(other.merge_into_main().unwrap(), MergeOutcome::Clean);
+        assert!(candidate
+            .merge_into_main_if_target_cut(&baseline_cut)
+            .unwrap_err()
+            .to_string()
+            .contains("baseline is stale"));
+        assert_eq!(
+            instance
+                .read_main_file("agent/AGENTS.md")
+                .unwrap()
+                .as_deref(),
+            Some("baseline")
+        );
+
+        let current_cut = instance.current_main_cut().unwrap().unwrap();
+        let fresh = instance.create_engagement("fresh").expect("fresh");
+        fresh.write_file("agent/AGENTS.md", "improved").unwrap();
+        fresh.commit_turn("candidate").unwrap();
+        assert_eq!(
+            fresh.merge_into_main_if_target_cut(&current_cut).unwrap(),
+            MergeOutcome::Clean
         );
     }
 

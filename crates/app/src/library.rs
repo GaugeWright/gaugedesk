@@ -748,6 +748,57 @@ pub fn target_id_path_v1(target_id: &str) -> Result<String, String> {
     Ok(encoded)
 }
 
+/// A work target's name is the name of its folder in a work chat (DR-0248),
+/// so it follows folder rules: non-empty, at most 255 bytes, no `/`, `\\`,
+/// NUL or other control character, and no leading `.`, which every entry the
+/// runtime owns at the workspace root begins with.
+pub fn validate_target_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a target name is required".to_owned());
+    }
+    if name.len() > 255 {
+        return Err("a target name is at most 255 bytes".to_owned());
+    }
+    if name.starts_with('.') {
+        return Err("a target name cannot begin with `.`".to_owned());
+    }
+    if name
+        .chars()
+        .any(|character| character == '/' || character == '\\' || character.is_control())
+    {
+        return Err("a target name cannot contain `/`, `\\` or a control character".to_owned());
+    }
+    Ok(())
+}
+
+/// The key two target names collide under: Unicode NFC normalization, then
+/// case folding. Two names with one key would be one folder on a Mac, and look
+/// like one folder to the person reading them.
+pub fn target_name_key(name: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(name)
+        .to_lowercase()
+}
+
+/// A valid name for a target of this project that no other target of it
+/// already uses under [`target_name_key`].
+pub fn validate_project_target_name<'a>(
+    name: &str,
+    target_id: Option<&str>,
+    others: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<(), String> {
+    validate_target_name(name)?;
+    let key = target_name_key(name);
+    for (other_id, other_name) in others {
+        if Some(other_id) != target_id && target_name_key(other_name) == key {
+            return Err(format!(
+                "another target in this project is already named `{other_name}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_target_set_revision(record: &ChatTargetSetRevisionRecord) -> Result<(), String> {
     if record.chat_id.is_empty() {
         return Err("a target-set revision must name its chat".to_owned());
@@ -1531,6 +1582,40 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
         assert_eq!(value["schema"], 1);
         assert_eq!(value["future_field"], serde_json::json!({"nested": true}));
+    }
+
+    #[test]
+    fn target_names_follow_folder_rules_and_collide_as_folders_do() {
+        for valid in [
+            "api",
+            "client site files",
+            "Été",
+            "a.b",
+            "x".repeat(255).as_str(),
+        ] {
+            assert!(validate_target_name(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "tab\there",
+            "nul\0",
+            "x".repeat(256).as_str(),
+        ] {
+            assert!(validate_target_name(invalid).is_err(), "{invalid:?}");
+        }
+        // NFC and case: `É` composed and decomposed, and `API`/`api`, collide.
+        assert_eq!(
+            target_name_key("E\u{301}t\u{e9}"),
+            target_name_key("\u{c9}T\u{c9}")
+        );
+        assert_eq!(target_name_key("API"), target_name_key("api"));
+        let others = [("t1", "Docs"), ("t2", "api")];
+        assert!(validate_project_target_name("docs", Some("t3"), others).is_err());
+        assert!(validate_project_target_name("docs", Some("t1"), others).is_ok());
+        assert!(validate_project_target_name("web", None, others).is_ok());
     }
 
     #[test]

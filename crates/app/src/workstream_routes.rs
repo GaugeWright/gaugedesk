@@ -270,7 +270,7 @@ impl Workbench {
     /// mainline advances. Promotion updates the managed target store; without this
     /// reconciliation, existing Main chat worktrees keep their old cut and make a
     /// successful promotion look like a no-op in the workbench.
-    fn sync_mainline_members(&self, storage_id: &str) -> Vec<String> {
+    pub(crate) fn sync_mainline_members(&self, storage_id: &str) -> Vec<String> {
         let Some(mainline) = self
             .workspace_by_storage_id(storage_id)
             .map(|workspace| workspace.mainline())
@@ -852,6 +852,8 @@ pub async fn promote_workstream(
         .workspace_by_storage_id(&root.workspace_id)
         .map(|workspace| workspace.mainline().to_owned())
         .unwrap_or_else(|| "main".to_owned());
+    // A promotion may carry renames (DR-0248); the project's names follow Main.
+    wb.project_main_target_names(&root.project_id);
     let members = if rehomed.is_empty() {
         promotion_members
     } else {

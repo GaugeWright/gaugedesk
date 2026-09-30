@@ -12,6 +12,7 @@ import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { DiffView as GitDiffView, DiffModeEnum, getLang } from "@git-diff-view/solid";
 import "@git-diff-view/solid/styles/diff-view.css";
 import { partitionedToolTarget } from "./tool-detail";
+import { isTargetNameFile, targetNameForRoot, targetRenames, type TargetName } from "./target-names";
 
 // Below this width the side-by-side split renders each column at a few characters,
 // wrapping a sentence one-syllable-per-line — illegible on the app's primary review
@@ -104,8 +105,11 @@ function isInternalFile(display: string): boolean {
     return name.startsWith(".");
 }
 
-export function DiffView(props: { diff: string }) {
-    const allFiles = () => splitFiles(props.diff);
+export function DiffView(props: { diff: string; targets?: readonly TargetName[] }) {
+    // A target's name file is shown as the rename it records, not as a file.
+    const allFiles = () => splitFiles(props.diff).filter((f) => !isTargetNameFile(f.display));
+    const renames = () => targetRenames(props.diff);
+    const targetName = (root: string | null) => root ? targetNameForRoot(root, props.targets ?? []) : null;
     // Default the review to the user's actual deliverables; fold internal config
     // artifacts under a quiet disclosure so "2 files changed" reads as the one file
     // the user cares about. If *every* changed file is internal, show them (there's
@@ -165,11 +169,14 @@ export function DiffView(props: { diff: string }) {
     const mode = () => (split() && wide() ? DiffModeEnum.Split : DiffModeEnum.Unified);
 
     return (
-        <Show when={files().length} fallback={<div class="status">no changes</div>}>
+        <Show when={files().length || renames().length} fallback={<div class="status">no changes</div>}>
             <div class="diff" ref={rootEl}>
                 <div class="diff-toolbar">
                     <span class="status">
-                        {files().length} file{files().length === 1 ? "" : "s"} changed
+                        {[
+                            files().length ? `${files().length} file${files().length === 1 ? "" : "s"} changed` : "",
+                            renames().length ? `${renames().length} folder${renames().length === 1 ? "" : "s"} renamed` : "",
+                        ].filter(Boolean).join(", ")}
                     </span>
                     {/* The internal config file is folded away by default (round-6 #4);
                         a quiet toggle reveals it for the curious, matching the Files
@@ -204,12 +211,21 @@ export function DiffView(props: { diff: string }) {
                         </span>
                     </Show>
                 </div>
+                <For each={renames()}>
+                    {(rename) => (
+                        <div class="diff-file diff-rename" data-target-rename={rename.root}>
+                            <div class="diff-file-head">
+                                {rename.from ? `Renamed folder ${rename.from} to ${rename.to}` : `Named folder ${rename.to}`}
+                            </div>
+                        </div>
+                    )}
+                </For>
                 <For each={files()}>
                     {(f) => (
                         <div class="diff-file" data-target-root={f.targetRoot ?? undefined}>
                             <div class="diff-file-head">
-                                <Show when={f.targetRoot}>
-                                    {(target) => <span class="diff-target">Target {target()} · </span>}
+                                <Show when={targetName(f.targetRoot)}>
+                                    {(name) => <span class="diff-target">Target {name()} · </span>}
                                 </Show>
                                 {f.targetRelativePath}
                             </div>

@@ -14,7 +14,7 @@
  * **rejects** (isolate); a conflict surfaces with repair/retry.
  */
 
-import { createEffect, createMemo, createResource, createSignal, lazy, Match, on, onCleanup, Show, Suspense, Switch, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, lazy, Match, on, onCleanup, Show, Suspense, Switch, type JSX } from "solid-js";
 import { editorSaveUpdate } from "./editor-save-update";
 import { editorRequestFence } from "./editor-request-fence";
 import type { SaveBase, SaveFileResult } from "@gaugewright/control-plane-client";
@@ -957,9 +957,31 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                         <button data-merge-retry onClick={() => session.merge("retry")}>try again</button>
                     </Show>
                 </div>
+                {/* A target this chat names differently from its line (DR-0248):
+                    its name is a hidden versioned file, so the choice is offered
+                    here rather than in an editor. Either choice retries the merge. */}
+                <Show when={(phase() === "Rejected" && session.mergeConflicted()) || phase() === "Repairing"}>
+                    <For each={session.targetNameDisagreements?.() ?? []}>
+                        {(disagreement) => (
+                            <div class="bar merge-review name-conflict" style={{ "margin-bottom": "10px" }} data-target-name-conflict>
+                                <span class="status">
+                                    This chat calls a folder <strong>{disagreement.chatName}</strong>; the shared copy calls it <strong>{disagreement.lineName}</strong>.
+                                </span>
+                                <button data-name-keep-chat onClick={() => void session.settleTargetName?.(disagreement.root, "chat")}>
+                                    keep {disagreement.chatName}
+                                </button>
+                                <button data-name-keep-line onClick={() => void session.settleTargetName?.(disagreement.root, "line")}>
+                                    use {disagreement.lineName}
+                                </button>
+                            </div>
+                        )}
+                    </For>
+                </Show>
                 {/* Once discarded, the changes are gone — don't keep rendering the
                     stale diff as if it were still live to keep/discard (#1). */}
-                <Show when={phase() !== "Rejected"} fallback={<div class="status discarded-note">These changes were discarded. Send a new request to try again.</div>}>
+                {/* A conflicted change is preserved for repair, not discarded: keep
+                    showing it, so the person can see what conflicts. */}
+                <Show when={phase() !== "Rejected" || session.mergeConflicted()} fallback={<div class="status discarded-note">These changes were discarded. Send a new request to try again.</div>}>
                     {/* One honest empty state when there's nothing to review — never an
                         empty diff sitting under a keep/discard prompt (round-11 #3). */}
                     <Show
@@ -967,7 +989,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                         fallback={<div class="status diff-empty" data-diff-empty>Nothing has changed yet. When the assistant edits files, you'll see what changed here — ready to keep or discard.</div>}
                     >
                         <Suspense fallback={<div class="status">loading diff…</div>}>
-                            <DiffView diff={diff()} />
+                            <DiffView diff={diff()} targets={session.targets?.() ?? []} />
                         </Suspense>
                     </Show>
                 </Show>

@@ -34,6 +34,7 @@ import {
     type ChoiceSelection,
 } from "@gaugewright/control-plane-client";
 import { type Transcript } from "./transcript";
+import { type NameDisagreement, type TargetName } from "./target-names";
 import { type ImageRef } from "./attachments";
 import {
     type ComposerCapabilities,
@@ -231,6 +232,14 @@ export interface Session {
     /** Whether a `Rejected` merge isolated because of a git **conflict** (couldn't be merged)
      *  rather than a user discard — so the UI says "conflicted", not "you discarded". */
     readonly mergeConflicted: Accessor<boolean>;
+    /** The chat's targets by stored root and name (DR-0248), so a view can
+     *  name a target instead of showing its encoded partition. Optional: an
+     *  environment that cannot list them shows paths without a target name. */
+    readonly targets?: Accessor<readonly TargetName[]>;
+    /** For a conflicted chat, the targets it names differently from its line
+     *  (DR-0248), with the action that settles one and retries the merge. */
+    readonly targetNameDisagreements?: Accessor<readonly NameDisagreement[]>;
+    readonly settleTargetName?: (root: string, keep: "chat" | "line") => Promise<void>;
     /** Whether this chat edits a reusable method ("edit") or does work ("work") —
      *  drives keep/kept vocabulary. */
     readonly chatKind: Accessor<"work" | "edit">;

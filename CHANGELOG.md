@@ -19,6 +19,23 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- A chat's changes name each target folder instead of showing its internal
+  id, and a folder renamed in the chat shows as a rename. When two chats
+  rename one folder differently, the conflicted chat offers keeping its name
+  or using the shared one, and a conflicted change stays visible instead of
+  reading as discarded. A target can now be renamed from the project's
+  settings. On hosted placements an agent's folder rename is kept once the
+  Home confirms it after the turn (DR-0248).
+
+- The agent in a work chat now sees each of the chat's targets as a folder
+  named after the target, such as `api/src/main.rs`, instead of an encoded
+  `targets/t-…` path, and never sees a target's permanent id. Renaming that
+  folder, by the agent's `mv` or from the Files pane, renames the target on the
+  chat's line; the rest of the project takes the new name when the line reaches
+  Main. Target names must now work as folder names and be unique in their
+  project; existing names that are not are adjusted once, at startup
+  (DR-0248).
+
 - Hosted GaugeDesk now offers Privacy & analytics controls: people can opt out
   per account, and organization owners can disable feature usage collection
   for their organization. The first measured actions are chat creation and

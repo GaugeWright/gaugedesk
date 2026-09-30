@@ -2128,16 +2128,8 @@ fn run_claimed_engagement_turn(
         ScriptedFakeFactory::startup_window(task);
         stop_checkpoint(id)?;
         bind_turn_interrupt(id, std::sync::Arc::new(move || releases.stop()));
-        // A real failure in here is still a failure; only the hold being cut
-        // short is an interrupt.
-        ScriptedFakeFactory::pre_turn(worktree, task, &hold)?;
-        if hold.was_stopped() {
-            return Err(EngineError::Interrupted);
-        }
-        // The fake ignores the runtime config; the spec carries the shell's
-        // minimal base policy for the seam's sake. Provider resolution and the
-        // fail-closed credential precheck are real-run policy, skipped here as
-        // before.
+        // The fake writes to disk directly rather than through the agent's
+        // named view (DR-0248), so it is handed the stored roots it may write.
         let process_declaration = wb.lock_unpoisoned().prepare_turn_process_declaration(
             id,
             factory.kind(),
@@ -2145,6 +2137,27 @@ fn run_claimed_engagement_turn(
             0,
             None,
         )?;
+        let writable_roots = process_declaration
+            .as_ref()
+            .map(|process| {
+                process
+                    .harness_bindings()
+                    .into_iter()
+                    .filter(|binding| binding.writable)
+                    .map(|binding| binding.root)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // A real failure in here is still a failure; only the hold being cut
+        // short is an interrupt.
+        ScriptedFakeFactory::pre_turn(worktree, task, &hold, &writable_roots)?;
+        if hold.was_stopped() {
+            return Err(EngineError::Interrupted);
+        }
+        // The fake ignores the runtime config; the spec carries the shell's
+        // minimal base policy for the seam's sake. Provider resolution and the
+        // fail-closed credential precheck are real-run policy, skipped here as
+        // before.
         let spec = HarnessSpec {
             chat_id: id.to_string(),
             worktree: worktree.to_path_buf(),
@@ -2824,6 +2837,8 @@ fn greedy_autosync(
 ) {
     let mut g = wb.lock_unpoisoned();
     g.greedy_autosync(id, sender, contribution_by);
+    // A rename the turn made reaches the project's names once Main has it.
+    g.project_chat_main_target_names(id);
 }
 
 /// The settle-time auto-advance (ADR 0082 §4): a settled turn on a **mainline**
@@ -2848,6 +2863,7 @@ fn auto_advance_turn(
 ) {
     let mut g = wb.lock_unpoisoned();
     g.auto_advance_turn(id, sender, guarantee_outcomes);
+    g.project_chat_main_target_names(id);
 }
 
 /// Whether a unified diff names no file — mirrors the web client's `diffHasFiles`
@@ -3109,6 +3125,33 @@ fn live_sink(sender: &broadcast::Sender<ServerEvent>) -> impl FnMut(&Observation
     }
 }
 
+/// Records an agent's rename of a target's folder on its chat's line
+/// (DR-0248). Each call takes the workbench lock briefly, as filing a task
+/// does, and applies the same rules as a rename in the Files pane.
+struct CurrentChatTargetRenamer {
+    wb: SharedWorkbench,
+    chat_id: String,
+}
+
+impl gaugedesk_harness::TargetRenamer for CurrentChatTargetRenamer {
+    fn rename_target(&self, root: &str, _from: &str, to: &str) -> Result<(), String> {
+        let mut g = self.wb.lock_unpoisoned();
+        g.rename_chat_target_root(&self.chat_id, root, to)
+    }
+
+    fn report_refused(&self, from: &str, to: &str, reason: &str) {
+        let mut g = self.wb.lock_unpoisoned();
+        let event = ServerEvent::Admitted {
+            kind: "edit".into(),
+            text: format!("kept the folder name {from} instead of {to}: {reason}"),
+        };
+        let _ = g
+            .store_mut()
+            .append_record(&self.chat_id, "transcript", &event.to_json());
+        g.publish(&self.chat_id, event);
+    }
+}
+
 /// Bound to the admitted turn; each call rechecks current project authority.
 struct CurrentProjectTaskFiler {
     wb: SharedWorkbench,
@@ -3294,6 +3337,19 @@ fn drive_persistent_turn(
                 _ => None,
             };
         harness.bind_task_filer(task_filer);
+        // DR-0248: a cached harness shows this turn's names, and an agent's
+        // rename of a target's folder is recorded on this chat's line.
+        harness
+            .bind_workspace_targets(spec.workspace_targets.clone())
+            .map_err(EngineError::Harness)?;
+        let target_renamer: Option<Arc<dyn gaugedesk_harness::TargetRenamer>> =
+            (!spec.workspace_targets.is_empty()).then(|| {
+                Arc::new(CurrentChatTargetRenamer {
+                    wb: Arc::clone(wb),
+                    chat_id: id.to_owned(),
+                }) as Arc<dyn gaugedesk_harness::TargetRenamer>
+            });
+        harness.bind_target_renamer(target_renamer);
         let external_tool_handler = if spec.mode == gaugedesk_harness::ChatMode::Use {
             let workbench = Arc::clone(wb);
             let conversation_id = id.to_owned();

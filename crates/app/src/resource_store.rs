@@ -140,7 +140,8 @@ pub(crate) fn bind_context_import(
 }
 
 fn is_target_payload_path(path: &str) -> bool {
-    path != gaugedesk_boundary::definition::CONFIG_PATH
+    !crate::target_names::is_target_name_path(path)
+        && path != gaugedesk_boundary::definition::CONFIG_PATH
         && path != gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT
         && !path.starts_with(&format!(
             "{}/",
@@ -2082,6 +2083,9 @@ pub(crate) async fn post_resource_export_to_disk(
             return err_response(error);
         }
     }
+    // Each target leaves under its name, as the chat shows it (DR-0248), not
+    // under its stable-ID partition.
+    let named_roots = wb.chat_target_folder_names(&id);
     let mut written = Vec::new();
     for rel in &files {
         let content = match wb.read_engagement_file(&id, rel) {
@@ -2091,7 +2095,14 @@ pub(crate) async fn post_resource_export_to_disk(
                 return (StatusCode::BAD_REQUEST, format!("{rel}: {e}")).into_response()
             }
         };
-        let out = dest.join(rel);
+        let shown = named_roots
+            .iter()
+            .find_map(|(root, name)| {
+                rel.strip_prefix(&format!("{root}/"))
+                    .map(|rest| format!("{name}/{rest}"))
+            })
+            .unwrap_or_else(|| rel.clone());
+        let out = dest.join(&shown);
         if let Some(parent) = out.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return (
@@ -2108,7 +2119,7 @@ pub(crate) async fn post_resource_export_to_disk(
             )
                 .into_response();
         }
-        written.push(rel.clone());
+        written.push(shown);
     }
 
     let egress = serde_json::json!({

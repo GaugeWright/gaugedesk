@@ -12,8 +12,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gaugedesk_harness::{
     ContextWindowReading, EgressGate, Harness, HarnessContinuitySpec, HarnessSpec, ImageContent,
     InterruptHandle, ModelContextHandle, ModelUsage, Observation, OutputFieldFlow, RuntimePosition,
-    ToolInfo, TurnOutcome,
+    TargetRenamer, ToolInfo, TurnOutcome,
 };
+
+/// Where the Durable Object records each presented-root rename it admits for
+/// this Home to ratify (WhippleScript DR-0148). Outside every selected root,
+/// so the agent never sees it; taken back with the workspace and never written
+/// into the chat's checkout.
+const ROOT_RENAME_RECORDS: &str = ".whipplescript/root-renames/";
+
+/// One rename the hosted placement admitted, as it recorded it.
+#[derive(serde::Deserialize)]
+struct RecordedRootRename {
+    selector: String,
+    from: String,
+    to: String,
+}
 use serde_json::{json, Value};
 
 use super::{
@@ -288,6 +302,7 @@ pub(crate) fn create_harness(
         .to_owned(),
         credential_ref: required_ref(spec.credential_ref.as_deref(), "credential ref")?.to_owned(),
         workspace_targets: spec.workspace_targets.clone(),
+        target_renamer: None,
         provider: required_ref(spec.provider.as_deref(), "provider")?.to_owned(),
         model: required_ref(spec.model.as_deref(), "model")?.to_owned(),
         placement_ceiling_ref: required_ref(
@@ -515,6 +530,8 @@ fn continuity_open_command(
 }
 
 struct DoHarness {
+    /// Ratifies each rename the hosted placement admitted (DR-0248).
+    target_renamer: Option<Arc<dyn TargetRenamer>>,
     config: DoHostConfig,
     placement: String,
     worktree: PathBuf,
@@ -546,6 +563,39 @@ struct DoHarness {
 }
 
 impl Harness for DoHarness {
+    /// A cached hosted harness shows each turn's target names (DR-0248) and
+    /// re-derives the read-only roots its workspace push attenuates.
+    fn bind_workspace_targets(
+        &mut self,
+        targets: Vec<gaugedesk_harness::WorkspaceTargetBinding>,
+    ) -> io::Result<()> {
+        if targets == self.workspace_targets {
+            return Ok(());
+        }
+        validate_workspace_targets(&targets).map_err(invalid_data)?;
+        let previous = self
+            .workspace_targets
+            .iter()
+            .map(|target| self.worktree.join(&target.root))
+            .chain(std::iter::once(
+                self.worktree.join(TARGET_MANIFEST_SELECTOR),
+            ))
+            .collect::<BTreeSet<_>>();
+        self.read_only.retain(|path| !previous.contains(path));
+        self.read_only.extend(
+            targets
+                .iter()
+                .filter(|target| !target.writable)
+                .map(|target| self.worktree.join(&target.root)),
+        );
+        if !targets.is_empty() {
+            self.read_only
+                .push(self.worktree.join(TARGET_MANIFEST_SELECTOR));
+        }
+        self.workspace_targets = targets;
+        Ok(())
+    }
+
     fn bind_authenticated_actor(&mut self, actor_ref: &str) {
         if !actor_ref.trim().is_empty() {
             self.actor_ref = actor_ref.to_owned();
@@ -554,6 +604,10 @@ impl Harness for DoHarness {
 
     fn bind_runtime_command_id(&mut self, command_id: Option<&str>) {
         self.runtime_command_id = command_id.map(str::to_owned);
+    }
+
+    fn bind_target_renamer(&mut self, renamer: Option<Arc<dyn TargetRenamer>>) {
+        self.target_renamer = renamer;
     }
 
     fn bind_user_context_provenance(&mut self, sources: Option<&[String]>) {
@@ -599,6 +653,7 @@ impl Harness for DoHarness {
                 kind: "command".into(),
                 selector: None,
                 writable: None,
+                presented_as: None,
             });
         }
         // ADR 0111: no suspended epoch to resume. Every hosted turn is an
@@ -624,6 +679,7 @@ impl Harness for DoHarness {
                         kind: "image".into(),
                         selector: Some(index.to_string()),
                         writable: None,
+                        presented_as: None,
                     })
                     .collect(),
             },
@@ -698,7 +754,19 @@ impl Harness for DoHarness {
         // the next.
         self.cancel_requested.store(false, Ordering::SeqCst);
         let pull_started = Instant::now();
-        self.pull_workspace()?;
+        let renames = self.pull_workspace()?;
+        // After the pull, which rewrites the checkout from the placement's
+        // copy: a ratified rename writes the chat's name file, and the pull
+        // would otherwise restore the copy pushed at the turn's start.
+        if let Some(renamer) = &self.target_renamer {
+            for rename in &renames {
+                if let Err(reason) =
+                    renamer.rename_target(&rename.selector, &rename.from, &rename.to)
+                {
+                    renamer.report_refused(&rename.from, &rename.to, &reason);
+                }
+            }
+        }
         let pull_workspace_ms = pull_started.elapsed().as_secs_f64() * 1000.0;
         let project_started = Instant::now();
         let mut outcome = project_result_inner(
@@ -820,7 +888,7 @@ impl DoHarness {
         Ok(())
     }
 
-    fn pull_workspace(&self) -> io::Result<()> {
+    fn pull_workspace(&self) -> io::Result<Vec<RecordedRootRename>> {
         let listing = get_json(
             &self.config,
             &self.placement,
@@ -848,6 +916,7 @@ impl DoHarness {
             )?;
             remote.insert(path.to_owned(), content);
         }
+        let (remote, recorded) = split_root_rename_records(remote)?;
 
         // Validate the entire remote projection before changing the local
         // workspace. Read-only roots were synced so the hosted model could
@@ -895,12 +964,35 @@ impl DoHarness {
                 fs::remove_file(target)?;
             }
         }
-        Ok(())
+        // The records are not pushed back: the next push leaves them out and
+        // the placement drops them.
+        Ok(recorded)
     }
 
     fn is_read_only(&self, path: &Path) -> bool {
         self.read_only.iter().any(|root| path.starts_with(root))
     }
+}
+
+/// Separate the placement's rename records from the workspace it hands back,
+/// in the order it admitted them (its record paths sort that way).
+fn split_root_rename_records(
+    mut remote: BTreeMap<String, String>,
+) -> io::Result<(BTreeMap<String, String>, Vec<RecordedRootRename>)> {
+    let records = remote
+        .keys()
+        .filter(|path| path.starts_with(ROOT_RENAME_RECORDS))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut renames = Vec::with_capacity(records.len());
+    for path in records {
+        let content = remote.remove(&path).unwrap_or_default();
+        renames.push(
+            serde_json::from_str::<RecordedRootRename>(&content)
+                .map_err(|error| invalid_data(format!("hosted rename record `{path}`: {error}")))?,
+        );
+    }
+    Ok((remote, renames))
 }
 
 fn host_request<T: serde::Serialize>(
@@ -926,6 +1018,15 @@ fn host_turn_request(
     user_context_sources: Option<&[String]>,
 ) -> io::Result<Value> {
     let mut request = host_request(command, package)?;
+    // DR-0248: this Home ratifies each rename the placement admits, after the
+    // command, since the placement cannot ask it mid-command.
+    if command
+        .resources
+        .iter()
+        .any(|resource| resource.presented_as.is_some())
+    {
+        request["workspace_root_renames"] = Value::from("recorded");
+    }
     request["initial_model_provenance"] = hosted_initial_model_provenance(
         &command.package_version_ref,
         mode,
@@ -1824,6 +1925,44 @@ mod tests {
     }
 
     #[test]
+    fn hosted_rename_records_are_taken_out_of_the_workspace_in_order() {
+        let record = |from: &str, to: &str| {
+            json!({ "handle": "target:t-a", "selector": "targets/t-a", "from": from, "to": to })
+                .to_string()
+        };
+        let remote = BTreeMap::from([
+            ("targets/t-a/a.txt".to_owned(), "a".to_owned()),
+            (
+                format!("{ROOT_RENAME_RECORDS}000002.json"),
+                record("backend", "server"),
+            ),
+            (
+                format!("{ROOT_RENAME_RECORDS}000001.json"),
+                record("api", "backend"),
+            ),
+        ]);
+        let (files, renames) = split_root_rename_records(remote).unwrap();
+        assert_eq!(files.keys().collect::<Vec<_>>(), ["targets/t-a/a.txt"]);
+        assert_eq!(
+            renames
+                .iter()
+                .map(|rename| (
+                    rename.selector.as_str(),
+                    rename.from.as_str(),
+                    rename.to.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("targets/t-a", "api", "backend"),
+                ("targets/t-a", "backend", "server")
+            ]
+        );
+        let broken =
+            BTreeMap::from([(format!("{ROOT_RENAME_RECORDS}000001.json"), "{".to_owned())]);
+        assert!(split_root_rename_records(broken).is_err());
+    }
+
+    #[test]
     fn custom_transport_receives_exact_placement_local_operation() {
         let transport = Arc::new(RecordingTransport::default());
         let config = DoHostConfig::with_transport("tenant:one", transport.clone(), false).unwrap();
@@ -2002,6 +2141,7 @@ mod tests {
             kind: "command".into(),
             selector: None,
             writable: None,
+            presented_as: None,
         }];
         let mut streamed = Vec::new();
         let outcome = project_result(&result, &resources, "openai", "gpt-test", &mut |item| {

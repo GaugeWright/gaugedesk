@@ -367,6 +367,9 @@ fn build_workbench_with_content_keywrap_for_home(
     // the sealed account state. No-op on a holder / seed-recovered device (none stored).
     wb.restore_recovered_account_key();
     federation::activate_configured_federation(&mut wb)?;
+    // DR-0248: every project target has a valid, unique name on collaboration
+    // Main, which the target records project.
+    wb.migrate_target_names();
     // Enterprise SSO activation (`ID-3`) moved with the ee band (`gaugedesk-ee`,
     // SPLIT-1): the ee/hosted compositions call `activate_configured_idp` right
     // after workbench open, through the open `set_identity_provider` seam.

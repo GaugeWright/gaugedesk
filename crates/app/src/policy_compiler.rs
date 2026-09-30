@@ -815,6 +815,7 @@ mod tests {
                 readable: true,
                 writable: true,
                 output: true,
+                name: String::new(),
             },
             crate::target_change_set::ProcessTargetBinding {
                 target_id: "target-b".to_owned(),
@@ -829,6 +830,7 @@ mod tests {
                 readable: true,
                 writable: false,
                 output: false,
+                name: String::new(),
             },
         ];
 

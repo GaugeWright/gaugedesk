@@ -45,6 +45,23 @@ fn signed_out_local_personal_files_unassigned_into_its_only_exposed_tracker() {
 }
 
 #[test]
+fn creating_a_project_initializes_its_tasks_tracker() {
+    let (_root, shared, context, _request) = fixture(ECHO);
+    let mut wb = shared.lock_unpoisoned();
+    crate::library_routes::create_named_project(
+        &mut wb,
+        "project-tracker-create",
+        "Tracker project",
+    )
+    .expect("create project");
+    let trackers = wb
+        .list_project_trackers(&context, "project-tracker-create")
+        .expect("read created project tracker");
+    assert_eq!(trackers.len(), 1);
+    assert_eq!(trackers[0].queue, "tasks");
+}
+
+#[test]
 fn agent_task_tool_files_a_real_personal_issue_once_under_current_authority() {
     let (_root, shared, context, _request) = fixture(ECHO);
     let mut wb = shared.lock_unpoisoned();

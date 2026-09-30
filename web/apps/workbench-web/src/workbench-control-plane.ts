@@ -203,6 +203,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     private readonly localWorkTransport: workbenchClient.WorkbenchTransport;
     private homeTransport: Promise<workbenchClient.WorkbenchTransport> | null = null;
     private selectedDirectJson: RouteJson | null = null;
+    private selectedDirectHome: { key: string; transport: Promise<workbenchClient.WorkbenchTransport> } | null = null;
     /** Several Homes at once, resolved per project (DESK-3). There is no
      * selected Home here: whichever project is open decides which Home serves,
      * and a Home that fails degrades only the projects routed to it. */
@@ -314,6 +315,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     private async invalidateHomeTransport(project: ProjectId | null): Promise<void> {
         if (project) await this.pool?.invalidateProject(project);
         this.homeTransport = null;
+        this.selectedDirectHome = null;
     }
 
     /** The shell proves local Home standing separately from Hub sign-in. A
@@ -325,6 +327,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.homeAdmission = null;
         this.homeTransport = null;
         this.selectedDirectJson = null;
+        this.selectedDirectHome = null;
         void this.pool?.closeAll().catch(() => undefined);
         this.pool = null;
         for (const reconnect of this.restartWorkStreams) reconnect();
@@ -334,6 +337,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     async closeAccountConnections(): Promise<void> {
         this.credentialGeneration++;
         this.homeTransport = null;
+        this.selectedDirectHome = null;
         const selected = this.selectedDirectJson;
         this.selectedDirectJson = null;
         const pool = this.pool;
@@ -353,6 +357,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             this.credentialGeneration++;
             this.homeAdmission = null;
             this.homeTransport = null;
+            this.selectedDirectHome = null;
             void this.pool?.closeAll().catch(() => undefined);
             this.pool = null;
         }
@@ -748,27 +753,40 @@ export class WorkbenchControlPlane implements ControlPlane {
             const pool = await this.homePool();
             return (await pool.connectHome(selected.id)).api;
         }
-        let admission: string | null = null;
-        const auth = {
-            bearer: () => this.bearer,
-            homeAdmission: () => admission,
-        };
-        const json = browserRouteJson(selected.endpoint, auth);
-        const result = (await json("POST", "/home/admissions")) as {
-            home?: unknown;
-            admission?: unknown;
-        };
-        if (result.home !== selected.id || typeof result.admission !== "string") {
-            throw new Error(`Selected Home identity mismatch: expected ${selected.id}`);
-        }
-        admission = result.admission;
-        this.homeAdmission = admission;
-        return {
-            base: selected.endpoint,
-            json,
-            request: browserRouteRequest(selected.endpoint, auth),
-            events: browserRouteEventStream(selected.endpoint, auth),
-        };
+        // A project switch must reuse this admission. The task bar reads
+        // several projects, and opening a second admission revokes the first.
+        const endpoint = selected.endpoint;
+        const key = `${this.credentialGeneration}:${selected.id}:${endpoint}`;
+        if (this.selectedDirectHome?.key === key) return this.selectedDirectHome.transport;
+        const transport = (async () => {
+            let admission: string | null = null;
+            const auth = {
+                bearer: () => this.bearer,
+                homeAdmission: () => admission,
+            };
+            const json = browserRouteJson(endpoint, auth);
+            const result = (await json("POST", "/home/admissions")) as {
+                home?: unknown;
+                admission?: unknown;
+            };
+            if (result.home !== selected.id || typeof result.admission !== "string") {
+                throw new Error(`Selected Home identity mismatch: expected ${selected.id}`);
+            }
+            admission = result.admission;
+            this.homeAdmission = admission;
+            this.selectedDirectJson = json;
+            return {
+                base: endpoint,
+                json,
+                request: browserRouteRequest(endpoint, auth),
+                events: browserRouteEventStream(endpoint, auth),
+            };
+        })().catch((error) => {
+            if (this.selectedDirectHome?.key === key) this.selectedDirectHome = null;
+            throw error;
+        });
+        this.selectedDirectHome = { key, transport };
+        return transport;
     }
 
     async bootstrapHome(): Promise<HomeBootstrapState> {
@@ -1135,6 +1153,19 @@ export class WorkbenchControlPlane implements ControlPlane {
         }, { idempotencyKey: key });
     }
 
+    /** DR-0248: a target's name, recorded on the project's collaboration Main. */
+    async setProjectManagementTargetName(project: ProjectId, target: string, name: string): Promise<void> {
+        const session = await this.openProjectManagement(project);
+        const json = await this.projectManagementJson(project);
+        const key = globalThis.crypto.randomUUID();
+        await json("POST", `/projects/${encodeURIComponent(project)}/settings/commands`, {
+            session_id: session.id, generation: session.generation, app: "project-settings", scope: session.scope,
+            page_id: "work-data", command_id: "project.target.name.set",
+            expected_basis: session.pages.find((page) => page.id === "work-data")?.resource_basis,
+            idempotency_key: key, payload: { target_id: target, name }, client: "web",
+        }, { idempotencyKey: key });
+    }
+
     async setProjectManagementName(project: ProjectId, name: string): Promise<void> {
         const session = await this.openProjectManagement(project);
         const json = await this.projectManagementJson(project);
@@ -1353,6 +1384,10 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     renameProject(id: ProjectId, name: string): Promise<void> {
         return this.setProjectManagementName(id, name);
+    }
+
+    renameProjectTarget(project: ProjectId, target: string, name: string): Promise<void> {
+        return this.setProjectManagementTargetName(project, target, name);
     }
 
     setProjectNetworkIsolated(id: ProjectId, isolated: boolean): Promise<void> {

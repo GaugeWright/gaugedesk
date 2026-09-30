@@ -710,6 +710,30 @@
         "signature": "fn active_engagements (& self) -> Result < Vec < String > >"
       },
       "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "read_line_file",
+        "owner": "ChatWorkspace",
+        "signature": "fn read_line_file (& self , _relative : & str) -> Result < Option < String > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "resolve_conflict_taking",
+        "owner": "ChatWorkspace",
+        "signature": "fn resolve_conflict_taking (& self , _relative : & str , _ours : bool) -> Result < bool >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "merge_into_main_if_target_cut",
+        "owner": "ChatWorkspace",
+        "signature": "fn merge_into_main_if_target_cut (& self , _expected_cut : & str) -> Result < MergeOutcome >"
+      },
+      "classification": "requires-provenance-review"
     }
   ],
   "profiles": {
@@ -967,7 +991,7 @@
         "callable": "impl inherent for Workbench::create_default_engagement",
         "capability": "create_engagement_subset",
         "count": 1,
-        "expression": "workspace . create_engagement_subset (& id , workspace . mainline () , & BTreeSet :: from ([root]))",
+        "expression": "workspace . create_engagement_subset (& id , workspace . mainline () , & roots)",
         "file": "crates/app/src/engagement_routes.rs"
       },
       "profile": "editor-and-import"
@@ -5036,7 +5060,7 @@
       "site": {
         "callable": "impl inherent for Workbench::apply_file_manager_command",
         "capability": "publish",
-        "count": 1,
+        "count": 2,
         "expression": "self . publish (chat_id , event)",
         "file": "crates/app/src/engagement_routes.rs"
       },
@@ -5501,6 +5525,246 @@
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::rename_target_folder",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "self . engagements . get (chat_id) . ok_or_else (| | (StatusCode :: NOT_FOUND , \"no such chat\" . to_owned ())) ? . commit_turn (& text)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::rename_target_folder",
+        "capability": "publish",
+        "count": 1,
+        "expression": "self . publish (chat_id , event)",
+        "file": "crates/app/src/engagement_routes.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::chat_target_name",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& target_name_path (target_id) . ok () ?)",
+        "file": "crates/app/src/target_names.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::main_target_name",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& target_name_path (target_id) . ok () ?)",
+        "file": "crates/app/src/target_names.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::rename_chat_target",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "self . engagements . get (chat_id) . ok_or_else (| | \"this chat's workspace is not open\" . to_owned ()) ? . write_file_bytes (& path , encode_name (to) . as_bytes ())",
+        "file": "crates/app/src/target_names.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::seed_main_target_name",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "self . collaboration_workspaces . get (& workspace_id) . ok_or_else (| | \"project collaboration workspace is not open\" . to_owned ()) ? . seed_main (& [(path . as_str () , body . as_str ())])",
+        "file": "crates/app/src/target_names.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl gaugedesk_harness :: TargetRenamer for CurrentChatTargetRenamer::report_refused",
+        "capability": "publish",
+        "count": 1,
+        "expression": "g . publish (& self . chat_id , event)",
+        "file": "crates/app/src/engine.rs"
+      },
+      "profile": "agent-turn"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::line_target_name",
+        "capability": "read_line_file",
+        "count": 1,
+        "expression": "self . engagements . get (chat_id) ? . read_line_file (& target_name_path (target_id) . ok () ?)",
+        "file": "crates/app/src/target_names.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::settle_target_name",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (& format ! (\"took the project's name {line_name}\"))",
+        "file": "crates/app/src/target_names.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::settle_target_name",
+        "capability": "resolve_conflict_taking",
+        "count": 1,
+        "expression": "engagement . resolve_conflict_taking (& path , keep_chat)",
+        "file": "crates/app/src/target_names.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::settle_target_name",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "engagement . write_file_bytes (& path , encode_name (& line_name) . as_bytes ())",
+        "file": "crates/app/src/target_names.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::read_line_file",
+        "capability": "read_line_file",
+        "count": 1,
+        "expression": "self . read_line_file (relative)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::resolve_conflict_taking",
+        "capability": "resolve_conflict_taking",
+        "count": 1,
+        "expression": "self . resolve_conflict_taking (relative , ours)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "prepare_native_shadow_pair_from_authoring",
+        "capability": "current_main_cut",
+        "count": 2,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/agent_improve.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "adopt_candidate",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (\"adopt Agent improvement candidate\")",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "adopt_candidate",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& engagement_id)",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "adopt_candidate",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "adopt_candidate",
+        "capability": "delete_entry",
+        "count": 1,
+        "expression": "engagement . delete_entry (path)",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "adopt_candidate",
+        "capability": "merge_into_main_if_target_cut",
+        "count": 1,
+        "expression": "engagement . merge_into_main_if_target_cut (expected_cut)",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "adopt_candidate",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& engagement_id)",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "adopt_candidate",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (path , body)",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for AgentDefinitionSnapshot::from_main",
+        "capability": "main_tree",
+        "count": 1,
+        "expression": "workspace . main_tree ()",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for AgentDefinitionSnapshot::from_main",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& entry . path)",
+        "file": "crates/app/src/agent_improve_adoption.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::merge_into_main_if_target_cut",
+        "capability": "merge_into_main_if_target_cut",
+        "count": 1,
+        "expression": "self . merge_into_main_if_target_cut (expected_cut)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
     }
   ]
 }

@@ -120,6 +120,7 @@ fn resources(
                     kind: "tracker".into(),
                     selector: Some(tracker.queue.clone()),
                     writable: Some(true),
+                    presented_as: None,
                 },
                 basis: ActionBasis::Version {
                     version_ref: whipplescript_store::stable_hash_hex(
@@ -137,6 +138,7 @@ fn resources(
                     kind: "tracker_issue".into(),
                     selector: Some(subject.clone()),
                     writable: Some(true),
+                    presented_as: None,
                 },
                 basis: ActionBasis::Version {
                     version_ref: whipplescript_store::stable_hash_hex(&subject),

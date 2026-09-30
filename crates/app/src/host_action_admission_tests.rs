@@ -69,6 +69,7 @@ pub(super) fn command(delegated: bool) -> HostActionCommand {
                     kind: "file_store".into(),
                     selector: Some("note.md".into()),
                     writable: Some(true),
+                    presented_as: None,
                 },
                 basis: ActionBasis::Version {
                     version_ref: "retained-base-cut".into(),

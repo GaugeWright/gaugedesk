@@ -102,6 +102,7 @@ pub(super) fn resource(
             kind: "resolution_memory".into(),
             selector: Some(serde_json::to_string(scope).map_err(|error| error.to_string())?),
             writable: Some(false),
+            presented_as: None,
         },
         basis: ActionBasis::Version {
             version_ref: scope.version_ref(),

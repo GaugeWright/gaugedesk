@@ -2928,12 +2928,10 @@ fn open_project_chat_engagements(
             })?
             .members
             .iter()
-            .map(|member| {
-                crate::library::target_id_path_v1(&member.target_id)
-                    .map(|encoded| format!("targets/{encoded}"))
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-            })
-            .collect::<std::io::Result<BTreeSet<_>>>()?;
+            .map(|member| member.target_id.as_str())
+            .collect::<Vec<_>>();
+        let roots = crate::target_names::chat_target_roots(roots)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let home = workspace.engagement_home_receipt(&chat.id).map_err(io)?;
         let target = home
             .line_branch_id
@@ -3902,6 +3900,9 @@ impl Workbench {
     }
 
     pub(crate) fn refresh_work_target_basis_from_chat(&mut self, chat_id: &str) {
+        // Called once a chat's merge has advanced Main, which may carry a
+        // rename (DR-0248).
+        self.project_chat_main_target_names(chat_id);
         let Some(target_id) = self.engagement_index.get(chat_id).cloned() else {
             return;
         };
@@ -4064,7 +4065,7 @@ impl Workbench {
             .iter()
             .any(|entry| entry.path == root || entry.path.starts_with(&format!("{root}/")));
         if exists {
-            return Ok(());
+            return self.ensure_recorded_main_target_name(project_id, target_id);
         }
 
         let source = self
@@ -4105,7 +4106,22 @@ impl Workbench {
             .ok_or_else(|| "project collaboration workspace is not open".to_owned())?
             .seed_main(&borrowed)
             .map(|_seeded| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.ensure_recorded_main_target_name(project_id, target_id)
+    }
+
+    /// Name a recorded target on Main (DR-0248). A target being attached has
+    /// no record yet; its attach names it once the record is written.
+    fn ensure_recorded_main_target_name(
+        &mut self,
+        project_id: &str,
+        target_id: &str,
+    ) -> Result<(), String> {
+        if self.library.work_targets.contains_key(target_id) {
+            self.ensure_main_target_name(project_id, target_id)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn write_workstream_root_record(&mut self, record: WorkstreamRootRecord) {
@@ -4131,6 +4147,9 @@ impl Workbench {
         if self.library.work_targets.contains_key(&target_id) {
             return Ok(target_id);
         }
+        // DR-0248: a proposed name such as `<project> files` is made a valid,
+        // free folder name rather than refused.
+        let name = self.free_target_name(project_id, &name);
         let project = self
             .library
             .projects
@@ -4661,10 +4680,12 @@ impl Workbench {
                     .work_targets
                     .get(&member.target_id)
                     .ok_or_else(|| format!("target {} is unavailable", member.target_id))?;
+                // DR-0248: the agent knows each target by the folder it sees,
+                // so the manifest names that folder and carries no stable id.
+                let name = self.chat_target_name(chat_id, &member.target_id);
                 Ok(serde_json::json!({
-                    "target_id": member.target_id,
-                    "display_name": target.name,
-                    "root": format!("targets/{}", crate::library::target_id_path_v1(&member.target_id)?),
+                    "name": name,
+                    "root": name,
                     "kind": target.kind,
                     "adapter_family": member.adapter_family,
                     "basis": self.library.chat_target_basis(chat_id, &member.target_id)
@@ -4677,7 +4698,7 @@ impl Workbench {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let manifest = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": "gaugedesk.target-set.v1",
+            "schema": "gaugedesk.target-set.v2",
             "chat_id": chat_id,
             "target_set_revision": target_set.revision,
             "targets": members,
@@ -4935,13 +4956,9 @@ impl Workbench {
                     .project_collaboration_workspaces
                     .get(project_id)
                     .ok_or_else(|| "project collaboration workspace is unresolved".to_owned())?;
-                let roots = targets
-                    .iter()
-                    .map(|target| {
-                        crate::library::target_id_path_v1(&target.id)
-                            .map(|encoded| format!("targets/{encoded}"))
-                    })
-                    .collect::<Result<BTreeSet<_>, _>>()?;
+                let roots = crate::target_names::chat_target_roots(
+                    targets.iter().map(|target| target.id.as_str()),
+                )?;
                 (workspace.workspace_id.clone(), Some(roots))
             }
             InstanceKind::Authoring => (target_id.clone(), None),
@@ -5124,13 +5141,9 @@ impl Workbench {
         for (target, _) in &targets {
             self.ensure_collaboration_target_partition(project_id, &target.id)?;
         }
-        let roots = targets
-            .iter()
-            .map(|(target, _)| {
-                crate::library::target_id_path_v1(&target.id)
-                    .map(|encoded| format!("targets/{encoded}"))
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
+        let roots = crate::target_names::chat_target_roots(
+            targets.iter().map(|(target, _)| target.id.as_str()),
+        )?;
         self.engagements
             .get_mut(chat_id)
             .ok_or_else(|| "chat collaboration branch is unavailable".to_owned())?
@@ -6982,13 +6995,9 @@ impl Workbench {
             let sparse_roots = (instance.kind == InstanceKind::Using
                 && historical_snapshot.is_some())
             .then(|| {
-                members
-                    .iter()
-                    .map(|member| {
-                        crate::library::target_id_path_v1(&member.target_id)
-                            .map(|encoded| format!("targets/{encoded}"))
-                    })
-                    .collect::<Result<BTreeSet<_>, _>>()
+                crate::target_names::chat_target_roots(
+                    members.iter().map(|member| member.target_id.as_str()),
+                )
             })
             .transpose()
             .map_err(ForkChatError::Create)?;
@@ -7525,7 +7534,7 @@ impl Workbench {
                         crate::library::target_id_path_v1(&member.target_id)
                             .expect("validated stable target id has a path encoding")
                     ),
-                    "name": member_target.name,
+                    "name": self.chat_target_name(&chat.id, &member.target_id),
                     "kind": member_target.kind,
                     "adapter": member_target.adapter,
                     "adapter_family": member.adapter_family,
@@ -7558,6 +7567,12 @@ impl Workbench {
             "collaboration_workspace_id": collaboration_workspace_id,
             "workstream": chat_ws.get(&chat.id),
             "conflict": conflict,
+            // DR-0248: a conflicted chat can settle a name its line disagrees on.
+            "target_name_disagreements": if conflict {
+                self.target_name_disagreements(&chat.id)
+            } else {
+                Vec::new()
+            },
             "rehome_blocked": rehome_blocked,
         })
     }

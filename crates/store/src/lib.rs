@@ -24,6 +24,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 pub mod command_dispatch;
 pub mod command_scope_archive;
+pub mod home_reference_journal;
 mod record_admission;
 #[cfg(test)]
 mod record_claim_tests;
@@ -239,7 +240,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 2;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 4;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -351,6 +352,70 @@ const MIGRATIONS: &[Migration] = &[
              );
              INSERT OR IGNORE INTO store_meta(key, value)
                  VALUES ('created_at', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
+    },
+    Migration {
+        version: 3,
+        name: "home-reference-journal",
+        // A Home-wide roster must live with the Home command authority, not
+        // inside one chat, gate, or action runtime store (DR-0250). Migration
+        // cannot establish coverage of older operations or of doors that are
+        // not wired yet: inventory_complete deliberately starts false.
+        sql: "CREATE TABLE IF NOT EXISTS home_reference_state (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 home_id TEXT,
+                 current_epoch INTEGER NOT NULL CHECK (current_epoch >= 0),
+                 inventory_complete INTEGER NOT NULL DEFAULT 0
+                     CHECK (inventory_complete = 0)
+             );
+             INSERT OR IGNORE INTO home_reference_state
+                 (id, home_id, current_epoch, inventory_complete)
+                 VALUES (1, NULL, 0, 0);
+             CREATE TABLE IF NOT EXISTS home_reference_operations (
+                 operation_id TEXT PRIMARY KEY,
+                 home_id TEXT NOT NULL,
+                 target_store TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 basis_digest TEXT NOT NULL,
+                 registered_epoch INTEGER NOT NULL,
+                 completed_epoch INTEGER,
+                 status TEXT NOT NULL CHECK (status IN ('pending', 'completed')),
+                 evidence_ref TEXT,
+                 witness_digest TEXT,
+                 revalidated_basis_digest TEXT,
+                 CHECK (
+                     (status = 'pending' AND completed_epoch IS NULL
+                      AND evidence_ref IS NULL AND witness_digest IS NULL
+                      AND revalidated_basis_digest IS NULL)
+                     OR
+                     (status = 'completed' AND completed_epoch IS NOT NULL
+                      AND evidence_ref IS NOT NULL AND witness_digest IS NOT NULL)
+                 )
+             );
+             CREATE INDEX IF NOT EXISTS home_reference_operations_epoch
+                 ON home_reference_operations(completed_epoch, operation_id);
+             CREATE TABLE IF NOT EXISTS home_reference_seals (
+                 epoch INTEGER PRIMARY KEY,
+                 home_id TEXT NOT NULL,
+                 registry_basis TEXT NOT NULL,
+                 policy_basis TEXT NOT NULL,
+                 structural_basis TEXT NOT NULL,
+                 roster_digest TEXT NOT NULL,
+                 operation_count INTEGER NOT NULL CHECK (operation_count >= 0)
+             );",
+    },
+    Migration {
+        version: 4,
+        name: "home-reference-terminal-refusals",
+        // Keep the v3 operation rows and sealed-roster encoding intact. A
+        // refused registration remains in the Home's durable account of work
+        // without entering the completed-operation cut (DR-0250).
+        sql: "CREATE TABLE IF NOT EXISTS home_reference_refusals (
+                 operation_id TEXT PRIMARY KEY
+                     REFERENCES home_reference_operations(operation_id),
+                 home_id TEXT NOT NULL,
+                 refused_epoch INTEGER NOT NULL CHECK (refused_epoch >= 0),
+                 reason_code TEXT NOT NULL CHECK (length(reason_code) > 0)
+             );",
     },
 ];
 
@@ -2014,7 +2079,11 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(versions, vec![1, 2], "each migration recorded exactly once");
+        assert_eq!(
+            versions,
+            vec![1, 2, 3, 4],
+            "each migration recorded exactly once"
+        );
         let created_at: String = store
             .conn
             .query_row(
@@ -2056,7 +2125,10 @@ mod tests {
                 .conn
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(rows, 2, "no duplicate ledger rows on re-open");
+            assert_eq!(
+                rows, SUPPORTED_SCHEMA_VERSION,
+                "no duplicate ledger rows on re-open"
+            );
             let still: String = store
                 .conn
                 .query_row(

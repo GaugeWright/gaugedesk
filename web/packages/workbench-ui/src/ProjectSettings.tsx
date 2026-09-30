@@ -40,6 +40,9 @@ export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi 
         role?: "member" | "viewer",
     ): Promise<CreatedHomeInvitation>;
     setProjectNetworkIsolated(project: ProjectId, isolated: boolean): Promise<void>;
+    /** Rename a work target for the whole project (DR-0248): its name is the
+     *  folder every chat and Agent sees it as. */
+    renameProjectTarget?(project: ProjectId, target: string, name: string): Promise<void>;
     placeArchetype(project: ProjectId, archetype: ArchetypeId, recipient?: CollectionRecipient): Promise<PlacementId>;
     ensureCollectionRecipient?(recipientId: string): Promise<CollectionRecipient>;
     acceptPlacement(placement: PlacementId): Promise<void>;
@@ -202,6 +205,27 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
 function WorkAndData(props: ProjectSettingsProps): JSX.Element {
     const [busy, setBusy] = createSignal(false);
     const [status, setStatus] = createSignal("");
+    const [renaming, setRenaming] = createSignal<string | null>(null);
+    const [draftName, setDraftName] = createSignal("");
+    const renameTarget = async (target: string, previous: string) => {
+        const name = draftName().trim();
+        if (!name || name === previous) {
+            setRenaming(null);
+            return;
+        }
+        setBusy(true);
+        setStatus("");
+        try {
+            await props.api.renameProjectTarget?.(props.project.id, target, name);
+            setStatus(`Renamed ${previous} to ${name}.`);
+            setRenaming(null);
+            await props.onChanged();
+        } catch (error) {
+            setStatus(describeError(error));
+        } finally {
+            setBusy(false);
+        }
+    };
     const setNetwork = async () => {
         setBusy(true);
         setStatus("");
@@ -225,8 +249,22 @@ function WorkAndData(props: ProjectSettingsProps): JSX.Element {
             <div class="project-settings-rows">
                 <For each={props.project.targets} fallback={<p class="project-settings-empty">No work targets are attached.</p>}>
                     {(target) => <div class="project-settings-row project-settings-target-row">
-                        <div><strong>{target.name}</strong><small>{target.kind} · {target.status} · {target.capabilities.propose ? "writable" : "read-only"}</small></div>
-                        <span>{target.currentBasis ? "Current" : "No basis"}</span>
+                        <Show
+                            when={renaming() === target.id}
+                            fallback={<div><strong>{target.name}</strong><small>{target.kind} · {target.status} · {target.capabilities.propose ? "writable" : "read-only"}</small></div>}
+                        >
+                            <form class="project-settings-inline-actions" onSubmit={(event) => { event.preventDefault(); void renameTarget(target.id, target.name); }}>
+                                <input aria-label={`New name for ${target.name}`} value={draftName()} onInput={(event) => setDraftName(event.currentTarget.value)} disabled={busy()} />
+                                <button type="submit" disabled={busy()}>Save</button>
+                                <button type="button" disabled={busy()} onClick={() => setRenaming(null)}>Cancel</button>
+                            </form>
+                        </Show>
+                        <span class="project-settings-inline-actions">
+                            <span>{target.currentBasis ? "Current" : "No basis"}</span>
+                            <Show when={props.api.renameProjectTarget && renaming() !== target.id}>
+                                <button type="button" data-rename-target onClick={() => { setDraftName(target.name); setRenaming(target.id); }}>Rename</button>
+                            </Show>
+                        </span>
                     </div>}
                 </For>
             </div>

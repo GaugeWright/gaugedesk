@@ -1216,6 +1216,7 @@ fn create_named_project_with_extra(
     let finish = (|| {
         wb.ensure_project_collaboration_workspace(id)?;
         let target_id = wb.create_managed_project_target(id, format!("{name} files"))?;
+        wb.ensure_project_tasks_tracker(id)?;
         let placement_id = general_placement_id(id);
         let placement_exists = workspace_value(wb)
             .get("projects")

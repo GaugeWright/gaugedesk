@@ -117,7 +117,12 @@ impl ScriptedFakeFactory {
     /// the blocking pool, pre-lock): the e2e suite opens chats and queues
     /// messages DURING the `[slow]` window, so holding the workbench mutex
     /// through the sleep would serialize what the tests observe as concurrent.
-    pub fn pre_turn(worktree: &Path, task: &str, hold: &SlowHold) -> Result<(), String> {
+    pub fn pre_turn(
+        worktree: &Path,
+        task: &str,
+        hold: &SlowHold,
+        writable_roots: &[String],
+    ) -> Result<(), String> {
         use std::io::Write;
         // `[slow]` opens a window wide enough to observe a busy composer and
         // queue behind it. `[hold]` opens one nothing outlasts, so a test of
@@ -144,26 +149,13 @@ impl ScriptedFakeFactory {
         if task.contains("[no-write]") {
             return Ok(());
         }
-        let target_roots =
-            std::fs::read_to_string(worktree.join(".gaugedesk-runtime/target-set.json"))
-                .ok()
-                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-                .and_then(|manifest| {
-                    manifest["targets"].as_array().map(|targets| {
-                        let writable = targets
-                            .iter()
-                            .filter(|target| target["participation"] == "writable")
-                            .filter_map(|target| target["root"].as_str().map(str::to_owned))
-                            .collect::<Vec<_>>();
-                        if task.contains("[all-writable]") {
-                            writable
-                        } else {
-                            writable.into_iter().take(1).collect()
-                        }
-                    })
-                })
-                .filter(|roots| !roots.is_empty())
-                .unwrap_or_else(|| vec![String::new()]);
+        let mut target_roots = writable_roots.to_vec();
+        if !task.contains("[all-writable]") {
+            target_roots.truncate(1);
+        }
+        if target_roots.is_empty() {
+            target_roots.push(String::new());
+        }
         for target_root in target_roots {
             let note = if target_root.is_empty() {
                 worktree.join("agent-note.txt")

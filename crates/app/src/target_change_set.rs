@@ -23,6 +23,10 @@ pub(crate) struct ProcessTargetBinding {
     pub(crate) target_id: String,
     pub(crate) resource_handle: String,
     pub(crate) root: String,
+    /// The target's name on the chat's line, the folder the agent sees
+    /// (DR-0248). Absent from declarations recorded before it existed.
+    #[serde(default)]
+    pub(crate) name: String,
     pub(crate) native_basis: String,
     pub(crate) adapter_family: String,
     pub(crate) path_scope: Vec<String>,
@@ -75,6 +79,7 @@ impl TurnProcessDeclaration {
                 target_id: binding.target_id.clone(),
                 resource_handle: binding.resource_handle.clone(),
                 root: binding.root.clone(),
+                name: binding.name.clone(),
                 readable: binding.readable,
                 writable: binding.writable,
                 output: binding.output,
@@ -192,6 +197,7 @@ impl Workbench {
                     target_id: member.target_id.clone(),
                     resource_handle: format!("target:{encoded}"),
                     root: format!("targets/{encoded}"),
+                    name: self.chat_target_name(chat_id, &member.target_id),
                     native_basis,
                     adapter_family: member.adapter_family.clone(),
                     path_scope: member.path_scope.clone(),
@@ -267,6 +273,11 @@ impl Workbench {
         let changed = crate::advancement::TurnFacts::changed_paths_of(&result.diff);
         let mut by_target = BTreeMap::<String, BTreeSet<String>>::new();
         for path in changed {
+            // A target's name (DR-0248) is versioned beside its partition and
+            // is not a change to the target's content.
+            if crate::target_names::is_target_name_path(&path) {
+                continue;
+            }
             let matches = process
                 .bindings
                 .iter()

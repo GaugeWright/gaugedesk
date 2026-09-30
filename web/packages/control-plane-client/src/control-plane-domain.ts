@@ -127,8 +127,19 @@ export interface ChatNode {
      *  `changes` dot went with per-change review (ADR 0136) — a clean candidate
      *  always settles now, so there is nothing for it to report. */
     readonly conflict: boolean;
+    /** For a conflicted chat, each target whose name differs between the chat
+     *  and the line it merges into, to settle (DR-0248). */
+    readonly targetNameDisagreements?: readonly TargetNameDisagreement[];
     /** True while re-homing would discard/transplant a candidate workspace. */
     readonly rehomeBlocked: boolean;
+}
+
+/** A target named differently by a chat and its line (DR-0248). `root` is the
+ *  target's stored folder, `targets/<id>`, which is never shown. */
+export interface TargetNameDisagreement {
+    readonly root: string;
+    readonly chatName: string;
+    readonly lineName: string;
 }
 
 /** A **workstream** (WS-E): a named shared auto-sync line within a placement. Member
@@ -636,8 +647,21 @@ type RawChat = {
     available_acts: TargetActKind[];
     changes?: boolean;
     conflict?: boolean;
+    target_name_disagreements?: unknown[];
     rehome_blocked?: boolean;
 };
+
+function parseTargetNameDisagreements(raw: unknown[] | undefined): TargetNameDisagreement[] {
+    return valueList(raw ?? [], "chat.target_name_disagreements").map((item, index) => {
+        const o = (item ?? {}) as Record<string, unknown>;
+        const field = `chat.target_name_disagreements[${index}]`;
+        return {
+            root: requiredString(o.root, `${field}.root`),
+            chatName: requiredString(o.chat_name, `${field}.chat_name`),
+            lineName: requiredString(o.line_name, `${field}.line_name`),
+        };
+    });
+}
 
 function parseChatTargetMember(raw: unknown, field: string): ChatTargetMember {
     const o = (raw ?? {}) as Record<string, unknown>;
@@ -703,6 +727,7 @@ const parseChat = (c: RawChat): ChatNode => {
     candidateRevision: requiredString(c.candidate_revision, "chat.candidate_revision"),
     availableActs: parseTargetActs(c.available_acts, "chat.available_acts"),
     conflict: c.conflict ?? false,
+    targetNameDisagreements: parseTargetNameDisagreements(c.target_name_disagreements),
     rehomeBlocked: c.rehome_blocked ?? true,
     });
 };

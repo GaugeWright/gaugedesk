@@ -405,6 +405,7 @@ impl Workbench {
                                     .map_err(|error| std::io::Error::other(debug_error(error)))?,
                                 ),
                                 writable: Some(false),
+                                presented_as: None,
                             },
                             basis: ActionBasis::Version {
                                 version_ref: source_input.version_ref.clone(),
@@ -422,6 +423,7 @@ impl Workbench {
                                     kind: "tracker".into(),
                                     selector: Some(queue.clone()),
                                     writable: Some(true),
+                                    presented_as: None,
                                 },
                                 basis: ActionBasis::Version {
                                     version_ref: whipplescript_store::stable_hash_hex(
