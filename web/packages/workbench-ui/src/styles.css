@@ -633,13 +633,14 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     font-size: var(--fs-small); }
 /* The account row, flush to the very bottom corner of the column. */
 .organization-bar { padding: 5px 8px 0; border-top: 1px solid; border-image: var(--shell-gold-rule) 1; }
+.organization-bar:empty { display: none; }
 .account-bar { padding: 5px 8px 6px; border-top: 1px solid; border-image: var(--shell-gold-rule) 1; }
 .account-switcher { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 0 6px; }
 .account-switcher button { border: 1px solid var(--edge); border-radius: 5px; background: transparent; color: inherit; padding: 4px 7px; cursor: pointer; }
 .account-switcher button[aria-current="true"] { font-weight: 700; }
 .account-switcher button:disabled { cursor: default; opacity: .65; }
 .account-switcher p { flex-basis: 100%; margin: 2px 0; color: var(--danger, #a33); }
-.organization-bar + .account-bar { border-top: 0; }
+.organization-bar:not(:empty) + .account-bar { border-top: 0; }
 .update-label { color: var(--muted); padding: 0 4px; font-size: var(--fs-label); line-height: 1.35; }
 .desktop-update { margin: 1px 4px 0; padding: 1px 4px; border: 1px solid var(--accent);
     border-radius: 4px; background: transparent; color: var(--accent); font: inherit; cursor: pointer; }

@@ -647,3 +647,197 @@ fn controller_dispatch_uses_the_exact_revocable_device_source_and_home() {
         .load_editor_file_save_dispatch_authority(&inputs, &command, &grant.grant_ref)
         .is_err());
 }
+
+#[test]
+fn retained_dispatch_refuses_an_idle_session_and_fences_already_prepared_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, command, inputs, token) = admitted_fixture(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let grant = wb
+        .authorize_editor_file_save_dispatch(&context, &inputs, &command, "idle-background")
+        .unwrap();
+    let scoped = wb
+        .load_editor_file_save_dispatch_authority(&inputs, &command, &grant.grant_ref)
+        .unwrap();
+    let prepared = wb
+        .prepare_native_editor_action(&scoped.context, &inputs, &command, &command.policy)
+        .unwrap();
+    let session_ref = crate::account_session::session_id(&token);
+    let mut session = crate::account_auth::AccountAuth::rebuild(wb.store_ref())
+        .unwrap()
+        .sessions[&session_ref]
+        .clone();
+    session.issued_at_ms =
+        crate::account::session_now_ms() - crate::account::SESSION_IDLE_MS - 1000;
+    session.last_seen_ms = session.issued_at_ms;
+    session.lifetime_secs = crate::account::SESSION_ABSOLUTE_LIFETIME_MS / 1000;
+    crate::account_auth::append_facts(
+        wb.store_mut(),
+        &[crate::account_auth::AccountAuthFact::Session(session)],
+    )
+    .unwrap();
+    assert!(wb.account_sessions().resolve_now(&token).is_some());
+    assert!(wb.authenticate_bearer(&token).is_none());
+    assert!(wb
+        .load_editor_file_save_dispatch_authority(&inputs, &command, &grant.grant_ref)
+        .is_err());
+    assert!(wb
+        .prepare_native_editor_action(&scoped.context, &inputs, &command, &command.policy)
+        .is_err());
+    assert!(wb
+        .store_mut()
+        .with_dispatch_basis(&prepared.basis, || panic!(
+            "idle source executed prepared work"
+        ))
+        .is_err());
+}
+
+#[test]
+fn retained_dispatch_rechecks_the_bound_account_device_without_cache_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, command, inputs, token) = admitted_fixture(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let session_ref = crate::account_session::session_id(&token);
+    let scope = crate::account::account_scope("alice");
+    let mut device = crate::account::DeviceRecord {
+        id: "office-device".into(),
+        op: crate::account::RecordOp::Upsert,
+        label: "Synthetic office client".into(),
+        kind: crate::account::DeviceKind::Computer,
+        subkey_pubkey: "synthetic-device-key".into(),
+        status: crate::account::DeviceStatus::Active,
+        enrolled_at: 1,
+    };
+    wb.upsert_account_device_in(&scope, &device).unwrap();
+    assert!(wb.bind_account_session_device(&session_ref, "alice", &device.id));
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let grant = wb
+        .authorize_editor_file_save_dispatch(&context, &inputs, &command, "device-background")
+        .unwrap();
+    let scoped = wb
+        .load_editor_file_save_dispatch_authority(&inputs, &command, &grant.grant_ref)
+        .unwrap();
+    let prepared = wb
+        .prepare_native_editor_action(&scoped.context, &inputs, &command, &command.policy)
+        .unwrap();
+    device.status = crate::account::DeviceStatus::Revoked;
+    wb.upsert_account_device_in(&scope, &device).unwrap();
+    assert!(
+        wb.account_sessions().resolve_now(&token).is_some(),
+        "cache eviction is not the source of this refusal"
+    );
+    assert!(wb.authenticate_bearer(&token).is_none());
+    assert!(wb
+        .load_editor_file_save_dispatch_authority(&inputs, &command, &grant.grant_ref)
+        .is_err());
+    assert!(wb
+        .prepare_native_editor_action(&scoped.context, &inputs, &command, &command.policy)
+        .is_err());
+    assert!(wb
+        .store_mut()
+        .with_dispatch_basis(&prepared.basis, || panic!(
+            "revoked device executed prepared work"
+        ))
+        .is_err());
+    // Losing the newer revocation payload must not expose the older active row.
+    struct HiddenDeviceRevocation {
+        inner: std::sync::Arc<dyn gaugedesk_store::ContentCodec>,
+    }
+    impl gaugedesk_store::ContentCodec for HiddenDeviceRevocation {
+        fn encode(&self, scope: &str, kind: &str, payload: &str) -> Result<String, String> {
+            self.inner.encode(scope, kind, payload)
+        }
+        fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String> {
+            let plain = self.inner.decode(scope, kind, payload)?;
+            if kind == "device" && plain.contains("revoked") {
+                None
+            } else {
+                Some(plain)
+            }
+        }
+    }
+    wb.store = wb
+        .store_ref()
+        .sibling()
+        .unwrap()
+        .with_codec(std::sync::Arc::new(HiddenDeviceRevocation {
+            inner: wb.content_vault.clone().unwrap(),
+        }));
+    assert!(wb.authenticate_bearer(&token).is_none());
+    assert!(wb
+        .prepare_native_editor_action(&scoped.context, &inputs, &command, &command.policy)
+        .is_err());
+}
+
+#[test]
+fn retained_dispatch_keeps_its_original_idle_ceiling_after_provider_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, command, inputs, _) = admitted_fixture(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let token = wb
+        .mint_account_session(
+            "alice",
+            "oidc",
+            crate::account::SESSION_ABSOLUTE_LIFETIME_MS / 1000,
+        )
+        .unwrap();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let grant = wb
+        .authorize_editor_file_save_dispatch(&context, &inputs, &command, "refresh-background")
+        .unwrap();
+    let scoped = wb
+        .load_editor_file_save_dispatch_authority(&inputs, &command, &grant.grant_ref)
+        .unwrap();
+    let first = wb
+        .prepare_native_editor_action(&scoped.context, &inputs, &command, &command.policy)
+        .unwrap();
+    let session_ref = crate::account_session::session_id(&token);
+    let source = crate::account_session::durable_evidence(
+        wb.store_ref(),
+        &session_ref,
+        crate::account::session_now_ms(),
+    )
+    .unwrap()
+    .unwrap()
+    .1;
+    let expected = std::time::UNIX_EPOCH
+        + std::time::Duration::from_millis(source.issued_at_ms + crate::account::SESSION_IDLE_MS);
+    assert_eq!(first.basis.deadline(), Some(expected));
+    let scope = crate::account::account_scope("alice");
+    wb.upsert_account_refresh_in(
+        &scope,
+        &session_ref,
+        crate::account::RefreshBinding::Web,
+        "",
+        "synthetic-sealed-refresh",
+        source.issued_at_ms,
+    )
+    .unwrap();
+    wb.touch_account_refresh_in(&scope, &session_ref, source.issued_at_ms + 1000)
+        .unwrap();
+    let fresh = crate::account_session::durable_evidence(
+        wb.store_ref(),
+        &session_ref,
+        crate::account::session_now_ms(),
+    )
+    .unwrap()
+    .unwrap()
+    .1;
+    assert!(fresh.expires_at_ms > source.expires_at_ms);
+    assert!(wb
+        .store_mut()
+        .with_dispatch_basis(&first.basis, || panic!(
+            "changed refresh executed prepared work"
+        ))
+        .is_err());
+    let later = wb
+        .prepare_native_editor_action(&scoped.context, &inputs, &command, &command.policy)
+        .unwrap();
+    assert_eq!(first.basis.deadline(), later.basis.deadline());
+    let retry = wb
+        .authorize_editor_file_save_dispatch(&context, &inputs, &command, "refresh-background")
+        .unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.grant_ref, grant.grant_ref);
+}

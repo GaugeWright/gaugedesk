@@ -48,7 +48,7 @@ fn set_membership(wb: &SharedWorkbench, account: &str, status: MembershipStatus)
 fn nobody_signed_in_claims_nothing_and_leaves_the_question_open() {
     let (_root, wb) = open();
     assert!(
-        matches!(claim_state(&wb).unwrap(), HomeClaimState::Available { projects } if projects >= 1)
+        matches!(claim_state(&wb).unwrap(), HomeClaimState::Available { projects, fresh: true } if projects >= 1)
     );
     assert_eq!(claim_if_never_claimed(&wb).unwrap(), HomeClaim::NotSignedIn);
     assert!(
@@ -56,6 +56,40 @@ fn nobody_signed_in_claims_nothing_and_leaves_the_question_open() {
         "signing in later still leaves the claim open"
     );
     assert_eq!(org(&wb).active_count_with_role("owner"), 0);
+}
+
+/// A fresh Home has nothing DR-0219 protects, so the desktop may claim it
+/// without asking (DR-0264); a project a person made ends that.
+#[test]
+fn a_home_is_fresh_until_it_holds_a_project_a_person_made() {
+    let (_root, wb) = open();
+    assert!(matches!(
+        claim_state(&wb).unwrap(),
+        HomeClaimState::Available { fresh: true, .. }
+    ));
+    {
+        let mut guard = wb.lock_unpoisoned();
+        let home_id = guard.home_id().clone();
+        guard.library.apply_project(crate::library::ProjectRecord {
+            schema: crate::library::LIBRARY_RECORD_SCHEMA,
+            extra: Default::default(),
+            id: "p-made".into(),
+            op: RecordOp::Upsert,
+            name: "Made".into(),
+            is_default: false,
+            home_id,
+            network_isolated: false,
+            run_purpose: None,
+            deployment_mode: None,
+        });
+    }
+    assert!(matches!(
+        claim_state(&wb).unwrap(),
+        HomeClaimState::Available {
+            fresh: false,
+            projects: 2
+        }
+    ));
 }
 
 #[test]
@@ -200,4 +234,59 @@ fn the_owner_can_take_a_native_action_the_empty_directory_refused() {
     );
     claim_if_never_claimed(&wb).unwrap();
     declare("after").expect("the owner declares a tracker in their own Personal project");
+}
+
+/// DR-0265: an owner admits another of their accounts, once, and nobody else
+/// can admit anyone.
+#[test]
+fn an_owner_admits_another_account_as_owner_once() {
+    let (_root, wb) = open();
+    crate::account_signin::store_session_for_test(&wb);
+    assert_eq!(
+        claim_if_never_claimed(&wb).unwrap(),
+        HomeClaim::Owner("account-root".into())
+    );
+
+    assert_eq!(
+        admit_owner(&wb, "stranger", "second-account").unwrap(),
+        OwnerAdmission::NotAnOwner,
+        "an account that owns nothing admits nobody"
+    );
+    assert_eq!(org(&wb).role_of("second-account"), None);
+
+    assert_eq!(
+        admit_owner(&wb, "account-root", "second-account").unwrap(),
+        OwnerAdmission::Admitted
+    );
+    let directory = org(&wb);
+    assert_eq!(
+        directory.role_of("second-account"),
+        Some(gaugedesk_core::abac::Role::owner())
+    );
+    assert!(directory.can_access_project("second-account", DEFAULT_PROJECT));
+    assert_eq!(
+        owners(&wb).unwrap(),
+        vec!["account-root".to_owned(), "second-account".to_owned()]
+    );
+    assert!(wb.lock_unpoisoned().is_home_owner("second-account"));
+    assert_eq!(
+        wb.lock_unpoisoned().home_owner_account().as_deref(),
+        Some("account-root"),
+        "the claimant stays the Home's primary owner"
+    );
+
+    assert_eq!(
+        admit_owner(&wb, "second-account", "account-root").unwrap(),
+        OwnerAdmission::AlreadyOwner
+    );
+    let admissions = wb
+        .lock_unpoisoned()
+        .store_ref()
+        .records(ORG_SCOPE, OWNER_ADMISSION_KIND)
+        .unwrap();
+    assert_eq!(admissions.len(), 1, "a repeated admission writes nothing");
+    let recorded: HomeOwnerAdmission = serde_json::from_str(&admissions[0]).unwrap();
+    assert_eq!(recorded.admitted_by, "account-root");
+    assert_eq!(recorded.account, "second-account");
+    assert_eq!(claims(&wb).len(), 1, "the claim is never rewritten");
 }

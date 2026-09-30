@@ -787,7 +787,9 @@ final class DeviceIdentityPlugin: Plugin {
     }
 }
 
+// Public, or Xcode 27's Swift Build gives the symbol local visibility and the
+// release link cannot find it (tauri-apps/tauri#16130).
 @_cdecl("init_plugin_gaugedesk_device_identity")
-func initPlugin() -> Plugin {
+public func initPlugin() -> Plugin {
     DeviceIdentityPlugin()
 }

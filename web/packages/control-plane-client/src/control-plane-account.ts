@@ -668,9 +668,11 @@ export interface HubSessionStatus {
     expired: boolean;
     /** The Hub-minted trusted-device id this session is bound to (LOGIN-3). */
     device: string | null;
-    /** This computer's one-time Home claim, separate from account sign-in. */
-    homeClaim: { state: "available"; projects: number }
-        | { state: "claimed"; owner: string }
+    /** This computer's one-time Home claim, separate from account sign-in.
+     *  `fresh` is a computer holding nothing a person made, which the desktop
+     *  claims without asking. */
+    homeClaim: { state: "available"; projects: number; fresh: boolean }
+        | { state: "claimed"; owner: string; owners: string[] }
         | { state: "governed" }
         | null;
 }
@@ -680,9 +682,15 @@ function hubSessionStatusFrom(value: unknown): HubSessionStatus {
     const person = typeof o?.person === "string" && o.person ? o.person : null;
     const claim = o?.home_claim as Record<string, unknown> | null;
     const homeClaim = claim?.state === "available" && typeof claim.projects === "number"
-        ? { state: "available" as const, projects: claim.projects }
+        ? { state: "available" as const, projects: claim.projects, fresh: claim.fresh === true }
         : claim?.state === "claimed" && typeof claim.owner === "string"
-            ? { state: "claimed" as const, owner: claim.owner }
+            ? {
+                state: "claimed" as const,
+                owner: claim.owner,
+                owners: Array.isArray(claim.owners)
+                    ? claim.owners.filter((id): id is string => typeof id === "string")
+                    : [claim.owner],
+            }
             : claim?.state === "governed" ? { state: "governed" as const } : null;
     return {
         available: Boolean(o?.available),
@@ -707,6 +715,15 @@ export async function hubSessionStatus(json: RouteJson): Promise<HubSessionStatu
 export async function hubSessionClaimHome(json: RouteJson, person: string): Promise<HubSessionStatus> {
     if (!person) throw new Error("Select an account before claiming this computer");
     return hubSessionStatusFrom(await json("POST", "/account/hub-session/claim-home", {
+        person, confirm: true,
+    }));
+}
+
+/** Make another account signed in on this computer an owner of its Home.
+ * Whichever of the selected account and `person` owns it admits the other. */
+export async function hubSessionAdmitOwner(json: RouteJson, person: string): Promise<HubSessionStatus> {
+    if (!person) throw new Error("Choose the account to admit");
+    return hubSessionStatusFrom(await json("POST", "/account/hub-session/admit-owner", {
         person, confirm: true,
     }));
 }
@@ -782,6 +799,20 @@ export async function hubSessionStart(
     if (typeof o.url !== "string" || !o.url) {
         throw new Error("account sign-in returned no login URL");
     }
+    return { url: o.url, webReturn: typeof o.return === "string" && o.return.startsWith("http://") };
+}
+
+/** Discover corporate sign-in at the Hub and bind it to the desktop's sealed
+ * handoff. No match leaves the card on its ordinary personal account path. */
+export async function hubSessionWorkEmailStart(
+    json: RouteJson,
+    email: string,
+): Promise<{ url: string; webReturn: boolean } | null> {
+    const o = await json("POST", "/account/hub-session/start", { work_email: email }) as {
+        organization?: boolean; url?: string; return?: string;
+    };
+    if (o.organization === false) return null;
+    if (typeof o.url !== "string" || !o.url) throw new Error("organization sign-in returned no login URL");
     return { url: o.url, webReturn: typeof o.return === "string" && o.return.startsWith("http://") };
 }
 

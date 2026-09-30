@@ -6,11 +6,13 @@ import { describe, expect, it } from "vitest";
 import {
     handoffCodeFromPaste,
     hubSessionCallback,
+    hubSessionAdmitOwner,
     hubSessionClaimHome,
     hubSessionAccounts,
     hubSessionReach,
     hubSessionSelect,
     hubSessionStart,
+    hubSessionWorkEmailStart,
     hubSessionStatus,
     parseNativeHandoffCode,
     parseWebReturnHandoffCode,
@@ -124,14 +126,44 @@ describe("hub session wrappers", () => {
         const status = await hubSessionStatus(jsonReturning({
             linked: true, person: "alice", home_claim: { state: "available", projects: 3 },
         }, calls));
-        expect(status.homeClaim).toEqual({ state: "available", projects: 3 });
+        expect(status.homeClaim).toEqual({ state: "available", projects: 3, fresh: false });
+        const fresh = await hubSessionStatus(jsonReturning({
+            linked: true, person: "alice", home_claim: { state: "available", projects: 1, fresh: true },
+        }, []));
+        expect(fresh.homeClaim).toEqual({ state: "available", projects: 1, fresh: true });
         const claimed = await hubSessionClaimHome(jsonReturning({
             linked: true, person: "alice", home_claim: { state: "claimed", owner: "alice" },
         }, calls), "alice");
         expect(calls.at(-1)).toEqual({
             path: "/account/hub-session/claim-home", body: { person: "alice", confirm: true },
         });
-        expect(claimed.homeClaim).toEqual({ state: "claimed", owner: "alice" });
+        // An older desktop names only the claimant; it is then the one owner.
+        expect(claimed.homeClaim).toEqual({ state: "claimed", owner: "alice", owners: ["alice"] });
+    });
+
+    it("sends the account to admit as another owner and reads every owner back", async () => {
+        const calls: Array<{ path: string; body?: unknown }> = [];
+        const admitted = await hubSessionAdmitOwner(jsonReturning({
+            linked: true, person: "alice",
+            home_claim: { state: "claimed", owner: "alice", owners: ["alice", "alice-work"] },
+        }, calls), "alice-work");
+        expect(calls.at(-1)).toEqual({
+            path: "/account/hub-session/admit-owner", body: { person: "alice-work", confirm: true },
+        });
+        expect(admitted.homeClaim).toEqual({ state: "claimed", owner: "alice", owners: ["alice", "alice-work"] });
+    });
+
+    it("corporate entry uses the account handoff and preserves no-match vs failure", async () => {
+        const calls: Array<{ path: string; body?: unknown }> = [];
+        const started = await hubSessionWorkEmailStart(jsonReturning({
+            organization: true, url: "https://idp.example.test/authorize?state=bound", return: "gaugewright://auth/callback",
+        }, calls), "person@company.example");
+        expect(calls).toEqual([{ path: "/account/hub-session/start", body: { work_email: "person@company.example" } }]);
+        expect(started).toEqual({ url: "https://idp.example.test/authorize?state=bound", webReturn: false });
+        expect(await hubSessionWorkEmailStart(jsonReturning({ organization: false }, []), "person@example.test")).toBeNull();
+        await expect(hubSessionWorkEmailStart(jsonReturning({}, []), "person@example.test")).rejects.toThrow(/no login URL/);
+        expect(await hubSessionWorkEmailStart(jsonReturning({ url: "https://idp.test/", return: "http://localhost:5176/" }, []), "person@example.test"))
+            .toEqual({ url: "https://idp.test/", webReturn: true });
     });
 
     it("start demands a login URL", async () => {

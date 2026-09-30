@@ -129,7 +129,7 @@ function writeManagementLocation(app: GaugeAppKind | null, page?: string, tenant
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
 }
 
-function OrganizationSelector(props: {
+export function OrganizationSelector(props: {
     memberships: readonly Membership[];
     selected: string | null;
     canCreate: boolean;
@@ -205,7 +205,8 @@ function OrganizationSelector(props: {
             setSubmitting(false);
         }
     };
-    return <div class="organization-anchor" ref={anchor}>
+    return <Show when={props.canCreate || props.memberships.some((membership) => !membership.personal)}>
+    <div class="organization-anchor" ref={anchor}>
         <button type="button" class="organization-trigger" aria-haspopup="menu" aria-expanded={open()} onClick={() => setOpen((value) => !value)}>
             <span class="organization-mark" aria-hidden="true">{selected() ? icon(selected()!) : "◇"}</span>
             <span><small>{selected()?.personal ? "Account" : "Organization"}</small><strong>{selected()?.display_name ?? "Choose organization"}</strong></span>
@@ -243,15 +244,15 @@ function OrganizationSelector(props: {
                         <button type="button" onClick={cancelCreate} disabled={submitting()}>Cancel</button>
                     </div>
                 </form>}>
-                    <button type="button" class="organization-create-trigger" disabled={!props.canCreate}
-                        onClick={() => setCreating(true)}>{props.canCreate ? "New organization" : "Sign in to create an organization"}</button>
+                    <Show when={props.canCreate}><button type="button" class="organization-create-trigger"
+                        onClick={() => setCreating(true)}>New organization</button></Show>
                 </Show>
                 {pageButtons(props.administration, "administration")}
                 {pageButtons(props.commercial, "commercial-operations")}
             </div>
             </Portal>
         </Show>
-    </div>;
+    </div></Show>;
 }
 
 /** The one GaugeDesk composition. GaugeApps replace pane contents in-place;
@@ -287,10 +288,11 @@ export function EnterpriseWorkbench(): JSX.Element {
         }
     };
 
+    const [accountEnabled, setAccountEnabled] = createSignal(true);
     const account = createGaugeAppWorkspace({
         api,
         app: "account-settings",
-        enabled: () => true,
+        enabled: accountEnabled,
         active: () => activeApp() === "account-settings",
         scope: () => undefined,
         openExternal,
@@ -343,7 +345,10 @@ export function EnterpriseWorkbench(): JSX.Element {
         (session) => api.readGaugeAppPage(session, "account"));
     const [createdMembership, setCreatedMembership] = createSignal<Membership | null>(null);
     const memberships = createMemo<readonly Membership[]>(() => {
-        const model = record(accountIndex()?.model);
+        const admitted = account.session();
+        const page = accountIndex();
+        if (!admitted || page?.scope.kind !== "person" || page.scope.id !== admitted.actor) return [];
+        const model = record(page.model);
         const values = Array.isArray(model?.memberships) ? model.memberships : [];
         const listed = values.flatMap((value) => {
             const membership = record(value);
@@ -390,7 +395,8 @@ export function EnterpriseWorkbench(): JSX.Element {
     const administration = createGaugeAppWorkspace({
         api,
         app: "administration",
-        enabled: () => Boolean(tenant()),
+        enabled: () => Boolean(account.session() && tenant()),
+        actor: () => account.session()?.actor,
         active: () => activeApp() === "administration",
         scope: tenantScope,
         onPageChange: (page) => {
@@ -419,7 +425,8 @@ export function EnterpriseWorkbench(): JSX.Element {
         app: "commercial-operations",
         // Attempt exact-scope admission and let the server decide. A cached
         // membership label or organization kind is never a capability gate.
-        enabled: () => Boolean(tenant()),
+        enabled: () => Boolean(account.session() && tenant()),
+        actor: () => account.session()?.actor,
         active: () => activeApp() === "commercial-operations",
         scope: providerScope,
         onPageChange: (page) => {
@@ -517,7 +524,7 @@ export function EnterpriseWorkbench(): JSX.Element {
             label: PAGE_LABELS[page.id] ?? page.id,
             open: () => openGaugeApp("account-settings", page.id),
         })),
-        organizationSelector: () => <OrganizationSelector
+        organizationSelector: () => <Show when={account.session()}><OrganizationSelector
             memberships={memberships()}
             selected={tenant()}
             canCreate={Boolean(account.session())}
@@ -545,7 +552,7 @@ export function EnterpriseWorkbench(): JSX.Element {
             onOpen={openGaugeApp}
             surfaceOpen={surfaceOpen()}
             onWork={closeSurface}
-        />,
+        /></Show>,
         chat: (controls) => proposalAccess()
             ? <ProposalChat preview={proposal()} onClose={closeSurface} />
             : activeController()?.chat(controls) ?? <p>Management conversation unavailable.</p>,
@@ -579,6 +586,7 @@ export function EnterpriseWorkbench(): JSX.Element {
         },
         close: closeSurface,
         onNativeAccountSessionChanged: async (linked) => {
+            setAccountEnabled(linked);
             if (!linked) {
                 closeSurface();
                 setCreatedMembership(null);

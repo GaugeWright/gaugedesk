@@ -79,6 +79,12 @@ import {
     serializeAttentionRules,
     type AttentionLevel,
     type AttentionSignal,
+    NOTIFICATION_CHOICES,
+    notificationPermission,
+    notificationPreference,
+    requestNotificationPermission,
+    setNotificationPreference,
+    type NotificationPreference,
     WorkbenchShell,
     type Session,
     type Transcript,
@@ -2019,6 +2025,9 @@ function AccountPage(props: {
     const [providerModels, setProviderModels] = createSignal("");
     const [defaultModel, setDefaultModel] = createSignal("");
     const [renamingConnection, setRenamingConnection] = createSignal<{ id: string; label: string } | null>(null);
+    // DR-0266: whether this device notifies is its own choice, so it is read
+    // and written here rather than through the account's page model.
+    const [notificationPermissionState, setNotificationPermissionState] = createSignal(notificationPermission());
     const [joinCode, setJoinCode] = createSignal("");
     const [joinName, setJoinName] = createSignal("This device");
     const [joinKind, setJoinKind] = createSignal<"computer" | "phone" | "tablet">("computer");
@@ -2649,6 +2658,24 @@ function AccountPage(props: {
                         <option value="mute">Transcript only</option>
                     </select>
                 </div>}</For>
+            </section>
+            <section class="gaugeapp-panel gaugeapp-section-stack">
+                <div class="gaugeapp-section-head"><div><h2>Notifications</h2><p>When a chat's turn ends while Desk is not in front. The notification names the chat, never what it said. This choice belongs to this device.</p></div></div>
+                <div class="gaugeapp-setting-row">
+                    <div><strong>Notify me on this device</strong><span>{NOTIFICATION_CHOICES.find((choice) => choice.preference === notificationPreference())?.hint}</span></div>
+                    <select aria-label="Notify me on this device" value={notificationPreference()} onChange={(event) => setNotificationPreference(event.currentTarget.value as NotificationPreference)}>
+                        <For each={NOTIFICATION_CHOICES}>{(choice) => <option value={choice.preference} selected={choice.preference === notificationPreference()}>{choice.label}</option>}</For>
+                    </select>
+                </div>
+                <Show when={notificationPreference() !== "off" && notificationPermissionState() === "default"}>
+                    <div class="gaugeapp-actions"><button type="button" onClick={() => void requestNotificationPermission().then(setNotificationPermissionState)}>Allow notifications in this browser</button></div>
+                </Show>
+                <Show when={notificationPreference() !== "off" && notificationPermissionState() === "denied"}>
+                    <p class="gaugeapp-empty" role="status">This browser blocks notifications from Desk. Allow them in its site settings.</p>
+                </Show>
+                <Show when={notificationPreference() !== "off" && notificationPermissionState() === "unsupported"}>
+                    <p class="gaugeapp-empty" role="status">This browser cannot show notifications.</p>
+                </Show>
             </section>
             <section class="gaugeapp-panel gaugeapp-section-stack">
                 <div class="gaugeapp-section-head"><div><h2>Automatic keep</h2><p>On the current Project Host, keep turns that only change these paths.</p></div></div>
@@ -3488,6 +3515,8 @@ export function createGaugeAppWorkspace(options: {
     enabled: Accessor<boolean>;
     active: Accessor<boolean>;
     scope: Accessor<GaugeAppScope | undefined>;
+    /** Tenant admission belongs to this selected person account. */
+    actor?: Accessor<string | undefined>;
     onPageChange?: (pageId: string) => void;
     deviceLinkInvitation?: Accessor<DeviceLinkInvitation | null>;
     onDeviceLinkClaimed?: () => void;
@@ -3522,15 +3551,19 @@ export function createGaugeAppWorkspace(options: {
         options.onPageChange?.(pageId);
     };
     const sessionSource = createMemo(() => options.enabled()
-        ? { scope: options.scope() }
+        ? { scope: options.scope(), actor: options.actor?.() }
         : null);
     const navigation = createGaugeAppOperations(() => {
         const source = sessionSource();
-        return source && options.active() ? JSON.stringify([options.app, source.scope?.kind, source.scope?.id]) : undefined;
+        return source && options.active() ? JSON.stringify([options.app, source.scope?.kind, source.scope?.id, source.actor]) : undefined;
     });
     const [session, { refetch: refetchSession }] = createGaugeAppResource(sessionSource,
-        ({ scope }) => JSON.stringify([options.app, scope?.kind, scope?.id]),
-        ({ scope }) => options.api.openGaugeApp(options.app, scope));
+        ({ scope, actor }) => JSON.stringify([options.app, scope?.kind, scope?.id, actor]),
+        async ({ scope, actor }) => {
+            const admitted = await options.api.openGaugeApp(options.app, scope);
+            if (actor && admitted.actor !== actor) throw new Error("Management admission belongs to another account.");
+            return admitted;
+        });
     // Admission stays available to the global menus while another surface is
     // selected. Only the displayed App owns page/agent request lifetimes.
     const visibleSession = createMemo(() => options.active() ? session() : undefined);

@@ -7115,6 +7115,27 @@ async fn the_task_bar_shows_each_person_only_their_own_work() {
     assert_eq!(ids(&theirs), vec!["theirs".to_owned()], "{theirs}");
     let (status, _) = send(&app, "GET", "/tasks", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // DR-0266: a chat's notice goes to the person its task would.
+    let notices = |body: &str| -> Vec<String> {
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        value["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|notice| notice["chat"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (_, mine) = send_as(&app, "GET", "/notices", None, &owner).await;
+    assert_eq!(notices(&mine), vec!["anonymous".to_owned()], "{mine}");
+    let (_, theirs) = send_as(&app, "GET", "/notices", None, &colleague).await;
+    assert_eq!(notices(&theirs), vec!["theirs".to_owned()], "{theirs}");
+    let (status, _) = send(&app, "GET", "/notices", None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "only the desktop window reads notices without an account"
+    );
 }
 
 /// ATTN-2 (ADR 0082 §3): the operator's attention rules re-shape the queue —
@@ -7189,6 +7210,75 @@ async fn attention_rules_reshape_queue_and_badges() {
         chat["conflict"], false,
         "muted conflict shows no badge: {chat}"
     );
+}
+
+/// DR-0266: a chat that has raised a signal carries one notice whatever the
+/// attention rules route the signal to — `turn-settled` is muted by default and
+/// still gives one — and the notice counts the chat's settles, so the same
+/// settle reads the same way twice and the next one reads higher. The settle
+/// pings the workspace stream, which is how a client that did not send the
+/// turn learns that it ended. The desktop window reads notices with nobody
+/// signed in: the chats it started are addressed to the Home itself.
+#[tokio::test]
+async fn a_settled_turn_raises_a_notice_that_counts_settles() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = lean_workbench();
+    let mut changes = wb
+        .lock_unpoisoned()
+        .sender(crate::library::LIBRARY_SCOPE)
+        .subscribe();
+    let desktop = crate::open_runtime::desktop_operator_plane(wb.clone());
+    send(&desktop, "POST", "/chats", Some(r#"{"id":"nt1"}"#)).await;
+    let notice = |body: &str| -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["notices"]
+            .as_array()
+            .and_then(|notices| notices.iter().find(|n| n["chat"] == "nt1"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let (status, body) = send(&desktop, "GET", "/notices", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        notice(&body),
+        serde_json::Value::Null,
+        "nothing raised yet: {body}"
+    );
+
+    while changes.try_recv().is_ok() {}
+    send(
+        &desktop,
+        "POST",
+        "/chats/nt1/task",
+        Some(r#"{"prompt":"go"}"#),
+    )
+    .await;
+    let mut pinged = false;
+    while let Ok(event) = changes.try_recv() {
+        pinged |= matches!(event, crate::stream::ServerEvent::WorkspaceChanged { record, id, .. }
+            if record == "chat" && id == "nt1");
+    }
+    assert!(pinged, "the settle pings the workspace stream");
+
+    let (_, body) = send(&desktop, "GET", "/notices", None).await;
+    let first = notice(&body);
+    assert_eq!(first["signal"], "turn-settled", "{body}");
+    assert_eq!(first["settle"], 1, "{body}");
+    assert_eq!(first["failed"], false, "{body}");
+    let (_, again) = send(&desktop, "GET", "/notices", None).await;
+    assert_eq!(notice(&again), first, "a second read is the same notice");
+
+    send(
+        &desktop,
+        "POST",
+        "/chats/nt1/task",
+        Some(r#"{"prompt":"again"}"#),
+    )
+    .await;
+    let (_, body) = send(&desktop, "GET", "/notices", None).await;
+    let second = notice(&body);
+    assert_eq!(second["signal"], "turn-settled", "{body}");
+    assert_eq!(second["settle"], 2, "{body}");
 }
 
 /// ADR 0096 supersedes the old default-hold posture: advancement policy may not

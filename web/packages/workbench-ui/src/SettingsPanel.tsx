@@ -35,6 +35,12 @@ import {
     type AttentionLevel,
     type AttentionSignal,
 } from "./attention";
+import {
+    notificationPermission,
+    notificationPreference,
+    requestNotificationPermission,
+    setNotificationPreference,
+} from "./chat-notifications";
 import { waitForCodexLink } from "./codex-link-poll";
 import {
     catalogWithEndpointModels,
@@ -206,6 +212,9 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
         props.onChanged?.();
     };
     const [status, setStatus] = createSignal("");
+    // Read when the panel opens and after the person answers the browser's
+    // question; nothing announces a change made in the browser's own settings.
+    const [notificationPermissionState, setNotificationPermissionState] = createSignal(notificationPermission());
 
     // Projection reads settle to undefined on failure instead of erroring the resource:
     // reading an errored resource throws mid-render (the Devices crash class,
@@ -475,6 +484,8 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
         behaviour: {
             attention: parseAttentionRules(settings()?.[ATTENTION_RULES_SETTING]),
             autoKeep: parseAdvancementScopes(settings()?.[ADVANCEMENT_RULES_SETTING]),
+            notifications: notificationPreference(),
+            notificationPermission: notificationPermissionState(),
         },
     }));
 
@@ -633,6 +644,9 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                         await props.api.accountSetSetting(ATTENTION_RULES_SETTING, serializeAttentionRules(next));
                         await refetchSettings();
                     }),
+                setNotifications: (preference) => setNotificationPreference(preference),
+                allowNotifications: () =>
+                    void requestNotificationPermission().then(setNotificationPermissionState),
                 addAutoKeep: (glob) => void act("add the scope", async () => {
                     await writeAutoKeep([...autoKeep(), glob]);
                     return `auto-keep covers ${glob}`;

@@ -208,6 +208,7 @@ async fn another_selected_account_cannot_borrow_the_local_home() {
         "/archetypes",
         "/chats",
         "/tasks",
+        "/notices",
         "/account/facilities",
     ] {
         assert_eq!(

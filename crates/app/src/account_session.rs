@@ -26,6 +26,88 @@ struct AccountSession {
     expires_at: u64,
 }
 
+/// Current non-secret bounds of one verified opaque session (DR-0262).
+/// This is authenticated response evidence, never an offline work capability.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AccountSessionEvidence {
+    pub session_ref: String,
+    pub method: String,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+/// Verify durable session bounds without needing the original bearer. Both
+/// request authentication and retained action read bases consult this authority.
+/// Callers fence the legacy catalog, exact account-auth and account scopes in
+/// their dispatch basis. Unreadable authority rows never reveal older standing.
+pub(crate) fn durable_evidence(
+    store: &gaugedesk_store::Store,
+    session_ref: &str,
+    now_ms: u64,
+) -> Result<Option<(String, AccountSessionEvidence)>, gaugedesk_store::AdmitError> {
+    store.retained_events(crate::account_auth::ACCOUNT_AUTH_SCOPE)?;
+    let auth = crate::account_auth::AccountAuth::rebuild(store)?;
+    let Some(record) = auth.sessions.get(session_ref) else {
+        return Ok(None);
+    };
+    if record.issued_at_ms == 0 || record.lifetime_secs == 0 {
+        return Ok(None);
+    }
+    let auth_scope =
+        crate::account_auth_custody::account_auth_scope(&record.account_id).map_err(|_| {
+            gaugedesk_store::AdmitError::Codec("invalid account-auth scope identity".into())
+        })?;
+    store.retained_events(&auth_scope)?;
+    let scope = crate::account::account_scope(&record.account_id);
+    store.retained_events(&scope)?;
+    let account = crate::account::Account::rebuild_in(store, &scope)?;
+    if !record.device_id.is_empty()
+        && !account
+            .devices
+            .get(&record.device_id)
+            .is_some_and(|device| device.status == crate::account::DeviceStatus::Active)
+    {
+        return Ok(None);
+    }
+    let mut last_seen_ms = record.last_seen_ms;
+    let mut expires_at_ms = record
+        .issued_at_ms
+        .saturating_add(record.lifetime_secs.saturating_mul(1000))
+        .min(
+            record
+                .issued_at_ms
+                .saturating_add(crate::account::SESSION_ABSOLUTE_LIFETIME_MS),
+        );
+    if let Some(grant) = account.refresh_sessions.get(session_ref) {
+        if grant.issued_at_ms == 0
+            || grant.device_id != record.device_id
+            || (!grant.device_id.is_empty()
+                && grant.binding != crate::account::RefreshBinding::Device)
+        {
+            return Ok(None);
+        }
+        last_seen_ms = grant.last_seen_ms;
+        expires_at_ms = expires_at_ms.min(
+            grant
+                .issued_at_ms
+                .saturating_add(crate::account::SESSION_ABSOLUTE_LIFETIME_MS),
+        );
+    }
+    expires_at_ms = expires_at_ms.min(last_seen_ms.saturating_add(crate::account::SESSION_IDLE_MS));
+    if last_seen_ms == 0 || expires_at_ms <= now_ms {
+        return Ok(None);
+    }
+    Ok(Some((
+        record.account_id.clone(),
+        AccountSessionEvidence {
+            session_ref: session_ref.to_owned(),
+            method: record.method.clone(),
+            issued_at_ms: record.issued_at_ms,
+            expires_at_ms,
+        },
+    )))
+}
+
 /// The in-memory hot cache of live opaque sessions. It is the request-path resolver
 /// (`authenticate_bearer`); its durable backing is the `AccountSessionRecord` index
 /// in the shared `account-auth` scope (`ADR 0147` §1), written through on mint/revoke
@@ -114,6 +196,16 @@ impl AccountSessionStore {
     }
 
     fn resolve_session_at(&self, token: &str, now: u64) -> Option<(String, String)> {
+        self.resolve_bounds_at(token, now)
+            .map(|(account, method, _)| (account, method))
+    }
+
+    /// Live cache bounds, used only alongside the authoritative durable record.
+    pub(crate) fn resolve_bounds(&self, token: &str) -> Option<(String, String, u64)> {
+        self.resolve_bounds_at(token, unix_now())
+    }
+
+    fn resolve_bounds_at(&self, token: &str, now: u64) -> Option<(String, String, u64)> {
         let key = token_digest(token);
         let mut sessions = self.lock();
         let session = sessions.get(&key)?.clone();
@@ -121,7 +213,7 @@ impl AccountSessionStore {
             sessions.remove(&key);
             return None;
         }
-        Some((session.account_id, session.method))
+        Some((session.account_id, session.method, session.expires_at))
     }
 
     pub fn revoke(&self, token: &str) -> bool {

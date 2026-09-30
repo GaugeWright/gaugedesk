@@ -40,8 +40,14 @@ async fn selected_account_guard(
         return next.run(request).await;
     }
     let selected = crate::account_signin::live_hub_session_actor(&wb);
-    let owner = wb.lock_unpoisoned().home_owner_account();
-    if (selected.is_some() && selected != owner)
+    let (owner, selected_owns) = {
+        let guard = wb.lock_unpoisoned();
+        let owns = selected
+            .as_deref()
+            .is_some_and(|actor| guard.is_home_owner(actor));
+        (guard.home_owner_account(), owns)
+    };
+    if (selected.is_some() && selected != owner && !selected_owns)
         || (owner.is_some()
             && selected.is_none()
             && !crate::account_signin::local_operator_selected(&wb))

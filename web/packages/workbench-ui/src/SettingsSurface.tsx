@@ -26,6 +26,11 @@ import {
     type AttentionLevel,
     type AttentionSignal,
 } from "./attention";
+import {
+    NOTIFICATION_CHOICES,
+    type NotificationPermissionState,
+    type NotificationPreference,
+} from "./chat-notifications";
 
 export type SettingsRoom = "account" | "models" | "devices" | "behaviour";
 
@@ -168,6 +173,12 @@ export interface SettingsModel {
          *  and removed individually, and a free-text field makes a typo in one entry
          *  silently rewrite the rest. */
         readonly autoKeep: readonly string[];
+        /** This device's own choice (DR-0266), not the account's: whether a
+         *  computer or a browser tab may interrupt is a fact about it. */
+        readonly notifications: NotificationPreference;
+        /** Whether this runtime can show one. A browser needs the person's
+         *  permission, which only a click can ask for. */
+        readonly notificationPermission: NotificationPermissionState;
     };
 }
 
@@ -199,6 +210,8 @@ export interface SettingsActions {
     readonly publishLibrary?: () => void;
     readonly pullLibrary?: () => void;
     readonly setAttention?: (signal: AttentionSignal, level: AttentionLevel) => void;
+    readonly setNotifications?: (preference: NotificationPreference) => void;
+    readonly allowNotifications?: () => void;
     readonly addAutoKeep?: (glob: string) => void;
     readonly removeAutoKeep?: (glob: string) => void;
 }
@@ -953,6 +966,54 @@ export function SettingsSurface(props: SettingsSurfaceProps): JSX.Element {
                                         }}
                                     </For>
                                 </ul>
+                            </section>
+
+                            <section class="admin-section" data-notification-settings>
+                                <h4>Notifications</h4>
+                                <ul class="settings-list">
+                                    <li class="settings-row" data-notification-preference={props.model.behaviour.notifications}>
+                                        <span class="settings-row-main">
+                                            <span class="settings-row-name">Notify me on this device</span>
+                                            <span class="settings-row-note">
+                                                When a chat's turn ends while GaugeDesk is not in front. The
+                                                notification names the chat, never what it said.
+                                            </span>
+                                        </span>
+                                        <span class="settings-row-meta" />
+                                        <span class="settings-row-action">
+                                            <span class="segmented" role="radiogroup" aria-label="Notify me on this device">
+                                                <For each={NOTIFICATION_CHOICES}>
+                                                    {(choice) => (
+                                                        <button
+                                                            type="button"
+                                                            role="radio"
+                                                            class="segment"
+                                                            classList={{ active: props.model.behaviour.notifications === choice.preference }}
+                                                            aria-checked={props.model.behaviour.notifications === choice.preference}
+                                                            title={choice.hint}
+                                                            data-preference={choice.preference}
+                                                            onClick={() => props.actions?.setNotifications?.(choice.preference)}
+                                                        >{choice.label}</button>
+                                                    )}
+                                                </For>
+                                            </span>
+                                        </span>
+                                    </li>
+                                </ul>
+                                <Show when={props.model.behaviour.notifications !== "off"}>
+                                    <Show when={props.model.behaviour.notificationPermission === "default"}>
+                                        <p class="muted">
+                                            This browser has not been asked yet.{" "}
+                                            <button type="button" class="link-button" onClick={() => props.actions?.allowNotifications?.()}>Allow notifications</button>
+                                        </p>
+                                    </Show>
+                                    <Show when={props.model.behaviour.notificationPermission === "denied"}>
+                                        <p class="muted">This browser blocks notifications from GaugeDesk. Allow them in its site settings.</p>
+                                    </Show>
+                                    <Show when={props.model.behaviour.notificationPermission === "unsupported"}>
+                                        <p class="muted">This browser cannot show notifications.</p>
+                                    </Show>
+                                </Show>
                             </section>
 
                             <section class="admin-section" data-advancement-settings>

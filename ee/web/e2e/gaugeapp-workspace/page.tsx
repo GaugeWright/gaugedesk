@@ -1,5 +1,6 @@
-import { createEffect, createSignal, onCleanup } from "solid-js";
+import { createEffect, createSignal, onCleanup, Show } from "solid-js";
 import { render } from "solid-js/web";
+import { OrganizationSelector } from "../../apps/enterprise-workbench/src/EnterpriseWorkbench";
 import { createGaugeAppWorkspace } from "../../apps/enterprise-workbench/src/AdministrationGaugeApp";
 import { applyAppearancePreference, resetAppearancePreference } from "../../apps/enterprise-workbench/src/appearance-preference";
 import { gaugeAppPageDefinitions, RouteHttpError, type AccountDeviceLinkStatus, type AppearancePreferenceV1, type CommercialEngagement, type CommercialProduct, type CommercialProductRevision, type ProviderConnectionModel, type GaugeAppAgentLiveFrame, type GaugeAppKind, type GaugeAppPageModel, type GaugeAppProposal, type GaugeAppScope, type GaugeAppSession, type GaugeAppUpdateSnapshot } from "@gaugewright/control-plane-client";
@@ -245,6 +246,8 @@ function Harness() {
     const actualShell = query.get("shell") === "1";
     const mobileSurface = query.get("mobile-surface") === "1";
     const allPages = query.get("all-pages") === "1";
+    const accountBound = query.get("account-bound") === "1";
+    const [selectedActor, setSelectedActor] = createSignal("admin");
     const actionablePages = query.get("actionable-pages") === "1";
     const persistentAgent = query.get("persistent-agent") === "1";
     const streamingAgent = query.get("stream-agent") === "1";
@@ -1405,6 +1408,7 @@ function Harness() {
         app,
         enabled,
         active,
+        actor: accountBound ? selectedActor : undefined,
         scope: () => { generation(); refreshTick(); return scope(); },
         openExternal: async (url) => { record({ openExternal: url }); return true; },
         onAccountErased: () => {
@@ -1435,6 +1439,7 @@ function Harness() {
     const controls = () => <nav aria-label="Fixture timing controls" style="display:flex;flex-wrap:wrap;gap:6px;padding:8px;font-size:12px">
             <button onClick={() => setScopeId((id) => id === "A" ? "B" : "A")}>Switch scope</button>
             <button onClick={() => setEnabled((value) => !value)}>Toggle active</button>
+            <Show when={accountBound}><button onClick={() => setSelectedActor((actor) => actor === "admin" ? "other-account" : "admin")}>Switch account</button></Show>
             <button onClick={() => setActive((value) => !value)}>Toggle visible</button>
             <button onClick={() => setGeneration((value) => value + 1)}>New authorization</button>
             <button onClick={() => setRefreshTick((value) => value + 1)}>Refresh fixture</button>
@@ -1493,6 +1498,20 @@ function Harness() {
 render(
     () => {
         const query = new URLSearchParams(location.search);
+        const picker = query.get("organization-picker");
+        if (picker) return <main style="width:300px;margin:140px auto">
+            <div class="organization-bar"><OrganizationSelector
+                memberships={picker === "signed-out" ? [] : [
+                    { id: "personal", display_name: "Personal", role: "owner", personal: true, provider_commercial: false },
+                    ...(picker === "member" ? [{ id: "company", display_name: "Company", role: "member", personal: false, provider_commercial: false }] : []),
+                ]}
+                selected={picker === "member" ? "company" : "personal"}
+                canCreate={picker === "create"}
+                onSelect={() => undefined} onCreate={async () => undefined} onOpen={() => undefined}
+                surfaceOpen={false} onWork={() => undefined}
+            /></div>
+            <div class="account-bar"><AccountMenuHarness state={picker === "signed-out" ? "signed-out" : "signed-in"} /></div>
+        </main>;
         if (query.get("account-entry") === "recovery") return <RecoveryEntryHarness />;
         if (query.get("account-menu") === "signed-out") return <AccountMenuHarness state="signed-out" />;
         if (query.get("account-menu") === "signed-out-failure") return <AccountMenuHarness state="signed-out" fail />;

@@ -41,8 +41,9 @@ export function selectedDesktopUpdatePolicy(
         : readOrganizationPolicy();
 }
 
-/** Account membership can arrive after the shell mounts. Local mode is an
- * explicit choice, so it may check without waiting for a membership. */
+/** Whether the policy governing this desktop is known. Account membership can
+ * arrive after the shell mounts, or never, when the Home refuses the selected
+ * account. Local mode is an explicit choice and has no organization policy. */
 export function desktopUpdateScopeReady(
     selected: { readonly personal: boolean } | null | undefined,
     localMode: boolean,
@@ -56,4 +57,32 @@ export function desktopUpdateAllowed(policy: SoftwareUpdatePolicy | null): boole
     return policy === null
         || policy.allowedChannels.length === 0
         || policy.allowedChannels.includes(DESKTOP_UPDATE_CHANNEL);
+}
+
+/** What a discovered update may do, given the policy that governs it.
+ * `undefined` is a policy not yet known: no account scope has resolved, which
+ * happens for as long as the selected account is refused by this computer's
+ * Home. Discovery does not wait for it — the update service needs no account —
+ * but installation does, because an unknown policy may be a ceiling. */
+export function desktopUpdateOffer(
+    policy: SoftwareUpdatePolicy | null | undefined,
+): "available" | "restricted" | "held" {
+    if (policy === undefined) return "held";
+    return desktopUpdateAllowed(policy) ? "available" : "restricted";
+}
+
+/** How long discovery waits on the update service or the policy read. Without
+ * a ceiling a request that never answers leaves "Checking for updates…" on
+ * screen indefinitely, which reads as a hang rather than a failed check. */
+export const DESKTOP_UPDATE_CHECK_TIMEOUT_MS = 30_000;
+
+export function withDesktopUpdateTimeout<T>(
+    work: Promise<T>,
+    ms: number = DESKTOP_UPDATE_CHECK_TIMEOUT_MS,
+): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`update check timed out after ${ms} ms`)), ms);
+    });
+    return Promise.race([work, expired]).finally(() => clearTimeout(timer));
 }

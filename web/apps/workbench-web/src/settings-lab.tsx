@@ -106,6 +106,9 @@ const INITIAL: SettingsModel = {
         // their shipped defaults to exercise the absent case.
         attention: { conflict: "queue", "turn-settled": "badge" },
         autoKeep: ["docs/**", "*.md"],
+        // A browser that has not been asked yet, so the bench shows the ask.
+        notifications: "all",
+        notificationPermission: "default",
     },
 };
 

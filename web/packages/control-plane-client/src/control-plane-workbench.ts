@@ -26,6 +26,8 @@ import type {
     EngagementId,
     ExportState,
     FileEntry,
+    ChatNotice,
+    ChatSignal,
     HumanTask,
     LegacyDeploymentImportOutcome,
     MergeAction,
@@ -155,6 +157,30 @@ export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask
         project: t.project,
         waiting: t.waiting,
     }));
+}
+
+/** Each chat's notice for the reader (DR-0266). A notice this client cannot
+ *  read — an unknown signal, no chat, no settle count — is dropped rather
+ *  than guessed at, since a notice is only worth raising when it is
+ *  understood. */
+export async function getChatNotices(transport: WorkbenchTransport): Promise<ChatNotice[]> {
+    const o = (await transport.json("GET", "/notices")) as { notices?: unknown };
+    const signals = new Set<string>(["question", "conflict", "turn-settled"]);
+    const notices: ChatNotice[] = [];
+    for (const raw of Array.isArray(o.notices) ? o.notices : []) {
+        const n = raw as { chat?: unknown; title?: unknown; signal?: unknown; settle?: unknown; failed?: unknown };
+        if (typeof n?.chat !== "string" || !n.chat) continue;
+        if (typeof n.settle !== "number" || !Number.isInteger(n.settle) || n.settle < 0) continue;
+        if (typeof n.signal !== "string" || !signals.has(n.signal)) continue;
+        notices.push({
+            chat: n.chat,
+            title: typeof n.title === "string" ? n.title : "",
+            signal: n.signal as ChatSignal,
+            settle: n.settle,
+            failed: n.failed === true,
+        });
+    }
+    return notices;
 }
 
 /** Active people who may be asked or assigned work. */

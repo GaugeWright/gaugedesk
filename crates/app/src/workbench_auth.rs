@@ -232,27 +232,38 @@ impl Workbench {
     /// append-only account projections decide whether that bearer may still be
     /// used after its device has been revoked.
     pub fn resolve_account_session(&self, token: &str) -> Option<(String, String)> {
-        let resolved = self.account_sessions.resolve_session(token)?;
-        let session_id = crate::account_session::session_id(token);
-        let Ok(auth) = crate::account_auth::AccountAuth::rebuild(self.store_ref()) else {
+        self.account_session_evidence(token)
+            .map(|(account, evidence)| (account, evidence.method))
+    }
+
+    /// Verify the exact opaque session and report its currently bounded authority.
+    /// The refresh grant's admitted activity may advance idle time; reading this
+    /// evidence never refreshes a session or grants access to any Home.
+    pub(crate) fn account_session_evidence(
+        &self,
+        token: &str,
+    ) -> Option<(String, crate::account_session::AccountSessionEvidence)> {
+        self.account_session_evidence_at(token, crate::account::session_now_ms())
+    }
+
+    fn account_session_evidence_at(
+        &self,
+        token: &str,
+        now_ms: u64,
+    ) -> Option<(String, crate::account_session::AccountSessionEvidence)> {
+        let (account_id, method, cache_expires_secs) =
+            self.account_sessions.resolve_bounds(token)?;
+        let session_ref = crate::account_session::session_id(token);
+        let (durable_account, mut evidence) =
+            crate::account_session::durable_evidence(self.store_ref(), &session_ref, now_ms)
+                .ok()??;
+        if durable_account != account_id || evidence.method != method {
             return None;
-        };
-        let Some(record) = auth.sessions.get(&session_id) else {
-            // Session durability is deliberately best-effort. A hot session whose
-            // index write failed remains valid for this process, but can never be
-            // device-bound or restored after restart.
-            return Some(resolved);
-        };
-        if record.account_id != resolved.0 || record.device_id.is_empty() {
-            return (record.account_id == resolved.0).then_some(resolved);
         }
-        let scope = crate::account::account_scope(&record.account_id);
-        let account = crate::account::Account::rebuild_in(self.store_ref(), &scope).ok()?;
-        account
-            .devices
-            .get(&record.device_id)
-            .is_some_and(|device| device.status == crate::account::DeviceStatus::Active)
-            .then_some(resolved)
+        evidence.expires_at_ms = evidence
+            .expires_at_ms
+            .min(cache_expires_secs.saturating_mul(1000));
+        (evidence.expires_at_ms > now_ms).then_some((account_id, evidence))
     }
 
     /// Preserve the source that actually verified the credential. Used at the
@@ -262,7 +273,7 @@ impl Workbench {
         token: &str,
     ) -> Option<crate::identity::AuthenticatedActionContext> {
         use crate::identity::AuthenticatedActionContext;
-        if let Some(account) = self.account_sessions.resolve_now(token) {
+        if let Some((account, _)) = self.resolve_account_session(token) {
             return Some(AuthenticatedActionContext::account_session(
                 gaugedesk_core::ids::AuthorityId::new(account),
                 crate::account_session::session_id(token),
@@ -293,9 +304,9 @@ impl Workbench {
     /// caller keys the per-session refresh grant by [`account_session::session_id`].
     /// `lifetime_secs` bounds the opaque token's cache liveness — the OIDC browser
     /// path passes the platform absolute-lifetime (the refresh grant enforces the
-    /// idle bound), the passkey ceremony passes its own session TTL. Best-effort
-    /// durability: a store-write failure leaves a working cache session that simply
-    /// does not survive a restart.
+    /// idle bound), the passkey ceremony passes its own session TTL. Issuance
+    /// requires the durable fact to commit; a failed write evicts the provisional
+    /// cache entry and returns no credential.
     pub fn mint_account_session(
         &mut self,
         account_id: &str,
@@ -307,17 +318,24 @@ impl Workbench {
         let cache = Arc::clone(&self.account_sessions);
         let token = cache.issue_with_method(account_id, method, now_secs, lifetime_secs)?;
         let session_id = crate::account_session::session_id(&token);
-        if let Ok(record) = crate::account_auth::AccountSessionRecord::new(
+        let committed = crate::account_auth::AccountSessionRecord::new(
             &session_id,
             account_id,
             method,
             now_ms,
             lifetime_secs,
-        ) {
-            let _ = crate::account_auth::append_facts(
+        )
+        .ok()
+        .is_some_and(|record| {
+            crate::account_auth::append_facts(
                 self.store_mut(),
                 &[crate::account_auth::AccountAuthFact::Session(record)],
-            );
+            )
+            .is_ok()
+        });
+        if !committed {
+            cache.revoke(&token);
+            return None;
         }
         Some(token)
     }
@@ -544,7 +562,7 @@ impl Workbench {
             return Ok(Vec::new());
         }
 
-        let authority = if self.idp.is_some() || web_account_mode() {
+        let authority = if self.idp.is_some() || web_account_mode() || bearer.is_some() {
             bearer
                 .and_then(|token| self.authenticate_bearer(token))
                 .ok_or((StatusCode::UNAUTHORIZED, "authenticate to administer"))?
@@ -581,7 +599,7 @@ impl Workbench {
 
     /// Authorize an `/admin/*` request (`RBAC-5`). The gate:
     ///
-    /// - **No IdP** (single-user local) ⇒ always `Ok` — the existing open behavior;
+    /// - **No IdP and no bearer** (single-user local) ⇒ `Ok` — the operator channel;
     ///   M3 adds the org layer without changing the single-user shape (ADR 0020).
     /// - **IdP, empty directory** ⇒ `Ok` (bootstrap): the directory must be seedable
     ///   (by SCIM / the initial owner) before there is anyone to authorize against.
@@ -612,7 +630,7 @@ impl Workbench {
         cap: Option<gaugedesk_core::rbac::Capability>,
         org_scope: &str,
     ) -> Result<(), (StatusCode, &'static str)> {
-        if self.idp.is_none() && !web_account_mode() {
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
             if self.hosted_home_mode() {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -658,7 +676,7 @@ impl Workbench {
     /// but requiring only **active membership** (any role — these are not console actions; per-
     /// scope RBAC is `ENTSEC-2`):
     ///
-    /// - **No IdP** (single-user local / loopback) ⇒ `Ok` — the zero-friction solo shape is
+    /// - **No IdP and no bearer** (single-user local / loopback) ⇒ `Ok` — the solo shape is
     ///   untouched (ADR 0020 / [ADR 0065]); the loopback channel is the local operator's own.
     /// - **IdP, empty directory** ⇒ `Ok` (bootstrap — there is no one to authenticate against
     ///   until SCIM / the initial owner provisions).
@@ -731,9 +749,7 @@ impl Workbench {
         // A durable account session is independently verifiable after restart.
         // The optional IdP's absence must not replace that actor with the local
         // operator, or Home admission and action attribution disagree.
-        let account_session =
-            bearer.is_some_and(|token| self.account_sessions.resolve_now(token).is_some());
-        if self.idp.is_none() && !web_account_mode() && !account_session {
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
             if self.hosted_home_mode() {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -922,7 +938,7 @@ impl Workbench {
         &self,
         bearer: Option<&str>,
     ) -> Result<gaugedesk_core::ids::AuthorityId, (StatusCode, &'static str)> {
-        if self.idp.is_none() && !web_account_mode() {
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
             if self.hosted_home_mode() {
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -960,7 +976,11 @@ impl Workbench {
         bearer: Option<&str>,
         org_scope: &str,
     ) -> ProjectVisibility {
-        if self.idp.is_none() && !web_account_mode() {
+        // A presented credential selects a person, even on a desktop without
+        // an IdP. Expiry or revocation must not widen that person to the local
+        // operator's projection. Only the credential-free operator channel
+        // retains the legacy all-project view (WS-545 / ENTSEC-2).
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
             if self.hosted_home_mode() {
                 return ProjectVisibility::Only(BTreeSet::new());
             }
@@ -1060,7 +1080,7 @@ impl Workbench {
         target_team: Option<&str>,
         org_scope: &str,
     ) -> bool {
-        if self.idp.is_none() && !web_account_mode() {
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
             return true; // single-user local: ungated
         }
         let Some(authority) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
@@ -1083,10 +1103,10 @@ impl Workbench {
 
     /// The label for the authority acting on a request (`AUD-1`): in enterprise mode
     /// the bearer's authenticated authority (or `"anonymous"` if it does not
-    /// authenticate); in single-user local mode this control plane's own authority.
+    /// authenticate); only the credential-free local channel uses the operator authority.
     /// Used to attribute audit entries to their actor (`INV-21`).
     pub fn actor(&self, bearer: Option<&str>) -> String {
-        if self.idp.is_some() || web_account_mode() {
+        if self.idp.is_some() || web_account_mode() || bearer.is_some() {
             bearer
                 .and_then(|token| self.authenticate_bearer(token))
                 .map(|authority| authority.as_str().to_string())
@@ -1143,7 +1163,7 @@ impl Workbench {
         bearer: Option<&str>,
         org_scope: &str,
     ) -> Result<(), (StatusCode, &'static str)> {
-        if self.idp.is_none() && !web_account_mode() {
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
             return Ok(()); // single-user local: ungated
         }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
@@ -1208,7 +1228,7 @@ impl Workbench {
         res_id: &gaugedesk_core::resource::ResourceId,
         org_scope: &str,
     ) -> Result<(), (StatusCode, &'static str)> {
-        if self.idp.is_none() && !web_account_mode() {
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
             return Ok(()); // single-user local / loopback: ungated
         }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
@@ -1280,7 +1300,7 @@ impl Workbench {
         res_id: &gaugedesk_core::resource::ResourceId,
         org_scope: &str,
     ) -> Result<(), (StatusCode, &'static str)> {
-        if self.idp.is_none() && !web_account_mode() {
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
             return Ok(()); // single-user local / loopback: ungated
         }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
@@ -1407,11 +1427,10 @@ mod provider_neutral_identity_tests {
                 ..AuthorityAttributes::default()
             },
         );
-        let wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
             .with_identity_provider(Arc::new(idp));
         let account_token = wb
-            .account_sessions()
-            .issue("person-root", crate::account_session::unix_now(), 60)
+            .mint_account_session("person-root", "passkey", 60)
             .unwrap();
 
         assert!(wb
@@ -1490,23 +1509,16 @@ mod provider_neutral_identity_tests {
 
     #[test]
     fn enforced_sso_rejects_personal_sessions_and_accepts_the_exact_enterprise_connection() {
-        let wb = enforced_org_workbench();
-        let now = crate::account_session::unix_now();
+        let mut wb = enforced_org_workbench();
         let passkey = wb
-            .account_sessions()
-            .issue_with_method("person-root", "passkey", now, 60)
+            .mint_account_session("person-root", "passkey", 60)
             .unwrap();
-        let consumer = wb
-            .account_sessions()
-            .issue_with_method("person-root", "oidc", now, 60)
-            .unwrap();
+        let consumer = wb.mint_account_session("person-root", "oidc", 60).unwrap();
         let wrong_org = wb
-            .account_sessions()
-            .issue_with_method("person-root", "enterprise-oidc:other-org", now, 60)
+            .mint_account_session("person-root", "enterprise-oidc:other-org", 60)
             .unwrap();
         let corporate = wb
-            .account_sessions()
-            .issue_with_method("person-root", "enterprise-oidc:org:org", now, 60)
+            .mint_account_session("person-root", "enterprise-oidc:org:org", 60)
             .unwrap();
 
         for token in [&passkey, &consumer, &wrong_org] {
@@ -1551,15 +1563,10 @@ mod provider_neutral_identity_tests {
     #[test]
     fn break_glass_requires_a_passkey_owner_with_unused_recovery() {
         let mut wb = enforced_org_workbench();
-        let now = crate::account_session::unix_now();
         let passkey = wb
-            .account_sessions()
-            .issue_with_method("person-root", "passkey", now, 60)
+            .mint_account_session("person-root", "passkey", 60)
             .unwrap();
-        let consumer = wb
-            .account_sessions()
-            .issue_with_method("person-root", "oidc", now, 60)
-            .unwrap();
+        let consumer = wb.mint_account_session("person-root", "oidc", 60).unwrap();
         assert!(wb.admit_sso_recovery(Some(&passkey), ORG_SCOPE).is_err());
 
         let credential = WebAuthnMethodRecord::new(
@@ -1683,6 +1690,204 @@ mod provider_neutral_identity_tests {
     }
 
     #[test]
+    fn source_evidence_uses_exact_session_refresh_activity_without_resetting_mint() {
+        use crate::account::{
+            account_scope, RefreshBinding, SESSION_ABSOLUTE_LIFETIME_MS, SESSION_IDLE_MS,
+        };
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let first = wb
+            .mint_account_session(
+                "person-root",
+                "consumer-oidc:google",
+                SESSION_ABSOLUTE_LIFETIME_MS / 1000,
+            )
+            .unwrap();
+        let second = wb
+            .mint_account_session(
+                "person-root",
+                "consumer-oidc:google",
+                SESSION_ABSOLUTE_LIFETIME_MS / 1000,
+            )
+            .unwrap();
+        let initial = wb.account_session_evidence(&first).unwrap().1;
+        let second_initial = wb.account_session_evidence(&second).unwrap().1;
+        assert_ne!(initial.session_ref, second_initial.session_ref);
+        assert_eq!(
+            initial.expires_at_ms,
+            initial.issued_at_ms + SESSION_IDLE_MS
+        );
+        let scope = account_scope("person-root");
+        wb.upsert_account_refresh_in(
+            &scope,
+            &initial.session_ref,
+            RefreshBinding::Web,
+            "",
+            "synthetic-sealed-provider-credential",
+            initial.issued_at_ms,
+        )
+        .unwrap();
+        let refreshed_at = initial.issued_at_ms + 24 * 60 * 60 * 1000;
+        wb.touch_account_refresh_in(&scope, &initial.session_ref, refreshed_at)
+            .unwrap();
+        let proof = wb
+            .account_session_evidence_at(&first, refreshed_at)
+            .unwrap()
+            .1;
+        assert_eq!(proof.issued_at_ms, initial.issued_at_ms);
+        assert_eq!(proof.session_ref, initial.session_ref);
+        assert_eq!(proof.expires_at_ms, refreshed_at + SESSION_IDLE_MS);
+        assert_eq!(
+            wb.account_session_evidence_at(&second, refreshed_at)
+                .unwrap()
+                .1,
+            second_initial
+        );
+        let after_original_idle = initial.expires_at_ms + 1;
+        assert!(wb
+            .account_session_evidence_at(&first, after_original_idle)
+            .is_some());
+        assert!(wb
+            .account_session_evidence_at(&second, after_original_idle)
+            .is_none());
+        assert!(wb
+            .account_session_evidence_at(&first, proof.expires_at_ms)
+            .is_none());
+        // Even repeated admitted refreshes never extend the original absolute bound.
+        let near_absolute = initial.issued_at_ms + SESSION_ABSOLUTE_LIFETIME_MS - 1000;
+        wb.touch_account_refresh_in(&scope, &initial.session_ref, near_absolute)
+            .unwrap();
+        let final_proof = wb
+            .account_session_evidence_at(&first, near_absolute)
+            .unwrap()
+            .1;
+        assert!(final_proof.expires_at_ms <= initial.issued_at_ms + SESSION_ABSOLUTE_LIFETIME_MS);
+        assert!(wb
+            .account_session_evidence_at(&first, final_proof.expires_at_ms)
+            .is_none());
+        let body = serde_json::to_string(&proof).unwrap();
+        assert!(!body.contains("synthetic-sealed-provider-credential"));
+        assert!(!body.contains(&first));
+    }
+
+    #[test]
+    fn source_evidence_refuses_a_refresh_grant_bound_to_another_device() {
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let token = wb
+            .mint_account_session("person-root", "oidc", 3600)
+            .unwrap();
+        let session_ref = crate::account_session::session_id(&token);
+        wb.upsert_account_refresh_in(
+            &crate::account::account_scope("person-root"),
+            &session_ref,
+            crate::account::RefreshBinding::Device,
+            "different-device",
+            "sealed",
+            crate::account::session_now_ms(),
+        )
+        .unwrap();
+        assert!(wb.account_sessions().resolve_now(&token).is_some());
+        assert!(wb.account_session_evidence(&token).is_none());
+        assert!(wb.authenticate_action_context(&token).is_none());
+    }
+
+    #[test]
+    fn durable_revocation_refuses_a_still_hot_session_for_identity_and_actions() {
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let token = wb
+            .mint_account_session("person-root", "passkey", 3600)
+            .unwrap();
+        let other = wb
+            .mint_account_session("person-root", "passkey", 3600)
+            .unwrap();
+        let mut record = crate::account_auth::AccountAuth::rebuild(wb.store_ref())
+            .unwrap()
+            .sessions[&crate::account_session::session_id(&token)]
+            .clone();
+        record.op = crate::account_auth::RecordOp::Tombstone;
+        crate::account_auth::append_facts(
+            wb.store_mut(),
+            &[crate::account_auth::AccountAuthFact::Session(record)],
+        )
+        .unwrap();
+        assert!(
+            wb.account_sessions().resolve_now(&token).is_some(),
+            "stale cache remains hot"
+        );
+        assert!(wb.resolve_account_session(&token).is_none());
+        assert!(wb.authenticate_bearer(&token).is_none());
+        assert!(wb.authenticate_action_context(&token).is_none());
+        assert!(
+            wb.authenticate_action_context(&other).is_some(),
+            "concurrent session remains live"
+        );
+    }
+
+    #[test]
+    fn cache_only_sessions_and_changed_durable_bounds_do_not_admit_actions() {
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let missing = wb
+            .account_sessions()
+            .issue("person-root", crate::account_session::unix_now(), 3600)
+            .unwrap();
+        assert!(wb.resolve_account_session(&missing).is_none());
+        assert!(wb.authenticate_action_context(&missing).is_none());
+        let token = wb
+            .mint_account_session("person-root", "passkey", 3600)
+            .unwrap();
+        let mut record = crate::account_auth::AccountAuth::rebuild(wb.store_ref())
+            .unwrap()
+            .sessions[&crate::account_session::session_id(&token)]
+            .clone();
+        record.issued_at_ms = 1;
+        record.lifetime_secs = 1;
+        crate::account_auth::append_facts(
+            wb.store_mut(),
+            &[crate::account_auth::AccountAuthFact::Session(record)],
+        )
+        .unwrap();
+        assert!(wb.account_sessions().resolve_now(&token).is_some());
+        assert!(wb.authenticate_bearer(&token).is_none());
+        assert!(wb.authenticate_action_context(&token).is_none());
+    }
+
+    #[test]
+    fn failed_session_commit_returns_no_credential_and_evicts_provisional_cache() {
+        use std::sync::Mutex;
+        struct UnavailableSessions(Mutex<Vec<String>>);
+        impl gaugedesk_store::ContentCodec for UnavailableSessions {
+            fn encode(&self, _scope: &str, _kind: &str, payload: &str) -> Result<String, String> {
+                if let Ok(record) =
+                    serde_json::from_str::<crate::account_auth::AccountSessionRecord>(payload)
+                {
+                    self.0.lock().unwrap().push(record.id);
+                }
+                Err("session storage unavailable".into())
+            }
+            fn decode(&self, _scope: &str, _kind: &str, payload: &str) -> Option<String> {
+                Some(payload.into())
+            }
+        }
+        let codec = Arc::new(UnavailableSessions(Mutex::new(Vec::new())));
+        let store = gaugedesk_store::Store::open_in_memory()
+            .unwrap()
+            .with_codec(codec.clone());
+        let mut wb = Workbench::new(store);
+        assert!(wb
+            .mint_account_session("person-root", "passkey", 3600)
+            .is_none());
+        let attempted = codec.0.lock().unwrap();
+        assert_eq!(
+            attempted.len(),
+            1,
+            "fault reached the durable session append"
+        );
+        assert!(
+            !wb.account_sessions().revoke_id(&attempted[0]),
+            "failed issuance left no hot credential"
+        );
+    }
+
+    #[test]
     fn device_bound_session_is_admitted_only_while_its_device_is_active() {
         let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
         let token = wb
@@ -1706,6 +1911,13 @@ mod provider_neutral_identity_tests {
             wb.resolve_account_session(&token),
             Some(("person-root".into(), "passkey".into()))
         );
+
+        assert!(wb.authenticate_action_context(&token).is_some());
+        let mut inactive = device.clone();
+        inactive.status = crate::account::DeviceStatus::Revoked;
+        wb.upsert_account_device_in(&scope, &inactive).unwrap();
+        assert!(wb.account_sessions().resolve_now(&token).is_some());
+        assert!(wb.authenticate_action_context(&token).is_none());
 
         wb.revoke_account_device_in(&scope, &device.id).unwrap();
         assert!(wb.resolve_account_session(&token).is_none());
@@ -2018,5 +2230,365 @@ mod id_token_bearer_tests {
             false,
         );
         assert_eq!(who(&wb, &token).as_deref(), Some(EMAIL));
+    }
+}
+
+#[cfg(test)]
+mod staff_authorization_tests {
+    use super::*;
+    use gaugedesk_core::rbac::Capability;
+
+    #[test]
+    fn staff_bearers_keep_their_permissions_and_audit_identity_without_an_idp() {
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let mut tokens = std::collections::BTreeMap::new();
+        for (actor, role, team) in [
+            ("owner", "owner", None),
+            ("admin", "admin", Some("team-one")),
+            ("staff", "member", None),
+            ("reader", "viewer", None),
+        ] {
+            let record = org::MembershipRecord {
+                id: actor.into(),
+                op: crate::library::RecordOp::Upsert,
+                org_id: org::ORG_ID.into(),
+                authority: actor.into(),
+                email: String::new(),
+                role: role.into(),
+                status: org::MembershipStatus::Active,
+                managed_by_scim: false,
+                team: team.map(str::to_owned),
+            };
+            wb.store_mut()
+                .append_record(
+                    org::ORG_SCOPE,
+                    "membership",
+                    &serde_json::to_string(&record).unwrap(),
+                )
+                .unwrap();
+            tokens.insert(
+                actor,
+                wb.mint_account_session(actor, "passkey", 60).unwrap(),
+            );
+        }
+        assert!(wb.idp.is_none());
+        for (actor, token) in &tokens {
+            assert_eq!(wb.actor(Some(token)), *actor);
+            assert_eq!(
+                wb.authenticate_identity(Some(token)).unwrap().as_str(),
+                *actor
+            );
+            assert_eq!(wb.admit_data_request(Some(token), None).unwrap(), *actor);
+        }
+        for person in ["staff", "reader"] {
+            let actor = wb.actor(Some(&tokens[person]));
+            crate::audit::record(&mut wb, &actor, "staff.access", "shared");
+        }
+        let audit = crate::audit::list(wb.store_ref());
+        assert_eq!(
+            audit
+                .iter()
+                .map(|entry| entry.actor.as_str())
+                .collect::<Vec<_>>(),
+            ["staff", "reader"]
+        );
+        assert!(crate::audit::verify(wb.store_ref(), None).ok);
+        assert_eq!(wb.actor(None), wb.authority().as_str());
+        assert_eq!(wb.actor(Some("unverified")), "anonymous");
+        assert_eq!(
+            wb.authenticate_identity(Some("unverified")).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(wb
+            .authorize(None, Some(Capability::ConfigureSecurity))
+            .is_ok());
+        assert!(wb
+            .authorize(Some(&tokens["owner"]), Some(Capability::ManageOrgLifecycle))
+            .is_ok());
+        assert!(wb
+            .authorize(Some(&tokens["admin"]), Some(Capability::ManageMembers))
+            .is_ok());
+        for actor in ["admin", "staff", "reader"] {
+            assert_eq!(
+                wb.authorize(Some(&tokens[actor]), Some(Capability::ManageOrgLifecycle))
+                    .unwrap_err()
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(wb
+            .admin_capabilities(Some(&tokens["staff"]), org::ORG_SCOPE)
+            .unwrap()
+            .is_empty());
+        assert!(wb.team_scope_ok(Some(&tokens["admin"]), Some("team-one")));
+        assert!(!wb.team_scope_ok(Some(&tokens["admin"]), Some("team-two")));
+        assert!(!wb.team_scope_ok(Some(&tokens["staff"]), None));
+        assert_eq!(
+            wb.authorize_export(Some(&tokens["reader"])).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(wb.authorize_export(Some(&tokens["staff"])).is_ok());
+        wb.account_sessions().revoke(&tokens["staff"]);
+        assert_eq!(wb.actor(Some(&tokens["staff"])), "anonymous");
+        assert_eq!(
+            wb.admit_data_request(Some(&tokens["staff"]), None)
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            wb.authorize(Some(&tokens["staff"]), Some(Capability::ConfigureSecurity))
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            wb.admin_capabilities(Some(&tokens["staff"]), org::ORG_SCOPE)
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            wb.authorize_export(Some(&tokens["staff"])).unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[cfg(test)]
+mod staff_project_visibility_tests {
+    use super::*;
+    use crate::LockUnpoisoned;
+
+    #[test]
+    fn desktop_account_sessions_observe_current_project_grants_without_an_idp() {
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        for (actor, role) in [("staff", "member"), ("owner", "owner")] {
+            let record = org::MembershipRecord {
+                id: actor.into(),
+                op: crate::library::RecordOp::Upsert,
+                org_id: org::ORG_ID.into(),
+                authority: actor.into(),
+                email: String::new(),
+                role: role.into(),
+                status: org::MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            };
+            wb.store_mut()
+                .append_record(
+                    org::ORG_SCOPE,
+                    "membership",
+                    &serde_json::to_string(&record).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut grant = org::MemberGrantRecord {
+            id: org::MemberGrantRecord::make_id("staff", "allowed"),
+            op: crate::library::RecordOp::Upsert,
+            authority: "staff".into(),
+            project_id: "allowed".into(),
+        };
+        wb.store_mut()
+            .append_record(
+                org::ORG_SCOPE,
+                "member_grant",
+                &serde_json::to_string(&grant).unwrap(),
+            )
+            .unwrap();
+        let staff = wb.mint_account_session("staff", "passkey", 60).unwrap();
+        let owner = wb.mint_account_session("owner", "passkey", 60).unwrap();
+        let outsider = wb.mint_account_session("outsider", "passkey", 60).unwrap();
+        assert!(wb.idp.is_none());
+        assert_eq!(wb.project_visibility(None), ProjectVisibility::All);
+        assert_eq!(wb.project_visibility(Some(&owner)), ProjectVisibility::All);
+        assert_eq!(
+            wb.project_visibility(Some(&staff)),
+            ProjectVisibility::Only(BTreeSet::from(["allowed".into()]))
+        );
+        assert_eq!(
+            wb.project_visibility(Some(&outsider)),
+            ProjectVisibility::Only(BTreeSet::new())
+        );
+        assert_eq!(
+            wb.project_visibility(Some("unverified")),
+            ProjectVisibility::Only(BTreeSet::new())
+        );
+        grant.op = crate::library::RecordOp::Tombstone;
+        wb.store_mut()
+            .append_record(
+                org::ORG_SCOPE,
+                "member_grant",
+                &serde_json::to_string(&grant).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            wb.project_visibility(Some(&staff)),
+            ProjectVisibility::Only(BTreeSet::new())
+        );
+        wb.account_sessions().insert_loaded(
+            &crate::account_session::session_id(&staff),
+            "staff",
+            "passkey",
+            1,
+        );
+        assert_eq!(
+            wb.project_visibility(Some(&staff)),
+            ProjectVisibility::Only(BTreeSet::new())
+        );
+    }
+    #[tokio::test]
+    async fn staff_workspace_and_search_hide_projects_outside_their_grants() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let staff = {
+            let mut guard = wb.lock_unpoisoned();
+            for id in ["allowed", "denied"] {
+                let project =
+                    crate::library_routes::create_named_project(&mut guard, id, id).unwrap();
+                let chat = guard
+                    .create_chat_in_instance_on_target(
+                        &crate::library_routes::general_placement_id(id),
+                        id,
+                        project["target_id"].as_str(),
+                    )
+                    .unwrap();
+                let chat_id = chat["id"].as_str().unwrap();
+                guard
+                    .store_mut()
+                    .append_record(
+                        chat_id,
+                        "transcript",
+                        &serde_json::json!({
+                            "type": "user", "text": format!("clinical transcript for {id}")
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                guard
+                    .engagements
+                    .get(chat_id)
+                    .unwrap()
+                    .write_file(
+                        &format!(
+                            "targets/{}/record.txt",
+                            crate::library::target_id_path_v1(
+                                project["target_id"].as_str().unwrap()
+                            )
+                            .unwrap()
+                        ),
+                        &format!("medicalfile for {id}"),
+                    )
+                    .unwrap();
+            }
+            let member = org::MembershipRecord {
+                id: "staff".into(),
+                op: crate::library::RecordOp::Upsert,
+                org_id: org::ORG_ID.into(),
+                authority: "staff".into(),
+                email: String::new(),
+                role: "member".into(),
+                status: org::MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            };
+            guard
+                .store_mut()
+                .append_record(
+                    org::ORG_SCOPE,
+                    "membership",
+                    &serde_json::to_string(&member).unwrap(),
+                )
+                .unwrap();
+            let grant = org::MemberGrantRecord {
+                id: org::MemberGrantRecord::make_id("staff", "allowed"),
+                op: crate::library::RecordOp::Upsert,
+                authority: "staff".into(),
+                project_id: "allowed".into(),
+            };
+            guard
+                .store_mut()
+                .append_record(
+                    org::ORG_SCOPE,
+                    "member_grant",
+                    &serde_json::to_string(&grant).unwrap(),
+                )
+                .unwrap();
+            guard.mint_account_session("staff", "passkey", 60).unwrap()
+        };
+        let app = crate::open_control_plane(wb.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/workspace")
+                    .header("authorization", format!("Bearer {staff}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let projects: Vec<_> = value["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|project| project["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(projects, ["allowed"]);
+        for query in ["clinical", "medicalfile"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/search?q={query}"))
+                        .header("authorization", format!("Bearer {staff}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let hits = value["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 1, "{value}");
+            assert_eq!(hits[0]["title"], "allowed");
+            assert!(!String::from_utf8(body.to_vec()).unwrap().contains("denied"));
+        }
+
+        let revoked = org::MemberGrantRecord {
+            id: org::MemberGrantRecord::make_id("staff", "allowed"),
+            op: crate::library::RecordOp::Tombstone,
+            authority: "staff".into(),
+            project_id: "allowed".into(),
+        };
+        wb.lock_unpoisoned()
+            .store_mut()
+            .append_record(
+                org::ORG_SCOPE,
+                "member_grant",
+                &serde_json::to_string(&revoked).unwrap(),
+            )
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/search?q=clinical")
+                    .header("authorization", format!("Bearer {staff}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["hits"], serde_json::json!([]));
     }
 }

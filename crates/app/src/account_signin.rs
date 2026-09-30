@@ -266,7 +266,6 @@ pub async fn proxy_account_authority(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let revision = selected_revision(wb);
     let Some(hub) = hub_base() else {
         return (
             StatusCode::CONFLICT,
@@ -274,6 +273,18 @@ pub async fn proxy_account_authority(
         )
             .into_response();
     };
+    proxy_account_authority_at(wb, hub, method, path_and_query, headers, body).await
+}
+
+async fn proxy_account_authority_at(
+    wb: &SharedWorkbench,
+    hub: String,
+    method: Method,
+    path_and_query: String,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let revision = selected_revision(wb);
     let Some(record) = latest_session(wb).filter(|record| record.expires > now_ms()) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -1656,11 +1667,16 @@ fn desktop_status_json(
     let mut status = status_json(record, available);
     if let Ok(state) = crate::home_owner::claim_state(wb) {
         match state {
-            crate::home_owner::HomeClaimState::Available { projects } => {
-                status["home_claim"] = json!({ "state": "available", "projects": projects });
+            crate::home_owner::HomeClaimState::Available { projects, fresh } => {
+                status["home_claim"] =
+                    json!({ "state": "available", "projects": projects, "fresh": fresh });
             }
             crate::home_owner::HomeClaimState::Claimed { owner } => {
-                status["home_claim"] = json!({ "state": "claimed", "owner": owner });
+                // Every active owner, the claimant first among them, so the
+                // surfaces can offer admitting another retained account.
+                let owners = crate::home_owner::owners(wb).unwrap_or_default();
+                status["home_claim"] =
+                    json!({ "state": "claimed", "owner": owner, "owners": owners });
             }
             crate::home_owner::HomeClaimState::Governed => {
                 status["home_claim"] = json!({ "state": "governed" });
@@ -1685,6 +1701,9 @@ pub struct SigninStart {
     /// default, so a client that predates DR-0189 is unchanged.
     #[serde(default)]
     provider: Option<String>,
+    /// Corporate routing hint, submitted only to the hosted account authority.
+    #[serde(default)]
+    work_email: Option<String>,
 }
 
 pub async fn post_signin_start(
@@ -1703,8 +1722,38 @@ pub async fn post_signin_start(
         Ok(value) => value,
         Err(message) => return (StatusCode::CONFLICT, message).into_response(),
     };
+    let selection_revision = selected_revision(&wb);
     let verifier = new_verifier();
     let challenge = challenge_for(&verifier);
+    let url = if let Some(email) = body.work_email {
+        let hub = hub.clone();
+        let challenge = challenge.clone();
+        let return_to = web_return
+            .clone()
+            .unwrap_or_else(|| NATIVE_RETURN.to_owned());
+        match tokio::task::spawn_blocking(move || {
+            work_email_login_at(&hub, email.trim(), &return_to, &challenge)
+        })
+        .await
+        {
+            Ok(Ok(Some(url))) => url,
+            Ok(Ok(None)) => return Json(json!({ "organization": false })).into_response(),
+            _ => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "organization sign-in could not be started; try again",
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        login_url(
+            &hub,
+            &challenge,
+            web_return.as_deref(),
+            body.provider.as_deref(),
+        )
+    };
     // Seal and store before handing out the URL. A verifier that reached the
     // browser but not the store is a sign-in that cannot complete, so fail
     // here — where it can still be reported — rather than at the callback.
@@ -1720,16 +1769,54 @@ pub async fn post_signin_start(
         sealed,
         started_ms: now_ms(),
         provider: body.provider.clone().unwrap_or_default(),
-        selection_revision: selected_revision(&wb),
+        selection_revision,
     };
     if let Err(message) = write_pending(&wb, &record) {
         return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
     }
     Json(json!({
-        "url": login_url(&hub, &challenge, web_return.as_deref(), body.provider.as_deref()),
+        "url": url,
         "return": web_return.as_deref().unwrap_or(NATIVE_RETURN),
     }))
     .into_response()
+}
+
+/// The same corporate ceremony as web, bound to this device's pending verifier.
+/// The Hub resolves the organization and returns its IdP redirect; the desktop
+/// never authenticates against a separate local organization identity store.
+fn work_email_login_at(
+    hub: &str,
+    email: &str,
+    return_to: &str,
+    challenge: &str,
+) -> Result<Option<String>, String> {
+    let http = HttpClient::with_timeout_no_redirects(Duration::from_secs(30));
+    let (status, location) = http.post_form_location(
+        &format!("{hub}/auth/work-email"),
+        &[
+            ("email", email),
+            ("return_to", return_to),
+            ("handoff_challenge", challenge),
+        ],
+    )?;
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(300..400).contains(&status) {
+        return Err("organization sign-in discovery failed".into());
+    }
+    let location = location.ok_or("organization sign-in returned no redirect")?;
+    let url = url::Url::parse(&location)
+        .map_err(|_| "organization sign-in returned an invalid redirect")?;
+    let local_http = url.scheme() == "http"
+        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if (url.scheme() != "https" && !local_http)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("organization sign-in returned an unsafe redirect".into());
+    }
+    Ok(Some(location))
 }
 
 #[derive(Deserialize)]
@@ -1876,6 +1963,95 @@ pub async fn post_claim_desktop_home(
         }
     }
     complete_verified_desktop_claim(&wb, &standing.person)
+}
+
+/// `POST /account/hub-session/admit-owner` — make another account signed in on
+/// this computer an owner of its Home (DR-0265).
+///
+/// A desktop hosts one Home, so a person who uses it under two accounts needs
+/// standing under both. The two accounts are the selected one and `person`;
+/// whichever of them already owns the Home admits the other. Both sign-ins
+/// must be live here and are freshly checked by the Hub, which is the proof
+/// that one person holds both on this computer.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmitDesktopOwner {
+    person: String,
+    confirm: bool,
+}
+
+pub async fn post_admit_desktop_owner(
+    State(wb): State<SharedWorkbench>,
+    desktop: Option<Extension<DesktopOperatorPlane>>,
+    Json(request): Json<AdmitDesktopOwner>,
+) -> Response {
+    if desktop.is_none() || crate::auth_oidc::web_account_mode() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(selected) = hub_standing(&wb).filter(|s| s.expires_ms > now_ms()) else {
+        return (StatusCode::UNAUTHORIZED, "select a signed-in account first").into_response();
+    };
+    if !request.confirm || request.person == selected.person {
+        return (
+            StatusCode::CONFLICT,
+            "name another account signed in on this computer, and confirm",
+        )
+            .into_response();
+    }
+    let other = request.person;
+    let (Some(selected_bearer), Some(other_bearer)) = (
+        hub_session_token_for(&wb, &selected.person),
+        hub_session_token_for(&wb, &other),
+    ) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "both accounts must be signed in on this computer",
+        )
+            .into_response();
+    };
+    let expected = (selected.person.clone(), other.clone());
+    let checked = tokio::task::spawn_blocking(move || {
+        use crate::relay_route_stack::BearerAccounts;
+        let hub = crate::relay_route_stack::HubBearerAccounts::configured();
+        Ok::<_, String>((
+            hub.account_for(&selected_bearer)?,
+            hub.account_for(&other_bearer)?,
+        ))
+    })
+    .await;
+    match checked {
+        Ok(Ok((Some(a), Some(b)))) if (a.clone(), b.clone()) == expected => {}
+        Ok(Ok(_)) => {
+            return (StatusCode::UNAUTHORIZED, "sign in to both accounts again").into_response()
+        }
+        Ok(Err(error)) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the account service could not be checked",
+            )
+                .into_response()
+        }
+    }
+    let owners = match crate::home_owner::owners(&wb) {
+        Ok(owners) => owners,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    let (by, account) = if owners.contains(&selected.person) {
+        (selected.person.as_str(), other.as_str())
+    } else {
+        (other.as_str(), selected.person.as_str())
+    };
+    match crate::home_owner::admit_owner(&wb, by, account) {
+        Ok(crate::home_owner::OwnerAdmission::Admitted)
+        | Ok(crate::home_owner::OwnerAdmission::AlreadyOwner) => {}
+        Ok(crate::home_owner::OwnerAdmission::NotAnOwner) => {
+            return (StatusCode::CONFLICT, "neither account owns this computer").into_response()
+        }
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+    crate::desktop_session::revoke(&wb);
+    Json(desktop_status_json(&wb, latest_session(&wb).as_ref(), true)).into_response()
 }
 
 fn complete_verified_desktop_claim(wb: &SharedWorkbench, person: &str) -> Response {
@@ -2230,6 +2406,24 @@ fn selected_signed_routes_uncached(
     }
 }
 
+/// Select a registered Home on the selected Hub account, rather than in the
+/// local operator's account table. The selected session remains sealed and the
+/// selection fence refuses a response from an account that changed in flight.
+pub async fn put_signin_selected_home(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_account_authority(
+        &wb,
+        Method::PUT,
+        "/account/homes/selected".to_owned(),
+        headers,
+        body,
+    )
+    .await
+}
+
 /// `GET /account/hub-session/reach` — what the signed-in account can reach
 /// (the ADR 0114 composition): the person, their registered Homes, and the
 /// opaque project-to-Home routes, fetched from the Hub with the sealed bearer.
@@ -2319,6 +2513,48 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn native_home_selection_reaches_the_selected_hub_account_without_exposing_its_bearer() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session_for_test(&wb);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/account/homes/selected",
+            axum::routing::put(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer opaque-account-session");
+                assert_eq!(body, json!({"home_id": "home:mine"}));
+                assert!(headers.get("cookie").is_none());
+                StatusCode::NO_CONTENT
+            }),
+        );
+        let service = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert(
+            "authorization",
+            "Bearer untrusted-browser-token".parse().unwrap(),
+        );
+        headers.insert("cookie", "session=untrusted-cookie".parse().unwrap());
+        let response = proxy_account_authority_at(
+            &wb,
+            hub,
+            Method::PUT,
+            "/account/homes/selected".into(),
+            headers,
+            Bytes::from_static(b"{\"home_id\":\"home:mine\"}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(hub_session_actor(&wb).as_deref(), Some("account-root"));
+        service.abort();
+    }
+
+    #[tokio::test]
     async fn a_home_binds_only_the_hubs_exact_reserved_project() {
         use axum::{
             extract::Path,
@@ -2379,6 +2615,72 @@ mod tests {
         service.abort();
         assert_eq!(result.project_id, "proj-org-abcd");
         assert_eq!(result.home_id.as_deref(), Some("home-a"));
+    }
+
+    #[tokio::test]
+    async fn corporate_entry_uses_hosted_discovery_and_the_device_handoff() {
+        use axum::{extract::Form, routing::post};
+        use std::collections::HashMap;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let router = axum::Router::new().route(
+            "/auth/work-email",
+            post(|Form(form): Form<HashMap<String, String>>| async move {
+                assert_eq!(form["return_to"], NATIVE_RETURN);
+                assert_eq!(form["handoff_challenge"], "device-bound-challenge");
+                match form["email"].as_str() {
+                    "employee@company.example" => (
+                        StatusCode::SEE_OTHER,
+                        [("location", "https://idp.example.test/authorize?state=bound")],
+                    ),
+                    "missing@example.test" => (StatusCode::NOT_FOUND, [("location", "")]),
+                    "unsafe@example.test" => {
+                        (StatusCode::SEE_OTHER, [("location", "javascript:alert(1)")])
+                    }
+                    _ => (StatusCode::SERVICE_UNAVAILABLE, [("location", "")]),
+                }
+            }),
+        );
+        let service = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        tokio::task::spawn_blocking(move || {
+            assert_eq!(
+                work_email_login_at(
+                    &hub,
+                    "employee@company.example",
+                    NATIVE_RETURN,
+                    "device-bound-challenge"
+                )
+                .unwrap(),
+                Some("https://idp.example.test/authorize?state=bound".into())
+            );
+            assert_eq!(
+                work_email_login_at(
+                    &hub,
+                    "missing@example.test",
+                    NATIVE_RETURN,
+                    "device-bound-challenge"
+                )
+                .unwrap(),
+                None
+            );
+            assert!(work_email_login_at(
+                &hub,
+                "unsafe@example.test",
+                NATIVE_RETURN,
+                "device-bound-challenge"
+            )
+            .is_err());
+            assert!(work_email_login_at(
+                &hub,
+                "down@example.test",
+                NATIVE_RETURN,
+                "device-bound-challenge"
+            )
+            .is_err());
+        })
+        .await
+        .unwrap();
+        service.abort();
     }
 
     #[test]

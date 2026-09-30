@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
     desktopUpdateAllowed,
+    desktopUpdateOffer,
+    withDesktopUpdateTimeout,
     desktopUpdateScopeReady,
     desktopUpdateShouldRecheck,
     selectedDesktopUpdatePolicy,
@@ -16,6 +18,38 @@ describe("desktopUpdateAllowed", () => {
     it("does not offer the stable updater outside an organization's allowed channels", () => {
         expect(desktopUpdateAllowed({ allowedChannels: ["beta", "dev"] })).toBe(false);
         expect(desktopUpdateAllowed({ allowedChannels: ["stable"] })).toBe(true);
+    });
+});
+
+describe("desktopUpdateOffer", () => {
+    it("holds an update while no account scope has resolved", () => {
+        // The selected account refused by this computer's Home never resolves a
+        // scope. Discovery still runs; installation waits for a known policy.
+        expect(desktopUpdateOffer(undefined)).toBe("held");
+    });
+
+    it("offers or restricts once the policy is known", () => {
+        expect(desktopUpdateOffer(null)).toBe("available");
+        expect(desktopUpdateOffer({ allowedChannels: [] })).toBe("available");
+        expect(desktopUpdateOffer({ allowedChannels: ["beta"] })).toBe("restricted");
+    });
+});
+
+describe("withDesktopUpdateTimeout", () => {
+    it("fails a request that never answers instead of leaving the check pending", async () => {
+        vi.useFakeTimers();
+        try {
+            const pending = withDesktopUpdateTimeout(new Promise<never>(() => {}), 1_000);
+            const outcome = expect(pending).rejects.toThrow("timed out");
+            await vi.advanceTimersByTimeAsync(1_000);
+            await outcome;
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("passes an answer through", async () => {
+        await expect(withDesktopUpdateTimeout(Promise.resolve(7), 1_000)).resolves.toBe(7);
     });
 });
 

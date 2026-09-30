@@ -18,7 +18,7 @@ use gaugedesk_workspace::Workspace;
 use crate::agent_improve::{
     adopt_evaluated_candidate, prepare_native_shadow_pair_from_authoring,
     run_hosted_shadow_selection, run_native_shadow_selection, HostGauge, HostJudge, HostSelection,
-    PreparedShadowPair, SelectedShadowPair, ShadowTurn,
+    HostedImprovePairAdmission, PreparedShadowPair, SelectedShadowPair, ShadowTurn,
 };
 use crate::agent_improve_funding::ManagedShadowMeter;
 use crate::{library::gen_id, SharedWorkbench};
@@ -634,7 +634,7 @@ pub fn run_native_campaign_with_reservation(
     )
 }
 
-/// Run a sampled campaign at a Home-provisioned hosted placement. Home retains
+/// Run a sampled campaign at Home-provisioned hosted placements. Home retains
 /// the sampled sources and sealed exposure ledger, supplies one exact signed
 /// policy in the template, and meters each baseline/candidate model turn.
 /// This entrypoint never provisions a placement or grants a funding plan.
@@ -646,6 +646,7 @@ pub fn run_hosted_managed_campaign_with_reservation(
 ) -> Result<SelectedCampaign, String> {
     let HostedCampaignExecution {
         factory,
+        pair_admission,
         template,
         target_id,
         workspace,
@@ -671,14 +672,19 @@ pub fn run_hosted_managed_campaign_with_reservation(
         candidate_repo,
         campaign,
         |prepared, judge, selection, prompt| {
-            run_hosted_shadow_selection(
-                factory,
+            pair_admission.with_pair(
                 prepared,
-                gate.egress,
-                prompt,
-                judge,
-                selection,
-                &mut meter,
+                Box::new(|| {
+                    run_hosted_shadow_selection(
+                        factory,
+                        prepared,
+                        gate.egress,
+                        prompt,
+                        judge,
+                        selection,
+                        &mut meter,
+                    )
+                }),
             )
         },
         &mut || (gate.reserve_sealed)().map(Some),
@@ -687,6 +693,7 @@ pub fn run_hosted_managed_campaign_with_reservation(
 
 pub struct HostedCampaignExecution<'a> {
     pub factory: &'a dyn HarnessFactory,
+    pub pair_admission: &'a dyn HostedImprovePairAdmission,
     pub template: &'a HarnessSpec,
     pub target_id: &'a str,
     pub workspace: &'a dyn Workspace,
@@ -1215,6 +1222,7 @@ mod tests {
         sandbox::SandboxPolicy, AllowAllGate, Harness, HarnessFactory, Observation, TurnOutcome,
     };
     use std::io;
+    use std::sync::Mutex;
 
     const OPEN: &str = r#"{
       "schema":"gaugedesk.agent-improve.open.v1",
@@ -1349,13 +1357,53 @@ mod tests {
 
     struct HostedFakeFactory;
 
+    #[derive(Default)]
+    struct RecordingPairAdmission(Mutex<Vec<String>>);
+
+    impl HostedImprovePairAdmission for RecordingPairAdmission {
+        fn with_pair(
+            &self,
+            prepared: &PreparedShadowPair,
+            run: Box<dyn FnOnce() -> Result<SelectedShadowPair, String> + '_>,
+        ) -> Result<SelectedShadowPair, String> {
+            let baseline = prepared
+                .baseline_spec()
+                .runtime_placement_id
+                .as_deref()
+                .ok_or("baseline has no hosted placement")?;
+            let candidate = prepared
+                .candidate_spec()
+                .runtime_placement_id
+                .as_deref()
+                .ok_or("candidate has no hosted placement")?;
+            if baseline == candidate {
+                return Err("hosted arms reused a placement".to_owned());
+            }
+            self.0.lock().unwrap().push("admit".to_owned());
+            let result = run();
+            self.0.lock().unwrap().push(if result.is_ok() {
+                "complete".to_owned()
+            } else {
+                "fail".to_owned()
+            });
+            result
+        }
+    }
+
     impl HarnessFactory for HostedFakeFactory {
         fn kind(&self) -> &'static str {
             "whip-do"
         }
 
         fn create(&self, spec: &HarnessSpec) -> io::Result<Box<dyn Harness>> {
-            if spec.runtime_placement_id.as_deref() != Some("improve-placement") {
+            if !spec
+                .runtime_placement_id
+                .as_deref()
+                .is_some_and(|placement| {
+                    placement.starts_with("improve-placement:")
+                        && (placement.ends_with(":baseline") || placement.ends_with(":candidate"))
+                })
+            {
                 return Err(io::Error::other("wrong hosted placement"));
             }
             let candidate = spec.chat_id.ends_with(":candidate");
@@ -1407,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_campaign_runs_both_arms_under_one_placement_and_turn_meter() {
+    fn hosted_campaign_uses_distinct_placements_and_one_turn_meter() {
         let root = tempfile::tempdir().unwrap();
         let workbench = crate::open_workbench(root.path()).unwrap();
         let mut guard = workbench.lock_unpoisoned();
@@ -1475,6 +1523,7 @@ mod tests {
         hosted_template.provider = Some("cloudflare-ai-gateway".to_owned());
         hosted_template.credential_ref = Some(funding_ref.clone());
         let mut exposures = 0;
+        let pair_admission = RecordingPairAdmission::default();
         let mut reserve_sealed = || {
             exposures += 1;
             Ok("sealed-reservation".to_owned())
@@ -1483,6 +1532,7 @@ mod tests {
             &workbench,
             HostedCampaignExecution {
                 factory: &HostedFakeFactory,
+                pair_admission: &pair_admission,
                 template: &hosted_template,
                 target_id: &target_id,
                 workspace: &workspace,
@@ -1506,6 +1556,29 @@ mod tests {
         assert!(selected.reviewer_verdict().proposable);
         assert_eq!(selected.sealed_count(), 1);
         assert_eq!(exposures, 1);
+        assert_eq!(
+            *pair_admission.0.lock().unwrap(),
+            ["admit", "complete", "admit", "complete"]
+        );
+        let placements = selected
+            .scenarios
+            .iter()
+            .flat_map(|scenario| {
+                [
+                    scenario
+                        .prepared
+                        .baseline_spec()
+                        .runtime_placement_id
+                        .as_deref(),
+                    scenario
+                        .prepared
+                        .candidate_spec()
+                        .runtime_placement_id
+                        .as_deref(),
+                ]
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(placements.len(), selected.scenarios.len() * 2);
         let guard = workbench.lock_unpoisoned();
         let reservations =
             crate::managed_inference::fold_reservations(guard.store_ref(), &billing_scope).unwrap();

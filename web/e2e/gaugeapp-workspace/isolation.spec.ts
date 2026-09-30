@@ -1707,3 +1707,42 @@ test("switching payment tools also fences a late session without leaving the pag
     await expect(page.getByText("Embedded payment tool", { exact: true })).toBeVisible();
     await expect(page.getByLabel("Stripe events")).toHaveText("initialized, session received");
 });
+
+
+test("organization management ends with account admission and cannot borrow another account", async ({ page }) => {
+    await page.goto("/?app=administration&account-bound=1");
+    const standing = page.getByLabel("Admission standing");
+    await expect(standing).toHaveText("admitted");
+    await click(page, "Toggle active");
+    await expect(standing).toHaveText("not admitted");
+    await expect(page.getByRole("heading", { name: "Enterprise Identity", exact: true })).toHaveCount(0);
+    await click(page, "Toggle active");
+    await expect(standing).toHaveText("admitted");
+    await click(page, "Switch account");
+    await expect(standing).toHaveText("not admitted");
+    await expect(page.getByRole("heading", { name: "Enterprise Identity", exact: true })).toHaveCount(0);
+    await click(page, "Switch account");
+    await expect(standing).toHaveText("admitted");
+});
+
+
+for (const state of ["signed-out", "none"]) test(`organization picker is absent without membership or creation: ${state}`, async ({ page }) => {
+    await page.goto(`/?organization-picker=${state}`);
+    await expect(page.locator("[data-account-menu-trigger]")).toBeVisible();
+    await expect(page.locator(".organization-trigger")).toHaveCount(0);
+    await expect(page.locator(".organization-bar")).not.toBeVisible();
+});
+
+test("organization creation makes the picker available without an organization membership", async ({ page }) => {
+    await page.goto("/?organization-picker=create");
+    await page.locator(".organization-trigger").click();
+    await expect(page.getByRole("button", { name: "New organization", exact: true })).toBeEnabled();
+});
+
+test("organization membership makes the picker available without offering creation", async ({ page }) => {
+    await page.goto("/?organization-picker=member");
+    await expect(page.locator(".organization-trigger")).toContainText("Company");
+    await page.locator(".organization-trigger").click();
+    await expect(page.getByRole("button", { name: "New organization", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Personal", exact: true })).toBeVisible();
+});

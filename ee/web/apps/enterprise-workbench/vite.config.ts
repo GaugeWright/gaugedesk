@@ -34,6 +34,7 @@ const controlPlanePrefixes = [
     "/health",
     "/home",
     "/mobile",
+    "/notices",
     "/organization-invitations",
     "/pairing-requests",
     "/pairing-status",

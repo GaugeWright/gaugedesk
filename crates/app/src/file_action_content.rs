@@ -24,6 +24,7 @@ impl Workbench {
         path: &str,
     ) -> Result<NativeFileContentObservation, String> {
         let home = self.home_id().clone();
+        let account_scopes = account_authority_scopes(context)?;
         let (authority, basis) = self
             .store_ref()
             .read_for_dispatch(
@@ -31,6 +32,8 @@ impl Workbench {
                     LIBRARY_SCOPE,
                     ORG_SCOPE,
                     crate::account_auth::ACCOUNT_AUTH_SCOPE,
+                    &account_scopes[0],
+                    &account_scopes[1],
                     crate::mobile_machine_session::SCOPE,
                 ],
                 |store| {

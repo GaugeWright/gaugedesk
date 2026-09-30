@@ -1434,6 +1434,19 @@ impl WhipHarnessFactory {
         self
     }
 
+    /// Only a caller-injected transport can carry a Home-admitted command.
+    /// The environment-configured bearer DO host is a legacy/dev lane and is
+    /// never authority for a funded hosted Agent improvement.
+    pub fn has_injected_do_transport(&self) -> bool {
+        self.hosted
+            .as_ref()
+            .is_some_and(DoHostConfig::injected_transport)
+    }
+
+    pub fn do_tenant_id(&self) -> Option<&str> {
+        self.hosted.as_ref().map(|host| host.tenant_id.as_str())
+    }
+
     /// Keep improvement evaluation's continuity database in the caller's
     /// disposable workspace while retaining the same authority and model
     /// broker configuration as an ordinary native work chat.

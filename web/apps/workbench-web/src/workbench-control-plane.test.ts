@@ -174,6 +174,49 @@ describe("selected desktop account outside the local Home", () => {
         await api.getWorkspace();
         expect(calls.some((url) => url.endsWith("/home/home%3Ab/workspace"))).toBe(true);
     });
+
+    // selects-a-registered-native-home: the recovery action uses the production
+    // client, changes the account choice, then admits the relay-only Home.
+    it("selects a registered native Home in the signed-in account before opening its relay", async () => {
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        const calls: string[] = [];
+        let selected: string | null = null;
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            calls.push(url);
+            if (url.endsWith("/account/hub-session/homes/selected")) {
+                expect(init?.method).toBe("PUT");
+                expect(JSON.parse(String(init?.body))).toEqual({ home_id: "home:b" });
+                expect(new Headers(init?.headers).has("authorization")).toBe(false);
+                selected = "home:b";
+                return new Response("{}", { status: 200 });
+            }
+            if (url.endsWith("/account/hub-session/reach")) {
+                return new Response(JSON.stringify({
+                    person: "account:b", device: "device:desk",
+                    homes: { homes: [{ id: "home:b", kind: "registered", endpoint: "" }],
+                        selected_home: selected },
+                    routes: { routes: [] },
+                    signed_routes: { routes: [{ project: "project:b", home_id: "home:b", relay: {
+                        endpoint: "wss://relay.example.test", handle: "a".repeat(43),
+                        proof: "b".repeat(43), route_epoch: 1,
+                        home_fingerprint: "ab".repeat(32),
+                    } }] },
+                }));
+            }
+            if (url.endsWith("/home/admissions")) {
+                return new Response(JSON.stringify({ home: "home:b", admission: "admission:b" }),
+                    { status: 201 });
+            }
+            throw new Error(`Home selection escaped the sealed account: ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        api.setNativeRemote(true);
+        await expect(api.selectHome("home:b" as never)).resolves.toMatchObject({
+            kind: "connected", home: { id: "home:b" },
+        });
+        expect(calls[0]).toBe("http://127.0.0.1:4919/account/hub-session/homes/selected");
+    });
 });
 
 describe("hosted Home bootstrap", () => {

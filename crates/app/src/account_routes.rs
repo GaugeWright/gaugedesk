@@ -167,6 +167,10 @@ pub fn runtime_credential_routes() -> Router<SharedWorkbench> {
             post(crate::account_signin::post_claim_desktop_home),
         )
         .route(
+            "/account/hub-session/admit-owner",
+            post(crate::account_signin::post_admit_desktop_owner),
+        )
+        .route(
             "/account/hub-session/start",
             post(crate::account_signin::post_signin_start),
         )
@@ -177,6 +181,10 @@ pub fn runtime_credential_routes() -> Router<SharedWorkbench> {
         .route(
             "/account/hub-session/reach",
             get(crate::account_signin::get_signin_reach),
+        )
+        .route(
+            "/account/hub-session/homes/selected",
+            put(crate::account_signin::put_signin_selected_home),
         )
         .route(
             "/account/hub-session/tenants",

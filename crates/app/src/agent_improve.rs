@@ -165,6 +165,17 @@ pub struct PreparedShadowPair {
     candidate_discipline_ref: String,
 }
 
+/// Home admits the two exact prepared arm snapshots before their first host
+/// operation, then records the terminal outcome of their managed commands.
+/// A failure to admit or finish the pair cannot become campaign evidence.
+pub trait HostedImprovePairAdmission: Send + Sync {
+    fn with_pair(
+        &self,
+        prepared: &PreparedShadowPair,
+        run: Box<dyn FnOnce() -> Result<SelectedShadowPair, String> + '_>,
+    ) -> Result<SelectedShadowPair, String>;
+}
+
 impl PreparedShadowPair {
     pub fn baseline_spec(&self) -> &HarnessSpec {
         &self.baseline
@@ -304,6 +315,9 @@ fn prepare_one(
         .ok_or_else(|| invalid("shadow scratch root has no identity"))?
         .to_string_lossy();
     spec.chat_id = format!("{}:improve:{nonce}:{label}", template.chat_id);
+    if let Some(placement) = &template.runtime_placement_id {
+        spec.runtime_placement_id = Some(format!("{placement}:{nonce}:{label}"));
+    }
     spec.worktree = worktree.clone();
     spec.package_root = Some(package_root);
     spec.package_version_ref = Some(package.version_ref().to_owned());
@@ -435,10 +449,10 @@ pub fn run_native_shadow_selection(
     run_shadow_selection_with_factory(&isolated, prepared, gate, prompt, judge, selection)
 }
 
-/// A hosted Home supplies an admitted disposable placement and a funding
-/// meter. Both arms share the signed policy and placement ceiling but open
-/// distinct WhippleScript instances and workspaces through their distinct
-/// chat identities. Placement provisioning and retirement stay with Home.
+/// A hosted Home supplies admitted disposable placements and a funding
+/// meter. Both arms share the signed policy and placement ceiling but use
+/// distinct placement, chat, and workspace identities. Placement admission
+/// and retirement stay with Home.
 pub(crate) fn run_hosted_shadow_selection(
     factory: &dyn HarnessFactory,
     prepared: &PreparedShadowPair,
@@ -863,12 +877,19 @@ fn validate_pair(
     candidate: &HarnessSpec,
 ) -> io::Result<()> {
     match factory.kind() {
-        "whip" if baseline.runtime_placement_id.is_none() => {}
+        "whip"
+            if baseline.runtime_placement_id.is_none()
+                && candidate.runtime_placement_id.is_none() => {}
         "whip-do"
             if baseline
                 .runtime_placement_id
                 .as_deref()
-                .is_some_and(|placement| !placement.trim().is_empty()) => {}
+                .is_some_and(|placement| !placement.trim().is_empty())
+                && candidate
+                    .runtime_placement_id
+                    .as_deref()
+                    .is_some_and(|placement| !placement.trim().is_empty())
+                && baseline.runtime_placement_id != candidate.runtime_placement_id => {}
         _ => {
             return Err(invalid(
                 "shadow comparison requires an admitted native or hosted WhippleScript placement",
@@ -892,7 +913,6 @@ fn validate_pair(
         || baseline.provider_binding_ref != candidate.provider_binding_ref
         || baseline.credential_ref != candidate.credential_ref
         || baseline.placement_ceiling_ref != candidate.placement_ceiling_ref
-        || baseline.runtime_placement_id != candidate.runtime_placement_id
         || !same_credential_capability(baseline, candidate)
         || baseline.provider != candidate.provider
         || baseline.model != candidate.model
@@ -1268,7 +1288,11 @@ mod tests {
 
     impl DoHostTransport for ShadowDoTransport {
         fn send(&self, request: DoHostRequest) -> io::Result<DoHostResponse> {
-            if request.placement_id != "improve-placement" || request.tenant_id != "tenant" {
+            if !request.placement_id.starts_with("improve-placement:")
+                || !(request.placement_id.ends_with(":baseline")
+                    || request.placement_id.ends_with(":candidate"))
+                || request.tenant_id != "tenant"
+            {
                 return Err(io::Error::other("shadow DO placement changed"));
             }
             let body: Value = if request.body.is_empty() {
@@ -1402,7 +1426,7 @@ mod tests {
         template.runtime_placement_id = Some("improve-placement".to_owned());
         template.provider = Some("cloudflare-ai-gateway".to_owned());
         template.credential_ref = Some("funding-ref".to_owned());
-        let prepared =
+        let mut prepared =
             prepare_native_shadow_pair(&template, &baseline_repo, &candidate_repo, &scenario)
                 .unwrap();
         let transport = Arc::new(ShadowDoTransport::default());
@@ -1413,6 +1437,14 @@ mod tests {
             root.path().join("runtimes"),
         )
         .with_do_host(config);
+        assert_ne!(
+            prepared.baseline.runtime_placement_id,
+            prepared.candidate.runtime_placement_id
+        );
+        let candidate_placement = prepared.candidate.runtime_placement_id.clone();
+        prepared.candidate.runtime_placement_id = prepared.baseline.runtime_placement_id.clone();
+        assert!(validate_pair(&factory, &prepared.baseline, &prepared.candidate).is_err());
+        prepared.candidate.runtime_placement_id = candidate_placement;
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut meter = RecordingMeter {
             events: Arc::clone(&events),

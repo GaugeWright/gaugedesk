@@ -10,6 +10,7 @@ import type {
     EngagementId,
     ExportState,
     FileEntry,
+    ChatNotice,
     HumanTask,
     MergeAction,
     MergeState,
@@ -864,7 +865,11 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async selectHome(id: HomeId): Promise<HomeBootstrapState> {
-        await accountClient.accountSelectHome(this.route, id);
+        if (this.nativeRemote) {
+            await this.route("PUT", "/account/hub-session/homes/selected", { home_id: id });
+        } else {
+            await accountClient.accountSelectHome(this.route, id);
+        }
         this.homeTransport = null;
         return this.bootstrapHome();
     }
@@ -1217,6 +1222,11 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     getTasks(): Promise<HumanTask[]> {
         return workbenchClient.getTasks(this.workbenchTransport());
+    }
+
+    /** Each chat's notice for this reader (DR-0266). */
+    getChatNotices(): Promise<ChatNotice[]> {
+        return workbenchClient.getChatNotices(this.workbenchTransport());
     }
 
     getRoster(): Promise<RosterPerson[]> {
@@ -2409,6 +2419,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.desktopSessionJson().then((json) => accountClient.hubSessionClaimHome(json, person));
     }
 
+    hubSessionAdmitOwner(person: string): Promise<accountClient.HubSessionStatus> {
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionAdmitOwner(json, person));
+    }
+
     hubSessionAccounts(): Promise<accountClient.HubSessionAccounts> {
         return this.desktopSessionJson().then((json) => accountClient.hubSessionAccounts(json));
     }
@@ -2419,6 +2433,10 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     hubSessionSelectLocal(): Promise<accountClient.HubSessionStatus> {
         return accountClient.hubSessionSelectLocal(this.route);
+    }
+
+    hubSessionWorkEmailStart(email: string): Promise<{ url: string; webReturn: boolean } | null> {
+        return this.desktopSessionJson().then((json) => accountClient.hubSessionWorkEmailStart(json, email));
     }
 
     hubSessionStart(provider?: string): Promise<{ url: string; webReturn: boolean }> {

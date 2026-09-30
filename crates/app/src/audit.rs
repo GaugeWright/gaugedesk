@@ -648,16 +648,27 @@ pub fn record(wb: &mut Workbench, actor: &str, action: &str, target: &str) {
 }
 
 pub fn record_in(wb: &mut Workbench, store_scope: &str, actor: &str, action: &str, target: &str) {
+    let _ = record_required_in(wb, store_scope, actor, action, target);
+}
+
+/// Persist an audit entry before serving a request that requires audit evidence.
+/// Append failures reach the caller. Checkpoints and streaming remain the
+/// non-authoritative completion effects described by [`finish_committed_in`].
+pub fn record_required_in(
+    wb: &mut Workbench,
+    store_scope: &str,
+    actor: &str,
+    action: &str,
+    target: &str,
+) -> Result<(), AdmitError> {
     let link = link(actor, action, target);
     let audit_scope = scope_for(store_scope);
-    let appended = wb
+    let (_, payload) = wb
         .store_mut()
-        .append_chained_record(&audit_scope, "entry", &link);
-    if let Ok((_, payload)) = appended {
-        if let Some(entry) = committed_entry(Some(&payload)) {
-            finish_committed_in(wb, store_scope, &entry);
-        }
-    }
+        .append_chained_record(&audit_scope, "entry", &link)?;
+    let entry: AuditEntry = serde_json::from_str(&payload)?;
+    finish_committed_in(wb, store_scope, &entry);
+    Ok(())
 }
 
 /// The full timeline in position order (oldest first).

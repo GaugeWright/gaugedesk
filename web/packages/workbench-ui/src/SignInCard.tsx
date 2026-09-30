@@ -40,7 +40,7 @@ export type SignInRoute =
     /** `label` only where the resolver actually knows the organization's name.
      *  Discovery against `/auth/work-email` does not: it redirects or answers a
      *  flat 404, and the redirect's destination is not readable. */
-    | { kind: "organization"; label?: string; go: () => void }
+    | { kind: "organization"; label?: string; go: () => void | Promise<void> }
     | { kind: "personal" };
 
 export interface SignInPasskeyActions {
@@ -139,7 +139,7 @@ export interface SignInCardProps {
 
 type Step =
     | { at: "identify" }
-    | { at: "organization"; email: string; label?: string; go: () => void }
+    | { at: "organization"; email: string; label?: string; go: () => void | Promise<void> }
     | { at: "personal"; email: string }
     | { at: "create"; email: string; challenge?: { id: string; expiresIn: number } }
     | { at: "provider-create"; email: string }
@@ -479,7 +479,8 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                                 </span>
                                 <button class="signin__change" type="button" onClick={restart}>Change</button>
                             </p>
-                            <button class="signin__primary" type="button" onClick={() => current().go()}>
+                            <button class="signin__primary" type="button" disabled={busy()}
+                                onClick={() => void run("open your organization's sign-in", async () => { await current().go(); })}>
                                 {current().label
                                     ? `Continue to ${current().label}`
                                     : "Continue to your organization's sign-in"}

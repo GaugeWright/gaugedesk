@@ -23,7 +23,7 @@ gaugedesk-relay-transport = { path = "../relay-transport" }
 gaugedesk-directory-protocol = { path = "../directory-protocol" }
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "fs", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -79,6 +79,8 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 # payment frequency, not the hot path). `rustls` TLS on `ring` (no native-tls), keeping
 # the build OpenSSL- and cmake-free to match the rest of the stack.
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# Cancellable management-provider transport; setup/payment seams retain ureq.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
 # Socket hand-off for hot-reload dev (DX): under `systemfd` the listening socket is
 # passed via the env, so a `cargo watch` restart inherits the *same* open socket —
 # clients queue across the rebuild instead of being refused. A no-op for a plain

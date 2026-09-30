@@ -3666,6 +3666,42 @@
       }
     },
     {
+      "id": "desktop.account-home.select",
+      "jurisdiction": "desktop-selected-account",
+      "transport": "http-json",
+      "method": "PUT",
+      "path": "/account/hub-session/homes/selected",
+      "producer": "gaugedesk-app account_signin",
+      "consumer": "WorkbenchControlPlane.selectHome",
+      "authentication": "sealed-selected-hub-session-with-selection-fence",
+      "scope": "selected-person-account",
+      "capability": "select-own-registered-home",
+      "requestSchema": "rust:gaugedesk-app/account_routes/SelectHomeBody",
+      "responseSchema": "http/204",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/apps/workbench-web/src/workbench-control-plane.test.ts#selects-a-registered-native-home"
+        ],
+        "authority": [
+          "crates/app/src/account_signin.rs#native_home_selection_reaches_the_selected_hub_account_without_exposing_its_bearer"
+        ],
+        "journey": [
+          "web/apps/workbench-web/src/workbench-control-plane.test.ts#selects-a-registered-native-home"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_signin.rs#native_home_selection_reaches_the_selected_hub_account_without_exposing_its_bearer"
+        ]
+      }
+    },
+    {
       "id": "account.home.unregister",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",
@@ -6713,17 +6749,89 @@
       },
       "evidence": {
         "contract": [
-          "crates/app/src/agent_improve_campaign.rs#hosted_campaign_runs_both_arms_under_one_placement_and_turn_meter"
+          "crates/app/src/agent_improve_campaign.rs#hosted_campaign_uses_distinct_placements_and_one_turn_meter"
         ],
         "authority": [
           "crates/app/src/agent_improve_routes.rs#hosted_entry_requires_verified_human_home_and_server_funding"
         ],
         "journey": [
-          "crates/app/src/agent_improve_campaign.rs#hosted_campaign_runs_both_arms_under_one_placement_and_turn_meter"
+          "crates/app/src/agent_improve_campaign.rs#hosted_campaign_uses_distinct_placements_and_one_turn_meter"
         ],
         "deployed": [],
         "property": [
           "crates/app/src/agent_improve.rs#hosted_shadow_uses_do_transport_and_discards_both_identities"
+        ]
+      }
+    },
+    {
+      "id": "home.archetype.improve.evidence.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/archetypes/:id/improve/evidence",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "Authenticated Agent authoring client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-archetype-campaign",
+      "capability": "review-owned-archetype-campaign",
+      "requestSchema": "rust:gaugedesk-app/agent_improve_routes/ReviewAgentImprove",
+      "responseSchema": "rust:gaugedesk-app/agent_improve_evidence/AgentImproveEvidenceRecord",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/agent_improve_campaign.rs#home_receipt_promotes_only_complete_sampled_evaluation_to_held_out_evidence"
+        ],
+        "authority": [
+          "crates/app/src/agent_improve_routes.rs#hosted_review_and_adoption_require_the_source_owner"
+        ],
+        "journey": [
+          "crates/app/src/agent_improve_campaign.rs#home_receipt_promotes_only_complete_sampled_evaluation_to_held_out_evidence"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/agent_improve_campaign.rs#home_receipt_promotes_only_complete_sampled_evaluation_to_held_out_evidence"
+        ]
+      }
+    },
+    {
+      "id": "home.archetype.improve.evidence.adopt",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/archetypes/:id/improve/evidence/:evidence_id/adopt",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "Authenticated Agent authoring client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-archetype-evidence",
+      "capability": "adopt-reviewed-archetype-candidate",
+      "requestSchema": "http/path-archetype-and-evidence-id",
+      "responseSchema": "rust:gaugedesk-app/agent_improve_routes/AdoptAgentImproveResult",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/agent_improve_campaign.rs#home_receipt_promotes_only_complete_sampled_evaluation_to_held_out_evidence"
+        ],
+        "authority": [
+          "crates/app/src/agent_improve_routes.rs#hosted_review_and_adoption_require_the_source_owner"
+        ],
+        "journey": [
+          "crates/app/src/agent_improve_campaign.rs#home_receipt_promotes_only_complete_sampled_evaluation_to_held_out_evidence"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/agent_improve_campaign.rs#home_receipt_promotes_only_complete_sampled_evaluation_to_held_out_evidence"
         ]
       }
     },
@@ -7300,6 +7408,42 @@
         "deployed": [],
         "property": [
           "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#home-navigation-authority-matrix"
+        ]
+      }
+    },
+    {
+      "id": "home.navigation.notices",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/notices",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "local-owner-or-account-session-and-home-admission",
+      "scope": "person-home-chat-notices",
+      "capability": "read-chat-notices",
+      "requestSchema": "http/empty",
+      "responseSchema": "rust:gaugedesk-app/library_state/chat_notices_value",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/control-plane-workbench.test.ts#reads each understood notice and drops the rest"
+        ],
+        "authority": [
+          "crates/app/src/tests.rs#the_task_bar_shows_each_person_only_their_own_work"
+        ],
+        "journey": [
+          "crates/app/src/tests.rs#a_settled_turn_raises_a_notice_that_counts_settles"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/desktop_session_tests.rs#another_selected_account_cannot_borrow_the_local_home"
         ]
       }
     },
@@ -10107,6 +10251,13 @@
     {
       "method": "GET",
       "path": "/account/hub-session",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/account/hub-session/admit-owner",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

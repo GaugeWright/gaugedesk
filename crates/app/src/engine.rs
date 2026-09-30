@@ -1797,8 +1797,15 @@ pub fn run_engagement_turn(
         return Err(EngineError::AlreadyRunning);
     };
     bind_turn_image_sources(id, input.images);
-    let mut result = run_claimed_engagement_turn(wb, id, worktree, sender, input)?;
+    let settled = run_claimed_engagement_turn(wb, id, worktree, sender, input);
     drop(claim);
+    // The chat's queue signals and notice change when its turn ends, however it
+    // ended and whoever started it — a choice answer, a federated crossing, or
+    // another client. Only the client that sent a turn learns its end from the
+    // reply, so every other one learns it here (DR-0266).
+    wb.lock_unpoisoned()
+        .notify_library_changed("chat", id, "upsert");
+    let mut result = settled?;
     if let Some(intent) = result.auto_title.take() {
         if result.run_phase == RunPhase::Completed && intent.model.is_some() {
             let workbench = wb.clone();

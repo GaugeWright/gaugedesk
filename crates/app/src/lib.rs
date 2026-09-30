@@ -33,11 +33,12 @@ pub use agent_improve_custody::{
 };
 pub mod agent_improve_evidence;
 mod agent_improve_routes;
+pub use agent_improve_routes::HostedImproveAdmittedFactory;
 mod agent_improve_runtime;
 pub use agent_improve_runtime::{
     adopt_agent_improve_from_desktop, evaluate_agent_improve_from_desktop,
     evaluate_agent_improve_from_hosted, latest_agent_improve_evidence_from_desktop,
-    NativeImproveResult,
+    HostedImproveAdmission, NativeImproveResult,
 };
 pub mod agent_question;
 pub mod agent_release;
@@ -118,6 +119,7 @@ pub mod net_http;
 pub mod net_relay;
 pub mod net_server;
 pub mod net_tls;
+pub mod office_home_admission;
 pub mod official_skills;
 pub mod open_api;
 pub mod open_route_stack;
@@ -135,6 +137,7 @@ pub mod project_tracker_routes;
 pub mod project_workflow;
 pub mod project_workflow_routes;
 pub mod protected_profiles;
+mod provider_transport;
 pub mod publisher_routes;
 pub mod quarantine;
 pub mod relay_route_stack;

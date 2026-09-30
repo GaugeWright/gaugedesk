@@ -53,6 +53,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route("/workspace", get(lr::get_workspace))
         .route("/workspace/events", get(er::workspace_events))
         .route("/tasks", get(lr::get_tasks))
+        .route("/notices", get(lr::get_notices))
         .route(
             "/projects/{project}/trackers",
             get(crate::project_tracker_routes::list_trackers),
@@ -118,6 +119,18 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route(
             "/archetypes/{id}/improve/evaluate",
             post(crate::agent_improve_routes::evaluate),
+        )
+        .route(
+            "/archetypes/{id}/improve/evidence",
+            get(crate::agent_improve_routes::review).layer(axum::middleware::map_response(
+                crate::file_action_routes::no_store,
+            )),
+        )
+        .route(
+            "/archetypes/{id}/improve/evidence/{evidence_id}/adopt",
+            post(crate::agent_improve_routes::adopt).layer(axum::middleware::map_response(
+                crate::file_action_routes::no_store,
+            )),
         )
         .route("/archetypes/{id}/use", post(lr::use_archetype))
         .route("/archetypes/{id}/fork", post(lr::fork_archetype))

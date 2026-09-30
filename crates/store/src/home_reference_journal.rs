@@ -313,6 +313,55 @@ fn digest(operations: &[ReferenceOperation]) -> Result<String, JournalError> {
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SealMetadata {
+    home_id: String,
+    registry_basis: String,
+    policy_basis: String,
+    structural_basis: String,
+    roster_digest: String,
+    operation_count: i64,
+    roster_scope: String,
+    seal_status: String,
+}
+
+fn seal_metadata(conn: &Connection, epoch: i64) -> Result<Option<SealMetadata>, JournalError> {
+    Ok(conn
+        .query_row(
+            "SELECT home_id, registry_basis, policy_basis, structural_basis, \
+                    roster_digest, operation_count, roster_scope, seal_status \
+             FROM home_reference_seals WHERE epoch = ?1",
+            [epoch],
+            |row| {
+                Ok(SealMetadata {
+                    home_id: row.get(0)?,
+                    registry_basis: row.get(1)?,
+                    policy_basis: row.get(2)?,
+                    structural_basis: row.get(3)?,
+                    roster_digest: row.get(4)?,
+                    operation_count: row.get(5)?,
+                    roster_scope: row.get(6)?,
+                    seal_status: row.get(7)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn validate_seal_frontier(
+    conn: &Connection,
+    epoch: i64,
+    home_id: &str,
+) -> Result<(), JournalError> {
+    let (bound, current_epoch, _) = state(conn)?;
+    if bound.as_deref() != Some(home_id) || current_epoch <= epoch {
+        return Err(JournalError::Conflict(
+            "reference seal has no matching advanced Home frontier",
+        ));
+    }
+    Ok(())
+}
+
 impl Store {
     /// Give one logical checked-program request a recoverable target operation
     /// identity. The request key is chosen and retained by the authenticated
@@ -739,10 +788,10 @@ impl Store {
         Ok(pinned)
     }
 
-    /// Atomically freeze every operation completed through this epoch and
-    /// advance admission to the next. Pending rows remain owed. The seal is
-    /// an exact cut, but cannot claim completeness until the accepting-path
-    /// inventory is proved.
+    /// Commit the cut and its bases under brief admission exclusion, then
+    /// materialize the immutable roster without holding the writer. A crash
+    /// between those steps leaves a pending seal that cannot certify a gate.
+    /// Pending operations remain owed in the next epoch.
     pub fn seal_reference_epoch(
         &mut self,
         home_id: &str,
@@ -757,21 +806,17 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let epoch = bind_home(&tx, home_id)?;
-        let operations = completed_through_epoch(&tx, epoch)?;
-        let roster_digest = digest(&operations)?;
         tx.execute(
             "INSERT INTO home_reference_seals \
              (epoch, home_id, registry_basis, policy_basis, structural_basis, \
-              roster_digest, operation_count, roster_scope) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'through_epoch')",
+              roster_digest, operation_count, roster_scope, seal_status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, '', 0, 'through_epoch', 'pending')",
             params![
                 epoch,
                 home_id,
                 registry_basis,
                 policy_basis,
-                structural_basis,
-                roster_digest,
-                operations.len() as i64
+                structural_basis
             ],
         )?;
         tx.execute(
@@ -779,16 +824,90 @@ impl Store {
             [epoch + 1],
         )?;
         tx.commit()?;
+        self.finalize_reference_seal(epoch)
+    }
+
+    /// Resume a cut whose frontier was durably advanced before a crash. The
+    /// completed rows through that epoch cannot change through this journal
+    /// API, so later admissions do not enter its roster.
+    pub fn finalize_reference_seal(&mut self, epoch: i64) -> Result<ReferenceSeal, JournalError> {
+        let before = seal_metadata(&self.conn, epoch)?
+            .ok_or(JournalError::Conflict("reference seal does not exist"))?;
+        validate_seal_frontier(&self.conn, epoch, &before.home_id)?;
+        if before.roster_scope != "through_epoch" {
+            return Err(JournalError::Conflict(
+                "legacy reference seal cannot be finalized again",
+            ));
+        }
+        let operations = completed_through_epoch(&self.conn, epoch)?;
+        let roster_digest = digest(&operations)?;
+        let operation_count = i64::try_from(operations.len())
+            .map_err(|_| JournalError::Conflict("reference roster exceeds seal capacity"))?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = seal_metadata(&tx, epoch)?
+            .ok_or(JournalError::Conflict("reference seal disappeared"))?;
+        if now != before {
+            return Err(JournalError::Conflict(
+                "reference seal changed during finalization",
+            ));
+        }
+        validate_seal_frontier(&tx, epoch, &now.home_id)?;
+        match now.seal_status.as_str() {
+            "pending" => {
+                tx.execute(
+                    "UPDATE home_reference_seals \
+                     SET roster_digest = ?2, operation_count = ?3, seal_status = 'final' \
+                     WHERE epoch = ?1 AND seal_status = 'pending'",
+                    params![epoch, roster_digest, operation_count],
+                )?;
+            }
+            "final"
+                if now.roster_digest == roster_digest && now.operation_count == operation_count => {
+            }
+            "final" => {
+                return Err(JournalError::Conflict(
+                    "sealed reference roster differs from its durable cut",
+                ));
+            }
+            _ => return Err(JournalError::Conflict("unknown reference seal status")),
+        }
+        tx.commit()?;
         Ok(ReferenceSeal {
-            home_id: home_id.to_owned(),
+            home_id: now.home_id,
             epoch,
-            registry_basis: registry_basis.to_owned(),
-            policy_basis: policy_basis.to_owned(),
-            structural_basis: structural_basis.to_owned(),
+            registry_basis: now.registry_basis,
+            policy_basis: now.policy_basis,
+            structural_basis: now.structural_basis,
             roster_digest,
             operations,
             inventory_complete: false,
         })
+    }
+
+    /// List durable cuts that advanced admission but have not yet finished
+    /// roster materialization. Recovery finalizes these exact epochs before
+    /// offering their certificates; it never infers them from current work.
+    pub fn unfinished_reference_seal_epochs(
+        &self,
+        home_id: &str,
+    ) -> Result<Vec<i64>, JournalError> {
+        required(home_id)?;
+        let (bound, _, _) = state(&self.conn)?;
+        if bound.as_deref().is_some_and(|bound| bound != home_id) {
+            return Err(JournalError::Conflict(
+                "reference journal belongs to a different Home",
+            ));
+        }
+        let mut statement = self.conn.prepare_cached(
+            "SELECT epoch FROM home_reference_seals \
+             WHERE home_id = ?1 AND seal_status = 'pending' ORDER BY epoch",
+        )?;
+        let epochs = statement
+            .query_map([home_id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(epochs)
     }
 
     /// Read back and verify a frozen cut. Later admissions do not change its
@@ -797,39 +916,16 @@ impl Store {
         &self,
         epoch: i64,
     ) -> Result<Option<ReferenceSeal>, JournalError> {
-        let seal: Option<(String, String, String, String, String, i64, String)> = self
-            .conn
-            .query_row(
-                "SELECT home_id, registry_basis, policy_basis, structural_basis, \
-                        roster_digest, operation_count, roster_scope \
-                 FROM home_reference_seals WHERE epoch = ?1",
-                [epoch],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((
-            home_id,
-            registry_basis,
-            policy_basis,
-            structural_basis,
-            roster_digest,
-            count,
-            roster_scope,
-        )) = seal
-        else {
+        let Some(seal) = seal_metadata(&self.conn, epoch)? else {
             return Ok(None);
         };
-        let operations = match roster_scope.as_str() {
+        validate_seal_frontier(&self.conn, epoch, &seal.home_id)?;
+        if seal.seal_status != "final" {
+            return Err(JournalError::Conflict(
+                "reference seal has not finished materializing",
+            ));
+        }
+        let operations = match seal.roster_scope.as_str() {
             "epoch" => completed_in_epoch(&self.conn, epoch)?,
             "through_epoch" => completed_through_epoch(&self.conn, epoch)?,
             _ => {
@@ -838,18 +934,20 @@ impl Store {
                 ))
             }
         };
-        if operations.len() as i64 != count || digest(&operations)? != roster_digest {
+        if i64::try_from(operations.len()).ok() != Some(seal.operation_count)
+            || digest(&operations)? != seal.roster_digest
+        {
             return Err(JournalError::Conflict(
                 "sealed reference roster differs from its durable cut",
             ));
         }
         Ok(Some(ReferenceSeal {
-            home_id,
+            home_id: seal.home_id,
             epoch,
-            registry_basis,
-            policy_basis,
-            structural_basis,
-            roster_digest,
+            registry_basis: seal.registry_basis,
+            policy_basis: seal.policy_basis,
+            structural_basis: seal.structural_basis,
+            roster_digest: seal.roster_digest,
             operations,
             inventory_complete: false,
         }))
@@ -1359,6 +1457,119 @@ mod tests {
             .complete_reference_operation("home:one", "next", evidence)
             .unwrap();
         assert_eq!(store.sealed_reference_epoch(0).unwrap(), Some(seal));
+    }
+
+    #[test]
+    fn unfinished_seal_survives_restart_and_excludes_later_admissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("home.sqlite");
+        let mut store = Store::open(path.to_str().unwrap()).unwrap();
+        store
+            .register_reference_operation("home:one", &input("one"))
+            .unwrap();
+        store
+            .complete_reference_operation("home:one", "one", evidence)
+            .unwrap();
+        store
+            .register_reference_operation("home:one", &input("pending"))
+            .unwrap();
+        assert!(store
+            .conn
+            .execute(
+                "UPDATE home_reference_operations SET witness_digest = 'changed' \
+                 WHERE operation_id = 'one'",
+                [],
+            )
+            .is_err());
+        assert!(store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO home_reference_operations \
+                 (operation_id, home_id, target_store, kind, basis_digest, \
+                  registered_epoch, status) \
+                 VALUES ('one', 'home:one', 'other', 'other', 'other', 0, 'pending')",
+                [],
+            )
+            .is_err());
+
+        // Crash immediately after the short frontier transaction commits.
+        let tx = store
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "INSERT INTO home_reference_seals \
+             (epoch, home_id, registry_basis, policy_basis, structural_basis, \
+              roster_digest, operation_count, roster_scope, seal_status) \
+             VALUES (0, 'home:one', 'registry:1', 'policy:1', 'tree:1', \
+                     '', 0, 'through_epoch', 'pending')",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "UPDATE home_reference_state SET current_epoch = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(store);
+
+        let mut reopened = Store::open(path.to_str().unwrap()).unwrap();
+        assert!(reopened.sealed_reference_epoch(0).is_err());
+        assert_eq!(
+            reopened
+                .unfinished_reference_seal_epochs("home:one")
+                .unwrap(),
+            vec![0]
+        );
+        assert!(reopened
+            .conn
+            .execute(
+                "UPDATE home_reference_operations \
+                 SET status = 'completed', completed_epoch = 0, \
+                     evidence_ref = 'late', witness_digest = 'late' \
+                 WHERE operation_id = 'pending'",
+                [],
+            )
+            .is_err());
+        reopened
+            .register_reference_operation("home:one", &input("two"))
+            .unwrap();
+        reopened
+            .complete_reference_operation("home:one", "two", evidence)
+            .unwrap();
+        let recovered = reopened.finalize_reference_seal(0).unwrap();
+        assert!(reopened
+            .unfinished_reference_seal_epochs("home:one")
+            .unwrap()
+            .is_empty());
+        assert_eq!(recovered.operations.len(), 1);
+        assert_eq!(recovered.operations[0].operation_id, "one");
+        assert_eq!(reopened.finalize_reference_seal(0).unwrap(), recovered);
+        assert_eq!(reopened.sealed_reference_epoch(0).unwrap(), Some(recovered));
+        reopened
+            .conn
+            .execute(
+                "UPDATE home_reference_state SET current_epoch = 0 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        assert!(reopened.sealed_reference_epoch(0).is_err());
+        reopened
+            .conn
+            .execute(
+                "UPDATE home_reference_state SET current_epoch = 1 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .seal_reference_epoch("home:one", "registry:2", "policy:2", "tree:2")
+                .unwrap()
+                .operations
+                .len(),
+            2
+        );
     }
 
     #[test]

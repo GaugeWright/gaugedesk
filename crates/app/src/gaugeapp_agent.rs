@@ -1584,15 +1584,6 @@ impl AgentCredential {
             Self::Codex { .. } => "https://chatgpt.com/backend-api/codex/responses",
         }
     }
-
-    fn authorize(&self, request: ureq::Request) -> ureq::Request {
-        match self {
-            Self::OpenAi(token) => request.set("authorization", &format!("Bearer {token}")),
-            Self::Codex { access, account_id } => request
-                .set("authorization", &format!("Bearer {access}"))
-                .set("chatgpt-account-id", account_id),
-        }
-    }
 }
 
 fn resolve_agent_credential(
@@ -2036,15 +2027,6 @@ where
     if is_stopped() {
         return Err(GaugeAppAgentError::Interrupted);
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_write(Duration::from_secs(10))
-        // An individual event-stream read is short so Stop is observed even
-        // while the provider is between events. The whole response keeps the
-        // independent 130-second bound enforced by read_provider_event_stream.
-        .timeout_read(Duration::from_secs(2))
-        .redirects(0)
-        .build();
     // Both provider transports use the same event-stream contract. Besides
     // satisfying the Codex endpoint, that gives the server bounded checkpoints
     // at which an authenticated Stop can take effect.
@@ -2061,38 +2043,59 @@ where
     };
     let serialized = serde_json::to_string(&sent)
         .map_err(|error| GaugeAppAgentError::InvalidOutput(error.to_string()))?;
-    let request = credential.authorize(
-        agent
-            .post(credential.endpoint())
-            .set("content-type", "application/json")
-            .set("accept", "text/event-stream"),
-    );
-    let response = match request.send_string(&serialized) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(status, response)) => {
-            // The provider's own explanation used to be dropped on the floor
-            // here, leaving `HTTP 400` and no way to act on it.
-            let complaint = response
-                .into_string()
-                .map(|body| provider_complaint(&body))
-                .unwrap_or_else(|error| format!("(unreadable response body: {error})"));
-            tracing::warn!(
-                status,
-                complaint,
-                "GaugeApp agent provider rejected request"
-            );
-            return Err(GaugeAppAgentError::Provider(format!(
-                "provider returned HTTP {status}: {complaint}"
-            )));
-        }
-        Err(ureq::Error::Transport(error)) => {
-            if is_stopped() {
-                return Err(GaugeAppAgentError::Interrupted);
-            }
-            return Err(GaugeAppAgentError::Provider(error.to_string()));
-        }
+    let authorization = match credential {
+        AgentCredential::OpenAi(token) => format!("Bearer {token}"),
+        AgentCredential::Codex { access, .. } => format!("Bearer {access}"),
     };
-    read_provider_event_stream(response.into_reader(), &mut is_stopped, emit)
+    let mut headers = vec![
+        ("authorization", authorization.as_str()),
+        ("content-type", "application/json"),
+        ("accept", "text/event-stream"),
+    ];
+    if let AgentCredential::Codex { account_id, .. } = credential {
+        headers.push(("chatgpt-account-id", account_id.as_str()));
+    }
+    // Keep the application error distinct from transport errors while the
+    // transport owns and settles its connection before returning.
+    let mut result = None;
+    crate::provider_transport::post(
+        credential.endpoint(),
+        &headers,
+        serialized,
+        &mut is_stopped,
+        |status, reader, stopped| {
+            result = Some(if !(200..300).contains(&status) {
+                let mut body = String::new();
+                let complaint = reader
+                    .take(MAX_PROVIDER_RESPONSE_BYTES + 1)
+                    .read_to_string(&mut body)
+                    .map(|_| provider_complaint(&body))
+                    .unwrap_or_else(|_| "(unreadable response body)".into());
+                tracing::warn!(
+                    status,
+                    complaint,
+                    "GaugeApp agent provider rejected request"
+                );
+                Err(GaugeAppAgentError::Provider(format!(
+                    "provider returned HTTP {status}: {complaint}"
+                )))
+            } else {
+                read_provider_event_stream(reader, stopped, emit)
+            });
+            Ok(())
+        },
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Interrupted || is_stopped() {
+            GaugeAppAgentError::Interrupted
+        } else {
+            GaugeAppAgentError::Provider(error.to_string())
+        }
+    })?;
+    if is_stopped() {
+        return Err(GaugeAppAgentError::Interrupted);
+    }
+    result.expect("provider transport consumed its response")
 }
 
 fn assistant_text(output: &[Value]) -> String {

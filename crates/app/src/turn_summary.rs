@@ -60,11 +60,27 @@ pub fn append(store: &mut Store, scope: &str, summary: &TurnSummary) -> Result<i
 
 /// Latest-wins fold over the append-only settle records.
 pub fn latest(store: &Store, scope: &str) -> Result<Option<TurnSummary>, AdmitError> {
-    store
-        .records(scope, TURN_SUMMARY_KIND)?
+    Ok(latest_with_ordinal(store, scope)?.map(|(_, summary)| summary))
+}
+
+/// The latest settle record with its ordinal: how many turns this scope has
+/// settled, counting it. The log is append-only, so the ordinal names one
+/// settle for good — a later turn has a larger one, and a retry of the same
+/// user message is a new settle rather than the old one again.
+pub fn latest_with_ordinal(
+    store: &Store,
+    scope: &str,
+) -> Result<Option<(usize, TurnSummary)>, AdmitError> {
+    let records = store.records(scope, TURN_SUMMARY_KIND)?;
+    let ordinal = records.len();
+    records
         .into_iter()
         .next_back()
-        .map(|payload| serde_json::from_str(&payload).map_err(AdmitError::Json))
+        .map(|payload| {
+            serde_json::from_str(&payload)
+                .map(|summary| (ordinal, summary))
+                .map_err(AdmitError::Json)
+        })
         .transpose()
 }
 

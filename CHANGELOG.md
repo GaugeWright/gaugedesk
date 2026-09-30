@@ -19,6 +19,48 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-30
+
+- First sign-in on a fresh computer opens its local Home directly when the
+  account has no Home or shared projects. A Home’s owner can let their other
+  signed-in accounts use the same computer and its projects.
+
+- Chats can notify your device when a turn ends, with notification and sound
+  preferences in Settings.
+
+- Desktop organization SSO now completes the same account sign-in handoff as
+  other sign-in methods. Organization management requires the selected live
+  account and closes when that account loses admission. The organization picker
+  appears only for an account that can create an organization or belongs to one.
+
+- The desktop app no longer shows "Checking for updates…" indefinitely when
+  this computer's Home does not admit the signed-in account. It checks at once;
+  an update found before the account's release policy can be read is shown as
+  waiting for your account and installs once the policy allows it. A check
+  that gets no answer in 30 seconds reports that it could not complete.
+
+- Queued native file actions now recheck account-session idle bounds and the
+  bound device before execution. Provider refresh cannot extend a retained
+  dispatch grant beyond the deadline originally admitted for it.
+
+- Management Agents tolerate model providers that take more than two seconds
+  to begin responding, and remain stoppable during the wait.
+
+- Opaque account sessions enforce their idle timeout on requests as well as
+  refreshes. The Hub identity response now reports non-secret session bounds
+  for native Home authentication, without exposing provider credentials or work.
+
+- iOS builds require iOS 15 or later. Devices still running iOS 14 must update
+  their operating system to install or update GaugeDesk.
+
+- Selecting a Home after desktop sign-in updates the signed-in account at the
+  Hub. Registered relay-only Homes are selected by identity rather than dialed
+  as empty endpoints, and selection failures are shown on the recovery card.
+
+- Account sign-in requires its session record to be saved successfully. Cached
+  credentials cannot bypass a revoked or missing session record, changed
+  session bounds, or a revoked device when authorizing work.
+
 ## [0.4.31] — 2026-09-30
 
 - Workshop Agents and top-level project groups start collapsed; expand a group

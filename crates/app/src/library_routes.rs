@@ -481,9 +481,22 @@ pub struct SearchQuery {
 pub async fn search(
     State(wb): State<SharedWorkbench>,
     Query(sq): Query<SearchQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    Json(wb.search_value(&sq.q)).into_response()
+    let bearer = net_http::bearer(&headers);
+    let scope = crate::workbench_auth::req_scope(&headers);
+    if let Err((status, error)) = wb.admit_data_request_with_client(
+        bearer,
+        None,
+        &scope,
+        crate::client_admission::ClientBuild::from_headers(&headers),
+        true,
+    ) {
+        return (status, Json(json!({ "error": error }))).into_response();
+    }
+    let visibility = wb.project_visibility_in(bearer, &scope);
+    Json(wb.search_value_visible(&sq.q, &visibility)).into_response()
 }
 
 // ---- GET /tasks : the human task queue -----------------------------------
@@ -510,6 +523,44 @@ pub async fn get_tasks(
             .into_response();
     };
     Json(wb.task_queue_value(context.actor().as_str())).into_response()
+}
+
+// ---- GET /notices : each chat's notice ------------------------------------
+
+/// Each chat's notice for the reader (DR-0266), which a device turns into an
+/// operating-system notification when a chat's turn ends.
+///
+/// Unlike the queue, it answers the local window with nobody signed in:
+/// notifying a person that the chat they started on this computer has
+/// finished needs no account. That reader is who such chats are addressed
+/// to — the Home's owner, or the Home itself before anyone has claimed it —
+/// and only the desktop operator plane is read that way, as the tracker
+/// routes read it; any other request needs an admitted actor.
+pub async fn get_notices(
+    State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
+    authenticated: Option<axum::Extension<crate::identity::AuthenticatedActionContext>>,
+    operator: Option<axum::Extension<crate::account_signin::DesktopOperatorPlane>>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    let reader = match crate::project_tracker_routes::context(&mut wb, &headers, authenticated) {
+        Some(context) => Some(context.actor().as_str().to_owned()),
+        None => (operator.is_some()
+            && crate::net_http::bearer(&headers).is_none()
+            && crate::mobile_machine_session::session_token(&headers).is_none())
+        .then(|| {
+            wb.home_owner_account()
+                .unwrap_or_else(|| wb.authority().as_str().to_owned())
+        }),
+    };
+    let Some(reader) = reader else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Sign in to see your chats' notices" })),
+        )
+            .into_response();
+    };
+    Json(wb.chat_notices_value(&reader)).into_response()
 }
 
 /// Who exists and may be given work (`GATE-3f`).
@@ -1089,7 +1140,7 @@ pub async fn post_materialize_organization_shared_project(
             role == Some(gaugedesk_core::abac::Role::owner())
                 || role == Some(gaugedesk_core::abac::Role::admin())
         });
-        let personal = guard.home_owner_account().as_deref() == Some(&actor)
+        let personal = guard.is_home_owner(&actor)
             && guard
                 .library
                 .projects

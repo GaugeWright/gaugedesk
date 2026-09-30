@@ -298,6 +298,27 @@ pub(crate) enum ForkChatError {
     HistoricalHomeClosed,
 }
 
+/// The signals one chat's durable state raises, and how many turns it has
+/// settled ([`Workbench::chat_signals`]).
+struct ChatSignals {
+    question: bool,
+    conflict: bool,
+    turn_settled: bool,
+    settle: usize,
+    /// The latest settle failed rather than completed.
+    failed: bool,
+}
+
+impl ChatSignals {
+    fn raised(&self, signal: crate::attention::Signal) -> bool {
+        match signal {
+            crate::attention::Signal::Question => self.question,
+            crate::attention::Signal::Conflict => self.conflict,
+            crate::attention::Signal::TurnSettled => self.turn_settled,
+        }
+    }
+}
+
 struct ResolvedForkPoint {
     entry_id: i64,
     /// Inclusive bound on the source-scope records the fork inherits
@@ -7819,12 +7840,28 @@ impl Workbench {
     /// file ordering. Both tiers are server projections (`INV-5`, projection-first): the
     /// client never folds transcripts nor walks worktrees. A chat that already matched in
     /// the log tier is not repeated as a file hit — the stronger (log) tier wins per chat.
+    #[cfg(test)]
     pub(crate) fn search_value(&self, query: &str) -> serde_json::Value {
+        self.search_value_visible(query, &crate::workbench_auth::ProjectVisibility::All)
+    }
+
+    pub(crate) fn search_value_visible(
+        &self,
+        query: &str,
+        visibility: &crate::workbench_auth::ProjectVisibility,
+    ) -> serde_json::Value {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
             return serde_json::json!({ "hits": [] });
         }
-        let mut chats: Vec<&ChatRecord> = self.library.chats.values().collect();
+        // Scope before folding transcripts or walking worktrees: search must not
+        // reveal a title, snippet, or file path from another staff project.
+        let mut chats: Vec<&ChatRecord> = self
+            .library
+            .chats
+            .values()
+            .filter(|chat| self.chat_visible(&chat.id, visibility))
+            .collect();
         chats.sort_by_key(|chat| std::cmp::Reverse(chat.created_position));
 
         // Tier 2 — chat log: fold each chat's *effective* transcript (its own
@@ -7968,6 +8005,117 @@ impl Workbench {
     /// it assignment. Unassigned stays unassigned — a real state meaning
     /// "whoever has access" (`GATE-3f`), answered by the workspace backlog
     /// rather than by this bar.
+    /// What one chat's durable state raises (ADR 0082 §2), read once for each
+    /// surface that shows it: the queue below and the chat's notice
+    /// (DR-0266). Derived from lifecycle state; the projection owns no truth.
+    fn chat_signals(&self, chat_id: &str) -> ChatSignals {
+        let run_phase = self
+            .store
+            .fold::<RunState>(chat_id)
+            .map(|run| run.phase)
+            .ok();
+        let merge = self.store.fold::<MergeState>(chat_id).ok();
+        // ATTN-1: settle-time facts are appended by the engine while it
+        // owns the workspace/runtime context. This projection only folds
+        // the newest record. `run_phase` remains the compatibility source
+        // for pre-ATTN-1 stores and the lifecycle-owned merge signals.
+        let latest = crate::turn_summary::latest_with_ordinal(&self.store, chat_id)
+            .ok()
+            .flatten();
+        let settle = latest.as_ref().map_or(0, |(ordinal, _)| *ordinal);
+        let turn_summary = latest.map(|(_, summary)| summary);
+        ChatSignals {
+            // ADR 0111: an agent's question is a tracker item, not a parked
+            // run phase. The chat raises `question` while it has an
+            // unanswered one.
+            question: !crate::agent_question::open_questions(&self.store, chat_id)
+                .unwrap_or_default()
+                .is_empty()
+                || crate::choice_prompt::list(&self.store, chat_id)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|card| card.answer.is_none()),
+            conflict: matches!(&merge, Some(m)
+                if m.phase == gaugedesk_core::merge::MergePhase::Rejected
+                    && m.workspace_outcome
+                        == gaugedesk_core::merge::WorkspaceOutcome::Conflict),
+            // A newer attempt appends a newer summary, so reply clears by
+            // construction when the human speaks/runs again.
+            turn_settled: turn_summary.as_ref().is_some_and(|summary| {
+                matches!(
+                    summary.receipt_status,
+                    crate::turn_summary::ReceiptStatus::Completed
+                        | crate::turn_summary::ReceiptStatus::Failed
+                )
+            }) || (turn_summary.is_none()
+                && run_phase == Some(gaugedesk_core::run::RunPhase::Completed)),
+            settle,
+            failed: turn_summary.is_some_and(|summary| {
+                summary.receipt_status == crate::turn_summary::ReceiptStatus::Failed
+            }),
+        }
+    }
+
+    /// Who should act on `signal` in a chat, read off the chat rather than off
+    /// the reader. An `answer` belongs to the question's own recipient (ADR 0113
+    /// §2); the rest belong to the chat's addressee. `default_addressee` is the
+    /// seam that already exists for this: it collapses to the acting authority
+    /// while a chat carries no distinct owner, and reads the owner once one
+    /// does, without changing this call site.
+    fn signal_addressee(&self, chat_id: &str, signal: crate::attention::Signal) -> String {
+        if signal != crate::attention::Signal::Question {
+            return self.default_addressee(chat_id);
+        }
+        crate::agent_question::open_questions(&self.store, chat_id)
+            .ok()
+            .and_then(|open| open.into_iter().next().map(|q| q.recipient))
+            .or_else(|| {
+                crate::choice_prompt::list(&self.store, chat_id)
+                    .ok()
+                    .and_then(|cards| {
+                        cards
+                            .into_iter()
+                            .find(|card| card.answer.is_none())
+                            .map(|card| card.recipient)
+                    })
+            })
+            .unwrap_or_else(|| self.default_addressee(chat_id))
+    }
+
+    /// Each chat's notice for `reader` (DR-0266): the chat's highest-priority
+    /// raised signal and how many turns it has settled, for the chats whose
+    /// signal is addressed to `reader`. The attention rules are not consulted.
+    /// They decide the bar and the badges, and `mute` says nothing about
+    /// interrupting; whether a notice interrupts is the receiving device's
+    /// own preference. A device notifies when a chat's settle count rises
+    /// and words it by the signal the chat then shows, so a question read
+    /// mid-turn, or a conflict repaired, reads as no new ending.
+    pub(crate) fn chat_notices_value(&self, reader: &str) -> serde_json::Value {
+        let notices: Vec<serde_json::Value> = self
+            .library
+            .chats
+            .values()
+            .filter(|chat| self.engagement_index.contains_key(&chat.id))
+            .filter_map(|chat| {
+                let signals = self.chat_signals(&chat.id);
+                let signal = crate::attention::Signal::ALL
+                    .into_iter()
+                    .find(|&signal| signals.raised(signal))?;
+                (self.signal_addressee(&chat.id, signal) == reader).then(|| {
+                    serde_json::json!({
+                        "chat": chat.id,
+                        "title": chat.title,
+                        "signal": signal.key(),
+                        "settle": signals.settle,
+                        "failed": signal == crate::attention::Signal::TurnSettled
+                            && signals.failed,
+                    })
+                })
+            })
+            .collect();
+        serde_json::json!({ "notices": notices })
+    }
+
     pub(crate) fn task_queue_value(&self, actor: &str) -> serde_json::Value {
         // Chats with an unanswered agent question (ADR 0113). The question is a
         // GaugeDesk record in the chat's own scope, so this is read per chat
@@ -8044,83 +8192,16 @@ impl Workbench {
             if !self.engagement_index.contains_key(&chat.id) {
                 continue;
             }
-            let run_phase = self
-                .store
-                .fold::<RunState>(&chat.id)
-                .map(|run| run.phase)
-                .ok();
-            let merge = self.store.fold::<MergeState>(&chat.id).ok();
-            // ATTN-1: settle-time facts are appended by the engine while it
-            // owns the workspace/runtime context. This projection only folds
-            // the newest record. `run_phase` remains the compatibility source
-            // for pre-ATTN-1 stores and the lifecycle-owned merge signals.
-            let turn_summary = crate::turn_summary::latest(&self.store, &chat.id)
-                .ok()
-                .flatten();
-            let raised = |signal: crate::attention::Signal| -> bool {
-                use crate::attention::Signal;
-                match signal {
-                    // ADR 0111: an agent's question is a tracker item, not a
-                    // parked run phase. The chat raises `question` while it has
-                    // an unanswered one.
-                    Signal::Question => {
-                        !crate::agent_question::open_questions(&self.store, &chat.id)
-                            .unwrap_or_default()
-                            .is_empty()
-                            || crate::choice_prompt::list(&self.store, &chat.id)
-                                .unwrap_or_default()
-                                .iter()
-                                .any(|card| card.answer.is_none())
-                    }
-                    Signal::Conflict => matches!(&merge, Some(m)
-                        if m.phase == gaugedesk_core::merge::MergePhase::Rejected
-                            && m.workspace_outcome
-                                == gaugedesk_core::merge::WorkspaceOutcome::Conflict),
-                    // A newer attempt appends a newer summary, so reply clears
-                    // by construction when the human speaks/runs again.
-                    Signal::TurnSettled => {
-                        turn_summary.as_ref().is_some_and(|summary| {
-                            matches!(
-                                summary.receipt_status,
-                                crate::turn_summary::ReceiptStatus::Completed
-                                    | crate::turn_summary::ReceiptStatus::Failed
-                            )
-                        }) || (turn_summary.is_none()
-                            && run_phase == Some(gaugedesk_core::run::RunPhase::Completed))
-                    }
-                }
-            };
+            let signals = self.chat_signals(&chat.id);
             let raised_signal = crate::attention::Signal::ALL.into_iter().find(|&signal| {
-                raised(signal) && rules.attention(signal) == crate::attention::Attention::Queue
+                signals.raised(signal)
+                    && rules.attention(signal) == crate::attention::Attention::Queue
             });
             let Some(raised_signal) = raised_signal else {
                 continue;
             };
             let ask = raised_signal.ask();
-            // Who should act, read off the chat rather than off the reader. An
-            // `answer` belongs to the question's own recipient (ADR 0113 §2); the
-            // rest belong to the chat's addressee. `default_addressee` is the seam
-            // that already exists for this: it collapses to the acting authority
-            // while a chat carries no distinct owner, and reads the owner once one
-            // does, without changing this call site.
-            let assignee = if raised_signal == crate::attention::Signal::Question {
-                crate::agent_question::open_questions(&self.store, &chat.id)
-                    .ok()
-                    .and_then(|open| open.into_iter().next().map(|q| q.recipient))
-                    .or_else(|| {
-                        crate::choice_prompt::list(&self.store, &chat.id)
-                            .ok()
-                            .and_then(|cards| {
-                                cards
-                                    .into_iter()
-                                    .find(|card| card.answer.is_none())
-                                    .map(|card| card.recipient)
-                            })
-                    })
-                    .unwrap_or_else(|| self.default_addressee(&chat.id))
-            } else {
-                self.default_addressee(&chat.id)
-            };
+            let assignee = self.signal_addressee(&chat.id, raised_signal);
             // ADR 0113 §3: the agent declared it cannot usefully proceed. This drives a
             // stronger presentation and suppresses *automatic* continuation — it is
             // never a lock on the person's own chat, who may always type.

@@ -8,6 +8,7 @@ import {
     getPlacementDistributionAudit,
     getResourceExport,
     getResourceReview,
+    getChatNotices,
     resourceExportCommand,
     resourceReviewCommand,
     renewPlacementDistribution,
@@ -148,5 +149,36 @@ describe("running a turn", () => {
         const transport = { base: "", json } as WorkbenchTransport;
         await runTask(transport, engagementId("chat-1"), "go");
         expect(json).toHaveBeenCalledWith("POST", "/chats/chat-1/task", { prompt: "go" }, undefined);
+    });
+});
+
+describe("chat notices", () => {
+    it("reads each understood notice and drops the rest", async () => {
+        const json = vi.fn().mockResolvedValue({
+            notices: [
+                { chat: "chat-1", title: "Plan", signal: "question", settle: 2, failed: false },
+                { chat: "chat-2", title: "Fix", signal: "turn-settled", settle: 3, failed: true },
+                { chat: "chat-3", title: "Later", signal: "celebration", settle: 1 },
+                { chat: "chat-4", title: "No count", signal: "conflict" },
+                { chat: "chat-5", title: "Odd count", signal: "conflict", settle: 1.5 },
+                { title: "No chat", signal: "conflict", settle: 1 },
+            ],
+        });
+        const transport = { base: "", json } as WorkbenchTransport;
+
+        const notices = await getChatNotices(transport);
+
+        expect(json).toHaveBeenCalledWith("GET", "/notices");
+        expect(notices).toEqual([
+            { chat: "chat-1", title: "Plan", signal: "question", settle: 2, failed: false },
+            { chat: "chat-2", title: "Fix", signal: "turn-settled", settle: 3, failed: true },
+        ]);
+    });
+
+    it("reads a reply without notices as none", async () => {
+        const json = vi.fn().mockResolvedValue({});
+        const transport = { base: "", json } as WorkbenchTransport;
+
+        expect(await getChatNotices(transport)).toEqual([]);
     });
 });

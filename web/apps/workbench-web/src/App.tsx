@@ -18,7 +18,9 @@
 // standalone entry (see wasm-modules.ts).
 import "./wasm-modules";
 import { accountSelectionSync } from "./account-selection-sync";
+import { accountMenuIdentity } from "./account-menu-identity";
 import { desktopHomeSession } from "./desktop-home-session";
+import { claimWithoutAsking } from "./desktop-home-default";
 import { createEffect, createMemo, createResource, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack, type Accessor, type JSX } from "solid-js";
 import {
     authority,
@@ -75,8 +77,9 @@ import {
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { ProjectManagementChat } from "./ProjectManagementChat";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
-import { desktopUpdateAllowed, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
+import { desktopUpdateOffer, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, withDesktopUpdateTimeout, DESKTOP_UPDATE_CHECK_TIMEOUT_MS, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
+import { CHAT_NOTIFICATION_EVENT, deliverChatNotice, personIsLooking } from "./chat-notification-delivery";
 import "@gaugewright/gw-embed";
 import {
     SignInCard,
@@ -167,6 +170,9 @@ import {
     writeChatModelPin,
     UNIVERSAL_COMPOSER_CAPABILITIES,
     writeChatThinking,
+    NoticeTracker,
+    notificationPreference,
+    preferenceWants,
 } from "@gaugewright/workbench-ui";
 import { isMobileHarness, MobileApp } from "@gaugewright/mobile-web";
 
@@ -414,6 +420,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setHomeBusy(false);
         }
     };
+    const selectAccountHome = async (id: import("@gaugewright/control-plane-client").HomeId) => {
+        setHomeBusy(true);
+        setHomeError("");
+        try {
+            await api.selectHome(id);
+            await refetchHome();
+        } catch (error) {
+            setHomeError(error instanceof Error ? error.message : String(error));
+        } finally {
+            setHomeBusy(false);
+        }
+    };
     const dismissHomeInvite = () => {
         setHomeInvite("");
         forgetHomeInvitation();
@@ -450,34 +468,60 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }, () => !switchingAccount() && props.gaugeApps?.selectedTenant()?.id === tenant).catch(() => undefined);
     };
     const [desktopUpdate, setDesktopUpdate] = createSignal<{
-        readonly kind: "checking" | "current" | "available" | "restricted" | "error" | "installing";
+        readonly kind: "checking" | "current" | "available" | "restricted" | "held" | "error" | "installing";
         readonly version?: string;
         readonly update?: import("@tauri-apps/plugin-updater").Update;
     } | null>(isTauri() ? { kind: "checking" } : null);
 
-    const selectedSoftwareUpdatePolicy = () =>
-        selectedDesktopUpdatePolicy(props.gaugeApps?.selectedTenant(), hubSession()?.local === true,
-            () => api.softwareUpdatePolicy());
+    /** `undefined` while no account scope has resolved: see `desktopUpdateOffer`. */
+    const selectedSoftwareUpdatePolicy = () => {
+        const selected = props.gaugeApps?.selectedTenant();
+        const localMode = hubSession()?.local === true;
+        if (props.gaugeApps && !desktopUpdateScopeReady(selected, localMode)) {
+            return Promise.resolve(undefined);
+        }
+        return withDesktopUpdateTimeout(selectedDesktopUpdatePolicy(selected, localMode,
+            () => api.softwareUpdatePolicy()));
+    };
 
     /** `announce` states the check in the interface. A check a person asked for
      * says so; the recheck timer's does not, because a footer that announces
      * itself every few hours is reporting the timer rather than the release. */
+    /** The latest check or install. A scope change starts a check while an
+     * earlier one may still be in flight, and whichever answers last would
+     * otherwise win: a pre-scope `held` could replace the governed result, or
+     * any result could replace `installing`. Only the newest run may answer. */
+    let desktopUpdateRun = 0;
+
     async function checkDesktopUpdate(announce = true) {
         if (!isTauri()) return;
+        // A scope change can land mid-install; a discovery result must not
+        // replace the installing state.
+        if (desktopUpdate()?.kind === "installing") return;
+        const run = ++desktopUpdateRun;
+        const superseded = () => run !== desktopUpdateRun;
         if (announce) setDesktopUpdate({ kind: "checking" });
         try {
             const [policy, updater] = await Promise.all([
                 selectedSoftwareUpdatePolicy(),
                 import("@tauri-apps/plugin-updater"),
             ]);
-            const update = await updater.check();
+            const update = await updater.check({ timeout: DESKTOP_UPDATE_CHECK_TIMEOUT_MS });
+            if (superseded()) {
+                await update?.close();
+                return;
+            }
             if (!update) {
                 setDesktopUpdate({ kind: "current" });
-            } else if (desktopUpdateAllowed(policy)) {
+                return;
+            }
+            const offer = desktopUpdateOffer(policy);
+            if (offer === "available") {
                 setDesktopUpdate({ kind: "available", version: update.version, update });
             } else {
+                // Held is asked again when the account scope resolves.
                 await update.close();
-                setDesktopUpdate({ kind: "restricted", version: update.version });
+                setDesktopUpdate({ kind: offer, version: update.version });
             }
         } catch {
             // Still not a warning: an unreachable update service is not the
@@ -485,20 +529,22 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // But it may not be *silent* either — rendering nothing here made a
             // failed check identical to a successful one, so a client that could
             // not reach the service looked exactly like a client that was current.
-            setDesktopUpdate({ kind: "error" });
+            if (!superseded()) setDesktopUpdate({ kind: "error" });
         }
     }
 
     async function installDesktopUpdate() {
         const candidate = desktopUpdate();
         if (candidate?.kind !== "available" || !candidate.update) return;
+        desktopUpdateRun++;
         setDesktopUpdate({ kind: "installing", version: candidate.version });
         try {
             // Re-read policy at the moment of installation: a stale discovery
             // result must never outlive a newly tightened organization ceiling.
-            if (!desktopUpdateAllowed(await selectedSoftwareUpdatePolicy())) {
+            const offer = desktopUpdateOffer(await selectedSoftwareUpdatePolicy());
+            if (offer !== "available") {
                 await candidate.update.close();
-                setDesktopUpdate({ kind: "restricted", version: candidate.version });
+                setDesktopUpdate({ kind: offer, version: candidate.version });
                 return;
             }
             await candidate.update.downloadAndInstall();
@@ -535,14 +581,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     );
     const localUpdateMode = createMemo(() => hubSession()?.local === true);
     if (isTauri()) {
-        // Wait for account membership or an explicit local choice. A local
-        // workbench has no organization policy to fetch, and otherwise waits
-        // forever on a selection that will never arrive.
+        // Check at mount and again whenever the account scope changes. Before
+        // the scope resolves — and it never does while the Home refuses the
+        // selected account — discovery still runs and an update is held rather
+        // than offered, so the footer never waits on a check nobody started.
         createEffect(on([() => props.gaugeApps?.selectedTenant(), localUpdateMode],
-            ([selected, localMode]) => {
-                if (props.gaugeApps && !desktopUpdateScopeReady(selected, localMode)) return;
-                void checkDesktopUpdate(false);
-            }));
+            () => void checkDesktopUpdate(false)));
     }
     const [claimPromptOpen, setClaimPromptOpen] = createSignal(false);
     const [claimBusy, setClaimBusy] = createSignal(false);
@@ -556,14 +600,49 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     };
     const selectedOwnsThisComputer = () => {
         const claim = hubSession()?.homeClaim;
+        const person = hubSession()?.person;
         return hubSession()?.expired !== true && claim?.state === "claimed"
-            && claim.owner === hubSession()?.person;
+            && !!person && claim.owners.includes(person);
     };
     const otherOwnerOfThisComputer = () => {
         const claim = hubSession()?.homeClaim;
-        if (claim?.state !== "claimed" || claim.owner === hubSession()?.person) return null;
-        return retainedAccounts()?.accounts.find((account) => account.person === claim.owner)?.label
+        const person = hubSession()?.person;
+        if (claim?.state !== "claimed" || (person && claim.owners.includes(person))) return null;
+        return retainedAccounts()?.accounts.find((account) => claim.owners.includes(account.person))?.label
             ?? claim.owner;
+    };
+    // The account that owns this computer, when it is signed in here too.
+    const owningRetainedAccount = () => {
+        const claim = hubSession()?.homeClaim;
+        const person = hubSession()?.person;
+        if (claim?.state !== "claimed" || (person && claim.owners.includes(person))) return null;
+        return retainedAccounts()?.accounts.find((account) => claim.owners.includes(account.person)) ?? null;
+    };
+    // Another account signed in here that this Home does not admit as an
+    // owner, which the selected owner may share the computer with (DR-0265).
+    const shareableAccounts = () => {
+        const status = hubSession();
+        const claim = status?.homeClaim;
+        if (!isTauri() || claim?.state !== "claimed" || !status?.person) return [];
+        if (!claim.owners.includes(status.person)) return [];
+        return (retainedAccounts()?.accounts ?? [])
+            .filter((account) => !claim.owners.includes(account.person));
+    };
+    const [admitBusy, setAdmitBusy] = createSignal(false);
+    const [admitError, setAdmitError] = createSignal("");
+    const admitOwner = async (person: string) => {
+        if (admitBusy()) return;
+        setAdmitBusy(true);
+        setAdmitError("");
+        try {
+            await api.hubSessionAdmitOwner(person);
+            await refetchHubSession();
+            await refetchHome();
+        } catch (error) {
+            setAdmitError(error instanceof Error ? error.message : "Could not share this computer.");
+        } finally {
+            setAdmitBusy(false);
+        }
     };
     const claimThisComputer = async () => {
         if ((!canClaimThisComputer() && !selectedOwnsThisComputer()) || claimBusy()) return;
@@ -696,23 +775,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // to say "nobody" — `null` is the signed-out state, not a value still loading. An
     // address is split so the trigger carries a name and the menu head the proof of
     // which account it is, rather than printing the same string twice.
-    const menuIdentity = createMemo(() => {
-        // Hosted GaugeApps project identity from their admitted account
-        // session. A native desktop keeps that opaque session sealed in its
-        // co-resident control plane, so the same menu falls back to the
-        // non-secret native status projection until the hosted Account pages
-        // are reachable. Neither path makes the browser an identity authority.
-        const gaugeAppIdentity = props.gaugeApps?.accountIdentity();
-        if (gaugeAppIdentity) return gaugeAppIdentity;
-        // The label (email, else name) is the display; the opaque IdP subject
-        // is a last resort for sessions sealed before the label existed.
-        const person = authority() ?? hubSession()?.label ?? hubSession()?.person ?? null;
-        if (!person) return null;
-        const at = person.indexOf("@");
-        return at > 0
-            ? { name: person.slice(0, at), email: person }
-            : { name: person };
-    });
+    const menuIdentity = createMemo(() => accountMenuIdentity(
+        props.gaugeApps?.accountIdentity(), Boolean(props.gaugeApps), hubSession(), authority(),
+    ));
     // What the signed-in account reaches (ADR 0114): Homes and opaque
     // project-to-Home routes, proxied by the control plane with its sealed
     // bearer. Only fetched while a live session exists.
@@ -1554,6 +1619,40 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             return next;
         });
     const [tasks] = createResource(navRefresh, () => api.getTasks().catch(() => []));
+    // `null` is a read that failed: it says nothing about which turns ended,
+    // so the tracker below skips it rather than read it as "none".
+    const [chatNotices] = createResource(navRefresh, () => api.getChatNotices().catch(() => null));
+    // DR-0266: a chat whose turn ends while the person is not looking at
+    // GaugeDesk raises an operating-system notification, as far as this
+    // device's preference allows. The tracker takes in every read, looked at
+    // or not, so what ended while the window was in front is never raised
+    // later. Its counts are per Home and per reader, because another Home's
+    // chats, or another person's, are not endings this person has seen.
+    const noticeTracker = new NoticeTracker();
+    const openNotifiedChat = (chat: string) => {
+        props.gaugeApps?.close();
+        openChat(chat as EngagementId);
+    };
+    createEffect(() => {
+        const notices = chatNotices();
+        if (!notices) return;
+        const home = homeState();
+        const reader = JSON.stringify([home?.kind === "connected" ? home.home.id : home?.kind ?? null, trackerActor()]);
+        const fresh = noticeTracker.fresh(reader, notices);
+        if (fresh.length === 0 || personIsLooking()) return;
+        const preference = untrack(notificationPreference);
+        for (const notice of fresh) {
+            if (preferenceWants(preference, notice)) void deliverChatNotice(notice, openNotifiedChat);
+        }
+    });
+    if (typeof window !== "undefined") {
+        const onChatNotification = (event: Event) => {
+            const chat = (event as CustomEvent).detail;
+            if (typeof chat === "string" && chat) openNotifiedChat(chat);
+        };
+        window.addEventListener(CHAT_NOTIFICATION_EVENT, onChatNotification);
+        onCleanup(() => window.removeEventListener(CHAT_NOTIFICATION_EVENT, onChatNotification));
+    }
     const reviewSet = () => new Set((tasks() ?? []).map((t) => String(t.id)));
     const runToneOf = (id: EngagementId | null): ChatRunTone | undefined => {
         if (!id) return undefined;
@@ -2471,6 +2570,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     <Show when={desktopUpdate()?.kind === "checking" || desktopUpdate()?.kind === "installing"}>
                         <span class="update-label" data-update-state>{desktopUpdate()?.kind === "installing" ? "Installing update…" : "Checking for updates…"}</span>
                     </Show>
+                    <Show when={desktopUpdate()?.kind === "held"}>
+                        <span class="update-label" data-update-held title="A newer release is available. It installs once this desktop can read the release policy of the account it is signed in to.">
+                            Update v{desktopUpdate()?.version} waits for your account
+                        </span>
+                    </Show>
                     <Show when={desktopUpdate()?.kind === "restricted"}>
                         <span class="update-label" data-update-restricted title="The available stable release is outside this organization's allowed release channels.">
                             Update v{desktopUpdate()?.version} is managed by your organization
@@ -2502,6 +2606,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     Claim this computer
                 </button>
             </Show>
+            <For each={shareableAccounts()}>
+                {(account) => <button type="button" data-admit-owner={account.person}
+                    title="Makes that account an owner of this computer's Home, so it opens these projects too."
+                    disabled={admitBusy()} onClick={() => void admitOwner(account.person)}>
+                    {admitBusy() ? "Sharing…" : `Share this computer with ${account.label}`}
+                </button>}
+            </For>
+            <Show when={admitError()}><p role="alert">{admitError()}</p></Show>
             <SettingsMenu
                 api={api}
                 placementPolicy={props.placementPolicy}
@@ -2571,6 +2683,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 ? "Sign in to your account. Projects on this computer stay local unless you choose to claim it."
                 : "Sign in to reach your account and its projects."}
             resolve={async (email) => {
+                if (!oidcRedirectAvailable) {
+                    const started = await api.hubSessionWorkEmailStart(email);
+                    return started ? {
+                        kind: "organization",
+                        go: async () => {
+                            if (started.webReturn) window.location.assign(started.url);
+                            else if (!await openExternal(started.url)) {
+                                throw new Error("Your browser could not be opened. Try Sign in again.");
+                            }
+                        },
+                    } : { kind: "personal" };
+                }
                 const { organization } = await resolveSignInRoute(
                     controlPlaneBase(),
                     email,
@@ -3406,6 +3530,23 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const state = homeState();
         return state?.kind === "none" ? state : null;
     });
+    // A desktop does not ask a signed-in account with no Home where its
+    // projects run (DR-0264): a fresh computer is claimed for it. Tried once;
+    // a failed claim leaves the card, with its error, rather than retrying
+    // behind it.
+    const autoClaim = createMemo(() => claimWithoutAsking({
+        desktop: isTauri(),
+        session: hubSession(),
+        noHome: noHomeState(),
+        invitation: Boolean(homeInvite()),
+    }));
+    const [autoClaimTried, setAutoClaimTried] = createSignal(false);
+    const desktopDefaultPending = () => !autoClaimTried() && autoClaim();
+    createEffect(() => {
+        if (!autoClaim() || untrack(autoClaimTried)) return;
+        setAutoClaimTried(true);
+        void claimThisComputer();
+    });
     // Whether the person asked for the advanced/recovery Home affordances
     // (endpoint entry, registered Homes, account reach). Off by default so a new
     // person meets one act, not a control panel.
@@ -3603,7 +3744,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 return state.homes.find((home) => home.id === state.selectedHome) ?? null;
             };
             const switchTo = (id: import("@gaugewright/control-plane-client").HomeId) =>
-                void api.selectHome(id).then(() => refetchHome());
+                void selectAccountHome(id);
             // One row, so the cards cannot drift apart in how they name a Home.
             //
             // It shows the Home id, because that is the only name a Home has:
@@ -3774,6 +3915,55 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             agents stay on the Home you choose—your computer, another team’s Home,
                             or a paid Cloud Home.
                         </p>
+                        {/* The desktop's own work is always one act away. Without
+                            this, an account on a computer another account owns had
+                            only ways to reach a Home somewhere else. */}
+                        <Show when={isTauri()}>
+                            <Show when={otherOwnerOfThisComputer()}>
+                                {/* An owner not signed in here is known only by an
+                                    opaque account id, which names nobody. */}
+                                <p class="homegate-lede" data-home-claimed-by-another>
+                                    This computer’s Home belongs to {owningRetainedAccount()?.label ?? "another account"},
+                                    so this account has no projects on it.
+                                </p>
+                                {/* A computer hosts one Home; a person reaches it
+                                    under each of their accounts by making each an
+                                    owner, which needs the owner signed in here too. */}
+                                <Show when={!owningRetainedAccount()}>
+                                    <p class="homegate-lede">
+                                        If that account is yours, sign in with it here once to let this account use this computer too.
+                                    </p>
+                                </Show>
+                            </Show>
+                            <div class="homegate-connect-row">
+                                <Show when={owningRetainedAccount()} fallback={
+                                    <Show when={otherOwnerOfThisComputer()}>
+                                        <button type="button" class="firstrun-connect" data-sign-in-owner
+                                            onClick={() => setSignInOpen(true)}>
+                                            Sign in with that account
+                                        </button>
+                                    </Show>
+                                }>
+                                    {(account) => <>
+                                        <button type="button" class="firstrun-connect" data-admit-owner
+                                            disabled={admitBusy() || switchingAccount()}
+                                            onClick={() => void admitOwner(account().person)}>
+                                            {admitBusy() ? "Sharing…" : "Let this account use this computer"}
+                                        </button>
+                                        <button type="button" data-switch-to-owner
+                                            disabled={switchingAccount()} onClick={() => void switchAccount(account().person)}>
+                                            Switch to {account().label}
+                                        </button>
+                                    </>}
+                                </Show>
+                                <button type="button" data-open-local-without-claim
+                                    disabled={switchingAccount()} onClick={() => void switchLocal()}>
+                                    Use this computer locally
+                                </button>
+                            </div>
+                            <Show when={accountSwitchError()}><p class="homegate-error" role="alert">{accountSwitchError()}</p></Show>
+                            <Show when={admitError()}><p class="homegate-error" role="alert">{admitError()}</p></Show>
+                        </Show>
                     </>}>
                         <p class="homegate-kicker">Signed in</p>
                         <h1 id="homegate-title">Your local projects are unclaimed</h1>
@@ -3787,6 +3977,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             <button type="button" class="homegate-link" data-open-home-claim
                                 onClick={() => setClaimPromptOpen(true)}>Review claim</button>
                         </div>
+                        <Show when={claimError()}><p class="homegate-error" role="alert">{claimError()}</p></Show>
+                        <Show when={accountSwitchError()}><p class="homegate-error" role="alert">{accountSwitchError()}</p></Show>
                         <p class="homegate-auth-note">Local mode keeps the projects on this computer. Your account stays saved here for later use.</p>
                     </Show>
 
@@ -3809,7 +4001,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                         type="button"
                                         class="homegate-home"
                                         disabled={homeBusy()}
-                                        onClick={() => void api.selectHome(home.id).then(() => refetchHome())}
+                                        onClick={() => void selectAccountHome(home.id)}
                                     >
                                         <span>{home.id}</span>
                                         <small>{home.endpoint}</small>
@@ -3831,10 +4023,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                         type="button"
                                         class="homegate-home"
                                         disabled={homeBusy()}
-                                        onClick={() => {
-                                            setHomeEndpoint(home.endpoint);
-                                            void connectHome();
-                                        }}
+                                        onClick={() => void selectAccountHome(home.id)}
                                     >
                                         <span>{home.id}</span>
                                         <small>{home.endpoint}</small>
@@ -3912,6 +4101,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             </Show>
         );
         return (
+            // A desktop that is claiming, has just claimed, or is switching to
+            // local mode is on its way to the workbench; the choice card behind
+            // it would only flash.
+            <Show when={!(noHomeState() && (desktopDefaultPending() || claimBusy() || switchingAccount()
+                || (isTauri() && selectedOwnsThisComputer())))} fallback={
+                <div class="homegate-scrim" data-tauri-drag-region data-home-desktop-default>
+                    <section class="homegate-card">
+                        <p class="homegate-lede">Setting up this computer…</p>
+                        {/* Never a dead end, should the Home not open. */}
+                        {signedInNote(false)}
+                    </section>
+                </div>
+            }>
             <Show
                 // An unclaimed desktop always gets the explicit choice screen.
                 // Rendering the claim card inline would make its defer button
@@ -3920,6 +4122,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 fallback={advancedSetup()}
             >
                 {simpleSetup()}
+            </Show>
             </Show>
         );
     };

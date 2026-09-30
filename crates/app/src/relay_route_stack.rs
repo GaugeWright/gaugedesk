@@ -227,11 +227,11 @@ async fn admit_relay_caller(
         }
     };
 
-    let (owner, home) = {
+    let (owns, home) = {
         let guard = relay.wb.lock_unpoisoned();
-        (guard.home_owner_account(), guard.home_id().clone())
+        (guard.is_home_owner(&account), guard.home_id().clone())
     };
-    if owner.as_deref() != Some(account.as_str()) {
+    if !owns {
         return refuse(
             StatusCode::FORBIDDEN,
             "this Home belongs to another account",

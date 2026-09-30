@@ -241,7 +241,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 6;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 7;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -450,6 +450,50 @@ const MIGRATIONS: &[Migration] = &[
         // candidate cannot silently omit a still-admitted earlier operation.
         sql: "ALTER TABLE home_reference_seals ADD COLUMN roster_scope TEXT NOT NULL
                  DEFAULT 'epoch' CHECK (roster_scope IN ('epoch', 'through_epoch'));",
+    },
+    Migration {
+        version: 7,
+        name: "home-reference-seal-finalization",
+        // The epoch and its authority bases commit under a short writer lock.
+        // A crash before the roster is materialized leaves an explicit pending
+        // seal, which can be resumed but cannot certify a gate candidate.
+        sql:
+            "ALTER TABLE home_reference_seals ADD COLUMN seal_status TEXT NOT NULL
+                 DEFAULT 'final' CHECK (seal_status IN ('pending', 'final'));
+             CREATE TRIGGER home_reference_completed_no_update
+                 BEFORE UPDATE ON home_reference_operations
+                 WHEN OLD.status = 'completed'
+                 BEGIN SELECT RAISE(ABORT, 'completed reference operation is immutable'); END;
+             CREATE TRIGGER home_reference_completed_no_delete
+                 BEFORE DELETE ON home_reference_operations
+                 WHEN OLD.status = 'completed'
+                 BEGIN SELECT RAISE(ABORT, 'completed reference operation is immutable'); END;
+             CREATE TRIGGER home_reference_completed_no_replace
+                 BEFORE INSERT ON home_reference_operations
+                 WHEN EXISTS (SELECT 1 FROM home_reference_operations
+                              WHERE operation_id = NEW.operation_id AND status = 'completed')
+                 BEGIN SELECT RAISE(ABORT, 'completed reference operation is immutable'); END;
+             CREATE TRIGGER home_reference_insert_current_epoch
+                 BEFORE INSERT ON home_reference_operations
+                 WHEN NEW.status != 'pending'
+                   OR NEW.registered_epoch != (SELECT current_epoch FROM home_reference_state WHERE id = 1)
+                 BEGIN SELECT RAISE(ABORT, 'reference registration must be pending in current epoch'); END;
+             CREATE TRIGGER home_reference_complete_current_epoch
+                 BEFORE UPDATE ON home_reference_operations
+                 WHEN OLD.status = 'pending' AND
+                     (NEW.status != 'completed'
+                      OR NEW.completed_epoch != (SELECT current_epoch FROM home_reference_state WHERE id = 1))
+                 BEGIN SELECT RAISE(ABORT, 'reference completion must use current epoch'); END;
+             CREATE TRIGGER home_reference_completed_no_refusal
+                 BEFORE INSERT ON home_reference_refusals
+                 WHEN EXISTS (SELECT 1 FROM home_reference_operations
+                              WHERE operation_id = NEW.operation_id AND status = 'completed')
+                 BEGIN SELECT RAISE(ABORT, 'completed reference operation cannot be refused'); END;
+             CREATE TRIGGER home_reference_completed_no_refusal_update
+                 BEFORE UPDATE ON home_reference_refusals
+                 WHEN EXISTS (SELECT 1 FROM home_reference_operations
+                              WHERE operation_id = NEW.operation_id AND status = 'completed')
+                 BEGIN SELECT RAISE(ABORT, 'completed reference operation cannot be refused'); END;",
     },
 ];
 
@@ -2179,7 +2223,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6],
+            vec![1, 2, 3, 4, 5, 6, 7],
             "each migration recorded exactly once"
         );
         let created_at: String = store

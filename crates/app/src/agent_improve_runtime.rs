@@ -2,12 +2,14 @@
 //! resolves one governed work-harness template before either shadow arm runs.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gaugedesk_boundary::AgentConfig;
 use gaugedesk_harness::{sandbox::Network, ChatMode, HarnessFactory, HarnessSpec};
 use gaugedesk_workspace::Instance;
 use serde::Serialize;
 
+use crate::agent_improve::HostedImprovePairAdmission;
 use crate::agent_improve_adoption::AgentDefinitionSnapshot;
 use crate::agent_improve_campaign::{
     run_hosted_managed_campaign_with_reservation, run_native_campaign_with_reservation,
@@ -40,13 +42,21 @@ struct NativeImprovePrepared {
     campaign: CampaignSnapshot,
     template: HarnessSpec,
     factory: gaugedesk_whip_runtime::WhipHarnessFactory,
+    pair_admission: Option<Arc<dyn HostedImprovePairAdmission>>,
     gate: MembraneGate,
     funding: Option<ManagedCampaignFunding>,
 }
 
 enum ImproveExecution {
     Native,
-    Hosted(crate::managed_funding::FundingAuthority, String),
+    Hosted(Box<HostedImproveAdmission>),
+}
+
+pub struct HostedImproveAdmission {
+    pub tenant_scope: String,
+    pub funding_authority: crate::managed_funding::FundingAuthority,
+    pub factory: gaugedesk_whip_runtime::WhipHarnessFactory,
+    pub pair_admission: Arc<dyn HostedImprovePairAdmission>,
 }
 
 /// The desktop IPC caller supplies identities, never paths, policy or secret
@@ -77,16 +87,16 @@ pub fn evaluate_agent_improve_from_desktop(
 }
 
 /// Home-only hosted evaluation. The caller must have authenticated the actor
-/// and tenant before this boundary; it may supply identities, never candidate
-/// paths, private cases, policy bytes, placement ids, or funding references.
+/// and tenant and admitted the exact managed Machine command before this
+/// boundary; it may supply identities and its admitted host factory, never
+/// candidate paths, private cases, policy bytes, placement ids, or funding refs.
 pub fn evaluate_agent_improve_from_hosted(
     wb: &SharedWorkbench,
     agent_id: &str,
     edit_chat_id: &str,
     campaign_ref: &str,
     actor: &str,
-    tenant_scope: &str,
-    funding_authority: crate::managed_funding::FundingAuthority,
+    admission: HostedImproveAdmission,
 ) -> Result<NativeImproveResult, String> {
     let _claim = crate::engine::claim_turn(edit_chat_id)
         .ok_or("Finish the edit-chat turn before evaluating this Agent")?;
@@ -96,7 +106,7 @@ pub fn evaluate_agent_improve_from_hosted(
         edit_chat_id,
         campaign_ref,
         Some(actor),
-        ImproveExecution::Hosted(funding_authority, tenant_scope.to_owned()),
+        ImproveExecution::Hosted(Box::new(admission)),
     )?;
     prepared.run(wb, Some(actor))
 }
@@ -222,12 +232,15 @@ impl NativeImprovePrepared {
             };
             let credential_ref =
                 guard.credential_ref_for_chat_in_class(edit_chat_id, &provider, &actor_name, class);
-            let factory = guard
-                .whip_harness_factory()
-                .map_err(|error| error.to_string())?;
+            let factory = match &execution {
+                ImproveExecution::Native => guard
+                    .whip_harness_factory()
+                    .map_err(|error| error.to_string())?,
+                ImproveExecution::Hosted(admission) => admission.factory.clone(),
+            };
             let org_scope = match &execution {
                 ImproveExecution::Native => crate::org::ORG_SCOPE,
-                ImproveExecution::Hosted(_, tenant_scope) => tenant_scope.as_str(),
+                ImproveExecution::Hosted(admission) => admission.tenant_scope.as_str(),
             };
             let org = crate::org::Org::rebuild_in(guard.store_ref(), org_scope)
                 .map_err(|error| format!("{error:?}"))?;
@@ -295,6 +308,10 @@ impl NativeImprovePrepared {
                 isolated,
             )
         };
+        let pair_admission = match &execution {
+            ImproveExecution::Native => None,
+            ImproveExecution::Hosted(admission) => Some(Arc::clone(&admission.pair_admission)),
+        };
         let funding = match execution {
             ImproveExecution::Native => {
                 // Native model connections have no managed usage reservation.
@@ -308,9 +325,11 @@ impl NativeImprovePrepared {
                 }
                 None
             }
-            ImproveExecution::Hosted(funding_authority, tenant_scope) => {
+            ImproveExecution::Hosted(admission) => {
                 if provider != crate::managed_inference::METERED_GATEWAY_PROVIDER
                     || factory.kind() != "whip-do"
+                    || !factory.has_injected_do_transport()
+                    || factory.do_tenant_id() != Some(admission.tenant_scope.as_str())
                 {
                     return Err(
                         "Hosted Agent improve needs the metered WhippleScript DO placement"
@@ -327,8 +346,8 @@ impl NativeImprovePrepared {
                 let grant = crate::managed_funding::resolve_plan(
                     guard.store_ref(),
                     &gaugedesk_core::ids::ScopeId::new(&account_scope),
-                    &gaugedesk_core::ids::ScopeId::new(&tenant_scope),
-                    &funding_authority.context(now),
+                    &gaugedesk_core::ids::ScopeId::new(&admission.tenant_scope),
+                    &admission.funding_authority.context(now),
                 )
                 .map_err(|error| format!("{error:?}"))?
                 .map_err(|denial| format!("Hosted Agent improve funding refused: {denial:?}"))?;
@@ -336,11 +355,11 @@ impl NativeImprovePrepared {
                 credential_ref = grant.reference();
                 Some(ManagedCampaignFunding {
                     account_scope,
-                    tenant_scope,
+                    tenant_scope: admission.tenant_scope,
                     billing_scope,
                     funding_ref: credential_ref.clone(),
                     provider: provider.clone(),
-                    funding_authority,
+                    funding_authority: admission.funding_authority,
                 })
             }
         };
@@ -532,6 +551,7 @@ impl NativeImprovePrepared {
             campaign,
             template,
             factory,
+            pair_admission,
             gate: MembraneGate::new(&config, default_external_tools()).with_mode(ChatMode::Use),
             funding,
         })
@@ -556,6 +576,10 @@ impl NativeImprovePrepared {
                 wb,
                 HostedCampaignExecution {
                     factory: &self.factory,
+                    pair_admission: self
+                        .pair_admission
+                        .as_deref()
+                        .ok_or("Hosted Agent improve has no pair admission authority")?,
                     template: &self.template,
                     target_id: &self.target_id,
                     workspace: &workspace,

@@ -140,10 +140,13 @@ impl Workbench {
         let policy_scope = identity.storage_scope()?;
         let key = SigningKey::from_seed(&self.governance_seed()).map_err(|error| error.reason)?;
         let handoff_scope = crate::federation::handoff_scope(&project_id);
+        let account_scopes = account_authority_scopes(context)?;
         let mut scopes = vec![
             LIBRARY_SCOPE,
             ORG_SCOPE,
             crate::account_auth::ACCOUNT_AUTH_SCOPE,
+            &account_scopes[0],
+            &account_scopes[1],
             crate::mobile_machine_session::SCOPE,
             &scope,
             &policy_scope,

@@ -184,6 +184,17 @@ export type { AccessPhase, FileNode, FilePresentation } from "./mobile-files";
 export { ADVANCEMENT_RULES_SETTING, parseAdvancementScopes, serializeAdvancementScopes } from "./advancement";
 export { ATTENTION_RULES_SETTING, ATTENTION_SIGNALS, parseAttentionRules, serializeAttentionRules } from "./attention";
 export type { AttentionLevel, AttentionSignal, AttentionSignalMeta } from "./attention";
+export {
+    NOTIFICATION_CHOICES,
+    NoticeTracker,
+    notificationPreference,
+    noticeText,
+    notificationPermission,
+    preferenceWants,
+    requestNotificationPermission,
+    setNotificationPreference,
+} from "./chat-notifications";
+export type { NotificationChoice, NotificationPermissionState, NotificationPreference } from "./chat-notifications";
 export { catalogWithEndpointModels, declaredModelsFor, defaultOption, defaultVisibleKeys, DEFAULT_OPTION, ENABLED_MODELS_SETTING, ENDPOINT_MODELS_SETTING, isDefaultVisible, modelAcceptsImages, modelKey, modelOptions, parseEnabledModels, parseEndpointModels, pickableModels, providerTakesCustomModel, providerTakesEndpoint, servedModelLabel, serializeEnabledModels, serializeEndpointModels, thinkingLevelsFor, withDeclaredModels } from "./model-picker";
 export type { DeclaredModels, ModelOption, PickableModel, ResolvedDefault } from "./model-picker";
 export { SettingsMenu as OpenSettingsMenu } from "./OpenSettingsMenu";

@@ -381,6 +381,18 @@ fn current_target_authority_with_source(
     })
 }
 
+// Session authority spans the legacy/custody catalog and the actor's current
+// authentication and device/refresh scopes. Every explicit dispatch snapshot
+// must fence all of them, including when a retained grant reconstructs its source.
+fn account_authority_scopes(context: &AuthenticatedActionContext) -> Result<[String; 2], String> {
+    let actor = context.actor().as_str();
+    Ok([
+        crate::account::account_scope(actor),
+        crate::account_auth_custody::account_auth_scope(actor)
+            .map_err(|error| format!("account authority scope refused: {error:?}"))?,
+    ])
+}
+
 impl Workbench {
     /// Native project-editor admission. The supplied context must come from the
     /// Home authentication boundary; the input store is trusted Home config.
@@ -398,6 +410,7 @@ impl Workbench {
             return Err("file input custody belongs to another Home".into());
         }
         let home = self.home_id().clone();
+        let account_scopes = account_authority_scopes(context)?;
         let read = |store: &Store| {
             let authority = current_authority(store, &home, context, request)?;
             crate::federation::require_project_writes_available(store, &authority.project_id)?;
@@ -410,6 +423,8 @@ impl Workbench {
                     LIBRARY_SCOPE,
                     ORG_SCOPE,
                     crate::account_auth::ACCOUNT_AUTH_SCOPE,
+                    &account_scopes[0],
+                    &account_scopes[1],
                     crate::mobile_machine_session::SCOPE,
                 ],
                 read,
@@ -545,6 +560,8 @@ impl Workbench {
                     LIBRARY_SCOPE,
                     ORG_SCOPE,
                     crate::account_auth::ACCOUNT_AUTH_SCOPE,
+                    &account_scopes[0],
+                    &account_scopes[1],
                     crate::mobile_machine_session::SCOPE,
                     &handoff_scope,
                 ],

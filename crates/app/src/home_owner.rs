@@ -49,8 +49,17 @@ pub enum HomeClaim {
 /// never reopened merely because its owner later lost their membership.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HomeClaimState {
-    Available { projects: usize },
-    Claimed { owner: String },
+    /// `fresh` is a Home holding nothing a person made: only the seeded
+    /// default project, and no chat or workstream. DR-0219's explicit claim
+    /// protects existing local work, so a fresh Home has none to protect and
+    /// the desktop claims it without asking (DR-0264).
+    Available {
+        projects: usize,
+        fresh: bool,
+    },
+    Claimed {
+        owner: String,
+    },
     Governed,
 }
 
@@ -77,13 +86,16 @@ pub fn claim_state(wb: &SharedWorkbench) -> Result<HomeClaimState, String> {
     {
         return Ok(HomeClaimState::Governed);
     }
-    let projects = guard
-        .library
+    let library = &guard.library;
+    let projects = library
         .projects
         .values()
         .filter(|project| &project.home_id == guard.home_id())
         .count();
-    Ok(HomeClaimState::Available { projects })
+    let fresh = library.projects.values().all(|project| project.is_default)
+        && library.chats.is_empty()
+        && library.workstreams.is_empty();
+    Ok(HomeClaimState::Available { projects, fresh })
 }
 
 /// Claim this Home for the signed-in account, once. Only the explicit desktop
@@ -174,6 +186,87 @@ fn claim_selected(wb: &SharedWorkbench, verified: Option<&str>) -> Result<HomeCl
     } else {
         HomeClaim::Owner(account)
     })
+}
+
+/// The record kind that says who admitted a further owner, in the Home's own
+/// directory scope beside the membership it grants.
+pub(crate) const OWNER_ADMISSION_KIND: &str = "home_owner_admission";
+
+/// One owner admitting another account as an owner of this Home (DR-0265).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HomeOwnerAdmission {
+    pub account: String,
+    pub admitted_by: String,
+    pub admitted_at_ms: i64,
+}
+
+/// What [`admit_owner`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OwnerAdmission {
+    /// `account` is now an active owner of this Home.
+    Admitted,
+    /// `account` was already an active owner; nothing changed.
+    AlreadyOwner,
+    /// `by` is not an active owner of this Home, so it admits nobody.
+    NotAnOwner,
+}
+
+/// The active owners of this Home's own directory.
+pub fn owners(wb: &SharedWorkbench) -> Result<Vec<String>, String> {
+    let guard = wb.lock_unpoisoned();
+    let org = Org::rebuild(guard.store_ref()).map_err(|error| format!("home owners: {error:?}"))?;
+    Ok(org.active_ids_with_role("owner"))
+}
+
+/// Admit `account` as an owner, on the authority of `by`, an active owner.
+///
+/// A desktop Home is one Home whoever uses it, so a person with more than one
+/// account reaches it from each by being an owner under each. The caller has
+/// proved both accounts are live and signed in on this computer; this records
+/// the grant and the membership it makes in one transaction. Nothing here
+/// removes or demotes anyone, and a claim is never rewritten.
+pub fn admit_owner(
+    wb: &SharedWorkbench,
+    by: &str,
+    account: &str,
+) -> Result<OwnerAdmission, String> {
+    let mut guard = wb.lock_unpoisoned();
+    let err = |error: gaugedesk_store::AdmitError| format!("home owner admission: {error:?}");
+    let org = Org::rebuild(guard.store_ref()).map_err(err)?;
+    let is_owner = |who: &str| org.active_ids_with_role("owner").iter().any(|id| id == who);
+    if !is_owner(by) {
+        return Ok(OwnerAdmission::NotAnOwner);
+    }
+    if is_owner(account) {
+        return Ok(OwnerAdmission::AlreadyOwner);
+    }
+    let admission = serde_json::to_string(&HomeOwnerAdmission {
+        account: account.to_owned(),
+        admitted_by: by.to_owned(),
+        admitted_at_ms: i64::try_from(crate::account::session_now_ms()).unwrap_or(i64::MAX),
+    })
+    .map_err(|e| e.to_string())?;
+    let membership = serde_json::to_string(&MembershipRecord {
+        id: account.to_owned(),
+        op: RecordOp::Upsert,
+        org_id: ORG_ID.to_owned(),
+        authority: account.to_owned(),
+        email: String::new(),
+        role: "owner".into(),
+        status: MembershipStatus::Active,
+        managed_by_scim: false,
+        team: None,
+    })
+    .map_err(|e| e.to_string())?;
+    guard
+        .store_mut()
+        .append_records_atomically(&[
+            (ORG_SCOPE, OWNER_ADMISSION_KIND, admission.as_str()),
+            (ORG_SCOPE, "membership", membership.as_str()),
+        ])
+        .map_err(err)?;
+    Ok(OwnerAdmission::Admitted)
 }
 
 #[cfg(test)]

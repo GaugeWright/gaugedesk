@@ -573,6 +573,26 @@ export interface HumanTask {
     readonly waiting?: number;
 }
 
+/** The signals a chat's durable state can raise (ADR 0082 §3), in the Home's
+ *  priority order. */
+export type ChatSignal = "question" | "conflict" | "turn-settled";
+
+/** A chat that has raised a signal for the reader, whatever the attention
+ *  rules route it to (DR-0266), from `GET /notices`. Each chat carries at most one: its
+ *  highest-priority raised signal. `settle` counts the turns the chat has
+ *  settled, so a client that remembers the last count it saw can tell a turn
+ *  that has just ended from the same notice read twice. Whether a notice
+ *  interrupts anyone is the receiving device's own preference. */
+export interface ChatNotice {
+    readonly chat: string;
+    readonly title: string;
+    readonly signal: ChatSignal;
+    readonly settle: number;
+    /** `turn-settled` only: the turn ended in failure rather than completing. */
+    readonly failed: boolean;
+}
+
+
 /** One active member in the host-derived roster used by ask and assignment. */
 export interface RosterPerson {
     readonly authority: string;

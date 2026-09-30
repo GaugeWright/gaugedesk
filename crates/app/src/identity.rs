@@ -146,25 +146,16 @@ pub(crate) fn revalidate_action_context(
     let mut valid_until_ms = None;
     match context.authentication() {
         ActorAuthentication::AccountSession { session_ref } => {
-            // An unavailable source record cannot disappear from an authority
-            // fold and expose an older still-active session or grant.
-            store.retained_events(crate::account_auth::ACCOUNT_AUTH_SCOPE)?;
-            let auth = crate::account_auth::AccountAuth::rebuild(store)?;
-            let session = auth
-                .sessions
-                .get(session_ref)
-                .ok_or_else(|| invalid("account action session is not durably active"))?;
-            let expires = session
-                .issued_at_ms
-                .saturating_add(session.lifetime_secs.saturating_mul(1000));
-            valid_until_ms = Some(expires);
-            if session.account_id != context.actor().as_str()
-                || expires <= crate::account::session_now_ms()
-            {
-                return Err(invalid(
-                    "account action session is expired or belongs to another actor",
-                ));
+            let (actor, evidence) = crate::account_session::durable_evidence(
+                store,
+                session_ref,
+                crate::account::session_now_ms(),
+            )?
+            .ok_or_else(|| invalid("account action session is not durably active"))?;
+            if actor != context.actor().as_str() {
+                return Err(invalid("account action session belongs to another actor"));
             }
+            valid_until_ms = Some(evidence.expires_at_ms);
         }
         ActorAuthentication::MachineController { grant_ref } => {
             store.retained_events(crate::mobile_machine_session::SCOPE)?;

@@ -16,6 +16,8 @@ use tauri::Manager;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_deep_link::DeepLinkExt;
 
+mod chat_notification;
+
 const BACKGROUND_ARG: &str = "--background";
 
 fn show_workbench(app: &tauri::AppHandle) {
@@ -44,6 +46,23 @@ fn open_external(app: tauri::AppHandle, url: String) -> Result<(), String> {
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+/// Show an operating-system notification for a chat (DR-0266). The page
+/// chooses the chat and the words; a click opens that chat
+/// ([`chat_notification`]).
+#[tauri::command]
+fn notify_chat(
+    app: tauri::AppHandle,
+    chat: String,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    chat_notification::post(
+        &app,
+        chat_notification::ChatNotification::new(chat, title, body)?,
+    );
+    Ok(())
 }
 
 /// Whether the shell will hand `url` to the OS default browser: exactly the web
@@ -162,6 +181,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             restart_app,
             open_external,
+            notify_chat,
             home_session,
             start_agent_improve_pool,
             latest_agent_improve_pool,

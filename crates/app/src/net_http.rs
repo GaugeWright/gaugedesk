@@ -339,6 +339,25 @@ impl HttpClient {
         }
     }
 
+    /// Submit a routing hint without following the identity-provider redirect.
+    /// The address stays in the POST body; no cookie or credential is forwarded.
+    pub fn post_form_location(
+        &self,
+        url: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<(u16, Option<String>), String> {
+        let response = match self.agent.post(url).send_form(fields) {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(_)) => {
+                return Err("account sign-in service could not be reached".into())
+            }
+        };
+        Ok((
+            response.status(),
+            response.header("location").map(str::to_owned),
+        ))
+    }
+
     /// `application/x-www-form-urlencoded` POST with bearer auth,
     /// returning `(status, body)`.
     pub fn post_form_auth(

@@ -305,10 +305,13 @@ impl Workbench {
         let key = SigningKey::from_seed(&self.governance_seed()).map_err(|e| e.reason)?;
         let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
         let acknowledgment_scope = format!("host-action-runtime-ack:{scope}");
+        let account_scopes = account_authority_scopes(context)?;
         let mut scopes = vec![
             LIBRARY_SCOPE,
             ORG_SCOPE,
             crate::account_auth::ACCOUNT_AUTH_SCOPE,
+            &account_scopes[0],
+            &account_scopes[1],
             crate::mobile_machine_session::SCOPE,
             &scope,
             &policy_scope,
