@@ -5,6 +5,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::agent_improve_adoption::{adopt_candidate, AgentDefinitionSnapshot};
 use crate::agent_improve_campaign::{
@@ -36,7 +37,7 @@ struct CandidateRecord {
     sealed_candidate: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct CandidateCapsule {
     schema: u32,
@@ -55,6 +56,40 @@ impl Workbench {
         agent_id: &str,
         campaign: &CampaignSnapshot,
         selected: &SelectedCampaign,
+    ) -> Result<String, String> {
+        self.append_agent_improve_evidence_with_operation(agent_id, campaign, selected, None)
+    }
+
+    /// Hosted workers use the immutable operation key for append-once final
+    /// evidence. A crash after this append but before the campaign queue's
+    /// terminal write must return the same evidence ID on replay.
+    pub fn append_hosted_agent_improve_evidence(
+        &mut self,
+        agent_id: &str,
+        campaign: &CampaignSnapshot,
+        selected: &SelectedCampaign,
+        operation_id: &str,
+    ) -> Result<String, String> {
+        if operation_id.is_empty()
+            || operation_id.len() > 256
+            || operation_id.chars().any(char::is_control)
+        {
+            return Err("hosted improve evidence has an invalid operation".into());
+        }
+        self.append_agent_improve_evidence_with_operation(
+            agent_id,
+            campaign,
+            selected,
+            Some(operation_id),
+        )
+    }
+
+    fn append_agent_improve_evidence_with_operation(
+        &mut self,
+        agent_id: &str,
+        campaign: &CampaignSnapshot,
+        selected: &SelectedCampaign,
+        operation_id: Option<&str>,
     ) -> Result<String, String> {
         let target_id = self.improve_authoring_target(agent_id)?;
         if selected.target_id() != target_id {
@@ -106,12 +141,20 @@ impl Workbench {
             .map_err(|_| "Agent improve evidence timestamp is too large")?;
         let record = AgentImproveEvidenceRecord {
             schema: RECORD_SCHEMA,
-            id: gen_id("agent-improve-evidence"),
+            id: operation_id.map_or_else(
+                || gen_id("agent-improve-evidence"),
+                |operation| {
+                    format!(
+                        "agent-improve-evidence:{}",
+                        hex::encode(Sha256::digest(operation.as_bytes()))
+                    )
+                },
+            ),
             target_id,
             captured_unix_ms,
             card,
         };
-        let sealed_candidate = selected
+        let candidate_capsule = selected
             .adoption_definition()?
             .map(|definition| {
                 if definition.identity != record.card.candidate_definition_ref {
@@ -120,19 +163,20 @@ impl Workbench {
                             .to_owned(),
                     );
                 }
-                let capsule = CandidateCapsule {
+                Ok(CandidateCapsule {
                     schema: RECORD_SCHEMA,
                     evidence_id: record.id.clone(),
                     target_id: record.target_id.clone(),
                     definition_json: definition.retained_json()?,
-                };
-                let json = serde_json::to_string(&capsule)
-                    .map_err(|_| "Agent improve candidate could not be encoded".to_owned())?;
-                self.seal_account_secret(&json)
-                    .ok_or("Agent improve candidate could not be sealed".to_owned())
+                })
             })
             .transpose()?;
-        if let Some(sealed_candidate) = sealed_candidate {
+        if let Some(capsule) = candidate_capsule {
+            let json = serde_json::to_string(&capsule)
+                .map_err(|_| "Agent improve candidate could not be encoded".to_owned())?;
+            let sealed_candidate = self
+                .seal_account_secret(&json)
+                .ok_or("Agent improve candidate could not be sealed")?;
             let candidate = CandidateRecord {
                 schema: RECORD_SCHEMA,
                 evidence_id: record.id.clone(),
@@ -147,22 +191,50 @@ impl Workbench {
                 .append_record_with_key(LIBRARY_SCOPE, &key, CANDIDATE_KIND, &payload)
                 .map_err(|_| "Agent improve candidate could not be retained")?;
             if !inserted {
-                return Err("Agent improve candidate was already retained".to_owned());
+                if operation_id.is_none() {
+                    return Err("Agent improve candidate was already retained".to_owned());
+                }
+                let prior = self.selected_agent_improve_candidate(&record.target_id, &record.id)?;
+                let prior = self
+                    .unseal_account_secret(&prior)
+                    .ok_or("hosted improve candidate cannot be unsealed")?;
+                let prior: CandidateCapsule = serde_json::from_str(&prior)
+                    .map_err(|_| "hosted improve retained candidate is invalid")?;
+                if prior != capsule {
+                    return Err("hosted improve operation changed its selected candidate".into());
+                }
             }
         }
         let payload = serde_json::to_string(&record)
             .map_err(|_| "Agent improve evidence could not be encoded")?;
-        if let Some(reservation_id) = record.card.reservation_ref.as_deref() {
-            let key = format!(
-                "agent-improve-evidence:{}:{reservation_id}",
-                record.target_id
-            );
+        if operation_id.is_some() || record.card.reservation_ref.is_some() {
+            let key = match operation_id {
+                Some(operation) => format!(
+                    "agent-improve-evidence-operation:{}",
+                    hex::encode(Sha256::digest(operation.as_bytes()))
+                ),
+                None => format!(
+                    "agent-improve-evidence:{}:{}",
+                    record.target_id,
+                    record.card.reservation_ref.as_deref().unwrap()
+                ),
+            };
             let (_, inserted) = self
                 .store
                 .append_record_with_key(LIBRARY_SCOPE, &key, RECORD_KIND, &payload)
                 .map_err(|_| "Agent improve evidence could not be retained")?;
             if !inserted {
-                return Err("Agent improve reservation was already recorded".to_owned());
+                if operation_id.is_none() {
+                    return Err("Agent improve reservation was already recorded".to_owned());
+                }
+                let existing = self.agent_improve_evidence(agent_id, &record.id)?;
+                let existing_card = serde_json::to_value(&existing.card)
+                    .map_err(|_| "hosted improve retained evidence is invalid")?;
+                let expected_card = serde_json::to_value(&record.card)
+                    .map_err(|_| "hosted improve reviewer evidence is invalid")?;
+                if existing.target_id != record.target_id || existing_card != expected_card {
+                    return Err("hosted improve operation changed its reviewer evidence".into());
+                }
             }
         } else {
             self.store

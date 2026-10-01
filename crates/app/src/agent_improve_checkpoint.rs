@@ -17,7 +17,7 @@ const RECORD_SCHEMA: u32 = 1;
 const PREPARED_KIND: &str = "agent_improve_hosted_prepared";
 const PREPARED_SCHEMA: u32 = 1;
 
-pub(crate) struct HostedImproveInputKey<'a> {
+pub struct HostedImproveInputKey<'a> {
     pub operation_id: &'a str,
     pub actor: &'a str,
     pub tenant_id: &'a str,
@@ -26,6 +26,12 @@ pub(crate) struct HostedImproveInputKey<'a> {
     pub campaign_ref: &'a str,
     pub target_id: &'a str,
     pub target_main_basis: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedImproveOperationBasis {
+    pub target_id: String,
+    pub target_main_basis: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,24 +143,21 @@ struct PreparedRecord {
 
 impl HostedImproveInputKey<'_> {
     pub(crate) fn digest(&self) -> Result<String, String> {
-        if self.operation_id.is_empty()
-            || self.operation_id.len() > 256
-            || self.operation_id.chars().any(char::is_control)
-            || [
-                self.actor,
-                self.tenant_id,
-                self.agent_id,
-                self.edit_chat_id,
-                self.campaign_ref,
-                self.target_id,
-                self.target_main_basis,
-            ]
-            .iter()
-            .any(|value| value.trim().is_empty())
+        if [
+            self.actor,
+            self.tenant_id,
+            self.agent_id,
+            self.edit_chat_id,
+            self.campaign_ref,
+            self.target_id,
+            self.target_main_basis,
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
         {
             return Err("hosted improve checkpoint has an invalid identity".to_owned());
         }
-        Ok(hex::encode(Sha256::digest(self.operation_id.as_bytes())))
+        operation_digest(self.operation_id)
     }
 
     fn matches(&self, record: &InputRecord) -> bool {
@@ -168,14 +171,82 @@ impl HostedImproveInputKey<'_> {
     }
 }
 
+fn operation_digest(operation_id: &str) -> Result<String, String> {
+    if operation_id.is_empty()
+        || operation_id.len() > 256
+        || operation_id.chars().any(char::is_control)
+    {
+        return Err("hosted improve checkpoint has an invalid operation".into());
+    }
+    Ok(hex::encode(Sha256::digest(operation_id.as_bytes())))
+}
+
 impl Workbench {
+    /// Find the original Main basis of an existing operation without reading
+    /// current authoring state. The trusted Home worker uses this solely to
+    /// reconcile commands that may have run before a Main change or restart.
+    pub fn hosted_improve_operation_basis(
+        &self,
+        operation_id: &str,
+        actor: &str,
+        tenant_id: &str,
+        agent_id: &str,
+        edit_chat_id: &str,
+        campaign_ref: &str,
+    ) -> Result<Option<HostedImproveOperationBasis>, String> {
+        let digest = operation_digest(operation_id)?;
+        if [actor, tenant_id, agent_id, edit_chat_id, campaign_ref]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err("hosted improve recovery has an invalid identity".into());
+        }
+        let mut found = None;
+        for row in self
+            .store
+            .records(LIBRARY_SCOPE, RECORD_KIND)
+            .map_err(|_| "hosted improve input custody is unavailable")?
+        {
+            let record: InputRecord =
+                serde_json::from_str(&row).map_err(|_| "hosted improve input record is invalid")?;
+            if record.schema != RECORD_SCHEMA {
+                return Err("hosted improve input record schema is unsupported".into());
+            }
+            if record.operation_digest != digest {
+                continue;
+            }
+            if found.is_some()
+                || record.actor != actor
+                || record.tenant_id != tenant_id
+                || record.agent_id != agent_id
+                || record.edit_chat_id != edit_chat_id
+                || record.campaign_ref != campaign_ref
+            {
+                return Err("hosted improve operation is bound to another input".into());
+            }
+            found = Some(HostedImproveOperationBasis {
+                target_id: record.target_id,
+                target_main_basis: record.target_main_basis,
+            });
+        }
+        Ok(found)
+    }
+
     pub(crate) fn hosted_improve_prepared_cut(
         &self,
         key: &HostedImproveInputKey<'_>,
     ) -> Result<Option<HostedImprovePreparedCut>, String> {
+        self.hosted_improve_prepared_cut_with_current_main(key, true)
+    }
+
+    pub(crate) fn hosted_improve_prepared_cut_with_current_main(
+        &self,
+        key: &HostedImproveInputKey<'_>,
+        require_current_main: bool,
+    ) -> Result<Option<HostedImprovePreparedCut>, String> {
         let digest = key.digest()?;
         let input = self
-            .hosted_improve_input_cut(key)?
+            .hosted_improve_input_cut_with_current_main(key, require_current_main)?
             .ok_or("hosted improve has no retained input cut")?;
         let mut found = None;
         for row in self
@@ -273,14 +344,24 @@ impl Workbench {
         &self,
         key: &HostedImproveInputKey<'_>,
     ) -> Result<Option<HostedImproveInputCut>, String> {
+        self.hosted_improve_input_cut_with_current_main(key, true)
+    }
+
+    pub(crate) fn hosted_improve_input_cut_with_current_main(
+        &self,
+        key: &HostedImproveInputKey<'_>,
+        require_current_main: bool,
+    ) -> Result<Option<HostedImproveInputCut>, String> {
         let digest = key.digest()?;
-        self.verify_hosted_improve_pair_subject(
-            key.actor,
-            key.agent_id,
-            key.target_id,
-            key.target_main_basis,
-            key.campaign_ref,
-        )?;
+        if require_current_main {
+            self.verify_hosted_improve_pair_subject(
+                key.actor,
+                key.agent_id,
+                key.target_id,
+                key.target_main_basis,
+                key.campaign_ref,
+            )?;
+        }
         let mut found = None;
         for row in self
             .store
@@ -583,7 +664,7 @@ mod tests {
         );
         assert_eq!(
             guard.hosted_improve_scenario_cuts(&key).unwrap(),
-            vec![scenario]
+            vec![scenario.clone()]
         );
         let wrong_tenant = HostedImproveInputKey {
             tenant_id: "tenant:other",
@@ -598,5 +679,53 @@ mod tests {
             ..key
         };
         assert!(guard.hosted_improve_input_cut(&wrong_actor).is_err());
+        let workspace = guard.targets.get(&target).unwrap();
+        let edit = workspace
+            .create_engagement("new-main-after-improve")
+            .unwrap();
+        edit.write_file("notes.md", "a newer Main cut").unwrap();
+        edit.commit_turn("new Main").unwrap();
+        edit.merge_into_main().unwrap();
+        workspace
+            .remove_engagement("new-main-after-improve")
+            .unwrap();
+        assert!(guard.hosted_improve_scenario_cuts(&key).is_err());
+        assert_eq!(
+            guard
+                .hosted_improve_operation_basis(
+                    key.operation_id,
+                    key.actor,
+                    key.tenant_id,
+                    key.agent_id,
+                    key.edit_chat_id,
+                    key.campaign_ref,
+                )
+                .unwrap(),
+            Some(HostedImproveOperationBasis {
+                target_id: target.clone(),
+                target_main_basis: main.clone(),
+            })
+        );
+        assert!(guard
+            .hosted_improve_operation_basis(
+                key.operation_id,
+                key.actor,
+                "tenant:other",
+                key.agent_id,
+                key.edit_chat_id,
+                key.campaign_ref,
+            )
+            .is_err());
+        let recovered = guard.hosted_improve_recovery_receipts(&key).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].ordinal, 0);
+        assert_eq!(recovered[0].scenario_id, "open-1");
+        assert_eq!(recovered[0].arms, scenario.arms);
+        assert!(guard
+            .hosted_improve_recovery_receipts(&wrong_tenant)
+            .is_err());
+        assert!(guard
+            .hosted_improve_recovery_receipts(&wrong_actor)
+            .is_err());
     }
 }

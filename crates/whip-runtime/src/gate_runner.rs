@@ -433,6 +433,8 @@ pub enum GateVersionUse<'a> {
 /// content, version, or import operation. The Home includes these and its own
 /// current policy/structural premises in the registration basis.
 pub struct GateNewAdmissionBasis<'a> {
+    /// Durable identity of the runtime store opened before Home registration.
+    pub target_store_incarnation: &'a str,
     pub program_name: &'a str,
     pub source_digest: &'a str,
     pub ir_digest: &'a str,
@@ -446,6 +448,7 @@ pub struct GateNewAdmissionBasis<'a> {
 /// binding; this readback alone does not certify the Home's accepting roster.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GateImportEvidence {
+    pub target_store_incarnation: String,
     pub operation_id: String,
     pub program_id: String,
     pub program_name: String,
@@ -477,6 +480,9 @@ pub fn verify_gate_import_operation(
         return Err(repair("target runtime store is missing"));
     }
     let store = SqliteStore::open_read_only(&path)?;
+    let target_store_incarnation =
+        whipplescript_kernel::host_facade::require_home_store_incarnation(&store)
+            .map_err(|error| repair(&error.to_string()))?;
     let operation = store
         .program_import_operation(operation_id)?
         .ok_or_else(|| repair("target operation is missing"))?;
@@ -529,6 +535,7 @@ pub fn verify_gate_import_operation(
         ));
     }
     Ok(GateImportEvidence {
+        target_store_incarnation,
         operation_id: operation.operation_id,
         program_id: version.program_id,
         program_name: version.program_name,
@@ -642,7 +649,11 @@ fn run_gate_inner<
             .map_err(GateRunError::NoDisposition)?;
         let envelope_digest =
             whipplescript_kernel::exec_http::sha256_hex(program.envelope.as_bytes());
+        let target_store_incarnation =
+            whipplescript_kernel::host_facade::require_home_store_incarnation(kernel.store())
+                .map_err(|error| GateRunError::NoDisposition(error.to_string()))?;
         let home_operation_id = register(GateNewAdmissionBasis {
+            target_store_incarnation: &target_store_incarnation,
             program_name: &program.ir.workflow,
             source_digest: &source_digest,
             ir_digest: &ir_hash,

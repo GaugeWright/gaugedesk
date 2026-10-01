@@ -241,7 +241,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 7;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 8;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -494,6 +494,34 @@ const MIGRATIONS: &[Migration] = &[
                  WHEN EXISTS (SELECT 1 FROM home_reference_operations
                               WHERE operation_id = NEW.operation_id AND status = 'completed')
                  BEGIN SELECT RAISE(ABORT, 'completed reference operation cannot be refused'); END;",
+    },
+    Migration {
+        version: 8,
+        name: "home-reference-target-store-incarnation",
+        // Existing operations cannot acquire an incarnation from a path or a
+        // newly opened store. They remain unknown until explicitly readmitted.
+        sql: "ALTER TABLE home_reference_operations
+                  ADD COLUMN target_store_incarnation TEXT
+                  CHECK (target_store_incarnation IS NULL OR
+                         length(target_store_incarnation) = 32);
+              CREATE TRIGGER home_reference_insert_requires_incarnation
+                  BEFORE INSERT ON home_reference_operations
+                  WHEN NEW.target_store_incarnation IS NULL OR
+                       length(NEW.target_store_incarnation) != 32 OR
+                       NEW.target_store_incarnation GLOB '*[^0-9a-f]*'
+                  BEGIN SELECT RAISE(ABORT, 'reference target incarnation is required'); END;
+              CREATE TRIGGER home_reference_pending_identity_immutable
+                  BEFORE UPDATE ON home_reference_operations
+                  WHEN OLD.status = 'pending' AND (
+                      NEW.operation_id IS NOT OLD.operation_id OR
+                      NEW.home_id IS NOT OLD.home_id OR
+                      NEW.target_store IS NOT OLD.target_store OR
+                      NEW.target_store_incarnation IS NOT OLD.target_store_incarnation OR
+                      NEW.kind IS NOT OLD.kind OR
+                      NEW.basis_digest IS NOT OLD.basis_digest OR
+                      NEW.registered_epoch IS NOT OLD.registered_epoch
+                  )
+                  BEGIN SELECT RAISE(ABORT, 'pending reference identity is immutable'); END;",
     },
 ];
 
@@ -2223,7 +2251,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7],
+            (1..=SUPPORTED_SCHEMA_VERSION).collect::<Vec<_>>(),
             "each migration recorded exactly once"
         );
         let created_at: String = store

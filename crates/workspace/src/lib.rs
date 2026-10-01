@@ -6498,6 +6498,7 @@ mod workspace_store_contention {
         let content = dir.path().join("content.sqlite");
         let mut vcs = NativeWorkspaceVcs::open(branches.clone(), content.clone()).unwrap();
         vcs.init(&crate::now_at()).unwrap();
+        let probe_hash = vcs.content_store().put(b"lock contention probe").unwrap();
 
         let holding = std::sync::Arc::new(std::sync::Barrier::new(2));
         let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -6520,7 +6521,7 @@ mod workspace_store_contention {
         holding.wait();
         let started = std::time::Instant::now();
         let mut changed = std::collections::BTreeMap::new();
-        changed.insert("probe.txt".to_string(), "hash-probe".to_string());
+        changed.insert("probe.txt".to_string(), probe_hash);
         let outcome = vcs.import_diff(
             whipplescript_store::branches::MAINLINE_BRANCH_ID,
             &changed,

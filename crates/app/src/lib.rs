@@ -35,7 +35,9 @@ pub use agent_improve_custody::{
 };
 pub mod agent_improve_evidence;
 mod agent_improve_routes;
-pub use agent_improve_routes::HostedImproveAdmittedFactory;
+pub use agent_improve_routes::{
+    HostedImproveCampaignQueue, HostedImproveJobInput, HostedImproveJobQueue, HostedImproveQueued,
+};
 mod agent_improve_runtime;
 pub use agent_improve_runtime::{
     adopt_agent_improve_from_desktop, evaluate_agent_improve_from_desktop,

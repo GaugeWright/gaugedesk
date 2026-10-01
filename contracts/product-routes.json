@@ -6739,7 +6739,7 @@
       "scope": "person-home-archetype-authoring-chat",
       "capability": "evaluate-owned-archetype-candidate",
       "requestSchema": "rust:gaugedesk-app/agent_improve_routes/EvaluateAgentImprove",
-      "responseSchema": "rust:gaugedesk-app/agent_improve_runtime/NativeImproveResult",
+      "responseSchema": "rust:gaugedesk-app/agent_improve_routes/HostedImproveQueued",
       "sideEffect": "mutation",
       "risk": "critical",
       "compatibility": {
@@ -6760,6 +6760,42 @@
         "deployed": [],
         "property": [
           "crates/app/src/agent_improve.rs#hosted_shadow_uses_do_transport_and_discards_both_identities"
+        ]
+      }
+    },
+    {
+      "id": "home.archetype.improve.operation.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/archetypes/:id/improve/operations/:operation_id",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "Authenticated Agent authoring client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-archetype-improve-operation",
+      "capability": "read-owned-archetype-improve-operation",
+      "requestSchema": "http/path-archetype-and-operation-id",
+      "responseSchema": "rust:gaugedesk-app/agent_improve_routes/HostedImproveQueued",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/agent_improve_routes.rs#hosted_entry_enqueues_after_owner_admission_and_status_requires_owner"
+        ],
+        "authority": [
+          "crates/app/src/agent_improve_routes.rs#hosted_entry_enqueues_after_owner_admission_and_status_requires_owner"
+        ],
+        "journey": [
+          "crates/app/src/agent_improve_routes.rs#hosted_entry_enqueues_after_owner_admission_and_status_requires_owner"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/agent_improve_routes.rs#hosted_entry_enqueues_after_owner_admission_and_status_requires_owner"
         ]
       }
     },

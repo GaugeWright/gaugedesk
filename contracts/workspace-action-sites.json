@@ -5818,6 +5818,16 @@
     },
     {
       "site": {
+        "callable": "run_hosted_managed_campaign_with_reservation",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/agent_improve_campaign.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
         "callable": "impl inherent for Workbench::verify_hosted_improve_pair_subject",
         "capability": "current_main_cut",
         "count": 1,
@@ -5828,7 +5838,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::append_agent_improve_evidence",
+        "callable": "impl inherent for Workbench::append_agent_improve_evidence_with_operation",
         "capability": "current_main_cut",
         "count": 1,
         "expression": "workspace . current_main_cut ()",
@@ -5838,7 +5848,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::append_agent_improve_evidence",
+        "callable": "impl inherent for Workbench::append_agent_improve_evidence_with_operation",
         "capability": "cut_descends_from",
         "count": 1,
         "expression": "workspace . cut_descends_from (& current , & card . baseline_main_cut)",

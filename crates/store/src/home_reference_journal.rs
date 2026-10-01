@@ -40,6 +40,7 @@ impl From<rusqlite::Error> for JournalError {
 pub struct NewReferenceOperation<'a> {
     pub operation_id: &'a str,
     pub target_store: &'a str,
+    pub target_store_incarnation: &'a str,
     pub kind: &'a str,
     /// Digest of the exact source, dependency, policy and structural input
     /// basis. Its meaning is supplied and verified by the accepting host.
@@ -51,6 +52,9 @@ pub struct ReferenceOperation {
     pub operation_id: String,
     pub home_id: String,
     pub target_store: String,
+    /// None denotes a pre-v8 operation whose physical target is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_store_incarnation: Option<String>,
     pub kind: String,
     pub basis_digest: String,
     pub registered_epoch: i64,
@@ -84,6 +88,7 @@ pub enum ReferenceUseClassification {
 pub struct ReferenceUsePin {
     pub home_id: String,
     pub target_store: String,
+    pub target_store_incarnation: Option<String>,
     pub use_key: String,
     pub version_id: String,
     pub operation_id: Option<String>,
@@ -94,6 +99,7 @@ pub struct ReferenceUsePin {
 /// The target store's read of the exact immutable operation and witness.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceUseEvidence {
+    pub target_store_incarnation: String,
     pub version_id: String,
     pub evidence_ref: String,
     pub witness_digest: String,
@@ -101,6 +107,7 @@ pub struct ReferenceUseEvidence {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceEvidence {
+    pub target_store_incarnation: String,
     /// Immutable identity in the target runtime store, not a moving version row.
     pub evidence_ref: String,
     pub witness_digest: String,
@@ -148,6 +155,32 @@ fn required(value: &str) -> Result<(), JournalError> {
     }
 }
 
+fn required_incarnation(value: &str) -> Result<(), JournalError> {
+    if value.len() != 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(JournalError::Conflict(
+            "reference target store incarnation is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn require_target_incarnation(
+    operation: &ReferenceOperation,
+    observed: &str,
+) -> Result<(), JournalError> {
+    required_incarnation(observed)?;
+    if operation.target_store_incarnation.as_deref() != Some(observed) {
+        return Err(JournalError::Conflict(
+            "reference target store incarnation differs from its Home registration",
+        ));
+    }
+    Ok(())
+}
+
 fn state(conn: &Connection) -> Result<(Option<String>, i64, bool), JournalError> {
     Ok(conn.query_row(
         "SELECT home_id, current_epoch, inventory_complete \
@@ -183,7 +216,7 @@ fn operation(
             "SELECT operations.operation_id, operations.home_id, target_store, kind, basis_digest, \
                     registered_epoch, completed_epoch, evidence_ref, witness_digest, \
                     revalidated_basis_digest, refusals.refused_epoch, refusals.reason_code, \
-                    refusals.home_id \
+                    refusals.home_id, operations.target_store_incarnation \
              FROM home_reference_operations AS operations \
              LEFT JOIN home_reference_refusals AS refusals \
                ON refusals.operation_id = operations.operation_id \
@@ -199,6 +232,7 @@ fn operation(
                     operation_id: row.get(0)?,
                     home_id,
                     target_store: row.get(2)?,
+                    target_store_incarnation: row.get(13)?,
                     kind: row.get(3)?,
                     basis_digest: row.get(4)?,
                     registered_epoch: row.get(5)?,
@@ -237,28 +271,34 @@ fn use_pin(
     let Some((version_id, classification, operation_id, bound_epoch)) = row else {
         return Ok(None);
     };
-    let classification = match (classification.as_str(), operation_id.as_deref()) {
-        ("exact", Some(id)) => {
-            let operation = operation(conn, id)?.ok_or(JournalError::Conflict(
-                "exact reference use pin has no target operation",
-            ))?;
-            if operation.home_id != home_id
-                || operation.target_store != target_store
-                || operation.completed_epoch.is_none()
-                || operation.refusal.is_some()
-            {
-                return Err(JournalError::Conflict(
-                    "exact reference use pin has no completed Home operation",
-                ));
+    let (classification, target_store_incarnation) =
+        match (classification.as_str(), operation_id.as_deref()) {
+            ("exact", Some(id)) => {
+                let operation = operation(conn, id)?.ok_or(JournalError::Conflict(
+                    "exact reference use pin has no target operation",
+                ))?;
+                if operation.home_id != home_id
+                    || operation.target_store != target_store
+                    || operation.target_store_incarnation.is_none()
+                    || operation.completed_epoch.is_none()
+                    || operation.refusal.is_some()
+                {
+                    return Err(JournalError::Conflict(
+                        "exact reference use pin has no completed Home operation",
+                    ));
+                }
+                (
+                    ReferenceUseClassification::Exact,
+                    operation.target_store_incarnation,
+                )
             }
-            ReferenceUseClassification::Exact
-        }
-        ("legacy_unknown", None) => ReferenceUseClassification::LegacyUnknown,
-        _ => return Err(JournalError::Conflict("malformed reference use pin")),
-    };
+            ("legacy_unknown", None) => (ReferenceUseClassification::LegacyUnknown, None),
+            _ => return Err(JournalError::Conflict("malformed reference use pin")),
+        };
     Ok(Some(ReferenceUsePin {
         home_id: home_id.to_owned(),
         target_store: target_store.to_owned(),
+        target_store_incarnation,
         use_key: use_key.to_owned(),
         version_id,
         operation_id,
@@ -374,12 +414,20 @@ impl Store {
         &mut self,
         home_id: &str,
         target_store: &str,
+        target_store_incarnation: &str,
         request_key: &str,
         basis_digest: &str,
     ) -> Result<ReferenceOperation, JournalError> {
-        for value in [home_id, target_store, request_key, basis_digest] {
+        for value in [
+            home_id,
+            target_store,
+            target_store_incarnation,
+            request_key,
+            basis_digest,
+        ] {
             required(value)?;
         }
+        required_incarnation(target_store_incarnation)?;
         let identity = serde_json::to_vec(&(
             "gaugedesk.checked-program-request.v1",
             home_id,
@@ -394,6 +442,7 @@ impl Store {
             &NewReferenceOperation {
                 operation_id: &operation_id,
                 target_store,
+                target_store_incarnation,
                 kind: "checked-program",
                 basis_digest,
             },
@@ -410,11 +459,13 @@ impl Store {
         for value in [
             new.operation_id,
             new.target_store,
+            new.target_store_incarnation,
             new.kind,
             new.basis_digest,
         ] {
             required(value)?;
         }
+        required_incarnation(new.target_store_incarnation)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -422,6 +473,8 @@ impl Store {
         if let Some(existing) = operation(&tx, new.operation_id)? {
             if existing.home_id != home_id
                 || existing.target_store != new.target_store
+                || existing.target_store_incarnation.as_deref()
+                    != Some(new.target_store_incarnation)
                 || existing.kind != new.kind
                 || existing.basis_digest != new.basis_digest
             {
@@ -434,12 +487,13 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO home_reference_operations \
-             (operation_id, home_id, target_store, kind, basis_digest, \
-              registered_epoch, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
+             (operation_id, home_id, target_store, target_store_incarnation, kind, basis_digest, \
+              registered_epoch, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
             params![
                 new.operation_id,
                 home_id,
                 new.target_store,
+                new.target_store_incarnation,
                 new.kind,
                 new.basis_digest,
                 epoch
@@ -481,6 +535,7 @@ impl Store {
             ));
         }
         let evidence = verify(&before).map_err(JournalError::Verification)?;
+        require_target_incarnation(&before, &evidence.target_store_incarnation)?;
         required(&evidence.evidence_ref)?;
         required(&evidence.witness_digest)?;
         if before.completed_epoch.is_some() {
@@ -500,6 +555,7 @@ impl Store {
         let now = operation(&tx, operation_id)?.ok_or(JournalError::Conflict(
             "reference operation disappeared during verification",
         ))?;
+        require_target_incarnation(&now, &evidence.target_store_incarnation)?;
         if now.refusal.is_some() {
             return Err(JournalError::Conflict(
                 "reference operation was refused during verification",
@@ -577,6 +633,7 @@ impl Store {
             ));
         }
         let checked = verify(&before, checked_epoch).map_err(JournalError::Verification)?;
+        require_target_incarnation(&before, &checked.evidence.target_store_incarnation)?;
         required(&checked.evidence.evidence_ref)?;
         required(&checked.evidence.witness_digest)?;
         required(&checked.current_basis_digest)?;
@@ -599,6 +656,7 @@ impl Store {
         let now = operation(&tx, operation_id)?.ok_or(JournalError::Conflict(
             "reference operation disappeared during revalidation",
         ))?;
+        require_target_incarnation(&now, &checked.evidence.target_store_incarnation)?;
         if now.refusal.is_some() {
             return Err(JournalError::Conflict(
                 "reference operation was refused during revalidation",
@@ -730,6 +788,7 @@ impl Store {
             ));
         }
         let evidence = verify(&before).map_err(JournalError::Verification)?;
+        require_target_incarnation(&before, &evidence.target_store_incarnation)?;
         for value in [
             &evidence.version_id,
             &evidence.evidence_ref,
@@ -1043,6 +1102,7 @@ impl Store {
         ))?;
         if origin.home_id != home_id
             || origin.target_store != target_store
+            || origin.target_store_incarnation.is_none()
             || origin.completed_epoch.is_none()
             || origin.refusal.is_some()
         {
@@ -1058,10 +1118,13 @@ impl Store {
 mod tests {
     use super::*;
 
+    const INCARNATION: &str = "0123456789abcdef0123456789abcdef";
+
     fn input<'a>(id: &'a str) -> NewReferenceOperation<'a> {
         NewReferenceOperation {
             operation_id: id,
             target_store: "chats/one.sqlite",
+            target_store_incarnation: INCARNATION,
             kind: "checked-program",
             basis_digest: "source+lock+compiler+policy:one",
         }
@@ -1069,6 +1132,7 @@ mod tests {
 
     fn evidence(_: &ReferenceOperation) -> Result<ReferenceEvidence, String> {
         Ok(ReferenceEvidence {
+            target_store_incarnation: INCARNATION.into(),
             evidence_ref: "operation:one".into(),
             witness_digest: "witness:one".into(),
         })
@@ -1076,10 +1140,132 @@ mod tests {
 
     fn exact_use_evidence(_: &ReferenceOperation) -> Result<ReferenceUseEvidence, String> {
         Ok(ReferenceUseEvidence {
+            target_store_incarnation: INCARNATION.into(),
             version_id: "version:one".into(),
             evidence_ref: "operation:one".into(),
             witness_digest: "witness:one".into(),
         })
+    }
+
+    #[test]
+    fn replacement_store_cannot_complete_or_use_the_old_home_operation() {
+        let mut store = Store::open_in_memory().unwrap();
+        let registered = store
+            .register_reference_operation("home:one", &input("one"))
+            .unwrap();
+        let replacement = "fedcba9876543210fedcba9876543210";
+        assert!(store
+            .conn
+            .execute(
+                "UPDATE home_reference_operations SET target_store_incarnation = ?1 \
+                 WHERE operation_id = 'one'",
+                [replacement],
+            )
+            .is_err());
+        let changed = NewReferenceOperation {
+            target_store_incarnation: replacement,
+            ..input("one")
+        };
+        assert!(matches!(
+            store.register_reference_operation("home:one", &changed),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            store.complete_reference_operation("home:one", "one", |_| {
+                Ok(ReferenceEvidence {
+                    target_store_incarnation: replacement.into(),
+                    evidence_ref: "operation:one".into(),
+                    witness_digest: "witness:one".into(),
+                })
+            }),
+            Err(JournalError::Conflict(_))
+        ));
+        assert_eq!(store.reference_operation("one").unwrap(), Some(registered));
+        store
+            .complete_reference_operation("home:one", "one", evidence)
+            .unwrap();
+        assert!(matches!(
+            store.bind_exact_reference_use(
+                "home:one",
+                "chats/one.sqlite",
+                "item:one",
+                "version:one",
+                "one",
+                |_| Ok(ReferenceUseEvidence {
+                    target_store_incarnation: replacement.into(),
+                    version_id: "version:one".into(),
+                    evidence_ref: "operation:one".into(),
+                    witness_digest: "witness:one".into(),
+                })
+            ),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(store
+            .reference_use_pin("home:one", "chats/one.sqlite", "item:one")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn migrated_legacy_operation_keeps_unknown_store_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("home.db");
+        let path = path.to_str().unwrap();
+        let mut store = Store::open(path).unwrap();
+        store
+            .register_reference_operation("home:one", &input("one"))
+            .unwrap();
+        store
+            .complete_reference_operation("home:one", "one", evidence)
+            .unwrap();
+        store
+            .seal_reference_epoch("home:one", "registry:1", "policy:1", "tree:1")
+            .unwrap();
+        let mut legacy = store.reference_operation("one").unwrap().unwrap();
+        legacy.target_store_incarnation = None;
+        let legacy_digest = digest(&[legacy]).unwrap();
+        drop(store);
+
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER home_reference_insert_requires_incarnation; \
+             DROP TRIGGER home_reference_pending_identity_immutable; \
+             ALTER TABLE home_reference_operations DROP COLUMN target_store_incarnation; \
+             DELETE FROM schema_migrations WHERE version = 8;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE home_reference_seals SET roster_digest = ?1 WHERE epoch = 0",
+            [&legacy_digest],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut upgraded = Store::open(path).unwrap();
+        assert_eq!(
+            upgraded
+                .sealed_reference_epoch(0)
+                .unwrap()
+                .unwrap()
+                .roster_digest,
+            legacy_digest
+        );
+        assert_eq!(
+            upgraded
+                .reference_operation("one")
+                .unwrap()
+                .unwrap()
+                .target_store_incarnation,
+            None
+        );
+        assert!(matches!(
+            upgraded.register_reference_operation("home:one", &input("one")),
+            Err(JournalError::Conflict(_))
+        ));
+        assert!(matches!(
+            upgraded.complete_reference_operation("home:one", "one", evidence),
+            Err(JournalError::Conflict(_))
+        ));
     }
 
     #[test]
@@ -1092,6 +1278,7 @@ mod tests {
             .register_checked_program_request(
                 "home:one",
                 "gates/project:one/runtime.sqlite",
+                INCARNATION,
                 "item:one:first-admission",
                 "source+lock+compiler+policy:one",
             )
@@ -1106,6 +1293,7 @@ mod tests {
             .register_checked_program_request(
                 "home:one",
                 "gates/project:one/runtime.sqlite",
+                INCARNATION,
                 "item:one:first-admission",
                 "source+lock+compiler+policy:one",
             )
@@ -1115,6 +1303,7 @@ mod tests {
             reopened.register_checked_program_request(
                 "home:one",
                 "gates/project:one/runtime.sqlite",
+                INCARNATION,
                 "item:one:first-admission",
                 "source+lock+compiler+policy:two",
             ),
@@ -1124,6 +1313,7 @@ mod tests {
             .register_checked_program_request(
                 "home:one",
                 "gates/project:one/runtime.sqlite",
+                INCARNATION,
                 "item:two:first-admission",
                 "source+lock+compiler+policy:one",
             )
@@ -1640,6 +1830,7 @@ mod tests {
         assert!(matches!(
             store.complete_reference_operation("home:one", "one", |_| {
                 Ok(ReferenceEvidence {
+                    target_store_incarnation: INCARNATION.into(),
                     evidence_ref: "operation:one".into(),
                     witness_digest: "witness:changed".into(),
                 })

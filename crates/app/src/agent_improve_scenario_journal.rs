@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use whipplescript_core::improve_selection::GaugeEvidence;
+use whipplescript_core::improve_selection::{Bar, GaugeEvidence, Reading};
 
 use crate::agent_improve::{PreparedShadowPair, SelectedShadowPair};
 use crate::agent_improve_campaign::Exposure;
@@ -90,6 +90,29 @@ impl HostedImproveGaugeSample {
         Ok(sample)
     }
 
+    pub(crate) fn as_evidence(&self) -> Result<GaugeEvidence, String> {
+        self.validate()?;
+        Ok(GaugeEvidence {
+            name: self.name.clone(),
+            direction_up: self.direction_up,
+            resource: self.resource,
+            bar: self.bar.as_ref().map(|bar| Bar {
+                chance: bar.chance,
+                stat: bar.stat.clone(),
+                ge: bar.ge,
+                threshold: bar.threshold,
+            }),
+            baseline: vec![Reading {
+                score: self.baseline.score,
+                passed: self.baseline.passed,
+            }],
+            candidate: vec![Reading {
+                score: self.candidate.score,
+                passed: self.candidate.passed,
+            }],
+        })
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty()
             || !self.baseline.score.is_finite()
@@ -114,6 +137,16 @@ pub struct HostedImproveArmTerminal {
     pub evidence_ref: String,
     pub usage_id: String,
     pub wall_millis: u64,
+}
+
+/// Exact command receipts available to the trusted hosted worker after a
+/// restart. Gauge readings stay inside Home until the worker reconciles every
+/// receipt against the managed execution ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedImproveRecoveryScenario {
+    pub ordinal: usize,
+    pub scenario_id: String,
+    pub arms: [HostedImproveArmTerminal; 2],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -279,9 +312,37 @@ impl Workbench {
         &self,
         key: &HostedImproveInputKey<'_>,
     ) -> Result<Vec<HostedImproveScenarioCut>, String> {
+        self.hosted_improve_scenario_cuts_with_current_main(key, true)
+    }
+
+    /// Read only saved receipts for settlement after the original Main cut
+    /// has moved. This is a service-only recovery seam, never an admission or
+    /// reviewer route. The operation record and each scenario remain sealed
+    /// and validated against their original input, preparation, and campaign.
+    pub fn hosted_improve_recovery_receipts(
+        &self,
+        key: &HostedImproveInputKey<'_>,
+    ) -> Result<Vec<HostedImproveRecoveryScenario>, String> {
+        self.hosted_improve_scenario_cuts_with_current_main(key, false)
+            .map(|cuts| {
+                cuts.into_iter()
+                    .map(|cut| HostedImproveRecoveryScenario {
+                        ordinal: cut.ordinal,
+                        scenario_id: cut.scenario_id,
+                        arms: cut.arms,
+                    })
+                    .collect()
+            })
+    }
+
+    fn hosted_improve_scenario_cuts_with_current_main(
+        &self,
+        key: &HostedImproveInputKey<'_>,
+        require_current_main: bool,
+    ) -> Result<Vec<HostedImproveScenarioCut>, String> {
         let digest = key.digest()?;
         let prepared = self
-            .hosted_improve_prepared_cut(key)?
+            .hosted_improve_prepared_cut_with_current_main(key, require_current_main)?
             .ok_or("hosted improve has no retained prepared cut")?;
         let campaign = self.load_agent_improve_campaign(key.agent_id, key.campaign_ref)?;
         let expected = campaign.evaluation_scenarios();

@@ -209,6 +209,9 @@ fn gate_evidence(
     if evidence.operation_id != operation.operation_id {
         return Err("gate target returned a different import operation".into());
     }
+    if operation.target_store_incarnation.as_deref() != Some(&evidence.target_store_incarnation) {
+        return Err("gate runtime store incarnation differs from its Home registration".into());
+    }
     Ok(evidence)
 }
 
@@ -278,6 +281,7 @@ fn home_gate_use(
                     return Err("gate target differs from registered Home basis".into());
                 }
                 Ok(ReferenceEvidence {
+                    target_store_incarnation: evidence.target_store_incarnation,
                     evidence_ref: evidence.operation_id,
                     witness_digest: evidence.witness_digest,
                 })
@@ -297,6 +301,7 @@ fn home_gate_use(
                         let evidence = gate_evidence(&current, state, operation)?;
                         Ok(RevalidatedReferenceEvidence {
                             evidence: ReferenceEvidence {
+                                target_store_incarnation: evidence.target_store_incarnation.clone(),
                                 evidence_ref: evidence.operation_id.clone(),
                                 witness_digest: evidence.witness_digest.clone(),
                             },
@@ -335,6 +340,7 @@ fn home_gate_use(
                     );
                 }
                 Ok(ReferenceUseEvidence {
+                    target_store_incarnation: evidence.target_store_incarnation,
                     version_id: evidence.version_id,
                     evidence_ref: evidence.operation_id,
                     witness_digest: evidence.witness_digest,
@@ -376,7 +382,13 @@ fn screen_item_with_home<T: GateTransport>(
             let digest = registration_basis_digest(home_id, project_id, &basis);
             shared
                 .borrow_mut()
-                .register_checked_program_request(home_id, &target, &request, &digest)
+                .register_checked_program_request(
+                    home_id,
+                    &target,
+                    basis.target_store_incarnation,
+                    &request,
+                    &digest,
+                )
                 .map(|operation| operation.operation_id)
                 .map_err(|error| GateRunError::NoDisposition(error.to_string()))
         },
@@ -690,6 +702,7 @@ mod tests {
                     .register_checked_program_request(
                         home,
                         &target,
+                        basis.target_store_incarnation,
                         "gate-item:project-one:item-one",
                         &digest,
                     )

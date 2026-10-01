@@ -21,7 +21,7 @@ use crate::agent_improve::{
     HostedImprovePairContext, PreparedShadowPair, SelectedShadowPair, ShadowTurn,
 };
 use crate::agent_improve_adoption::{adopt_candidate, AgentDefinitionSnapshot};
-use crate::agent_improve_checkpoint::HostedImproveInputKey;
+use crate::agent_improve_checkpoint::{HostedImproveInputCut, HostedImproveInputKey};
 use crate::agent_improve_funding::ManagedShadowMeter;
 use crate::agent_improve_scenario_journal::{HostedImproveScenarioCut, HostedScenarioSelection};
 use crate::LockUnpoisoned;
@@ -677,13 +677,48 @@ pub fn run_hosted_managed_campaign_with_reservation(
         return Err("hosted Agent improve needs an admitted WhippleScript placement".to_owned());
     }
     let tenant_id = funding.tenant_scope.clone();
+    let current_main_cut = workspace
+        .current_main_cut()
+        .map_err(|error| error.to_string())?
+        .ok_or("hosted improve replay has no Main cut")?;
+    let replay = if let Some(operation_id) = operation_id {
+        let key = HostedImproveInputKey {
+            operation_id,
+            actor,
+            tenant_id: &tenant_id,
+            agent_id,
+            edit_chat_id: edit_chat_id.ok_or("hosted improve replay has no edit chat identity")?,
+            campaign_ref: campaign.reference(),
+            target_id,
+            target_main_basis: &current_main_cut,
+        };
+        let reconciled = pair_admission.reconcile_saved_prefix(&key)?;
+        let guard = wb.lock_unpoisoned();
+        let cuts = guard.hosted_improve_scenario_cuts(&key)?;
+        if reconciled != cuts.len() {
+            return Err(
+                "hosted improve ledger and scenario journal have different prefixes".into(),
+            );
+        }
+        let definitions = guard
+            .hosted_improve_input_cut(&key)?
+            .ok_or("hosted improve replay has no retained definition cut")?;
+        Some((cuts, definitions))
+    } else {
+        None
+    };
     let mut meter = ManagedShadowMeter::new(wb, gen_id("agent-improve-attempt"), funding);
-    run_campaign_with_reservation(
-        template,
-        target_id,
-        workspace,
-        candidate_repo,
-        campaign,
+    run_campaign_with_reservation_replay(
+        CampaignSources {
+            template,
+            target_id,
+            workspace,
+            candidate_repo,
+            campaign,
+        },
+        replay
+            .as_ref()
+            .map(|(cuts, definitions)| CampaignReplay { cuts, definitions }),
         |ordinal, scenario_id, exposure, prepared, judge, selection, prompt| {
             let target_main_basis = prepared
                 .baseline_main_cut()
@@ -813,6 +848,50 @@ fn run_campaign_with_reservation<F>(
     workspace: &dyn Workspace,
     candidate_repo: &Path,
     campaign: &CampaignSnapshot,
+    run: F,
+    reserve: &mut dyn FnMut() -> Result<Option<String>, String>,
+) -> Result<SelectedCampaign, String>
+where
+    F: FnMut(
+        usize,
+        &str,
+        Exposure,
+        &PreparedShadowPair,
+        &dyn HostJudge,
+        &HostSelection,
+        &str,
+    ) -> Result<SelectedShadowPair, String>,
+{
+    run_campaign_with_reservation_replay(
+        CampaignSources {
+            template,
+            target_id,
+            workspace,
+            candidate_repo,
+            campaign,
+        },
+        None,
+        run,
+        reserve,
+    )
+}
+
+struct CampaignSources<'a> {
+    template: &'a HarnessSpec,
+    target_id: &'a str,
+    workspace: &'a dyn Workspace,
+    candidate_repo: &'a Path,
+    campaign: &'a CampaignSnapshot,
+}
+
+struct CampaignReplay<'a> {
+    cuts: &'a [HostedImproveScenarioCut],
+    definitions: &'a HostedImproveInputCut,
+}
+
+fn run_campaign_with_reservation_replay<F>(
+    sources: CampaignSources<'_>,
+    replay: Option<CampaignReplay<'_>>,
     mut run: F,
     reserve: &mut dyn FnMut() -> Result<Option<String>, String>,
 ) -> Result<SelectedCampaign, String>
@@ -827,6 +906,19 @@ where
         &str,
     ) -> Result<SelectedShadowPair, String>,
 {
+    let CampaignSources {
+        template,
+        target_id,
+        workspace,
+        candidate_repo,
+        campaign,
+    } = sources;
+    if replay
+        .as_ref()
+        .is_some_and(|saved| saved.cuts.len() > campaign.evaluation_scenarios().len())
+    {
+        return Err("hosted improve journal exceeds its campaign".into());
+    }
     let selection = campaign.selection();
     let mut scenarios = Vec::new();
     let mut readings: BTreeMap<String, GaugeEvidence> = BTreeMap::new();
@@ -843,6 +935,15 @@ where
                 campaign.open.gauges.len(),
             )?;
             if !verdict.proposable {
+                if replay
+                    .as_ref()
+                    .is_some_and(|saved| saved.cuts.len() > scenarios.len())
+                {
+                    return Err(
+                        "hosted improve journal contains sealed evidence after a failed open gate"
+                            .into(),
+                    );
+                }
                 let (baseline_definition, candidate_definition) =
                     definitions.ok_or("Agent improve campaign has no evaluated definitions")?;
                 return Ok(SelectedCampaign {
@@ -861,47 +962,98 @@ where
             open_verdict = Some(verdict);
             reservation_id = reserve()?;
         }
-        let scenario_root = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let prepared = prepare_native_shadow_pair_from_authoring(
-            template,
-            workspace,
-            candidate_repo,
-            scenario_root.path(),
-        )
-        .map_err(|error| error.to_string())?;
-        let judge = campaign.judge_for(scenario.id)?;
-        let selected = run(
-            ordinal,
-            scenario.id,
-            scenario.exposure,
-            &prepared,
-            &judge,
-            &selection,
-            scenario.prompt,
-        )?;
-        let evidence = selected.evidence();
         let expected_prompt_ref = format!(
             "agent-prompt:sha256:{}",
             hex::encode(Sha256::digest(scenario.prompt.as_bytes()))
         );
-        if evidence.prompt_ref() != expected_prompt_ref
-            || selected.judge_ref() != campaign.reference()
-            || selected.selection_ref() != campaign.reference()
+        let (this_lineage, this_definitions, evaluated) = if let Some((saved, cut)) = replay
+            .as_ref()
+            .and_then(|saved| saved.cuts.get(ordinal).map(|cut| (saved, cut)))
         {
-            return Err(
-                "Agent improve scenario evidence differs from the pinned campaign".to_owned(),
-            );
-        }
-        let this_lineage = CampaignLineage {
-            baseline_main_cut: evidence.baseline_main_cut().unwrap_or("").to_owned(),
-            baseline_definition_ref: evidence.baseline_definition_ref().to_owned(),
-            candidate_definition_ref: evidence.candidate_definition_ref().to_owned(),
-            baseline_package_ref: evidence.baseline().package_ref().to_owned(),
-            candidate_package_ref: evidence.candidate().package_ref().to_owned(),
-            baseline_discipline_ref: evidence.baseline().discipline_ref().to_owned(),
-            candidate_discipline_ref: evidence.candidate().discipline_ref().to_owned(),
+            let exposure = match scenario.exposure {
+                Exposure::Open => "open",
+                Exposure::Sealed => "sealed",
+            };
+            if cut.ordinal != ordinal
+                || cut.scenario_id != scenario.id
+                || cut.exposure != exposure
+                || cut.prompt_ref != expected_prompt_ref
+                || cut.baseline_definition_ref != saved.definitions.baseline.identity
+                || cut.candidate_definition_ref != saved.definitions.candidate.identity
+            {
+                return Err("hosted improve replay changed its pinned scenario".into());
+            }
+            let lineage = CampaignLineage {
+                baseline_main_cut: cut.baseline_main_cut.clone(),
+                baseline_definition_ref: cut.baseline_definition_ref.clone(),
+                candidate_definition_ref: cut.candidate_definition_ref.clone(),
+                baseline_package_ref: cut.baseline_package_ref.clone(),
+                candidate_package_ref: cut.candidate_package_ref.clone(),
+                baseline_discipline_ref: cut.baseline_discipline_ref.clone(),
+                candidate_discipline_ref: cut.candidate_discipline_ref.clone(),
+            };
+            let evaluated = EvaluatedScenario {
+                id: scenario.id.to_owned(),
+                exposure: scenario.exposure,
+                readings: cut
+                    .gauges
+                    .iter()
+                    .map(|gauge| gauge.as_evidence())
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            (
+                lineage,
+                (
+                    saved.definitions.baseline.clone(),
+                    saved.definitions.candidate.clone(),
+                ),
+                evaluated,
+            )
+        } else {
+            let scenario_root = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let prepared = prepare_native_shadow_pair_from_authoring(
+                template,
+                workspace,
+                candidate_repo,
+                scenario_root.path(),
+            )
+            .map_err(|error| error.to_string())?;
+            let judge = campaign.judge_for(scenario.id)?;
+            let selected = run(
+                ordinal,
+                scenario.id,
+                scenario.exposure,
+                &prepared,
+                &judge,
+                &selection,
+                scenario.prompt,
+            )?;
+            let evidence = selected.evidence();
+            if evidence.prompt_ref() != expected_prompt_ref
+                || selected.judge_ref() != campaign.reference()
+                || selected.selection_ref() != campaign.reference()
+            {
+                return Err(
+                    "Agent improve scenario evidence differs from the pinned campaign".to_owned(),
+                );
+            }
+            let lineage = CampaignLineage {
+                baseline_main_cut: evidence.baseline_main_cut().unwrap_or("").to_owned(),
+                baseline_definition_ref: evidence.baseline_definition_ref().to_owned(),
+                candidate_definition_ref: evidence.candidate_definition_ref().to_owned(),
+                baseline_package_ref: evidence.baseline().package_ref().to_owned(),
+                candidate_package_ref: evidence.candidate().package_ref().to_owned(),
+                baseline_discipline_ref: evidence.baseline().discipline_ref().to_owned(),
+                candidate_discipline_ref: evidence.candidate().discipline_ref().to_owned(),
+            };
+            let definitions = prepared.evaluated_definitions(evidence)?;
+            let evaluated = EvaluatedScenario {
+                id: scenario.id.to_owned(),
+                exposure: scenario.exposure,
+                readings: selected.gauges().to_vec(),
+            };
+            (lineage, definitions, evaluated)
         };
-        let this_definitions = prepared.evaluated_definitions(evidence)?;
         if this_lineage.baseline_main_cut.is_empty()
             || lineage
                 .as_ref()
@@ -916,11 +1068,6 @@ where
         }
         lineage = Some(this_lineage);
         definitions = Some(this_definitions);
-        let evaluated = EvaluatedScenario {
-            id: scenario.id.to_owned(),
-            exposure: scenario.exposure,
-            readings: selected.gauges().to_vec(),
-        };
         for gauge in &evaluated.readings {
             let entry = readings
                 .entry(gauge.name.clone())
@@ -1919,10 +2066,46 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].contains("Return beta"));
         assert!(!rows[0].contains("selected method"));
+        let hosted_id = guard
+            .append_hosted_agent_improve_evidence(crate::DEFAULT_AGENT, &source, &selected, "op")
+            .unwrap();
+        assert_eq!(
+            guard
+                .append_hosted_agent_improve_evidence(
+                    crate::DEFAULT_AGENT,
+                    &source,
+                    &selected,
+                    "op"
+                )
+                .unwrap(),
+            hosted_id
+        );
+        assert_eq!(
+            guard
+                .store
+                .records(
+                    crate::library::LIBRARY_SCOPE,
+                    "agent_improve_campaign_evidence"
+                )
+                .unwrap()
+                .len(),
+            2
+        );
         drop(guard);
         drop(workbench);
         let reopened = crate::open_workbench(root.path()).unwrap();
         let mut guard = reopened.lock_unpoisoned();
+        assert_eq!(
+            guard
+                .append_hosted_agent_improve_evidence(
+                    crate::DEFAULT_AGENT,
+                    &source,
+                    &selected,
+                    "op"
+                )
+                .unwrap(),
+            hosted_id
+        );
         let evidence = guard
             .agent_improve_evidence(crate::DEFAULT_AGENT, &evidence_id)
             .unwrap();
@@ -1939,6 +2122,161 @@ mod tests {
                 .unwrap_err()
                 .contains("sealed evaluation is incomplete")
         );
+    }
+
+    #[test]
+    fn reconciled_scenario_prefix_replays_readings_without_reexecuting_its_arms() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let guard = workbench.lock_unpoisoned();
+        let target_id = crate::library_state::authoring_target_id(crate::DEFAULT_AGENT);
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let candidate_repo = root.path().join("candidate");
+        AgentDefinitionSnapshot::from_main(workspace.as_ref())
+            .unwrap()
+            .materialize(&candidate_repo)
+            .unwrap();
+        std::fs::write(candidate_repo.join("agent/AGENTS.md"), "selected method\n").unwrap();
+        let source = CampaignSnapshot::parse(OPEN.as_bytes(), PRIVATE.as_bytes()).unwrap();
+        let template = template(root.path());
+        fn evaluate_case(
+            _: usize,
+            _: &str,
+            _: Exposure,
+            prepared: &PreparedShadowPair,
+            judge: &dyn HostJudge,
+            selection: &HostSelection,
+            prompt: &str,
+        ) -> Result<SelectedShadowPair, String> {
+            crate::agent_improve::run_shadow_selection_with_factory(
+                &FakeFactory {
+                    open_passes: true,
+                    sealed_passes: true,
+                },
+                prepared,
+                &AllowAllGate,
+                prompt,
+                judge,
+                selection,
+            )
+        }
+        let original = run_campaign_with_reservation(
+            &template,
+            &target_id,
+            workspace.as_ref(),
+            &candidate_repo,
+            &source,
+            evaluate_case,
+            &mut || Ok(Some("reservation:one".into())),
+        )
+        .unwrap();
+        let definitions = HostedImproveInputCut {
+            baseline: original.baseline_definition.clone(),
+            candidate: original.candidate_definition.clone(),
+        };
+        let ordered = source.evaluation_scenarios();
+        let cuts = original
+            .scenarios
+            .iter()
+            .enumerate()
+            .map(|(ordinal, evaluated)| {
+                let scenario = &ordered[ordinal];
+                HostedImproveScenarioCut {
+                    ordinal,
+                    scenario_id: evaluated.id.clone(),
+                    exposure: match evaluated.exposure {
+                        Exposure::Open => "open",
+                        Exposure::Sealed => "sealed",
+                    }
+                    .into(),
+                    scenario_ref: format!("scenario:{ordinal}"),
+                    prompt_ref: format!(
+                        "agent-prompt:sha256:{}",
+                        hex::encode(Sha256::digest(scenario.prompt.as_bytes()))
+                    ),
+                    baseline_main_cut: original.lineage.baseline_main_cut.clone(),
+                    baseline_definition_ref: original.lineage.baseline_definition_ref.clone(),
+                    candidate_definition_ref: original.lineage.candidate_definition_ref.clone(),
+                    baseline_package_ref: original.lineage.baseline_package_ref.clone(),
+                    candidate_package_ref: original.lineage.candidate_package_ref.clone(),
+                    baseline_discipline_ref: original.lineage.baseline_discipline_ref.clone(),
+                    candidate_discipline_ref: original.lineage.candidate_discipline_ref.clone(),
+                    gauges: evaluated
+                        .readings
+                        .iter()
+                        .map(crate::agent_improve_scenario_journal::HostedImproveGaugeSample::from_evidence)
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap(),
+                    arms: ["baseline", "candidate"].map(|label| {
+                        crate::agent_improve::HostedImproveArmTerminal {
+                            label: label.into(),
+                            command_id: format!("command:{ordinal}:{label}"),
+                            epoch: 1,
+                            evidence_ref: format!("sha256:{}", "a".repeat(64)),
+                            usage_id: format!("usage:{ordinal}:{label}"),
+                            wall_millis: 1,
+                        }
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
+        let sources = || CampaignSources {
+            template: &template,
+            target_id: &target_id,
+            workspace: workspace.as_ref(),
+            candidate_repo: &candidate_repo,
+            campaign: &source,
+        };
+        let full = run_campaign_with_reservation_replay(
+            sources(),
+            Some(CampaignReplay {
+                cuts: &cuts,
+                definitions: &definitions,
+            }),
+            |_, _, _, _, _, _, _| panic!("a replayed arm must not execute"),
+            &mut || Ok(Some("reservation:one".into())),
+        )
+        .unwrap();
+        assert_eq!(full.scenarios.len(), 2);
+        assert_eq!(
+            full.reviewer_verdict().proposable,
+            original.reviewer_verdict().proposable
+        );
+        assert_eq!(
+            full.reviewer_verdict().lines[0].candidate,
+            original.reviewer_verdict().lines[0].candidate
+        );
+        let mut new_runs = 0;
+        let partial = run_campaign_with_reservation_replay(
+            sources(),
+            Some(CampaignReplay {
+                cuts: &cuts[..1],
+                definitions: &definitions,
+            }),
+            |ordinal, id, exposure, prepared, judge, selection, prompt| {
+                new_runs += 1;
+                evaluate_case(ordinal, id, exposure, prepared, judge, selection, prompt)
+            },
+            &mut || Ok(Some("reservation:one".into())),
+        )
+        .unwrap();
+        assert_eq!(new_runs, 1);
+        assert_eq!(
+            partial.reviewer_verdict().proposable,
+            original.reviewer_verdict().proposable
+        );
+        let mut changed = cuts.clone();
+        changed[0].prompt_ref = "another prompt".into();
+        assert!(run_campaign_with_reservation_replay(
+            sources(),
+            Some(CampaignReplay {
+                cuts: &changed,
+                definitions: &definitions,
+            }),
+            |_, _, _, _, _, _, _| panic!("a changed replay must not execute"),
+            &mut || Ok(Some("reservation:one".into())),
+        )
+        .is_err());
     }
 
     #[test]

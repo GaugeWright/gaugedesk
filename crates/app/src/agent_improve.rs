@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 use whipplescript_core::improve_selection::{self, Bar, Campaign, GaugeEvidence, Reading, Verdict};
 
 use crate::agent_improve_adoption::{adopt_candidate, AgentDefinitionSnapshot};
-pub use crate::agent_improve_scenario_journal::HostedImproveArmTerminal;
+pub use crate::agent_improve_checkpoint::{HostedImproveInputKey, HostedImproveOperationBasis};
+pub use crate::agent_improve_scenario_journal::{
+    HostedImproveArmTerminal, HostedImproveRecoveryScenario,
+};
 
 pub struct ShadowTurn {
     package_ref: String,
@@ -182,6 +185,13 @@ pub struct HostedImprovePairContext<'a> {
 }
 
 pub trait HostedImprovePairAdmission: Send + Sync {
+    /// Settle the retained scenario prefix against Home's managed command
+    /// ledger before any of its gauge readings can be replayed. The default
+    /// refuses replay when an admission adapter has no recovery authority.
+    fn reconcile_saved_prefix(&self, _key: &HostedImproveInputKey<'_>) -> Result<usize, String> {
+        Err("hosted improve pair admission has no recovery authority".into())
+    }
+
     fn with_pair(
         &self,
         context: &HostedImprovePairContext<'_>,

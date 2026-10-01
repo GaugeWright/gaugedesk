@@ -121,6 +121,12 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             post(crate::agent_improve_routes::evaluate),
         )
         .route(
+            "/archetypes/{id}/improve/operations/{operation_id}",
+            get(crate::agent_improve_routes::operation_status).layer(
+                axum::middleware::map_response(crate::file_action_routes::no_store),
+            ),
+        )
+        .route(
             "/archetypes/{id}/improve/evidence",
             get(crate::agent_improve_routes::review).layer(axum::middleware::map_response(
                 crate::file_action_routes::no_store,

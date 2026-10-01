@@ -4455,7 +4455,7 @@ mod tests {
             &[],
         );
         let admitted = admit_organization_model_request(&openai, "gpt-5-mini", &request).unwrap();
-        assert_eq!(admitted.token_bound, 128_000);
+        assert_eq!(admitted.token_bound, 272_000);
         assert_eq!(
             admitted.request_digest,
             organization_model_request_digest(&request).unwrap()
@@ -4509,7 +4509,7 @@ mod tests {
         );
         let admitted = admit_organization_model_request(&xai, "grok-4.6", &request).unwrap();
         assert_eq!(request.url, "https://api.x.ai/v1/chat/completions");
-        assert_eq!(admitted.token_bound, 256_000);
+        assert_eq!(admitted.token_bound, 500_000);
         assert_eq!(
             organization_model_response_tokens(
                 &xai,

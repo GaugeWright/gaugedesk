@@ -163,6 +163,27 @@ impl NativeImprovePrepared {
     ) -> Result<Self, String> {
         if let ImproveExecution::Hosted(admission) = &execution {
             let actor = actor.ok_or("Hosted Agent improve has no source-owner actor")?;
+            let basis = wb.lock_unpoisoned().hosted_improve_operation_basis(
+                &admission.operation_id,
+                actor,
+                &admission.tenant_scope,
+                agent_id,
+                edit_chat_id,
+                campaign_ref,
+            )?;
+            if let Some(basis) = basis {
+                let key = HostedImproveInputKey {
+                    operation_id: &admission.operation_id,
+                    actor,
+                    tenant_id: &admission.tenant_scope,
+                    agent_id,
+                    edit_chat_id,
+                    campaign_ref,
+                    target_id: &basis.target_id,
+                    target_main_basis: &basis.target_main_basis,
+                };
+                admission.pair_admission.reconcile_saved_prefix(&key)?;
+            }
             let recovered = {
                 let guard = wb.lock_unpoisoned();
                 guard.verify_agent_improve_source_owner(agent_id, Some(actor))?;
@@ -981,8 +1002,19 @@ impl NativeImprovePrepared {
             if current.as_deref() != Some(&self.expected_main_cut) {
                 return Err("Agent draft changed during improvement evaluation".to_owned());
             }
-            let id =
-                guard.append_agent_improve_evidence(&self.agent_id, &self.campaign, &selected)?;
+            let id = match operation_id.as_deref() {
+                Some(operation) => guard.append_hosted_agent_improve_evidence(
+                    &self.agent_id,
+                    &self.campaign,
+                    &selected,
+                    operation,
+                )?,
+                None => guard.append_agent_improve_evidence(
+                    &self.agent_id,
+                    &self.campaign,
+                    &selected,
+                )?,
+            };
             guard.agent_improve_evidence(&self.agent_id, &id)?
         };
         Ok(NativeImproveResult {

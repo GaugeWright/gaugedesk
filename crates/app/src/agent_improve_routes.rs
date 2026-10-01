@@ -16,14 +16,40 @@ use crate::{
     LockUnpoisoned, SharedWorkbench,
 };
 
-/// Only a hosted Home with a command admission authority may install this
-/// request extension. The pair callback admits both prepared arm snapshots
-/// before they run and records their managed command outcomes. A generic DO
-/// bearer configured in the workbench environment is never an authority.
+/// Only a hosted Home with a durable campaign queue may install this request
+/// extension. Enqueue persists the exact human, tenant, Agent, edit chat, and
+/// campaign before the HTTP request ends. The Home's worker later installs
+/// the admitted pair factory; a generic DO bearer is never an authority.
 #[derive(Clone)]
-pub struct HostedImproveAdmittedFactory {
-    pub factory: gaugedesk_whip_runtime::WhipHarnessFactory,
-    pub pair_admission: Arc<dyn crate::agent_improve::HostedImprovePairAdmission>,
+pub struct HostedImproveCampaignQueue(pub Arc<dyn HostedImproveJobQueue>);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostedImproveJobInput {
+    pub operation_id: String,
+    pub tenant_scope: String,
+    pub actor: String,
+    pub agent_id: String,
+    pub edit_chat_id: String,
+    pub campaign_ref: String,
+}
+
+#[derive(Serialize)]
+pub struct HostedImproveQueued {
+    pub operation_id: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_id: Option<String>,
+}
+
+pub trait HostedImproveJobQueue: Send + Sync {
+    fn enqueue(&self, input: HostedImproveJobInput) -> Result<HostedImproveQueued, String>;
+    fn status(
+        &self,
+        operation_id: &str,
+        tenant_scope: &str,
+        actor: &str,
+        agent_id: &str,
+    ) -> Result<Option<HostedImproveQueued>, String>;
 }
 
 #[derive(Deserialize)]
@@ -155,7 +181,7 @@ pub async fn evaluate(
     headers: HeaderMap,
     authenticated: Option<Extension<AuthenticatedActionContext>>,
     funding: Option<Extension<FundingAuthority>>,
-    admitted_factory: Option<Extension<HostedImproveAdmittedFactory>>,
+    campaign_queue: Option<Extension<HostedImproveCampaignQueue>>,
     Json(body): Json<EvaluateAgentImprove>,
 ) -> Response {
     let Some(Extension(context)) = authenticated else {
@@ -173,20 +199,16 @@ pub async fn evaluate(
             "Agent improve requires a human owner",
         );
     }
-    let Some(Extension(funding)) = funding else {
+    let Some(Extension(_funding)) = funding else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "Hosted funding authority unavailable",
         );
     };
-    let Some(Extension(HostedImproveAdmittedFactory {
-        factory,
-        pair_admission,
-    })) = admitted_factory
-    else {
+    let Some(Extension(HostedImproveCampaignQueue(queue))) = campaign_queue else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Admitted hosted execution is unavailable",
+            "Durable hosted improvement is unavailable",
         );
     };
     if !wb.lock_unpoisoned().hosted_home_mode() {
@@ -198,25 +220,26 @@ pub async fn evaluate(
     };
     let actor = context.actor().as_str().to_owned();
     let tenant_scope = crate::workbench_auth::req_scope(&headers);
+    if wb
+        .lock_unpoisoned()
+        .verify_agent_improve_source_owner(&agent_id, Some(&actor))
+        .is_err()
+    {
+        return problem(StatusCode::FORBIDDEN, "Agent improve source owner required");
+    }
     let result = tokio::task::spawn_blocking(move || {
-        crate::evaluate_agent_improve_from_hosted(
-            &wb,
-            &agent_id,
-            &body.edit_chat_id,
-            &body.campaign_ref,
-            &actor,
-            crate::HostedImproveAdmission {
-                operation_id,
-                tenant_scope,
-                funding_authority: funding,
-                factory,
-                pair_admission,
-            },
-        )
+        queue.enqueue(HostedImproveJobInput {
+            operation_id,
+            tenant_scope,
+            actor,
+            agent_id,
+            edit_chat_id: body.edit_chat_id,
+            campaign_ref: body.campaign_ref,
+        })
     })
     .await;
     match result {
-        Ok(Ok(evidence)) => Json(evidence).into_response(),
+        Ok(Ok(job)) => (StatusCode::ACCEPTED, Json(job)).into_response(),
         Ok(Err(error)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": error })),
@@ -224,7 +247,49 @@ pub async fn evaluate(
             .into_response(),
         Err(_) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Agent improve worker failed",
+            "Agent improve admission worker failed",
+        ),
+    }
+}
+
+/// Poll one durable campaign operation. The queue compares the operation's
+/// original human, tenant, and Agent before returning any progress or evidence
+/// reference; an unknown or differently owned key has the same 404 result.
+pub async fn operation_status(
+    State(wb): State<SharedWorkbench>,
+    Path((agent_id, operation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+    campaign_queue: Option<Extension<HostedImproveCampaignQueue>>,
+) -> Response {
+    let actor = match hosted_owner(&wb, authenticated) {
+        Ok(actor) => actor,
+        Err((status, message)) => return problem(status, message),
+    };
+    let Some(Extension(HostedImproveCampaignQueue(queue))) = campaign_queue else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Durable hosted improvement is unavailable",
+        );
+    };
+    if wb
+        .lock_unpoisoned()
+        .verify_agent_improve_source_owner(&agent_id, Some(&actor))
+        .is_err()
+    {
+        return problem(StatusCode::FORBIDDEN, "Agent improve source owner required");
+    }
+    let tenant_scope = crate::workbench_auth::req_scope(&headers);
+    let result = tokio::task::spawn_blocking(move || {
+        queue.status(&operation_id, &tenant_scope, &actor, &agent_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(job))) => Json(job).into_response(),
+        Ok(Ok(None)) => problem(StatusCode::NOT_FOUND, "Agent improve operation not found"),
+        Ok(Err(_)) | Err(_) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Agent improve operation status is unavailable",
         ),
     }
 }
@@ -233,6 +298,35 @@ pub async fn evaluate(
 mod tests {
     use super::*;
     use gaugedesk_core::ids::AuthorityId;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingQueue(Mutex<Vec<HostedImproveJobInput>>);
+
+    impl HostedImproveJobQueue for RecordingQueue {
+        fn enqueue(&self, input: HostedImproveJobInput) -> Result<HostedImproveQueued, String> {
+            self.0.lock().unwrap().push(input.clone());
+            Ok(HostedImproveQueued {
+                operation_id: input.operation_id,
+                phase: "queued".into(),
+                evidence_id: None,
+            })
+        }
+
+        fn status(
+            &self,
+            operation_id: &str,
+            _tenant_scope: &str,
+            _actor: &str,
+            _agent_id: &str,
+        ) -> Result<Option<HostedImproveQueued>, String> {
+            Ok((operation_id == "op").then(|| HostedImproveQueued {
+                operation_id: operation_id.into(),
+                phase: "queued".into(),
+                evidence_id: None,
+            }))
+        }
+    }
 
     fn request() -> Json<EvaluateAgentImprove> {
         Json(EvaluateAgentImprove {
@@ -292,6 +386,71 @@ mod tests {
         assert_eq!(
             call(Some(owner), Some(funding()), None).await.status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_entry_enqueues_after_owner_admission_and_status_requires_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        {
+            let mut guard = wb.lock_unpoisoned();
+            guard.enable_hosted_home_mode();
+            let agent = guard.library.agents.get_mut(crate::DEFAULT_AGENT).unwrap();
+            agent
+                .versions
+                .get_mut(&agent.current_version)
+                .unwrap()
+                .source_owner_authority = Some("owner".into());
+        }
+        let queue = Arc::new(RecordingQueue::default());
+        let extension = Extension(HostedImproveCampaignQueue(queue.clone()));
+        let owner = Extension(AuthenticatedActionContext::account_session(
+            AuthorityId::new("owner"),
+            "session".into(),
+        ));
+        let outsider = Extension(AuthenticatedActionContext::account_session(
+            AuthorityId::new("outsider"),
+            "session".into(),
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "op".parse().unwrap());
+        let response = evaluate(
+            State(wb.clone()),
+            Path(crate::DEFAULT_AGENT.to_owned()),
+            headers,
+            Some(owner.clone()),
+            Some(funding()),
+            Some(extension.clone()),
+            request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(queue.0.lock().unwrap().len(), 1);
+        assert_eq!(queue.0.lock().unwrap()[0].operation_id, "op");
+        assert_eq!(
+            operation_status(
+                State(wb.clone()),
+                Path((crate::DEFAULT_AGENT.to_owned(), "op".into())),
+                HeaderMap::new(),
+                Some(owner),
+                Some(extension.clone()),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            operation_status(
+                State(wb),
+                Path((crate::DEFAULT_AGENT.to_owned(), "op".into())),
+                HeaderMap::new(),
+                Some(outsider),
+                Some(extension),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
         );
     }
 
