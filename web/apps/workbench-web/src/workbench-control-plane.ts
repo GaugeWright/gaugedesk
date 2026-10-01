@@ -120,6 +120,17 @@ export interface SoftwareUpdatePolicy {
     readonly allowedChannels: readonly string[];
 }
 
+export interface HostedImprovePool {
+    readonly campaign_ref: string;
+    readonly open_source: string;
+}
+
+export interface HostedImproveOperation {
+    readonly operation_id: string;
+    readonly phase: "queued" | "running" | "completed" | "failed";
+    readonly evidence_id?: string;
+}
+
 class NoSelectedHomeError extends Error {}
 
 /** The single-Home rollout can expose its private Home origin before a
@@ -1554,6 +1565,35 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     createChatUnderArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {
         return workbenchClient.createChatUnderArchetype(this.workbenchTransport(), archetypeId, title);
+    }
+
+    startAgentImprovePool(id: ArchetypeId, pool: unknown): Promise<HostedImprovePool> {
+        return this.workbenchTransport().json("POST", `/archetypes/${encodeURIComponent(id)}/improve/pool`, pool) as Promise<HostedImprovePool>;
+    }
+
+    latestAgentImprovePool(id: ArchetypeId): Promise<HostedImprovePool | null> {
+        return this.workbenchTransport().json("GET", `/archetypes/${encodeURIComponent(id)}/improve/pool`)
+            .then((value) => value ?? null) as Promise<HostedImprovePool | null>;
+    }
+
+    evaluateAgentImprove(id: ArchetypeId, editChatId: EngagementId, campaignRef: string, operationId: string): Promise<HostedImproveOperation> {
+        return this.workbenchTransport().json("POST", `/archetypes/${encodeURIComponent(id)}/improve/evaluate`, {
+            edit_chat_id: editChatId,
+            campaign_ref: campaignRef,
+        }, { idempotencyKey: operationId }) as Promise<HostedImproveOperation>;
+    }
+
+    agentImproveOperation(id: ArchetypeId, operationId: string): Promise<HostedImproveOperation> {
+        return this.workbenchTransport().json("GET", `/archetypes/${encodeURIComponent(id)}/improve/operations/${encodeURIComponent(operationId)}`) as Promise<HostedImproveOperation>;
+    }
+
+    agentImproveEvidence(id: ArchetypeId, campaignRef: string): Promise<unknown> {
+        return this.workbenchTransport().json("GET", `/archetypes/${encodeURIComponent(id)}/improve/evidence?campaign_ref=${encodeURIComponent(campaignRef)}`);
+    }
+
+    async adoptAgentImprove(id: ArchetypeId, evidenceId: string): Promise<string[]> {
+        const result = await this.workbenchTransport().json("POST", `/archetypes/${encodeURIComponent(id)}/improve/evidence/${encodeURIComponent(evidenceId)}/adopt`) as { changed_paths: string[] };
+        return result.changed_paths;
     }
 
     useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {

@@ -117,6 +117,14 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         )
         .route("/archetypes/{id}/chats", post(lr::create_chat_under_agent))
         .route(
+            "/archetypes/{id}/improve/pool",
+            post(crate::agent_improve_routes::start_pool)
+                .get(crate::agent_improve_routes::latest_pool)
+                .layer(axum::middleware::map_response(
+                    crate::file_action_routes::no_store,
+                )),
+        )
+        .route(
             "/archetypes/{id}/improve/evaluate",
             post(crate::agent_improve_routes::evaluate),
         )

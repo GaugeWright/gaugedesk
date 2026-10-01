@@ -853,15 +853,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [latestImprovePool] = createResource(
         () => {
             const id = agentSettings()?.id;
-            return isTauri() && homeState()?.kind === "direct" && id
+            return (isTauri() ? homeState()?.kind === "direct" : homeState()?.kind === "connected") && id
                 ? { id, account: bearer() } : null;
         },
         async ({ id }) => {
             try {
-                const { invoke } = await import("@tauri-apps/api/core");
-                const pool = await invoke<{ campaign_ref: string; open_source: string } | null>(
-                    "latest_agent_improve_pool", { agentId: id },
-                );
+                const pool = isTauri()
+                    ? await (await import("@tauri-apps/api/core")).invoke<{ campaign_ref: string; open_source: string } | null>(
+                        "latest_agent_improve_pool", { agentId: id },
+                    )
+                    : await api.latestAgentImprovePool(id);
                 return pool ? { agentId: id, campaignRef: pool.campaign_ref, openSource: pool.open_source } : null;
             } catch (error) {
                 return { agentId: id, error: String(error) };
@@ -886,19 +887,27 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const retained = latestImprovePool();
         return retained?.agentId === id && "error" in retained ? retained.error : undefined;
     };
+    const improveAvailableFor = (id: ArchetypeId) => {
+        if (isTauri()) return homeState()?.kind === "direct";
+        if (homeState()?.kind !== "connected") return false;
+        const retained = latestImprovePool();
+        return retained !== undefined && (retained === null
+            || (retained.agentId === id && !("error" in retained)));
+    };
     const [latestImproveEvidence] = createResource(
         () => {
             const id = agentSettings()?.id;
             const prepared = id ? preparedImproveFor(id) : null;
-            return isTauri() && homeState()?.kind === "direct" && id && prepared
+            return (isTauri() ? homeState()?.kind === "direct" : homeState()?.kind === "connected") && id && prepared
                 ? { id, campaignRef: prepared.campaignRef, account: bearer() } : null;
         },
         async ({ id, campaignRef }) => {
             try {
-                const { invoke } = await import("@tauri-apps/api/core");
-                const evidence = await invoke<AgentImproveEvidence | null>(
-                    "latest_agent_improve_evidence", { agentId: id, campaignRef },
-                );
+                const evidence = isTauri()
+                    ? await (await import("@tauri-apps/api/core")).invoke<AgentImproveEvidence | null>(
+                        "latest_agent_improve_evidence", { agentId: id, campaignRef },
+                    )
+                    : await api.agentImproveEvidence(id, campaignRef) as AgentImproveEvidence | null;
                 return { agentId: id, campaignRef, evidence };
             } catch (error) {
                 return { agentId: id, campaignRef, error: String(error) };
@@ -1901,17 +1910,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     async function prepareAgentImprovePool(id: ArchetypeId, poolJson: string) {
         const chat = selected();
-        if (!isTauri() || homeState()?.kind !== "direct" || agentSettings()?.id !== id || !chat) {
-            throw new Error("Open this Agent in the desktop Workshop first.");
+        if ((isTauri() ? homeState()?.kind !== "direct" : homeState()?.kind !== "connected")
+            || agentSettings()?.id !== id || !chat) {
+            throw new Error("Open this Agent's connected Workshop and edit chat first.");
         }
         if (draft().trim()) {
             throw new Error("Send or clear the current edit-chat draft before preparing cases.");
         }
-        const { invoke } = await import("@tauri-apps/api/core");
-        const prepared = await invoke<{ campaign_ref: string; open_source: string }>(
-            "start_agent_improve_pool",
-            { agentId: id, poolJson },
-        );
+        const prepared = isTauri()
+            ? await (await import("@tauri-apps/api/core")).invoke<{ campaign_ref: string; open_source: string }>(
+                "start_agent_improve_pool", { agentId: id, poolJson },
+            )
+            : await api.startAgentImprovePool(id, JSON.parse(poolJson));
         if (typeof prepared.open_source !== "string" || !prepared.open_source) {
             throw new Error("Home did not return the open cases.");
         }
@@ -1949,18 +1959,49 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     async function evaluateAgentImprove(id: ArchetypeId) {
         const prepared = preparedImproveFor(id);
         const chat = selected();
-        if (!prepared || !chat || agentSettings()?.id !== id || !isTauri()
-            || homeState()?.kind !== "direct") {
-            throw new Error("Open this Agent's desktop Workshop and edit chat first.");
+        if (!prepared || !chat || agentSettings()?.id !== id
+            || (isTauri() ? homeState()?.kind !== "direct" : homeState()?.kind !== "connected")) {
+            throw new Error("Open this Agent's connected Workshop and edit chat first.");
         }
         if (draft().trim()) {
             throw new Error("Send or clear the edit-chat draft before evaluating its candidate.");
         }
-        const { invoke } = await import("@tauri-apps/api/core");
-        const result = await invoke<{ reviewer: AgentImproveEvidence }>(
-            "evaluate_agent_improve",
-            { agentId: id, editChatId: chat, campaignRef: prepared.campaignRef },
-        );
+        let result: { reviewer: AgentImproveEvidence };
+        if (isTauri()) {
+            result = await (await import("@tauri-apps/api/core")).invoke<{ reviewer: AgentImproveEvidence }>(
+                "evaluate_agent_improve", { agentId: id, editChatId: chat, campaignRef: prepared.campaignRef },
+            );
+        } else {
+            const key = `gw.agent-improve.operation:${id}:${prepared.campaignRef}`;
+            let operationId = sessionStorage.getItem(key);
+            if (!operationId) {
+                operationId = crypto.randomUUID();
+                sessionStorage.setItem(key, operationId);
+            }
+            // The Home queue binds this key to the exact actor, Agent, chat,
+            // and campaign. A retry after an uncertain response is safe.
+            await api.evaluateAgentImprove(id, chat, prepared.campaignRef, operationId);
+            let completedEvidenceId: string | undefined;
+            for (let attempt = 0; attempt < 120; attempt++) {
+                const operation = await api.agentImproveOperation(id, operationId);
+                if (operation.phase === "failed") {
+                    sessionStorage.removeItem(key);
+                    throw new Error("Home could not complete this evaluation. Review the case pool and try again.");
+                }
+                if (operation.phase === "completed") {
+                    completedEvidenceId = operation.evidence_id;
+                    break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 2_000));
+            }
+            if (!completedEvidenceId) throw new Error("Evaluation is still running. Choose Evaluate again to resume its status.");
+            const reviewer = await api.agentImproveEvidence(id, prepared.campaignRef) as AgentImproveEvidence | null;
+            if (!reviewer || reviewer.id !== completedEvidenceId) {
+                throw new Error("Home did not return the reviewer evidence for this operation.");
+            }
+            sessionStorage.removeItem(key);
+            result = { reviewer };
+        }
         setEvaluatedImproveCampaign({
             agentId: id, account: bearer(), campaignRef: prepared.campaignRef,
             evidence: result.reviewer,
@@ -1987,11 +2028,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     }
 
     async function adoptAgentImprove(id: ArchetypeId, evidenceId: string) {
-        if (!isTauri() || homeState()?.kind !== "direct" || agentSettings()?.id !== id) {
-            throw new Error("Open this Agent's desktop Workshop first.");
+        if ((isTauri() ? homeState()?.kind !== "direct" : homeState()?.kind !== "connected")
+            || agentSettings()?.id !== id) {
+            throw new Error("Open this Agent's connected Workshop first.");
         }
-        const { invoke } = await import("@tauri-apps/api/core");
-        const changed = await invoke<string[]>("adopt_agent_improve", { agentId: id, evidenceId });
+        const changed = isTauri()
+            ? await (await import("@tauri-apps/api/core")).invoke<string[]>("adopt_agent_improve", { agentId: id, evidenceId })
+            : await api.adoptAgentImprove(id, evidenceId);
         bumpNav();
         void Promise.all([refetchDiff(), refetchMerge(), refetchChatInfo()]);
         return changed;
@@ -4392,18 +4435,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 refreshKey={navRefresh()}
                                 onClose={() => setAgentSettings(null)}
                                 onSaved={bumpNav}
-                                onPrepareImprove={isTauri() && homeState()?.kind === "direct"
+                                onPrepareImprove={improveAvailableFor(a.id)
                                     ? (poolJson) => prepareAgentImprovePool(a.id, poolJson) : undefined}
                                 preparedImproveRef={preparedImproveFor(a.id)?.campaignRef}
                                 onUsePreparedImprove={() => placePreparedImproveCases(a.id)}
                                 improveRecoveryError={improveRecoveryErrorFor(a.id)}
-                                onEvaluateImprove={isTauri() && homeState()?.kind === "direct" && preparedImproveFor(a.id)
+                                onEvaluateImprove={improveAvailableFor(a.id) && preparedImproveFor(a.id)
                                     ? () => evaluateAgentImprove(a.id) : undefined}
                                 improveEvidence={improveEvidenceFor(a.id)}
                                 improveEvidenceError={improveEvidenceErrorFor(a.id)}
                                 onUseOpenFeedback={improveEvidenceFor(a.id)
                                     ? () => placeOpenImproveFeedback(a.id) : undefined}
-                                onAdoptImprove={isTauri() && homeState()?.kind === "direct"
+                                onAdoptImprove={improveAvailableFor(a.id)
                                     ? (evidenceId) => adoptAgentImprove(a.id, evidenceId) : undefined}
                             />}
                         </Show>

@@ -6728,6 +6728,78 @@
       }
     },
     {
+      "id": "home.archetype.improve.pool.start",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/archetypes/:id/improve/pool",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "Authenticated Agent authoring client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-archetype-improve-pool",
+      "capability": "start-owned-archetype-improve-pool",
+      "requestSchema": "rust:gaugedesk-app/agent_improve_campaign/CasePool",
+      "responseSchema": "rust:gaugedesk-app/agent_improve_custody/AgentImprovePoolStart",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/agent_improve_routes.rs#hosted_pool_is_owner_scoped_and_returns_only_open_cases"
+        ],
+        "authority": [
+          "crates/app/src/agent_improve_routes.rs#hosted_pool_is_owner_scoped_and_returns_only_open_cases"
+        ],
+        "journey": [
+          "crates/app/src/agent_improve_routes.rs#hosted_pool_is_owner_scoped_and_returns_only_open_cases"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/agent_improve_routes.rs#hosted_pool_is_owner_scoped_and_returns_only_open_cases"
+        ]
+      }
+    },
+    {
+      "id": "home.archetype.improve.pool.latest",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/archetypes/:id/improve/pool",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "Authenticated Agent authoring client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-archetype-improve-pool",
+      "capability": "read-owned-archetype-improve-pool",
+      "requestSchema": "http/path-archetype-id",
+      "responseSchema": "rust:gaugedesk-app/agent_improve_custody/AgentImprovePoolStart",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/agent_improve_routes.rs#hosted_pool_is_owner_scoped_and_returns_only_open_cases"
+        ],
+        "authority": [
+          "crates/app/src/agent_improve_routes.rs#hosted_pool_is_owner_scoped_and_returns_only_open_cases"
+        ],
+        "journey": [
+          "crates/app/src/agent_improve_routes.rs#hosted_pool_is_owner_scoped_and_returns_only_open_cases"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/agent_improve_routes.rs#hosted_pool_is_owner_scoped_and_returns_only_open_cases"
+        ]
+      }
+    },
+    {
       "id": "home.archetype.improve.evaluate",
       "jurisdiction": "private-home",
       "transport": "http-json",

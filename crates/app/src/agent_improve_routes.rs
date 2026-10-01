@@ -70,6 +70,83 @@ pub struct AdoptAgentImproveResult {
     changed_paths: Vec<String>,
 }
 
+/// The request body is the complete case pool. Home samples and seals it
+/// before returning the open projection; callers never choose the split.
+pub async fn start_pool(
+    State(wb): State<SharedWorkbench>,
+    Path(agent_id): Path<String>,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+    campaign_queue: Option<Extension<HostedImproveCampaignQueue>>,
+    Json(pool): Json<serde_json::Value>,
+) -> Response {
+    let actor = match hosted_owner(&wb, authenticated) {
+        Ok(actor) => actor,
+        Err((status, message)) => return problem(status, message),
+    };
+    if campaign_queue.is_none() {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Durable hosted improvement is unavailable",
+        );
+    }
+    if wb
+        .lock_unpoisoned()
+        .verify_agent_improve_source_owner(&agent_id, Some(&actor))
+        .is_err()
+    {
+        return problem(StatusCode::FORBIDDEN, "Agent improve source owner required");
+    }
+    let pool_bytes = match serde_json::to_vec(&pool) {
+        Ok(bytes) => bytes,
+        Err(_) => return problem(StatusCode::BAD_REQUEST, "Agent improve pool is invalid"),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        wb.lock_unpoisoned()
+            .start_agent_improve_pool_for_source_owner(&agent_id, &pool_bytes, Some(&actor))
+    })
+    .await;
+    match result {
+        Ok(Ok(started)) => (StatusCode::CREATED, Json(started)).into_response(),
+        Ok(Err(_)) => problem(StatusCode::BAD_REQUEST, "Agent improve pool was refused"),
+        Err(_) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Agent improve pool worker failed",
+        ),
+    }
+}
+
+/// Recover only the open projection of the latest sampled pool. The sealed
+/// assignment and checks stay in Home custody across browser restarts.
+pub async fn latest_pool(
+    State(wb): State<SharedWorkbench>,
+    Path(agent_id): Path<String>,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+    campaign_queue: Option<Extension<HostedImproveCampaignQueue>>,
+) -> Response {
+    let actor = match hosted_owner(&wb, authenticated) {
+        Ok(actor) => actor,
+        Err((status, message)) => return problem(status, message),
+    };
+    if campaign_queue.is_none() {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Durable hosted improvement is unavailable",
+        );
+    }
+    let guard = wb.lock_unpoisoned();
+    if guard
+        .verify_agent_improve_source_owner(&agent_id, Some(&actor))
+        .is_err()
+    {
+        return problem(StatusCode::FORBIDDEN, "Agent improve source owner required");
+    }
+    match guard.latest_agent_improve_pool_for_source_owner(&agent_id, Some(&actor)) {
+        Ok(Some(pool)) => Json(pool).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => problem(StatusCode::CONFLICT, "Agent improve pool is unavailable"),
+    }
+}
+
 fn problem(status: StatusCode, message: &'static str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
@@ -340,6 +417,117 @@ mod tests {
             AuthorityId::new("test-funding-issuer"),
             crate::managed_funding::FundingEnvironment::Test,
         ))
+    }
+
+    #[tokio::test]
+    async fn hosted_pool_is_owner_scoped_and_returns_only_open_cases() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        {
+            let mut guard = wb.lock_unpoisoned();
+            guard.enable_hosted_home_mode();
+            let agent = guard.library.agents.get_mut(crate::DEFAULT_AGENT).unwrap();
+            agent
+                .versions
+                .get_mut(&agent.current_version)
+                .unwrap()
+                .source_owner_authority = Some("owner".into());
+        }
+        let owner = Extension(AuthenticatedActionContext::account_session(
+            AuthorityId::new("owner"),
+            "session".into(),
+        ));
+        let outsider = Extension(AuthenticatedActionContext::account_session(
+            AuthorityId::new("outsider"),
+            "session".into(),
+        ));
+        let queue = Some(Extension(HostedImproveCampaignQueue(Arc::new(
+            RecordingQueue::default(),
+        ))));
+        let pool = serde_json::json!({
+            "schema": "gaugedesk.agent-improve.pool.v1",
+            "gauges": [{"name":"quality", "description":"Return the requested token"}],
+            "selection": {"ascend":{"quality":null}},
+            "scenarios": (0..4).map(|index| serde_json::json!({
+                "id": format!("case-{index}"),
+                "prompt": format!("Return token-{index}"),
+                "checks": {"quality":{"kind":"assistant-contains", "text":format!("token-{index}")}}
+            })).collect::<Vec<_>>()
+        });
+        assert_eq!(
+            latest_pool(
+                State(wb.clone()),
+                Path(crate::DEFAULT_AGENT.into()),
+                Some(owner.clone()),
+                None
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            start_pool(
+                State(wb.clone()),
+                Path(crate::DEFAULT_AGENT.into()),
+                Some(outsider.clone()),
+                queue.clone(),
+                Json(pool.clone())
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            latest_pool(
+                State(wb.clone()),
+                Path(crate::DEFAULT_AGENT.into()),
+                Some(owner.clone()),
+                queue.clone()
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let started = start_pool(
+            State(wb.clone()),
+            Path(crate::DEFAULT_AGENT.into()),
+            Some(owner.clone()),
+            queue.clone(),
+            Json(pool),
+        )
+        .await;
+        assert_eq!(started.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(started.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let projection: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(projection["campaign_ref"].as_str().is_some());
+        assert!(!projection["open_source"]
+            .as_str()
+            .unwrap()
+            .contains("assistant-contains"));
+        assert_eq!(
+            latest_pool(
+                State(wb.clone()),
+                Path(crate::DEFAULT_AGENT.into()),
+                Some(outsider),
+                queue.clone()
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            latest_pool(
+                State(wb),
+                Path(crate::DEFAULT_AGENT.into()),
+                Some(owner),
+                queue
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

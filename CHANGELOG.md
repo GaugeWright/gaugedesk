@@ -19,6 +19,27 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-10-01
+
+- A Panel agent's deployment now chooses its model provider from who pays for
+  it: GaugeWright managed inference by default, or a provider key you store.
+  Publishing on managed inference no longer requires typing the metered
+  gateway's address into the agent's contract, and the contract's Model
+  section offers your work-chat default or a pinned model instead of provider
+  fields. An unpinned agent publishes with your work-chat default model
+  (DR-0272).
+- Try a Panel agent from its Workshop menu ("try in a preview chat") or a
+  placement's ("preview this version"): a disposable work chat on your usual
+  model and funding, listed under the agent. Deleting the chat ends it. The
+  earlier public-edge preview is removed.
+- The deploy dialog opens for a Panel agent whose Home runs an older GaugeDesk,
+  instead of failing silently.
+- A member limited to specific projects can no longer reach Home routes that
+  name no project, apart from their own account, filtered listings and
+  Home-wide settings such as the Isolated workspace policy (DR-0270).
+- The desktop's local channel answers only its own window (DR-0269).
+- A provider that is out of credit is reported as such, not as a failed request.
+- A Panel agent's visitor model picker offers every catalog model.
 - Workshop keeps existing local Agents and edit chats in the local account
   across sign-in and upgrades. Its listings and file access follow the selected
   account, and the desktop account menu names and opens the local account.
