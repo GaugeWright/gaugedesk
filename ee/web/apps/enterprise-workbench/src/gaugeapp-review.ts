@@ -106,6 +106,9 @@ export const REVIEW_COMMANDS = {
     "application-settings.appearance.set": ["account-settings", "application-settings", "Change appearance preference"],
     "commercial-product.create": ["commercial-operations", "products", "Create product"],
     "commercial-product.revise": ["commercial-operations", "products", "Revise product"],
+    "commercial-product.retire": ["commercial-operations", "products", "Retire product"],
+    "commercial-product.restore": ["commercial-operations", "products", "Restore product"],
+    "commercial-product.delete": ["commercial-operations", "products", "Delete product"],
     "commercial-client.create": ["commercial-operations", "clients", "Create client"],
     "commercial-client.edit": ["commercial-operations", "clients", "Edit client"],
     "commercial-client.close": ["commercial-operations", "clients", "Close client"],
@@ -548,6 +551,19 @@ export function summarizeGaugeAppChange(proposal: GaugeAppProposal, page: GaugeA
                 fields.push(...serviceFields(revision.service_obligations));
                 field("Commercial revision", String(current ? number(current.current_revision) + 1 : 1));
                 note = "Existing proposals and accepted agreements keep their exact commercial revision. Agent behavior is unchanged.";
+                break;
+            }
+            case "commercial-product.retire":
+            case "commercial-product.restore":
+            case "commercial-product.delete": {
+                const product = recordIn(m.products, string(p.id));
+                field("Product", `${string(data(product.commercial).listing_title)} (${string(p.id)})`);
+                field("Commercial revision", String(number(product.current_revision)));
+                note = proposal.command_id.endsWith("retire")
+                    ? "Stop offering this product in new proposals. Engagements that already reference it keep their lifecycle and accepted terms; it can be restored."
+                    : proposal.command_id.endsWith("restore")
+                        ? "Offer this product in new proposals again, with its revision history unchanged."
+                        : "Permanently remove this product and every commercial revision of it. No engagement references it; this cannot be undone.";
                 break;
             }
             case "commercial-client.create":

@@ -539,6 +539,7 @@ mod instance_view_tests {
     }
 }
 
+mod editor_skill;
 pub mod gate_runner;
 pub mod whip_stats;
 /// The sans-I/O HTTP types a gate host implements its transport against.
@@ -1434,34 +1435,6 @@ impl WhipHarnessFactory {
         self
     }
 
-    /// Only a caller-injected transport can carry a Home-admitted command.
-    /// The environment-configured bearer DO host is a legacy/dev lane and is
-    /// never authority for a funded hosted Agent improvement.
-    pub fn has_injected_do_transport(&self) -> bool {
-        self.hosted
-            .as_ref()
-            .is_some_and(DoHostConfig::injected_transport)
-    }
-
-    pub fn do_tenant_id(&self) -> Option<&str> {
-        self.hosted.as_ref().map(|host| host.tenant_id.as_str())
-    }
-
-    /// Keep improvement evaluation's continuity database in the caller's
-    /// disposable workspace while retaining the same authority and model
-    /// broker configuration as an ordinary native work chat.
-    pub fn isolated_native_shadow(&self, runtime_root: impl Into<PathBuf>) -> io::Result<Self> {
-        if self.hosted.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "hosted placements need their own improvement binding",
-            ));
-        }
-        let mut isolated = self.clone();
-        isolated.runtime_root = runtime_root.into();
-        Ok(isolated)
-    }
-
     /// Route WhippleScript-built provider requests through one exact
     /// organization final-fetch authority for this turn factory. Hosted DO
     /// placements have their own Home callback and therefore reject this
@@ -1550,6 +1523,45 @@ impl WhipHarnessFactory {
                 })
                 .map_err(|error| invalid_data(format!("{error:?}")))?;
         }
+        Ok(())
+    }
+
+    /// An edit chat's catalogue holds exactly WhippleScript's authoring skill,
+    /// mounted from the vendored copy. Nothing the Agent being edited declares
+    /// is registered here: its skills are files the editor edits, not
+    /// instructions the editor follows.
+    fn refresh_editor_skill_catalogue(&self, chat_id: &str, worktree: &Path) -> io::Result<()> {
+        editor_skill::mount(worktree)?;
+        let store = whipplescript_store::SqliteStore::open(chat_runtime_database(
+            &self.runtime_root,
+            chat_id,
+        ))
+        .map_err(|error| invalid_data(format!("{error:?}")))?;
+        store
+            .remove_unattached_skills_from_source(editor_skill::EDITOR_SKILL_SOURCE)
+            .map_err(|error| invalid_data(format!("{error:?}")))?;
+        let body = editor_skill::skill_body();
+        let frontmatter = whipplescript_store::skill_frontmatter::parse_skill_frontmatter(body)
+            .map_err(invalid_data)?;
+        let version = frontmatter
+            .metadata
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0.0.0");
+        let metadata = serde_json::to_string(&frontmatter.metadata).map_err(invalid_data)?;
+        store
+            .register_skill(whipplescript_store::SkillRegistration {
+                skill_id: &format!("skill:{}", frontmatter.name),
+                name: &frontmatter.name,
+                version,
+                source: editor_skill::EDITOR_SKILL_SOURCE,
+                source_path: &editor_skill::skill_location(),
+                body,
+                description: &frontmatter.description,
+                required_capabilities_json: "[]",
+                metadata_json: &metadata,
+            })
+            .map_err(|error| invalid_data(format!("{error:?}")))?;
         Ok(())
     }
 
@@ -1667,8 +1679,13 @@ impl WhipHarnessFactory {
             )
         })?;
         let mut runtime = self.runtime_for_chat(&spec.chat_id, epoch, signed_policy)?;
-        if spec.mode == gaugedesk_harness::ChatMode::Use {
-            self.refresh_agent_skill_catalogue(&spec.chat_id, &spec.worktree)?;
+        match spec.mode {
+            gaugedesk_harness::ChatMode::Use => {
+                self.refresh_agent_skill_catalogue(&spec.chat_id, &spec.worktree)?
+            }
+            gaugedesk_harness::ChatMode::Edit => {
+                self.refresh_editor_skill_catalogue(&spec.chat_id, &spec.worktree)?
+            }
         }
         let mut source_runtime = self.runtime_for_chat(&spec.chat_id, epoch, signed_policy)?;
         let source_open = Self::open_request(
@@ -2343,6 +2360,19 @@ fn registered_agent_skill_sources(
     chat_id: &str,
     mode: gaugedesk_harness::ChatMode,
 ) -> Option<Vec<String>> {
+    if mode == gaugedesk_harness::ChatMode::Edit {
+        // The editor's one skill is GaugeDesk-shipped runtime material, like
+        // its persona, and only the exact vendored bytes count as that.
+        let shipped = whipplescript_store::stable_hash_hex(editor_skill::skill_body());
+        return skills
+            .iter()
+            .all(|skill| {
+                skill.source == editor_skill::EDITOR_SKILL_SOURCE
+                    && skill.source_path == editor_skill::skill_location()
+                    && skill.content_hash == shipped
+            })
+            .then(|| vec!["runtime".to_owned(); skills.len().min(1)]);
+    }
     let mut sources = Vec::with_capacity(skills.len());
     for skill in skills {
         let expected_path = format!(".gaugedesk-runtime/agent/skills/{}/SKILL.md", skill.name);
@@ -3926,6 +3956,83 @@ mod tests {
             .refresh_agent_skill_catalogue("chat-one", &worktree)
             .unwrap();
         assert!(store.list_skills().unwrap().is_empty());
+    }
+
+    #[test]
+    fn edit_chat_catalogue_is_the_vendored_authoring_skill_alone() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worktree");
+        // A skill of the Agent being edited is a file to edit, never one the
+        // editor is offered.
+        let agent_skill = worktree.join(".gaugedesk-runtime/agent/skills/triage");
+        std::fs::create_dir_all(&agent_skill).unwrap();
+        std::fs::write(
+            agent_skill.join("SKILL.md"),
+            "---\nname: triage\ndescription: Inspect reports\n---\nRead the report.\n",
+        )
+        .unwrap();
+        let runtime_root = root.path().join("runtime");
+        std::fs::create_dir_all(&runtime_root).unwrap();
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            SigningKey::from_seed(&[7u8; 32]).unwrap(),
+            &runtime_root,
+        );
+        factory
+            .refresh_editor_skill_catalogue("chat-edit", &worktree)
+            .unwrap();
+        factory
+            .refresh_editor_skill_catalogue("chat-edit", &worktree)
+            .unwrap();
+        let store = whipplescript_store::SqliteStore::open(chat_runtime_database(
+            &runtime_root,
+            "chat-edit",
+        ))
+        .unwrap();
+        let registered = store.list_skills().unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].name, "whipplescript-author");
+        assert_eq!(registered[0].source_path, editor_skill::skill_location());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(&registered[0].source_path)).unwrap(),
+            editor_skill::skill_body()
+        );
+        assert_eq!(
+            registered_agent_skill_sources(
+                &registered,
+                "chat-edit",
+                gaugedesk_harness::ChatMode::Edit,
+            ),
+            Some(vec!["runtime".to_owned()])
+        );
+        assert!(registered_agent_skill_sources(
+            &registered,
+            "chat-edit",
+            gaugedesk_harness::ChatMode::Use,
+        )
+        .is_none());
+
+        // Bytes that are not the vendored skill are not runtime material.
+        store
+            .register_skill(whipplescript_store::SkillRegistration {
+                skill_id: "skill:whipplescript-author",
+                name: "whipplescript-author",
+                version: "0.0.0",
+                source: editor_skill::EDITOR_SKILL_SOURCE,
+                source_path: &editor_skill::skill_location(),
+                body: "---\nname: whipplescript-author\ndescription: altered\n---\n",
+                description: "altered",
+                required_capabilities_json: "[]",
+                metadata_json: "{}",
+            })
+            .unwrap();
+        assert!(registered_agent_skill_sources(
+            &store.list_skills().unwrap(),
+            "chat-edit",
+            gaugedesk_harness::ChatMode::Edit,
+        )
+        .is_none());
     }
 
     #[test]

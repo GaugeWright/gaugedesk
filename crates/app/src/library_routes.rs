@@ -93,7 +93,7 @@ pub(crate) fn workspace_actor(wb: &Workbench, headers: &axum::http::HeaderMap) -
 }
 
 #[allow(clippy::result_large_err)]
-fn admit_agent_authoring_owner(
+pub(crate) fn admit_agent_authoring_owner(
     wb: &Workbench,
     id: &str,
     headers: &HeaderMap,

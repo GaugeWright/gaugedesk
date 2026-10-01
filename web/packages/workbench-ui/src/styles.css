@@ -453,13 +453,22 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .transcript-frame { display: flex; position: relative; min-width: 0; }
 .transcript-frame > .transcript { flex: 1 1 auto; min-width: 0; min-height: 0;
     overflow: auto; overscroll-behavior: contain; overflow-anchor: none; }
-.transcript-frame.has-chat-log-navigation > .transcript { padding-left: 24px; }
+/* The user-message rail rests in the gutter its host already leaves left of the
+   transcript, so adding it moves no line of the chat. --chat-log-gutter is that
+   gutter's width; a host with none (the embed) insets the transcript just enough
+   to hold the resting rail. */
+.transcript-frame { --chat-log-gutter: 0px; --chat-log-rail-left: calc(1px - var(--chat-log-gutter)); }
+.run .transcript-frame { --chat-log-gutter: 12px; }
+.mobile-chat > .transcript-frame { --chat-log-gutter: 10px; }
+.transcript-frame.has-chat-log-navigation > .transcript {
+    padding-left: max(0px, calc(12px - var(--chat-log-gutter))); }
 /* One mark for each user turn. The compact rail remains independent of the
    transcript's scrollbox, so its preview can extend to the right of the marks. */
-.chat-log-navigation { position: absolute; left: 0; top: 50%; transform: translateY(-50%);
-    width: 20px; max-height: min(320px, calc(100% - 16px)); display: flex; z-index: 5; }
-/* The rail widens only while it is pointed at or focused, so the fan-out has room
-   without the resting rail taking any more of the transcript's inset. */
+.chat-log-navigation { position: absolute; left: var(--chat-log-rail-left); top: 50%;
+    transform: translateY(-50%); width: 10px; max-height: min(320px, calc(100% - 16px));
+    display: flex; z-index: 5; }
+/* The rail widens only while it is pointed at or focused, so the fan-out has room;
+   it then lies over the transcript's edge rather than reserving a column in it. */
 .chat-log-navigation:hover, .chat-log-navigation:focus-within { width: 26px; }
 .chat-log-navigation-ticks { width: 100%; min-height: 0; overflow-y: auto; scrollbar-width: none; }
 .chat-log-navigation-ticks::-webkit-scrollbar { display: none; }
@@ -469,7 +478,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .chat-log-navigation-bar { display: block; height: 2px; border-radius: 1px;
     background: var(--muted); opacity: .5; transition: width 100ms ease, opacity 100ms ease; }
 .chat-log-navigation-bar.selected { background: var(--ink); opacity: 1; }
-.chat-log-navigation-preview { position: absolute; left: 32px; transform: translateY(-50%);
+.chat-log-navigation-preview { position: absolute; left: calc(var(--chat-log-rail-left) + 32px); transform: translateY(-50%);
     z-index: 6; width: min(280px, calc(100% - 40px)); max-height: min(120px, calc(100% - 12px));
     overflow: hidden; padding: 8px 10px; border: 1px solid var(--edge); border-radius: 8px;
     background: var(--panel); color: var(--ink); box-shadow: 0 6px 18px rgb(0 0 0 / 25%);
@@ -477,8 +486,8 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none; }
 /* A content-sized Panel lets its host page scroll. Keep its rail in view while
    the page moves through the tall transcript; the marks still target that page. */
-.chat-log-navigation.page-sized { position: sticky; top: 16px; transform: none;
-    order: -1; flex: 0 0 0; align-self: flex-start; }
+.chat-log-navigation.page-sized { position: sticky; left: auto; top: 16px; transform: none;
+    order: -1; flex: 0 0 0; align-self: flex-start; margin-left: var(--chat-log-rail-left); }
 .raw-model-context { padding: 20px; min-width: 0; }
 .raw-model-context h2 { margin: 0 0 8px; font-size: 13px; letter-spacing: .1em; text-transform: uppercase; }
 .raw-model-context-note, .raw-model-context-status { color: var(--muted); font-size: 13px; }

@@ -205,6 +205,11 @@ run_contracts() {
     echo "== WhippleScript stats report contract =="
     gate_section stats-report-contract
 
+    # The editor writes WhippleScript for the runtime pinned above, so the
+    # authoring guide it reads must be the one published at that revision.
+    echo "== WhippleScript author skill pin =="
+    gate_section author-skill-pin
+
     echo "== TokenWright native-control metadata =="
     gate_section tokenwright-metadata
 

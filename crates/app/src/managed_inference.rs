@@ -1452,9 +1452,6 @@ pub const METERED_GATEWAY_ACCOUNT: &str = "1689dd452ba2d2d8eb1f3c364c92b3f4";
 /// hard-stop the private runtime — see `specs/systems.md`.
 pub const METERED_GATEWAY_PANELS: &str = "gaugewright-panels";
 
-/// The private hosted runtime's separate spend and failure domain.
-pub const METERED_GATEWAY_HOSTED: &str = "gaugewright-hosted";
-
 #[cfg(debug_assertions)]
 const DEVELOPMENT_GATEWAY_ID_ENV: &str = "GAUGEWRIGHT_DEV_AI_GATEWAY_ID";
 
@@ -1467,11 +1464,11 @@ fn valid_gateway_id(value: &str) -> bool {
 }
 
 #[cfg(debug_assertions)]
-fn metered_gateway_id(default: &str) -> String {
+fn metered_gateway_id() -> String {
     match std::env::var(DEVELOPMENT_GATEWAY_ID_ENV) {
         Ok(value) if valid_gateway_id(&value) => value,
         Ok(_) => panic!("{DEVELOPMENT_GATEWAY_ID_ENV} is not a valid exact gateway id"),
-        Err(std::env::VarError::NotPresent) => default.to_owned(),
+        Err(std::env::VarError::NotPresent) => METERED_GATEWAY_PANELS.to_owned(),
         Err(std::env::VarError::NotUnicode(_)) => {
             panic!("{DEVELOPMENT_GATEWAY_ID_ENV} is not Unicode")
         }
@@ -1479,8 +1476,8 @@ fn metered_gateway_id(default: &str) -> String {
 }
 
 #[cfg(not(debug_assertions))]
-fn metered_gateway_id(default: &str) -> String {
-    default.to_owned()
+fn metered_gateway_id() -> String {
+    METERED_GATEWAY_PANELS.to_owned()
 }
 
 /// Where a managed release reaches its model: the endpoint it is admitted
@@ -1529,17 +1526,7 @@ pub const WIRE_OPENAI_CHAT_COMPAT: &str = "openai-chat-compat";
 /// Everything else keeps the compat shim and its unified `provider/model`
 /// naming, which is what unified billing routes by.
 pub fn metered_route(model: &str) -> MeteredRoute {
-    metered_route_on(model, &metered_gateway_id(METERED_GATEWAY_PANELS))
-}
-
-/// The managed route for private hosted work turns. The model spelling and
-/// wire stay identical to panel routing, while the gateway's spend limit is
-/// independent of public deployments.
-pub fn hosted_metered_route(model: &str) -> MeteredRoute {
-    metered_route_on(model, &metered_gateway_id(METERED_GATEWAY_HOSTED))
-}
-
-fn metered_route_on(model: &str, gateway: &str) -> MeteredRoute {
+    let gateway = metered_gateway_id();
     let base = format!("https://gateway.ai.cloudflare.com/v1/{METERED_GATEWAY_ACCOUNT}/{gateway}");
     let model = model.trim();
     let native = model.strip_prefix("anthropic/").unwrap_or(model);
@@ -1661,18 +1648,6 @@ fn is_grok_model(model: &str) -> bool {
 
 #[cfg(test)]
 mod metered_rail {
-    #[test]
-    fn private_hosted_model_uses_a_separate_gateway_with_the_same_wire() {
-        let panels = super::metered_route_on("gpt-5.6-sol", super::METERED_GATEWAY_PANELS);
-        let hosted = super::metered_route_on("gpt-5.6-sol", super::METERED_GATEWAY_HOSTED);
-        assert_eq!(hosted.model, panels.model);
-        assert_eq!(hosted.wire, panels.wire);
-        assert_eq!(hosted.wire, super::WIRE_OPENAI_RESPONSES);
-        assert!(hosted.base_url.contains("/gaugewright-hosted/"));
-        assert!(panels.base_url.contains("/gaugewright-panels/"));
-        assert_ne!(hosted.base_url, panels.base_url);
-    }
-
     #[test]
     fn the_base_url_is_the_panels_gateway_and_ends_at_compat() {
         let url = super::metered_route("gpt-4.1-mini").base_url;

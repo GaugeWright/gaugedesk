@@ -2364,7 +2364,6 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
- "whipplescript-core",
  "whipplescript-kernel",
  "whipplescript-store",
 ]

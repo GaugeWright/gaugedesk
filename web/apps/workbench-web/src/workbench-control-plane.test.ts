@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+    type ArchetypeId,
+    type ProjectId,
     setDirectoryModuleLoader,
     setTunnelModuleLoader,
     type TunnelFacade,
@@ -1358,5 +1360,47 @@ describe("a selected Home with no address (DESK-8, ADR 0134)", () => {
         const { api } = relayOnlySelected(null);
         const state = await api.bootstrapHome();
         expect(state.kind).toBe("none");
+    });
+});
+
+describe("GaugeApp management on the one host", () => {
+    it("reaches every app's routes under its own base with the same calls", async () => {
+        const calls: string[] = [];
+        const bodies: Record<string, unknown>[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input).replace("http://127.0.0.1:4919", "");
+            calls.push(`${init?.method ?? "GET"} ${url.split("?")[0]}`);
+            if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+            if (url.endsWith("/settings/sessions")) {
+                const kind = url.startsWith("/projects/") ? "project" : "agent";
+                return new Response(JSON.stringify({ session: {
+                    id: `session-${kind}`, generation: "g", scope: { kind, id: "x y" }, actor: "local",
+                    pages: [{ id: "overview", resource_basis: `basis-${kind}` }], update_cursor: "c",
+                } }));
+            }
+            if (url.includes("/settings/agent/messages")) {
+                return new Response(JSON.stringify({ thread: { id: "t", messages: [] } }));
+            }
+            return new Response(JSON.stringify({ receipt: { status: "applied" } }));
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        const agent = { app: "agent-settings", id: "x y" as ArchetypeId } as const;
+        const session = await api.openManagement(agent);
+        await expect(api.managementMessages(agent, session)).resolves.toEqual([]);
+        await api.submitManagementCommand(agent, "overview", "agent.model.set", { model: "m" });
+        await api.renameProject("x y" as ProjectId, "Renamed");
+        expect(calls).toEqual([
+            "POST /archetypes/x%20y/settings/sessions",
+            "GET /archetypes/x%20y/settings/agent/messages",
+            "POST /archetypes/x%20y/settings/sessions",
+            "POST /archetypes/x%20y/settings/commands",
+            "POST /projects/x%20y/settings/sessions",
+            "POST /projects/x%20y/settings/commands",
+        ]);
+        const commands = bodies.filter((body) => "command_id" in body);
+        expect(commands.map((body) => [body.app, body.command_id, body.expected_basis])).toEqual([
+            ["agent-settings", "agent.model.set", "basis-agent"],
+            ["project-settings", "project.name.set", "basis-project"],
+        ]);
     });
 });

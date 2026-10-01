@@ -1,0 +1,146 @@
+import { createMemo, createResource, createSignal, onCleanup, Show, type JSX } from "solid-js";
+import { engagementId } from "@gaugewright/control-plane-client";
+import { ChatPanel, ChatPaneHeader, localTurnActivity, type Session, type Transcript } from "@gaugewright/workbench-ui";
+import type { ManagementSession, ManagementTarget, WorkbenchControlPlane } from "./workbench-control-plane";
+
+/** How the chat names its GaugeApp. */
+export interface ManagementChatCopy {
+    /** "Project settings" — the agent's name and the loading/error subject. */
+    readonly label: string;
+    /** The empty-conversation notice. */
+    readonly notice: string;
+    readonly placeholder: string;
+}
+
+export const MANAGEMENT_CHAT_COPY: Record<ManagementTarget["app"], ManagementChatCopy> = {
+    "project-settings": {
+        label: "Project settings",
+        notice: "Ask about this project's settings or request a change.",
+        placeholder: "ask about this project…",
+    },
+    "agent-settings": {
+        label: "Agent settings",
+        notice: "Ask about this Agent's model, abilities or Panel contract, or request a change.",
+        placeholder: "ask about this Agent…",
+    },
+};
+
+interface Props {
+    readonly api: WorkbenchControlPlane;
+    readonly target: ManagementTarget;
+    /** The managed thing's name, shown in the chat header. */
+    readonly name: string;
+    readonly mobile: boolean;
+    readonly onCollapse: () => void;
+    readonly onChanged: () => void | Promise<void>;
+}
+
+/** The bounded management conversation of any GaugeApp the Home serves. */
+export function ManagementChat(props: Props): JSX.Element {
+    const copy = () => MANAGEMENT_CHAT_COPY[props.target.app];
+    const [session, { refetch: refetchSession }] = createResource(() => props.target,
+        (target) => props.api.openManagement(target));
+    const [messages, { refetch: refetchMessages }] = createResource(
+        () => session() ? { target: props.target, session: session()! } : undefined,
+        ({ target, session }) => props.api.managementMessages(target, session),
+    );
+    const [busy, setBusy] = createSignal(false);
+    const [error, setError] = createSignal("");
+    const [confirmClear, setConfirmClear] = createSignal(false);
+    onCleanup(() => {
+        const admitted = session();
+        if (admitted && busy()) void props.api.stopManagement(props.target, admitted).catch(() => undefined);
+    });
+    const transcript = createMemo<Transcript>(() => ({
+        openText: null,
+        lines: (messages() ?? []).map((message) => ({
+            seq: message.sequence, tier: "admitted" as const,
+            kind: message.role, text: message.text,
+        })),
+    }));
+    const current = (admitted: ManagementSession, target: ManagementTarget) =>
+        session()?.id === admitted.id && props.target.app === target.app && props.target.id === target.id;
+    const send = async (text: string, _images: readonly unknown[] = [], composedId?: string) => {
+        const admitted = session();
+        const target = props.target;
+        if (!admitted) throw new Error(`${copy().label} are not ready`);
+        setError("");
+        setBusy(true);
+        try {
+            await props.api.sendManagementMessage(target, admitted, text, composedId ?? crypto.randomUUID());
+            if (!current(admitted, target)) return;
+            await refetchMessages();
+            await refetchSession();
+            await props.onChanged();
+        } catch (reason) {
+            if (current(admitted, target)) setError(reason instanceof Error ? reason.message : String(reason));
+            throw reason;
+        } finally {
+            if (current(admitted, target)) setBusy(false);
+        }
+    };
+    const stop = async () => {
+        const admitted = session();
+        if (admitted) await props.api.stopManagement(props.target, admitted);
+    };
+    const chatSession = createMemo<Session | undefined>(() => {
+        const admitted = session();
+        if (!admitted) return undefined;
+        const target = props.target;
+        return {
+            api: { getTree: async () => [], getFile: async () => "", putFile: async () => undefined },
+            engagementId: () => engagementId(admitted.id),
+            project: () => target.app === "project-settings" ? target.id : null,
+            worktreeRev: () => admitted.update_cursor,
+            selectedFile: () => null,
+            selectFile: () => undefined,
+            diff: () => "",
+            mergePhase: () => null,
+            mergeConflicted: () => false,
+            chatKind: () => "work",
+            methodName: () => copy().label,
+            transcript,
+            busy,
+            turnActivity: localTurnActivity(busy, transcript),
+            composerCapabilities: () => ({ queue: false, steer: false, stop: true, hold: false, fork: false, attachments: [] }),
+            canCommand: () => current(admitted, target),
+            merge: () => undefined,
+            onContentSaved: () => undefined,
+            send: send as Session["send"],
+            appliesComposedIdOnce: true,
+            stop,
+        };
+    });
+    const clearLabel = () => `Clear ${copy().label.toLowerCase()} conversation`;
+    return <div class="management-chat" data-management-chat={props.target.app}>
+        <Show when={chatSession()} fallback={<div class="management-chat-loading" role="status">
+            {session.error
+                ? <><p>{copy().label} chat is unavailable: {String(session.error)}</p><button type="button" onClick={() => void refetchSession()}>Retry</button></>
+                : `Opening ${copy().label.toLowerCase()}…`}
+        </div>}>
+            {(active) => <>
+                <ChatPaneHeader branch={props.name} kind="management" statusLabel={busy() ? "Working" : "Ready"}
+                    mobile={props.mobile} onCollapse={props.onCollapse}
+                    menu={<button type="button" class="management-chat-menu" title={clearLabel()}
+                        aria-label={clearLabel()} onClick={() => setConfirmClear(true)}>⋯</button>} />
+                <Show when={confirmClear()}><div class="management-chat-confirm" role="alert">
+                    <span>Clear this conversation?</span>
+                    <button type="button" onClick={() => setConfirmClear(false)}>Cancel</button>
+                    <button type="button" class="danger" disabled={busy()} onClick={() => {
+                        const admitted = session();
+                        if (!admitted) return;
+                        void props.api.eraseManagement(props.target, admitted)
+                            .then(() => refetchMessages())
+                            .then(() => { setConfirmClear(false); setError(""); })
+                            .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+                    }}>Clear</button>
+                </div></Show>
+                <Show when={messages.error}><p class="management-chat-error" role="alert">Could not load this conversation. <button type="button" onClick={() => void refetchMessages()}>Retry</button></p></Show>
+                <Show when={error()}>{(reason) => <p class="management-chat-error" role="alert">{reason()}</p>}</Show>
+                <ChatPanel session={active()} bare agentName={copy().label}
+                    notice={copy().notice}
+                    composerPlaceholder={copy().placeholder} />
+            </>}
+        </Show>
+    </div>;
+}

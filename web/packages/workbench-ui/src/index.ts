@@ -29,7 +29,7 @@ export type { AccountMenuItem, AccountMenuProps, MenuComposition, MenuIdentity }
 export { FirstRunOverlay } from "./FirstRunOverlay";
 export type { FirstRunApi } from "./FirstRunOverlay";
 export { AgentSettings, plainConfigError, readFormConfig, writeFormConfig } from "./AgentSettings";
-export type { AgentSettingsApi, AgentSettingsProps, AgentImproveEvidence } from "./AgentSettings";
+export type { AgentSettingsApi, AgentSettingsProps } from "./AgentSettings";
 export { buildOutgoing, classifyAttachment, documentFileType, extractDocumentAttachment, fileToBase64 } from "./attachments";
 export type { Attachment, DocumentFileType, ImageRef } from "./attachments";
 export { Carousel, applySelection } from "./CarouselIsland";

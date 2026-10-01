@@ -1545,7 +1545,6 @@ dependencies = [
  "ureq",
  "url",
  "whipplescript",
- "whipplescript-core",
  "whipplescript-kernel",
  "whipplescript-parser",
  "whipplescript-store",

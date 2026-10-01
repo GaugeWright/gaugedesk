@@ -293,6 +293,7 @@ function Harness() {
     const [commercialProductRevision, setCommercialProductRevision] = createSignal(1);
     const [commercialProductTitle, setCommercialProductTitle] = createSignal(commercialTestRevision.listing_title);
     const [commercialCreatedProduct, setCommercialCreatedProduct] = createSignal<CommercialProduct | null>(null);
+    const [commercialProductStatus, setCommercialProductStatus] = createSignal<CommercialProduct["status"]>("active");
     const [commercialClientName, setCommercialClientName] = createSignal("Cosmos Design");
     const [commercialClientBillingReference, setCommercialClientBillingReference] = createSignal<string | null>("COSMOS-001");
     const [commercialClientStatus, setCommercialClientStatus] = createSignal<"active" | "closed">("active");
@@ -418,7 +419,7 @@ function Harness() {
         account: ["account.profile.set", "account.avatar.set", "account.avatar.remove", "account.authenticator.begin-add", "account.authenticator.complete-add", "account.authenticator.remove", "account.recovery-codes.reissue", "account.membership.leave"],
         "provider-connections": ["provider-connection.api-key.add", "provider-connection.subscription.begin"],
     } : commercialLifecycle ? {
-        products: ["commercial-product.create", "commercial-product.read", "commercial-product.revise"],
+        products: ["commercial-product.create", "commercial-product.read", "commercial-product.revise", "commercial-product.retire", "commercial-product.restore", "commercial-product.delete"],
         clients: ["commercial-client.create", "commercial-client.read", "commercial-client.edit", "commercial-engagements.read-by-client", "commercial-payments.read-by-client", "commercial-client.close"],
         engagements: [
             "commercial-engagement.proposal.create", "commercial-engagement.proposal.save", "commercial-engagement.proposal.send",
@@ -578,7 +579,7 @@ function Harness() {
             })),
         });
         const commercialProduct = () => ({
-            id: "product-a", current_revision: commercialProductRevision(), commercial: commercialRevision(),
+            id: "product-a", status: commercialProductStatus(), current_revision: commercialProductRevision(), commercial: commercialRevision(),
             engagement_counts: {
                 open: (commercialEngagementPresent() && ["draft", "sent"].includes(commercialEngagementStage()) ? 1 : 0) + (commercialCreatedEngagement()?.product_id === "product-a" ? 1 : 0),
                 active: commercialEngagementPresent() && ["accepted", "active"].includes(commercialEngagementStage()) ? 1 : 0,
@@ -1059,11 +1060,24 @@ function Harness() {
                 if (payload.id && payload.revision) {
                     setCommercialCreatedProduct({
                         id: payload.id,
+                        status: "active",
                         current_revision: 1,
                         commercial: { ...payload.revision, id: `${payload.id}:revision:1`, op: "upsert", product_id: payload.id, revision: 1 },
                         engagement_counts: { open: 0, active: 0, closed: 0 },
                     });
                 }
+                setServerRevision((value) => value + 1);
+            }
+            if (request.command_id === "commercial-product.retire" || request.command_id === "commercial-product.restore") {
+                const status = request.command_id === "commercial-product.retire" ? "retired" : "active";
+                const id = (request.payload as { id?: string }).id;
+                const created = commercialCreatedProduct();
+                if (id === "product-a") setCommercialProductStatus(status);
+                else if (created && id === created.id) setCommercialCreatedProduct({ ...created, status });
+                setServerRevision((value) => value + 1);
+            }
+            if (request.command_id === "commercial-product.delete") {
+                if (commercialCreatedProduct()?.id === (request.payload as { id?: string }).id) setCommercialCreatedProduct(null);
                 setServerRevision((value) => value + 1);
             }
             if (request.command_id === "commercial-product.read") return delayed(response({ id: "product-a" }));

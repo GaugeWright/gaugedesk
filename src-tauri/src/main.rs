@@ -5,8 +5,7 @@
 //! **HTTP, not Tauri IPC** — so the exact same client works as a browser/web
 //! build and (later) against a remote. Tauri here is packaging + a window, not a
 //! second general transport. Operator-only inputs use IPC when a loopback
-//! caller could impersonate the UI: the Home credential (DR-0188) and a
-//! private Agent improvement pool (DR-0257).
+//! caller could impersonate the UI: the Home credential (DR-0188).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -122,76 +121,6 @@ fn launch_operator_secret() -> gaugedesk_app::open_api::LocalOperatorSecret {
     gaugedesk_app::open_api::LocalOperatorSecret::generate()
 }
 
-/// Private campaign intake crosses the desktop's UI IPC boundary. The local
-/// HTTP listener is reachable by other processes, so it cannot distinguish a
-/// person configuring a pool from an Agent trying to plant its own holdout.
-#[tauri::command]
-async fn start_agent_improve_pool(
-    agent_id: String,
-    pool_json: String,
-) -> Result<gaugedesk_app::AgentImprovePoolStart, String> {
-    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        gaugedesk_app::start_agent_improve_pool_from_desktop(&wb, &agent_id, pool_json.as_bytes())
-    })
-    .await
-    .map_err(|_| "Agent improve pool intake did not complete".to_owned())?
-}
-
-#[tauri::command]
-async fn latest_agent_improve_pool(
-    agent_id: String,
-) -> Result<Option<gaugedesk_app::AgentImprovePoolStart>, String> {
-    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        gaugedesk_app::latest_agent_improve_pool_from_desktop(&wb, &agent_id)
-    })
-    .await
-    .map_err(|_| "Agent improve pool read did not complete".to_owned())?
-}
-
-#[tauri::command]
-async fn evaluate_agent_improve(
-    agent_id: String,
-    edit_chat_id: String,
-    campaign_ref: String,
-) -> Result<gaugedesk_app::NativeImproveResult, String> {
-    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        gaugedesk_app::evaluate_agent_improve_from_desktop(
-            &wb,
-            &agent_id,
-            &edit_chat_id,
-            &campaign_ref,
-        )
-    })
-    .await
-    .map_err(|_| "Agent improve evaluation did not complete".to_owned())?
-}
-
-#[tauri::command]
-async fn latest_agent_improve_evidence(
-    agent_id: String,
-    campaign_ref: String,
-) -> Result<Option<gaugedesk_app::agent_improve_evidence::AgentImproveEvidenceRecord>, String> {
-    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        gaugedesk_app::latest_agent_improve_evidence_from_desktop(&wb, &agent_id, &campaign_ref)
-    })
-    .await
-    .map_err(|_| "Agent improve reviewer evidence read did not complete".to_owned())?
-}
-
-#[tauri::command]
-async fn adopt_agent_improve(agent_id: String, evidence_id: String) -> Result<Vec<String>, String> {
-    let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        gaugedesk_app::adopt_agent_improve_from_desktop(&wb, &agent_id, &evidence_id)
-    })
-    .await
-    .map_err(|_| "Agent improvement adoption did not complete".to_owned())?
-}
-
 #[tauri::command]
 fn hash_chat_acceptance_text(text: String) -> Result<String, String> {
     gaugedesk_app::open_api::chat_acceptance_digest(&text)
@@ -245,12 +174,7 @@ fn main() {
             open_external,
             notify_chat,
             home_session,
-            operator_secret,
-            start_agent_improve_pool,
-            latest_agent_improve_pool,
-            evaluate_agent_improve,
-            latest_agent_improve_evidence,
-            adopt_agent_improve
+            operator_secret
         ])
         .menu(|app| {
             let menu = Menu::default(app)?;

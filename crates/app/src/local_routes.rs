@@ -116,36 +116,6 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             get(lr::get_archetype_abilities).put(lr::put_archetype_abilities),
         )
         .route("/archetypes/{id}/chats", post(lr::create_chat_under_agent))
-        .route(
-            "/archetypes/{id}/improve/pool",
-            post(crate::agent_improve_routes::start_pool)
-                .get(crate::agent_improve_routes::latest_pool)
-                .layer(axum::middleware::map_response(
-                    crate::file_action_routes::no_store,
-                )),
-        )
-        .route(
-            "/archetypes/{id}/improve/evaluate",
-            post(crate::agent_improve_routes::evaluate),
-        )
-        .route(
-            "/archetypes/{id}/improve/operations/{operation_id}",
-            get(crate::agent_improve_routes::operation_status).layer(
-                axum::middleware::map_response(crate::file_action_routes::no_store),
-            ),
-        )
-        .route(
-            "/archetypes/{id}/improve/evidence",
-            get(crate::agent_improve_routes::review).layer(axum::middleware::map_response(
-                crate::file_action_routes::no_store,
-            )),
-        )
-        .route(
-            "/archetypes/{id}/improve/evidence/{evidence_id}/adopt",
-            post(crate::agent_improve_routes::adopt).layer(axum::middleware::map_response(
-                crate::file_action_routes::no_store,
-            )),
-        )
         .route("/archetypes/{id}/use", post(lr::use_archetype))
         .route("/archetypes/{id}/preview", post(lr::start_panel_preview))
         .route("/archetypes/{id}/fork", post(lr::fork_archetype))
@@ -304,7 +274,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             put(lr::update_project).delete(lr::delete_project),
         )
         .route("/projects/{id}/home", get(lr::project_home))
-        .merge(crate::project_settings_gaugeapp::routes())
+        .merge(crate::gaugeapp_host::routes())
         .route("/projects/{id}/whips", get(lr::project_whips))
         .route("/projects/{id}/whip-costs", get(lr::project_whip_costs))
         .route(

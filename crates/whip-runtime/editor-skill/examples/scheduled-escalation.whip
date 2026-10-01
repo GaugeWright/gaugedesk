@@ -1,0 +1,92 @@
+use std.agent
+
+workflow ScheduledEscalation
+
+output result ReviewClosed
+failure error ReviewEscalated
+
+# Time is modeled as effects: both the human answer and deadline can win.
+class ReviewRequest {
+  id string
+  title string
+  dueAt time
+  status "waiting"
+}
+
+class ReviewClosed {
+  id string
+  decision string
+}
+
+class ReviewEscalated {
+  id string
+  reason string
+}
+
+agent reviewer {
+  provider fixture
+  profile "repo-reader"
+  capacity 1
+}
+
+table reviews as ReviewRequest [
+  {
+    id "REV-1"
+    title "Approve release notes"
+    dueAt "2026-06-11T18:00:00Z"
+    status "waiting"
+  }
+]
+
+rule request_review_with_deadline
+  when ReviewRequest as review where review.status == "waiting"
+=> {
+  tell reviewer as answer timeout 24h """markdown
+  {{ review.title }}
+  """
+
+  timer until review.dueAt as deadline
+
+  after answer completes {
+    case answer {
+      Completed as decided => {
+        done review
+        cancel deadline
+        complete result {
+          id review.id
+          decision answer.summary
+        }
+      }
+      Failed as failure => {
+        done review
+        fail error {
+          id review.id
+          reason failure.reason
+        }
+      }
+      TimedOut as timeout => {
+        done review
+        fail error {
+          id review.id
+          reason timeout.summary
+        }
+      }
+      Cancelled as cancel => {
+        done review
+        fail error {
+          id review.id
+          reason cancel.summary
+        }
+      }
+    }
+  }
+
+  after deadline succeeds {
+    done review
+    cancel answer
+    fail error {
+      id review.id
+      reason "deadline reached"
+    }
+  }
+}

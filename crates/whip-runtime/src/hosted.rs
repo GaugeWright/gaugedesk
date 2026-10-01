@@ -46,7 +46,6 @@ pub struct DoHostConfig {
     transport: Arc<dyn DoHostTransport>,
     pub tenant_id: String,
     reuse_across_turns: bool,
-    injected_transport: bool,
 }
 
 impl std::fmt::Debug for DoHostConfig {
@@ -56,7 +55,6 @@ impl std::fmt::Debug for DoHostConfig {
             .field("transport", &self.transport)
             .field("tenant_id", &self.tenant_id)
             .field("reuse_across_turns", &self.reuse_across_turns)
-            .field("injected_transport", &self.injected_transport)
             .finish()
     }
 }
@@ -179,7 +177,6 @@ impl DoHostConfig {
             }),
             tenant_id,
             reuse_across_turns: true,
-            injected_transport: false,
         })
     }
 
@@ -199,16 +196,11 @@ impl DoHostConfig {
             transport,
             tenant_id,
             reuse_across_turns,
-            injected_transport: true,
         })
     }
 
     pub(crate) fn reuse_across_turns(&self) -> bool {
         self.reuse_across_turns
-    }
-
-    pub(crate) fn injected_transport(&self) -> bool {
-        self.injected_transport
     }
 }
 
@@ -1974,11 +1966,6 @@ mod tests {
     fn custom_transport_receives_exact_placement_local_operation() {
         let transport = Arc::new(RecordingTransport::default());
         let config = DoHostConfig::with_transport("tenant:one", transport.clone(), false).unwrap();
-        assert!(
-            !DoHostConfig::new("https://runtime.test", "bearer", "tenant:one")
-                .unwrap()
-                .injected_transport()
-        );
 
         let response = post_json(
             &config,
@@ -1990,7 +1977,6 @@ mod tests {
 
         assert_eq!(response, json!({ "ok": true }));
         assert!(!config.reuse_across_turns());
-        assert!(config.injected_transport());
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, "POST");

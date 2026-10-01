@@ -93,7 +93,6 @@ whipplescript-store = { version = "0.8.0" }
 # now, not only a test one. The comment below in [dev-dependencies] described the
 # parser's dev-only use and no longer covers the kernel.
 whipplescript-kernel = { version = "0.8.0" }
-whipplescript-core = { version = "0.8.0" }
 
 [dev-dependencies]
 # Competing connection proves publication holds the content authority's lock.

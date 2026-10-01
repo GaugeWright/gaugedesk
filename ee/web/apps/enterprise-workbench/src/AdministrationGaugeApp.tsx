@@ -2826,16 +2826,27 @@ function ProductEditor(props: {
 
 function ProductDetail(props: {
     readonly product: CommercialProduct;
+    readonly commands: readonly string[];
+    readonly onSubmit: SubmitPageCommand;
     readonly onEdit: () => void;
-    readonly canEdit: boolean;
 }): JSX.Element {
     const commercial = () => props.product.commercial;
     const archetype = () => commercial().archetype;
     const counts = () => props.product.engagement_counts;
+    const retired = () => props.product.status === "retired";
+    const referenced = () => counts().open + counts().active + counts().closed > 0;
+    const id = () => ({ id: props.product.id });
     return <section class="gaugeapp-product-detail">
-        <header><div><span>{text(archetype().kind, "Agent")}</span><h3>{text(commercial().listing_title, "Untitled product")}</h3><p>{text(commercial().description, "No description.")}</p></div><button type="button" disabled={!props.canEdit} onClick={props.onEdit}>Edit</button></header>
+        <header><div><span>{text(archetype().kind, "Agent")}{retired() ? " · Retired" : ""}</span><h3>{text(commercial().listing_title, "Untitled product")}</h3><p>{text(commercial().description, "No description.")}</p></div><button type="button" disabled={retired() || !props.commands.includes("commercial-product.revise")} onClick={props.onEdit}>Edit</button></header>
         <div class="gaugeapp-detail-facts"><Fact label="Agent" value={`${text(archetype().name)} · v${text(archetype().version)}`} /><Fact label="Price" value={priceSummary(commercial().prices)} /><Fact label="Delivery" value={text(commercial().delivery)} /><Fact label="Activity" value={`${count(counts().active)} active · ${count(counts().open)} open · ${count(counts().closed)} closed`} /></div>
         <Show when={commercial().service_obligations.length > 0}><div class="gaugeapp-detail-list"><strong>Services included</strong><For each={commercial().service_obligations}>{(service) => { return <span>{text(service.label)}<Show when={service.cadence}> · {text(service.cadence)}</Show></span>; }}</For></div></Show>
+        <Show when={referenced()}><p class="gaugeapp-form-note">{retired() ? "Retired: not offered in new proposals." : "Retiring stops new proposals."} Engagements reference this product, so it cannot be deleted.</p></Show>
+        <div class="gaugeapp-detail-actions gaugeapp-detail-actions-end">
+            <Show when={retired()} fallback={<CommandButton command="commercial-product.retire" commands={props.commands} label="Retire" payload={id()} onSubmit={props.onSubmit} />}>
+                <CommandButton command="commercial-product.restore" commands={props.commands} label="Restore" payload={id()} onSubmit={props.onSubmit} />
+            </Show>
+            <Show when={!referenced()}><CommandButton command="commercial-product.delete" commands={props.commands} label="Delete product" danger payload={id()} onSubmit={props.onSubmit} /></Show>
+        </div>
     </section>;
 }
 
@@ -3350,20 +3361,28 @@ type CommercialPanelActions = { commands: readonly string[]; onSubmit: SubmitPag
 function ProductsPage(props: CommercialPanelActions & { model: ProductsPageV1 }): JSX.Element {
     const [editor, setEditor] = createSignal<CommercialProduct | "new" | null>(null);
     const [selectedId, setSelectedId] = createSignal<string | null>(null);
+    const [showRetired, setShowRetired] = createSignal(false);
     const selected = () => props.model.products.find((product) => product.id === selectedId());
+    const retired = () => props.model.products.filter((product) => product.status === "retired");
+    const listed = () => props.model.products.filter((product) => (product.status === "retired") === showRetired());
+    const empty = () => showRetired() ? "No retired products."
+        : retired().length ? `No active products. ${retired().length} retired.` : "No products yet. Choose an Agent from Library to start.";
     return <section class="gaugeapp-panel gaugeapp-section-stack">
-        <div class="gaugeapp-section-head"><div><h2>Products</h2><p>Commercial revisions of Agents from this organization’s Library.</p></div><button type="button" disabled={!props.commands.includes("commercial-product.create") || !props.model.library.archetypes.length} onClick={() => setEditor("new")}>New product</button></div>
+        <div class="gaugeapp-section-head"><div><h2>{showRetired() ? "Retired products" : "Products"}</h2><p>{showRetired() ? "Not offered in new proposals. Existing engagements are unaffected." : "Commercial revisions of Agents from this organization’s Library."}</p></div><div class="gaugeapp-actions">
+            <Show when={showRetired() || retired().length > 0}><button type="button" aria-pressed={showRetired()} onClick={() => { setShowRetired(!showRetired()); setSelectedId(null); }}>{showRetired() ? "Show active" : `Retired (${retired().length})`}</button></Show>
+            <button type="button" disabled={!props.commands.includes("commercial-product.create") || !props.model.library.archetypes.length} onClick={() => setEditor("new")}>New product</button>
+        </div></div>
         <Show when={props.model.library.availability === "unavailable"}><p class="gaugeapp-unavailable">{props.model.library.reason}</p></Show>
         <Show keyed when={editor()}>{(value) => <ProductEditor product={value === "new" ? undefined : value} agents={props.model.library.archetypes} commands={props.commands} onSubmit={props.onSubmit} onClose={() => setEditor(null)} />}</Show>
         <Show when={!editor()}>
-            <Show when={props.model.products.length} fallback={<p class="gaugeapp-empty">No products yet. Choose an Agent from Library to start.</p>}>
-                <div class="gaugeapp-catalog"><For each={props.model.products}>{(product) => <article class="gaugeapp-catalog-card">
-                    <header><div><strong>{product.commercial.listing_title}</strong><span>{product.commercial.archetype.kind === "panel-agent" ? "Panel agent" : "Agent"}</span></div><div class="gaugeapp-card-actions"><button type="button" disabled={!props.commands.includes("commercial-product.read")} onClick={() => void props.onSubmit("commercial-product.read", { id: product.id }).then(() => setSelectedId(product.id))}>View</button><button type="button" disabled={!props.commands.includes("commercial-product.revise")} onClick={() => setEditor(product)}>Edit</button></div></header>
+            <Show when={listed().length} fallback={<p class="gaugeapp-empty">{empty()}</p>}>
+                <div class="gaugeapp-catalog"><For each={listed()}>{(product) => <article class="gaugeapp-catalog-card">
+                    <header><div><strong>{product.commercial.listing_title}</strong><span>{product.commercial.archetype.kind === "panel-agent" ? "Panel agent" : "Agent"}</span></div><div class="gaugeapp-card-actions"><button type="button" disabled={!props.commands.includes("commercial-product.read")} onClick={() => void props.onSubmit("commercial-product.read", { id: product.id }).then(() => setSelectedId(product.id))}>View</button><button type="button" disabled={product.status === "retired" || !props.commands.includes("commercial-product.revise")} onClick={() => setEditor(product)}>Edit</button></div></header>
                     <p>{product.commercial.description || "No listing description."}</p>
                     <div class="gaugeapp-card-facts"><span>{priceSummary(product.commercial.prices)}</span><span>{product.engagement_counts.active} active · {product.engagement_counts.open} open · {product.engagement_counts.closed} closed</span></div>
                 </article>}</For></div>
             </Show>
-            <Show keyed when={selected()}>{(product) => <ProductDetail product={product} canEdit={props.commands.includes("commercial-product.revise")} onEdit={() => setEditor(product)} />}</Show>
+            <Show keyed when={selected()}>{(product) => <ProductDetail product={product} commands={props.commands} onSubmit={props.onSubmit} onEdit={() => setEditor(product)} />}</Show>
         </Show>
     </section>;
 }
@@ -3394,8 +3413,8 @@ function EngagementsPage(props: CommercialPanelActions & { model: EngagementsPag
     const selected = () => props.model.engagements.find((engagement) => engagement.id === selectedId());
     const client = (id: string) => props.model.clients.find((entry) => entry.client.id === id);
     return <section class="gaugeapp-panel gaugeapp-section-stack">
-        <div class="gaugeapp-section-head"><div><h2>Engagements</h2><p>Proposals, agreements, access, and billing.</p></div><button type="button" disabled={!props.commands.includes("commercial-engagement.proposal.create") || !props.model.products.length || !props.model.clients.some((entry) => entry.client.status === "active")} onClick={() => setEditor("new")}>New proposal</button></div>
-        <Show keyed when={editor()}>{(value) => <EngagementEditor engagement={value === "new" ? undefined : value} products={props.model.products} clients={props.model.clients} commands={props.commands} onSubmit={props.onSubmit} onClose={() => setEditor(null)} />}</Show>
+        <div class="gaugeapp-section-head"><div><h2>Engagements</h2><p>Proposals, agreements, access, and billing.</p></div><button type="button" disabled={!props.commands.includes("commercial-engagement.proposal.create") || !props.model.products.some((product) => product.status === "active") || !props.model.clients.some((entry) => entry.client.status === "active")} onClick={() => setEditor("new")}>New proposal</button></div>
+        <Show keyed when={editor()}>{(value) => <EngagementEditor engagement={value === "new" ? undefined : value} products={value === "new" ? props.model.products.filter((product) => product.status === "active") : props.model.products} clients={props.model.clients} commands={props.commands} onSubmit={props.onSubmit} onClose={() => setEditor(null)} />}</Show>
         <Show when={!editor()}>
             <Show when={props.model.engagements.length} fallback={<p class="gaugeapp-empty">No engagements yet. Add a client and product, then create a proposal.</p>}>
                 <For each={["Open proposals", "Active engagements", "Closed"]}>{(group) => {

@@ -22,30 +22,9 @@ mod action_input_binding;
 pub mod action_inputs;
 pub mod action_policy;
 pub mod advancement;
-pub mod agent_improve;
-mod agent_improve_adoption;
-pub mod agent_improve_campaign;
-mod agent_improve_checkpoint;
-mod agent_improve_custody;
-mod agent_improve_funding;
-mod agent_improve_scenario_journal;
-pub use agent_improve_custody::{
-    latest_agent_improve_pool_from_desktop, start_agent_improve_pool_from_desktop,
-    AgentImprovePoolStart,
-};
-pub mod agent_improve_evidence;
-mod agent_improve_routes;
-pub use agent_improve_routes::{
-    HostedImproveCampaignQueue, HostedImproveJobInput, HostedImproveJobQueue, HostedImproveQueued,
-};
-mod agent_improve_runtime;
-pub use agent_improve_runtime::{
-    adopt_agent_improve_from_desktop, evaluate_agent_improve_from_desktop,
-    evaluate_agent_improve_from_hosted, latest_agent_improve_evidence_from_desktop,
-    HostedImproveAdmission, NativeImproveResult,
-};
 pub mod agent_question;
 pub mod agent_release;
+pub mod agent_settings_gaugeapp;
 pub mod app_support;
 pub mod at_rest;
 pub mod attention;
@@ -90,6 +69,7 @@ pub mod gate;
 pub mod gate_service;
 pub mod gaugeapp_agent;
 pub mod gaugeapp_contract;
+pub mod gaugeapp_host;
 pub mod gaugevault_dispatch;
 pub mod gaugevault_intake;
 pub mod gaugevault_namespace;

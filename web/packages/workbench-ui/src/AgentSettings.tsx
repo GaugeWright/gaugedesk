@@ -12,7 +12,7 @@
  * package draft is edited in an edit chat and frozen by Publish.
  */
 
-import { createEffect, createMemo, createResource, createSignal, Index, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, Show } from "solid-js";
 import { PanelContractEditor } from "./PanelContractEditor";
 import { Option } from "./PanelAgentControls";
 import "./panel-agent.css";
@@ -80,76 +80,6 @@ export interface AgentSettingsProps {
     refreshKey?: number;
     onClose: () => void;
     onSaved?: () => void;
-    onPrepareImprove?: (poolJson: string) => Promise<void>;
-    preparedImproveRef?: string;
-    onUsePreparedImprove?: () => void;
-    improveRecoveryError?: string;
-    onEvaluateImprove?: () => Promise<void>;
-    improveEvidence?: AgentImproveEvidence | null;
-    improveEvidenceError?: string;
-    onUseOpenFeedback?: () => void;
-    onAdoptImprove?: (evidenceId: string) => Promise<string[]>;
-}
-
-export interface AgentImproveEvidence {
-    id: string;
-    card: {
-        campaign_ref: string;
-        baseline_main_cut: string;
-        baseline_definition_ref: string;
-        candidate_definition_ref: string;
-        open_count: number;
-        sealed_available: number;
-        sealed_evaluated: number;
-        holdout_status: string;
-        open_verdict: ImproveReviewVerdict;
-        final_verdict: ImproveReviewVerdict;
-    };
-}
-
-export interface ImproveReviewVerdict {
-    proposable: boolean;
-    tradeoff: boolean;
-    reasons: string[];
-    lines: Array<{
-        gauge: string;
-        role: string;
-        delta: string;
-        baseline: number | null;
-        candidate: number | null;
-    }>;
-}
-
-export interface ImproveCaseDraft {
-    prompt: string;
-    expected: string;
-}
-
-/** One intentionally narrow first gauge. Home does the sampling; this form
- * never decides which cases are open or sealed. */
-export function buildImprovePool(cases: readonly ImproveCaseDraft[]): string {
-    if (cases.length < 4) throw new Error("Add at least four cases for a sampled holdout.");
-    if (cases.length > 64) throw new Error("A campaign can contain at most 64 cases.");
-    if (cases.some((entry) => !entry.prompt.trim() || !entry.expected.trim())) {
-        throw new Error("Every case needs a prompt and expected text.");
-    }
-    if (new Set(cases.map((entry) => JSON.stringify([entry.prompt.trim(), entry.expected.trim()]))).size !== cases.length) {
-        throw new Error("The same prompt and expected text cannot appear twice.");
-    }
-    return JSON.stringify({
-        schema: "gaugedesk.agent-improve.pool.v1",
-        gauges: [{
-            name: "quality",
-            description: "The assistant reply includes the expected text",
-            minimum_pass_rate: 1,
-        }],
-        selection: { ascend: { quality: null } },
-        scenarios: cases.map((entry, index) => ({
-            id: `case-${index + 1}`,
-            prompt: entry.prompt.trim(),
-            checks: { quality: { kind: "assistant-contains", text: entry.expected.trim() } },
-        })),
-    });
 }
 
 export const AGENT_ABILITY_PRESETS: ReadonlyArray<{
@@ -203,12 +133,6 @@ export function AgentSettings(props: AgentSettingsProps) {
     );
     const [panelDraft, setPanelDraft] = createSignal<PanelPublicProfile | null>(null);
     const [panelDirty, setPanelDirty] = createSignal(false);
-    const [improveCases, setImproveCases] = createSignal<ImproveCaseDraft[]>(
-        Array.from({ length: 4 }, () => ({ prompt: "", expected: "" })),
-    );
-    const [improveBusy, setImproveBusy] = createSignal(false);
-    const [improveMessage, setImproveMessage] = createSignal("");
-    const [adoptedImproveEvidenceId, setAdoptedImproveEvidenceId] = createSignal<string | null>(null);
     const text = () => raw() ?? loaded() ?? "{}";
 
     // Parse the current text for the form. If the raw JSON is mid-edit and invalid,
@@ -253,55 +177,6 @@ export function AgentSettings(props: AgentSettingsProps) {
             props.onSaved?.();
         } catch (e) {
             setMsg(plainConfigError(String(e)));
-        }
-    }
-
-    function updateImproveCase(index: number, patch: Partial<ImproveCaseDraft>) {
-        setImproveCases((entries) => entries.map((entry, i) => i === index ? { ...entry, ...patch } : entry));
-        setImproveMessage("");
-    }
-
-    async function prepareImprove() {
-        if (!props.onPrepareImprove) return;
-        try {
-            const pool = buildImprovePool(improveCases());
-            setImproveBusy(true);
-            await props.onPrepareImprove(pool);
-            setImproveCases(Array.from({ length: 4 }, () => ({ prompt: "", expected: "" })));
-            setImproveMessage("Home saved the case pool. The edit chat now has only the open cases.");
-        } catch (error) {
-            setImproveMessage(String(error).replace(/^Error:\s*/, ""));
-        } finally {
-            setImproveBusy(false);
-        }
-    }
-
-    async function evaluateImprove() {
-        if (!props.onEvaluateImprove) return;
-        setImproveBusy(true);
-        setImproveMessage("Running the baseline and candidate on the open cases first…");
-        try {
-            await props.onEvaluateImprove();
-            setAdoptedImproveEvidenceId(null);
-            setImproveMessage("Evaluation saved in Home. Review the result below before applying it.");
-        } catch (error) {
-            setImproveMessage(String(error).replace(/^Error:\s*/, ""));
-        } finally {
-            setImproveBusy(false);
-        }
-    }
-
-    async function adoptImprove(evidenceId: string) {
-        if (!props.onAdoptImprove) return;
-        setImproveBusy(true);
-        try {
-            const paths = await props.onAdoptImprove(evidenceId);
-            setAdoptedImproveEvidenceId(evidenceId);
-            setImproveMessage(`Applied the selected candidate to the draft (${paths.length} changed file${paths.length === 1 ? "" : "s"}). Publish separately when ready.`);
-        } catch (error) {
-            setImproveMessage(String(error).replace(/^Error:\s*/, ""));
-        } finally {
-            setImproveBusy(false);
         }
     }
 
@@ -415,88 +290,6 @@ export function AgentSettings(props: AgentSettingsProps) {
                 <button type="button" class="pa-button primary" data-settings-save onClick={save}>Save</button>
                 <span class="status" data-config-status>{msg()}</span>
             </div>
-            <Show when={props.onPrepareImprove}>
-                <section class="pa-section divided" data-agent-improve-cases>
-                    <Show when={props.improveEvidenceError}>
-                        <p class="status" role="alert">Couldn't recover reviewer evidence: {props.improveEvidenceError}</p>
-                    </Show>
-                    <Show when={props.improveEvidence}>
-                        {(evidence) => <section class="pa-section" data-agent-improve-review>
-                            <h4>Improvement review</h4>
-                            <p>{evidence().card.final_verdict.proposable
-                                ? "The candidate passed the regularized comparison. Review the tradeoffs before applying it."
-                                : "The comparison did not propose this candidate."}</p>
-                            <p class="status">{evidence().card.holdout_status} · {evidence().card.open_count} open case(s) · {evidence().card.sealed_evaluated}/{evidence().card.sealed_available} held-out case(s) evaluated</p>
-                            <Show when={evidence().card.final_verdict.tradeoff}>
-                                <p class="status">This proposal has a measured tradeoff.</p>
-                            </Show>
-                            <ul>
-                                <Index each={evidence().card.final_verdict.lines}>{(line) => <li>
-                                    {line().gauge}: {line().delta} ({line().role}; baseline {line().baseline ?? "unmeasured"}, candidate {line().candidate ?? "unmeasured"})
-                                </li>}</Index>
-                            </ul>
-                            <Index each={evidence().card.final_verdict.reasons}>{(reason) =>
-                                <p class="status">{reason()}</p>
-                            }</Index>
-                            <div class="bar">
-                                <Show when={props.onUseOpenFeedback}>
-                                    <button type="button" class="pa-button" onClick={() => {
-                                        try { props.onUseOpenFeedback?.(); setImproveMessage(""); }
-                                        catch (error) { setImproveMessage(String(error).replace(/^Error:\s*/, "")); }
-                                    }}>Put open feedback in chat</button>
-                                </Show>
-                                <Show when={evidence().card.final_verdict.proposable && props.onAdoptImprove && adoptedImproveEvidenceId() !== evidence().id}>
-                                    <button type="button" class="pa-button primary" disabled={improveBusy()}
-                                        onClick={() => void adoptImprove(evidence().id)}>Apply to unchanged draft</button>
-                                </Show>
-                            </div>
-                        </section>}
-                    </Show>
-                    <Show when={improveMessage()}><p class="status" role="status">{improveMessage()}</p></Show>
-                    <Show when={props.improveRecoveryError}>
-                        <p class="status" role="alert">Couldn't recover the last Home campaign: {props.improveRecoveryError}</p>
-                    </Show>
-                    <Show when={props.preparedImproveRef}>
-                        <p class="status">Pool saved in Home. Send the open cases to the edit chat, then evaluate its proposed file changes.</p>
-                        <button type="button" class="pa-button" onClick={() => {
-                            try {
-                                props.onUsePreparedImprove?.();
-                                setImproveMessage("");
-                            } catch (error) {
-                                setImproveMessage(String(error).replace(/^Error:\s*/, ""));
-                            }
-                        }}>Put open cases in chat</button>
-                        <Show when={props.onEvaluateImprove}>
-                            <button type="button" class="pa-button primary" disabled={improveBusy()}
-                                onClick={() => void evaluateImprove()}>
-                                {improveBusy() ? "Evaluating…" : "Evaluate draft candidate"}
-                            </button>
-                        </Show>
-                    </Show>
-                    <div class="pa-section-head">
-                        <h3>Prepare improvement cases</h3>
-                        <p>Write examples of what this Agent should answer. Home will set aside cases before the edit chat sees the rest. These first checks look for exact text in the reply.</p>
-                    </div>
-                    <Index each={improveCases()}>{(entry, index) => <div class="pa-field">
-                        <strong>Case {index + 1}</strong>
-                        <label class="pa-field"><span>Prompt</span><textarea class="config-text"
-                            value={entry().prompt}
-                            onInput={(event) => updateImproveCase(index, { prompt: event.currentTarget.value })}
-                        /></label>
-                        <label class="pa-field"><span>Reply must include</span><input class="pa-input"
-                            value={entry().expected}
-                            onInput={(event) => updateImproveCase(index, { expected: event.currentTarget.value })}
-                        /></label>
-                    </div>}</Index>
-                    <div class="bar">
-                        <button type="button" class="pa-button" disabled={improveCases().length >= 64}
-                            onClick={() => setImproveCases((entries) => [...entries, { prompt: "", expected: "" }])}>Add case</button>
-                        <button type="button" class="pa-button primary" disabled={improveBusy()} onClick={() => void prepareImprove()}>
-                            {improveBusy() ? "Preparing…" : "Prepare in Home"}
-                        </button>
-                    </div>
-                </section>
-            </Show>
             </article>
         </main>
     );

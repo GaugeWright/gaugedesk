@@ -5596,6 +5596,18 @@ impl Workbench {
                 ..existing
             });
         }
+        // Its Agent Settings conversations end with it, for every person who
+        // held one, as a tenant's management threads end with the tenant.
+        let settings = crate::gaugeapp_contract::GaugeAppScope {
+            kind: "agent".into(),
+            id: id.into(),
+        };
+        let _ = crate::gaugeapp_agent::crypto_erase_gaugeapp_agent_threads_for_scope(
+            self,
+            crate::gaugeapp_contract::GaugeAppKind::AgentSettings,
+            &settings,
+        );
+        self.crypto_erase_content(&crate::agent_settings_gaugeapp::agent_settings_scope(id));
         Ok(())
     }
 

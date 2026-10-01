@@ -77,7 +77,7 @@ import {
     beginWorkEmailLogin,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
-import { ProjectManagementChat } from "./ProjectManagementChat";
+import { ManagementChat } from "./ManagementChat";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
 import { desktopUpdateOffer, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, withDesktopUpdateTimeout, DESKTOP_UPDATE_CHECK_TIMEOUT_MS, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
@@ -87,7 +87,6 @@ import "@gaugewright/gw-embed";
 import {
     SignInCard,
     AgentSettings,
-    type AgentImproveEvidence,
     BASIC_COMPOSER_CAPABILITIES,
     ChatPanel,
     ChatPaneHeader,
@@ -842,96 +841,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
     }
     const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string; kind: AgentKind } | null>(null);
-    const [preparedImproveCampaign, setPreparedImproveCampaign] = createSignal<{
-        agentId: ArchetypeId;
-        account: string | null;
-        campaignRef: string;
-        openSource: string;
-    } | null>(null);
-    const [evaluatedImproveCampaign, setEvaluatedImproveCampaign] = createSignal<{
-        agentId: ArchetypeId;
-        account: string | null;
-        campaignRef: string;
-        evidence: AgentImproveEvidence;
-    } | null>(null);
-    const [latestImprovePool] = createResource(
-        () => {
-            const id = agentSettings()?.id;
-            return (isTauri() ? homeState()?.kind === "direct" : homeState()?.kind === "connected") && id
-                ? { id, account: bearer() } : null;
-        },
-        async ({ id }) => {
-            try {
-                const pool = isTauri()
-                    ? await (await import("@tauri-apps/api/core")).invoke<{ campaign_ref: string; open_source: string } | null>(
-                        "latest_agent_improve_pool", { agentId: id },
-                    )
-                    : await api.latestAgentImprovePool(id);
-                return pool ? { agentId: id, campaignRef: pool.campaign_ref, openSource: pool.open_source } : null;
-            } catch (error) {
-                return { agentId: id, error: String(error) };
-            }
-        },
-    );
-    const preparedImproveFor = (id: ArchetypeId): {
-        agentId: ArchetypeId;
-        campaignRef: string;
-        openSource: string;
-    } | null => {
-        const local = preparedImproveCampaign();
-        if (local?.agentId === id && local.account === bearer()) return local;
-        const retained = latestImprovePool();
-        return retained?.agentId === id && "campaignRef" in retained
-            && typeof retained.campaignRef === "string"
-            && "openSource" in retained && typeof retained.openSource === "string"
-            ? { agentId: id, campaignRef: retained.campaignRef, openSource: retained.openSource }
-            : null;
-    };
-    const improveRecoveryErrorFor = (id: ArchetypeId) => {
-        const retained = latestImprovePool();
-        return retained?.agentId === id && "error" in retained ? retained.error : undefined;
-    };
-    const improveAvailableFor = (id: ArchetypeId) => {
-        if (isTauri()) return homeState()?.kind === "direct";
-        if (homeState()?.kind !== "connected") return false;
-        const retained = latestImprovePool();
-        return retained !== undefined && (retained === null
-            || (retained.agentId === id && !("error" in retained)));
-    };
-    const [latestImproveEvidence] = createResource(
-        () => {
-            const id = agentSettings()?.id;
-            const prepared = id ? preparedImproveFor(id) : null;
-            return (isTauri() ? homeState()?.kind === "direct" : homeState()?.kind === "connected") && id && prepared
-                ? { id, campaignRef: prepared.campaignRef, account: bearer() } : null;
-        },
-        async ({ id, campaignRef }) => {
-            try {
-                const evidence = isTauri()
-                    ? await (await import("@tauri-apps/api/core")).invoke<AgentImproveEvidence | null>(
-                        "latest_agent_improve_evidence", { agentId: id, campaignRef },
-                    )
-                    : await api.agentImproveEvidence(id, campaignRef) as AgentImproveEvidence | null;
-                return { agentId: id, campaignRef, evidence };
-            } catch (error) {
-                return { agentId: id, campaignRef, error: String(error) };
-            }
-        },
-    );
-    const improveEvidenceFor = (id: ArchetypeId) => {
-        const prepared = preparedImproveFor(id);
-        if (!prepared) return null;
-        const local = evaluatedImproveCampaign();
-        if (local?.agentId === id && local.account === bearer()
-            && local.campaignRef === prepared.campaignRef) return local.evidence;
-        const retained = latestImproveEvidence();
-        return retained?.agentId === id && retained.campaignRef === prepared.campaignRef
-            && "evidence" in retained ? retained.evidence : null;
-    };
-    const improveEvidenceErrorFor = (id: ArchetypeId) => {
-        const retained = latestImproveEvidence();
-        return retained?.agentId === id && "error" in retained ? retained.error : undefined;
-    };
     let agentSettingsOpenSequence = 0;
     // The per-project Engagement pane (FED-7), opened from a project node.
     const [engagement, setEngagement] = createSignal<{ id: ProjectId; name: string } | null>(null);
@@ -1932,138 +1841,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 setStatus(`Couldn't open ${name} settings: ${String(error)}`);
             }
         }
-    }
-
-    async function prepareAgentImprovePool(id: ArchetypeId, poolJson: string) {
-        const chat = selected();
-        if ((isTauri() ? homeState()?.kind !== "direct" : homeState()?.kind !== "connected")
-            || agentSettings()?.id !== id || !chat) {
-            throw new Error("Open this Agent's connected Workshop and edit chat first.");
-        }
-        if (draft().trim()) {
-            throw new Error("Send or clear the current edit-chat draft before preparing cases.");
-        }
-        const prepared = isTauri()
-            ? await (await import("@tauri-apps/api/core")).invoke<{ campaign_ref: string; open_source: string }>(
-                "start_agent_improve_pool", { agentId: id, poolJson },
-            )
-            : await api.startAgentImprovePool(id, JSON.parse(poolJson));
-        if (typeof prepared.open_source !== "string" || !prepared.open_source) {
-            throw new Error("Home did not return the open cases.");
-        }
-        if (typeof prepared.campaign_ref !== "string" || !prepared.campaign_ref) {
-            throw new Error("Home did not return the retained campaign reference.");
-        }
-        setPreparedImproveCampaign({
-            agentId: id, account: bearer(),
-            campaignRef: prepared.campaign_ref, openSource: prepared.open_source,
-        });
-        if (selected() !== chat || draft().trim()) {
-            throw new Error("Pool saved in Home. Return to this Agent's empty edit-chat draft to place the open cases.");
-        }
-        placePreparedImproveCases(id);
-    }
-
-    function placePreparedImproveCases(id: ArchetypeId) {
-        const prepared = preparedImproveFor(id);
-        if (!prepared || prepared.agentId !== id || agentSettings()?.id !== id || !selected()) {
-            throw new Error("Open this Agent's edit chat to place its prepared cases.");
-        }
-        if (draft().trim()) throw new Error("Send or clear the current edit-chat draft first.");
-        // The pool's exact checks and sampled sealed cases never enter the
-        // composer. Keep the private campaign reference in Home/UI custody.
-        const openPrompt =
-            "Propose one improvement to this Agent's authored files using the open cases below. " +
-            "You may edit agent/, .whipple/draft/, and .whipple/discipline/draft/. " +
-            "Treat these as examples, not a complete rubric. Leave the changes for comparison; do not claim held-out success.\n\n" +
-            `Open cases:\n\`\`\`json\n${prepared.openSource}\n\`\`\``;
-        setDraft(openPrompt);
-        workbenchShell.openPane("chat", { chatSelected: true, fileSelected: false });
-        queueMicrotask(() => composerEl?.focus());
-    }
-
-    async function evaluateAgentImprove(id: ArchetypeId) {
-        const prepared = preparedImproveFor(id);
-        const chat = selected();
-        if (!prepared || !chat || agentSettings()?.id !== id
-            || (isTauri() ? homeState()?.kind !== "direct" : homeState()?.kind !== "connected")) {
-            throw new Error("Open this Agent's connected Workshop and edit chat first.");
-        }
-        if (draft().trim()) {
-            throw new Error("Send or clear the edit-chat draft before evaluating its candidate.");
-        }
-        let result: { reviewer: AgentImproveEvidence };
-        if (isTauri()) {
-            result = await (await import("@tauri-apps/api/core")).invoke<{ reviewer: AgentImproveEvidence }>(
-                "evaluate_agent_improve", { agentId: id, editChatId: chat, campaignRef: prepared.campaignRef },
-            );
-        } else {
-            const key = `gw.agent-improve.operation:${id}:${prepared.campaignRef}`;
-            let operationId = sessionStorage.getItem(key);
-            if (!operationId) {
-                operationId = crypto.randomUUID();
-                sessionStorage.setItem(key, operationId);
-            }
-            // The Home queue binds this key to the exact actor, Agent, chat,
-            // and campaign. A retry after an uncertain response is safe.
-            await api.evaluateAgentImprove(id, chat, prepared.campaignRef, operationId);
-            let completedEvidenceId: string | undefined;
-            for (let attempt = 0; attempt < 120; attempt++) {
-                const operation = await api.agentImproveOperation(id, operationId);
-                if (operation.phase === "failed") {
-                    sessionStorage.removeItem(key);
-                    throw new Error("Home could not complete this evaluation. Review the case pool and try again.");
-                }
-                if (operation.phase === "completed") {
-                    completedEvidenceId = operation.evidence_id;
-                    break;
-                }
-                await new Promise((resolve) => setTimeout(resolve, 2_000));
-            }
-            if (!completedEvidenceId) throw new Error("Evaluation is still running. Choose Evaluate again to resume its status.");
-            const reviewer = await api.agentImproveEvidence(id, prepared.campaignRef) as AgentImproveEvidence | null;
-            if (!reviewer || reviewer.id !== completedEvidenceId) {
-                throw new Error("Home did not return the reviewer evidence for this operation.");
-            }
-            sessionStorage.removeItem(key);
-            result = { reviewer };
-        }
-        setEvaluatedImproveCampaign({
-            agentId: id, account: bearer(), campaignRef: prepared.campaignRef,
-            evidence: result.reviewer,
-        });
-    }
-
-    function placeOpenImproveFeedback(id: ArchetypeId) {
-        const prepared = preparedImproveFor(id);
-        const review = improveEvidenceFor(id);
-        if (!prepared || !review || agentSettings()?.id !== id || !selected()) {
-            throw new Error("Open this Agent's edit chat and reviewer evidence first.");
-        }
-        if (draft().trim()) throw new Error("Send or clear the current edit-chat draft first.");
-        const source = JSON.parse(prepared.openSource) as { scenarios?: Array<{ id?: string }> };
-        const feedback = {
-            open_scenario_ids: (source.scenarios ?? []).map((scenario) => scenario.id),
-            open_verdict: review.card.open_verdict,
-        };
-        setDraft("Revise this Agent's authored files using only the open evaluation feedback below. " +
-            "Do not infer hidden cases or claim held-out success. Leave the revised candidate for another comparison.\n\n" +
-            `Open feedback:\n\`\`\`json\n${JSON.stringify(feedback, null, 2)}\n\`\`\``);
-        workbenchShell.openPane("chat", { chatSelected: true, fileSelected: false });
-        queueMicrotask(() => composerEl?.focus());
-    }
-
-    async function adoptAgentImprove(id: ArchetypeId, evidenceId: string) {
-        if ((isTauri() ? homeState()?.kind !== "direct" : homeState()?.kind !== "connected")
-            || agentSettings()?.id !== id) {
-            throw new Error("Open this Agent's connected Workshop first.");
-        }
-        const changed = isTauri()
-            ? await (await import("@tauri-apps/api/core")).invoke<string[]>("adopt_agent_improve", { agentId: id, evidenceId })
-            : await api.adoptAgentImprove(id, evidenceId);
-        bumpNav();
-        void Promise.all([refetchDiff(), refetchMerge(), refetchChatInfo()]);
-        return changed;
     }
 
     // Opening a Panel agent is one movement across the panes (navigation.md,
@@ -4404,7 +4181,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     navFooter={navFooter}
                     chat={() => <>
                         <div
-                            hidden={props.gaugeApps?.active() || !!projectSettings()}
+                            hidden={props.gaugeApps?.active() || !!projectSettings() || !!agentSettings()}
                             data-work-chat-slot
                             data-chat-drop-target
                             onDragEnter={chatFileDrop.enter}
@@ -4418,11 +4195,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             </Show>
                         </div>
                         <Show when={!props.gaugeApps?.active()}>
-                            <Show when={projectSettings()} keyed>{(project) => <ProjectManagementChat
-                                api={api} project={project.id} name={project.name}
+                            {/* The chat lane follows the content pane: an open
+                                Agent's settings take precedence, as they do there. */}
+                            <Show when={agentSettings()} keyed fallback={
+                                <Show when={projectSettings()} keyed>{(project) => <ManagementChat
+                                    api={api} target={{ app: "project-settings", id: project.id }} name={project.name}
+                                    mobile={workbenchShell.isMobile()}
+                                    onCollapse={() => workbenchShell.setCollapsed("chat", true)}
+                                    onChanged={refreshProjectSettings}
+                                />}</Show>
+                            }>{(agent) => <ManagementChat
+                                api={api} target={{ app: "agent-settings", id: agent.id }} name={agent.name}
                                 mobile={workbenchShell.isMobile()}
                                 onCollapse={() => workbenchShell.setCollapsed("chat", true)}
-                                onChanged={refreshProjectSettings}
+                                onChanged={() => { bumpNav(); }}
                             />}</Show>
                         </Show>
                         <Show when={props.gaugeApps?.active()}>{props.gaugeApps?.chat({
@@ -4467,19 +4253,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 refreshKey={navRefresh()}
                                 onClose={() => setAgentSettings(null)}
                                 onSaved={bumpNav}
-                                onPrepareImprove={improveAvailableFor(a.id)
-                                    ? (poolJson) => prepareAgentImprovePool(a.id, poolJson) : undefined}
-                                preparedImproveRef={preparedImproveFor(a.id)?.campaignRef}
-                                onUsePreparedImprove={() => placePreparedImproveCases(a.id)}
-                                improveRecoveryError={improveRecoveryErrorFor(a.id)}
-                                onEvaluateImprove={improveAvailableFor(a.id) && preparedImproveFor(a.id)
-                                    ? () => evaluateAgentImprove(a.id) : undefined}
-                                improveEvidence={improveEvidenceFor(a.id)}
-                                improveEvidenceError={improveEvidenceErrorFor(a.id)}
-                                onUseOpenFeedback={improveEvidenceFor(a.id)
-                                    ? () => placeOpenImproveFeedback(a.id) : undefined}
-                                onAdoptImprove={improveAvailableFor(a.id)
-                                    ? (evidenceId) => adoptAgentImprove(a.id, evidenceId) : undefined}
                             />}
                         </Show>
                     }>

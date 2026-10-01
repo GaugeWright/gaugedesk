@@ -353,7 +353,10 @@
           "actions": [
             { "id": "create-product", "operation": "commercial-product.create", "lifecycle": "commercial-product", "capability": "commercial-products.manage", "secretBoundary": "real archetype/version reference only" },
             { "id": "view-product", "operation": "commercial-product.read", "lifecycle": "commercial-product", "capability": "commercial-products.read", "secretBoundary": "commercial and engagement summaries only" },
-            { "id": "edit-product", "operation": "commercial-product.revise", "lifecycle": "commercial-product-revision", "capability": "commercial-products.manage", "secretBoundary": "does not modify Agent behavior/source" }
+            { "id": "edit-product", "operation": "commercial-product.revise", "lifecycle": "commercial-product-revision", "capability": "commercial-products.manage", "secretBoundary": "does not modify Agent behavior/source" },
+            { "id": "retire-product", "operation": "commercial-product.retire", "lifecycle": "commercial-product", "capability": "commercial-products.manage", "secretBoundary": "history and referencing engagements preserved" },
+            { "id": "restore-product", "operation": "commercial-product.restore", "lifecycle": "commercial-product", "capability": "commercial-products.manage", "secretBoundary": "commercial status only" },
+            { "id": "delete-product", "operation": "commercial-product.delete", "lifecycle": "commercial-product", "capability": "commercial-products.manage", "secretBoundary": "admitted only when no engagement references the product" }
           ]
         },
         {

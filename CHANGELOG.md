@@ -19,6 +19,15 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- An Agent's settings have their own chat. Selecting an Agent in Workshop shows
+  its settings and, in the chat lane, an Agent Settings conversation that can
+  explain and change its preferred model, its abilities and, for a Panel
+  agent, its public profile. The Agent's edit chats stay rows under it.
+  Deleting the Agent ends those conversations.
+- The Agent improvement campaign controls and hosted comparison routes have
+  been removed. Agent editing, preview, publishing, and placement remain
+  available; WhippleScript's standalone `improve` function is unaffected.
+
 - The model picker offers the current models: Claude Fable 5.1, Opus 5.5,
   Sonnet 5.5 and Haiku 4.5; GPT-6 Astra, 6.1 Sol and Luna; and Grok 4.7. A
   model that a newer one in its line has replaced, such as Claude Opus 4.7 or

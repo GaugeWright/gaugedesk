@@ -4,7 +4,7 @@ import { parseCommercialGaugeAppPage, gaugeAppPageDefinitions } from "./gaugeapp
 import { commercialEmptyModels, commercialTestEngagement, commercialTestRevision, commercialTestInvoice, commercialTestPayout } from "./gaugeapp-commercial-models.fixture";
 
 const counts = { open: 1, active: 0, closed: 0 };
-const product = { id: "product-a", current_revision: 1, commercial: commercialTestRevision, engagement_counts: counts };
+const product = { id: "product-a", status: "active" as const, current_revision: 1, commercial: commercialTestRevision, engagement_counts: counts };
 const client = { client: { id: "client-a", op: "upsert" as const, display_name: "Client", billing_reference: null, status: "active" as const }, engagement_counts: counts, participant_references: [...commercialTestEngagement.terms.proposal_recipients, commercialTestEngagement.terms.billing_recipient] };
 const event = { event_id: "evt-a", event_type: "charge.succeeded", object_id: "ch-a", amount_cents: 1200, currency: "eur", status: "succeeded", engagement_id: "engagement-a", client_id: "client-a", payment_intent_id: "pi-a", platform_fee_cents: 120, created: 1800000000 };
 const populated: CommercialGaugeAppPageData = {

@@ -53,8 +53,9 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     "choice-card",
     "choice-answer",
     "choice-continuation",
-    // Native Agent improve inputs may contain private scenario text. The
-    // private field is additionally sealed with the Home account key.
+    // Historical Agent improve records may still contain private scenario
+    // text. Keep their at-rest protection and account-erasure coverage after
+    // the campaign adapter is removed.
     "agent_improve_campaign_source",
     "agent_improve_campaign_evidence",
     "agent_improve_selected_candidate",

@@ -30,7 +30,7 @@ const revision = shape({
 });
 export type CommercialProductRevision = ReturnType<typeof revision>;
 const counts = shape({ open: integerValue, active: integerValue, closed: integerValue });
-const readProduct = shape({ id: stringValue, current_revision: integerValue, commercial: revision, engagement_counts: counts });
+const readProduct = shape({ id: stringValue, status: oneOf("active", "retired"), current_revision: integerValue, commercial: revision, engagement_counts: counts });
 export type CommercialProduct = ReturnType<typeof readProduct>;
 const product: ModelReader<CommercialProduct> = (value, path) => {
     const result = readProduct(value, path);

@@ -16,7 +16,6 @@
 //! scale-time change behind this same API — not needed for the single-process,
 //! single-user shape — and would not alter the admission semantics above.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1751,70 +1750,6 @@ impl Store {
         Ok(positions)
     }
 
-    /// Reserve several at-most-once record keys as one transition. A key
-    /// already present in the store (or repeated in this batch) refuses the
-    /// entire batch without appending any record. The immediate transaction
-    /// makes a competing connection's reservation visible before it checks.
-    pub fn append_records_with_keys_atomically(
-        &mut self,
-        records: &[(&str, &str, &str, &str)],
-    ) -> Result<Option<Vec<i64>>, AdmitError> {
-        let mut keys = BTreeSet::new();
-        if records
-            .iter()
-            .any(|(scope, key, _, _)| !keys.insert((*scope, *key)))
-        {
-            return Ok(None);
-        }
-        let stored: Result<Vec<(&str, &str, &str, String)>, AdmitError> = records
-            .iter()
-            .map(|(scope, key, kind, payload)| {
-                let payload = match &self.codec {
-                    Some(codec) => codec
-                        .encode(scope, kind, payload)
-                        .map_err(AdmitError::Codec)?,
-                    None => (*payload).to_owned(),
-                };
-                Ok((*scope, *key, *kind, payload))
-            })
-            .collect();
-        let stored = stored?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (scope, key, _, _) in &stored {
-            let exists = tx
-                .prepare_cached(
-                    "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-                )?
-                .query_row(params![scope, key], |_| Ok(()))
-                .optional()?
-                .is_some();
-            if exists {
-                return Ok(None);
-            }
-        }
-        let mut positions = Vec::with_capacity(stored.len());
-        for (scope, key, kind, payload) in stored {
-            let position: i64 = tx
-                .prepare_cached(
-                    "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-                )?
-                .query_row(params![scope], |row| row.get(0))?;
-            tx.prepare_cached(
-                "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            )?
-            .execute(params![scope, position, kind, payload])?;
-            tx.prepare_cached(
-                "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-            )?
-            .execute(params![scope, key, position])?;
-            positions.push(position);
-        }
-        tx.commit()?;
-        Ok(Some(positions))
-    }
-
     /// Atomically append one non-lifecycle record under an idempotency key.
     /// The returned tuple is `(position, inserted)`: a replay returns the
     /// original assigned position and `false` without duplicating the pointer.
@@ -2763,7 +2698,6 @@ mod tests {
             tenant_id: "tenant-a".into(),
             project_id: "project-a".into(),
             work_target_basis: "basis:abc".into(),
-            agent_authoring: None,
             command_id: "command-a".into(),
             payload_digest: "sha256:payload-a".into(),
             profile: ExecutionProfile::IsolatedWorkspace,
@@ -2794,7 +2728,7 @@ mod tests {
                 .admit_with_key::<ManagedExecutionState>(
                     scope,
                     "prepare:command-a",
-                    ManagedExecutionCommand::Prepare(Box::new(workspace_execution_request())),
+                    ManagedExecutionCommand::Prepare(workspace_execution_request()),
                 )
                 .unwrap();
             store
@@ -2864,39 +2798,6 @@ mod tests {
         assert_eq!(
             store.records("chat-1", "runtime_pointer").unwrap(),
             vec!["pointer-a"]
-        );
-    }
-
-    #[test]
-    fn keyed_batch_reservation_is_all_or_nothing() {
-        let mut store = Store::open_in_memory().unwrap();
-        assert_eq!(
-            store
-                .append_records_with_keys_atomically(&[
-                    ("home", "case-a:1", "exposure", "a"),
-                    ("home", "case-b:1", "exposure", "b"),
-                ])
-                .unwrap(),
-            Some(vec![0, 1])
-        );
-        assert_eq!(
-            store
-                .append_records_with_keys_atomically(&[
-                    ("home", "case-a:1", "exposure", "collision"),
-                    ("home", "case-c:1", "exposure", "must-not-append"),
-                ])
-                .unwrap(),
-            None
-        );
-        assert_eq!(store.records("home", "exposure").unwrap(), vec!["a", "b"]);
-        assert_eq!(
-            store
-                .append_records_with_keys_atomically(&[
-                    ("home", "same", "exposure", "x"),
-                    ("home", "same", "exposure", "y"),
-                ])
-                .unwrap(),
-            None
         );
     }
 

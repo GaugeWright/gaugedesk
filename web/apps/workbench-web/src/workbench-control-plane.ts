@@ -91,15 +91,29 @@ export type HomeBootstrapState =
           readonly selectedHome: HomeId | null;
       };
 
-export interface ProjectManagementSession {
+/** A GaugeApp a Home serves through its one management host
+ *  (`crates/app/src/gaugeapp_host.rs`), and the exact thing it manages. */
+export type ManagementTarget =
+    | { readonly app: "project-settings"; readonly id: ProjectId }
+    | { readonly app: "agent-settings"; readonly id: ArchetypeId };
+
+/** Where each GaugeApp's management routes are. The host serves `/sessions`,
+ *  `/agent/messages`, `/agent/stop`, `/agent/erase` and `/commands` under each,
+ *  and `scripts/check-client-calls.mjs` reads this table to match them. */
+const MANAGEMENT_BASES = {
+    "project-settings": (id: string) => `/projects/${encodeURIComponent(id)}/settings`,
+    "agent-settings": (id: string) => `/archetypes/${encodeURIComponent(id)}/settings`,
+} as const;
+
+export interface ManagementSession {
     readonly id: string;
     readonly generation: string;
-    readonly scope: { readonly kind: "project"; readonly id: string };
+    readonly scope: { readonly kind: string; readonly id: string };
     readonly actor: string;
     readonly pages: readonly { readonly id: string; readonly resource_basis: string }[];
     readonly update_cursor: string;
 }
-export interface ProjectManagementMessage {
+export interface ManagementMessage {
     readonly id: string;
     readonly sequence: number;
     readonly role: "user" | "assistant";
@@ -118,17 +132,6 @@ export interface TenantReviewNotification {
  * signed desktop updater may offer its stable release lane. */
 export interface SoftwareUpdatePolicy {
     readonly allowedChannels: readonly string[];
-}
-
-export interface HostedImprovePool {
-    readonly campaign_ref: string;
-    readonly open_source: string;
-}
-
-export interface HostedImproveOperation {
-    readonly operation_id: string;
-    readonly phase: "queued" | "running" | "completed" | "failed";
-    readonly evidence_id?: string;
 }
 
 class NoSelectedHomeError extends Error {}
@@ -1118,77 +1121,62 @@ export class WorkbenchControlPlane implements ControlPlane {
         return (await this.projectTrackerTransport(project)).json;
     }
 
-    async openProjectManagement(project: ProjectId): Promise<ProjectManagementSession> {
-        const json = await this.projectManagementJson(project);
-        const result = await json("POST", `/projects/${encodeURIComponent(project)}/settings/sessions`) as { session: ProjectManagementSession };
+    /** A project's routes are reached at its Home; an Agent's at the Home
+     *  serving this workbench, which owns it. */
+    private async managementRoute(target: ManagementTarget): Promise<{ json: RouteJson; base: string }> {
+        const json = target.app === "project-settings"
+            ? await this.projectManagementJson(target.id)
+            : this.workbenchTransport().json;
+        return { json, base: MANAGEMENT_BASES[target.app](target.id) };
+    }
+
+    async openManagement(target: ManagementTarget): Promise<ManagementSession> {
+        const { json, base } = await this.managementRoute(target);
+        const result = await json("POST", `${base}/sessions`) as { session: ManagementSession };
         return result.session;
     }
 
-    async projectManagementMessages(project: ProjectId, session: ProjectManagementSession): Promise<readonly ProjectManagementMessage[]> {
-        const json = await this.projectManagementJson(project);
+    async managementMessages(target: ManagementTarget, session: ManagementSession): Promise<readonly ManagementMessage[]> {
+        const { json, base } = await this.managementRoute(target);
         const query = new URLSearchParams({ session: session.id, generation: session.generation, scope: session.scope.id });
-        const result = await json("GET", `/projects/${encodeURIComponent(project)}/settings/agent/messages?${query}`) as { thread: { messages: ProjectManagementMessage[] } };
+        const result = await json("GET", `${base}/agent/messages?${query}`) as { thread: { messages: ManagementMessage[] } };
         return result.thread.messages;
     }
 
-    async sendProjectManagementMessage(project: ProjectId, session: ProjectManagementSession, message: string, key: string): Promise<void> {
-        const json = await this.projectManagementJson(project);
-        await json("POST", `/projects/${encodeURIComponent(project)}/settings/agent/messages`, {
+    async sendManagementMessage(target: ManagementTarget, session: ManagementSession, message: string, key: string): Promise<void> {
+        const { json, base } = await this.managementRoute(target);
+        await json("POST", `${base}/agent/messages`, {
             session_id: session.id, generation: session.generation, scope: session.scope,
             idempotency_key: key, message,
         }, { idempotencyKey: key });
     }
 
-    async stopProjectManagement(project: ProjectId, session: ProjectManagementSession): Promise<void> {
-        const json = await this.projectManagementJson(project);
-        await json("POST", `/projects/${encodeURIComponent(project)}/settings/agent/stop`, {
+    async stopManagement(target: ManagementTarget, session: ManagementSession): Promise<void> {
+        const { json, base } = await this.managementRoute(target);
+        await json("POST", `${base}/agent/stop`, {
             session_id: session.id, generation: session.generation, scope: session.scope,
         });
     }
 
-    async eraseProjectManagement(project: ProjectId, session: ProjectManagementSession): Promise<void> {
-        const json = await this.projectManagementJson(project);
+    async eraseManagement(target: ManagementTarget, session: ManagementSession): Promise<void> {
+        const { json, base } = await this.managementRoute(target);
         const key = globalThis.crypto.randomUUID();
-        await json("POST", `/projects/${encodeURIComponent(project)}/settings/agent/erase`, {
+        await json("POST", `${base}/agent/erase`, {
             session_id: session.id, generation: session.generation, scope: session.scope,
             idempotency_key: key,
         }, { idempotencyKey: key });
     }
 
-    async setProjectManagementNetworkIsolation(project: ProjectId, isolated: boolean): Promise<void> {
-        const session = await this.openProjectManagement(project);
-        const json = await this.projectManagementJson(project);
+    /** One command against a freshly admitted session and its page's basis. */
+    async submitManagementCommand(target: ManagementTarget, page: string, command: string, payload: unknown): Promise<void> {
+        const session = await this.openManagement(target);
+        const { json, base } = await this.managementRoute(target);
         const key = globalThis.crypto.randomUUID();
-        await json("POST", `/projects/${encodeURIComponent(project)}/settings/commands`, {
-            session_id: session.id, generation: session.generation, app: "project-settings", scope: session.scope,
-            page_id: "overview", command_id: "project.network-isolation.set",
-            expected_basis: session.pages[0]?.resource_basis,
-            idempotency_key: key, payload: { isolated }, client: "web",
-        }, { idempotencyKey: key });
-    }
-
-    /** DR-0248: a target's name, recorded on the project's collaboration Main. */
-    async setProjectManagementTargetName(project: ProjectId, target: string, name: string): Promise<void> {
-        const session = await this.openProjectManagement(project);
-        const json = await this.projectManagementJson(project);
-        const key = globalThis.crypto.randomUUID();
-        await json("POST", `/projects/${encodeURIComponent(project)}/settings/commands`, {
-            session_id: session.id, generation: session.generation, app: "project-settings", scope: session.scope,
-            page_id: "work-data", command_id: "project.target.name.set",
-            expected_basis: session.pages.find((page) => page.id === "work-data")?.resource_basis,
-            idempotency_key: key, payload: { target_id: target, name }, client: "web",
-        }, { idempotencyKey: key });
-    }
-
-    async setProjectManagementName(project: ProjectId, name: string): Promise<void> {
-        const session = await this.openProjectManagement(project);
-        const json = await this.projectManagementJson(project);
-        const key = globalThis.crypto.randomUUID();
-        await json("POST", `/projects/${encodeURIComponent(project)}/settings/commands`, {
-            session_id: session.id, generation: session.generation, app: "project-settings", scope: session.scope,
-            page_id: "overview", command_id: "project.name.set",
-            expected_basis: session.pages[0]?.resource_basis,
-            idempotency_key: key, payload: { name }, client: "web",
+        await json("POST", `${base}/commands`, {
+            session_id: session.id, generation: session.generation, app: target.app, scope: session.scope,
+            page_id: page, command_id: command,
+            expected_basis: session.pages.find((candidate) => candidate.id === page)?.resource_basis,
+            idempotency_key: key, payload, client: "web",
         }, { idempotencyKey: key });
     }
 
@@ -1402,15 +1390,18 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     renameProject(id: ProjectId, name: string): Promise<void> {
-        return this.setProjectManagementName(id, name);
+        return this.submitManagementCommand({ app: "project-settings", id }, "overview", "project.name.set", { name });
     }
 
+    /** DR-0248: a target's name, recorded on the project's collaboration Main. */
     renameProjectTarget(project: ProjectId, target: string, name: string): Promise<void> {
-        return this.setProjectManagementTargetName(project, target, name);
+        return this.submitManagementCommand({ app: "project-settings", id: project }, "work-data",
+            "project.target.name.set", { target_id: target, name });
     }
 
     setProjectNetworkIsolated(id: ProjectId, isolated: boolean): Promise<void> {
-        return this.setProjectManagementNetworkIsolation(id, isolated);
+        return this.submitManagementCommand({ app: "project-settings", id }, "overview",
+            "project.network-isolation.set", { isolated });
     }
 
     deleteProject(id: ProjectId): Promise<void> {
@@ -1565,35 +1556,6 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     createChatUnderArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {
         return workbenchClient.createChatUnderArchetype(this.workbenchTransport(), archetypeId, title);
-    }
-
-    startAgentImprovePool(id: ArchetypeId, pool: unknown): Promise<HostedImprovePool> {
-        return this.workbenchTransport().json("POST", `/archetypes/${encodeURIComponent(id)}/improve/pool`, pool) as Promise<HostedImprovePool>;
-    }
-
-    latestAgentImprovePool(id: ArchetypeId): Promise<HostedImprovePool | null> {
-        return this.workbenchTransport().json("GET", `/archetypes/${encodeURIComponent(id)}/improve/pool`)
-            .then((value) => value ?? null) as Promise<HostedImprovePool | null>;
-    }
-
-    evaluateAgentImprove(id: ArchetypeId, editChatId: EngagementId, campaignRef: string, operationId: string): Promise<HostedImproveOperation> {
-        return this.workbenchTransport().json("POST", `/archetypes/${encodeURIComponent(id)}/improve/evaluate`, {
-            edit_chat_id: editChatId,
-            campaign_ref: campaignRef,
-        }, { idempotencyKey: operationId }) as Promise<HostedImproveOperation>;
-    }
-
-    agentImproveOperation(id: ArchetypeId, operationId: string): Promise<HostedImproveOperation> {
-        return this.workbenchTransport().json("GET", `/archetypes/${encodeURIComponent(id)}/improve/operations/${encodeURIComponent(operationId)}`) as Promise<HostedImproveOperation>;
-    }
-
-    agentImproveEvidence(id: ArchetypeId, campaignRef: string): Promise<unknown> {
-        return this.workbenchTransport().json("GET", `/archetypes/${encodeURIComponent(id)}/improve/evidence?campaign_ref=${encodeURIComponent(campaignRef)}`);
-    }
-
-    async adoptAgentImprove(id: ArchetypeId, evidenceId: string): Promise<string[]> {
-        const result = await this.workbenchTransport().json("POST", `/archetypes/${encodeURIComponent(id)}/improve/evidence/${encodeURIComponent(evidenceId)}/adopt`) as { changed_paths: string[] };
-        return result.changed_paths;
     }
 
     useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {

@@ -17,6 +17,7 @@ use gaugedesk_store::{AdmitError, Store};
 pub enum GaugeAppKind {
     AccountSettings,
     Administration,
+    AgentSettings,
     CommercialOperations,
     ProjectSettings,
 }
@@ -26,6 +27,7 @@ impl GaugeAppKind {
         match self {
             Self::AccountSettings => "account-settings",
             Self::Administration => "administration",
+            Self::AgentSettings => "agent-settings",
             Self::CommercialOperations => "commercial-operations",
             Self::ProjectSettings => "project-settings",
         }

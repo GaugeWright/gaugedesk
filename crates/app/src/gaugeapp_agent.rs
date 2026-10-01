@@ -58,6 +58,8 @@ pub const AGENT_PROPOSABLE_IMMEDIATE_COMMANDS: &[&str] = &[
     "application-settings.appearance.set",
     "commercial-product.create",
     "commercial-product.revise",
+    "commercial-product.retire",
+    "commercial-product.restore",
     "commercial-client.create",
     "commercial-client.edit",
     "commercial-engagement.proposal.create",
@@ -73,6 +75,9 @@ pub const AGENT_PROPOSABLE_IMMEDIATE_COMMANDS: &[&str] = &[
     "project.name.set",
     "project.network-isolation.set",
     "project.target.name.set",
+    "agent.model.set",
+    "agent.abilities.set",
+    "agent.panel-profile.set",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -549,13 +554,19 @@ fn gaugeapp_agent_generation_scope(session: &GaugeAppSession, generation: u64) -
     }
 }
 
-fn gaugeapp_agent_thread_owner_scope(session: &GaugeAppSession) -> String {
+/// The store scope that owns a GaugeApp's management state: its thread
+/// pointers and, for an app served by [`crate::gaugeapp_host`], its command
+/// receipts. Registering a GaugeApp kind adds one arm here.
+pub(crate) fn gaugeapp_agent_thread_owner_scope(session: &GaugeAppSession) -> String {
     match session.app {
         GaugeAppKind::AccountSettings => account_scope(&session.actor),
         GaugeAppKind::Administration | GaugeAppKind::CommercialOperations => {
             crate::org::tenant_scope(&session.scope.id)
         }
         GaugeAppKind::ProjectSettings => crate::account::project_scope(&session.scope.id),
+        GaugeAppKind::AgentSettings => {
+            crate::agent_settings_gaugeapp::agent_settings_scope(&session.scope.id)
+        }
     }
 }
 
@@ -696,7 +707,7 @@ pub fn migrate_legacy_gaugeapp_agent_transcript(
         GaugeAppKind::AccountSettings => LegacyEnvironmentKind::Hub,
         GaugeAppKind::Administration => LegacyEnvironmentKind::Administration,
         GaugeAppKind::CommercialOperations => LegacyEnvironmentKind::Vend,
-        GaugeAppKind::ProjectSettings => return Ok(false),
+        GaugeAppKind::ProjectSettings | GaugeAppKind::AgentSettings => return Ok(false),
     };
     let legacy_scope = format!(
         "environment-agent:{}:{}:{}",
@@ -1050,6 +1061,23 @@ pub fn crypto_erase_gaugeapp_agent_threads_for_tenant(
                 message.app,
                 GaugeAppKind::Administration | GaugeAppKind::CommercialOperations
             )
+    })?;
+    Ok(scopes
+        .iter()
+        .filter(|scope| workbench.crypto_erase_content(scope))
+        .count())
+}
+
+/// Destroy every independently keyed management transcript of one GaugeApp
+/// scope, for every person who held one. Deleting the thing a GaugeApp
+/// manages — an Agent — calls this so its conversations end with it.
+pub fn crypto_erase_gaugeapp_agent_threads_for_scope(
+    workbench: &Workbench,
+    app: GaugeAppKind,
+    scope: &GaugeAppScope,
+) -> Result<usize, AdmitError> {
+    let scopes = gaugeapp_agent_content_scopes_matching(workbench.store_ref(), |message| {
+        message.app == app && message.scope == *scope
     })?;
     Ok(scopes
         .iter()
@@ -3536,6 +3564,63 @@ mod tests {
         assert_eq!(transcript.len(), 2);
         assert_eq!(transcript[0].text, "Start a new conversation.");
         assert_eq!(transcript[1].text, "Only the new answer remains.");
+    }
+
+    #[test]
+    fn a_scope_cascade_ends_every_persons_thread_for_that_scope_alone() {
+        use std::sync::{Arc, Mutex};
+
+        let root = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::content_vault::ContentVault::new(
+            root.path().join("content-keys"),
+            Box::new(crate::at_rest::LoopbackKeyWrap::new([41u8; 32])),
+        ));
+        let store = Store::open_in_memory().unwrap().with_codec(vault.clone());
+        let workbench = Arc::new(Mutex::new(Workbench::new(store).with_content_vault(vault)));
+        let agent = |actor: &str, id: &str| {
+            let mut session = gaugeapp();
+            session.app = GaugeAppKind::AgentSettings;
+            session.actor = actor.into();
+            session.scope = GaugeAppScope {
+                kind: "agent".into(),
+                id: id.into(),
+            };
+            session
+        };
+        let (alice, bob, other) = (
+            agent("person:alice", "agent-a"),
+            agent("person:bob", "agent-a"),
+            agent("person:alice", "agent-b"),
+        );
+        let turn = GaugeAppAgentTurn {
+            message: "private settings answer".into(),
+            proposals: Vec::new(),
+        };
+        for (session, key) in [(&alice, "alice"), (&bob, "bob"), (&other, "other")] {
+            append_gaugeapp_agent_exchange(&workbench, session, key, "settings question", &turn)
+                .unwrap();
+        }
+        let guard = workbench.lock_unpoisoned();
+        assert_eq!(
+            crypto_erase_gaugeapp_agent_threads_for_scope(
+                &guard,
+                GaugeAppKind::AgentSettings,
+                &alice.scope
+            )
+            .unwrap(),
+            2,
+        );
+        for erased in [&alice, &bob] {
+            assert!(gaugeapp_agent_transcript(guard.store_ref(), erased)
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(
+            gaugeapp_agent_transcript(guard.store_ref(), &other)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
