@@ -448,6 +448,42 @@ impl Workbench {
                 .flat_map(|boundary| [boundary.user_entry_id, boundary.assistant_entry_id])
                 .filter(|entry| *entry <= bound)
                 .collect();
+            // The settle receipt, rather than a successful read tool, proves a
+            // workspace change. Pair it with the run immediately preceding it;
+            // a later retry or a receipt beyond a fork cut cannot qualify it.
+            let mut receipts = std::collections::BTreeMap::new();
+            let mut preceding_run = None;
+            for (position, kind, payload) in &events {
+                if *position > bound {
+                    continue;
+                }
+                if kind == "transcript" {
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(payload) {
+                        if event["type"] == "user" {
+                            preceding_run = None;
+                        } else if event["type"] == "admitted" && event["kind"] == "run" {
+                            preceding_run =
+                                (event["text"] == "run → Completed").then_some(*position);
+                        }
+                    }
+                } else if kind == crate::turn_summary::TURN_SUMMARY_KIND {
+                    if let (Some(run), Ok(summary)) = (
+                        preceding_run.take(),
+                        serde_json::from_str::<crate::turn_summary::TurnSummary>(payload),
+                    ) {
+                        if summary.receipt_status == crate::turn_summary::ReceiptStatus::Completed {
+                            receipts.insert(
+                                run,
+                                serde_json::json!({
+                                    "user_entry_id": summary.user_entry_id,
+                                    "summary_entry_id": position,
+                                    "changed_count": summary.changed_count,
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
             for (position, _, payload) in events
                 .into_iter()
                 .filter(|(position, kind, _)| *position <= bound && kind == "transcript")
@@ -459,6 +495,9 @@ impl Workbench {
                     continue;
                 };
                 object.insert("entry_id".into(), position.into());
+                if let Some(receipt) = receipts.remove(&position) {
+                    object.insert("workspace_change".into(), receipt);
+                }
                 if forkable.contains(&position) {
                     object.insert("forkable".into(), true.into());
                 }

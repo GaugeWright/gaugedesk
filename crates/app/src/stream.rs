@@ -40,6 +40,10 @@ pub enum ServerEvent {
     /// A tool's ✓/✗ and output, correlated to its [`Tool`] line by `call_id`.
     ToolResult {
         call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<String>,
@@ -97,6 +101,8 @@ impl ServerEvent {
             "tool_result" => {
                 let t = obs.tool.as_ref();
                 ServerEvent::ToolResult {
+                    tool: t.map(|i| i.name.clone()),
+                    target: t.and_then(|i| i.target.clone()),
                     call_id: t.map(|i| i.call_id.clone()).unwrap_or_default(),
                     ok: t.and_then(|i| i.ok).unwrap_or(true),
                     result: t.and_then(|i| i.result.clone()),

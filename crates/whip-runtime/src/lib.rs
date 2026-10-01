@@ -2177,6 +2177,7 @@ impl Harness for WhipHarness {
         let command = self.new_turn_command(prompt, images, nonce, admitted_command_id);
         let resources = TurnResources {
             workspace: &self.workspace,
+            workspace_resources: &command.resources,
             chat_id: &self.chat_id,
             mode: self.mode,
             images,
@@ -2261,6 +2262,15 @@ impl Harness for WhipHarness {
         let sink = resources.live.into_inner();
         let mut outcome =
             project_turn_execution(execution, evidence_pointers, &command, sink, !streamed)?;
+        if outcome.error.is_some() {
+            if let Some(reason) = self
+                .runtime
+                .turn_failure_summary(&command)
+                .map_err(invalid_data)?
+            {
+                outcome.error = Some(reason);
+            }
+        }
         outcome.context_reading = context_tokens.map(|last_input_tokens| ContextWindowReading {
             provider: provider_wire_name(self.provider.provider).to_owned(),
             model: self.provider.model.clone(),
@@ -3282,6 +3292,7 @@ impl SecretResolver for ProviderConfig {
 
 struct TurnResources<'a> {
     workspace: &'a NativeWorkspaceResolver,
+    workspace_resources: &'a [ResourceRef],
     chat_id: &'a str,
     mode: gaugedesk_harness::ChatMode,
     images: &'a [ImageContent],
@@ -3304,6 +3315,29 @@ struct TurnResources<'a> {
 }
 
 impl ResourceResolver for TurnResources<'_> {
+    fn model_visible_environment(&self) -> whipplescript_kernel::world_state::EnvironmentState {
+        // The file tools use a virtual view: model paths begin at the target's
+        // presented name, never at the host's materialized storage partition.
+        let mut environment = self.workspace.model_visible_environment();
+        environment.cwd = Some(".".to_owned());
+        environment.workspace_roots = self
+            .workspace_resources
+            .iter()
+            .filter(|resource| {
+                resource.kind == "file_store" && resource.handle != TARGET_MANIFEST_RESOURCE
+            })
+            .map(|resource| {
+                resource
+                    .presented_as
+                    .as_deref()
+                    .or(resource.selector.as_deref())
+                    .unwrap_or(".")
+                    .to_owned()
+            })
+            .collect();
+        environment
+    }
+
     fn model_skill_catalogue_provenance(
         &self,
         skills: &[whipplescript_store::SkillView],
@@ -3835,6 +3869,7 @@ mod tests {
         let mut sink = |_observation: &gaugedesk_harness::Observation| {};
         let resources = TurnResources {
             workspace: &workspace,
+            workspace_resources: &[],
             chat_id: "chat-one",
             mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
@@ -3909,6 +3944,7 @@ mod tests {
         let mut sink = |_observation: &gaugedesk_harness::Observation| {};
         let resources = super::TurnResources {
             workspace: &workspace,
+            workspace_resources: &[],
             chat_id: "test-chat",
             mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
@@ -4015,6 +4051,7 @@ mod tests {
         let mut sink = |_observation: &gaugedesk_harness::Observation| {};
         let resources = super::TurnResources {
             workspace: &workspace,
+            workspace_resources: &[],
             chat_id: "test-chat",
             mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
@@ -4263,6 +4300,60 @@ mod tests {
         assert!(super::validate_workspace_targets(&[impossible]).is_err());
     }
 
+    /// WS-590: a first work chat must tell the model the same folder names
+    /// that the governed file tools admit, without exposing storage partitions.
+    #[test]
+    fn first_chat_model_world_names_the_admitted_target_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = NativeWorkspaceResolver::new(root.path()).unwrap();
+        let admitted = workspace_resource_refs(&[gaugedesk_harness::WorkspaceTargetBinding {
+            target_id: "target-personal".into(),
+            resource_handle: "target:personal".into(),
+            root: "targets/t-opaque-partition".into(),
+            name: "Personal".into(),
+            readable: true,
+            writable: true,
+            output: true,
+        }]);
+        let mut sink = |_: &Observation| {};
+        let resources = TurnResources {
+            workspace: &workspace,
+            workspace_resources: &admitted,
+            chat_id: "first-chat",
+            mode: gaugedesk_harness::ChatMode::Use,
+            images: &[],
+            task_filer: None,
+            asked: std::cell::RefCell::new(Vec::new()),
+            external_tool_handler: None,
+            command_id: "first-turn".into(),
+            live: std::cell::RefCell::new(&mut sink),
+            streamed: std::cell::Cell::new(false),
+        };
+        let environment = resources.model_visible_environment();
+        assert_eq!(environment.cwd.as_deref(), Some("."));
+        assert_eq!(environment.workspace_roots, vec!["Personal"]);
+        std::fs::create_dir_all(root.path().join("targets/t-opaque-partition")).unwrap();
+        let write = |path: &str| ToolCall {
+            id: "write-poem".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path":path,"content":"A first poem."}),
+        };
+        resources
+            .execute_tool(&admitted, &write("Personal/poem.md"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("targets/t-opaque-partition/poem.md"))
+                .unwrap(),
+            "A first poem."
+        );
+        assert!(resources
+            .execute_tool(&admitted, &write("poem.md"))
+            .is_err());
+        assert!(resources
+            .execute_tool(&admitted, &write("../escape.md"))
+            .is_err());
+    }
+
     #[test]
     fn native_workspace_rejects_writes_below_a_read_only_target_root() {
         use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
@@ -4339,6 +4430,7 @@ mod tests {
             };
             let resources = super::TurnResources {
                 workspace: &workspace,
+                workspace_resources: &[],
                 chat_id: "test-chat",
                 mode: gaugedesk_harness::ChatMode::Use,
                 images: &[],
@@ -4924,6 +5016,10 @@ mod tests {
     }
 
     fn signed_harness_policy() -> String {
+        signed_harness_policy_at("https://api.openai.com")
+    }
+
+    fn signed_harness_policy_at(base_url: &str) -> String {
         let principal = ResourcePolicy {
             principal: true,
             ..ResourcePolicy::default()
@@ -4932,6 +5028,8 @@ mod tests {
         let policy = HostGovernancePolicy {
             resources: std::collections::BTreeMap::from([
                 ("file:workspace:chat-1".to_owned(), ordinary.clone()),
+                ("file:personal".to_owned(), ordinary.clone()),
+                ("file:target-manifest".to_owned(), ordinary.clone()),
                 ("memory:turn-images:chat-1".to_owned(), ordinary),
                 ("tracker:tasks".to_owned(), ResourcePolicy::default()),
                 ("command:workspace:chat-1".to_owned(), principal.clone()),
@@ -4941,6 +5039,11 @@ mod tests {
             ]),
             bindings: std::collections::BTreeMap::from([
                 ("project".to_owned(), "file:workspace:chat-1".to_owned()),
+                ("target:personal".to_owned(), "file:personal".to_owned()),
+                (
+                    TARGET_MANIFEST_RESOURCE.to_owned(),
+                    "file:target-manifest".to_owned(),
+                ),
                 (
                     "turn_images".to_owned(),
                     "memory:turn-images:chat-1".to_owned(),
@@ -4962,7 +5065,7 @@ mod tests {
                 ProviderBindingPolicy {
                     provider: "openai".to_owned(),
                     model: "gpt-test".to_owned(),
-                    base_url: "https://api.openai.com".to_owned(),
+                    base_url: base_url.to_owned(),
                     credential_ref: "credential:gaugedesk/account/616c696365/6f70656e6169/v1"
                         .to_owned(),
                     wire: Some("openai-responses".to_owned()),
@@ -5211,6 +5314,264 @@ mod tests {
             &wrong_root,
         )
         .is_err());
+    }
+
+    #[test]
+    fn first_chat_creates_file_continues_and_reopens_through_real_runtime() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let root = tempfile::tempdir().expect("runtime root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let package_root = worktree.path().join(".whipple/versions/1");
+        std::fs::create_dir_all(&package_root).expect("method dir");
+        std::fs::write(
+            package_root.join("package.json"),
+            r#"{
+  "schema":"whipplescript.agent_package.v0",
+  "source":"method.whip",
+  "workflow":"Method",
+  "agent":"assistant",
+  "system_prompt":"persona.md",
+  "capabilities":["workspace.read","workspace.write","command.run","tracker.file"],
+  "agent_abilities":["workspace.read","workspace.write","command.run","tracker.file"],
+  "max_steps":32
+}"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            package_root.join("method.whip"),
+            r#"
+file store project { root "." allow read ["**"] allow write ["**"] }
+workflow Method {
+  agent assistant {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+    capabilities ["workspace.read", "workspace.write", "command.run", "tracker.file"]
+  }
+  rule converse when started => {
+    tell assistant requires ["workspace.read", "workspace.write", "command.run"]
+      with access to project { read ["**"] write ["**"] }
+      with access to command { run }
+      "Run."
+  }
+}
+"#,
+        )
+        .expect("source");
+        std::fs::write(package_root.join("persona.md"), "Use the project method.").expect("method");
+        let package_ref = AuthoredAgentPackage::load(&package_root)
+            .expect("package")
+            .version_ref()
+            .to_owned();
+        let spec = HarnessSpec {
+            chat_id: "chat-1".to_owned(),
+            worktree: worktree.path().to_path_buf(),
+            mode: gaugedesk_harness::ChatMode::Use,
+            package_root: Some(package_root.clone()),
+            package_version_ref: Some(package_ref.clone()),
+            policy_epoch: Some(1),
+            signed_policy_envelope: Some(signed_harness_policy_at(&origin)),
+            provider_binding_ref: Some("model".to_owned()),
+            credential_ref: Some(
+                "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),
+            ),
+            placement_ceiling_ref: Some("local".to_owned()),
+            workspace_targets: vec![gaugedesk_harness::WorkspaceTargetBinding {
+                target_id: "personal".into(),
+                resource_handle: "target:personal".into(),
+                name: "Personal".into(),
+                root: "targets/t-personal".into(),
+                readable: true,
+                writable: true,
+                output: true,
+            }],
+            runtime_placement_id: Some("placement-test".to_owned()),
+            provider: Some("openai".to_owned()),
+            model: Some("gpt-test".to_owned()),
+            base_url: None,
+            thinking: None,
+            system_prompt: None,
+            credential_capability: Some(test_credential_capability()),
+            sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree
+                .path()
+                .to_path_buf()])
+            .read_only(vec![worktree.path().join(".whipple")])
+            .filter_egress(vec!["api.openai.com".to_owned(), "127.0.0.1".to_owned()]),
+            roster: Vec::new(),
+        };
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            SigningKey::from_seed(&[7u8; 32]).expect("key"),
+            root.path(),
+        );
+        let mut first = factory.create_harness(&spec).expect("first harness");
+        // The fixed OpenAI endpoint is replaced only in this test fixture;
+        // the signed runtime policy admits this exact loopback endpoint.
+        first.provider.base_url = origin.clone();
+
+        // A controlled provider speaks the actual Responses HTTP protocol.
+        // Harness, credentials, admission, kernel, native transport and file
+        // tools stay on their production paths; no scripted agent is involved.
+        let calls = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorded = Arc::clone(&calls);
+        let server = std::thread::spawn(move || {
+            for ordinal in 0..6 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        result => panic!("provider accept failed: {result:?}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let start = loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..start]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < start + length {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[start..start + length]).unwrap();
+                recorded.lock().unwrap().push(request.clone());
+                let body = match ordinal {
+                    0 | 1 | 3 => {
+                        assert!(request.to_string().contains("Personal"));
+                        if ordinal == 1 {
+                            // Reproduce the observed first-chat tool refusal:
+                            // its result must retain its matching model call
+                            // so the provider can correct the path and continue.
+                            let input = request["input"].as_array().unwrap();
+                            assert!(input.iter().any(|item| item["type"] == "function_call"
+                                && item["call_id"] == "write-0"));
+                            assert!(input.iter().any(|item| item["type"]
+                                == "function_call_output"
+                                && item["call_id"] == "write-0"
+                                && item["output"]
+                                    .as_str()
+                                    .is_some_and(|text| text.contains("outside the admitted"))));
+                        }
+                        let content = if ordinal < 2 {
+                            "first poem"
+                        } else {
+                            "second poem"
+                        };
+                        let path = if ordinal == 0 {
+                            "poem.md"
+                        } else {
+                            "Personal/poem.md"
+                        };
+                        serde_json::json!({"output":[{"type":"function_call",
+                            "call_id":format!("write-{ordinal}"),"name":"write",
+                            "arguments":serde_json::json!({"path":path,"content":content}).to_string()}]})
+                    }
+                    2 | 4 => {
+                        let input = request["input"].as_array().expect("Responses input");
+                        let id = format!("write-{}", ordinal - 1);
+                        assert!(input
+                            .iter()
+                            .any(|item| item["type"] == "function_call" && item["call_id"] == id));
+                        assert!(input
+                            .iter()
+                            .any(|item| item["type"] == "function_call_output"
+                                && item["call_id"] == id));
+                        serde_json::json!({"output_text":"Done.","usage":{"input_tokens":100,"output_tokens":3}})
+                    }
+                    _ => serde_json::json!({"error":{"message":"synthetic provider refusal"}}),
+                };
+                let (status, content_type, wire) = if ordinal == 5 {
+                    ("400 Bad Request", "application/json", body.to_string())
+                } else if headers.contains("text/event-stream") {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            serde_json::json!({"type":"response.completed","response":body})
+                        ),
+                    )
+                } else {
+                    ("200 OK", "application/json", body.to_string())
+                };
+                write!(socket,"HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}",wire.len()).unwrap();
+            }
+        });
+        fn drive(harness: &mut WhipHarness, prompt: &str) {
+            let outcome = harness
+                .run_turn(&gaugedesk_harness::AllowAllGate, prompt, &[], &mut |_| {})
+                .unwrap();
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            assert_eq!(outcome.assistant_text, "Done.");
+            assert!(outcome.observations.iter().any(|observation| observation
+                .tool
+                .as_ref()
+                .is_some_and(|tool| tool.name == "write" && tool.ok == Some(true))));
+        }
+        std::fs::create_dir_all(worktree.path().join("targets/t-personal")).unwrap();
+        drive(&mut first, "add a file called poem.md");
+        let file = worktree.path().join("targets/t-personal/poem.md");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first poem");
+        let instance = first.instance_ref.clone();
+        drop(first);
+        let mut reopened = factory.create_harness(&spec).unwrap();
+        reopened.provider.base_url = origin;
+        assert_eq!(reopened.instance_ref, instance);
+        drive(&mut reopened, "change the poem");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second poem");
+        assert!(
+            calls.lock().unwrap()[3]
+                .to_string()
+                .contains("add a file called poem.md"),
+            "the reopened second turn retains the first request"
+        );
+        let refused = reopened
+            .run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "exercise a provider refusal",
+                &[],
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(refused
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("synthetic provider refusal"));
+        server.join().unwrap();
+        drop(reopened);
+        assert_eq!(
+            factory.create_harness(&spec).unwrap().instance_ref,
+            instance
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second poem");
     }
 
     #[test]

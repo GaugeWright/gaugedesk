@@ -10,7 +10,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::menu::{CheckMenuItem, Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, HELP_SUBMENU_ID};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
@@ -159,7 +159,10 @@ async fn evaluate_agent_improve(
     let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
     tauri::async_runtime::spawn_blocking(move || {
         gaugedesk_app::evaluate_agent_improve_from_desktop(
-            &wb, &agent_id, &edit_chat_id, &campaign_ref,
+            &wb,
+            &agent_id,
+            &edit_chat_id,
+            &campaign_ref,
         )
     })
     .await
@@ -180,16 +183,46 @@ async fn latest_agent_improve_evidence(
 }
 
 #[tauri::command]
-async fn adopt_agent_improve(
-    agent_id: String,
-    evidence_id: String,
-) -> Result<Vec<String>, String> {
+async fn adopt_agent_improve(agent_id: String, evidence_id: String) -> Result<Vec<String>, String> {
     let wb = HOME.get().ok_or("local Home is unavailable")?.clone();
     tauri::async_runtime::spawn_blocking(move || {
         gaugedesk_app::adopt_agent_improve_from_desktop(&wb, &agent_id, &evidence_id)
     })
     .await
     .map_err(|_| "Agent improvement adoption did not complete".to_owned())?
+}
+
+#[tauri::command]
+fn hash_chat_acceptance_text(text: String) -> Result<String, String> {
+    gaugedesk_app::open_api::chat_acceptance_digest(&text)
+}
+
+#[tauri::command]
+async fn save_chat_acceptance(
+    app: tauri::AppHandle,
+    evidence: serde_json::Value,
+) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let bytes = serde_json::to_vec_pretty(&evidence).map_err(|error| error.to_string())?;
+    if bytes.len() > 16_384 {
+        return Err("chat test evidence is too large".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = app
+            .dialog()
+            .file()
+            .add_filter("JSON evidence", &["json"])
+            .set_file_name("gaugedesk-chat-observation.json")
+            .blocking_save_file()
+        else {
+            return Ok(false);
+        };
+        let path = path.into_path().map_err(|error| error.to_string())?;
+        std::fs::write(path, bytes).map_err(|error| error.to_string())?;
+        Ok(true)
+    })
+    .await
+    .map_err(|_| "chat evidence save did not complete".to_owned())?
 }
 
 fn main() {
@@ -207,6 +240,8 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             restart_app,
+            save_chat_acceptance,
+            hash_chat_acceptance_text,
             open_external,
             notify_chat,
             home_session,
@@ -217,6 +252,31 @@ fn main() {
             latest_agent_improve_evidence,
             adopt_agent_improve
         ])
+        .menu(|app| {
+            let menu = Menu::default(app)?;
+            let capture = MenuItem::with_id(
+                app,
+                "chat-acceptance",
+                "Save chat test evidence…",
+                true,
+                None::<&str>,
+            )?;
+            if let Some(help) = menu
+                .get(HELP_SUBMENU_ID)
+                .and_then(|item| item.as_submenu().cloned())
+            {
+                help.append(&capture)?;
+            }
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "chat-acceptance" {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ =
+                        window.eval("window.dispatchEvent(new CustomEvent('gw-chat-acceptance'))");
+                }
+            }
+        })
         // LOGIN-7: the system-browser opener behind `open_external`. Sign-in and
         // "manage in the Hub" leave through it; the webview itself cannot open
         // anything (its `window.open` is a silent no-op).

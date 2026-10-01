@@ -10,3 +10,14 @@ pub use crate::open_runtime::{
     open_control_plane_root, open_prepare, open_serve, open_serve_workbench,
     open_serve_workbench_with,
 };
+
+/// Hash a small synthetic chat observation inside the native app. The desktop
+/// shell only calls this app surface; it does not reach into the domain crate.
+pub fn chat_acceptance_digest(text: &str) -> Result<String, String> {
+    if text.len() > 1_048_576 {
+        return Err("synthetic chat evidence input is too large".into());
+    }
+    Ok(gaugedesk_core::protected_profile::sha256_hex(
+        text.as_bytes(),
+    ))
+}

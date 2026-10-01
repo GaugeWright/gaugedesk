@@ -527,7 +527,7 @@ export type StreamEvent =
     | { type: "assistant"; text: string; entry_id?: number; forkable?: boolean; origin?: string }
     | { type: "text"; delta: string }
     | { type: "tool"; tool: string; mediated: boolean; call_id?: string; target?: string; args?: string; origin?: string }
-    | { type: "toolresult"; call_id: string; ok: boolean; result?: string; origin?: string }
+    | { type: "toolresult"; call_id: string; ok: boolean; tool?: string; target?: string; result?: string; origin?: string }
     | { type: "blocked"; tool: string; reason: string; origin?: string }
     | { type: "error"; reason: string; code?: string; origin?: string }
     | { type: "admitted"; kind: string; text: string; origin?: string };

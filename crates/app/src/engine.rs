@@ -4071,6 +4071,13 @@ mod tests {
             joined.contains(r#""type":"toolresult""#),
             "the result is durable: {joined}"
         );
+        let result: serde_json::Value = rows
+            .iter()
+            .map(|row| serde_json::from_str::<serde_json::Value>(row).unwrap())
+            .find(|row| row["type"] == "toolresult")
+            .unwrap();
+        assert_eq!(result["tool"], "write");
+        assert_eq!(result["target"], "answer.txt");
         assert!(
             joined.contains("wrote 1 file"),
             "the result body survives: {joined}"

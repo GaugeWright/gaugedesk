@@ -5498,6 +5498,73 @@ fn append_turn(wb: &mut Workbench, chat: &str, user: &str, assistant: &str) -> (
     (user_entry, assistant_entry)
 }
 
+#[test]
+fn transcript_workspace_receipts_are_scoped_to_the_settle_and_fork_cut() {
+    let mut wb = Workbench::new(Store::open_in_memory().unwrap());
+    wb.write_chat_record(lineage_chat("receipt-parent", None, None));
+    let (user, _) = append_turn(&mut wb, "receipt-parent", "write the file", "done");
+    let run = wb
+        .store_mut()
+        .append_record(
+            "receipt-parent",
+            "transcript",
+            &serde_json::json!({"type":"admitted","kind":"run","text":"run → Completed"})
+                .to_string(),
+        )
+        .unwrap();
+    let summary = crate::turn_summary::append(
+        wb.store_mut(),
+        "receipt-parent",
+        &crate::turn_summary::TurnSummary {
+            user_entry_id: user,
+            changed_count: 1,
+            changed_paths: vec!["private/path".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // The parent has the receipt; a fork cut before its admission does not.
+    wb.write_chat_record(lineage_chat(
+        "receipt-child",
+        Some("receipt-parent"),
+        Some(run),
+    ));
+    let parent: serde_json::Value =
+        serde_json::from_str(&wb.engagement_transcript_json("receipt-parent").unwrap()).unwrap();
+    let receipt = &parent[2]["workspace_change"];
+    assert_eq!(receipt["user_entry_id"], user);
+    assert_eq!(receipt["summary_entry_id"], summary);
+    assert_eq!(receipt["changed_count"], 1);
+    assert!(!parent.to_string().contains("private/path"));
+    let child: serde_json::Value =
+        serde_json::from_str(&wb.engagement_transcript_json("receipt-child").unwrap()).unwrap();
+    assert!(child[2]["workspace_change"].is_null());
+    // A later read-only retry has its own receipt, not the first turn's writes.
+    let (later_user, _) = append_turn(&mut wb, "receipt-parent", "read it", "done");
+    wb.store_mut()
+        .append_record(
+            "receipt-parent",
+            "transcript",
+            &serde_json::json!({"type":"admitted","kind":"run","text":"run → Completed"})
+                .to_string(),
+        )
+        .unwrap();
+    crate::turn_summary::append(
+        wb.store_mut(),
+        "receipt-parent",
+        &crate::turn_summary::TurnSummary {
+            user_entry_id: later_user,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let parent: serde_json::Value =
+        serde_json::from_str(&wb.engagement_transcript_json("receipt-parent").unwrap()).unwrap();
+    assert_eq!(parent[2]["workspace_change"]["changed_count"], 1);
+    assert_eq!(parent[5]["workspace_change"]["user_entry_id"], later_user);
+    assert_eq!(parent[5]["workspace_change"]["changed_count"], 0);
+}
+
 /// ADR 0141: a fork's transcript is its parent's records up to the recorded cut
 /// — resolved by lineage, tagged with their authoring scope — followed by its
 /// own. Records past the cut, and the whole prefix of a pre-ADR-0141 fork

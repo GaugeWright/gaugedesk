@@ -19,6 +19,11 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Chats expose the admitted folder names to the model, so a new file-writing
+  turn can use the paths its tools accept. Provider failures retain their reason
+  in the chat. Desktop publication now requires successful first and second
+  file-writing turns and persistence after restarting each installed bundle.
+
 ## [0.5.1] — 2026-10-01
 
 - A Panel agent's deployment now chooses its model provider from who pays for

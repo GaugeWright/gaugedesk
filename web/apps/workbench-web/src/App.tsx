@@ -81,6 +81,7 @@ import { ProjectManagementChat } from "./ProjectManagementChat";
 import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
 import { desktopUpdateOffer, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, withDesktopUpdateTimeout, DESKTOP_UPDATE_CHECK_TIMEOUT_MS, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
+import { chatAcceptanceEvidence } from "./chat-acceptance-observation";
 import { CHAT_NOTIFICATION_EVENT, deliverChatNotice, personIsLooking } from "./chat-notification-delivery";
 import "@gaugewright/gw-embed";
 import {
@@ -1658,6 +1659,28 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             const chat = (event as CustomEvent).detail;
             if (typeof chat === "string" && chat) openNotifiedChat(chat);
         };
+        const saveChatEvidence = async () => {
+            if (!isTauri()) return;
+            const chat = selected();
+            const file = selectedFile();
+            if (!chat || !file) { setStatus("Open the synthetic test file in its chat before saving evidence."); return; }
+            try {
+                const [transcript, session, context, content] = await Promise.all([
+                    api.getTranscript(chat), api.hubSessionStatus(), api.getContextUsage(chat), api.getFile(chat, file),
+                ]);
+                const current = await api.hubSessionStatus();
+                if (selected() !== chat || selectedFile() !== file || current.person !== session.person)
+                    throw new Error("The selected chat, file or account changed during capture.");
+                const { invoke } = await import("@tauri-apps/api/core");
+                const evidence = await chatAcceptanceEvidence({ transcript, session, context, content, chat, file },
+                    (text) => invoke<string>("hash_chat_acceptance_text", { text }));
+                const saved = await invoke<boolean>("save_chat_acceptance", { evidence });
+                setStatus(saved ? "Chat test evidence saved. It contains hashes and outcomes only." : "Chat test evidence was not saved.");
+            } catch (error) { setStatus(`Chat test evidence could not be saved: ${error instanceof Error ? error.message : String(error)}`); }
+        };
+        const captureChatEvidence = () => { void saveChatEvidence(); };
+        window.addEventListener("gw-chat-acceptance", captureChatEvidence);
+        onCleanup(() => window.removeEventListener("gw-chat-acceptance", captureChatEvidence));
         window.addEventListener(CHAT_NOTIFICATION_EVENT, onChatNotification);
         onCleanup(() => window.removeEventListener(CHAT_NOTIFICATION_EVENT, onChatNotification));
     }
