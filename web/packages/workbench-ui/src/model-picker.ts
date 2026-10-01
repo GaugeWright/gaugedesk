@@ -102,6 +102,7 @@ export interface PickableModel {
   readonly thinking: readonly string[];
   readonly reasoning: boolean;
   readonly primary: boolean;
+  readonly legacy?: boolean;
 }
 
 /** A stable key for a pickable model / an enabled-set entry: `provider:id`. */
@@ -136,6 +137,7 @@ export function pickableModels(
           thinking: m.thinking,
           reasoning: m.reasoning,
           primary: tier === "primary",
+          ...(m.legacy ? { legacy: true } : {}),
         });
       }
     }
@@ -165,13 +167,16 @@ export function pickableModels(
 const SNAPSHOT = /\d{6,8}|\d{4}-\d{2}-\d{2}/;
 
 /** The default-visible set when the operator hasn't curated their models: the account's
- *  **primary**, reasoning-capable, non-snapshot models — the modern, agent-suitable ones.
+ *  **primary**, reasoning-capable, non-snapshot, non-legacy models — the current,
+ *  agent-suitable ones. A model superseded in its line stays in the catalog while its
+ *  provider serves it, so a pinned chat keeps its name and the operator can still enable
+ *  it, but it does not crowd the uncurated picker.
  *  A declared endpoint model is already the operator's own choice — they typed the id —
  *  so it is visible without a second act of curation, and without us guessing at
  *  capabilities an unlistable endpoint never reported. */
 export function isDefaultVisible(m: PickableModel): boolean {
   if (providerTakesCustomModel(m.provider)) return true;
-  return m.primary && m.reasoning && !SNAPSHOT.test(m.id);
+  return m.primary && m.reasoning && !m.legacy && !SNAPSHOT.test(m.id);
 }
 
 /** A picker option (the `<option>`): `id`/`provider` are the config pin (empty = no
@@ -202,7 +207,7 @@ export interface ResolvedDefault {
 }
 
 /** The picker's first row: the engine's resolved no-pin default, named —
- *  "GPT-5.5 (default)" — so the row says what will actually run. The value
+ *  "GPT-6.1 Sol (default)" — so the row says what will actually run. The value
  *  stays empty: picking it means "no per-chat override", not a pin. `null`
  *  when no default resolves: a row that said "Default" then named a turn the
  *  engine could not run, so the picker asks for a model instead

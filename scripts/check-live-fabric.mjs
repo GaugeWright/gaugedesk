@@ -2,10 +2,12 @@
 /**
  * Refuse to run a check lane over a checkout a development fabric is serving.
  *
- * The fabric runs this checkout: `devctl up --composition desktop --platform
- * <here>` builds this repository's binaries, serves its web packages through a
- * vite dev server, and watches the tree. A check lane then runs four vite
- * builds and a cargo build over that same tree. On 2026-09-04 a fabric died
+ * The fabric runs this checkout: `devctl up --platform <here>` serves its web
+ * packages through a vite dev server and watches the tree, in either
+ * composition — the hosted one builds gaugewright-cloud's server against this
+ * repository's crates, and `--composition desktop` builds this repository's
+ * own binaries. A check lane then runs four vite builds and a cargo build over
+ * that same tree. On 2026-09-04 a fabric died
  * mid-request during exactly that overlap, with no shutdown line and no kernel
  * kill to explain it, and the session that did it spent its time diagnosing a
  * crash rather than the collision that caused one.

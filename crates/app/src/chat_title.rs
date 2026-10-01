@@ -119,6 +119,15 @@ impl<T: CoerceTransport> CoerceTransport for TitleEffortTransport<'_, T> {
             "openai-codex" | "openai" if known_standard_gpt_five(&model) => {
                 request.body["reasoning"] = serde_json::json!({ "effort": "none" });
             }
+            "openai-codex" | "openai" if matches!(model.as_str(), "gpt-6-sol" | "gpt-6-luna") => {
+                request.body["reasoning"] = serde_json::json!({ "effort": "none" });
+            }
+            // Astra and 6.1 Sol accept neither `none` nor `minimal`.
+            "openai-codex" | "openai"
+                if matches!(model.as_str(), "gpt-6-astra" | "gpt-6.1-sol") =>
+            {
+                request.body["reasoning"] = serde_json::json!({ "effort": "low" });
+            }
             // The documented floor for the Pro variants is medium.
             "openai" if matches!(model.as_str(), "gpt-5.4-pro" | "gpt-5.5-pro") => {
                 request.body["reasoning"] = serde_json::json!({ "effort": "medium" });
@@ -135,9 +144,15 @@ impl<T: CoerceTransport> CoerceTransport for TitleEffortTransport<'_, T> {
             {
                 request.body["reasoning"] = serde_json::json!({ "effort": "low" });
             }
-            // Anthropic's currently shipped models run without extended
-            // thinking when the field is omitted. Other endpoints and the
-            // Grok subscription proxy have no verified low-effort wire here.
+            // The Claude 5 line thinks when `thinking` is omitted, and Opus
+            // 5.5, Sonnet 5.5 and Fable refuse to turn it off, so the title
+            // asks for the lowest effort instead. Earlier Claude models run
+            // without thinking when the field is omitted.
+            "anthropic" if claude_thinks_by_default(&model) => {
+                request.body["output_config"] = serde_json::json!({ "effort": "low" });
+            }
+            // Other endpoints and the Grok subscription proxy have no
+            // verified low-effort wire here.
             _ => {}
         }
         self.inner.post(&request)
@@ -155,6 +170,18 @@ fn known_standard_gpt_five(model: &str) -> bool {
             | "gpt-5.6-sol"
             | "gpt-5.6-terra"
             | "gpt-5.6-luna"
+    )
+}
+
+fn claude_thinks_by_default(model: &str) -> bool {
+    matches!(
+        model,
+        "claude-opus-5"
+            | "claude-opus-5-5"
+            | "claude-sonnet-5"
+            | "claude-sonnet-5-5"
+            | "claude-fable-5"
+            | "claude-fable-5-1"
     )
 }
 
@@ -359,8 +386,13 @@ mod tests {
             ("openai", "gpt-5.4-pro", "medium"),
             ("openai", "gpt-5.5-pro", "medium"),
             ("openai", "gpt-5.6-sol", "none"),
+            ("openai-codex", "gpt-6.1-sol", "low"),
+            ("openai", "gpt-6-astra", "low"),
+            ("openai", "gpt-6-sol", "none"),
+            ("openai-codex", "gpt-6-luna", "none"),
             ("xai", "grok-4.3", "none"),
             ("xai", "grok-4.6", "low"),
+            ("xai", "grok-4.7", "low"),
         ] {
             let descriptor =
                 gaugedesk_whip_runtime::native_provider_descriptor(provider, Some(model), None)
@@ -441,6 +473,38 @@ mod tests {
             inner.0.lock().unwrap()[0].body,
             serde_json::json!({ "model": "custom-model" })
         );
+    }
+
+    #[test]
+    fn claude_title_asks_for_low_effort_only_where_thinking_is_on_by_default() {
+        for (model, asks_low) in [
+            ("claude-opus-5-5", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-fable-5-1", true),
+            ("claude-opus-4-8", false),
+            ("claude-haiku-4-5", false),
+        ] {
+            let descriptor =
+                gaugedesk_whip_runtime::native_provider_descriptor("anthropic", Some(model), None)
+                    .unwrap();
+            let inner = FakeTransport(Mutex::new(Vec::new()));
+            let transport = TitleEffortTransport {
+                inner: &inner,
+                descriptor: &descriptor,
+            };
+            transport
+                .post(&HttpRequest {
+                    url: "https://api.anthropic.com/v1/messages".into(),
+                    headers: Vec::new(),
+                    body: serde_json::json!({ "model": model }),
+                    model_provenance: None,
+                })
+                .unwrap();
+            let body = &inner.0.lock().unwrap()[0].body;
+            let expected = asks_low.then(|| serde_json::json!({ "effort": "low" }));
+            assert_eq!(body.get("output_config").cloned(), expected, "{model}");
+            assert!(body.get("reasoning").is_none(), "{model}");
+        }
     }
 
     #[test]

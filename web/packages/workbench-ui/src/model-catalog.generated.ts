@@ -13,6 +13,9 @@ export interface CatalogModel {
     readonly thinking: readonly string[];
     /** Input modalities the model accepts (e.g. "text", "image"). */
     readonly input: readonly string[];
+    /** Still served, but superseded in its line: reachable through the
+     *  operator's model list, never in the uncurated picker. */
+    readonly legacy?: boolean;
 }
 
 export const MODEL_CATALOG: readonly CatalogModel[] = catalog;

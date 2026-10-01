@@ -3106,30 +3106,39 @@ pub fn native_provider_descriptor(
             wire: provider_model_wire_name(provider_name)?,
         });
     }
+    // A fixed-host provider with a shipped catalog defaults to the current
+    // model of its line there, so a chat that pins nothing runs it (DR-0287).
+    // Change one only alongside its catalog row in
+    // `web/packages/workbench-ui/src/model-catalog.json`.
     let (base_url, endpoint_host, credential_env, default_model) = match provider_name {
         "openai" => (
             "https://api.openai.com",
             "api.openai.com",
             "OPENAI_API_KEY",
-            None,
+            Some("gpt-6.1-sol"),
         ),
         "anthropic" => (
             "https://api.anthropic.com",
             "api.anthropic.com",
             "ANTHROPIC_API_KEY",
-            None,
+            Some("claude-opus-5-5"),
         ),
         "openai-codex" => (
             "https://chatgpt.com",
             "chatgpt.com",
             "GAUGEDESK_CODEX_ACCESS_TOKEN",
-            Some("gpt-5.5"),
+            Some("gpt-6.1-sol"),
         ),
         // xAI's Grok API: a fixed-host OpenAI-compatible endpoint. The wire is
         // the Chat Completions client (ADR 0083 §4), whose builder appends only
         // `/chat/completions`, so the base URL must carry the `/v1` segment —
         // unlike the rows above, whose clients append the full `/v1/...` path.
-        "xai" => ("https://api.x.ai/v1", "api.x.ai", "XAI_API_KEY", None),
+        "xai" => (
+            "https://api.x.ai/v1",
+            "api.x.ai",
+            "XAI_API_KEY",
+            Some("grok-4.7"),
+        ),
         // OpenRouter: a fixed-host aggregator on the same Chat Completions
         // wire, so its base URL carries `/v1` for the same reason xAI's does.
         // Its model ids are vendor-namespaced (`anthropic/claude-sonnet-4.5`)
@@ -3157,7 +3166,7 @@ pub fn native_provider_descriptor(
     let model = model.or(default_model).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "WhippleScript native API-key providers require an explicit model",
+            "this WhippleScript native provider requires an explicit model",
         )
     })?;
     Ok(NativeProviderDescriptor {
@@ -5161,7 +5170,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_descriptor_carries_the_v1_base_and_requires_an_explicit_model() {
+    fn xai_descriptor_carries_the_v1_base_and_defaults_to_the_current_grok() {
         // Fixed host, but on the Chat Completions wire: the client appends only
         // `/chat/completions`, so the base URL MUST already carry `/v1` or every
         // turn 404s (the openai-generic lesson, live-confirmed 2026-07-19).
@@ -5170,8 +5179,12 @@ mod tests {
         assert_eq!(desc.base_url, "https://api.x.ai/v1");
         assert_eq!(desc.endpoint_host, "api.x.ai");
         assert_eq!(desc.model, "grok-4.6");
-        // Like the other fixed-host API-key providers, the model is not defaulted.
-        assert!(native_provider_descriptor("xai", None, None).is_err());
+        // Like the other fixed-host providers with a shipped catalog, an
+        // unpinned turn runs the current model of the line (DR-0287).
+        assert_eq!(
+            native_provider_descriptor("xai", None, None).unwrap().model,
+            "grok-4.7"
+        );
         // base_url is ignored for fixed-host providers rather than honored.
         let pinned =
             native_provider_descriptor("xai", Some("grok-4.6"), Some("https://evil.example"))

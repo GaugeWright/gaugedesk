@@ -1596,14 +1596,20 @@ fn metered_route_on(model: &str, gateway: &str) -> MeteredRoute {
 /// build that avoids it while keeping the agent's tools, so the surface is the
 /// thing that has to change.
 ///
+/// The GPT-6 families reason by default too, and Astra and 6.1 Sol cannot be
+/// asked not to, so they take the same surface. Codex and an OpenAI key default
+/// to `gpt-6.1-sol` (DR-0287), which is what an unpinned Panel version publishes
+/// with (DR-0272).
+///
 /// Deliberately a family test rather than a catalogue lookup: the catalogue
 /// lives in the workbench UI and this decision is made where the release is
 /// built. It is also deliberately narrow — models that work on the shim today
 /// keep it, so this fix moves exactly the deployments that are broken.
 fn openai_requires_responses(model: &str) -> bool {
-    // `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna`, and whatever the next
-    // point release of that family is called.
-    model.starts_with("gpt-5.6")
+    // `gpt-5.6-terra`, `gpt-5.6-sol`, `gpt-5.6-luna`; `gpt-6-astra`,
+    // `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`; and whatever the next point
+    // release of either family is called.
+    model.starts_with("gpt-5.6") || model.starts_with("gpt-6")
 }
 
 /// Why this model cannot be served from this surface, if it cannot.
@@ -1721,6 +1727,19 @@ mod metered_rail {
         // selects the provider, so the native surface takes a bare name.
         assert_eq!(super::metered_route("openai/gpt-5.6-terra"), route);
 
+        // GPT-6 reasons by default as well, and is the Codex and OpenAI-key
+        // default an unpinned Panel version publishes with (DR-0287).
+        for model in ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"] {
+            let route = super::metered_route(model);
+            assert!(
+                route.base_url.ends_with("/openai"),
+                "{model}: {}",
+                route.base_url
+            );
+            assert_eq!(route.model, model);
+            assert_eq!(route.wire, super::WIRE_OPENAI_RESPONSES, "{model}");
+        }
+
         // The fix is narrow on purpose. A model that works on the shim today
         // keeps it, so this moves only the deployments that are broken.
         let compat = super::metered_route("gpt-5.5");
@@ -1786,7 +1805,10 @@ mod metered_rail {
             "gpt-5.5",
             "gpt-5.6-terra",
             "openai/gpt-5.6-luna",
+            "gpt-6.1-sol",
+            "openai/gpt-6-luna",
             "claude-opus-5",
+            "claude-opus-5-5",
             "anthropic/claude-sonnet-5",
             "grok-4",
             "some-future-model",

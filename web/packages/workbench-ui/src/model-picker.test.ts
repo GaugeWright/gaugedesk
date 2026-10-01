@@ -127,6 +127,33 @@ describe("model-picker", () => {
         expect(isDefaultVisible(codexGpt)).toBe(true);
     });
 
+    it("a legacy model is hidden until enabled, and a chat pinned to it keeps it", () => {
+        const withLegacy: CatalogModel[] = [
+            ...CAT,
+            { provider: "anthropic", id: "claude-opus-4-5", name: "Claude Opus 4.5", reasoning: true, thinking: ["off", "high"], input: ["text"], legacy: true },
+        ];
+        const [legacy] = pickableModels(["anthropic"], withLegacy).filter((m) => m.id === "claude-opus-4-5");
+        expect(legacy.legacy).toBe(true);
+        expect(isDefaultVisible(legacy)).toBe(false);
+        expect(defaultVisibleKeys(["anthropic"], withLegacy).has("anthropic:claude-opus-4-5")).toBe(false);
+        expect(modelOptions(["anthropic"], null, undefined, withLegacy).map((o) => o.id)).not.toContain("claude-opus-4-5");
+        const enabled = new Set(["anthropic:claude-opus-4-5"]);
+        expect(modelOptions(["anthropic"], enabled, undefined, withLegacy).map((o) => o.id)).toEqual(["claude-opus-4-5"]);
+        const pinned = { id: "claude-opus-4-5", provider: "anthropic" };
+        expect(modelOptions(["anthropic"], null, pinned, withLegacy).map((o) => o.id)).toContain("claude-opus-4-5");
+    });
+
+    it("the shipped catalog's uncurated picker offers each line's current model, not its predecessors", () => {
+        const ids = modelOptions(["anthropic"], null, undefined, MODEL_CATALOG).map((o) => o.id);
+        expect(ids).toContain("claude-opus-5-5");
+        expect(ids).toContain("claude-sonnet-5-5");
+        expect(ids).not.toContain("claude-opus-5");
+        expect(ids).not.toContain("claude-opus-4-6");
+        const codex = modelOptions(["openai-codex"], null, undefined, MODEL_CATALOG).map((o) => o.id);
+        expect(codex).toContain("gpt-6.1-sol");
+        expect(codex).not.toContain("gpt-5.5");
+    });
+
     it("an explicit empty enabled set shows only the default (operator disabled everything)", () => {
         const codexDefault = { provider: "openai-codex", model: "gpt-5.5" };
         const labels = modelOptions(["openai-codex"], new Set(), undefined, CAT, codexDefault).map((o) => o.label);
@@ -181,7 +208,7 @@ describe("xai fixed-host provider", () => {
         // so this is the drift guard.
         const opts = modelOptions(["xai"], null, undefined, MODEL_CATALOG);
         const grok = opts.filter((o) => o.provider === "xai");
-        expect(grok.map((o) => o.id)).toContain("grok-4.6");
+        expect(grok.map((o) => o.id)).toContain("grok-4.7");
         expect(grok.length).toBeGreaterThanOrEqual(2);
     });
 

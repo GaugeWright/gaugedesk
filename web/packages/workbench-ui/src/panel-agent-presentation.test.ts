@@ -114,16 +114,20 @@ describe("choosing a model", () => {
     it("offers every model the catalog lists for the providers that can serve a deployment", () => {
         // Containment, not an exact list: the catalog grows, and this follows it.
         expect(ids()).toEqual(expect.arrayContaining([
-            "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6-terra",
-            "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5",
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna",
+            "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5",
         ]));
+        // A model superseded in its line is not offered, as in the chat picker (DR-0287).
+        expect(ids()).not.toContain("gpt-5.4-mini");
+        expect(ids()).not.toContain("claude-sonnet-4-6");
         // The moving alias stands for its date-pinned snapshot, as in the chat picker.
         expect(ids()).not.toContain("claude-haiku-4-5-20251001");
     });
 
-    it("keeps a model the profile already pins, even one the catalog lacks", () => {
+    it("keeps a model the profile already pins, even one the catalog lacks or retires", () => {
         expect(ids("gpt-5-mini")).toContain("gpt-5-mini");
-        expect(ids("gpt-5.5").filter((id) => id === "gpt-5.5")).toHaveLength(1);
+        expect(ids("gpt-5.4-mini")).toContain("gpt-5.4-mini");
+        expect(ids("gpt-6.1-sol").filter((id) => id === "gpt-6.1-sol")).toHaveLength(1);
     });
 
     it("pins and unpins without touching the token ceilings", () => {

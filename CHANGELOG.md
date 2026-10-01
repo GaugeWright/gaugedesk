@@ -19,6 +19,19 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- The model picker offers the current models: Claude Fable 5.1, Opus 5.5,
+  Sonnet 5.5 and Haiku 4.5; GPT-6 Astra, 6.1 Sol and Luna; and Grok 4.7. A
+  model that a newer one in its line has replaced, such as Claude Opus 4.7 or
+  GPT-5.5, is hidden until you enable it under "Models in the picker", and a
+  chat already using one keeps it. Retired models are gone: Claude 3.x,
+  Claude Opus 4.1, Claude Haiku 3, and GPT-5.4 for a Codex sign-in.
+- A chat that pins no model now runs GPT-6.1 Sol when you are signed in to
+  Codex. Before, it ran GPT-5.5, which Codex retires on 2026-10-14. With only
+  an Anthropic, OpenAI or xAI key linked, it now runs Claude Opus 5.5, GPT-6.1
+  Sol or Grok 4.7, billed to that key, instead of asking you to pick a model.
+  A Panel agent that pins no model publishes with the same default, so pin a
+  model if you want a cheaper one for visitors.
+
 ## [0.5.3] — 2026-10-01
 
 - Signed in on the desktop, the workbench now opens on the selected account's

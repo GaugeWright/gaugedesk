@@ -204,6 +204,22 @@ async fn default_model_follows_the_linked_credentials() {
 }
 
 #[tokio::test]
+async fn a_sole_keyed_provider_names_its_current_model() {
+    let (_dir, app) = workbench();
+    let (s, _) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(r#"{"provider":"anthropic","token":"sk-ant-test"}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_s, body) = send(&app, "GET", "/account/default-model", None).await;
+    assert_eq!(body["provider"], "anthropic");
+    assert_eq!(body["model"], "claude-opus-5-5");
+}
+
+#[tokio::test]
 async fn oauth_credential_stays_out_of_the_generic_credential_list() {
     let (_dir, app) = workbench();
 
