@@ -5027,6 +5027,7 @@ async fn exact_pre_target_defaults_migrate_additively() {
     {
         let mut store = Store::open(root.join("gaugewright.db").to_str().unwrap()).unwrap();
         let agent = AgentRecord {
+            authoring_owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: DEFAULT_AGENT.into(),
@@ -5174,6 +5175,7 @@ async fn pre_target_store_is_rejected_instead_of_self_healed() {
             )
             .unwrap();
         let agent = AgentRecord {
+            authoring_owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: DEFAULT_AGENT.into(),

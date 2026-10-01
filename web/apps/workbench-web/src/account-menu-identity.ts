@@ -7,7 +7,9 @@ export function accountMenuIdentity(
     hasAccountAuthority: boolean,
     native: Pick<HubSessionStatus, "linked" | "expired" | "label" | "person"> | null | undefined,
     homeActor: string | null,
+    localAccount = false,
 ): MenuIdentity | null {
+    if (localAccount) return { name: "Local account" };
     if (admitted) return admitted;
     const nativePerson = native?.linked === true && !native.expired ? native.label ?? native.person : null;
     const person = nativePerson ?? (hasAccountAuthority ? null : homeActor);

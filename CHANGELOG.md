@@ -19,6 +19,11 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Workshop keeps existing local Agents and edit chats in the local account
+  across sign-in and upgrades. Its listings and file access follow the selected
+  account, and the desktop account menu names and opens the local account.
+  Failed file reads now show an error with retry instead of staying on loading.
+
 ## [0.5.0] — 2026-09-30
 
 - First sign-in on a fresh computer opens its local Home directly when the

@@ -744,12 +744,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const keepAlive = window.setInterval(() => void refetchHubSession(), 5 * 60 * 1000);
         onCleanup(() => window.clearInterval(keepAlive));
     }
-    // Who the account menu names. The trigger *is* the identity, so this has to be able
-    // to say "nobody" — `null` is the signed-out state, not a value still loading. An
-    // address is split so the trigger carries a name and the menu head the proof of
-    // which account it is, rather than printing the same string twice.
+    // The native signed-out context is the local account; an external account
+    // requires its own live sign-in. Never label a local selection with a stale
+    // hosted account projection while that selection is clearing.
+    const localAccount = () => isTauri() && (hubSession()?.local === true
+        || (hubSession()?.linked === false && !hubSession()?.expired && !hubSession()?.localChoiceRequired));
     const menuIdentity = createMemo(() => accountMenuIdentity(
         props.gaugeApps?.accountIdentity(), Boolean(props.gaugeApps), hubSession(), authority(),
+        localAccount(),
     ));
     // What the signed-in account reaches (ADR 0114): Homes and opaque
     // project-to-Home routes, proxied by the control plane with its sealed
@@ -2586,6 +2588,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 managedInferenceEditable={import.meta.env.VITE_HOME_SPLIT !== "true"}
                 librarySyncAvailable={import.meta.env.VITE_HOME_SPLIT !== "true"}
                 identity={menuIdentity}
+                localAccount={localAccount}
                 version={clientBuild.version}
                 hubUrl={props.hubUrl}
                 openAccount={accountRequest}
@@ -2622,7 +2625,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 }))}
                 onSelectAccount={(person) => void switchAccount(person)}
                 onAddAccount={() => setSignInOpen(true)}
-                onUseLocal={isTauri() && !hubSession()?.local ? () => void switchLocal() : undefined}
+                onUseLocal={isTauri() ? () => void switchLocal() : undefined}
                 switchingAccount={switchingAccount}
                 accountSwitchError={accountSwitchError}
                 openExternal={openExternal}

@@ -79,45 +79,47 @@ pub async fn get_workspace(
 }
 
 pub(crate) fn workspace_actor(wb: &Workbench, headers: &axum::http::HeaderMap) -> Option<String> {
-    match crate::net_http::bearer(headers) {
+    // Admission already ran at the route boundary. Resolve identity without
+    // repeating its client observation with an empty software report.
+    match net_http::bearer(headers) {
         Some(bearer) => wb
             .authenticate_bearer(bearer)
             .map(|actor| actor.as_str().to_owned()),
-        None => wb.home_owner_account(),
+        None => (!wb.hosted_home_mode()
+            && wb.idp.is_none()
+            && !crate::workbench_auth::web_account_mode())
+        .then(|| wb.authority().as_str().to_owned()),
     }
 }
 
 #[allow(clippy::result_large_err)]
-fn admit_agent_source_owner(
+fn admit_agent_authoring_owner(
     wb: &Workbench,
     id: &str,
     headers: &HeaderMap,
 ) -> Result<String, axum::response::Response> {
-    let actor = match wb.admit_data_request(net_http::bearer(headers), None) {
+    let actor = match wb.admit_data_request_with_client(
+        net_http::bearer(headers),
+        None,
+        &crate::workbench_auth::req_scope(headers),
+        crate::client_admission::ClientBuild::from_headers(headers),
+        false,
+    ) {
         Ok(actor) if actor != "anonymous" => actor,
         Ok(_) => {
             return Err((StatusCode::UNAUTHORIZED, "authenticate to edit an Agent").into_response())
         }
         Err(error) => return Err(error.into_response()),
     };
-    if crate::method_access::account_backed(wb, headers) {
-        let agent = wb
-            .library
-            .agents
-            .get(id)
-            .ok_or_else(|| (StatusCode::NOT_FOUND, "no such Agent").into_response())?;
-        if agent
-            .versions
-            .get(&agent.current_version)
-            .and_then(|version| version.source_owner_authority.as_deref())
-            != Some(actor.as_str())
-        {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Agent source ownership is unverified",
-            )
-                .into_response());
-        }
+    if !wb.library.agents.contains_key(id) {
+        return Err((StatusCode::NOT_FOUND, "no such Agent").into_response());
+    }
+    if !wb.agent_authoring_visible(id, Some(&actor)) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Agent authoring is unavailable to this account",
+        )
+            .into_response());
     }
     Ok(actor)
 }
@@ -126,8 +128,8 @@ fn admit_agent_source_owner(
 /// projects that are not visible and any recent chat outside a visible project. Under
 /// [`ProjectVisibility::All`] (solo / owner / admin / bootstrap), ordinary projects
 /// are untouched; Tutorials still shows only the learner's own instance. The
-/// archetype library is shared method truth (a placement
-/// shows its archetype's name as lineage), so it is not project-scoped here.
+/// Workshop draft ownership is independent of project administration. Placement
+/// lineage remains visible through its project, without exposing the draft.
 pub fn scope_workspace_value(
     wb: &Workbench,
     mut value: serde_json::Value,
@@ -135,6 +137,41 @@ pub fn scope_workspace_value(
     actor: Option<&str>,
 ) -> serde_json::Value {
     use crate::workbench_auth::ProjectVisibility;
+    if let Some(agents) = value.get_mut("archetypes").and_then(|v| v.as_array_mut()) {
+        agents.retain(|agent| {
+            agent["id"]
+                .as_str()
+                .is_some_and(|id| wb.agent_authoring_visible(id, actor))
+        });
+        for agent in agents {
+            if let Some(chats) = agent.get_mut("chats").and_then(|v| v.as_array_mut()) {
+                chats.retain(|chat| {
+                    chat["id"]
+                        .as_str()
+                        .is_some_and(|id| wb.authoring_chat_visible(id, actor) == Some(true))
+                });
+            }
+        }
+    }
+    if let Some(targets) = value.get_mut("work_targets").and_then(|v| v.as_array_mut()) {
+        targets.retain(|target| {
+            target["owner_kind"] != "archetype"
+                || target["owner_id"]
+                    .as_str()
+                    .is_some_and(|id| wb.agent_authoring_visible(id, actor))
+        });
+    }
+    if let Some(streams) = value.get_mut("workstreams").and_then(|v| v.as_array_mut()) {
+        streams.retain(|stream| {
+            stream["placement_id"]
+                .as_str()
+                .and_then(|id| wb.library.instances.get(id))
+                .is_none_or(|instance| {
+                    instance.kind != crate::library::InstanceKind::Authoring
+                        || wb.agent_authoring_visible(&instance.agent_id, actor)
+                })
+        });
+    }
     // Owner/admin can administer every project, but the everyday Projects
     // facet shows only the Tutorials instance belonging to this learner.
     let own_product_project = |id: &str| {
@@ -157,6 +194,12 @@ pub fn scope_workspace_value(
     }
     if let Some(recent) = value.get_mut("recent").and_then(|r| r.as_array_mut()) {
         recent.retain(|chat| {
+            if chat["id"]
+                .as_str()
+                .is_some_and(|id| wb.authoring_chat_visible(id, actor) == Some(false))
+            {
+                return false;
+            }
             chat.get("id")
                 .and_then(|i| i.as_str())
                 .and_then(|id| wb.library.project_of_chat(id))
@@ -178,7 +221,10 @@ pub fn scope_workspace_value(
         recent.retain(|c| {
             c.get("id")
                 .and_then(|i| i.as_str())
-                .map(|id| wb.chat_visible(id, vis))
+                .map(|id| {
+                    wb.authoring_chat_visible(id, actor)
+                        .unwrap_or_else(|| wb.chat_visible(id, vis))
+                })
                 .unwrap_or(false)
         });
     }
@@ -496,7 +542,8 @@ pub async fn search(
         return (status, Json(json!({ "error": error }))).into_response();
     }
     let visibility = wb.project_visibility_in(bearer, &scope);
-    Json(wb.search_value_visible(&sq.q, &visibility)).into_response()
+    let actor = workspace_actor(&wb, &headers);
+    Json(wb.search_value_visible(&sq.q, &visibility, actor.as_deref())).into_response()
 }
 
 // ---- GET /tasks : the human task queue -----------------------------------
@@ -626,7 +673,7 @@ pub async fn copy_agent_as_panel(
     Json(body): Json<ForkArchetype>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_source_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
         return error;
     }
     match wb.copy_agent_as_panel(&id, body.name) {
@@ -667,7 +714,7 @@ pub async fn fork_archetype(
     Json(body): Json<ForkArchetype>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_source_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
         return error;
     }
     match wb.fork_archetype(&id, body.name) {
@@ -704,7 +751,7 @@ pub async fn post_pull_from_source(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_source_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
         return error;
     }
     match wb.pull_archetype_from_source(&id) {
@@ -751,8 +798,12 @@ pub async fn post_pull_from_source(
 pub async fn get_agent(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.agent_record(&id) {
         Some(a) => Json(json!({
             "id": a.id,
@@ -773,8 +824,12 @@ pub async fn get_agent(
 pub async fn get_panel_profile(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.panel_profile(&id) {
         Ok(profile) => Json(profile).into_response(),
         Err(error) if error == "no such agent" => {
@@ -787,9 +842,13 @@ pub async fn get_panel_profile(
 pub async fn put_panel_profile(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(profile): Json<PanelPublicProfile>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.set_panel_profile(&id, profile) {
         Ok(profile) => Json(profile).into_response(),
         Err(error) if error == "no such agent" => {
@@ -806,8 +865,12 @@ pub async fn put_panel_profile(
 pub async fn get_archetype_abilities(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.archetype_abilities(&id) {
         Ok(abilities) => Json(json!({ "abilities": abilities })).into_response(),
         Err(error) if error == "no such archetype" => {
@@ -825,9 +888,13 @@ pub struct UpdateArchetypeAbilities {
 pub async fn put_archetype_abilities(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<UpdateArchetypeAbilities>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.set_archetype_abilities(&id, body.abilities) {
         Ok(abilities) => Json(json!({ "abilities": abilities })).into_response(),
         Err(error) if error == "no such archetype" => {
@@ -862,6 +929,7 @@ pub struct UpdateAgent {
 pub async fn update_agent(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<UpdateAgent>,
 ) -> impl IntoResponse {
     if let Some(cfg) = &body.config {
@@ -874,6 +942,9 @@ pub async fn update_agent(
         }
     }
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+        return error;
+    }
     let Some(updated) = wb.update_agent_record(&id, body.name, body.config) else {
         return (
             StatusCode::NOT_FOUND,
@@ -893,8 +964,12 @@ pub async fn update_agent(
 pub async fn delete_agent(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+        return error;
+    }
     match wb.delete_agent_cascade(&id) {
         Ok(()) => (StatusCode::OK, Json(json!({ "deleted": id }))).into_response(),
         Err(AgentDeleteError::DefaultAgent) => (
@@ -1507,7 +1582,7 @@ pub async fn post_publish_archetype(
     Json(body): Json<PublishArchetype>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let owner = match admit_agent_source_owner(&wb, &id, &headers) {
+    let owner = match admit_agent_authoring_owner(&wb, &id, &headers) {
         Ok(owner) => owner,
         Err(error) => return error,
     };
@@ -1652,17 +1727,13 @@ pub async fn create_chat_under_agent(
     Json(body): Json<CreateChat>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let creator = if crate::method_access::account_backed(&wb, &headers) {
-        match admit_agent_source_owner(&wb, &id, &headers) {
-            Ok(actor) => Some(actor),
-            Err(error) => return error,
-        }
-    } else {
-        None
+    let creator = match admit_agent_authoring_owner(&wb, &id, &headers) {
+        Ok(actor) => actor,
+        Err(error) => return error,
     };
     match wb.create_chat_under_agent(&id, &body.title) {
         Ok(v) => {
-            if let (Some(creator), Some(chat)) = (creator, v["id"].as_str()) {
+            if let Some(chat) = v["id"].as_str() {
                 wb.claim_chat_owner(chat, &creator);
             }
             (StatusCode::CREATED, Json(v)).into_response()

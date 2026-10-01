@@ -225,6 +225,10 @@ pub struct ArchetypeVersionRecord {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AgentRecord {
     pub id: String,
+    /// Account owning the mutable Workshop draft, independent of frozen
+    /// publisher provenance. Missing on legacy records (DR-0271).
+    #[serde(default)]
+    pub authoring_owner: Option<String>,
     #[serde(default)]
     pub op: RecordOp,
     pub name: String,
@@ -1742,6 +1746,7 @@ mod tests {
 
     fn agent(store: &mut Store, id: &str, op: RecordOp, name: &str) {
         let r = AgentRecord {
+            authoring_owner: None,
             schema: LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: id.into(),

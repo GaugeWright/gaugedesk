@@ -124,6 +124,8 @@ export function SettingsMenu(props: {
     onSelectAccount?: (person: string) => void;
     onAddAccount?: () => void;
     onUseLocal?: () => void;
+    /** The selected native local account has no external sign-in to end. */
+    localAccount?: Accessor<boolean>;
     switchingAccount?: Accessor<boolean>;
     accountSwitchError?: Accessor<string>;
     /** Authenticated org floor supplied only by an enrolled composition. */
@@ -255,7 +257,8 @@ export function SettingsMenu(props: {
                     props.onAddAccount?.();
                 } },
                 ...(props.onUseLocal ? [{
-                    id: "use-local", label: "Use this computer locally", disabled: busy,
+                    id: "use-local", label: "Local account", hint: props.localAccount?.() ? "Current" : undefined,
+                    disabled: busy || props.localAccount?.(),
                     run: () => props.onUseLocal?.(),
                 }] : []),
             ];
@@ -315,7 +318,7 @@ export function SettingsMenu(props: {
                 },
             });
         }
-        if ((props.accountChoices?.().length ?? 0) > 0) {
+        if ((props.accountChoices?.().length ?? 0) > 0 || props.onUseLocal) {
             rows.push({
                 id: "change-account",
                 label: "Change account",
@@ -328,7 +331,7 @@ export function SettingsMenu(props: {
         // composition holds no account at all there is no verb to offer.
         if (accountAvailable()) {
             rows.push({ id: "session-rule", label: "", separator: true, run: () => {} });
-            if (!props.identity?.()) {
+            if (!props.identity?.() || props.localAccount?.()) {
                 // The trigger reads "Sign in"; this is where that promise is kept.
                 rows.push({
                     id: "sign-in",

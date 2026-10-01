@@ -751,6 +751,7 @@ impl Workbench {
         }
         if account_backed_viewer
             && !self.is_installed_method_path(chat_id, path)
+            && !self.authoring_draft_readable(chat_id, path, viewer)
             && !viewer.is_some_and(|viewer| {
                 crate::context_inspection::file_readable(
                     self,
@@ -3710,6 +3711,7 @@ pub(crate) async fn get_tree(
                 .filter(|e| {
                     !crate::method_access::account_backed_chat(&wb, &id, &headers)
                         || wb.is_installed_method_path(&id, &e.path)
+                        || wb.authoring_draft_readable(&id, &e.path, Some(&viewer))
                         || if e.is_dir {
                             crate::context_inspection::directory_visible(&wb, &id, &viewer, &e.path)
                         } else {
@@ -3780,9 +3782,13 @@ impl FileManagerCommand {
 pub(crate) async fn post_file_manager_command(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(command): Json<FileManagerCommand>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = crate::method_access::chat_reader(&wb, &id, &headers) {
+        return error.into_response();
+    }
     match wb.apply_file_manager_command(&id, &command) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "updated": true }))).into_response(),
         Err((status, reason)) => {
@@ -3901,10 +3907,14 @@ pub(crate) struct SaveFileBody {
 pub(crate) async fn put_file(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Query(q): Query<FileQuery>,
     body: String,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if let Err(error) = crate::method_access::chat_reader(&wb, &id, &headers) {
+        return error.into_response();
+    }
     if let Err(reason) = wb.authorize_file_edit(&id, &q.path) {
         return (StatusCode::FORBIDDEN, reason).into_response();
     }
@@ -3996,9 +4006,13 @@ pub(crate) struct MergePreviewBody {
 pub(crate) async fn post_merge_preview(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<MergePreviewBody>,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
+    if let Err(error) = crate::method_access::chat_reader(&wb, &id, &headers) {
+        return error.into_response();
+    }
     let Some(result) = wb.engagement_merge_preview(&id, &body.path, &body.draft, &body.base_cut)
     else {
         return (StatusCode::NOT_FOUND, "no such engagement").into_response();

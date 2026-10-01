@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { accountMenuIdentity } from "./account-menu-identity";
 
 describe("the account menu follows person sign-in", () => {
+    it("names the selected local account even while an old account projection is clearing", () => {
+        expect(accountMenuIdentity({ name: "Previous account" }, true, null, "host", true))
+            .toEqual({ name: "Local account" });
+    });
     it("does not treat organization/Home admission as account sign-in", () => {
         expect(accountMenuIdentity(null, true, null, "org-member")).toBeNull();
         expect(accountMenuIdentity(null, true, { linked: false, expired: false, label: "old", person: "old" }, "org-member")).toBeNull();

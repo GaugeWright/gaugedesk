@@ -72,7 +72,10 @@ export function Workspace(props: WorkspaceProps = {}) {
         || path.startsWith(".whipple/versions/");
     const canManage = (path: string) => !!session.api.manageFile && !isProtected(path)
         && (rootFor(path)?.writable ?? true) && session.canEditFile?.(path) !== false;
-    const allEntries = () => (tree() ?? []).filter((entry) => leafOf(entry.path) !== FOLDER_MARKER);
+    // A rejected Solid resource throws when read. These projections run before
+    // the rendered error branch, so never read the failed resource here: doing
+    // so aborts the update and leaves the pane displaying its loading fallback.
+    const allEntries = () => (tree.error ? [] : tree() ?? []).filter((entry) => leafOf(entry.path) !== FOLDER_MARKER);
     const allFiles = () => allEntries().filter((entry) => !entry.isDir);
     const visibleEntries = createMemo(() => {
         const order = (path: string) => {

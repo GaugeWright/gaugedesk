@@ -41,15 +41,83 @@ pub(crate) fn account_backed(wb: &Workbench, headers: &HeaderMap) -> bool {
 
 pub(crate) fn account_backed_chat(wb: &Workbench, chat_id: &str, headers: &HeaderMap) -> bool {
     account_backed(wb, headers)
-        || wb
-            .library
-            .chats
-            .get(chat_id)
-            .is_some_and(|chat| chat.owner.is_some())
+        || wb.library.chats.get(chat_id).is_some_and(|chat| {
+            chat.owner
+                .as_deref()
+                .is_some_and(|owner| owner != wb.authority().as_str())
+        })
 }
 
-/// Authenticate a reader before showing even method handle metadata. An
-/// account-backed legacy chat with no verified owner cannot supply a reader.
+impl Workbench {
+    /// Draft and runtime surfaces belong to the authoring owner. Imported
+    /// context at the target root still needs its separate inspection grant.
+    pub(crate) fn authoring_draft_readable(
+        &self,
+        chat_id: &str,
+        path: &str,
+        actor: Option<&str>,
+    ) -> bool {
+        self.authoring_chat_visible(chat_id, actor) == Some(true)
+            && !path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            && (path == "agent"
+                || path.starts_with("agent/")
+                || path == "work"
+                || path.starts_with("work/")
+                || path == "artifacts"
+                || path.starts_with("artifacts/")
+                || path == ".whipple"
+                || path.starts_with(".whipple/")
+                || gaugedesk_boundary::is_method_surface_path(path)
+                || gaugedesk_boundary::is_control_surface_path(path))
+    }
+
+    /// DR-0271: legacy local drafts stay local; compatibility ownership never
+    /// supplies the frozen source provenance used by installed-method grants.
+    pub(crate) fn agent_authoring_owner(&self, id: &str) -> Option<&str> {
+        let agent = self.library.agents.get(id)?;
+        agent
+            .authoring_owner
+            .as_deref()
+            .or_else(|| {
+                agent
+                    .versions
+                    .get(&agent.current_version)
+                    .and_then(|version| version.source_owner_authority.as_deref())
+            })
+            .or_else(|| {
+                (!self.hosted_home_mode() && !crate::workbench_auth::web_account_mode())
+                    .then(|| self.authority().as_str())
+            })
+            .filter(|owner| !owner.is_empty() && *owner != "anonymous")
+    }
+
+    pub(crate) fn agent_authoring_visible(&self, id: &str, actor: Option<&str>) -> bool {
+        actor.is_some_and(|actor| self.agent_authoring_owner(id) == Some(actor))
+    }
+
+    /// None denotes a work chat, whose project admission remains separate.
+    pub(crate) fn authoring_chat_visible(&self, id: &str, actor: Option<&str>) -> Option<bool> {
+        let chat = self.library.chats.get(id)?;
+        let instance = self.library.instances.get(&chat.instance_id)?;
+        if instance.kind != crate::library::InstanceKind::Authoring {
+            return None;
+        }
+        Some(
+            self.agent_authoring_visible(&instance.agent_id, actor)
+                && actor.is_some_and(|actor| {
+                    chat.owner
+                        .as_deref()
+                        .or_else(|| self.agent_authoring_owner(&instance.agent_id))
+                        == Some(actor)
+                }),
+        )
+    }
+}
+
+/// Admit the exact authoring owner before draft reads. Work-chat method
+/// inspection retains its separate verified reader and project admission.
 pub(crate) fn chat_reader(
     wb: &Workbench,
     chat_id: &str,
@@ -60,10 +128,20 @@ pub(crate) fn chat_reader(
         .chats
         .get(chat_id)
         .ok_or((StatusCode::NOT_FOUND, "chat not found"))?;
-    let actor = wb.admit_data_request(
+    let actor = wb.admit_data_request_with_client(
         net_http::bearer(headers),
         wb.library.project_of_chat(chat_id),
+        &crate::workbench_auth::req_scope(headers),
+        crate::client_admission::ClientBuild::from_headers(headers),
+        false,
     )?;
+    if let Some(visible) = wb.authoring_chat_visible(chat_id, Some(&actor)) {
+        return if visible {
+            Ok(actor)
+        } else {
+            Err((StatusCode::FORBIDDEN, "chat is unavailable"))
+        };
+    }
     if account_backed_chat(wb, chat_id, headers) {
         let verified = net_http::bearer(headers).and_then(|token| wb.authenticate_bearer(token));
         let shared_project_reader = wb.library.project_of_chat(chat_id).is_some()
@@ -427,19 +505,46 @@ mod tests {
         .await
         .into_response();
         assert_eq!(created.status(), StatusCode::CREATED);
+        let agent_id = {
+            let wb = shared.lock_unpoisoned();
+            let agent = wb
+                .library
+                .agents
+                .values()
+                .find(|agent| agent.name == "Solo method")
+                .unwrap();
+            assert_eq!(
+                agent.authoring_owner.as_deref(),
+                Some(wb.authority().as_str())
+            );
+            assert!(agent.versions[&1].source_owner_authority.is_none());
+            agent.id.clone()
+        };
+        let response = crate::library_routes::create_chat_under_agent(
+            State(shared.clone()),
+            Path(agent_id),
+            HeaderMap::new(),
+            Json(crate::library_routes::CreateChat {
+                title: "Local edit".into(),
+                target_id: None,
+                target_ids: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
         let wb = shared.lock_unpoisoned();
-        let agent = wb
+        let chat = wb
             .library
-            .agents
+            .chats
             .values()
-            .find(|agent| agent.name == "Solo method")
+            .find(|chat| chat.title == "Local edit")
             .unwrap();
-        assert!(agent
-            .versions
-            .get(&1)
-            .unwrap()
-            .source_owner_authority
-            .is_none());
+        assert_eq!(chat.owner.as_deref(), Some(wb.authority().as_str()));
+        assert!(
+            !account_backed_chat(&wb, &chat.id, &HeaderMap::new()),
+            "local ownership preserves the solo context-ingest posture"
+        );
     }
 
     #[tokio::test]
@@ -704,5 +809,267 @@ mod tests {
         }
         assert_eq!(read_raw(shared).await["calls"][0]["redacted"], true);
         drop(turn_claim);
+    }
+}
+
+#[cfg(test)]
+mod workshop_upgrade_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    async fn read(app: &axum::Router, path: &str, token: Option<&str>) -> (StatusCode, String) {
+        let mut req = Request::builder().uri(path);
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// Persist the pre-owner record shape, rather than testing an empty startup
+    /// or substituting a mocked file API for the production router.
+    #[tokio::test]
+    async fn workshop_upgrade_preserves_legacy_files_across_account_switches() {
+        let root = tempfile::tempdir().unwrap();
+        let (local_agent, local_chat, owned_agent, owned_chat, local_actor) = {
+            let shared = crate::open_workbench(root.path()).unwrap();
+            let mut wb = shared.lock_unpoisoned();
+            let local_actor = wb.authority().as_str().to_owned();
+            let mut legacy = |name: &str, publisher: Option<String>| {
+                let id = wb
+                    .create_archetype(name.into(), crate::library::AgentKind::Work, publisher)
+                    .unwrap_or_else(|_| panic!("create old Agent"))
+                    .id;
+                let chat = wb
+                    .create_chat_under_agent(&id, name)
+                    .unwrap_or_else(|_| panic!("create old edit chat"))["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let mut old = serde_json::to_value(wb.library.agents.get(&id).unwrap()).unwrap();
+                old.as_object_mut().unwrap().remove("authoring_owner");
+                wb.store_mut()
+                    .append_record(crate::library::LIBRARY_SCOPE, "agent", &old.to_string())
+                    .unwrap();
+                assert!(wb.library.chats[&chat].owner.is_none());
+                (id, chat)
+            };
+            let (local_agent, local_chat) = legacy("Old local Agent", None);
+            let (owned_agent, owned_chat) =
+                legacy("Old signed-in Agent", Some("account-root".into()));
+            (
+                local_agent,
+                local_chat,
+                owned_agent,
+                owned_chat,
+                local_actor,
+            )
+        };
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let app = crate::open_control_plane(shared.clone());
+        let assert_context = |token: Option<String>, local: bool| {
+            let app = app.clone();
+            let (local_agent, local_chat, owned_agent, owned_chat) = (
+                local_agent.clone(),
+                local_chat.clone(),
+                owned_agent.clone(),
+                owned_chat.clone(),
+            );
+            async move {
+                let (status, body) = read(&app, "/workspace", token.as_deref()).await;
+                assert_eq!(status, StatusCode::OK);
+                let workspace: serde_json::Value = serde_json::from_str(&body).unwrap();
+                for (agent, chat, visible) in [
+                    (&local_agent, &local_chat, local),
+                    (&owned_agent, &owned_chat, !local),
+                ] {
+                    assert_eq!(
+                        workspace["archetypes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|a| a["id"] == *agent),
+                        visible
+                    );
+                    let (status, body) = read(
+                        &app,
+                        &format!("/projections/library/workspace/archetype/{agent}"),
+                        token.as_deref(),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::OK);
+                    let delta: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(
+                        delta["value"]["archetypes"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|a| a["id"] == *agent),
+                        visible,
+                        "a streamed refresh must obey the same Workshop discovery rule"
+                    );
+                    assert_eq!(
+                        workspace["recent"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|c| c["id"] == *chat),
+                        visible
+                    );
+                    let (status, body) =
+                        read(&app, &format!("/chats/{chat}/tree"), token.as_deref()).await;
+                    assert_eq!(
+                        status,
+                        if visible {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::FORBIDDEN
+                        }
+                    );
+                    if visible {
+                        let tree: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        assert!(
+                            tree["files"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|f| f["path"] == "agent/AGENTS.md"),
+                            "draft files must be present: {body}"
+                        );
+                    }
+                    let (status, body) = read(
+                        &app,
+                        &format!("/chats/{chat}/file?path=agent/AGENTS.md"),
+                        token.as_deref(),
+                    )
+                    .await;
+                    assert_eq!(
+                        status,
+                        if visible {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::FORBIDDEN
+                        }
+                    );
+                    if visible {
+                        assert!(!body.trim().is_empty());
+                    }
+                    assert_eq!(
+                        read(&app, &format!("/archetypes/{agent}"), token.as_deref())
+                            .await
+                            .0,
+                        if visible {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::FORBIDDEN
+                        }
+                    );
+                }
+            }
+        };
+        assert_context(None, true).await;
+        crate::account_signin::store_session_for_test(&shared);
+        crate::home_owner::claim_if_never_claimed(&shared).unwrap();
+        let signed = crate::desktop_session::home_session(&shared).unwrap();
+        assert_context(Some(signed.clone()), false).await;
+        // Another independently admitted account still cannot borrow either
+        // account's draft, even with org-wide project visibility.
+        let other = shared
+            .lock_unpoisoned()
+            .mint_account_session("account-other", "test", 3600)
+            .unwrap();
+        let (status, body) = read(&app, "/workspace", Some(&other)).await;
+        assert_eq!(status, StatusCode::OK);
+        let workspace: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(workspace["archetypes"].as_array().unwrap().is_empty());
+        for chat in [&local_chat, &owned_chat] {
+            assert_eq!(
+                read(&app, &format!("/chats/{chat}/tree"), Some(&other))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+            let denied = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/chats/{chat}/file?path=agent/AGENTS.md"))
+                        .header("authorization", format!("Bearer {other}"))
+                        .header("idempotency-key", format!("foreign-save-{chat}"))
+                        .body(Body::from("foreign edit must not be applied"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                denied.status(),
+                StatusCode::FORBIDDEN,
+                "a guessed draft URL must not permit another account to edit"
+            );
+        }
+        // Use the real native account-selection route. It revokes the prior
+        // window session and returns to the stable local actor.
+        let desktop = crate::open_runtime::desktop_operator_plane(shared.clone());
+        let response = desktop
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/account/hub-session/select-local")
+                    .header("idempotency-key", "workshop-upgrade-select-local")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_context(None, true).await;
+        assert_eq!(shared.lock_unpoisoned().authority().as_str(), local_actor);
+        assert!(
+            shared.lock_unpoisoned().library.agents[&local_agent].versions[&1]
+                .source_owner_authority
+                .is_none(),
+            "compatibility ownership must not manufacture publisher provenance"
+        );
+        assert!(shared
+            .lock_unpoisoned()
+            .resolve_account_session(&signed)
+            .is_none());
+        drop(desktop);
+        drop(app);
+        drop(shared);
+        let reopened = crate::open_workbench(root.path()).unwrap();
+        assert_eq!(
+            reopened
+                .lock_unpoisoned()
+                .agent_authoring_owner(&local_agent),
+            Some(local_actor.as_str())
+        );
+        assert_eq!(
+            reopened
+                .lock_unpoisoned()
+                .agent_authoring_owner(&owned_agent),
+            Some("account-root")
+        );
+    }
+
+    #[test]
+    fn hosted_legacy_workshop_does_not_infer_local_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        assert!(wb.agent_authoring_owner(crate::DEFAULT_AGENT).is_some());
+        wb.enable_hosted_home_mode();
+        assert!(wb.agent_authoring_owner(crate::DEFAULT_AGENT).is_none());
     }
 }

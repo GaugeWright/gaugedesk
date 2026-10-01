@@ -1812,16 +1812,31 @@ async fn relocated_workstream_chat(protected: bool) {
         StatusCode::OK,
         "the relocated custom archetype remains projectable: {workspace}"
     );
-    assert!(
-        workspace["archetypes"]
-            .as_array()
-            .is_some_and(|archetypes| archetypes.iter().any(|candidate| {
-                candidate["id"] == archetype_id
-                    && candidate["authoring_target_id"]
-                        .as_str()
-                        .is_some_and(|target| target == format!("target-archetype-{archetype_id}"))
-            })),
-        "the target received the custom archetype and its authoring target: {workspace}"
+    // DR-0271: relocating a project carries its installed Agent definition,
+    // not ownership of the sender's Workshop draft. Runtime lineage remains
+    // available, while both draft discovery and direct access stay owner-only.
+    {
+        let guard = bob_wb.lock().unwrap();
+        let library = gaugedesk_app::library::Library::rebuild(guard.store_ref()).unwrap();
+        let agent = &library.agents[&archetype_id];
+        assert_eq!(agent.authoring_owner.as_deref(), Some("alice"));
+        assert!(agent.versions.contains_key(&agent.current_version));
+        assert_eq!(library.instances[&placement_id].agent_id, archetype_id);
+    }
+    assert!(workspace["archetypes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|candidate| candidate["id"] != archetype_id));
+    assert!(workspace["work_targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|target| target["owner_kind"] != "archetype" || target["owner_id"] != archetype_id));
+    assert_eq!(
+        get(&bob, &format!("/archetypes/{archetype_id}")).await.0,
+        StatusCode::FORBIDDEN,
+        "project relocation must not transfer Workshop authoring access"
     );
     let relocated_chat = workspace["recent"]
         .as_array()

@@ -3086,6 +3086,7 @@ fn seed_builtin_archetype(
     library.apply_instance(instance);
     activate_instance(store, &instance_id);
     let agent = AgentRecord {
+        authoring_owner: None,
         schema: crate::library::LIBRARY_RECORD_SCHEMA,
         extra: Default::default(),
         id: archetype.id.to_owned(),
@@ -3501,6 +3502,7 @@ impl Workbench {
             collection_recipient: None,
         };
         let agent = AgentRecord {
+            authoring_owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: agent_id.clone(),
@@ -5832,6 +5834,9 @@ impl Workbench {
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
         let mut version = published_archetype_version(&self.targets_dir(), &target_id, 1)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
+        let authoring_owner = source_owner_authority
+            .clone()
+            .unwrap_or_else(|| self.authority().as_str().to_owned());
         version.source_owner_authority = source_owner_authority;
         let panel_profile = (agent_kind == AgentKind::Panel).then(PanelPublicProfile::default);
         version.panel_profile = panel_profile.clone();
@@ -5851,6 +5856,7 @@ impl Workbench {
         });
         activate_instance(self.store_mut(), &inst_id);
         self.write_agent_record(AgentRecord {
+            authoring_owner: Some(authoring_owner),
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: agent_id.clone(),
@@ -5942,6 +5948,7 @@ impl Workbench {
         activate_instance(self.store_mut(), &new_inst);
         let name = name.unwrap_or_else(|| format!("{} (fork)", src.name));
         self.write_agent_record(AgentRecord {
+            authoring_owner: self.agent_authoring_owner(id).map(str::to_owned),
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: new_agent.clone(),
@@ -7842,13 +7849,18 @@ impl Workbench {
     /// the log tier is not repeated as a file hit — the stronger (log) tier wins per chat.
     #[cfg(test)]
     pub(crate) fn search_value(&self, query: &str) -> serde_json::Value {
-        self.search_value_visible(query, &crate::workbench_auth::ProjectVisibility::All)
+        self.search_value_visible(
+            query,
+            &crate::workbench_auth::ProjectVisibility::All,
+            Some(self.authority().as_str()),
+        )
     }
 
     pub(crate) fn search_value_visible(
         &self,
         query: &str,
         visibility: &crate::workbench_auth::ProjectVisibility,
+        actor: Option<&str>,
     ) -> serde_json::Value {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
@@ -7860,7 +7872,10 @@ impl Workbench {
             .library
             .chats
             .values()
-            .filter(|chat| self.chat_visible(&chat.id, visibility))
+            .filter(|chat| {
+                self.authoring_chat_visible(&chat.id, actor)
+                    .unwrap_or_else(|| self.chat_visible(&chat.id, visibility))
+            })
             .collect();
         chats.sort_by_key(|chat| std::cmp::Reverse(chat.created_position));
 

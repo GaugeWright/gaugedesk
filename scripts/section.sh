@@ -223,14 +223,17 @@ case "${1:-}" in
     CARGO_TARGET_DIR="$PWD/target/no-default-features" \
         cargo check -p gaugedesk-app --no-default-features --all-targets ;;
   web)
-    [ -d web/node_modules ] || npm --prefix web ci
+    # Fleet slots retain node_modules between revisions. Its presence does not
+    # prove the current lockfile was installed; a newly declared test dependency
+    # must be available before this section runs. Unchanged sections are spared
+    # by the action cache, not by reusing an unverified installed tree.
+    npm --prefix web ci
     # The browser tunnel (DESK-7, ADR 0130) is generated and gitignored, so a
     # fresh checkout has no module for the loader's dynamic import to resolve
     # and `vite build` fails outright — it cannot bundle an unresolvable
     # specifier, and a stub is not an option because the design refuses to
-    # silently degrade a Home to unreachable. Built on absence, exactly the way
-    # node_modules above is: a developer pays once, CI pays every run because
-    # its checkout is always fresh.
+    # silently degrade a Home to unreachable. Local bindings build on absence;
+    # the native bar hands this section the bindings it built for this revision.
     # Both modules, because either one missing fails the build the same way.
     # Handed both already linked (the native bar), it always packages them: a
     # generated tree an earlier cargo run left is not what this bar built.
@@ -238,8 +241,8 @@ case "${1:-}" in
         && [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
         && [ -f web/packages/control-plane-client/src/generated/directory.js ]; } \
         || scripts/build-wasm.sh
-    [ -d ee/web/node_modules ] || npm --prefix ee/web ci
-    [ -d ee/sidecar/saml-verify/node_modules ] || npm --prefix ee/sidecar/saml-verify ci
+    npm --prefix ee/web ci
+    npm --prefix ee/sidecar/saml-verify ci
 
     # Everything below reads the installed trees and the generated modules above
     # and writes only its own output — the vite builds each to their own
