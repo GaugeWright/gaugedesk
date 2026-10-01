@@ -13,6 +13,7 @@
  */
 
 import type { AgentAbility, PanelPublicProfile, PublicPanelComponent } from "@gaugewright/control-plane-client";
+import { isDefaultVisible, pickableModels } from "./model-picker";
 
 export interface Choice<T> {
     readonly value: T;
@@ -41,7 +42,8 @@ export interface ProviderChoice {
     readonly name: string;
     readonly baseUrl: string;
     readonly credentialClass: string;
-    readonly models: readonly string[];
+    /** The model a profile lands on when the owner switches to this provider. */
+    readonly defaultModel: string;
 }
 
 /** Providers the public session host calls directly. The base URL is the
@@ -52,19 +54,36 @@ export const PROVIDER_CHOICES: readonly ProviderChoice[] = [
         name: "OpenAI",
         baseUrl: "https://api.openai.com",
         credentialClass: "openai-api-key",
-        models: ["gpt-5-mini", "gpt-5", "gpt-5-nano"],
+        defaultModel: "gpt-5.4-mini",
     },
     {
         value: "anthropic",
         name: "Anthropic",
         baseUrl: "https://api.anthropic.com",
         credentialClass: "anthropic-api-key",
-        models: ["claude-sonnet-5", "claude-haiku-4-5-20251001"],
+        defaultModel: "claude-sonnet-4-6",
     },
 ];
 
 export function providerName(provider: string): string {
     return PROVIDER_CHOICES.find((choice) => choice.value === provider)?.name ?? provider;
+}
+
+/** The models a provider offers visitors' turns, from GaugeDesk's shipped model
+ *  catalog: the set the chat picker shows by default, so the two never list
+ *  different models. It kept a short list of its own until WS-597, which had
+ *  drifted from the catalog entirely.
+ *
+ *  A model the profile already names stays listed when the catalog does not
+ *  carry it, so opening the editor never changes what a published version
+ *  runs. */
+export function panelModelChoices(provider: string, current = ""): readonly Choice<string>[] {
+    const models: Choice<string>[] = pickableModels([provider]).filter(isDefaultVisible)
+        .map((model) => ({ value: model.id, name: model.name, detail: model.id }));
+    if (current && !models.some((model) => model.value === current)) {
+        models.push({ value: current, name: current, detail: "Not in GaugeDesk's model catalog." });
+    }
+    return models;
 }
 
 /** Switch provider, carrying the base URL and credential class with it when they
@@ -82,7 +101,9 @@ export function withProvider(
     return {
         ...current,
         provider,
-        model: next.models.includes(current.model) ? current.model : next.models[0]!,
+        model: panelModelChoices(provider).some((model) => model.value === current.model)
+            ? current.model
+            : next.defaultModel,
         base_url: keepsDefaults ? next.baseUrl : current.base_url,
         credential_class: keepsDefaults ? next.credentialClass : current.credential_class,
     };

@@ -19,6 +19,8 @@ import {
     durationParts,
     formatCents,
     formatDuration,
+    panelModelChoices,
+    PROVIDER_CHOICES,
     secondsFrom,
     withProvider,
 } from "./panel-agent-presentation";
@@ -105,7 +107,7 @@ describe("switching provider", () => {
     it("carries the provider's own defaults with it", () => {
         expect(withProvider(PROFILE.provider, "anthropic")).toEqual({
             provider: "anthropic",
-            model: "claude-sonnet-5",
+            model: "claude-sonnet-4-6",
             base_url: "https://api.anthropic.com",
             credential_class: "anthropic-api-key",
         });
@@ -116,6 +118,37 @@ describe("switching provider", () => {
         const switched = withProvider(custom, "anthropic");
         expect(switched.base_url).toBe("https://gateway.example.com");
         expect(switched.credential_class).toBe("openai-api-key");
+    });
+});
+
+describe("choosing a model", () => {
+    const ids = (provider: string, current?: string) =>
+        panelModelChoices(provider, current).map((choice) => choice.value);
+
+    it("offers every model the catalog lists for the provider", () => {
+        // Containment, not an exact list: the catalog grows, and this follows it.
+        expect(ids("openai")).toEqual(expect.arrayContaining([
+            "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro",
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        ]));
+        expect(ids("anthropic")).toContain("claude-opus-4-7");
+        expect(ids("anthropic")).toContain("claude-sonnet-4-6");
+        expect(ids("anthropic")).toContain("claude-haiku-4-5");
+        // The moving alias stands for its date-pinned snapshot, as in the chat picker.
+        expect(ids("anthropic")).not.toContain("claude-haiku-4-5-20251001");
+    });
+
+    it("keeps a model the profile already names, even one the catalog lacks", () => {
+        const choices = ids("openai", "gpt-5-mini");
+        expect(choices).toContain("gpt-5-mini");
+        expect(choices).toContain("gpt-5.5");
+        expect(ids("openai", "gpt-5.5").filter((id) => id === "gpt-5.5")).toHaveLength(1);
+    });
+
+    it("lands a provider switch on a model that provider offers", () => {
+        for (const choice of PROVIDER_CHOICES) {
+            expect(ids(choice.value)).toContain(choice.defaultModel);
+        }
     });
 });
 

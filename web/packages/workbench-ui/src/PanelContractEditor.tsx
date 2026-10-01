@@ -10,7 +10,8 @@
  * It speaks the owner's language: panels and abilities by their plain names,
  * retention in hours and days, sizes in megabytes. The wire names live in
  * `panel-agent-presentation.ts`, and the few that still need to be editable by
- * hand — base URL, credential class, collection schema — sit under Advanced.
+ * hand — model ID, base URL, credential class, collection schema — sit under
+ * Advanced.
  *
  * Three parts of the contract are not edited here. Its starting files are what
  * the builder — the agent's edit chat — writes. Its default panel has no effect on
@@ -30,6 +31,7 @@ import {
     durationParts,
     MAX_COLLECTED_FILE_MB,
     PANEL_CHOICES,
+    panelModelChoices,
     PROVIDER_CHOICES,
     PUBLIC_ABILITY_CHOICES,
     secondsFrom,
@@ -111,7 +113,9 @@ export function PanelContractEditor(props: {
     const pathProblems = () => (profile().collection?.exportable_paths ?? [])
         .map(collectionPathProblem).filter(Boolean);
     const knownProvider = () => PROVIDER_CHOICES.some((choice) => choice.value === profile().provider.provider);
-    const models = () => PROVIDER_CHOICES.find((choice) => choice.value === profile().provider.provider)?.models ?? [];
+    const models = () => panelModelChoices(profile().provider.provider, profile().provider.model);
+    const setModel = (model: string) =>
+        update((current) => ({ ...current, provider: { ...current.provider, model } }));
 
     return <div class="pa-root" data-panel-public-profile>
         <section class="pa-section" data-panel-contract-panels>
@@ -166,13 +170,22 @@ export function PanelContractEditor(props: {
                         <For each={PROVIDER_CHOICES}>{(choice) => <option value={choice.value}>{choice.name}</option>}</For>
                         <Show when={!knownProvider()}><option value={profile().provider.provider}>{profile().provider.provider}</option></Show>
                     </select></label>
+                {/* A select, not an input with a datalist: a datalist offers only the
+                    suggestions matching what the field already holds, so a saved model
+                    hid every other one (WS-597). */}
                 <label class="pa-field"><span>Model</span>
-                    <input class="pa-input" list="pa-model-suggestions" spellcheck={false} value={profile().provider.model}
-                        onInput={(event) => update((current) => ({ ...current, provider: { ...current.provider, model: event.currentTarget.value } }))} />
-                    <datalist id="pa-model-suggestions"><For each={models()}>{(model) => <option value={model} />}</For></datalist>
-                </label>
+                    <select class="pa-input" data-panel-contract-model-choice value={profile().provider.model}
+                        onChange={(event) => setModel(event.currentTarget.value)}>
+                        <For each={models()}>{(choice) =>
+                            <option value={choice.value} title={choice.detail}
+                                selected={choice.value === profile().provider.model}>{choice.name}</option>}</For>
+                    </select></label>
             </div>
             <details class="pa-advanced"><summary>Advanced</summary><div class="pa-fields">
+                <label class="pa-field"><span>Model ID</span>
+                    <input class="pa-input" spellcheck={false} value={profile().provider.model}
+                        onInput={(event) => setModel(event.currentTarget.value)} />
+                    <small>Exactly as the provider names it, for a model the list doesn't carry.</small></label>
                 <label class="pa-field"><span>API address</span>
                     <input class="pa-input" spellcheck={false} value={profile().provider.base_url}
                         onInput={(event) => update((current) => ({ ...current, provider: { ...current.provider, base_url: event.currentTarget.value } }))} />
