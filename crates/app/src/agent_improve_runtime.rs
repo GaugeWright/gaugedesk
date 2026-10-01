@@ -946,6 +946,8 @@ impl NativeImprovePrepared {
                     workspace: &workspace,
                     candidate_repo: &self.candidate_repo,
                     campaign: &self.campaign,
+                    operation_id: self.operation_id.as_deref(),
+                    edit_chat_id: Some(&self.edit_chat_id),
                 },
                 NativeCampaignGate {
                     egress: &self.gate,

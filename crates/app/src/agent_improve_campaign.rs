@@ -21,7 +21,10 @@ use crate::agent_improve::{
     HostedImprovePairContext, PreparedShadowPair, SelectedShadowPair, ShadowTurn,
 };
 use crate::agent_improve_adoption::{adopt_candidate, AgentDefinitionSnapshot};
+use crate::agent_improve_checkpoint::HostedImproveInputKey;
 use crate::agent_improve_funding::ManagedShadowMeter;
+use crate::agent_improve_scenario_journal::{HostedImproveScenarioCut, HostedScenarioSelection};
+use crate::LockUnpoisoned;
 use crate::{library::gen_id, SharedWorkbench};
 
 const OPEN_SCHEMA: &str = "gaugedesk.agent-improve.open.v1";
@@ -598,7 +601,7 @@ pub fn run_native_campaign(
         workspace,
         candidate_repo,
         campaign,
-        |prepared, judge, selection, prompt| {
+        |_, _, _, prepared, judge, selection, prompt| {
             run_native_shadow_selection(factory, prepared, gate, prompt, judge, selection)
         },
     )
@@ -632,7 +635,7 @@ pub fn run_native_campaign_with_reservation(
         workspace,
         candidate_repo,
         campaign,
-        |prepared, judge, selection, prompt| {
+        |_, _, _, prepared, judge, selection, prompt| {
             run_native_shadow_selection(factory, prepared, gate.egress, prompt, judge, selection)
         },
         &mut || (gate.reserve_sealed)().map(Some),
@@ -659,6 +662,8 @@ pub fn run_hosted_managed_campaign_with_reservation(
         workspace,
         candidate_repo,
         campaign,
+        operation_id,
+        edit_chat_id,
     } = execution;
     if !campaign.sampled {
         return Err("Agent improve campaign has no sampled Home assignment".to_owned());
@@ -679,7 +684,7 @@ pub fn run_hosted_managed_campaign_with_reservation(
         workspace,
         candidate_repo,
         campaign,
-        |prepared, judge, selection, prompt| {
+        |ordinal, scenario_id, exposure, prepared, judge, selection, prompt| {
             let target_main_basis = prepared
                 .baseline_main_cut()
                 .ok_or("hosted Agent improve has no authoring Main basis")?;
@@ -694,6 +699,7 @@ pub fn run_hosted_managed_campaign_with_reservation(
                 target_id,
                 target_main_basis,
                 campaign_ref: campaign.reference(),
+                scenario_id,
                 scenario_ref: prepared.scenario_ref(),
                 prompt_ref: &prompt_ref,
             };
@@ -711,6 +717,37 @@ pub fn run_hosted_managed_campaign_with_reservation(
                         &mut meter,
                     )
                 }),
+                Box::new(|selected, arms| {
+                    let cut = HostedImproveScenarioCut::from_selected(
+                        HostedScenarioSelection {
+                            ordinal,
+                            scenario_id,
+                            exposure,
+                            prompt,
+                            campaign_ref: campaign.reference(),
+                            prepared,
+                            selected,
+                        },
+                        arms,
+                    )?;
+                    let Some(operation_id) = operation_id else {
+                        return Ok(());
+                    };
+                    let edit_chat_id =
+                        edit_chat_id.ok_or("hosted improve journal has no edit chat identity")?;
+                    let key = HostedImproveInputKey {
+                        operation_id,
+                        actor,
+                        tenant_id: &tenant_id,
+                        agent_id,
+                        edit_chat_id,
+                        campaign_ref: campaign.reference(),
+                        target_id,
+                        target_main_basis,
+                    };
+                    wb.lock_unpoisoned()
+                        .retain_hosted_improve_scenario_cut(&key, &cut)
+                }),
             )
         },
         &mut || (gate.reserve_sealed)().map(Some),
@@ -727,6 +764,8 @@ pub struct HostedCampaignExecution<'a> {
     pub workspace: &'a dyn Workspace,
     pub candidate_repo: &'a Path,
     pub campaign: &'a CampaignSnapshot,
+    pub operation_id: Option<&'a str>,
+    pub edit_chat_id: Option<&'a str>,
 }
 
 pub struct ManagedCampaignFunding {
@@ -748,6 +787,9 @@ fn run_campaign_with<F>(
 ) -> Result<SelectedCampaign, String>
 where
     F: FnMut(
+        usize,
+        &str,
+        Exposure,
         &PreparedShadowPair,
         &dyn HostJudge,
         &HostSelection,
@@ -776,6 +818,9 @@ fn run_campaign_with_reservation<F>(
 ) -> Result<SelectedCampaign, String>
 where
     F: FnMut(
+        usize,
+        &str,
+        Exposure,
         &PreparedShadowPair,
         &dyn HostJudge,
         &HostSelection,
@@ -789,7 +834,7 @@ where
     let mut definitions: Option<(AgentDefinitionSnapshot, AgentDefinitionSnapshot)> = None;
     let mut open_verdict = None;
     let mut reservation_id = None;
-    for scenario in campaign.evaluation_scenarios() {
+    for (ordinal, scenario) in campaign.evaluation_scenarios().into_iter().enumerate() {
         if scenario.exposure == Exposure::Sealed && open_verdict.is_none() {
             let verdict = aggregate_verdict(
                 &readings,
@@ -825,7 +870,15 @@ where
         )
         .map_err(|error| error.to_string())?;
         let judge = campaign.judge_for(scenario.id)?;
-        let selected = run(&prepared, &judge, &selection, scenario.prompt)?;
+        let selected = run(
+            ordinal,
+            scenario.id,
+            scenario.exposure,
+            &prepared,
+            &judge,
+            &selection,
+            scenario.prompt,
+        )?;
         let evidence = selected.evidence();
         let expected_prompt_ref = format!(
             "agent-prompt:sha256:{}",
@@ -964,6 +1017,10 @@ pub fn adopt_selected_campaign(
 }
 
 impl CampaignSnapshot {
+    pub(crate) fn gauge_names(&self) -> impl Iterator<Item = &str> {
+        self.open.gauges.iter().map(|gauge| gauge.name.as_str())
+    }
+
     /// `private_bytes` must come from host custody, never the Agent authoring
     /// target or a candidate workspace. Both exact sources are pinned together.
     pub fn parse(open_bytes: &[u8], private_bytes: &[u8]) -> Result<Self, String> {
@@ -1412,10 +1469,12 @@ mod tests {
             context: &HostedImprovePairContext<'_>,
             prepared: &PreparedShadowPair,
             run: Box<dyn FnOnce() -> Result<SelectedShadowPair, String> + '_>,
+            retain: crate::agent_improve::HostedImprovePairRetainer<'_>,
         ) -> Result<SelectedShadowPair, String> {
             if context.actor.is_empty()
                 || context.tenant_id.is_empty()
                 || context.campaign_ref.is_empty()
+                || context.scenario_id.is_empty()
                 || context.agent_id.is_empty()
                 || context.target_id.is_empty()
                 || context.target_main_basis != prepared.baseline_main_cut().unwrap_or("")
@@ -1442,7 +1501,30 @@ mod tests {
                 .unwrap()
                 .extend([baseline.to_owned(), candidate.to_owned()]);
             self.0.lock().unwrap().push("admit".to_owned());
-            let result = run();
+            let result = run().and_then(|selected| {
+                retain(
+                    &selected,
+                    [
+                        crate::agent_improve::HostedImproveArmTerminal {
+                            label: "baseline".into(),
+                            command_id: "command:baseline".into(),
+                            epoch: 1,
+                            evidence_ref: "sha256:baseline".into(),
+                            usage_id: "usage:baseline".into(),
+                            wall_millis: 1,
+                        },
+                        crate::agent_improve::HostedImproveArmTerminal {
+                            label: "candidate".into(),
+                            command_id: "command:candidate".into(),
+                            epoch: 1,
+                            evidence_ref: "sha256:candidate".into(),
+                            usage_id: "usage:candidate".into(),
+                            wall_millis: 1,
+                        },
+                    ],
+                )?;
+                Ok(selected)
+            });
             self.0.lock().unwrap().push(if result.is_ok() {
                 "complete".to_owned()
             } else {
@@ -1602,6 +1684,8 @@ mod tests {
                 workspace: &workspace,
                 candidate_repo: &candidate_repo,
                 campaign: &campaign,
+                operation_id: None,
+                edit_chat_id: None,
             },
             NativeCampaignGate {
                 egress: &AllowAllGate,
@@ -1753,7 +1837,7 @@ mod tests {
                 workspace.as_ref(),
                 &candidate_repo,
                 &source,
-                |prepared, judge, selection, prompt| {
+                |_, _, _, prepared, judge, selection, prompt| {
                     crate::agent_improve::run_shadow_selection_with_factory(
                         &FakeFactory {
                             open_passes: true,
@@ -1878,7 +1962,7 @@ mod tests {
             workspace.as_ref(),
             &candidate_repo,
             &source,
-            |prepared, judge, selection, prompt| {
+            |_, _, _, prepared, judge, selection, prompt| {
                 crate::agent_improve::run_shadow_selection_with_factory(
                     &FakeFactory {
                         open_passes: false,
@@ -1926,7 +2010,7 @@ mod tests {
             workspace.as_ref(),
             &candidate_repo,
             &source,
-            |prepared, judge, selection, prompt| {
+            |_, _, _, prepared, judge, selection, prompt| {
                 crate::agent_improve::run_shadow_selection_with_factory(
                     &FakeFactory {
                         open_passes: true,
@@ -1958,7 +2042,7 @@ mod tests {
             workspace.as_ref(),
             &candidate_repo,
             &source,
-            |prepared, judge, selection, prompt| {
+            |_, _, _, prepared, judge, selection, prompt| {
                 crate::agent_improve::run_shadow_selection_with_factory(
                     &FakeFactory {
                         open_passes: true,
@@ -2006,7 +2090,7 @@ mod tests {
             workspace.as_ref(),
             &candidate_repo,
             &source,
-            |prepared, judge, selection, prompt| {
+            |_, _, _, prepared, judge, selection, prompt| {
                 if prompt == "Return beta" {
                     ran_sealed = true;
                 }
@@ -2065,7 +2149,7 @@ mod tests {
             workspace.as_ref(),
             &candidate_repo,
             &campaign,
-            |prepared, judge, selection, prompt| {
+            |_, _, _, prepared, judge, selection, prompt| {
                 crate::agent_improve::run_shadow_selection_with_factory(
                     &FakeFactory {
                         open_passes: true,

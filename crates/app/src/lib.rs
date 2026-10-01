@@ -28,6 +28,7 @@ pub mod agent_improve_campaign;
 mod agent_improve_checkpoint;
 mod agent_improve_custody;
 mod agent_improve_funding;
+mod agent_improve_scenario_journal;
 pub use agent_improve_custody::{
     latest_agent_improve_pool_from_desktop, start_agent_improve_pool_from_desktop,
     AgentImprovePoolStart,

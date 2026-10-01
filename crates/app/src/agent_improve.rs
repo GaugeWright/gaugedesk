@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use whipplescript_core::improve_selection::{self, Bar, Campaign, GaugeEvidence, Reading, Verdict};
 
 use crate::agent_improve_adoption::{adopt_candidate, AgentDefinitionSnapshot};
+pub use crate::agent_improve_scenario_journal::HostedImproveArmTerminal;
 
 pub struct ShadowTurn {
     package_ref: String,
@@ -175,6 +176,7 @@ pub struct HostedImprovePairContext<'a> {
     pub target_id: &'a str,
     pub target_main_basis: &'a str,
     pub campaign_ref: &'a str,
+    pub scenario_id: &'a str,
     pub scenario_ref: &'a str,
     pub prompt_ref: &'a str,
 }
@@ -185,8 +187,12 @@ pub trait HostedImprovePairAdmission: Send + Sync {
         context: &HostedImprovePairContext<'_>,
         prepared: &PreparedShadowPair,
         run: Box<dyn FnOnce() -> Result<SelectedShadowPair, String> + '_>,
+        retain: HostedImprovePairRetainer<'_>,
     ) -> Result<SelectedShadowPair, String>;
 }
+
+pub type HostedImprovePairRetainer<'a> =
+    Box<dyn FnOnce(&SelectedShadowPair, [HostedImproveArmTerminal; 2]) -> Result<(), String> + 'a>;
 
 impl PreparedShadowPair {
     pub fn baseline_spec(&self) -> &HarnessSpec {

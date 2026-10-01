@@ -384,6 +384,10 @@ impl Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_improve_scenario_journal::{
+        HostedImproveArmTerminal, HostedImproveGaugeSample, HostedImproveReading,
+        HostedImproveScenarioCut,
+    };
     use crate::LockUnpoisoned;
 
     const OPEN: &str = r#"{"schema":"gaugedesk.agent-improve.open.v1","gauges":[{"name":"quality","description":"quality"}],"selection":{"ascend":{"quality":null}},"scenarios":[{"id":"open-1","prompt":"Return alpha"}]}"#;
@@ -468,12 +472,67 @@ mod tests {
             billing_scope: "billing:one".into(),
             funding_ref: "funding:one".into(),
         };
+        let scenario = HostedImproveScenarioCut {
+            ordinal: 0,
+            scenario_id: "open-1".into(),
+            exposure: "open".into(),
+            scenario_ref: "scenario-private-marker".into(),
+            prompt_ref: format!(
+                "agent-prompt:sha256:{}",
+                hex::encode(Sha256::digest("Return alpha".as_bytes()))
+            ),
+            baseline_main_cut: main.clone(),
+            baseline_definition_ref: prepared.baseline_ref.clone(),
+            candidate_definition_ref: prepared.candidate_ref.clone(),
+            baseline_package_ref: prepared.baseline_package_ref.clone(),
+            candidate_package_ref: prepared.candidate_package_ref.clone(),
+            baseline_discipline_ref: prepared.baseline_discipline_ref.clone(),
+            candidate_discipline_ref: prepared.candidate_discipline_ref.clone(),
+            gauges: vec![HostedImproveGaugeSample {
+                name: "quality".into(),
+                direction_up: true,
+                resource: false,
+                bar: None,
+                baseline: HostedImproveReading {
+                    score: 0.0,
+                    passed: Some(false),
+                },
+                candidate: HostedImproveReading {
+                    score: 1.0,
+                    passed: Some(true),
+                },
+            }],
+            arms: [
+                HostedImproveArmTerminal {
+                    label: "baseline".into(),
+                    command_id: "command:baseline".into(),
+                    epoch: 1,
+                    evidence_ref: format!("sha256:{}", "a".repeat(64)),
+                    usage_id: "usage:baseline".into(),
+                    wall_millis: 1,
+                },
+                HostedImproveArmTerminal {
+                    label: "candidate".into(),
+                    command_id: "command:candidate".into(),
+                    epoch: 1,
+                    evidence_ref: format!("sha256:{}", "b".repeat(64)),
+                    usage_id: "usage:candidate".into(),
+                    wall_millis: 1,
+                },
+            ],
+        };
         {
             let mut guard = wb.lock_unpoisoned();
             guard.retain_hosted_improve_input_cut(&key, &cut).unwrap();
             guard.retain_hosted_improve_input_cut(&key, &cut).unwrap();
             guard
                 .retain_hosted_improve_prepared_cut(&key, &prepared)
+                .unwrap();
+            guard
+                .retain_hosted_improve_scenario_cut(&key, &scenario)
+                .unwrap();
+            guard
+                .retain_hosted_improve_scenario_cut(&key, &scenario)
                 .unwrap();
             guard
                 .retain_hosted_improve_prepared_cut(&key, &prepared)
@@ -484,6 +543,17 @@ mod tests {
             let prepared_rows = guard.store.records(LIBRARY_SCOPE, PREPARED_KIND).unwrap();
             assert_eq!(prepared_rows.len(), 1);
             assert!(!prepared_rows[0].contains("private-signed-policy-marker"));
+            let scenario_rows = guard
+                .store
+                .records(LIBRARY_SCOPE, "agent_improve_hosted_scenario")
+                .unwrap();
+            assert_eq!(scenario_rows.len(), 1);
+            assert!(!scenario_rows[0].contains("scenario-private-marker"));
+            let mut changed_scenario = scenario.clone();
+            changed_scenario.gauges[0].candidate.score = 0.5;
+            assert!(guard
+                .retain_hosted_improve_scenario_cut(&key, &changed_scenario)
+                .is_err());
             let mut changed_policy = prepared.clone();
             changed_policy.signed_policy_envelope = "substitute".into();
             assert!(guard
@@ -510,6 +580,10 @@ mod tests {
         assert_eq!(
             guard.hosted_improve_prepared_cut(&key).unwrap(),
             Some(prepared)
+        );
+        assert_eq!(
+            guard.hosted_improve_scenario_cuts(&key).unwrap(),
+            vec![scenario]
         );
         let wrong_tenant = HostedImproveInputKey {
             tenant_id: "tenant:other",
