@@ -2,9 +2,11 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { reconcileLines, type TranscriptLine } from "./transcript";
 
+/** At rest every mark is the same short tick. A hovered or focused mark peaks and
+    its neighbours fall away exponentially, 6 + 15·e^-|d|: 21, 12, 8, 7, then 6. */
 export function tickWidth(index: number, near: number | null): number {
-    if (near === null) return 12;
-    return [52, 40, 29, 20][Math.abs(index - near)] ?? 12;
+    if (near === null) return 6;
+    return Math.round(6 + 15 * Math.exp(-Math.abs(index - near)));
 }
 
 export function ChatLogNavigation(props: {
@@ -29,12 +31,21 @@ export function ChatLogNavigation(props: {
     };
     let ticksEl: HTMLDivElement | undefined;
     let updateQueued = false;
+    /** The mark last clicked. A jump near the end of the chat cannot bring its
+        message to the reading line, and the end-of-log rule would then name the
+        last message instead, so the clicked mark stays current until the reader
+        scrolls by hand. */
+    let jumped: number | null = null;
 
     const updateActive = () => {
         updateQueued = false;
         const scroller = props.scroller();
         const rows = scroller?.querySelectorAll<HTMLElement>(".transcript-body .line.user");
         if (!scroller || !rows?.length) return;
+        if (jumped !== null && jumped < rows.length) {
+            setActive(jumped);
+            return;
+        }
         const localScroll = scroller.scrollHeight - scroller.clientHeight > 1;
         setPageSized(!localScroll && (props.frame()?.clientHeight ?? 0) > window.innerHeight);
         const threshold = localScroll
@@ -76,8 +87,19 @@ export function ChatLogNavigation(props: {
     onMount(() => {
         const scroller = props.scroller();
         if (!scroller) return;
+        const release = () => {
+            if (jumped === null) return;
+            jumped = null;
+            queueUpdate();
+        };
+        const releaseOnKey = (event: KeyboardEvent) => {
+            if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) release();
+        };
+        const readerGestures = ["wheel", "touchstart", "pointerdown"] as const;
         scroller.addEventListener("scroll", queueUpdate, { passive: true });
         window.addEventListener("scroll", queueUpdate, { passive: true });
+        for (const gesture of readerGestures) window.addEventListener(gesture, release, { passive: true });
+        window.addEventListener("keydown", releaseOnKey);
         const observer = new ResizeObserver(queueUpdate);
         observer.observe(scroller);
         const body = scroller.querySelector(".transcript-body");
@@ -86,6 +108,8 @@ export function ChatLogNavigation(props: {
         onCleanup(() => {
             scroller.removeEventListener("scroll", queueUpdate);
             window.removeEventListener("scroll", queueUpdate);
+            for (const gesture of readerGestures) window.removeEventListener(gesture, release);
+            window.removeEventListener("keydown", releaseOnKey);
             observer.disconnect();
         });
     });
@@ -129,12 +153,12 @@ export function ChatLogNavigation(props: {
                                 onMouseEnter={(event) => { setFocused(null); setPointer(index()); positionPreview(event.currentTarget); }}
                                 onFocus={(event) => { if (pointer() === null) setFocused(index()); positionPreview(event.currentTarget); }}
                                 onBlur={() => setFocused(null)}
-                                onClick={() => props.onJump(index())}
+                                onClick={() => { jumped = index(); setActive(index()); props.onJump(index()); }}
                             >
                                 <span
                                     class="chat-log-navigation-bar"
                                     classList={{ selected: selected() === index() || (selected() === null && active() === index()) }}
-                                    style={{ width: `${tickWidth(index(), selected() ?? active())}px` }}
+                                    style={{ width: `${tickWidth(index(), selected())}px` }}
                                 />
                             </button>
                         );

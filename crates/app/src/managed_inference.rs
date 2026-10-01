@@ -187,12 +187,25 @@ pub struct ManagedReservationRecord {
     pub valid_from: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<u64>,
+    /// The most this turn may draw from the paying account's credits, in
+    /// billionths of a US dollar (GaugeWright DR-0203). Zero on reservations
+    /// admitted before credits, which therefore hold no credit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub maximum_nanos_usd: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ManagedAllowanceReserve {
     pub reservation: ManagedReservationRecord,
     pub observed_tokens: u64,
+    /// Retained so stored commands still read. It no longer refuses a turn:
+    /// managed inference is paid from credits, not a plan allowance
+    /// (GaugeWright DR-0203).
+    #[serde(default)]
     pub included_tokens: u64,
 }
 
@@ -201,7 +214,30 @@ pub struct ManagedAllowanceSettle {
     pub reservation_id: String,
     pub usage_ref: String,
     pub actual_tokens: u64,
+    /// What the turn cost the paying account: measured gateway cost plus the
+    /// margin, or the rate card marked as an estimate. Absent from a reporter
+    /// that predates credits, in which case the reservation's bound is drawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_nanos_usd: Option<u64>,
 }
+
+/// Credits added to a paying account (GaugeWright DR-0203). A grant id is
+/// used once, so the one-time starter credit cannot be granted twice.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ManagedCreditGrant {
+    pub grant_id: String,
+    pub nanos_usd: u64,
+    /// `starter`, `operator`, or `purchase` — what the grant is, for the
+    /// account's history.
+    pub reason: String,
+    /// Server time of the grant, in Unix seconds.
+    pub granted_at: u64,
+}
+
+/// The id of a paying account's one-time USD 5 starter credit.
+pub const STARTER_CREDIT_GRANT_ID: &str = "starter";
+/// USD 5, in billionths of a dollar.
+pub const STARTER_CREDIT_NANOS_USD: u64 = 5_000_000_000;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ManagedAllowanceRelease {
@@ -215,6 +251,7 @@ pub enum ManagedAllowanceCommand {
     Reserve(ManagedAllowanceReserve),
     Settle(ManagedAllowanceSettle),
     Release(ManagedAllowanceRelease),
+    Grant(ManagedCreditGrant),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -229,11 +266,16 @@ pub enum ManagedAllowanceEvent {
         reservation_id: String,
         usage_ref: String,
         actual_tokens: u64,
+        /// Credits drawn by this settlement. Zero on settlements recorded
+        /// before credits.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        drawn_nanos_usd: u64,
     },
     Released {
         reservation_id: String,
         release_ref: String,
     },
+    Granted(ManagedCreditGrant),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -254,6 +296,37 @@ pub struct ManagedAllowanceReservation {
 pub struct ManagedAllowanceState {
     pub accounted_tokens: BTreeMap<String, u64>,
     pub reservations: BTreeMap<String, ManagedAllowanceReservation>,
+    /// Every credit grant, by id.
+    pub grants: BTreeMap<String, ManagedCreditGrant>,
+    /// Credits drawn by settled turns.
+    pub drawn_nanos_usd: u64,
+}
+
+impl ManagedAllowanceState {
+    /// Credits granted to the account.
+    pub fn granted_nanos_usd(&self) -> u64 {
+        self.grants
+            .values()
+            .fold(0_u64, |total, grant| total.saturating_add(grant.nanos_usd))
+    }
+
+    /// Credits held by open reservations.
+    pub fn held_nanos_usd(&self) -> u64 {
+        self.reservations
+            .values()
+            .filter(|held| held.status == ManagedAllowanceStatus::Open)
+            .fold(0_u64, |total, held| {
+                total.saturating_add(held.record.maximum_nanos_usd)
+            })
+    }
+
+    /// Credits the account can still spend: granted, less drawn and held. A
+    /// settlement can draw more than its hold, so this saturates at zero.
+    pub fn available_nanos_usd(&self) -> u64 {
+        self.granted_nanos_usd()
+            .saturating_sub(self.drawn_nanos_usd)
+            .saturating_sub(self.held_nanos_usd())
+    }
 }
 
 pub struct ManagedAllowanceLedger;
@@ -297,23 +370,11 @@ impl Lifecycle for ManagedAllowanceLedger {
                     .copied()
                     .unwrap_or(0)
                     .max(command.observed_tokens);
-                let open = state
-                    .reservations
-                    .values()
-                    .filter(|held| {
-                        held.status == ManagedAllowanceStatus::Open
-                            && allowance_period(&held.record).as_deref() == Some(&period)
-                    })
-                    .fold(0_u64, |total, held| {
-                        total.saturating_add(held.record.maximum_tokens)
-                    });
-                if observed
-                    .saturating_add(open)
-                    .saturating_add(reservation.maximum_tokens)
-                    > command.included_tokens
-                {
+                // Tokens are still accounted per period, but they no longer
+                // refuse a turn: credits do (GaugeWright DR-0203).
+                if reservation.maximum_nanos_usd > state.available_nanos_usd() {
                     return Err(Rejection {
-                        reason: "managed inference allowance exhausted",
+                        reason: "managed inference credits exhausted",
                     });
                 }
                 let mut events = Vec::with_capacity(2);
@@ -339,10 +400,16 @@ impl Lifecycle for ManagedAllowanceLedger {
                         reason: "managed allowance reservation is not settleable",
                     });
                 }
+                // A reporter that predates credits sends no cost; the turn draws
+                // the bound it was admitted under.
+                let drawn_nanos_usd = command
+                    .actual_nanos_usd
+                    .unwrap_or(held.record.maximum_nanos_usd);
                 Ok(vec![ManagedAllowanceEvent::Settled {
                     reservation_id: command.reservation_id,
                     usage_ref: command.usage_ref,
                     actual_tokens: command.actual_tokens,
+                    drawn_nanos_usd,
                 }])
             }
             ManagedAllowanceCommand::Release(command) => {
@@ -362,6 +429,22 @@ impl Lifecycle for ManagedAllowanceLedger {
                     reservation_id: command.reservation_id,
                     release_ref: command.release_ref,
                 }])
+            }
+            ManagedAllowanceCommand::Grant(grant) => {
+                if grant.grant_id.trim().is_empty()
+                    || grant.nanos_usd == 0
+                    || grant.reason.trim().is_empty()
+                {
+                    return Err(Rejection {
+                        reason: "managed credit grant is invalid",
+                    });
+                }
+                if state.grants.contains_key(&grant.grant_id) {
+                    return Err(Rejection {
+                        reason: "managed credit grant already exists",
+                    });
+                }
+                Ok(vec![ManagedAllowanceEvent::Granted(grant)])
             }
         }
     }
@@ -384,8 +467,10 @@ impl Lifecycle for ManagedAllowanceLedger {
             ManagedAllowanceEvent::Settled {
                 reservation_id,
                 actual_tokens,
+                drawn_nanos_usd,
                 ..
             } => {
+                next.drawn_nanos_usd = next.drawn_nanos_usd.saturating_add(drawn_nanos_usd);
                 if let Some(held) = next.reservations.get_mut(&reservation_id) {
                     held.status = ManagedAllowanceStatus::Settled;
                     if let Some(period) = allowance_period(&held.record) {
@@ -398,6 +483,9 @@ impl Lifecycle for ManagedAllowanceLedger {
                 if let Some(held) = next.reservations.get_mut(&reservation_id) {
                     held.status = ManagedAllowanceStatus::Released;
                 }
+            }
+            ManagedAllowanceEvent::Granted(grant) => {
+                next.grants.insert(grant.grant_id.clone(), grant);
             }
         }
         next
@@ -651,6 +739,7 @@ pub fn reserve_turn(
         admitted_at: None,
         valid_from: None,
         valid_until: None,
+        maximum_nanos_usd: 0,
     };
     let payload = serde_json::to_string(&record)?;
     store.append_record_with_key(
@@ -959,6 +1048,7 @@ mod tests {
                 admitted_at: Some(150),
                 valid_from: Some(100),
                 valid_until: Some(200),
+                maximum_nanos_usd: 0,
             },
         )
         .unwrap());
@@ -973,6 +1063,7 @@ mod tests {
                 admitted_at: Some(150),
                 valid_from: Some(100),
                 valid_until: Some(200),
+                maximum_nanos_usd: 0,
             },
         )
         .unwrap());
@@ -987,6 +1078,7 @@ mod tests {
                 admitted_at: Some(150),
                 valid_from: Some(100),
                 valid_until: Some(200),
+                maximum_nanos_usd: 0,
             },
         )
         .unwrap());
@@ -1001,6 +1093,7 @@ mod tests {
                 admitted_at: Some(50),
                 valid_from: Some(1),
                 valid_until: Some(100),
+                maximum_nanos_usd: 0,
             },
         )
         .unwrap();
@@ -1038,90 +1131,132 @@ mod tests {
         );
     }
 
-    #[test]
-    fn allowance_lifecycle_counts_observed_usage_open_holds_and_settlement_once() {
-        let mut store = Store::open_in_memory().unwrap();
-        let reservation = |id: &str, maximum_tokens| ManagedReservationRecord {
+    fn credit_reservation(id: &str, maximum_nanos_usd: u64) -> ManagedReservationRecord {
+        ManagedReservationRecord {
             id: id.into(),
             engagement_id: "public-deployment::dep-1".into(),
             funding_ref: "funding-current".into(),
-            maximum_tokens,
+            maximum_tokens: 8_192,
             admitted_at: Some(150),
             valid_from: Some(100),
             valid_until: Some(200),
+            maximum_nanos_usd,
+        }
+    }
+
+    fn reserve_credit(id: &str, maximum_nanos_usd: u64) -> ManagedAllowanceCommand {
+        ManagedAllowanceCommand::Reserve(ManagedAllowanceReserve {
+            reservation: credit_reservation(id, maximum_nanos_usd),
+            observed_tokens: 0,
+            included_tokens: 0,
+        })
+    }
+
+    fn grant(id: &str, nanos_usd: u64) -> ManagedAllowanceCommand {
+        ManagedAllowanceCommand::Grant(ManagedCreditGrant {
+            grant_id: id.into(),
+            nanos_usd,
+            reason: "operator".into(),
+            granted_at: 150,
+        })
+    }
+
+    /// A plan's included tokens no longer refuse a turn; credits do
+    /// (GaugeWright DR-0203). A reservation holds its bound, a settlement draws
+    /// its actual cost, and a release returns the hold.
+    #[test]
+    fn credits_hold_draw_and_release_and_refuse_only_when_exhausted() {
+        let mut store = Store::open_in_memory().unwrap();
+        let admit = |store: &mut Store, key: &str, command| {
+            store.admit_materialized::<ManagedAllowanceLedger>("account", key, command)
         };
-        let reserve = |id: &str, maximum_tokens| {
-            ManagedAllowanceCommand::Reserve(ManagedAllowanceReserve {
-                reservation: reservation(id, maximum_tokens),
-                observed_tokens: 100,
-                included_tokens: 1_000,
-            })
-        };
-        store
-            .admit_materialized::<ManagedAllowanceLedger>(
-                "account",
-                "reserve-1",
-                reserve("r1", 600),
-            )
-            .unwrap();
-        let exhausted = store
-            .admit_materialized::<ManagedAllowanceLedger>(
-                "account",
-                "reserve-2",
-                reserve("r2", 301),
-            )
-            .unwrap_err();
-        assert!(format!("{exhausted:?}").contains("allowance exhausted"));
-        store
-            .admit_materialized::<ManagedAllowanceLedger>(
-                "account",
-                "settle-1",
-                ManagedAllowanceCommand::Settle(ManagedAllowanceSettle {
-                    reservation_id: "r1".into(),
-                    usage_ref: "usage-1".into(),
-                    actual_tokens: 250,
-                }),
-            )
-            .unwrap();
-        store
-            .admit_materialized::<ManagedAllowanceLedger>(
-                "account",
-                "reserve-2b",
-                reserve("r2", 650),
-            )
-            .unwrap();
-        store
-            .admit_materialized::<ManagedAllowanceLedger>(
-                "account",
-                "release-2",
-                ManagedAllowanceCommand::Release(ManagedAllowanceRelease {
-                    reservation_id: "r2".into(),
-                    release_ref: "runtime-known-unused:r2".into(),
-                }),
-            )
-            .unwrap();
-        store
-            .admit_materialized::<ManagedAllowanceLedger>(
-                "account",
-                "reserve-3",
-                reserve("r3", 650),
-            )
-            .unwrap();
-        let state = store.fold::<ManagedAllowanceLedger>("account").unwrap();
-        assert_eq!(
-            state.accounted_tokens.values().copied().collect::<Vec<_>>(),
-            vec![350]
+        let refused = admit(&mut store, "reserve-0", reserve_credit("r0", 1)).unwrap_err();
+        assert!(
+            format!("{refused:?}").contains("credits exhausted"),
+            "no credits, no turn"
         );
-        assert_eq!(state.reservations.len(), 3);
+
+        admit(&mut store, "grant-1", grant("operator-1", 1_000)).unwrap();
+        admit(&mut store, "reserve-1", reserve_credit("r1", 600)).unwrap();
+        let refused = admit(&mut store, "reserve-2", reserve_credit("r2", 401)).unwrap_err();
+        assert!(format!("{refused:?}").contains("credits exhausted"));
+
+        admit(
+            &mut store,
+            "settle-1",
+            ManagedAllowanceCommand::Settle(ManagedAllowanceSettle {
+                reservation_id: "r1".into(),
+                usage_ref: "usage-1".into(),
+                actual_tokens: 250,
+                actual_nanos_usd: Some(250),
+            }),
+        )
+        .unwrap();
+        admit(&mut store, "reserve-2b", reserve_credit("r2", 650)).unwrap();
+        admit(
+            &mut store,
+            "release-2",
+            ManagedAllowanceCommand::Release(ManagedAllowanceRelease {
+                reservation_id: "r2".into(),
+                release_ref: "runtime-known-unused:r2".into(),
+            }),
+        )
+        .unwrap();
+        admit(&mut store, "reserve-3", reserve_credit("r3", 700)).unwrap();
+        // A reporter that sends no cost draws the bound the turn was admitted
+        // under.
+        admit(
+            &mut store,
+            "settle-3",
+            ManagedAllowanceCommand::Settle(ManagedAllowanceSettle {
+                reservation_id: "r3".into(),
+                usage_ref: "usage-3".into(),
+                actual_tokens: 10,
+                actual_nanos_usd: None,
+            }),
+        )
+        .unwrap();
+
+        let state = store.fold::<ManagedAllowanceLedger>("account").unwrap();
+        assert_eq!(state.granted_nanos_usd(), 1_000);
+        assert_eq!(state.drawn_nanos_usd, 950);
+        assert_eq!(state.held_nanos_usd(), 0);
+        assert_eq!(state.available_nanos_usd(), 50);
         assert_eq!(
             state.reservations["r2"].status,
             ManagedAllowanceStatus::Released
         );
+        assert_eq!(
+            state.accounted_tokens.values().copied().collect::<Vec<_>>(),
+            vec![260],
+            "tokens are still accounted per period",
+        );
+
+        let again = admit(&mut store, "grant-1b", grant("operator-1", 1_000)).unwrap_err();
+        assert!(
+            format!("{again:?}").contains("already exists"),
+            "a grant id is used once"
+        );
+        admit(
+            &mut store,
+            "grant-2",
+            grant(STARTER_CREDIT_GRANT_ID, STARTER_CREDIT_NANOS_USD),
+        )
+        .unwrap();
+        let state = store.fold::<ManagedAllowanceLedger>("account").unwrap();
+        assert_eq!(state.available_nanos_usd(), 50 + STARTER_CREDIT_NANOS_USD);
     }
 
     #[test]
-    fn allowance_reservations_serialize_across_store_connections() {
-        let store = Store::open_in_memory().unwrap();
+    fn credit_reservations_serialize_across_store_connections() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .admit_materialized::<ManagedAllowanceLedger>(
+                "account",
+                "grant",
+                grant("operator", 1_000),
+            )
+            .unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let handles: Vec<_> = ["r1", "r2"]
             .into_iter()
@@ -1133,19 +1268,7 @@ mod tests {
                     sibling.admit_materialized::<ManagedAllowanceLedger>(
                         "account",
                         &format!("reserve-{id}"),
-                        ManagedAllowanceCommand::Reserve(ManagedAllowanceReserve {
-                            reservation: ManagedReservationRecord {
-                                id: id.into(),
-                                engagement_id: "public-deployment::dep-1".into(),
-                                funding_ref: "funding-current".into(),
-                                maximum_tokens: 600,
-                                admitted_at: Some(150),
-                                valid_from: Some(100),
-                                valid_until: Some(200),
-                            },
-                            observed_tokens: 0,
-                            included_tokens: 1_000,
-                        }),
+                        reserve_credit(id, 600),
                     )
                 })
             })
@@ -1158,7 +1281,7 @@ mod tests {
         assert_eq!(
             outcomes
                 .iter()
-                .filter(|outcome| format!("{outcome:?}").contains("allowance exhausted"))
+                .filter(|outcome| format!("{outcome:?}").contains("credits exhausted"))
                 .count(),
             1
         );

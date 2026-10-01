@@ -30,6 +30,7 @@ Feature: The chat log's reading position
     When I task the agent with "first request"
     And I task the agent with "second request"
     Then the user-message rail has 2 marks
+    And every user-message mark rests at the same width
     When I hover the first user-message mark
     Then the message preview shows "first request"
     And the hovered mark is wider than its neighbor

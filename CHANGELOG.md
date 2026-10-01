@@ -19,6 +19,15 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-10-01
+
+- Signed in on the desktop, the workbench now opens on the selected account's
+  own Workshop and Projects. In 0.5.1 and 0.5.2 it could first list the Local
+  account's Agents and keep them, so opening one did nothing or failed with
+  "Agent authoring is unavailable to this account". That work is still in the
+  Local account, which you can select from the account menu. A Panel agent that
+  cannot be opened now says why.
+
 ## [0.5.2] — 2026-10-01
 
 - Multiple browser windows and devices can connect to one Home concurrently.

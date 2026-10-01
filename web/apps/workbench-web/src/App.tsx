@@ -21,7 +21,7 @@ import "./wasm-modules";
 import "./desktop-operator-credential";
 import { accountSelectionSync } from "./account-selection-sync";
 import { accountMenuIdentity } from "./account-menu-identity";
-import { desktopHomeSession } from "./desktop-home-session";
+import { followDesktopHomeSession } from "./desktop-home-session";
 import { claimWithoutAsking } from "./desktop-home-default";
 import { createEffect, createMemo, createResource, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack, type Accessor, type JSX } from "solid-js";
 import {
@@ -706,24 +706,25 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // Desktop: the shell hands this UI a Home session for its signed-in owner
     // (DR-0188), asked again whenever the sign-in status is re-read so it
     // follows sign-out, expiry and renewal. A browser build is never handed one.
-    let desktopSessionHeld = false;
-    let desktopSessionRead = 0;
+    // The workbench mounts only once the first answer is in, and re-reads its
+    // account-scoped projections whenever the answer moves (WS-613).
+    const [desktopSessionSettled, setDesktopSessionSettled] = createSignal(false);
+    const followSession = followDesktopHomeSession({
+        present: (token) => {
+            setBearer(token);
+            api.setBearer(token);
+        },
+        reachRemotely: (remote) => api.setNativeRemote(remote),
+        answered: ({ first, credentialMoved, remoteMoved }) => {
+            if (remoteMoved) void refetchHome();
+            if (first) setDesktopSessionSettled(true);
+            else if (credentialMoved || remoteMoved) bumpNav();
+        },
+    });
     createEffect(() => {
         const status = hubSession();
         if (status === undefined) return;
-        const read = ++desktopSessionRead;
-        const linked = status?.linked === true && !status.expired;
-        void (linked ? desktopHomeSession() : Promise.resolve(null)).then((token) => {
-            if (read !== desktopSessionRead) return;
-            if (token) {
-                desktopSessionHeld = true;
-                setBearer(token);
-            } else if (desktopSessionHeld) {
-                desktopSessionHeld = false;
-                setBearer(null);
-            }
-            if (api.setNativeRemote(linked && !token)) void refetchHome();
-        });
+        followSession(status?.linked === true && !status.expired);
     });
     const beginAccountAdmission = async (provider?: string): Promise<void> => {
         if (oidcRedirectAvailable) {
@@ -2612,7 +2613,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 workbenchShell.openPane("content", { chatSelected: false, fileSelected: true });
             }}
             onDeployPlacement={setDeployment}
-            onOpenPanelAgent={(agent, project) => void openPanelAgent(agent, project)}
+            onOpenPanelAgent={(agent, project) => void openPanelAgent(agent, project)
+                .catch((error) => setStatus(`Couldn't open ${agent.name}: ${String(error)}`))}
             onOpenInbox={(id, name) => setProjectInbox({ id, name })}
             onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
@@ -4354,7 +4356,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 </div>
             </Show>
             <Show when={!homeState.loading && !homeFailure() && homeState()?.kind !== "none"
-                && (!isTauri() || (hubSession() !== undefined && !hubSession()?.localChoiceRequired))}>
+                && (!isTauri() || (hubSession() !== undefined && desktopSessionSettled()
+                    && !hubSession()?.localChoiceRequired))}>
                 <WorkbenchShell
                     state={workbenchShell}
                     titles={props.gaugeApps?.active() ? {

@@ -72,6 +72,16 @@ Then("the user-message rail has {int} marks", async ({ page }, count: number) =>
     await expect(page.locator("[data-chat-message-mark]")).toHaveCount(count);
 });
 
+Then("every user-message mark rests at the same width", async ({ page }) => {
+    await page.mouse.move(0, 0);
+    await expect.poll(async () => {
+        const widths = await page.locator("[data-chat-message-mark] span").evaluateAll((bars) =>
+            bars.map((bar) => bar.getBoundingClientRect().width),
+        );
+        return new Set(widths).size;
+    }).toBe(1);
+});
+
 When("I hover the first user-message mark", async ({ page }) => {
     await page.locator("[data-chat-message-mark='0']").hover();
 });
