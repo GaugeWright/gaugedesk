@@ -28,22 +28,6 @@ const PERSON: &str = "e2e-person@example.test";
 const ACCOUNT: &str = "e2e-account-root";
 const SESSION: &str = "e2e-opaque-account-session";
 const CODE: &str = "e2e-handoff-code";
-/// A second person-account the same device can also sign in to, for journeys
-/// about one computer used under two accounts (DR-0265). Only sign-in,
-/// refresh and identity know it; every other route plays the first account.
-const SECOND_PERSON: &str = "e2e-second@example.test";
-const SECOND_ACCOUNT: &str = "e2e-account-second";
-const SECOND_SESSION: &str = "e2e-opaque-account-session-second";
-const SECOND_CODE: &str = "e2e-handoff-code-second";
-
-/// The account an opaque session belongs to.
-fn account_of(headers: &HeaderMap) -> Option<&'static str> {
-    match headers.get("authorization").and_then(|v| v.to_str().ok())? {
-        v if v == format!("Bearer {SESSION}") => Some(ACCOUNT),
-        v if v == format!("Bearer {SECOND_SESSION}") => Some(SECOND_ACCOUNT),
-        _ => None,
-    }
-}
 const DEVICE: &str = "native-e2e-device";
 /// Short enough that every status read on the desktop control plane falls
 /// inside its proactive-refresh window (10 minutes).
@@ -85,22 +69,17 @@ async fn exchange(
         .get("verifier")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let (account, session, person) = match code {
-        CODE => (ACCOUNT, SESSION, PERSON),
-        SECOND_CODE => (SECOND_ACCOUNT, SECOND_SESSION, SECOND_PERSON),
-        _ => return (StatusCode::UNAUTHORIZED, "unknown handoff").into_response(),
-    };
-    if verifier.is_empty() {
+    if code != CODE || verifier.is_empty() {
         return (StatusCode::UNAUTHORIZED, "unknown handoff").into_response();
     }
     hub.revoked.store(false, Ordering::SeqCst);
     let now_ms = now_secs() * 1000;
     Json(json!({
-        "account_id": account,
-        "account_session": session,
+        "account_id": ACCOUNT,
+        "account_session": SESSION,
         "token_type": "Bearer",
         "device_id": DEVICE,
-        "label": person,
+        "label": PERSON,
         "expires_at_ms": now_ms + 30 * 24 * 60 * 60 * 1000,
         "refresh_after_ms": now_ms + TOKEN_LIFE_SECS * 1000,
     }))
@@ -125,7 +104,7 @@ async fn refresh(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> impl IntoRe
     let n = hub.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
     Json(json!({
         "refreshed": true,
-        "person": account_of(&headers).unwrap_or(ACCOUNT),
+        "person": ACCOUNT,
         "refresh_after_ms": (now_secs() + TOKEN_LIFE_SECS + n) * 1000,
     }))
     .into_response()
@@ -167,12 +146,14 @@ async fn home_routes() -> impl IntoResponse {
 
 /// The account a bearer belongs to, which a desktop Home claim re-checks.
 async fn identity(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> impl IntoResponse {
-    match account_of(&headers) {
-        Some(account) if !hub.revoked.load(Ordering::SeqCst) => {
-            Json(json!({ "account": account })).into_response()
-        }
-        _ => StatusCode::UNAUTHORIZED.into_response(),
+    let authorized = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        == Some(&format!("Bearer {SESSION}") as &str);
+    if !authorized || hub.revoked.load(Ordering::SeqCst) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
+    Json(json!({ "account": ACCOUNT })).into_response()
 }
 
 async fn revoke(State(hub): State<Arc<Hub>>) -> impl IntoResponse {

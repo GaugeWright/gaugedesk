@@ -1672,11 +1672,7 @@ fn desktop_status_json(
                     json!({ "state": "available", "projects": projects, "fresh": fresh });
             }
             crate::home_owner::HomeClaimState::Claimed { owner } => {
-                // Every active owner, the claimant first among them, so the
-                // surfaces can offer admitting another retained account.
-                let owners = crate::home_owner::owners(wb).unwrap_or_default();
-                status["home_claim"] =
-                    json!({ "state": "claimed", "owner": owner, "owners": owners });
+                status["home_claim"] = json!({ "state": "claimed", "owner": owner });
             }
             crate::home_owner::HomeClaimState::Governed => {
                 status["home_claim"] = json!({ "state": "governed" });
@@ -1963,95 +1959,6 @@ pub async fn post_claim_desktop_home(
         }
     }
     complete_verified_desktop_claim(&wb, &standing.person)
-}
-
-/// `POST /account/hub-session/admit-owner` — make another account signed in on
-/// this computer an owner of its Home (DR-0265).
-///
-/// A desktop hosts one Home, so a person who uses it under two accounts needs
-/// standing under both. The two accounts are the selected one and `person`;
-/// whichever of them already owns the Home admits the other. Both sign-ins
-/// must be live here and are freshly checked by the Hub, which is the proof
-/// that one person holds both on this computer.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AdmitDesktopOwner {
-    person: String,
-    confirm: bool,
-}
-
-pub async fn post_admit_desktop_owner(
-    State(wb): State<SharedWorkbench>,
-    desktop: Option<Extension<DesktopOperatorPlane>>,
-    Json(request): Json<AdmitDesktopOwner>,
-) -> Response {
-    if desktop.is_none() || crate::auth_oidc::web_account_mode() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let Some(selected) = hub_standing(&wb).filter(|s| s.expires_ms > now_ms()) else {
-        return (StatusCode::UNAUTHORIZED, "select a signed-in account first").into_response();
-    };
-    if !request.confirm || request.person == selected.person {
-        return (
-            StatusCode::CONFLICT,
-            "name another account signed in on this computer, and confirm",
-        )
-            .into_response();
-    }
-    let other = request.person;
-    let (Some(selected_bearer), Some(other_bearer)) = (
-        hub_session_token_for(&wb, &selected.person),
-        hub_session_token_for(&wb, &other),
-    ) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "both accounts must be signed in on this computer",
-        )
-            .into_response();
-    };
-    let expected = (selected.person.clone(), other.clone());
-    let checked = tokio::task::spawn_blocking(move || {
-        use crate::relay_route_stack::BearerAccounts;
-        let hub = crate::relay_route_stack::HubBearerAccounts::configured();
-        Ok::<_, String>((
-            hub.account_for(&selected_bearer)?,
-            hub.account_for(&other_bearer)?,
-        ))
-    })
-    .await;
-    match checked {
-        Ok(Ok((Some(a), Some(b)))) if (a.clone(), b.clone()) == expected => {}
-        Ok(Ok(_)) => {
-            return (StatusCode::UNAUTHORIZED, "sign in to both accounts again").into_response()
-        }
-        Ok(Err(error)) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the account service could not be checked",
-            )
-                .into_response()
-        }
-    }
-    let owners = match crate::home_owner::owners(&wb) {
-        Ok(owners) => owners,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
-    };
-    let (by, account) = if owners.contains(&selected.person) {
-        (selected.person.as_str(), other.as_str())
-    } else {
-        (other.as_str(), selected.person.as_str())
-    };
-    match crate::home_owner::admit_owner(&wb, by, account) {
-        Ok(crate::home_owner::OwnerAdmission::Admitted)
-        | Ok(crate::home_owner::OwnerAdmission::AlreadyOwner) => {}
-        Ok(crate::home_owner::OwnerAdmission::NotAnOwner) => {
-            return (StatusCode::CONFLICT, "neither account owns this computer").into_response()
-        }
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
-    }
-    crate::desktop_session::revoke(&wb);
-    Json(desktop_status_json(&wb, latest_session(&wb).as_ref(), true)).into_response()
 }
 
 fn complete_verified_desktop_claim(wb: &SharedWorkbench, person: &str) -> Response {

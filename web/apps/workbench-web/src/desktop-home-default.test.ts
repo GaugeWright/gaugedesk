@@ -34,7 +34,7 @@ describe("claiming a desktop for a signed-in account no Home serves", () => {
             session: session({ state: "available", projects: 4, fresh: false }),
         }))).toBe(false);
         expect(claimWithoutAsking(input({
-            session: session({ state: "claimed", owner: "someone-else", owners: ["someone-else"] }),
+            session: session({ state: "claimed", owner: "someone-else" }),
         }))).toBe(false);
         expect(claimWithoutAsking(input({ session: session({ state: "governed" }) }))).toBe(false);
     });

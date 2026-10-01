@@ -956,6 +956,109 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     assert_eq!(s, StatusCode::FORBIDDEN, "a revoked grant withdraws access");
 }
 
+/// The ids in a fork-forest response, depth first.
+fn forest_ids(forest: &Value) -> Vec<String> {
+    fn walk(nodes: &Value, out: &mut Vec<String>) {
+        for node in nodes.as_array().into_iter().flatten() {
+            out.push(node["id"].as_str().unwrap_or_default().to_owned());
+            walk(&node["children"], out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&forest["forest"], &mut out);
+    out
+}
+
+#[tokio::test]
+async fn ws580_routes_naming_no_project_are_closed_to_a_member_limited_to_projects() {
+    // WS-580: the per-project gate applied only where a path resolved to a
+    // project, so a scoped member reached every unmapped route on membership
+    // alone. Unmapped routes now fail closed for such a member, the cross-
+    // project listing filters, and a projection resolves to its chat's project.
+    let (_dir, app) = workbench_with_scoped_project();
+    let (s, _) = admin(
+        &app,
+        Some("owner-token"),
+        "people",
+        "project-access.grant",
+        serde_json::json!({"authority":"consultant-a","project_id":"proj-acme"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // The fork forest lists only chats the caller can see.
+    let (s, forest) = send(&app, "GET", "/fork-tree", None, Some("b-token")).await;
+    assert_eq!(s, StatusCode::OK, "{forest}");
+    assert!(
+        !forest_ids(&forest).contains(&"chat-acme".to_owned()),
+        "an ungranted member must not see another project's chats: {forest}"
+    );
+    let (_, forest) = send(&app, "GET", "/fork-tree", None, Some("a-token")).await;
+    assert!(
+        forest_ids(&forest).contains(&"chat-acme".to_owned()),
+        "{forest}"
+    );
+    let (_, forest) = send(&app, "GET", "/fork-tree", None, Some("owner-token")).await;
+    assert!(
+        forest_ids(&forest).contains(&"chat-acme".to_owned()),
+        "{forest}"
+    );
+
+    // A projection of a chat's scope resolves to that chat's project.
+    let (s, body) = send(
+        &app,
+        "GET",
+        "/projections/chat-acme/run",
+        None,
+        Some("b-token"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    let (s, body) = send(
+        &app,
+        "GET",
+        "/projections/chat-acme/run",
+        None,
+        Some("a-token"),
+    )
+    .await;
+    assert_ne!(s, StatusCode::FORBIDDEN, "{body}");
+
+    // A route naming no project is closed to a scoped member and open to the
+    // owner, who sees every project.
+    for (method, path, body) in [
+        ("GET", "/archetypes/agent-default", None),
+        ("POST", "/chats", Some("{}")),
+        ("GET", "/targets/inst-test/acts", None),
+        ("GET", "/projections/an-unknown-scope/run", None),
+    ] {
+        for token in ["a-token", "b-token"] {
+            let (s, reply) = send(&app, method, path, body, Some(token)).await;
+            assert_eq!(
+                s,
+                StatusCode::FORBIDDEN,
+                "{method} {path} must be closed to a scoped member ({token}): {reply}"
+            );
+        }
+        let (s, reply) = send(&app, method, path, body, Some("owner-token")).await;
+        assert_ne!(
+            s,
+            StatusCode::FORBIDDEN,
+            "{method} {path} stays open to the owner: {reply}"
+        );
+    }
+
+    // What a scoped member is meant to reach still answers.
+    for path in ["/workspace", "/chats", "/roster", "/whoami"] {
+        let (s, reply) = send(&app, "GET", path, None, Some("b-token")).await;
+        assert_ne!(
+            s,
+            StatusCode::FORBIDDEN,
+            "GET {path} for a scoped member: {reply}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn secaud4_audits_sensitive_reads_when_enabled() {
     // SECAUD-4 (CC7.2): with read-auditing on, a granted member's GET of project-scoped

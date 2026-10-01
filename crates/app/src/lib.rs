@@ -106,6 +106,7 @@ pub mod library_routes;
 pub mod library_state;
 pub mod lifecycle_routes;
 pub mod local_model_broker;
+pub mod local_operator;
 pub mod local_routes;
 pub mod managed_entitlement;
 pub mod managed_funding;
@@ -181,10 +182,11 @@ pub use gaugedesk_whip_runtime::{
     AdmittedPolicyEpoch, DoHostConfig, DoHostRequest, DoHostResponse, DoHostTransport,
     PolicyAdmissionError, PolicyEpoch, WhipHarnessFactory,
 };
+pub use local_operator::LocalOperatorSecret;
 pub use open_route_stack::{open_control_plane, open_control_plane_with_native_saves};
 pub use open_runtime::{
     open_control_plane_root, open_prepare, open_serve, open_serve_workbench,
-    spawn_project_workflow_supervisor,
+    open_serve_workbench_with, spawn_project_workflow_supervisor,
 };
 // The test-only reset route is this alias's only consumer (DR-0054 Phase A).
 #[cfg(debug_assertions)]

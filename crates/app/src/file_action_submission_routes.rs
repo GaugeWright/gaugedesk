@@ -79,6 +79,7 @@ fn submit(
     let context = match crate::home_routes::authenticate_home_work_request(
         &mut wb,
         &headers,
+        &axum::http::Method::POST,
         &format!("/chats/{chat}/file-actions/save"),
     ) {
         Ok(Some(context)) => context,

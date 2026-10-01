@@ -154,7 +154,12 @@ pub async fn require_home_admission(
 
     let admitted = {
         let mut workbench = wb.lock_unpoisoned();
-        authenticate_home_work_request(&mut workbench, req.headers(), req.uri().path())
+        authenticate_home_work_request(
+            &mut workbench,
+            req.headers(),
+            req.method(),
+            req.uri().path(),
+        )
     };
     let context = match admitted {
         Ok(context) => context,
@@ -178,6 +183,7 @@ pub async fn require_home_admission(
 pub(crate) fn authenticate_home_work_request(
     wb: &mut crate::Workbench,
     headers: &HeaderMap,
+    method: &Method,
     path: &str,
 ) -> Result<Option<crate::identity::AuthenticatedActionContext>, (StatusCode, &'static str)> {
     if !path.starts_with("/mobile/")
@@ -199,7 +205,20 @@ pub(crate) fn authenticate_home_work_request(
     let token = admission_token(headers)
         .ok_or((StatusCode::UNAUTHORIZED, "target Home admission required"))?;
     let bearer = net_http::bearer(headers);
-    let actor = AuthorityId::new(wb.admit_data_request(bearer, None)?);
+    // The path's project, so a member's grant is checked here as it is on the
+    // enterprise boundary, and a route naming no project is closed to a member
+    // limited to specific projects (WS-580).
+    let project = wb.scope_project_of_path(path);
+    let actor = AuthorityId::new(wb.admit_data_request(bearer, project.as_deref())?);
+    if let Some(refusal) = wb.scoped_member_route_refusal(
+        bearer,
+        crate::org::ORG_SCOPE,
+        method,
+        path,
+        project.as_deref(),
+    ) {
+        return Err(refusal);
+    }
     if wb
         .home_admissions
         .authorize(wb.home_id(), &actor, &token)

@@ -142,12 +142,17 @@ fn authenticate_staff_request(
     if request.uri().path() == "/home/admissions" && request.method() == Method::POST {
         return Ok(context);
     }
-    crate::home_routes::authenticate_home_work_request(wb, request.headers(), request.uri().path())?
-        .filter(|admitted| admitted.actor() == &actor)
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "office identity could not be admitted",
-        ))
+    crate::home_routes::authenticate_home_work_request(
+        wb,
+        request.headers(),
+        request.method(),
+        request.uri().path(),
+    )?
+    .filter(|admitted| admitted.actor() == &actor)
+    .ok_or((
+        StatusCode::UNAUTHORIZED,
+        "office identity could not be admitted",
+    ))
 }
 
 #[cfg(test)]

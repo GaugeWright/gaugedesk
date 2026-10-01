@@ -1140,7 +1140,7 @@ pub async fn post_materialize_organization_shared_project(
             role == Some(gaugedesk_core::abac::Role::owner())
                 || role == Some(gaugedesk_core::abac::Role::admin())
         });
-        let personal = guard.is_home_owner(&actor)
+        let personal = guard.home_owner_account().as_deref() == Some(&actor)
             && guard
                 .library
                 .projects

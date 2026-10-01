@@ -2,6 +2,7 @@ export * from "./auth-session";
 export * from "./webauthn-browser";
 export * from "./backups";
 export * from "./browser-route-json";
+export * from "./local-operator-credential";
 export * from "./client-build";
 export * from "./bridge";
 export * from "./control-plane-account";

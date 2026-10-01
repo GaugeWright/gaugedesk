@@ -66,6 +66,7 @@ import type {
 import type { RouteJson } from "./control-plane-transport";
 import { newIdempotencyKey } from "./control-plane-transport";
 import type { RouteEventStream, RouteRequest } from "./browser-route-json";
+import { LOCAL_OPERATOR_HEADER, localOperatorCredentialFor } from "./local-operator-credential";
 
 export interface WorkbenchTransport {
     readonly base: string;
@@ -74,9 +75,12 @@ export interface WorkbenchTransport {
     readonly events?: RouteEventStream;
 }
 
-function request(transport: WorkbenchTransport, path: string, init?: RequestInit): Promise<Response> {
+async function request(transport: WorkbenchTransport, path: string, init?: RequestInit): Promise<Response> {
     if (transport.request) return transport.request(path, init);
-    return fetch(transport.base + path, { ...init, credentials: "include" });
+    const headers = new Headers(init?.headers);
+    const operator = await localOperatorCredentialFor(transport.base + path);
+    if (operator) headers.set(LOCAL_OPERATOR_HEADER, operator);
+    return fetch(transport.base + path, { ...init, headers, credentials: "include" });
 }
 
 export async function getRun(transport: WorkbenchTransport, scope: ScopeId): Promise<RunState> {

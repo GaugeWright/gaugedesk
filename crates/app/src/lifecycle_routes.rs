@@ -126,10 +126,6 @@ impl Workbench {
         Ok(admission)
     }
 
-    pub(crate) fn fork_forest_value(&self) -> serde_json::Value {
-        serde_json::json!({ "forest": self.library_fork_forest() })
-    }
-
     pub(crate) fn lifecycle_projection_value(
         &self,
         scope: &str,
@@ -344,10 +340,43 @@ pub(crate) async fn get_workspace_delta(
 }
 
 /// The chat fork forest (`UX-8`): live chats nested by `forked_from`, a derived
-/// read-only projection (`INV-5`) over the library.
-pub(crate) async fn get_fork_tree(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+/// read-only projection (`INV-5`) over the library. A member limited to
+/// specific projects sees only those projects' chats (WS-580); a visible fork
+/// of a chat they cannot see is lifted to the top rather than dropped.
+pub(crate) async fn get_fork_tree(
+    State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    (StatusCode::OK, Json(wb.fork_forest_value())).into_response()
+    let vis = wb.project_visibility_in(
+        crate::net_http::bearer(&headers),
+        &crate::workbench_auth::req_scope(&headers),
+    );
+    let forest = visible_forest(wb.library_fork_forest(), &|id| wb.chat_visible(id, &vis));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "forest": forest })),
+    )
+        .into_response()
+}
+
+/// `forest` with every node `visible` refuses removed, its visible
+/// descendants taking its place.
+fn visible_forest(
+    forest: Vec<crate::library::ForkNode>,
+    visible: &dyn Fn(&str) -> bool,
+) -> Vec<crate::library::ForkNode> {
+    let mut out = Vec::new();
+    for mut node in forest {
+        let children = visible_forest(std::mem::take(&mut node.children), visible);
+        if visible(&node.id) {
+            node.children = children;
+            out.push(node);
+        } else {
+            out.extend(children);
+        }
+    }
+    out
 }
 
 /// `GET /projections/:scope/:kind?freshness=`: the freshness-carrying projection

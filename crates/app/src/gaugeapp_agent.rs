@@ -479,6 +479,11 @@ pub enum GaugeAppAgentError {
     NoModelAccess,
     Credential(String),
     Provider(String),
+    /// The provider refused because the account behind the credential has no
+    /// credit or quota left. Nothing about the request is wrong and retrying
+    /// will not help until someone funds that account, so it is kept apart from
+    /// `Provider`, which is a failure of this request.
+    ProviderFunding(String),
     InvalidOutput(String),
     Rejected(GaugeAppAgentRejection),
     Store(String),
@@ -500,6 +505,10 @@ impl std::fmt::Display for GaugeAppAgentError {
                 write!(formatter, "model credential is unavailable: {reason}")
             }
             Self::Provider(reason) => write!(formatter, "model provider request failed: {reason}"),
+            Self::ProviderFunding(reason) => write!(
+                formatter,
+                "the model provider account has no credit or quota left: {reason}"
+            ),
             Self::InvalidOutput(reason) => {
                 write!(formatter, "model returned invalid agent output: {reason}")
             }
@@ -1661,6 +1670,41 @@ fn canonical_tool(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Error codes by which OpenAI says the account behind a credential has run out
+/// of credit or quota, on an HTTP refusal and inside a failed event stream
+/// alike. On 2026-09-30 the hosted management agent's account ran dry and every
+/// turn failed for fourteen hours as a bare `502`, because a failed stream was
+/// indistinguishable from a broken request.
+const FUNDING_REFUSALS: &[&str] = &[
+    "insufficient_quota",
+    "credit_balance_exhausted",
+    "billing_hard_limit_reached",
+];
+
+/// Whether a provider error body or stream event says the account is out of
+/// credit or quota. The code sits in `error`, in `response.error`, or on the
+/// event itself, as `code` or as `type`.
+fn funding_refusal(value: &Value) -> bool {
+    let named = |object: &Value| {
+        ["code", "type"].iter().any(|key| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|code| FUNDING_REFUSALS.contains(&code))
+        })
+    };
+    [
+        Some(value),
+        value.get("error"),
+        value
+            .get("response")
+            .and_then(|response| response.get("error")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(named)
+}
+
 /// What the provider said about refusing, bounded and on one line. A bare
 /// status is what the failing turn used to report, and it costs a round trip
 /// through a human to learn anything from it.
@@ -1885,7 +1929,7 @@ fn provider_event(frame: &[u8]) -> Option<(String, Value)> {
 fn reduce_provider_event<E>(
     frame: &[u8],
     completed: &mut Option<Value>,
-    failure: &mut Option<String>,
+    failure: &mut Option<GaugeAppAgentError>,
     live_text: &mut SafeLiveText,
     emit: &mut E,
 ) -> Result<(), GaugeAppAgentError>
@@ -1913,9 +1957,14 @@ where
                         .iter()
                         .find_map(|key| response.get(key))
                 });
-                match nested {
+                let complaint = match nested {
                     Some(reason) => provider_complaint(&reason.to_string()),
                     None => provider_complaint(&payload),
+                };
+                if funding_refusal(&event) {
+                    GaugeAppAgentError::ProviderFunding(complaint)
+                } else {
+                    GaugeAppAgentError::Provider(complaint)
                 }
             });
         }
@@ -1996,9 +2045,9 @@ where
         return Err(GaugeAppAgentError::Interrupted);
     }
     let response = completed.ok_or_else(|| {
-        GaugeAppAgentError::Provider(
-            failure.unwrap_or_else(|| "event stream carried no completed response".into()),
-        )
+        failure.unwrap_or_else(|| {
+            GaugeAppAgentError::Provider("event stream carried no completed response".into())
+        })
     })?;
     if live_text.observed.is_empty() {
         let output = response
@@ -2076,9 +2125,13 @@ where
                     complaint,
                     "GaugeApp agent provider rejected request"
                 );
-                Err(GaugeAppAgentError::Provider(format!(
-                    "provider returned HTTP {status}: {complaint}"
-                )))
+                let reason = format!("provider returned HTTP {status}: {complaint}");
+                if serde_json::from_str::<Value>(&body).is_ok_and(|parsed| funding_refusal(&parsed))
+                {
+                    Err(GaugeAppAgentError::ProviderFunding(reason))
+                } else {
+                    Err(GaugeAppAgentError::Provider(reason))
+                }
             } else {
                 read_provider_event_stream(reader, stopped, emit)
             });
@@ -3839,6 +3892,77 @@ data: {\"type\":\"response.completed\",\"response\":{\"ok\":true}}\r\n\r\n";
             .unwrap_err()
             .contains("no completed response"));
         assert!(response_from_event_stream("").is_err());
+    }
+
+    fn streamed_failure(stream: &str) -> GaugeAppAgentError {
+        read_provider_event_stream(
+            std::io::Cursor::new(stream.to_owned()),
+            || false,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err()
+    }
+
+    // The shape OpenAI streamed to the hosted management agent on 2026-09-30,
+    // when its account had no credit: the request is accepted, then fails.
+    #[test]
+    fn a_stream_refused_for_want_of_credit_is_a_funding_failure() {
+        let stream = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"insufficient_quota\",",
+            "\"code\":\"credit_balance_exhausted\",\"message\":\"You have no credits remaining.\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":",
+            "{\"code\":\"credit_balance_exhausted\",\"message\":\"You have no credits remaining.\"}}}\n\n",
+        );
+        match streamed_failure(stream) {
+            GaugeAppAgentError::ProviderFunding(reason) => {
+                assert!(reason.contains("no credits remaining"), "{reason}")
+            }
+            other => panic!("expected a funding failure, got {other:?}"),
+        }
+        // The code alone, nested under the response, is enough.
+        let nested = "data: {\"type\":\"response.failed\",\"response\":{\"error\":\
+{\"code\":\"insufficient_quota\",\"message\":\"quota\"}}}\n\n";
+        assert!(matches!(
+            streamed_failure(nested),
+            GaugeAppAgentError::ProviderFunding(_)
+        ));
+    }
+
+    #[test]
+    fn a_stream_that_fails_for_another_reason_stays_a_provider_failure() {
+        let stream = "data: {\"type\":\"response.failed\",\"response\":{\"error\":\
+{\"code\":\"server_error\",\"message\":\"The server had an error\"}}}\n\n";
+        assert!(matches!(
+            streamed_failure(stream),
+            GaugeAppAgentError::Provider(reason) if reason == "The server had an error"
+        ));
+        assert!(matches!(
+            streamed_failure("data: {\"type\":\"response.created\",\"response\":{}}\n\n"),
+            GaugeAppAgentError::Provider(reason) if reason.contains("no completed response")
+        ));
+    }
+
+    // The same refusal as an HTTP 429 body, which is how OpenAI answers a
+    // request it refuses before streaming.
+    #[test]
+    fn a_funding_refusal_is_recognised_by_code_or_type() {
+        let refused = serde_json::json!({ "error": {
+            "message": "You exceeded your current quota.",
+            "type": "insufficient_quota",
+            "code": "insufficient_quota",
+        }});
+        assert!(funding_refusal(&refused));
+        assert!(funding_refusal(
+            &serde_json::json!({ "error": { "code": "billing_hard_limit_reached" } })
+        ));
+        assert!(!funding_refusal(&serde_json::json!({ "error": {
+            "type": "requests",
+            "code": "rate_limit_exceeded",
+        }})));
+        assert!(!funding_refusal(
+            &serde_json::json!({ "detail": "no access" })
+        ));
     }
 
     // The exact refusal that reached the canary, reported as the provider wrote

@@ -6,7 +6,6 @@ import { describe, expect, it } from "vitest";
 import {
     handoffCodeFromPaste,
     hubSessionCallback,
-    hubSessionAdmitOwner,
     hubSessionClaimHome,
     hubSessionAccounts,
     hubSessionReach,
@@ -137,20 +136,7 @@ describe("hub session wrappers", () => {
         expect(calls.at(-1)).toEqual({
             path: "/account/hub-session/claim-home", body: { person: "alice", confirm: true },
         });
-        // An older desktop names only the claimant; it is then the one owner.
-        expect(claimed.homeClaim).toEqual({ state: "claimed", owner: "alice", owners: ["alice"] });
-    });
-
-    it("sends the account to admit as another owner and reads every owner back", async () => {
-        const calls: Array<{ path: string; body?: unknown }> = [];
-        const admitted = await hubSessionAdmitOwner(jsonReturning({
-            linked: true, person: "alice",
-            home_claim: { state: "claimed", owner: "alice", owners: ["alice", "alice-work"] },
-        }, calls), "alice-work");
-        expect(calls.at(-1)).toEqual({
-            path: "/account/hub-session/admit-owner", body: { person: "alice-work", confirm: true },
-        });
-        expect(admitted.homeClaim).toEqual({ state: "claimed", owner: "alice", owners: ["alice", "alice-work"] });
+        expect(claimed.homeClaim).toEqual({ state: "claimed", owner: "alice" });
     });
 
     it("corporate entry uses the account handoff and preserves no-match vs failure", async () => {

@@ -4,7 +4,9 @@
 //! callers, but open binaries and desktop shells should import this module so
 //! the future open repo has a narrow, source-posture-specific API.
 
+pub use crate::local_operator::LocalOperatorSecret;
 pub use crate::open_route_stack::{open_control_plane, open_control_plane_with_native_saves};
 pub use crate::open_runtime::{
     open_control_plane_root, open_prepare, open_serve, open_serve_workbench,
+    open_serve_workbench_with,
 };

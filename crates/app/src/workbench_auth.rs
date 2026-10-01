@@ -53,6 +53,51 @@ impl ProjectVisibility {
     }
 }
 
+/// The routes naming no project that a member limited to specific projects may
+/// still reach (WS-580). Each is one of:
+/// - the caller's own account, sign-in, Home admission or invitation;
+/// - a listing that filters itself to the caller's visible projects or to
+///   what is addressed to the caller;
+/// - Home-wide data that is not project data: the member directory, health,
+///   identity;
+/// - starting the caller's own shipped tutorial project;
+/// - creating a project of their own.
+///
+/// Anything else that resolves to no project is refused to such a member,
+/// so a route added later is closed to them until someone decides otherwise.
+/// Administration routes gate themselves by role and are reached as before.
+pub(crate) fn scoped_member_may_reach(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    let get = method == Method::GET || method == Method::HEAD;
+    let exact = |candidates: &[&str]| candidates.contains(&path);
+    path.starts_with("/admin/")
+        || path.starts_with("/account/")
+        || path.starts_with("/auth/")
+        || path.starts_with("/mobile/")
+        || path.starts_with("/gaugeapps/account-settings/")
+        || path.starts_with("/gaugeapps/administration/")
+        || path.starts_with("/directory/")
+        || exact(&["/home/admissions", "/home/invitations/accept"])
+        || path.starts_with("/tutorials/")
+        || exact(&["/health", "/whoami"])
+        // Listings that filter to the caller's visible projects or to what
+        // is addressed to the caller.
+        || (get
+            && (exact(&[
+                "/workspace",
+                "/workspace/events",
+                "/chats",
+                "/fork-tree",
+                "/search",
+                "/tasks",
+                "/notices",
+                "/console/review-count",
+                "/roster",
+            ]) || path.starts_with("/projections/library/workspace")))
+        // A project of the member's own creation leaks no one else's.
+        || (method == Method::POST && path == "/projects")
+}
+
 /// Gate an admin request by capability (`RBAC-5`); returns the error response to
 /// short-circuit with, or `None` to proceed. `cap = None` is a read (any console
 /// access). Ungated in single-user mode (no IdP) — see [`Workbench::authorize`].
@@ -1057,7 +1102,58 @@ impl Workbench {
                 let id = segs.next()?;
                 (!id.is_empty()).then(|| id.to_string())
             }
+            // WS-580: these address one project's data by an id the library or
+            // the store resolves. The library workspace carriage is the nav
+            // projection, which filters itself and is classified separately.
+            "projections" => match segs.next()? {
+                crate::library::LIBRARY_SCOPE => None,
+                scope => self.library.project_of_chat(scope).map(str::to_string),
+            },
+            "targets" => self
+                .library
+                .project_of_target(segs.next()?)
+                .map(str::to_string),
+            "target-settlements" => self
+                .store_ref()
+                .fold::<gaugedesk_core::target_settlement::TargetSettlementState>(
+                    &crate::target_settlement::settlement_scope(segs.next()?),
+                )
+                .ok()
+                .and_then(|state| state.declaration)
+                .map(|declaration| declaration.project_id),
             _ => None,
+        }
+    }
+
+    /// **WS-580**: refuse a member limited to specific projects any route that
+    /// names none of them, unless the route is one such a member is meant to
+    /// reach. `None` when the request may proceed to the ordinary gates.
+    ///
+    /// The per-project gate applies only where a path resolves to a project,
+    /// so before this every route nobody mapped answered on membership alone:
+    /// the fork forest listed every project's chats, a projection read any
+    /// chat's events, a project-less edit chat was open to every member, and
+    /// `POST /chats` wrote into the Home's Personal project. This makes the
+    /// unmapped case fail closed for exactly the principals scoping exists for.
+    /// Solo, bootstrap and owner/admin callers see every project, so it never
+    /// refuses them; `project` is the path's resolved project, if any.
+    pub fn scoped_member_route_refusal(
+        &self,
+        bearer: Option<&str>,
+        org_scope: &str,
+        method: &axum::http::Method,
+        path: &str,
+        project: Option<&str>,
+    ) -> Option<(StatusCode, &'static str)> {
+        if project.is_some() || scoped_member_may_reach(method, path) {
+            return None;
+        }
+        match self.project_visibility_in(bearer, org_scope) {
+            ProjectVisibility::All => None,
+            ProjectVisibility::Only(_) => Some((
+                StatusCode::FORBIDDEN,
+                "this is not available to a member limited to specific projects",
+            )),
         }
     }
 

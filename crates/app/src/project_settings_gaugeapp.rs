@@ -621,6 +621,7 @@ fn agent_error(reason: GaugeAppAgentError) -> Response {
         GaugeAppAgentError::Busy => StatusCode::CONFLICT,
         GaugeAppAgentError::NoModelAccess => StatusCode::PRECONDITION_FAILED,
         GaugeAppAgentError::Interrupted => StatusCode::CONFLICT,
+        GaugeAppAgentError::ProviderFunding(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_GATEWAY,
     };
     error(status, reason.to_string())

@@ -192,6 +192,9 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
             axum::http::HeaderName::from_static("x-gaugedesk-client-protocol"),
             axum::http::HeaderName::from_static("x-gaugedesk-client-channel"),
             axum::http::HeaderName::from_static("x-gaugedesk-client-platform"),
+            // DR-0269: the desktop window's per-launch secret for its own
+            // local control plane.
+            axum::http::HeaderName::from_static(crate::local_operator::HEADER),
         ])
         // Browser editors must be able to carry the exact workspace cut from a
         // cross-origin GET into save/preview requests. Without this exposure

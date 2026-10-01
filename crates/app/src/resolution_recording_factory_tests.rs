@@ -30,7 +30,7 @@ fn corrections(intent: &Intent) -> CorrectionIntent {
     }
 }
 fn recording_router(wb: SharedWorkbench, input_path: std::path::PathBuf, budget: usize) -> Router {
-    Router::new().merge(crate::home_routes::routes()).route("/corrections", post(move |
+    Router::new().merge(crate::home_routes::routes()).route("/chats/{chat}/corrections", post(move |
         State(wb): State<SharedWorkbench>, Extension(context): Extension<AuthenticatedActionContext>, Json(intent): Json<CorrectionIntent>
     | {
         let path = input_path.clone();
@@ -55,7 +55,7 @@ async fn submit(
 ) -> (StatusCode, String) {
     send(
         app,
-        "/corrections",
+        &format!("/chats/{}/corrections", intent.chat_id),
         Some(token),
         Some(admission),
         &serde_json::to_string(intent).unwrap(),
@@ -73,7 +73,15 @@ async fn correction_home_admission_retains_exact_input_and_outbox_without_a_file
     let body = serde_json::to_string(&intent).unwrap();
     for token in [None, Some(token.as_str())] {
         assert_eq!(
-            send(&app, "/corrections", token, None, &body).await.0,
+            send(
+                &app,
+                &format!("/chats/{}/corrections", intent.chat_id),
+                token,
+                None,
+                &body
+            )
+            .await
+            .0,
             StatusCode::UNAUTHORIZED
         );
     }
@@ -217,7 +225,12 @@ async fn correction_admission_uses_committed_membership_and_target_permission() 
     membership(&mut wb.lock_unpoisoned(), "alice", "consultant");
     let (status, reason) = submit(&app, &token, &admission, &intent).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{reason}");
-    assert!(reason.contains("current grant"), "{reason}");
+    // Refused at the Home boundary, which resolves the chat's project, before
+    // the factory's own grant check (WS-580).
+    assert!(
+        reason.contains("not in scope for this project") || reason.contains("current grant"),
+        "{reason}"
+    );
     {
         let mut wb = wb.lock_unpoisoned();
         membership(&mut wb, "alice", "owner");

@@ -22,7 +22,7 @@ use crate::account::{
 use crate::{LockUnpoisoned, SharedWorkbench};
 
 const PROTOCOL: &str = "whipplescript.model-egress.v1";
-const PATH: &str = "/internal/local-model-egress";
+pub(crate) const PATH: &str = "/internal/local-model-egress";
 const TOKEN_ENV: &str = "GAUGEDESK_LOCAL_MODEL_BROKER_TOKEN";
 const CODEX_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;

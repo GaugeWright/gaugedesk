@@ -17,6 +17,8 @@
 // build's wasm loaders for every host that renders `App`, not just the
 // standalone entry (see wasm-modules.ts).
 import "./wasm-modules";
+// Before anything can reach the control plane (DR-0269).
+import "./desktop-operator-credential";
 import { accountSelectionSync } from "./account-selection-sync";
 import { accountMenuIdentity } from "./account-menu-identity";
 import { desktopHomeSession } from "./desktop-home-session";
@@ -600,49 +602,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     };
     const selectedOwnsThisComputer = () => {
         const claim = hubSession()?.homeClaim;
-        const person = hubSession()?.person;
         return hubSession()?.expired !== true && claim?.state === "claimed"
-            && !!person && claim.owners.includes(person);
+            && claim.owner === hubSession()?.person;
     };
     const otherOwnerOfThisComputer = () => {
         const claim = hubSession()?.homeClaim;
-        const person = hubSession()?.person;
-        if (claim?.state !== "claimed" || (person && claim.owners.includes(person))) return null;
-        return retainedAccounts()?.accounts.find((account) => claim.owners.includes(account.person))?.label
+        if (claim?.state !== "claimed" || claim.owner === hubSession()?.person) return null;
+        return retainedAccounts()?.accounts.find((account) => account.person === claim.owner)?.label
             ?? claim.owner;
     };
     // The account that owns this computer, when it is signed in here too.
     const owningRetainedAccount = () => {
         const claim = hubSession()?.homeClaim;
-        const person = hubSession()?.person;
-        if (claim?.state !== "claimed" || (person && claim.owners.includes(person))) return null;
-        return retainedAccounts()?.accounts.find((account) => claim.owners.includes(account.person)) ?? null;
-    };
-    // Another account signed in here that this Home does not admit as an
-    // owner, which the selected owner may share the computer with (DR-0265).
-    const shareableAccounts = () => {
-        const status = hubSession();
-        const claim = status?.homeClaim;
-        if (!isTauri() || claim?.state !== "claimed" || !status?.person) return [];
-        if (!claim.owners.includes(status.person)) return [];
-        return (retainedAccounts()?.accounts ?? [])
-            .filter((account) => !claim.owners.includes(account.person));
-    };
-    const [admitBusy, setAdmitBusy] = createSignal(false);
-    const [admitError, setAdmitError] = createSignal("");
-    const admitOwner = async (person: string) => {
-        if (admitBusy()) return;
-        setAdmitBusy(true);
-        setAdmitError("");
-        try {
-            await api.hubSessionAdmitOwner(person);
-            await refetchHubSession();
-            await refetchHome();
-        } catch (error) {
-            setAdmitError(error instanceof Error ? error.message : "Could not share this computer.");
-        } finally {
-            setAdmitBusy(false);
-        }
+        if (claim?.state !== "claimed" || claim.owner === hubSession()?.person) return null;
+        return retainedAccounts()?.accounts.find((account) => account.person === claim.owner) ?? null;
     };
     const claimThisComputer = async () => {
         if ((!canClaimThisComputer() && !selectedOwnsThisComputer()) || claimBusy()) return;
@@ -2606,14 +2579,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     Claim this computer
                 </button>
             </Show>
-            <For each={shareableAccounts()}>
-                {(account) => <button type="button" data-admit-owner={account.person}
-                    title="Makes that account an owner of this computer's Home, so it opens these projects too."
-                    disabled={admitBusy()} onClick={() => void admitOwner(account.person)}>
-                    {admitBusy() ? "Sharing…" : `Share this computer with ${account.label}`}
-                </button>}
-            </For>
-            <Show when={admitError()}><p role="alert">{admitError()}</p></Show>
             <SettingsMenu
                 api={api}
                 placementPolicy={props.placementPolicy}
@@ -3926,35 +3891,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                     This computer’s Home belongs to {owningRetainedAccount()?.label ?? "another account"},
                                     so this account has no projects on it.
                                 </p>
-                                {/* A computer hosts one Home; a person reaches it
-                                    under each of their accounts by making each an
-                                    owner, which needs the owner signed in here too. */}
-                                <Show when={!owningRetainedAccount()}>
-                                    <p class="homegate-lede">
-                                        If that account is yours, sign in with it here once to let this account use this computer too.
-                                    </p>
-                                </Show>
                             </Show>
                             <div class="homegate-connect-row">
-                                <Show when={owningRetainedAccount()} fallback={
-                                    <Show when={otherOwnerOfThisComputer()}>
-                                        <button type="button" class="firstrun-connect" data-sign-in-owner
-                                            onClick={() => setSignInOpen(true)}>
-                                            Sign in with that account
-                                        </button>
-                                    </Show>
-                                }>
-                                    {(account) => <>
-                                        <button type="button" class="firstrun-connect" data-admit-owner
-                                            disabled={admitBusy() || switchingAccount()}
-                                            onClick={() => void admitOwner(account().person)}>
-                                            {admitBusy() ? "Sharing…" : "Let this account use this computer"}
-                                        </button>
-                                        <button type="button" data-switch-to-owner
-                                            disabled={switchingAccount()} onClick={() => void switchAccount(account().person)}>
-                                            Switch to {account().label}
-                                        </button>
-                                    </>}
+                                <Show when={owningRetainedAccount()}>
+                                    {(account) => <button type="button" class="firstrun-connect" data-switch-to-owner
+                                        disabled={switchingAccount()} onClick={() => void switchAccount(account().person)}>
+                                        Switch to {account().label}
+                                    </button>}
                                 </Show>
                                 <button type="button" data-open-local-without-claim
                                     disabled={switchingAccount()} onClick={() => void switchLocal()}>
@@ -3962,7 +3905,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 </button>
                             </div>
                             <Show when={accountSwitchError()}><p class="homegate-error" role="alert">{accountSwitchError()}</p></Show>
-                            <Show when={admitError()}><p class="homegate-error" role="alert">{admitError()}</p></Show>
                         </Show>
                     </>}>
                         <p class="homegate-kicker">Signed in</p>

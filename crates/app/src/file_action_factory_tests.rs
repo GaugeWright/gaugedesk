@@ -37,7 +37,7 @@ struct Intent {
 }
 
 fn router(wb: SharedWorkbench, input_path: std::path::PathBuf) -> Router {
-    Router::new().merge(crate::home_routes::routes()).route("/factory", post(move |
+    Router::new().merge(crate::home_routes::routes()).route("/chats/{chat}/factory", post(move |
         State(wb): State<SharedWorkbench>, Extension(context): Extension<AuthenticatedActionContext>, Json(intent): Json<Intent>
     | {
         let path = input_path.clone();
@@ -53,6 +53,12 @@ fn router(wb: SharedWorkbench, input_path: std::path::PathBuf) -> Router {
             }
         }
     })).route_layer(axum::middleware::from_fn_with_state(wb.clone(), crate::home_routes::require_home_admission)).with_state(wb)
+}
+
+/// The production-shaped, chat-scoped path the factory is mounted at, so the
+/// Home boundary resolves the chat's project as it does for real saves.
+fn factory_path(intent: &Intent) -> String {
+    format!("/chats/{}/factory", intent.chat_id)
 }
 
 async fn send(
@@ -316,15 +322,26 @@ async fn real_home_factory_retains_exact_command_through_renewal_and_restart() {
     let app = router(wb.clone(), input_path.clone());
     let body = serde_json::to_string(&intent).unwrap();
     assert_eq!(
-        send(&app, "/factory", None, None, &body).await.0,
+        send(&app, &factory_path(&intent), None, None, &body)
+            .await
+            .0,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(
-        send(&app, "/factory", Some(&token), None, &body).await.0,
+        send(&app, &factory_path(&intent), Some(&token), None, &body)
+            .await
+            .0,
         StatusCode::UNAUTHORIZED
     );
     let admission = home_admission(&app, &token).await;
-    let (status, response) = send(&app, "/factory", Some(&token), Some(&admission), &body).await;
+    let (status, response) = send(
+        &app,
+        &factory_path(&intent),
+        Some(&token),
+        Some(&admission),
+        &body,
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{response}");
     let result: serde_json::Value = serde_json::from_str(&response).unwrap();
     assert_eq!(result["replayed"], false);
@@ -367,7 +384,14 @@ async fn real_home_factory_retains_exact_command_through_renewal_and_restart() {
     };
     let app = router(wb.clone(), input_path);
     let admission = home_admission(&app, &renewed).await;
-    let (status, replay) = send(&app, "/factory", Some(&renewed), Some(&admission), &body).await;
+    let (status, replay) = send(
+        &app,
+        &factory_path(&intent),
+        Some(&renewed),
+        Some(&admission),
+        &body,
+    )
+    .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
     let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
     assert_eq!(replay["replayed"], true);
@@ -376,7 +400,7 @@ async fn real_home_factory_retains_exact_command_through_renewal_and_restart() {
     assert_eq!(
         send(
             &app,
-            "/factory",
+            &factory_path(&intent),
             Some(&renewed),
             Some(&admission),
             &serde_json::to_string(&intent).unwrap()
@@ -415,9 +439,22 @@ async fn factory_requires_current_project_grants_and_committed_target_permission
         let mut wb = wb.lock_unpoisoned();
         membership(&mut wb, "alice", "consultant");
     }
-    let (status, refusal) = send(&app, "/factory", Some(&token), Some(&admission), &body).await;
+    let (status, refusal) = send(
+        &app,
+        &factory_path(&intent),
+        Some(&token),
+        Some(&admission),
+        &body,
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
-    assert!(refusal.contains("current grant"), "{refusal}");
+    // The Home boundary resolves the chat's project and refuses an ungranted
+    // member before the factory's own grant check, which stays as a second
+    // layer (WS-580).
+    assert!(
+        refusal.contains("not in scope for this project") || refusal.contains("current grant"),
+        "{refusal}"
+    );
     {
         let mut wb = wb.lock_unpoisoned();
         membership(&mut wb, "alice", "owner");
@@ -442,7 +479,14 @@ async fn factory_requires_current_project_grants_and_committed_target_permission
             "cache deliberately stays stale"
         );
     }
-    let (status, refusal) = send(&app, "/factory", Some(&token), Some(&admission), &body).await;
+    let (status, refusal) = send(
+        &app,
+        &factory_path(&intent),
+        Some(&token),
+        Some(&admission),
+        &body,
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
     assert!(refusal.contains("target authority"), "{refusal}");
 }
@@ -528,12 +572,19 @@ async fn factory_uses_target_restrictions_and_the_claims_of_the_actual_authentic
     let app = router(wb, dir.path().join("inputs.sqlite"));
     let admission = home_admission(&app, &token).await;
     let body = serde_json::to_string(&intent).unwrap();
-    let (status, reason) = send(&app, "/factory", Some(&token), Some(&admission), &body).await;
+    let (status, reason) = send(
+        &app,
+        &factory_path(&intent),
+        Some(&token),
+        Some(&admission),
+        &body,
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{reason}");
     assert!(reason.contains("resource policy"), "{reason}");
     let (status, response) = send(
         &app,
-        "/factory",
+        &factory_path(&intent),
         Some("eu-idp-token"),
         Some(&admission),
         &body,

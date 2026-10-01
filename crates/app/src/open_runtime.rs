@@ -5,6 +5,8 @@ use crate::{federation, open_control_plane, open_workbench, LockUnpoisoned};
 /// The window's loopback port is an operator channel for local work, but an
 /// account selected in that window cannot inherit the co-resident Home owner's
 /// operator authority. The relay uses its own listener and its own admission.
+/// The desktop serves this behind [`crate::local_operator::guard`], so only its
+/// own window, holding the per-launch secret, reaches it at all (DR-0269).
 pub(crate) fn desktop_operator_plane(wb: crate::SharedWorkbench) -> axum::Router {
     let home_broker = axum::Router::new()
         .route(
@@ -40,14 +42,8 @@ async fn selected_account_guard(
         return next.run(request).await;
     }
     let selected = crate::account_signin::live_hub_session_actor(&wb);
-    let (owner, selected_owns) = {
-        let guard = wb.lock_unpoisoned();
-        let owns = selected
-            .as_deref()
-            .is_some_and(|actor| guard.is_home_owner(actor));
-        (guard.home_owner_account(), owns)
-    };
-    if (selected.is_some() && selected != owner && !selected_owns)
+    let owner = wb.lock_unpoisoned().home_owner_account();
+    if (selected.is_some() && selected != owner)
         || (owner.is_some()
             && selected.is_none()
             && !crate::account_signin::local_operator_selected(&wb))
@@ -87,11 +83,26 @@ pub fn open_prepare(root: &std::path::Path) -> std::io::Result<crate::SharedWork
     Ok(wb)
 }
 
-/// Serve a workbench from [`open_prepare`] on `addr`.
+/// Serve a workbench from [`open_prepare`] on `addr`, requiring the local
+/// operator secret `GAUGEDESK_OPERATOR_SECRET` names, if it names one. The
+/// desktop shell uses [`open_serve_workbench_with`] and its own secret.
 pub async fn open_serve_workbench(
     wb: crate::SharedWorkbench,
     addr: &str,
     root: &std::path::Path,
+) -> std::io::Result<()> {
+    let secret =
+        crate::local_operator::LocalOperatorSecret::from_env().map_err(std::io::Error::other)?;
+    open_serve_workbench_with(wb, addr, root, secret).await
+}
+
+/// Serve a workbench on `addr`, refusing every request that does not carry
+/// `secret` when there is one (DR-0269).
+pub async fn open_serve_workbench_with(
+    wb: crate::SharedWorkbench,
+    addr: &str,
+    root: &std::path::Path,
+    secret: Option<crate::local_operator::LocalOperatorSecret>,
 ) -> std::io::Result<()> {
     {
         let guard = wb.lock_unpoisoned();
@@ -104,8 +115,9 @@ pub async fn open_serve_workbench(
     let listener = open_listener(addr).await?;
     spawn_project_workflow_supervisor(wb.clone());
     // The relay leg gets a listener of its own, never this one: this is the
-    // operator's channel, where a caller with no credentials is the operator,
-    // and the leg's locator is public (DR-0206). That one admits only this
+    // operator's channel, where a caller holding the window's secret (or, on a
+    // headless server without one, any caller) is the operator, and the leg's
+    // locator is public (DR-0206). That one admits only this
     // Home's owner, as the Hub names them.
     let crossings = serve_relay_crossings(
         wb.clone(),
@@ -124,7 +136,8 @@ pub async fn open_serve_workbench(
     // header is preferred when present.
     axum::serve(
         listener,
-        desktop_operator_plane(wb).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        crate::local_operator::guard(desktop_operator_plane(wb), secret)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
 }

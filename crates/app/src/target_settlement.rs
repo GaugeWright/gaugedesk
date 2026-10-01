@@ -75,7 +75,7 @@ pub struct SupersedeTargetSettlementMemberBody {
     pub later_member_id: String,
 }
 
-fn settlement_scope(declaration_id: &str) -> String {
+pub(crate) fn settlement_scope(declaration_id: &str) -> String {
     format!("target-settlement::{declaration_id}")
 }
 

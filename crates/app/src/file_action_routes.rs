@@ -158,7 +158,12 @@ fn context(
     headers: &HeaderMap,
     path: &str,
 ) -> Result<AuthenticatedActionContext, (StatusCode, &'static str)> {
-    match crate::home_routes::authenticate_home_work_request(wb, headers, path) {
+    match crate::home_routes::authenticate_home_work_request(
+        wb,
+        headers,
+        &axum::http::Method::GET,
+        path,
+    ) {
         Ok(Some(context)) => Ok(context),
         Ok(None) => Err((
             StatusCode::UNAUTHORIZED,

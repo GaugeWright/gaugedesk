@@ -2419,10 +2419,6 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.desktopSessionJson().then((json) => accountClient.hubSessionClaimHome(json, person));
     }
 
-    hubSessionAdmitOwner(person: string): Promise<accountClient.HubSessionStatus> {
-        return this.desktopSessionJson().then((json) => accountClient.hubSessionAdmitOwner(json, person));
-    }
-
     hubSessionAccounts(): Promise<accountClient.HubSessionAccounts> {
         return this.desktopSessionJson().then((json) => accountClient.hubSessionAccounts(json));
     }

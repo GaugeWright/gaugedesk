@@ -642,7 +642,8 @@ fn agent_error(error: GaugeAppAgentError) -> Response {
     //
     // Only the variants an operator can act on are logged, and only their own
     // messages. `Provider` carries a timeout, a size cap, or a transport error;
-    // `Credential` and `Store` describe configuration and persistence. The
+    // `ProviderFunding` says whose account needs credit; `Credential` and
+    // `Store` describe configuration and persistence. The
     // model's own output is deliberately excluded: `InvalidOutput` and
     // `Rejected` carry generated content, which is the person's, not an
     // operational detail. `Busy`, `Interrupted` and `NoModelAccess` are ordinary
@@ -650,6 +651,11 @@ fn agent_error(error: GaugeAppAgentError) -> Response {
     match &error {
         GaugeAppAgentError::Provider(detail) => {
             eprintln!("[gaugewright] management agent turn failed: provider: {detail}");
+        }
+        GaugeAppAgentError::ProviderFunding(detail) => {
+            eprintln!(
+                "[gaugewright] management agent turn failed: provider account has no credit or quota: {detail}"
+            );
         }
         GaugeAppAgentError::Credential(detail) => {
             eprintln!("[gaugewright] management agent turn failed: credential: {detail}");
@@ -672,6 +678,9 @@ fn agent_error(error: GaugeAppAgentError) -> Response {
         GaugeAppAgentError::Interrupted => StatusCode::from_u16(499).expect("valid status"),
         GaugeAppAgentError::NoModelAccess => StatusCode::CONFLICT,
         GaugeAppAgentError::Credential(_) => StatusCode::SERVICE_UNAVAILABLE,
+        // Not a bad gateway: the provider answered, and said it will not serve
+        // this account until it is funded.
+        GaugeAppAgentError::ProviderFunding(_) => StatusCode::SERVICE_UNAVAILABLE,
         GaugeAppAgentError::Provider(_) => StatusCode::BAD_GATEWAY,
         GaugeAppAgentError::InvalidOutput(_) | GaugeAppAgentError::Rejected(_) => {
             StatusCode::UNPROCESSABLE_ENTITY

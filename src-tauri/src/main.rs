@@ -95,6 +95,33 @@ async fn home_session() -> Option<String> {
         .flatten()
 }
 
+/// The secret the co-resident control plane requires on every request
+/// (DR-0269), set once before it starts serving. Only this window learns it,
+/// through [`operator_secret`]; no other process can call that.
+static OPERATOR: std::sync::OnceLock<gaugedesk_app::open_api::LocalOperatorSecret> =
+    std::sync::OnceLock::new();
+
+/// The local control plane's per-launch secret, or `None` in enterprise mode,
+/// where there is no co-resident control plane. The webview attaches it to
+/// every request to its own control plane.
+#[tauri::command]
+fn operator_secret() -> Option<String> {
+    OPERATOR.get().map(|secret| secret.expose().to_owned())
+}
+
+/// A fresh secret for each launch. A debug build alone may take a fixed one
+/// from `GAUGEDESK_OPERATOR_SECRET`, so a developer can call a source build's
+/// control plane by hand; a release build never reads it.
+fn launch_operator_secret() -> gaugedesk_app::open_api::LocalOperatorSecret {
+    #[cfg(debug_assertions)]
+    match gaugedesk_app::open_api::LocalOperatorSecret::from_env() {
+        Ok(Some(secret)) => return secret,
+        Ok(None) => {}
+        Err(message) => eprintln!("[gaugewright] ignoring the configured secret: {message}"),
+    }
+    gaugedesk_app::open_api::LocalOperatorSecret::generate()
+}
+
 /// Private campaign intake crosses the desktop's UI IPC boundary. The local
 /// HTTP listener is reachable by other processes, so it cannot distinguish a
 /// person configuring a pool from an Agent trying to plant its own holdout.
@@ -183,6 +210,7 @@ fn main() {
             open_external,
             notify_chat,
             home_session,
+            operator_secret,
             start_agent_improve_pool,
             latest_agent_improve_pool,
             evaluate_agent_improve,
@@ -290,6 +318,9 @@ fn main() {
                 });
             match decision {
                 Some(bind) => {
+                    // The secret exists before the window does, so the window's
+                    // first request can carry it and nothing is ever served open.
+                    let secret = OPERATOR.get_or_init(launch_operator_secret).clone();
                     // Start the control plane in the background before the window is
                     // interactive. Both stores live under the OS app-data dir
                     // (cwd `.gaugewright` in dev), resolved by the workspace crate.
@@ -303,8 +334,13 @@ fn main() {
                             let served = match gaugedesk_app::open_api::open_prepare(&root) {
                                 Ok(wb) => {
                                     let _ = HOME.set(wb.clone());
-                                    gaugedesk_app::open_api::open_serve_workbench(wb, bind, &root)
-                                        .await
+                                    gaugedesk_app::open_api::open_serve_workbench_with(
+                                        wb,
+                                        bind,
+                                        &root,
+                                        Some(secret),
+                                    )
+                                    .await
                                 }
                                 Err(e) => Err(e),
                             };

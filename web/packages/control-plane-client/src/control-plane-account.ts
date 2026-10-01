@@ -672,7 +672,7 @@ export interface HubSessionStatus {
      *  `fresh` is a computer holding nothing a person made, which the desktop
      *  claims without asking. */
     homeClaim: { state: "available"; projects: number; fresh: boolean }
-        | { state: "claimed"; owner: string; owners: string[] }
+        | { state: "claimed"; owner: string }
         | { state: "governed" }
         | null;
 }
@@ -684,13 +684,7 @@ function hubSessionStatusFrom(value: unknown): HubSessionStatus {
     const homeClaim = claim?.state === "available" && typeof claim.projects === "number"
         ? { state: "available" as const, projects: claim.projects, fresh: claim.fresh === true }
         : claim?.state === "claimed" && typeof claim.owner === "string"
-            ? {
-                state: "claimed" as const,
-                owner: claim.owner,
-                owners: Array.isArray(claim.owners)
-                    ? claim.owners.filter((id): id is string => typeof id === "string")
-                    : [claim.owner],
-            }
+            ? { state: "claimed" as const, owner: claim.owner }
             : claim?.state === "governed" ? { state: "governed" as const } : null;
     return {
         available: Boolean(o?.available),
@@ -715,15 +709,6 @@ export async function hubSessionStatus(json: RouteJson): Promise<HubSessionStatu
 export async function hubSessionClaimHome(json: RouteJson, person: string): Promise<HubSessionStatus> {
     if (!person) throw new Error("Select an account before claiming this computer");
     return hubSessionStatusFrom(await json("POST", "/account/hub-session/claim-home", {
-        person, confirm: true,
-    }));
-}
-
-/** Make another account signed in on this computer an owner of its Home.
- * Whichever of the selected account and `person` owns it admits the other. */
-export async function hubSessionAdmitOwner(json: RouteJson, person: string): Promise<HubSessionStatus> {
-    if (!person) throw new Error("Choose the account to admit");
-    return hubSessionStatusFrom(await json("POST", "/account/hub-session/admit-owner", {
         person, confirm: true,
     }));
 }

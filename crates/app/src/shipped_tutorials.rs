@@ -72,18 +72,6 @@ impl Workbench {
         }
     }
 
-    /// Whether `actor` is an active owner of this Home: its claimant, or an
-    /// account an owner admitted as another owner (DR-0265).
-    pub(crate) fn is_home_owner(&self, actor: &str) -> bool {
-        Org::rebuild(self.store_ref()).is_ok_and(|org| {
-            org.members.values().any(|member| {
-                member.status == MembershipStatus::Active
-                    && member.role == "owner"
-                    && member.authority == actor
-            })
-        })
-    }
-
     pub(crate) fn home_owner_account(&self) -> Option<String> {
         let claimed = self
             .store_ref()

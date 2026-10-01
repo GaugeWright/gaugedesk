@@ -1238,19 +1238,6 @@ impl Org {
             .filter(|m| m.status == MembershipStatus::Active && m.role == role)
             .count()
     }
-
-    /// The authorities of the active members holding `role`, sorted.
-    pub fn active_ids_with_role(&self, role: &str) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .members
-            .values()
-            .filter(|m| m.status == MembershipStatus::Active && m.role == role)
-            .map(|m| m.authority.clone())
-            .collect();
-        ids.sort();
-        ids.dedup();
-        ids
-    }
 }
 
 /// Hex-encoded SHA-256 of `s` — used to store/verify the SCIM token by hash only

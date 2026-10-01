@@ -597,7 +597,7 @@ async fn unavailable_audit_storage_refuses_staff_work_before_the_handler_runs() 
     let inspect = ran.clone();
     let app = Router::new()
         .route(
-            "/inspect",
+            "/workspace",
             get(move || {
                 let ran = inspect.clone();
                 async move {
@@ -610,7 +610,7 @@ async fn unavailable_audit_storage_refuses_staff_work_before_the_handler_runs() 
             wb.clone(),
             require_office_home_admission,
         ));
-    let (status, body) = send(&app, "GET", "/inspect", Some(&alice), Some(&admission)).await;
+    let (status, body) = send(&app, "GET", "/workspace", Some(&alice), Some(&admission)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(body.contains("office audit unavailable"));
     assert!(!ran.load(Ordering::SeqCst));

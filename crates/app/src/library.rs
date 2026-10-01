@@ -1347,6 +1347,15 @@ impl Library {
             .get(instance_id)
             .and_then(|i| i.project_id.as_deref())
     }
+    /// The project a work target belongs to (WS-580), or `None` for an Agent's
+    /// authoring target or an unknown id.
+    pub fn project_of_target(&self, target_id: &str) -> Option<&str> {
+        match &self.work_targets.get(target_id)?.owner {
+            WorkTargetOwner::Project { project_id } => Some(project_id.as_str()),
+            WorkTargetOwner::Archetype { .. } => None,
+        }
+    }
+
     /// The using-instances bound into a project.
     pub fn using_instances_of(&self, project_id: &str) -> Vec<&InstanceRecord> {
         let mut v: Vec<&InstanceRecord> = self

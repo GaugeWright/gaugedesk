@@ -790,6 +790,17 @@ pub async fn enterprise_auth(
                 }
             }
         };
+        // WS-580: a route naming no project is closed to a member limited to
+        // specific projects unless it is one such a member is meant to reach.
+        if let Some((code, msg)) = guard.scoped_member_route_refusal(
+            bearer.as_deref(),
+            &org_scope,
+            &method,
+            &path,
+            project.as_deref(),
+        ) {
+            return (code, Json(json!({ "error": msg }))).into_response();
+        }
         // ENTSEC-4 (ADR 0065): audit data-route *actions* (mutating methods) to the org trail —
         // the "what did this consultant do" record (references only, `INV-10`). `/admin/*` audits
         // itself semantically, so it is not double-logged here. Solo (no IdP) writes nothing.
