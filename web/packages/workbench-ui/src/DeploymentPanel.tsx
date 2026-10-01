@@ -37,6 +37,7 @@ import {
     formatAge,
     formatCents,
     formatDuration,
+    KEY_PROVIDERS,
     providerName,
 } from "./panel-agent-presentation";
 import "./panel-agent.css";
@@ -169,13 +170,16 @@ export function DeploymentPanel(props: {
     const [credentials, setCredentials] = createSignal<PublicCredentialMetadata[]>([]);
     const [addingKey, setAddingKey] = createSignal(false);
     const [providerKey, setProviderKey] = createSignal("");
+    // The provider a new key belongs to. The deployment then runs on that
+    // provider; the version names none (DR-0272).
+    const [keyProvider, setKeyProvider] = createSignal(KEY_PROVIDERS[0]!.value);
     const [credentialLabel, setCredentialLabel] = createSignal("");
     /** The one destructive action awaiting a second click: `revoke`, `session:<id>`, `key:<ref>`. */
     const [confirming, setConfirming] = createSignal<string | null>(null);
     let stopMonitor = () => {};
     const managedFunding = () => fundingMode() === "managed";
     const managing = () => binding() !== null;
-    const provider = () => providerName(profile().provider.provider);
+    const provider = () => providerName(keyProvider());
     const address = () => `${edgeOrigin().replace(/\/+$/, "")}/d/${deploymentId()}`;
     const embedSnippet = () => `<gw-session host="${address()}" panels="${profile().panels.components
         .map((panel) => panel.replace(/^gw-/, "")).join(",")}"></gw-session>`;
@@ -256,7 +260,11 @@ export function DeploymentPanel(props: {
                 setAbsoluteDays(Math.max(1, Math.floor(config.retention.absolute_ttl_seconds / 86_400)));
             }
             setWhiteLabel(config.white_label ?? false);
-            const managed = config.funding_ref?.startsWith("managed:") ?? false;
+            // Managed funding never names an owner credential and an owner key
+            // always does — the invariant the Home enforces at publish. The
+            // reference's prefix is versioned, and matching a stale one
+            // reopened every managed deployment as key-funded.
+            const managed = !config.credential_ref?.trim();
             setFundingMode(managed ? "managed" : "byok");
             if (!managed && config.credential_ref) setCredentialRef(config.credential_ref);
             const audience = config.audience;
@@ -329,7 +337,7 @@ export function DeploymentPanel(props: {
         if (!(counts().turns >= 1) || !(counts().sessions >= 1)) return "Visitor limits must be at least 1.";
         if (retentionError()) return retentionError();
         if (managedFunding() && !managedTenantId()) return "Choose the account that pays for this deployment.";
-        if (!managedFunding() && !credentialRef().trim()) return `Choose or add the ${provider()} key that pays for this deployment.`;
+        if (!managedFunding() && !credentialRef().trim()) return "Choose or add the provider key that pays for this deployment.";
         if (audienceMode() === "oidc" && (!oidcIssuer().trim() || !oidcAudience().trim())) {
             return "Signed-in visitors need both the sign-in provider's address and this site's client ID.";
         }
@@ -453,8 +461,8 @@ export function DeploymentPanel(props: {
         try {
             const created = await props.api.provisionPublicCredential({
                 edge_origin: edgeOrigin(),
-                provider: profile().provider.provider === "anthropic" ? "anthropic" : "openai",
-                credential_class: profile().provider.credential_class,
+                provider: keyProvider() === "anthropic" ? "anthropic" : "openai",
+                credential_class: KEY_PROVIDERS.find((choice) => choice.value === keyProvider())!.credentialClass,
                 api_key: providerKey().trim(),
                 label: credentialLabel().trim() || `${props.selection.archetypeName} deployment`,
             });
@@ -648,7 +656,7 @@ export function DeploymentPanel(props: {
                         onChange={() => setFundingMode("managed")}
                         label="GaugeWright billing" detail="Usage is billed to an account you administer." />
                     <Option type="radio" name="pa-funding" checked={!managedFunding()} onChange={() => setFundingMode("byok")}
-                        label={`Your own ${provider()} key`} detail={`${provider()} bills you directly for what visitors use.`} />
+                        label="Your own provider key" detail="The key's provider bills you directly for what visitors use, and the deployment runs on that provider." />
                 </div>
                 <Show when={managedUnavailable()}><p class="pa-hint warn">{managedUnavailable()}</p></Show>
                 <Show when={managedFunding()}>
@@ -662,14 +670,14 @@ export function DeploymentPanel(props: {
                     <Show when={credentialRef() && !credentials().some((credential) => credential.credential_ref === credentialRef())}>
                         <p class="pa-hint">Paying with the preset key <code>{credentialRef()}</code>.</p>
                     </Show>
-                    <Show when={credentials().length} fallback={<p class="pa-hint pa-indent">No {provider()} keys stored yet.</p>}>
-                        <div class="pa-options pa-indent" role="radiogroup" aria-label={`${provider()} key`}>
+                    <Show when={credentials().length} fallback={<p class="pa-hint pa-indent">No provider keys stored yet.</p>}>
+                        <div class="pa-options pa-indent" role="radiogroup" aria-label="Provider key">
                             <For each={credentials()}>{(credential) => <>
                                 <div class="pa-option-row">
                                     <Option type="radio" name="pa-credential" checked={credentialRef() === credential.credential_ref}
                                         onChange={() => setCredentialRef(credential.credential_ref)}
                                         label={credential.label}
-                                        detail={`added ${new Date(credential.created_at_unix_ms).toLocaleDateString()}`} />
+                                        detail={`${providerName(credential.provider)} key, added ${new Date(credential.created_at_unix_ms).toLocaleDateString()}`} />
                                     <Show when={props.api.revokePublicCredential}>
                                         <button type="button" class="pa-quiet danger" onClick={() => setConfirming(`key:${credential.credential_ref}`)}>Remove</button>
                                     </Show>
@@ -684,9 +692,13 @@ export function DeploymentPanel(props: {
                     </Show>
                     <Show when={props.api.provisionPublicCredential}>
                         <Show when={addingKey()} fallback={<div class="pa-row pa-indent">
-                            <button type="button" class="pa-button" onClick={() => setAddingKey(true)}>Add {/^[aeiou]/i.test(provider()) ? "an" : "a"} {provider()} key…</button></div>}>
+                            <button type="button" class="pa-button" onClick={() => setAddingKey(true)}>Add a provider key…</button></div>}>
                             <div class="pa-composer pa-indent-box">
                                 <div class="pa-fields">
+                                    <label class="pa-field"><span>Provider</span>
+                                        <select class="pa-input" value={keyProvider()} onChange={(event) => setKeyProvider(event.currentTarget.value)}>
+                                            <For each={KEY_PROVIDERS}>{(choice) => <option value={choice.value}>{choice.name}</option>}</For>
+                                        </select></label>
                                     <label class="pa-field"><span>Name</span>
                                         <input class="pa-input" placeholder={`${props.selection.archetypeName} deployment`} value={credentialLabel()} onInput={(event) => setCredentialLabel(event.currentTarget.value)} /></label>
                                     <label class="pa-field"><span>{provider()} API key</span>

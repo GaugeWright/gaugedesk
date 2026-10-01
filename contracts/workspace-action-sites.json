@@ -1758,7 +1758,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "callable": "impl inherent for Workbench::create_managed_project_target_seeded",
         "capability": "boundary_cut",
         "count": 1,
         "expression": "probe . boundary_cut ()",
@@ -1768,7 +1768,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "callable": "impl inherent for Workbench::create_managed_project_target_seeded",
         "capability": "create_engagement",
         "count": 1,
         "expression": "workspace . create_engagement (& probe_id)",
@@ -1778,7 +1778,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "callable": "impl inherent for Workbench::create_managed_project_target_seeded",
         "capability": "init_at",
         "count": 1,
         "expression": "self . workspace_provider (& target_id) . init_at (& self . targets_dir () . join (& target_id))",
@@ -1788,7 +1788,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "callable": "impl inherent for Workbench::create_managed_project_target_seeded",
         "capability": "remove_engagement",
         "count": 1,
         "expression": "workspace . remove_engagement (& probe_id)",
@@ -1798,10 +1798,10 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::create_managed_project_target",
+        "callable": "impl inherent for Workbench::create_managed_project_target_seeded",
         "capability": "seed_main",
         "count": 1,
-        "expression": "workspace . seed_main (& default_gate_files ())",
+        "expression": "workspace . seed_main (& seed)",
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "topology-and-settlement"
@@ -5228,6 +5228,56 @@
     },
     {
       "site": {
+        "callable": "impl inherent for Workbench::commit_preview_version",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (& format ! (\"panel preview version {version}\"))",
+        "file": "crates/app/src/panel_preview.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::commit_preview_version",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& engagement_id)",
+        "file": "crates/app/src/panel_preview.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::commit_preview_version",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/panel_preview.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::commit_preview_version",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& engagement_id)",
+        "file": "crates/app/src/panel_preview.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::commit_preview_version",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& path , text)",
+        "file": "crates/app/src/panel_preview.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
         "callable": "migrate_agent_file_drafts",
         "capability": "commit_turn",
         "count": 1,
@@ -5793,6 +5843,16 @@
         "count": 1,
         "expression": "workspace . cut_descends_from (& current , & card . baseline_main_cut)",
         "file": "crates/app/src/agent_improve_evidence.rs"
+      },
+      "profile": "authoring"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for NativeImprovePrepared::prepare",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "guard . targets . get (& target_id) . ok_or (\"Agent improve authoring target is unavailable\") ? . current_main_cut ()",
+        "file": "crates/app/src/agent_improve_runtime.rs"
       },
       "profile": "authoring"
     },

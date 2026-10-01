@@ -313,7 +313,7 @@ function fixturePanelProfile(): PanelPublicProfile {
     return {
         panels: { components: ["gw-chat", "gw-viewer"], default_component: "gw-chat", attribution: "white_label_eligible" },
         public_abilities: ["command.run"],
-        provider: { provider: "managed", model: "configured by placement", base_url: "", credential_class: "deployment" },
+        model: {},
         audience_inputs: ["text", "document"], initial_workspace: [],
         retention: { idle_ttl_seconds: 3600, absolute_ttl_seconds: 86400, transcript_retained: true, workspace_retained: false },
         collection: null,
@@ -433,7 +433,7 @@ function fixtureWorkspace(scope: ScopeFixture, projectFixtures: readonly Project
     const archetype = ({ seed, id, targetId }: typeof libraryAgents[number]): Workspace["archetypes"][number] => ({
         id, name: seed.name, kind: seed.kind, panelProfile: seed.kind === "panel" ? fixturePanelProfile() : null,
         instanceId: fixturePlacementId(`${id}:authoring`), authoringTargetId: targetId,
-        isDefault: Boolean(seed.isDefault), forkedFrom: null, forkedFromName: null,
+        isDefault: Boolean(seed.isDefault), forkedFrom: null, forkedFromName: null, previews: [],
         chats: seed.isDefault ? [] : [editChat(id, targetId, `Improve ${seed.name}`)], workstreams: [],
     });
     const archetypes = libraryAgents.map(archetype);

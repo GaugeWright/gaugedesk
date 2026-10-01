@@ -10,8 +10,8 @@
  * It speaks the owner's language: panels and abilities by their plain names,
  * retention in hours and days, sizes in megabytes. The wire names live in
  * `panel-agent-presentation.ts`, and the few that still need to be editable by
- * hand — model ID, base URL, credential class, collection schema — sit under
- * Advanced.
+ * hand — an exact model ID and the collection schema — sit under Advanced. No
+ * provider is authored here: who pays for a deployment chooses it (DR-0272).
  *
  * Three parts of the contract are not edited here. Its starting files are what
  * the builder — the agent's edit chat — writes. Its default panel has no effect on
@@ -32,10 +32,9 @@ import {
     MAX_COLLECTED_FILE_MB,
     PANEL_CHOICES,
     panelModelChoices,
-    PROVIDER_CHOICES,
     PUBLIC_ABILITY_CHOICES,
     secondsFrom,
-    withProvider,
+    withPinnedModel,
     type DurationUnit,
 } from "./panel-agent-presentation";
 import "./panel-agent.css";
@@ -112,10 +111,9 @@ export function PanelContractEditor(props: {
         : "";
     const pathProblems = () => (profile().collection?.exportable_paths ?? [])
         .map(collectionPathProblem).filter(Boolean);
-    const knownProvider = () => PROVIDER_CHOICES.some((choice) => choice.value === profile().provider.provider);
-    const models = () => panelModelChoices(profile().provider.provider, profile().provider.model);
-    const setModel = (model: string) =>
-        update((current) => ({ ...current, provider: { ...current.provider, model } }));
+    const pinned = () => profile().model.pinned ?? "";
+    const models = () => panelModelChoices(pinned());
+    const setModel = (model: string) => update((current) => withPinnedModel(current, model));
 
     return <div class="pa-root" data-panel-public-profile>
         <section class="pa-section" data-panel-contract-panels>
@@ -161,39 +159,25 @@ export function PanelContractEditor(props: {
         <section class="pa-section" data-panel-contract-model>
             <div class="pa-section-head">
                 <h3>Model</h3>
-                <p>The model that answers visitors.</p>
+                <p>The model that answers visitors. Who pays is chosen when you deploy: GaugeWright billing by default, or your own key.</p>
             </div>
             <div class="pa-fields">
-                <label class="pa-field"><span>Provider</span>
-                    <select class="pa-input" value={profile().provider.provider}
-                        onChange={(event) => update((current) => ({ ...current, provider: withProvider(current.provider, event.currentTarget.value) }))}>
-                        <For each={PROVIDER_CHOICES}>{(choice) => <option value={choice.value}>{choice.name}</option>}</For>
-                        <Show when={!knownProvider()}><option value={profile().provider.provider}>{profile().provider.provider}</option></Show>
-                    </select></label>
                 {/* A select, not an input with a datalist: a datalist offers only the
                     suggestions matching what the field already holds, so a saved model
                     hid every other one (WS-597). */}
                 <label class="pa-field"><span>Model</span>
-                    <select class="pa-input" data-panel-contract-model-choice value={profile().provider.model}
+                    <select class="pa-input" data-panel-contract-model-choice value={pinned()}
                         onChange={(event) => setModel(event.currentTarget.value)}>
                         <For each={models()}>{(choice) =>
                             <option value={choice.value} title={choice.detail}
-                                selected={choice.value === profile().provider.model}>{choice.name}</option>}</For>
+                                selected={choice.value === pinned()}>{choice.name}</option>}</For>
                     </select></label>
             </div>
             <details class="pa-advanced"><summary>Advanced</summary><div class="pa-fields">
                 <label class="pa-field"><span>Model ID</span>
-                    <input class="pa-input" spellcheck={false} value={profile().provider.model}
+                    <input class="pa-input" spellcheck={false} value={pinned()}
                         onInput={(event) => setModel(event.currentTarget.value)} />
-                    <small>Exactly as the provider names it, for a model the list doesn't carry.</small></label>
-                <label class="pa-field"><span>API address</span>
-                    <input class="pa-input" spellcheck={false} value={profile().provider.base_url}
-                        onInput={(event) => update((current) => ({ ...current, provider: { ...current.provider, base_url: event.currentTarget.value } }))} />
-                    <small>The provider's origin. The client adds the API path.</small></label>
-                <label class="pa-field"><span>Key type</span>
-                    <input class="pa-input" spellcheck={false} value={profile().provider.credential_class}
-                        onInput={(event) => update((current) => ({ ...current, provider: { ...current.provider, credential_class: event.currentTarget.value } }))} />
-                    <small>A deployment's own key must be stored under this type.</small></label>
+                    <small>Exactly as the model's maker names it, for a model the list doesn't carry. Empty uses your work-chat default.</small></label>
             </div></details>
         </section>
 

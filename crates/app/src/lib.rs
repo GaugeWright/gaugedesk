@@ -25,6 +25,7 @@ pub mod advancement;
 pub mod agent_improve;
 mod agent_improve_adoption;
 pub mod agent_improve_campaign;
+mod agent_improve_checkpoint;
 mod agent_improve_custody;
 mod agent_improve_funding;
 pub use agent_improve_custody::{
@@ -128,6 +129,7 @@ pub mod open_runtime;
 pub mod org;
 pub mod package_flow;
 pub mod package_store;
+pub mod panel_preview;
 pub mod policy_compiler;
 pub mod possession_exchange;
 pub mod project_credential_routes;

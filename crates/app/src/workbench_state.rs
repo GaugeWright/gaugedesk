@@ -87,10 +87,6 @@ pub struct Workbench {
     pub(crate) sessions: BTreeMap<String, SharedHarness>,
     /// One remote harness per remotely placed engagement (ADR 0020/0031).
     pub(crate) remote_sessions: BTreeMap<String, Box<dyn gaugedesk_harness::RemoteHarness>>,
-    /// Disposable public-session previews. These are operational, in-memory
-    /// handles only: no Agent, project, placement, chat, or Inbox fact is
-    /// appended for a preview (ADR 0143 §3).
-    pub(crate) panel_previews: BTreeMap<String, crate::agent_release::ActivePanelPreview>,
     /// The trusted reproducible-build measurement allow-list (ATTEST-10).
     pub(crate) measurements: MeasurementStore,
     /// The sealed-key release service (ATTEST-5/-6).
@@ -392,7 +388,6 @@ impl Workbench {
             streams: BTreeMap::new(),
             sessions: BTreeMap::new(),
             remote_sessions: BTreeMap::new(),
-            panel_previews: BTreeMap::new(),
             measurements: MeasurementStore::new(),
             sealed_keys: LoopbackKeyReleaseService::new(),
             attestation_mode: AttestationMode::RealRequired,

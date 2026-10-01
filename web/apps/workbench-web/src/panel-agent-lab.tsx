@@ -38,12 +38,7 @@ const wait = (ms = 350) => new Promise((resolve) => setTimeout(resolve, ms));
 const PROFILE: PanelPublicProfile = {
     panels: { components: ["gw-chat", "gw-files"], default_component: "gw-chat", attribution: "gauge_wright" },
     public_abilities: ["workspace.read", "workspace.write"],
-    provider: {
-        provider: "openai",
-        model: "gpt-5-mini",
-        base_url: "https://api.openai.com",
-        credential_class: "openai-api-key",
-    },
+    model: {},
     audience_inputs: ["text"],
     initial_workspace: [
         { path: "welcome.md", media_type: "text/markdown", sha256: "0".repeat(64), bytes: [...new TextEncoder().encode("# Welcome\n\nTell us about your project.")] },

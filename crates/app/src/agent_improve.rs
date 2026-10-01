@@ -221,14 +221,17 @@ impl PreparedShadowPair {
         &self.candidate_discipline_ref
     }
 
-    pub(crate) fn evaluated_candidate_definition(
+    pub(crate) fn evaluated_definitions(
         &self,
         evidence: &ShadowPair,
-    ) -> Result<AgentDefinitionSnapshot, String> {
+    ) -> Result<(AgentDefinitionSnapshot, AgentDefinitionSnapshot), String> {
         if !evidence_matches(self, evidence) {
             return Err("shadow evidence does not identify the evaluated Agent pair".to_owned());
         }
-        Ok(self.candidate_definition.clone())
+        Ok((
+            self.baseline_definition.clone(),
+            self.candidate_definition.clone(),
+        ))
     }
 }
 

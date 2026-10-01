@@ -1754,6 +1754,47 @@ pub async fn create_chat_under_agent(
     }
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StartPanelPreview {
+    /// A project placement whose pinned version is tried; absent tries the
+    /// Workshop draft.
+    #[serde(default)]
+    pub placement_id: Option<String>,
+}
+
+/// Try a Panel agent in a disposable work chat (DR-0272 §3): its draft, or a
+/// project placement's pinned version, with the caller's work-chat defaults.
+/// The chat is ended with `DELETE /chats/{id}`, which ends the preview.
+pub async fn start_panel_preview(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<StartPanelPreview>,
+) -> impl IntoResponse {
+    let mut wb = wb.lock_unpoisoned();
+    let creator = match admit_agent_authoring_owner(&wb, &id, &headers) {
+        Ok(actor) => actor,
+        Err(error) => return error,
+    };
+    match wb.start_panel_preview_chat(&id, body.placement_id.as_deref()) {
+        Ok(chat) => {
+            if let Some(chat_id) = chat["id"].as_str() {
+                wb.claim_chat_owner(chat_id, &creator);
+            }
+            (StatusCode::CREATED, Json(chat)).into_response()
+        }
+        Err(error) => {
+            let status = if error.contains("requires") || error.contains("not text") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({ "error": error }))).into_response()
+        }
+    }
+}
+
 /// New chat under a project's using-instance.
 pub async fn create_chat_under_instance(
     State(wb): State<SharedWorkbench>,

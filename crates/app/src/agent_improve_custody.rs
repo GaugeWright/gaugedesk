@@ -6,7 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use whipplescript_core::improve_holdout::WEAR_OUT_AT;
 
-use crate::agent_improve_campaign::{sample_pool, CampaignSnapshot, Exposure, PoolAssignment};
+use crate::agent_improve_campaign::{
+    sample_pool, CampaignSnapshot, CaseAssignment, Exposure, PoolAssignment,
+};
+use crate::agent_improve_checkpoint::HostedImproveInputKey;
 use crate::library::LIBRARY_SCOPE;
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 
@@ -78,6 +81,8 @@ struct ExposureRecord {
     reservation_id: String,
     fingerprint: String,
     ordinal: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_digest: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -355,6 +360,28 @@ impl Workbench {
         agent_id: &str,
         campaign_ref: &str,
     ) -> Result<String, String> {
+        self.reserve_agent_improve_sealed_exposure_with_operation(agent_id, campaign_ref, None)
+    }
+
+    pub(crate) fn reserve_hosted_agent_improve_sealed_exposure(
+        &mut self,
+        key: &HostedImproveInputKey<'_>,
+    ) -> Result<String, String> {
+        self.hosted_improve_prepared_cut(key)?
+            .ok_or("hosted improve has no retained prepared cut")?;
+        self.reserve_agent_improve_sealed_exposure_with_operation(
+            key.agent_id,
+            key.campaign_ref,
+            Some(&key.digest()?),
+        )
+    }
+
+    fn reserve_agent_improve_sealed_exposure_with_operation(
+        &mut self,
+        agent_id: &str,
+        campaign_ref: &str,
+        operation_digest: Option<&str>,
+    ) -> Result<String, String> {
         let target_id = self.improve_authoring_target(agent_id)?;
         let assignment = self.improve_pool_assignment(agent_id, campaign_ref)?;
         let sealed = assignment
@@ -365,13 +392,20 @@ impl Workbench {
         if sealed.is_empty() {
             return Err("Agent improve campaign has no sealed cases to reserve".to_owned());
         }
+        if let Some(digest) = operation_digest {
+            if let Some(reservation) =
+                self.improve_operation_reservation(&target_id, campaign_ref, &sealed, digest)?
+            {
+                return Ok(reservation);
+            }
+        }
         let counts = self.improve_case_wear(&target_id)?;
         let mut random = [0u8; 32];
         getrandom::getrandom(&mut random)
             .map_err(|_| "Agent improve reservation randomness is unavailable")?;
         let reservation_id = format!("agent-improve-reservation:{}", hex::encode(random));
         let mut records = Vec::with_capacity(sealed.len());
-        for case in sealed {
+        for case in &sealed {
             let prior = counts.get(&case.fingerprint).copied().unwrap_or(0);
             if prior >= WEAR_OUT_AT {
                 return Err("Agent improve sealed case is retired".to_owned());
@@ -384,6 +418,7 @@ impl Workbench {
                 reservation_id: reservation_id.clone(),
                 fingerprint: case.fingerprint.clone(),
                 ordinal,
+                operation_digest: operation_digest.map(str::to_owned),
             };
             let payload = serde_json::to_string(&event)
                 .map_err(|_| "Agent improve exposure could not be encoded")?;
@@ -397,11 +432,74 @@ impl Workbench {
             .iter()
             .map(|(key, payload)| (LIBRARY_SCOPE, key.as_str(), EXPOSURE_KIND, payload.as_str()))
             .collect::<Vec<_>>();
-        self.store
+        let appended = self
+            .store
             .append_records_with_keys_atomically(&borrowed)
-            .map_err(|_| "Agent improve exposure could not be reserved")?
-            .ok_or("Agent improve sealed case exposure was concurrently reserved")?;
+            .map_err(|_| "Agent improve exposure could not be reserved")?;
+        if appended.is_none() {
+            if let Some(digest) = operation_digest {
+                if let Some(reservation) =
+                    self.improve_operation_reservation(&target_id, campaign_ref, &sealed, digest)?
+                {
+                    return Ok(reservation);
+                }
+            }
+            return Err("Agent improve sealed case exposure was concurrently reserved".to_owned());
+        }
         Ok(reservation_id)
+    }
+
+    fn improve_operation_reservation(
+        &self,
+        target_id: &str,
+        campaign_ref: &str,
+        sealed: &[&CaseAssignment],
+        operation_digest: &str,
+    ) -> Result<Option<String>, String> {
+        let mut reservation = None;
+        let mut found = BTreeSet::new();
+        for row in self
+            .store
+            .records(LIBRARY_SCOPE, EXPOSURE_KIND)
+            .map_err(|_| "Agent improve exposure records are unavailable")?
+        {
+            let event: ExposureRecord = serde_json::from_str(&row)
+                .map_err(|_| "Agent improve exposure record is invalid")?;
+            if event.operation_digest.as_deref() != Some(operation_digest) {
+                continue;
+            }
+            if event.schema != EXPOSURE_SCHEMA
+                || event.target_id != target_id
+                || event.campaign_ref != campaign_ref
+                || event.ordinal < 1
+                || event
+                    .reservation_id
+                    .strip_prefix("agent-improve-reservation:")
+                    .is_none_or(|suffix| {
+                        suffix.len() != 64 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                || !found.insert(event.fingerprint)
+                || reservation
+                    .as_ref()
+                    .is_some_and(|previous| previous != &event.reservation_id)
+            {
+                return Err("hosted improve operation has a conflicting sealed reservation".into());
+            }
+            reservation = Some(event.reservation_id);
+        }
+        if reservation.is_some()
+            && found
+                != sealed
+                    .iter()
+                    .map(|case| case.fingerprint.clone())
+                    .collect::<BTreeSet<_>>()
+        {
+            return Err("hosted improve operation has an incomplete sealed reservation".into());
+        }
+        if reservation.is_some() {
+            self.improve_case_wear(target_id)?;
+        }
+        Ok(reservation)
     }
 
     /// Verify the runner's receipt against Home's sampled assignment and the
@@ -795,7 +893,7 @@ mod tests {
         let signed_in = guard
             .start_agent_improve_pool_for_source_owner(
                 crate::DEFAULT_AGENT,
-                &case_pool(4),
+                &case_pool(5),
                 Some("person-1"),
             )
             .unwrap();
@@ -1067,6 +1165,87 @@ mod tests {
         assert!(guard
             .reserve_agent_improve_sealed_exposure(crate::DEFAULT_AGENT, &next_ref)
             .is_err());
+    }
+
+    #[test]
+    fn hosted_operation_reuses_one_atomic_sealed_reservation_across_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let digest = "hosted-operation-one";
+        let (campaign_ref, reservation, sealed_fingerprints) = {
+            let wb = crate::open_workbench(root.path()).unwrap();
+            let mut guard = wb.lock_unpoisoned();
+            let campaign_ref = guard
+                .register_agent_improve_pool(crate::DEFAULT_AGENT, &case_pool(4))
+                .unwrap();
+            let assignment = guard
+                .improve_pool_assignment(crate::DEFAULT_AGENT, &campaign_ref)
+                .unwrap();
+            let sealed_fingerprints = assignment
+                .cases
+                .iter()
+                .filter(|case| case.exposure == "sealed")
+                .map(|case| case.fingerprint.clone())
+                .collect::<Vec<_>>();
+            let reservation = guard
+                .reserve_agent_improve_sealed_exposure_with_operation(
+                    crate::DEFAULT_AGENT,
+                    &campaign_ref,
+                    Some(digest),
+                )
+                .unwrap();
+            assert_eq!(
+                guard
+                    .reserve_agent_improve_sealed_exposure_with_operation(
+                        crate::DEFAULT_AGENT,
+                        &campaign_ref,
+                        Some(digest),
+                    )
+                    .unwrap(),
+                reservation
+            );
+            (campaign_ref, reservation, sealed_fingerprints)
+        };
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let mut guard = wb.lock_unpoisoned();
+        assert_eq!(
+            guard
+                .reserve_agent_improve_sealed_exposure_with_operation(
+                    crate::DEFAULT_AGENT,
+                    &campaign_ref,
+                    Some(digest),
+                )
+                .unwrap(),
+            reservation
+        );
+        let target = guard
+            .improve_authoring_target(crate::DEFAULT_AGENT)
+            .unwrap();
+        let wear = guard.improve_case_wear(&target).unwrap();
+        for fingerprint in &sealed_fingerprints {
+            assert_eq!(wear[fingerprint], 1);
+        }
+        let other = guard
+            .reserve_agent_improve_sealed_exposure_with_operation(
+                crate::DEFAULT_AGENT,
+                &campaign_ref,
+                Some("hosted-operation-two"),
+            )
+            .unwrap();
+        assert_ne!(other, reservation);
+        assert_eq!(
+            guard
+                .reserve_agent_improve_sealed_exposure_with_operation(
+                    crate::DEFAULT_AGENT,
+                    &campaign_ref,
+                    Some(digest),
+                )
+                .unwrap(),
+            reservation
+        );
+        let wear = guard.improve_case_wear(&target).unwrap();
+        for fingerprint in &sealed_fingerprints {
+            assert_eq!(wear[fingerprint], 2);
+        }
     }
 
     #[test]

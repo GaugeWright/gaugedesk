@@ -22,9 +22,8 @@ use whipplescript_store::skill_frontmatter::parse_skill_frontmatter;
 use crate::app_support::LockUnpoisoned;
 use crate::key_store::FileKeyStore;
 use crate::library::{
-    Admission, ArchetypeVersionRecord, DeploymentAudience, DeploymentAudienceOidc,
-    DeploymentBindingStatus, DeploymentOperationalConfig, InstanceKind, InstanceRecord,
-    PlacementKind, PublicDeploymentBindingRecord, RecordOp, LIBRARY_RECORD_SCHEMA,
+    DeploymentAudience, DeploymentAudienceOidc, DeploymentBindingStatus,
+    DeploymentOperationalConfig, PlacementKind, PublicDeploymentBindingRecord, RecordOp,
 };
 use crate::library_state::{published_discipline_root, published_package_root};
 use crate::Workbench;
@@ -58,8 +57,127 @@ fn reservation_cents_for_spend_guards(
     .unwrap_or(0)
 }
 
-fn preview_release_spec(
+/// The credential class a managed release and its deployment agree on.
+///
+/// Managed funding presents no customer credential, so the class names no key;
+/// the edge only proves the release, configuration, and host closure agree on
+/// it. Every metered Panel was published under this spelling, so keeping it
+/// means republishing one does not change its class and end its sessions.
+pub const MANAGED_PANEL_CREDENTIAL_CLASS: &str = "managed-openai";
+
+/// Who pays for a release, as far as choosing its provider surface goes.
+#[derive(Clone, Copy, Debug)]
+pub enum ReleaseFunding<'a> {
+    Managed,
+    /// An owner key, by the provider and class its registry record declares.
+    OwnerKey {
+        provider: &'a str,
+        credential_class: &'a str,
+    },
+}
+
+/// The provider surface a Panel release runs on: the version's model pin, else
+/// the publisher's work-chat default, on the surface its funding implies
+/// (DR-0272).
+///
+/// Managed funding takes the metered-gateway route that fits the model. An
+/// owner key takes its own provider's native endpoint, and a model that
+/// provider does not serve is refused here rather than at a visitor's first
+/// message.
+pub fn release_provider(
+    model: &crate::library::PanelModelPolicy,
+    work_chat_default_model: Option<&str>,
+    funding: ReleaseFunding<'_>,
+) -> io::Result<ProviderPolicy> {
+    let pinned = model
+        .pinned
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    let chosen = pinned
+        .or_else(|| {
+            work_chat_default_model
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+        })
+        .ok_or_else(|| {
+            invalid(
+                "this Panel agent pins no model and you have no work-chat default model; \
+                 link a model provider or pin a model in the agent's contract",
+            )
+        })?;
+    let (provider, model_name, base_url, credential_class) = match funding {
+        ReleaseFunding::Managed => {
+            let route = crate::managed_inference::metered_route(chosen);
+            (
+                crate::managed_inference::METERED_GATEWAY_PROVIDER.to_owned(),
+                route.model,
+                route.base_url,
+                MANAGED_PANEL_CREDENTIAL_CLASS.to_owned(),
+            )
+        }
+        ReleaseFunding::OwnerKey {
+            provider,
+            credential_class,
+        } => {
+            let native = owner_key_model(provider, chosen).ok_or_else(|| {
+                invalid(format!(
+                    "model `{chosen}` is not served by the {provider} key this deployment is \
+                     funded with; pin a {provider} model or fund it with managed inference"
+                ))
+            })?;
+            let descriptor = gaugedesk_whip_runtime::native_provider_descriptor(
+                provider,
+                Some(&native),
+                None,
+            )
+            .map_err(|_| invalid(format!("owner keys for `{provider}` cannot fund a Panel")))?;
+            (
+                provider.to_owned(),
+                native,
+                descriptor.base_url,
+                credential_class.to_owned(),
+            )
+        }
+    };
+    Ok(ProviderPolicy {
+        provider,
+        model: model_name,
+        base_url,
+        credential_class,
+        max_input_tokens: model.max_input_tokens,
+        max_output_tokens: model.max_output_tokens,
+    })
+}
+
+/// `model` as `provider`'s own endpoint names it, if that provider serves it.
+///
+/// A unified-billing name (`openai/gpt-5.5`) is accepted for its own provider
+/// and stripped; a name of another family is refused.
+fn owner_key_model(provider: &str, model: &str) -> Option<String> {
+    let (prefix, bare) = match model.split_once('/') {
+        Some((prefix, bare)) => (Some(prefix), bare),
+        None => (None, model),
+    };
+    let family = if bare.starts_with("claude-") {
+        "anthropic"
+    } else if bare.starts_with("grok-") {
+        "xai"
+    } else {
+        "openai"
+    };
+    let prefix_ok = match prefix {
+        None => true,
+        Some(prefix) => prefix == provider || (provider == "xai" && prefix == "grok"),
+    };
+    (family == provider && prefix_ok && !bare.is_empty()).then(|| bare.to_owned())
+}
+
+/// The release a frozen Panel profile publishes as, on the provider its
+/// funding chose (DR-0272).
+fn release_spec(
     profile: &crate::library::PanelPublicProfile,
+    provider: ProviderPolicy,
     published_at_unix_ms: u64,
 ) -> ReleasePublishSpec {
     ReleasePublishSpec {
@@ -67,7 +185,7 @@ fn preview_release_spec(
         public_abilities: profile.public_abilities.clone(),
         panels: profile.panels.clone(),
         audience_inputs: profile.audience_inputs.clone(),
-        provider: profile.provider.clone(),
+        provider,
         retention: profile.retention.clone(),
         initial_workspace: profile.initial_workspace.clone(),
         collection: profile.collection.clone(),
@@ -81,21 +199,6 @@ fn discipline_media_type(path: &str) -> &'static str {
         "text/markdown"
     } else {
         "application/octet-stream"
-    }
-}
-
-/// Deletes only the two generated version directories named by a disposable
-/// draft snapshot. The authoring draft and every real numeric version are
-/// outside these exact paths.
-struct PreviewSnapshot {
-    roots: Vec<std::path::PathBuf>,
-}
-
-impl Drop for PreviewSnapshot {
-    fn drop(&mut self) {
-        for root in &self.roots {
-            let _ = std::fs::remove_dir_all(root);
-        }
     }
 }
 
@@ -281,6 +384,11 @@ pub struct PublishDeploymentRequest {
     /// that narrows what a live session may do.
     #[serde(default)]
     pub end_sessions: bool,
+    /// The publisher's work-chat default model, which an unpinned version
+    /// publishes with (DR-0272). Filled by the route from the caller's account;
+    /// never read from the request body.
+    #[serde(skip)]
+    pub work_chat_default_model: Option<String>,
 }
 
 fn default_idle_ttl_seconds() -> u64 {
@@ -302,48 +410,6 @@ pub struct PublishDeploymentOutcome {
     pub deployment_url: String,
     pub embed_html: String,
     pub deployment: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StartPanelPreviewRequest {
-    pub agent_id: String,
-    /// Present for a project-scoped preview. The placement's pinned version and
-    /// frozen profile win; the mutable Library draft is not consulted.
-    #[serde(default)]
-    pub placement_id: Option<String>,
-    pub edge_origin: String,
-    pub allowed_origin: String,
-    #[serde(default)]
-    pub funding: Option<DeploymentFundingSelection>,
-    #[serde(default)]
-    pub funding_ref: String,
-    #[serde(default)]
-    pub credential_ref: String,
-    #[serde(default)]
-    pub managed_tenant_id: Option<String>,
-    #[serde(default)]
-    pub funding_entitlement: Option<crate::managed_entitlement::Entitlement>,
-    #[serde(default)]
-    pub dictation_entitlement: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PanelPreviewOutcome {
-    pub preview_id: String,
-    pub deployment_id: String,
-    pub release_id: String,
-    pub edge_origin: String,
-    pub deployment_url: String,
-    pub panels: BTreeSet<String>,
-    pub expires_at_unix_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ActivePanelPreview {
-    pub edge_origin: String,
-    pub deployment_id: String,
-    pub expires_at_unix_ms: u64,
 }
 
 const PUBLIC_EMBED_LOADER_URL: &str = "https://embed.gaugewright.com/embed.js";
@@ -423,7 +489,7 @@ fn operational_from_hosted_config(
         .map_err(|error| invalid(format!("hosted operational config is incomplete: {error}")))?;
     if hosted.credential_class != expected_credential_class {
         return Err(invalid(
-            "hosted provider posture does not match the selected Panel-agent version",
+            "hosted deployment config does not match its active release's credential class",
         ));
     }
     Ok(DeploymentOperationalConfig {
@@ -574,7 +640,7 @@ struct PackageManifestPaths {
 }
 
 /// Materialize the same package bytes for a disposable evaluation as for a
-/// Panel draft preview. `agent/` is authoritative for v1 context; the draft
+/// Panel-agent preview's snapshot (DR-0272). `agent/` is authoritative for v1 context; the draft
 /// package supplies the generated wrapper and manifest. The caller owns the
 /// destination's lifetime and must keep it outside any published version.
 pub(crate) fn snapshot_authored_package(
@@ -1035,340 +1101,6 @@ impl Workbench {
             .map_err(invalid)
     }
 
-    /// Construct the exact public release exercised by Preview without
-    /// publishing an Agent version or creating a project/chat record.
-    ///
-    /// A project preview uses the placement's real pinned version. A Library
-    /// preview copies the current draft package and discipline into a generated
-    /// high-numbered version directory solely long enough for the ordinary
-    /// release builder to validate and sign it. The generated directories and
-    /// the in-memory instance/version entries are removed before this method
-    /// returns; no append-only store fact is written.
-    pub fn build_panel_preview_release(
-        &mut self,
-        agent_id: &str,
-        placement_id: Option<&str>,
-        published_at_unix_ms: u64,
-    ) -> io::Result<(SignedAgentRelease, crate::library::PanelPublicProfile)> {
-        let agent = self
-            .library
-            .agents
-            .get(agent_id)
-            .filter(|agent| agent.agent_kind == crate::library::AgentKind::Panel)
-            .cloned()
-            .ok_or_else(|| invalid("preview requires a Panel agent"))?;
-        if let Some(placement_id) = placement_id {
-            let placement = self
-                .library
-                .instances
-                .get(placement_id)
-                .filter(|placement| {
-                    placement.kind == InstanceKind::Using
-                        && placement.placement_kind == PlacementKind::Panel
-                        && placement.agent_id == agent.id
-                })
-                .ok_or_else(|| invalid("project preview requires this Panel-agent placement"))?;
-            let profile = agent
-                .versions
-                .get(&placement.version)
-                .and_then(|version| version.panel_profile.clone())
-                .ok_or_else(|| invalid("project preview placement has no frozen public profile"))?;
-            let release = self.build_agent_release(
-                placement_id,
-                preview_release_spec(&profile, published_at_unix_ms),
-            )?;
-            return Ok((release, profile));
-        }
-
-        let profile = agent
-            .panel_profile
-            .clone()
-            .ok_or_else(|| invalid("Panel-agent draft has no public profile"))?;
-        let target_id = self
-            .library
-            .authoring_target_for(&agent.id)
-            .map(|target| target.id.clone())
-            .ok_or_else(|| not_found("Panel-agent authoring target does not exist"))?;
-        let repo = self.targets_dir().join(&target_id).join("repo");
-        let draft_package_root = repo.join(gaugedesk_boundary::definition::DRAFT_ROOT);
-        let draft_package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(&draft_package_root)
-            .map_err(invalid)?;
-        crate::discipline::load(
-            &repo.join(crate::discipline::DISCIPLINE_DRAFT_ROOT),
-            draft_package.capabilities().iter().cloned(),
-        )
-        .map_err(invalid)?;
-
-        let mut preview_version = u64::MAX;
-        while agent.versions.contains_key(&preview_version)
-            || published_package_root(&self.targets_dir(), &target_id, preview_version).exists()
-            || published_discipline_root(&self.targets_dir(), &target_id, preview_version).exists()
-        {
-            preview_version = preview_version
-                .checked_sub(1)
-                .ok_or_else(|| invalid("no disposable preview version is available"))?;
-        }
-        let package_root = published_package_root(&self.targets_dir(), &target_id, preview_version);
-        let discipline_root =
-            published_discipline_root(&self.targets_dir(), &target_id, preview_version);
-        std::fs::create_dir_all(&package_root)?;
-        std::fs::create_dir_all(&discipline_root)?;
-        let _snapshot = PreviewSnapshot {
-            roots: vec![package_root.clone(), discipline_root.clone()],
-        };
-        let preview_package = snapshot_authored_package(&repo, &package_root)?;
-        let preview_discipline =
-            snapshot_authored_discipline(&repo, &discipline_root, &preview_package)?;
-
-        let preview_instance_id = crate::library::gen_id("panel-preview-instance");
-        let version = ArchetypeVersionRecord {
-            package_ref: preview_package.version_ref().to_owned(),
-            discipline_ref: preview_discipline.reference,
-            source_owner_authority: None,
-            panel_profile: Some(profile.clone()),
-        };
-        self.library
-            .agents
-            .get_mut(&agent.id)
-            .expect("agent was resolved above")
-            .versions
-            .insert(preview_version, version);
-        self.library.instances.insert(
-            preview_instance_id.clone(),
-            InstanceRecord {
-                schema: LIBRARY_RECORD_SCHEMA,
-                extra: Default::default(),
-                id: preview_instance_id.clone(),
-                op: RecordOp::Upsert,
-                kind: InstanceKind::Using,
-                placement_kind: PlacementKind::Panel,
-                agent_id: agent.id.clone(),
-                project_id: None,
-                version: preview_version,
-                admission: Admission::Active,
-                collection_recipient: None,
-            },
-        );
-        let release = self.build_agent_release(
-            &preview_instance_id,
-            preview_release_spec(&profile, published_at_unix_ms),
-        );
-        self.library.instances.remove(&preview_instance_id);
-        if let Some(agent) = self.library.agents.get_mut(&agent.id) {
-            agent.versions.remove(&preview_version);
-        }
-        release.map(|release| (release, profile))
-    }
-
-    /// Publish a bounded, expiring public deployment used only by the Preview
-    /// surface. It deliberately creates no local deployment binding: there is
-    /// no project and therefore no production Inbox or custody destination.
-    pub fn start_panel_preview(
-        &mut self,
-        request: StartPanelPreviewRequest,
-    ) -> io::Result<PanelPreviewOutcome> {
-        let edge = normalized_edge(&request.edge_origin)?;
-        if !request.allowed_origin.starts_with("https://")
-            || request.allowed_origin.contains('?')
-            || request.allowed_origin.contains('#')
-            || request.allowed_origin.trim_end_matches('/') != request.allowed_origin
-        {
-            return Err(invalid("preview origin must be one exact HTTPS origin"));
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(io::Error::other)?;
-        let (release, profile) = self.build_panel_preview_release(
-            &request.agent_id,
-            request.placement_id.as_deref(),
-            now.as_millis().try_into().map_err(io::Error::other)?,
-        )?;
-        let managed = crate::managed_inference::is_managed_funding_ref(&request.funding_ref);
-        if request.funding_ref.trim().is_empty() {
-            return Err(invalid("preview funding is required"));
-        }
-        if managed {
-            if !request.credential_ref.trim().is_empty() {
-                return Err(invalid(
-                    "managed preview funding may not name an owner credential",
-                ));
-            }
-            request
-                .managed_tenant_id
-                .as_deref()
-                .filter(|tenant| !tenant.trim().is_empty())
-                .ok_or_else(|| invalid("managed preview requires an authenticated tenant"))?;
-            let entitlement = request
-                .funding_entitlement
-                .as_ref()
-                .ok_or_else(|| invalid("managed preview requires a Hub entitlement"))?;
-            if entitlement.claims.authority != self.public_publisher_key()? {
-                return Err(invalid(
-                    "managed preview entitlement is not bound to this publisher",
-                ));
-            }
-            if entitlement.claims.funding_ref != request.funding_ref {
-                return Err(invalid(
-                    "managed preview entitlement does not match the funding reference",
-                ));
-            }
-            if entitlement.claims.exp <= now.as_secs() {
-                return Err(invalid("managed preview entitlement has expired"));
-            }
-            if profile.provider.provider != crate::managed_inference::METERED_GATEWAY_PROVIDER {
-                return Err(invalid(
-                    "managed preview requires a Panel-agent draft authored for the metered gateway",
-                ));
-            }
-            if let Some(reason) = crate::managed_inference::metered_pairing_error(
-                &profile.provider.base_url,
-                &profile.provider.model,
-            ) {
-                return Err(invalid(reason));
-            }
-        } else {
-            if request.credential_ref.trim().is_empty() {
-                return Err(invalid("BYOK preview requires an exact owner credential"));
-            }
-            if request.funding_entitlement.is_some() || request.managed_tenant_id.is_some() {
-                return Err(invalid(
-                    "BYOK preview may not carry managed funding authority",
-                ));
-            }
-        }
-
-        const PREVIEW_LIFETIME_MS: u64 = 60 * 60 * 1_000;
-        const PREVIEW_TOTAL_CENTS: u64 = 100;
-        const PREVIEW_SESSION_CENTS: u64 = 50;
-        const PREVIEW_TURN_CENTS: u64 = 10;
-        let expires_at_unix_ms = u64::try_from(now.as_millis())
-            .map_err(io::Error::other)?
-            .saturating_add(PREVIEW_LIFETIME_MS);
-        let preview_id = crate::library::gen_id("panel-preview");
-        let deployment_id = preview_id.clone();
-        let release_bytes = release.canonical_bytes().map_err(io::Error::other)?;
-        send_publisher_request(
-            self,
-            &edge,
-            "PUT",
-            &format!("/v1/releases/{}", release.release_id()),
-            &release_bytes,
-            AGENT_RELEASE_MEDIA_TYPE,
-        )?;
-        let idle = profile.retention.idle_ttl_seconds.clamp(1, 3_600);
-        let absolute = profile.retention.absolute_ttl_seconds.min(3_600).max(idle);
-        let mut config = serde_json::json!({
-            "deployment_id": deployment_id,
-            "enabled": true,
-            "allowed_origins": [request.allowed_origin],
-            "panel_ceiling": profile.panels.components.clone(),
-            "max_spend_cents": PREVIEW_TOTAL_CENTS,
-            "max_session_spend_cents": PREVIEW_SESSION_CENTS,
-            "max_turn_spend_cents": PREVIEW_TURN_CENTS,
-            "reserve_cents_per_turn": DEFAULT_PUBLIC_TURN_RESERVE_CENTS,
-            "reserve_tokens_per_turn": DEFAULT_MANAGED_TURN_RESERVE_TOKENS,
-            "per_visitor_turn_limit": 20,
-            "max_concurrent_sessions": 1,
-            "funding_ref": request.funding_ref,
-            "credential_class": profile.provider.credential_class.clone(),
-            "credential_ref": request.credential_ref,
-            "audience": { "anonymous_allowed": true },
-            "pricing": crate::deployment_pricing::pricing_block(),
-            "retention": {
-                "idle_ttl_seconds": idle,
-                "absolute_ttl_seconds": absolute,
-                "transcript_retained": profile.retention.transcript_retained,
-                "workspace_retained": profile.retention.workspace_retained,
-            },
-            "white_label": false,
-            "preview_expires_at_unix_ms": expires_at_unix_ms,
-        });
-        if let Some(entitlement) = &request.funding_entitlement {
-            config["funding_entitlement"] =
-                serde_json::Value::String(serde_json::to_string(entitlement).map_err(invalid)?);
-        }
-        if let Some(entitlement) = &request.dictation_entitlement {
-            config["dictation_entitlement"] = serde_json::Value::String(entitlement.clone());
-        }
-        let body = serde_json::to_vec(&serde_json::json!({
-            "config": config,
-            "initial_release_id": release.release_id(),
-        }))
-        .map_err(invalid)?;
-        send_publisher_request(
-            self,
-            &edge,
-            "PUT",
-            &format!("/v1/deployments/{deployment_id}"),
-            &body,
-            "application/json",
-        )?;
-        self.panel_previews.insert(
-            preview_id.clone(),
-            ActivePanelPreview {
-                edge_origin: edge.clone(),
-                deployment_id: deployment_id.clone(),
-                expires_at_unix_ms,
-            },
-        );
-        Ok(PanelPreviewOutcome {
-            preview_id,
-            deployment_id: deployment_id.clone(),
-            release_id: release.release_id(),
-            edge_origin: edge.clone(),
-            deployment_url: format!("{edge}/d/{deployment_id}"),
-            panels: profile.panels.components,
-            expires_at_unix_ms,
-        })
-    }
-
-    /// Revoke an in-memory preview handle. A failed edge mutation keeps the
-    /// handle so the caller can retry; an already-expired preview is forgotten.
-    pub fn stop_panel_preview(&mut self, preview_id: &str) -> io::Result<()> {
-        let preview = self
-            .panel_previews
-            .get(preview_id)
-            .cloned()
-            .ok_or_else(|| not_found("panel preview does not exist"))?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_millis() as u64;
-        if now >= preview.expires_at_unix_ms {
-            self.panel_previews.remove(preview_id);
-            return Ok(());
-        }
-        let path = format!("/v1/deployments/{}", preview.deployment_id);
-        let inspection = send_publisher_request(
-            self,
-            &preview.edge_origin,
-            "GET",
-            &path,
-            &[],
-            "application/json",
-        )?;
-        let inspection: serde_json::Value = serde_json::from_str(&inspection).map_err(invalid)?;
-        let revision = inspection
-            .pointer("/deployment/activation_revision")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| invalid("preview inspection omitted its revision"))?;
-        let body = serde_json::to_vec(&serde_json::json!({
-            "command": "revoke",
-            "expected_revision": revision,
-        }))
-        .map_err(invalid)?;
-        send_publisher_request(
-            self,
-            &preview.edge_origin,
-            "POST",
-            &format!("{path}/control"),
-            &body,
-            "application/json",
-        )?;
-        self.panel_previews.remove(preview_id);
-        Ok(())
-    }
-
     /// Build, upload, and atomically create one public edge deployment.
     ///
     /// The account root key never leaves the Workbench key store. Every edge
@@ -1492,11 +1224,51 @@ impl Workbench {
                 "deployment funding, credential, or quota is invalid",
             ));
         }
+        // A managed plan funds the turn from GaugeWright's metered rail and the
+        // owner is billed from usage, so there is no customer credential to name
+        // (ADR 0085 §1, `FUND-1`). BYOK still requires one — an empty reference
+        // there is a deployment with nothing to pay with.
+        //
+        // Naming both is refused rather than disambiguated: the ambiguity is
+        // about *who pays*, and resolving it quietly downstream is how a turn
+        // gets billed to the wrong party.
+        let managed = crate::managed_inference::is_managed_funding_ref(&request.funding_ref);
+        if managed && !request.credential_ref.trim().is_empty() {
+            return Err(invalid(
+                "managed funding may not also name an owner credential",
+            ));
+        }
+        if !managed && request.credential_ref.trim().is_empty() {
+            return Err(invalid(
+                "BYOK funding requires the owner credential reference",
+            ));
+        }
+        // Who pays decides the provider surface (DR-0272). The model and the
+        // surface it is admitted against are chosen together here, so an
+        // impossible pairing is refused before anything is published.
+        let provider = if managed {
+            release_provider(
+                &profile.model,
+                request.work_chat_default_model.as_deref(),
+                ReleaseFunding::Managed,
+            )?
+        } else {
+            let (key_provider, key_class) =
+                self.owner_key_record(&edge, &request.credential_ref)?;
+            release_provider(
+                &profile.model,
+                request.work_chat_default_model.as_deref(),
+                ReleaseFunding::OwnerKey {
+                    provider: &key_provider,
+                    credential_class: &key_class,
+                },
+            )?
+        };
         let operational = DeploymentOperationalConfig {
             allowed_origins: request.allowed_origins.clone(),
             audience: request.audience.clone(),
             funding_ref: request.funding_ref.clone(),
-            credential_class: profile.provider.credential_class.clone(),
+            credential_class: provider.credential_class.clone(),
             credential_ref: request.credential_ref.clone(),
             max_spend_cents: request.max_spend_cents,
             max_session_spend_cents: request.max_session_spend_cents,
@@ -1518,25 +1290,6 @@ impl Workbench {
         let reuses_admitted_operational = existing.as_ref().is_some_and(|binding| {
             binding.status == DeploymentBindingStatus::Active && binding.operational == operational
         });
-        // A managed plan funds the turn from GaugeWright's metered rail and the
-        // owner is billed from usage, so there is no customer credential to name
-        // (ADR 0085 §1, `FUND-1`). BYOK still requires one — an empty reference
-        // there is a deployment with nothing to pay with.
-        //
-        // Naming both is refused rather than disambiguated: the ambiguity is
-        // about *who pays*, and resolving it quietly downstream is how a turn
-        // gets billed to the wrong party.
-        let managed = crate::managed_inference::is_managed_funding_ref(&request.funding_ref);
-        if managed && !request.credential_ref.trim().is_empty() {
-            return Err(invalid(
-                "managed funding may not also name an owner credential",
-            ));
-        }
-        if !managed && request.credential_ref.trim().is_empty() {
-            return Err(invalid(
-                "BYOK funding requires the owner credential reference",
-            ));
-        }
         if managed && !(reuses_admitted_operational && request.funding_entitlement.is_none()) {
             let _tenant = request
                 .managed_tenant_id
@@ -1576,23 +1329,6 @@ impl Workbench {
                 "BYOK funding may not carry a managed funding entitlement",
             ));
         }
-        // A model and the surface it is admitted against are chosen together
-        // here, so this is where they are compared. Publishing an impossible
-        // pairing used to succeed and fail later, in front of a visitor, with
-        // the reason recorded two systems away.
-        if managed {
-            if profile.provider.provider != crate::managed_inference::METERED_GATEWAY_PROVIDER {
-                return Err(invalid(
-                    "managed funding requires a Panel-agent version authored for the metered gateway",
-                ));
-            }
-            if let Some(reason) = crate::managed_inference::metered_pairing_error(
-                &profile.provider.base_url,
-                &profile.provider.model,
-            ) {
-                return Err(invalid(reason));
-            }
-        }
 
         let path = format!("/v1/deployments/{}", request.deployment_id);
         let inspected =
@@ -1617,16 +1353,7 @@ impl Workbench {
             .map_err(io::Error::other)?;
         let release = self.build_agent_release(
             &request.placement_id,
-            ReleasePublishSpec {
-                published_at_unix_ms,
-                public_abilities: profile.public_abilities.clone(),
-                panels: profile.panels.clone(),
-                audience_inputs: profile.audience_inputs.clone(),
-                provider: profile.provider.clone(),
-                retention: profile.retention.clone(),
-                initial_workspace: profile.initial_workspace.clone(),
-                collection: profile.collection.clone(),
-            },
+            release_spec(&profile, provider.clone(), published_at_unix_ms),
         )?;
 
         let binding_id = existing
@@ -1690,7 +1417,7 @@ impl Workbench {
             "per_visitor_turn_limit": request.per_visitor_turn_limit,
             "max_concurrent_sessions": request.max_concurrent_sessions,
             "funding_ref": request.funding_ref.clone(),
-            "credential_class": profile.provider.credential_class.clone(),
+            "credential_class": provider.credential_class.clone(),
             "credential_ref": request.credential_ref.clone(),
             "audience": request.audience.clone(),
             // Upstream cost plus GaugeWright's margin for fronting the metered
@@ -1922,8 +1649,14 @@ impl Workbench {
             ));
         }
         let binding_id = crate::library::gen_id("public-deployment");
-        let operational =
-            operational_from_hosted_config(hosted_config, &profile.provider.credential_class)?;
+        // The version names no provider (DR-0272), so the hosted config is held
+        // to the class its own active release was published under.
+        let release_class = hosted_release
+            .pointer("/host_policy/credential_class")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid("hosted active release omitted its credential class"))?
+            .to_owned();
+        let operational = operational_from_hosted_config(hosted_config, &release_class)?;
         self.write_public_deployment_record(PublicDeploymentBindingRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
@@ -2190,6 +1923,38 @@ impl Workbench {
             "application/json",
         )?;
         serde_json::from_str(&response).map_err(invalid)
+    }
+
+    /// The provider and credential class the edge registry records for one
+    /// owner key. An owner key funds a release on its own provider, so this is
+    /// where a BYOK release learns which provider that is (DR-0272).
+    fn owner_key_record(&self, edge: &str, credential_ref: &str) -> io::Result<(String, String)> {
+        let listed = self.list_public_credentials(ListPublicCredentialsRequest {
+            edge_origin: edge.to_owned(),
+        })?;
+        listed
+            .get("credentials")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .get("credential_ref")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(credential_ref)
+            })
+            .and_then(|entry| {
+                Some((
+                    entry.get("provider")?.as_str()?.to_owned(),
+                    entry.get("credential_class")?.as_str()?.to_owned(),
+                ))
+            })
+            .ok_or_else(|| {
+                invalid(format!(
+                    "owner key `{credential_ref}` is not stored on {edge}; store a provider key \
+                     from the deployment panel or fund it with managed inference"
+                ))
+            })
     }
 
     /// Send a provider key directly to the account-owned edge registry.
@@ -2859,8 +2624,14 @@ mod publisher_tests {
 
             // The public release builder also refuses a direct spec that
             // bypassed profile editing or names an older frozen profile.
-            let mut spec = preview_release_spec(
+            let mut spec = release_spec(
                 &crate::library::PanelPublicProfile::default(),
+                release_provider(
+                    &crate::library::PanelModelPolicy::default(),
+                    Some("gpt-5.5"),
+                    ReleaseFunding::Managed,
+                )
+                .unwrap(),
                 1_800_000_000_000,
             );
             spec.collection = Some(collection(path));
@@ -2879,80 +2650,16 @@ mod publisher_tests {
     }
 
     #[test]
-    fn library_preview_signs_the_draft_without_publishing_or_placing_it() {
-        let root = tempfile::tempdir().unwrap();
-        let workbench = crate::open_workbench(root.path()).unwrap();
-        let mut guard = workbench.lock_unpoisoned();
-        guard
-            .seed_panel_placement(
-                "inst-preview-source",
-                crate::library::PanelPublicProfile::default(),
-            )
-            .unwrap();
-        let agent_id = "inst-preview-source-agent";
-        let versions_before = guard.library.agents[agent_id].versions.clone();
-        let instances_before = guard.library.instances.len();
-        let records_before = guard
-            .store_ref()
-            .records(crate::library::LIBRARY_SCOPE, "agent")
-            .unwrap()
-            .len();
-
-        let (release, profile) = guard
-            .build_panel_preview_release(agent_id, None, 1_800_000_000_000)
-            .expect("the mutable draft can be exercised as a signed public release");
-
-        assert_eq!(profile, crate::library::PanelPublicProfile::default());
-        assert_eq!(release.payload.panels.components, profile.panels.components);
-        assert_eq!(guard.library.agents[agent_id].versions, versions_before);
-        assert_eq!(guard.library.instances.len(), instances_before);
-        assert_eq!(
-            guard
-                .store_ref()
-                .records(crate::library::LIBRARY_SCOPE, "agent")
-                .unwrap()
-                .len(),
-            records_before,
-            "preview appends no Library fact",
-        );
-        assert!(
-            !guard
-                .library
-                .instances
-                .keys()
-                .any(|id| id.starts_with("panel-preview-instance-")),
-            "the transient instance is gone before the preview is returned",
-        );
-    }
-
-    /// The public session runtime resolves the provider binding by presenting a
-    /// credential id and requiring the signed envelope's binding to carry the
-    /// same string (`VerifiedEnvelope::resolve_provider_binding`). The closure
-    /// carries the raw class, which the edge compares against the deployment
-    /// config; the envelope carries the canonical `credential:` form, which is
-    /// the only spelling WhippleScript custody admits. The runtime bridges the
-    /// two by deriving the canonical form from the class with this exact rule,
-    /// so the rule is pinned here as a literal — a release whose halves the
-    /// runtime cannot reconcile passes every validator and refuses its first
-    /// turn with "provider binding has no exact realization in the verified
-    /// policy epoch", which is what every Panel release built after
-    /// 2026-08-27 did until the runtime learned the derivation.
-    #[test]
     fn envelope_names_the_canonical_class_ref() {
         let root = tempfile::tempdir().unwrap();
         let workbench = crate::open_workbench(root.path()).unwrap();
         let mut guard = workbench.lock_unpoisoned();
         // The managed metered-gateway profile every production Panel runs on,
         // so the literal pinned below is the one the runtime meets in practice.
-        let route = crate::managed_inference::metered_route("gpt-5.6-terra");
         let profile = crate::library::PanelPublicProfile {
-            provider: ProviderPolicy {
-                provider: crate::managed_inference::METERED_GATEWAY_PROVIDER.to_owned(),
-                model: route.model,
-                base_url: route.base_url,
-                credential_class: "managed-openai".to_owned(),
-                max_input_tokens: None,
-                max_output_tokens: None,
+            model: crate::library::PanelModelPolicy {
+                pinned: Some("gpt-5.6-terra".to_owned()),
+                ..Default::default()
             },
             ..crate::library::PanelPublicProfile::default()
         };
@@ -2960,8 +2667,18 @@ mod publisher_tests {
             .seed_panel_placement("inst-envelope-agreement", profile)
             .unwrap();
 
-        let (release, _) = guard
-            .build_panel_preview_release("inst-envelope-agreement-agent", None, 1_800_000_000_000)
+        let profile = guard
+            .panel_profile("inst-envelope-agreement-agent")
+            .unwrap();
+        let release = guard
+            .build_agent_release(
+                "inst-envelope-agreement",
+                release_spec(
+                    &profile,
+                    release_provider(&profile.model, None, ReleaseFunding::Managed).unwrap(),
+                    1_800_000_000_000,
+                ),
+            )
             .unwrap();
 
         let host_policy = &release.payload.host_policy;
@@ -2994,42 +2711,6 @@ mod publisher_tests {
                         .any(|b| b.as_str() == Some(host_policy.provider_binding_ref.as_str()))
                 }),
             "the closure's placement must list the closure's binding",
-        );
-    }
-
-    #[test]
-    fn project_preview_uses_the_placement_profile_not_the_later_library_draft() {
-        let root = tempfile::tempdir().unwrap();
-        let workbench = crate::open_workbench(root.path()).unwrap();
-        let mut guard = workbench.lock_unpoisoned();
-        guard
-            .seed_panel_placement(
-                "inst-preview-pinned",
-                crate::library::PanelPublicProfile::default(),
-            )
-            .unwrap();
-        let agent_id = "inst-preview-pinned-agent";
-        let mut changed = guard.panel_profile(agent_id).unwrap();
-        changed.panels.components.insert("gw-viewer".to_owned());
-        guard.set_panel_profile(agent_id, changed).unwrap();
-
-        let (release, tested) = guard
-            .build_panel_preview_release(agent_id, Some("inst-preview-pinned"), 1_800_000_000_000)
-            .unwrap();
-
-        assert_eq!(
-            tested.panels.components,
-            BTreeSet::from(["gw-chat".to_owned()])
-        );
-        assert_eq!(release.payload.panels.components, tested.panels.components);
-        assert!(
-            guard
-                .panel_profile(agent_id)
-                .unwrap()
-                .panels
-                .components
-                .contains("gw-viewer"),
-            "the mutable draft really did diverge from the pinned placement",
         );
     }
 
@@ -3067,6 +2748,99 @@ mod publisher_tests {
             .to_string()
             .contains("managed Panel provider must use"));
         assert!(error.to_string().contains("/openai"));
+    }
+
+    fn unpinned() -> crate::library::PanelModelPolicy {
+        crate::library::PanelModelPolicy::default()
+    }
+
+    fn pinned(model: &str) -> crate::library::PanelModelPolicy {
+        crate::library::PanelModelPolicy {
+            pinned: Some(model.to_owned()),
+            max_input_tokens: None,
+            max_output_tokens: Some(2048),
+        }
+    }
+
+    /// The deploy the founder could not make on 2026-09-30: a Panel agent
+    /// nobody edited, published on managed inference (DR-0272).
+    #[test]
+    fn an_untouched_panel_publishes_on_managed_inference_with_the_work_chat_default() {
+        let provider =
+            release_provider(&unpinned(), Some("gpt-5.6-terra"), ReleaseFunding::Managed).unwrap();
+        let route = crate::managed_inference::metered_route("gpt-5.6-terra");
+        assert_eq!(
+            provider.provider,
+            crate::managed_inference::METERED_GATEWAY_PROVIDER
+        );
+        assert_eq!(provider.base_url, route.base_url);
+        assert_eq!(provider.model, route.model);
+        assert_eq!(provider.credential_class, MANAGED_PANEL_CREDENTIAL_CLASS);
+        assert!(provider_wire(&provider).is_ok());
+    }
+
+    #[test]
+    fn a_pinned_model_wins_over_the_work_chat_default_and_keeps_its_ceilings() {
+        let provider = release_provider(
+            &pinned("claude-sonnet-5"),
+            Some("gpt-5.5"),
+            ReleaseFunding::Managed,
+        )
+        .unwrap();
+        assert_eq!(provider.model, "claude-sonnet-5");
+        assert!(provider.base_url.ends_with("/anthropic"));
+        assert_eq!(provider.max_output_tokens, Some(2048));
+    }
+
+    #[test]
+    fn no_pin_and_no_work_chat_default_is_refused_with_a_remedy() {
+        let error = release_provider(&unpinned(), None, ReleaseFunding::Managed).unwrap_err();
+        assert!(error.to_string().contains("pin a model"));
+    }
+
+    #[test]
+    fn an_owner_key_supplies_its_provider_endpoint_and_class() {
+        let provider = release_provider(
+            &unpinned(),
+            Some("openai/gpt-5.5"),
+            ReleaseFunding::OwnerKey {
+                provider: "openai",
+                credential_class: "openai-api-key",
+            },
+        )
+        .unwrap();
+        assert_eq!(provider.provider, "openai");
+        assert_eq!(provider.model, "gpt-5.5");
+        assert_eq!(provider.base_url, "https://api.openai.com");
+        assert_eq!(provider.credential_class, "openai-api-key");
+    }
+
+    #[test]
+    fn an_owner_key_refuses_a_model_its_provider_does_not_serve() {
+        for (provider, model) in [
+            ("anthropic", "gpt-5.5"),
+            ("openai", "claude-sonnet-5"),
+            ("openai", "anthropic/claude-sonnet-5"),
+            ("xai", "gpt-5.5"),
+        ] {
+            let error = release_provider(
+                &pinned(model),
+                None,
+                ReleaseFunding::OwnerKey {
+                    provider,
+                    credential_class: "k",
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("is not served by the"),
+                "{provider} / {model}: {error}"
+            );
+        }
+        assert_eq!(
+            owner_key_model("xai", "grok/grok-4.6").as_deref(),
+            Some("grok-4.6")
+        );
     }
 
     /// A conversation is kept unless the publisher asks for it to end.

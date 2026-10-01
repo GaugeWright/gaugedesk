@@ -101,12 +101,16 @@ fn main() -> io::Result<()> {
             let root = path_arg(args.next())?;
             let request_path = path_arg(args.next())?;
             no_more(args)?;
-            let request: PublishDeploymentRequest =
+            let mut request: PublishDeploymentRequest =
                 serde_json::from_slice(&fs::read(request_path)?).map_err(invalid)?;
             let workbench = open_workbench(&root)?;
-            let outcome = workbench
-                .lock_unpoisoned()
-                .publish_agent_deployment(request)?;
+            let mut workbench = workbench.lock_unpoisoned();
+            // An unpinned version publishes with the work-chat default of the
+            // account this workbench runs as (DR-0272).
+            request.work_chat_default_model = workbench
+                .work_chat_default_model_in(gaugedesk_app::account::ACCOUNT_SCOPE)
+                .1;
+            let outcome = workbench.publish_agent_deployment(request)?;
             println!("{}", serde_json::to_string(&outcome).map_err(invalid)?);
         }
         Some("update") => {

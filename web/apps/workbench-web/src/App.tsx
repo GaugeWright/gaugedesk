@@ -1455,6 +1455,30 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 };
             }
         }
+        // A Panel-agent preview is a work chat nobody else lists (DR-0272): its
+        // lineage names the Panel agent it tries, and its context says what.
+        for (const a of ws.archetypes) {
+            const preview = a.previews.find((candidate) => candidate.chat.id === id);
+            if (preview) {
+                const c = preview.chat;
+                return {
+                    kind: c.kind,
+                    lineage: `${a.name} · Preview`,
+                    context: preview.version === null ? "Draft" : `Version ${preview.version}`,
+                    conflict: c.conflict,
+                    workstream: "Main",
+                    title: c.title,
+                    targets: c.targets,
+                    target: c.targets.map((target) => target.name).join(", "),
+                    targetKind: c.targets.length === 1 ? c.targets[0].kind : undefined,
+                    targetConcurrency: undefined,
+                    basis: c.targets.map((target) => target.basis).join(" · "),
+                    candidate: c.candidateRevision,
+                    acts: c.availableActs,
+                    preview: true,
+                };
+            }
+        }
         // Fallback to the flat recent list (archetype name only).
         const r = ws.recent.find((c) => c.id === id);
         const targets = (r?.targets ?? []).map((member) => ({
@@ -2869,7 +2893,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         stop: stopTurn,
         draft: { value: paneDraft, set: setPaneDraft },
         retainDraftOnScopeChange: true,
-        modelToolbar: composerModelToolbar,
+        // A Panel-agent preview says what it is where you type into it: a test
+        // on your own model and funding, which does not exercise the website
+        // panels or visitor sign-in (DR-0272).
+        modelToolbar: (stacked?: boolean) => <>
+            <Show when={chatInfo()?.preview}>
+                <p class="composer-preview-note" role="note" data-panel-preview-note>
+                    Preview: a test chat on your usual model and funding. It doesn't exercise the
+                    website panels or visitor sign-in. Delete the chat to end it.
+                </p>
+            </Show>
+            {composerModelToolbar(stacked)}
+        </>,
         acceptsImages: () => modelAcceptsImages({ id: chatModel(), provider: chatProvider() }),
         onStatus: setStatus,
     });
@@ -3370,8 +3405,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     selection={selectedDeployment()}
                     defaultEdgeOrigin={import.meta.env.VITE_PUBLIC_EDGE_ORIGIN
                         || PUBLIC_EDGE_ORIGIN}
-                    defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF
-                        || "credential:production:openai:v1"}
+                    // No preset key: a deployment's own key must be one stored in the
+                    // edge registry, whose record names its provider (DR-0272). The old
+                    // static reference was in no registry and could not be resolved.
+                    defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF ?? ""}
                     onOpenInbox={() => {
                         setProjectInbox({ id: selectedDeployment().projectId as ProjectId, name: selectedDeployment().projectName });
                         setDeployment(null);

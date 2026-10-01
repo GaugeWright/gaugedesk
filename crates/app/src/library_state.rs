@@ -126,12 +126,23 @@ fn validate_panel_profile(
             ));
         }
     }
-    if profile.provider.provider.trim().is_empty()
-        || profile.provider.model.trim().is_empty()
-        || profile.provider.base_url.trim().is_empty()
-        || profile.provider.credential_class.trim().is_empty()
+    if profile
+        .model
+        .pinned
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty() || model.trim() != model)
     {
-        return Err("provider, model, base URL, and credential class are required".to_owned());
+        return Err("a pinned model must be a non-empty model name".to_owned());
+    }
+    if [
+        profile.model.max_input_tokens,
+        profile.model.max_output_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|ceiling| ceiling == 0)
+    {
+        return Err("a token ceiling must be positive".to_owned());
     }
     if profile.audience_inputs != ["text".to_owned()].into_iter().collect() {
         return Err("the current public host admits exactly the text input class".to_owned());
@@ -4166,6 +4177,19 @@ impl Workbench {
         project_id: &str,
         name: String,
     ) -> Result<String, String> {
+        self.create_managed_project_target_seeded(project_id, name, &[])
+    }
+
+    /// [`create_managed_project_target`](Self::create_managed_project_target)
+    /// with further files in its first mainline beside the gate, before any
+    /// partition is copied from it. A Panel-agent preview seeds its profile's
+    /// initial files this way (DR-0272).
+    pub(crate) fn create_managed_project_target_seeded(
+        &mut self,
+        project_id: &str,
+        name: String,
+        seeds: &[(String, String)],
+    ) -> Result<String, String> {
         let target_id = managed_project_target_id(project_id);
         if self.library.work_targets.contains_key(&target_id) {
             return Ok(target_id);
@@ -4199,8 +4223,14 @@ impl Workbench {
         // it needs no provider, no key, and no judgement about whether a
         // classifier suits the material -- so `coerce-screen` is something an
         // author moves to, never a default.
+        let mut seed = default_gate_files().to_vec();
+        seed.extend(
+            seeds
+                .iter()
+                .map(|(path, body)| (path.as_str(), body.as_str())),
+        );
         workspace
-            .seed_main(&default_gate_files())
+            .seed_main(&seed)
             .map_err(|error| error.to_string())?;
         let probe_id = library::gen_id("target-basis");
         let probe = workspace
@@ -5534,6 +5564,9 @@ impl Workbench {
         let Some(agent) = self.library.agents.get(id).cloned() else {
             return Err(AgentDeleteError::NotFound);
         };
+        // A Panel agent's previews are placements of its hidden forks on
+        // hidden projects; they end with it rather than holding it bound.
+        self.end_panel_previews_of(id);
         let bound_elsewhere = self.library.instances.values().any(|instance| {
             instance.agent_id == id
                 && instance.kind == InstanceKind::Using
@@ -6192,6 +6225,9 @@ impl Workbench {
             return Err(BindPlacementError::Create(
                 "Tutorials is maintained by GaugeWright".into(),
             ));
+        }
+        if self.is_panel_preview_project_id(project_id) {
+            return Err(BindPlacementError::ProjectNotFound);
         }
         let agent_kind = self
             .library
@@ -6873,6 +6909,12 @@ impl Workbench {
         let Some(src_chat) = self.library.chats.get(id).cloned() else {
             return Err(ForkChatError::NotFound);
         };
+        // A preview is one disposable chat (DR-0272); start another instead.
+        if self.panel_preview_project_of_chat(id).is_some() {
+            return Err(ForkChatError::Create(
+                "a Panel-agent preview is not forked; start a new preview instead".into(),
+            ));
+        }
         if self.chat_project_moving(id) {
             return Err(ForkChatError::Create(
                 crate::federation::PAUSED_FOR_MOVE.into(),
@@ -7333,6 +7375,11 @@ impl Workbench {
         if !self.engagement_index.contains_key(id) && !self.library.chats.contains_key(id) {
             return false;
         }
+        // A preview is its chat: ending the chat ends the hidden project and
+        // Agent it ran in (DR-0272).
+        if let Some(project) = self.panel_preview_project_of_chat(id) {
+            return self.end_panel_preview(&project);
+        }
         // Capture the hosting storage before teardown drops the index entry, so we can
         // purge its now-unreachable workspace blobs after the engagement line is gone (SECAUD-6).
         let storage_id = self.engagement_index.get(id).cloned();
@@ -7680,7 +7727,23 @@ impl Workbench {
         let archetypes: Vec<_> = lib
             .agents
             .values()
+            // A Panel-agent preview's Agent is listed under the Panel agent it
+            // tries, as one of its `previews`, never as an Agent of its own.
+            .filter(|agent| !crate::panel_preview::is_panel_preview_agent(agent))
             .map(|agent| {
+                let previews = self
+                    .panel_previews_of(&agent.id)
+                    .into_iter()
+                    .filter_map(|preview| {
+                        let chat = lib.chats.get(&preview.chat_id)?;
+                        let mut projected = serde_json::to_value(&preview).ok()?;
+                        projected.as_object_mut()?.insert(
+                            "chat".to_owned(),
+                            self.library_chat_json(chat, &chat_ws, &rules, &mut observations),
+                        );
+                        Some(projected)
+                    })
+                    .collect::<Vec<_>>();
                 serde_json::json!({
                     "id": agent.id,
                     "name": agent.name,
@@ -7697,6 +7760,7 @@ impl Workbench {
                     "forked_from_name": agent.forked_from.as_ref().and_then(|src| lib.agents.get(src).map(|source| source.name.clone())),
                     "chats": lib.chats_in(&agent.instance_id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules, &mut observations)).collect::<Vec<_>>(),
                     "workstreams": self.library_workstreams_in(&agent.instance_id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
+                    "previews": previews,
                 })
             })
             .collect();
@@ -7705,6 +7769,7 @@ impl Workbench {
             .projects
             .values()
             .filter(|project| project.home_id == self.home_id)
+            .filter(|project| !crate::panel_preview::is_panel_preview_project(project))
             .map(|project| {
                 let placements: Vec<_> = lib
                     .using_instances_of(&project.id)
@@ -7793,6 +7858,7 @@ impl Workbench {
         recent.retain(|chat| {
             lib.project_of_chat(&chat.id)
                 .is_none_or(|project| self.owns_project(project))
+                && self.panel_preview_project_of_chat(&chat.id).is_none()
         });
         recent.sort_by_key(|chat| std::cmp::Reverse(chat.created_position));
         let recent: Vec<_> = recent
@@ -7827,7 +7893,12 @@ impl Workbench {
             "projects": projects,
             "recent": recent,
             "workstreams": workstreams,
-            "work_targets": lib.work_targets.values().map(Self::work_target_json).collect::<Vec<_>>(),
+            "work_targets": lib
+                .work_targets
+                .values()
+                .filter(|target| !self.is_panel_preview_target(target))
+                .map(Self::work_target_json)
+                .collect::<Vec<_>>(),
             "personal_placement": DEFAULT_PLACEMENT,
         })
     }

@@ -1,3 +1,4 @@
+import { panelProfileFromWire, panelProfileToWire } from "./panel-profile-wire";
 import { type ProjectionCarriage, parseProjectionCarriage } from "./projection-carriage";
 import { parseWorkspaceDelta, type WorkspaceDelta } from "./workspace-delta";
 import { type ProjectHome, parseProjectHome } from "./project-home";
@@ -33,8 +34,6 @@ import type {
     MergeAction,
     MergeState,
     PanelPublicProfile,
-    PanelPreviewInput,
-    PanelPreviewOutcome,
     PlacementId,
     ProjectId,
     CollectionRecipient,
@@ -248,7 +247,7 @@ export async function getPanelProfile(
     transport: WorkbenchTransport,
     id: ArchetypeId,
 ): Promise<PanelPublicProfile> {
-    return await transport.json("GET", `/archetypes/${id}/panel-profile`) as PanelPublicProfile;
+    return panelProfileFromWire(await transport.json("GET", `/archetypes/${id}/panel-profile`));
 }
 
 export async function setPanelProfile(
@@ -256,7 +255,9 @@ export async function setPanelProfile(
     id: ArchetypeId,
     profile: PanelPublicProfile,
 ): Promise<PanelPublicProfile> {
-    return await transport.json("PUT", `/archetypes/${id}/panel-profile`, profile) as PanelPublicProfile;
+    return panelProfileFromWire(
+        await transport.json("PUT", `/archetypes/${id}/panel-profile`, panelProfileToWire(profile)),
+    );
 }
 
 export async function renameArchetype(
@@ -704,32 +705,21 @@ export async function publicPublisherKey(
     return response.public_key;
 }
 
-export async function startPanelPreview(
+/** Try a Panel agent in a disposable work chat with the caller's work-chat
+ *  defaults: its draft, or a project placement's pinned version (DR-0272). A
+ *  second preview of the same thing replaces the first; deleting the chat ends
+ *  it. */
+export async function previewPanelAgent(
     transport: WorkbenchTransport,
-    input: PanelPreviewInput,
-): Promise<PanelPreviewOutcome> {
-    const response = await transport.json("POST", "/panel-previews", input) as {
-        preview?: PanelPreviewOutcome;
-    };
-    const preview = response.preview;
-    if (
-        !preview
-        || typeof preview.preview_id !== "string"
-        || typeof preview.deployment_id !== "string"
-        || typeof preview.release_id !== "string"
-        || typeof preview.edge_origin !== "string"
-        || typeof preview.deployment_url !== "string"
-        || !Array.isArray(preview.panels)
-        || !Number.isSafeInteger(preview.expires_at_unix_ms)
-    ) throw new Error("Panel preview response is malformed");
-    return preview;
-}
-
-export async function stopPanelPreview(
-    transport: WorkbenchTransport,
-    previewId: string,
-): Promise<void> {
-    await transport.json("DELETE", `/panel-previews/${encodeURIComponent(previewId)}`);
+    archetypeId: ArchetypeId,
+    placementId?: PlacementId,
+): Promise<EngagementId> {
+    const o = (await transport.json(
+        "POST",
+        `/archetypes/${archetypeId}/preview`,
+        placementId ? { placement_id: placementId } : {},
+    )) as { id: string };
+    return engagementId(o.id);
 }
 
 export async function importLegacyDeployment(

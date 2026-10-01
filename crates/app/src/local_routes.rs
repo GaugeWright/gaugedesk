@@ -133,6 +133,7 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             )),
         )
         .route("/archetypes/{id}/use", post(lr::use_archetype))
+        .route("/archetypes/{id}/preview", post(lr::start_panel_preview))
         .route("/archetypes/{id}/fork", post(lr::fork_archetype))
         .route(
             "/archetypes/{id}/copy-as-panel",
@@ -177,14 +178,6 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
         .route(
             "/public-deployments/publisher-authority",
             get(crate::publisher_routes::publisher_authority),
-        )
-        .route(
-            "/panel-previews",
-            post(crate::publisher_routes::start_panel_preview),
-        )
-        .route(
-            "/panel-previews/{id}",
-            delete(crate::publisher_routes::stop_panel_preview),
         )
         .route(
             "/public-deployments/import",

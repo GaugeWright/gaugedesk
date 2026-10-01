@@ -1,3 +1,5 @@
+import { panelProfileFromWire } from "./panel-profile-wire";
+
 declare const brand: unique symbol;
 type Brand<T, B> = T & { readonly [brand]: B };
 
@@ -206,6 +208,16 @@ export interface ArchetypeNode {
     readonly forkedFromName: string | null;
     readonly chats: ChatNode[];
     readonly workstreams: WorkstreamNode[];
+    /** A Panel agent's live previews: disposable work chats running its draft
+     *  or a placement's pinned version, listed nowhere else (DR-0272). */
+    readonly previews: PanelPreviewNode[];
+}
+/** One live Panel-agent preview. Ending its chat ends the preview. */
+export interface PanelPreviewNode {
+    readonly chat: ChatNode;
+    /** The project placement whose version is tried; null for the draft. */
+    readonly placementId: PlacementId | null;
+    readonly version: number | null;
 }
 export type AgentKind = "work" | "panel";
 export type AgentAbility = "workspace.read" | "workspace.write" | "command.run" | "tracker.file" | "question.ask";
@@ -304,25 +316,6 @@ export interface PublicDeploymentInput {
     readonly end_sessions?: boolean;
 }
 
-export interface PanelPreviewInput {
-    readonly dictation_entitlement?: string;
-    readonly agent_id: ArchetypeId;
-    readonly placement_id?: PlacementId;
-    readonly edge_origin: string;
-    readonly allowed_origin: string;
-    readonly funding: PublicDeploymentInput["funding"];
-}
-
-export interface PanelPreviewOutcome {
-    readonly preview_id: string;
-    readonly deployment_id: string;
-    readonly release_id: string;
-    readonly edge_origin: string;
-    readonly deployment_url: string;
-    readonly panels: readonly string[];
-    readonly expires_at_unix_ms: number;
-}
-
 /** What a collecting deployment gathers, and who it seals to (ADR 0109 §5–§7).
  *
  *  `exportable_paths` and `transcript_eligible` are release content — what the
@@ -352,14 +345,17 @@ export interface PanelPublicProfile {
         readonly attribution: "gauge_wright" | "white_label_eligible";
     };
     readonly public_abilities: readonly AgentAbility[];
-    readonly provider: {
-        readonly provider: string;
-        readonly model: string;
-        readonly base_url: string;
-        readonly credential_class: string;
+    /** The model visitors' turns use, if the version pins one; otherwise the
+     *  publisher's work-chat default at publish. No provider is authored: who
+     *  pays for a deployment chooses it (DR-0272). */
+    readonly model: {
+        readonly pinned?: string;
         readonly max_input_tokens?: number;
         readonly max_output_tokens?: number;
     };
+    /** The provider posture a Home older than DR-0272 sent, kept so the
+     *  profile is written back in the shape that Home accepts. */
+    readonly legacyProvider?: import("./panel-profile-wire").LegacyPanelProvider;
     readonly audience_inputs: readonly AudienceInputClass[];
     readonly initial_workspace: readonly {
         readonly path: string;
@@ -863,7 +859,7 @@ export function parseWorkTarget(raw: unknown): WorkTargetNode {
  *  `/projections/library/workspace` carriage value) into the branded {@link Workspace}. */
 export function parseWorkspace(raw: unknown): Workspace {
     const o = (raw ?? {}) as {
-        archetypes?: { id: string; name: string; kind?: AgentKind; panel_profile?: PanelPublicProfile | null; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: RawChat[]; workstreams?: Parameters<typeof parseWorkstream>[0][] }[];
+        archetypes?: { id: string; name: string; kind?: AgentKind; panel_profile?: PanelPublicProfile | null; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: RawChat[]; workstreams?: Parameters<typeof parseWorkstream>[0][]; previews?: { chat: RawChat; placement_id?: string | null; version?: number | null }[] }[];
         projects?: {
             id: string;
             home_id?: string;
@@ -901,7 +897,7 @@ export function parseWorkspace(raw: unknown): Workspace {
             id: a.id as ArchetypeId,
             name: a.name,
             kind: a.kind ?? "work",
-            panelProfile: a.panel_profile ?? null,
+            panelProfile: a.panel_profile ? panelProfileFromWire(a.panel_profile) : null,
             instanceId: (a.instance_id ?? "") as PlacementId,
             authoringTargetId: workTargetId(requiredString(a.authoring_target_id, "archetype.authoring_target_id")),
             isDefault: a.is_default,
@@ -909,6 +905,11 @@ export function parseWorkspace(raw: unknown): Workspace {
             forkedFromName: a.forked_from_name ?? null,
             chats: a.chats.map(parseChat),
             workstreams: (a.workstreams ?? []).map(parseWorkstream),
+            previews: (a.previews ?? []).map((preview) => ({
+                chat: parseChat(preview.chat),
+                placementId: preview.placement_id ? (preview.placement_id as PlacementId) : null,
+                version: preview.version ?? null,
+            })),
         })),
         projects: (o.projects ?? []).map((p) => ({
             id: p.id as ProjectId,
@@ -928,7 +929,7 @@ export function parseWorkspace(raw: unknown): Workspace {
                 pinnedVersion: pl.pinned_version ?? null,
                 version: pl.version ?? 1,
                 currentVersion: pl.current_version ?? 1,
-                panelProfile: pl.panel_profile ?? null,
+                panelProfile: pl.panel_profile ? panelProfileFromWire(pl.panel_profile) : null,
                 upgradeAvailable: pl.upgrade_available ?? false,
                 pending: pl.pending ?? false,
                 deployments: (pl.deployments ?? []).map((deployment) => ({

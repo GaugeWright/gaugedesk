@@ -151,6 +151,9 @@ export interface FacetBrowserApi {
     createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetIds: readonly WorkTargetId[]): Promise<EngagementId>;
     reviseChatTargets(id: EngagementId, targets: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[]): Promise<void>;
     useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId>;
+    /** Try a Panel agent in a disposable work chat (DR-0272): its draft, or a
+     *  placement's pinned version. */
+    previewPanelAgent?(archetypeId: ArchetypeId, placementId?: PlacementId): Promise<EngagementId>;
     createEngagement(): Promise<Engagement>;
     deleteChat(id: EngagementId): Promise<void>;
     organizeChat(id: EngagementId, change: { archived?: boolean; pinned?: boolean }): Promise<void>;
@@ -562,8 +565,9 @@ export function FacetBrowser(props: {
     // children (#2 round-9); on a method with no chats and nowhere placed it
     // expanded to nothing, so the caret lied. Render a real caret only when there
     // are children, and a fixed-width spacer otherwise so labels stay aligned.
-    const archetypeHasChildren = (a: { id: string; chats: { archived?: boolean }[] }) =>
-        activeChatCount(a.chats) > 0 || (placementsOf().get(a.id)?.length ?? 0) > 0;
+    const archetypeHasChildren = (a: { id: string; chats: { archived?: boolean }[]; previews?: readonly unknown[] }) =>
+        activeChatCount(a.chats) > 0 || (placementsOf().get(a.id)?.length ?? 0) > 0
+        || (a.previews?.length ?? 0) > 0;
     const caret = (id: string, hasChildren: boolean) =>
         hasChildren ? (
             <span class="node-icon" onClick={(e) => { e.stopPropagation(); toggleCollapse(id); }}>
@@ -912,6 +916,17 @@ export function FacetBrowser(props: {
         }, "new work chat");
     }
 
+    // TRY a Panel agent (DR-0272): a disposable work chat running its draft or a
+    // placement's pinned version, on the author's work-chat model and funding.
+    // Trying the same thing again replaces the previous preview.
+    async function previewPanelAgent(archetypeId: ArchetypeId, placementId?: PlacementId) {
+        if (!props.api.previewPanelAgent) return;
+        await withRefresh(async () => {
+            const id = await props.api.previewPanelAgent!(archetypeId, placementId);
+            props.onSelect(id);
+        }, "preview chat opened");
+    }
+
     function openMenu(e: MouseEvent, items: MenuState["items"]) {
         e.preventDefault();
         e.stopPropagation();
@@ -1117,6 +1132,7 @@ export function FacetBrowser(props: {
 
     // A placement row's menu (shared by right-click and the row's ⋯ button).
     const placementMenuItems = (p: ProjectNode, pl: ProjectNode["placements"][number]): MenuState["items"] => pl.kind === "panel" ? [
+        ...(props.api.previewPanelAgent ? [{ label: "preview this version", icon: "eye" as const, hint: `Run version ${pl.version} in a disposable work chat on your usual model and funding`, run: () => void previewPanelAgent(pl.archetypeId, pl.placementId) }] : []),
         ...(props.onOpenPanelAgent ? [{ label: "open", hint: "Open this placement: its pinned contract and deployments", run: () => {
             const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
             if (agent) props.onOpenPanelAgent?.(agent, p);
@@ -1208,11 +1224,15 @@ export function FacetBrowser(props: {
     const archetypeMenuItems = (a: ArchetypeNode): MenuState["items"] => [
         ...(a.kind === "work"
             ? [{ label: "test in a chat", icon: "eye" as const, hint: "Try this Agent in a Personal work chat", run: () => void useArchetype(a.id) }]
-            : props.onOpenPanelAgent
-                // Opening shows the contract beside the edit chat. The eye is for
-                // trying an Agent, and a Panel agent is tried in the workbench.
-                ? [{ label: "open", hint: "Open this Panel agent: its edit chat and public contract", run: () => props.onOpenPanelAgent?.(a) }]
-                : []),
+            : [
+                ...(props.api.previewPanelAgent
+                    ? [{ label: "try in a preview chat", icon: "eye" as const, hint: "Run the draft in a disposable work chat on your usual model and funding. It doesn't exercise the website panels or visitor sign-in; deploying does.", run: () => void previewPanelAgent(a.id) }]
+                    : []),
+                // Opening shows the contract beside the edit chat.
+                ...(props.onOpenPanelAgent
+                    ? [{ label: "open", hint: "Open this Panel agent: its edit chat and public contract", run: () => props.onOpenPanelAgent?.(a) }]
+                    : []),
+            ]),
         { label: "new authoring chat", icon: "page-edit", hint: "Open a chat to edit what this Agent does — you review every change before it's kept", run: () => newEditChat(a.id) },
         { label: "new workstream", icon: "child-branch", hint: "Create a shared auto-sync line over this Agent's edit chats", run: () => startEdit({ kind: "new-workstream", placementId: a.instanceId }) },
         { label: "settings", run: () => props.onOpenArchetypeSettings(a.id, a.name, a.kind) },
@@ -2232,6 +2252,12 @@ export function FacetBrowser(props: {
                                         {wsEditorFor(a.instanceId)}
                                         {/* The method's edit chats, grouped by workstream (WS-F). */}
                                         {chatGroups(chatsFor(a.name, a.chats), a.workstreams)}
+                                        {/* A Panel agent's live previews (DR-0272); deleting one ends it. */}
+                                        <Show when={a.previews.length}>
+                                            <div class="facet-preview-chats" data-panel-previews={a.id}>
+                                                {chatGroups(chatsFor(a.name, a.previews.map((preview) => preview.chat)), [])}
+                                            </div>
+                                        </Show>
                                         </Show>
                                     </div>
                                 )}

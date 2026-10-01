@@ -1042,22 +1042,7 @@ pub async fn get_default_model(
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
     let scope = wb.account_scope_for(net_http::bearer(&headers));
-    let class = wb.model_execution_class();
-    let linked = wb.linked_providers_in_class(&scope, class);
-    let provider = crate::engine::resolve_default_provider(
-        gaugedesk_env::var("MODEL_PROVIDER"),
-        None,
-        &linked,
-    );
-    let model = provider.as_deref().and_then(|provider| {
-        crate::engine::resolve_turn_model(gaugedesk_env::var("MODEL"), None)
-            .or_else(|| {
-                gaugedesk_whip_runtime::native_provider_descriptor(provider, None, None)
-                    .ok()
-                    .map(|d| d.model)
-            })
-            .or_else(|| wb.declared_default_model_in(&scope, provider))
-    });
+    let (provider, model) = wb.work_chat_default_model_in(&scope);
     (
         StatusCode::OK,
         Json(json!({ "provider": provider, "model": model })),

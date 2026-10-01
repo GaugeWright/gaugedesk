@@ -114,12 +114,21 @@ impl From<AgentKind> for PlacementKind {
 
 /// Complete public contract authored with a Panel agent and frozen into each
 /// numeric version. None of these fields are deployment-time choices.
+///
+/// It names no provider: who pays for a deployment decides that at publish
+/// (DR-0272). It names at most a model.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PanelPublicProfile {
     pub panels: PanelManifest,
     #[serde(default)]
     pub public_abilities: BTreeSet<String>,
-    pub provider: ProviderPolicy,
+    /// Read from `provider` in records frozen before DR-0272.
+    #[serde(
+        default,
+        alias = "provider",
+        deserialize_with = "deserialize_panel_model_policy"
+    )]
+    pub model: PanelModelPolicy,
     #[serde(default)]
     pub audience_inputs: BTreeSet<String>,
     #[serde(default)]
@@ -138,17 +147,7 @@ impl Default for PanelPublicProfile {
                 attribution: AttributionPolicy::GaugeWright,
             },
             public_abilities: BTreeSet::new(),
-            provider: ProviderPolicy {
-                provider: "openai".to_owned(),
-                model: "gpt-5-mini".to_owned(),
-                // The native OpenAI Responses client appends `/v1/responses`.
-                // This is therefore the provider origin, not the SDK-style
-                // compat base used by `openai-generic` chat completions.
-                base_url: "https://api.openai.com".to_owned(),
-                credential_class: "openai-api-key".to_owned(),
-                max_input_tokens: None,
-                max_output_tokens: None,
-            },
+            model: PanelModelPolicy::default(),
             audience_inputs: ["text".to_owned()].into_iter().collect(),
             initial_workspace: Vec::new(),
             retention: RetentionPolicy {
@@ -160,6 +159,63 @@ impl Default for PanelPublicProfile {
             collection: None,
         }
     }
+}
+
+/// The model a Panel agent's version names, if any, and its authored token
+/// ceilings.
+///
+/// An unpinned version publishes with the publisher's work-chat default model,
+/// recorded into that release. The provider surface is never authored: managed
+/// funding routes through the metered gateway and an owner key supplies its
+/// own provider (DR-0272).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PanelModelPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<String>,
+    /// Optional authored narrowing. Absence delegates the model capability and
+    /// context policy to WhippleScript (ADR 0121).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+}
+
+/// The posture every Panel agent was created with before DR-0272. Nobody chose
+/// it, so a version still carrying it exactly is unpinned.
+const LEGACY_DEFAULT_PANEL_MODEL: (&str, &str, &str, &str) = (
+    "openai",
+    "gpt-5-mini",
+    "https://api.openai.com",
+    "openai-api-key",
+);
+
+fn deserialize_panel_model_policy<'de, D>(deserializer: D) -> Result<PanelModelPolicy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Legacy(ProviderPolicy),
+        Current(PanelModelPolicy),
+    }
+    Ok(match Wire::deserialize(deserializer)? {
+        Wire::Current(policy) => policy,
+        Wire::Legacy(provider) => {
+            let untouched = (
+                provider.provider.as_str(),
+                provider.model.as_str(),
+                provider.base_url.as_str(),
+                provider.credential_class.as_str(),
+            ) == LEGACY_DEFAULT_PANEL_MODEL;
+            PanelModelPolicy {
+                pinned: (!untouched).then_some(provider.model),
+                max_input_tokens: provider.max_input_tokens,
+                max_output_tokens: provider.max_output_tokens,
+            }
+        }
+    })
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -1469,10 +1525,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn panel_default_uses_the_openai_responses_origin() {
-        let profile = PanelPublicProfile::default();
-        assert_eq!(profile.provider.provider, "openai");
-        assert_eq!(profile.provider.base_url, "https://api.openai.com");
+    fn a_default_panel_profile_pins_no_model() {
+        assert_eq!(
+            PanelPublicProfile::default().model,
+            PanelModelPolicy::default()
+        );
+    }
+
+    fn legacy_profile(provider: serde_json::Value) -> PanelPublicProfile {
+        let mut value = serde_json::to_value(PanelPublicProfile::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("model");
+        object.insert("provider".to_owned(), provider);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_legacy_untouched_default_posture_reads_as_unpinned() {
+        let profile = legacy_profile(serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "base_url": "https://api.openai.com",
+            "credential_class": "openai-api-key",
+        }));
+        assert_eq!(profile.model, PanelModelPolicy::default());
+    }
+
+    #[test]
+    fn a_legacy_chosen_posture_keeps_its_model_and_ceilings_as_a_pin() {
+        let profile = legacy_profile(serde_json::json!({
+            "provider": "cloudflare-ai-gateway",
+            "model": "gpt-5.6-terra",
+            "base_url": "https://gateway.ai.cloudflare.com/v1/a/g/openai",
+            "credential_class": "managed-openai",
+            "max_output_tokens": 4096,
+        }));
+        assert_eq!(
+            profile.model,
+            PanelModelPolicy {
+                pinned: Some("gpt-5.6-terra".to_owned()),
+                max_input_tokens: None,
+                max_output_tokens: Some(4096),
+            }
+        );
+    }
+
+    #[test]
+    fn a_current_profile_round_trips_under_its_own_name() {
+        let mut profile = PanelPublicProfile::default();
+        profile.model.pinned = Some("claude-sonnet-5".to_owned());
+        let value = serde_json::to_value(&profile).unwrap();
+        assert!(value.get("provider").is_none());
+        assert_eq!(value["model"]["pinned"], "claude-sonnet-5");
+        assert_eq!(
+            serde_json::from_value::<PanelPublicProfile>(value).unwrap(),
+            profile
+        );
     }
 
     #[test]

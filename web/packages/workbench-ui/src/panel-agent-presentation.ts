@@ -40,73 +40,53 @@ export const PUBLIC_ABILITY_CHOICES: readonly Choice<AgentAbility>[] = [
 export interface ProviderChoice {
     readonly value: string;
     readonly name: string;
-    readonly baseUrl: string;
     readonly credentialClass: string;
-    /** The model a profile lands on when the owner switches to this provider. */
-    readonly defaultModel: string;
 }
 
 /** Providers the public session host calls directly. The base URL is the
  *  provider's origin: the native clients append their own API paths. */
-export const PROVIDER_CHOICES: readonly ProviderChoice[] = [
-    {
-        value: "openai",
-        name: "OpenAI",
-        baseUrl: "https://api.openai.com",
-        credentialClass: "openai-api-key",
-        defaultModel: "gpt-5.4-mini",
-    },
-    {
-        value: "anthropic",
-        name: "Anthropic",
-        baseUrl: "https://api.anthropic.com",
-        credentialClass: "anthropic-api-key",
-        defaultModel: "claude-sonnet-4-6",
-    },
+/** The providers whose keys can pay for a deployment. A key is stored under its
+ *  provider's class, and a deployment it funds runs on that provider (DR-0272). */
+export const KEY_PROVIDERS: readonly ProviderChoice[] = [
+    { value: "openai", name: "OpenAI", credentialClass: "openai-api-key" },
+    { value: "anthropic", name: "Anthropic", credentialClass: "anthropic-api-key" },
 ];
 
 export function providerName(provider: string): string {
-    return PROVIDER_CHOICES.find((choice) => choice.value === provider)?.name ?? provider;
+    return KEY_PROVIDERS.find((choice) => choice.value === provider)?.name ?? provider;
 }
 
-/** The models a provider offers visitors' turns, from GaugeDesk's shipped model
- *  catalog: the set the chat picker shows by default, so the two never list
- *  different models. It kept a short list of its own until WS-597, which had
- *  drifted from the catalog entirely.
+/** The value the model choice holds for "no pin". */
+export const WORK_CHAT_DEFAULT_MODEL = "";
+
+/** The models a Panel version can pin, from GaugeDesk's shipped model catalog:
+ *  the set the chat picker shows by default across the providers that can serve
+ *  a deployment, so the two never list different models (WS-597). The first
+ *  choice pins nothing, so a deployment uses the publisher's work-chat default.
  *
- *  A model the profile already names stays listed when the catalog does not
+ *  A model the profile already pins stays listed when the catalog does not
  *  carry it, so opening the editor never changes what a published version
  *  runs. */
-export function panelModelChoices(provider: string, current = ""): readonly Choice<string>[] {
-    const models: Choice<string>[] = pickableModels([provider]).filter(isDefaultVisible)
-        .map((model) => ({ value: model.id, name: model.name, detail: model.id }));
+export function panelModelChoices(current = ""): readonly Choice<string>[] {
+    const models: Choice<string>[] = [{
+        value: WORK_CHAT_DEFAULT_MODEL,
+        name: "Your work-chat default",
+        detail: "Whatever model your work chats use when you deploy.",
+    }];
+    for (const model of pickableModels(KEY_PROVIDERS.map((provider) => provider.value)).filter(isDefaultVisible)) {
+        models.push({ value: model.id, name: model.name, detail: model.id });
+    }
     if (current && !models.some((model) => model.value === current)) {
         models.push({ value: current, name: current, detail: "Not in GaugeDesk's model catalog." });
     }
     return models;
 }
 
-/** Switch provider, carrying the base URL and credential class with it when they
- *  were still the previous provider's defaults. A value the owner set by hand is
- *  theirs and is left alone. */
-export function withProvider(
-    current: PanelPublicProfile["provider"],
-    provider: string,
-): PanelPublicProfile["provider"] {
-    const previous = PROVIDER_CHOICES.find((choice) => choice.value === current.provider);
-    const next = PROVIDER_CHOICES.find((choice) => choice.value === provider);
-    if (!next) return { ...current, provider };
-    const keepsDefaults = !previous
-        || (current.base_url === previous.baseUrl && current.credential_class === previous.credentialClass);
-    return {
-        ...current,
-        provider,
-        model: panelModelChoices(provider).some((model) => model.value === current.model)
-            ? current.model
-            : next.defaultModel,
-        base_url: keepsDefaults ? next.baseUrl : current.base_url,
-        credential_class: keepsDefaults ? next.credentialClass : current.credential_class,
-    };
+/** The profile with `model` pinned, or unpinned for the work-chat default. */
+export function withPinnedModel(profile: PanelPublicProfile, model: string): PanelPublicProfile {
+    const pinned = model.trim();
+    const { pinned: _previous, ...ceilings } = profile.model;
+    return { ...profile, model: pinned ? { ...ceilings, pinned } : ceilings };
 }
 
 // --- money ------------------------------------------------------------------
@@ -216,7 +196,7 @@ export function contractFacts(profile: PanelPublicProfile): ContractFact[] {
         { label: "Visitors see", value: list(panels) },
         // Commas, not "and": "create and edit files" already has one.
         { label: "The agent can", value: abilities.length ? abilities.join(", ") : "only chat" },
-        { label: "Model", value: `${providerName(profile.provider.provider)} · ${profile.provider.model}` },
+        { label: "Model", value: profile.model.pinned ?? "Your work-chat default when deployed" },
         { label: "Starting files", value: files.length ? list(files) : "None" },
         {
             label: "History",

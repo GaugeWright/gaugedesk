@@ -1339,6 +1339,28 @@ impl Workbench {
         .next()
     }
 
+    /// The provider and model a new work chat in `scope` runs on when nothing
+    /// narrows it: what `GET /account/default-model` reports, and what an
+    /// unpinned Panel agent publishes with (DR-0272).
+    pub fn work_chat_default_model_in(&self, scope: &str) -> (Option<String>, Option<String>) {
+        let linked = self.linked_providers_in_class(scope, self.model_execution_class());
+        let provider = crate::engine::resolve_default_provider(
+            gaugedesk_env::var("MODEL_PROVIDER"),
+            None,
+            &linked,
+        );
+        let model = provider.as_deref().and_then(|provider| {
+            crate::engine::resolve_turn_model(gaugedesk_env::var("MODEL"), None)
+                .or_else(|| {
+                    gaugedesk_whip_runtime::native_provider_descriptor(provider, None, None)
+                        .ok()
+                        .map(|d| d.model)
+                })
+                .or_else(|| self.declared_default_model_in(scope, provider))
+        });
+        (provider, model)
+    }
+
     /// [`declared_default_model_in`](Self::declared_default_model_in) for the
     /// actor behind a turn.
     pub(crate) fn declared_default_model_for_actor(

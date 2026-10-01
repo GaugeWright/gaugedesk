@@ -16,8 +16,6 @@ import type {
     MergeState,
     PlacementId,
     PanelPublicProfile,
-    PanelPreviewInput,
-    PanelPreviewOutcome,
     CollectionRecipient,
     PublicDeploymentInput,
     PublicDeploymentInspection,
@@ -1455,22 +1453,11 @@ export class WorkbenchControlPlane implements ControlPlane {
         return result.text;
     }
 
-    async startPanelPreview(input: PanelPreviewInput): Promise<PanelPreviewOutcome> {
-        let admitted = { ...input, dictation_entitlement: await this.dictationEntitlement() };
-        if (
-            this.usesRemoteHome()
-            && input.funding.kind === "managed"
-            && !input.funding.entitlement
-        ) {
-            const publicKey = await workbenchClient.publicPublisherKey(this.workbenchTransport());
-            const entitlement = await accountClient.mintManagedEntitlement(
-                this.route,
-                input.funding.tenant_id,
-                publicKey,
-            );
-            admitted = { ...admitted, funding: { ...input.funding, entitlement } };
-        }
-        return workbenchClient.startPanelPreview(this.workbenchTransport(), admitted);
+    /** A disposable work chat running a Panel agent with the caller's
+     *  work-chat defaults (DR-0272). No entitlement is minted: the chat is
+     *  funded the way any work chat is. */
+    previewPanelAgent(archetypeId: ArchetypeId, placementId?: PlacementId): Promise<EngagementId> {
+        return workbenchClient.previewPanelAgent(this.workbenchTransport(), archetypeId, placementId);
     }
 
     private async dictationEntitlement(): Promise<string | undefined> {
@@ -1482,10 +1469,6 @@ export class WorkbenchControlPlane implements ControlPlane {
             if (error instanceof RouteHttpError && (error.status === 401 || error.status === 402)) return undefined;
             throw error;
         }
-    }
-
-    stopPanelPreview(previewId: string): Promise<void> {
-        return workbenchClient.stopPanelPreview(this.workbenchTransport(), previewId);
     }
 
     /** Owner/admin tenants eligible to be selected as managed deployment

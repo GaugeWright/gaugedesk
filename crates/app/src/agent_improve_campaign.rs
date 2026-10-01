@@ -16,11 +16,11 @@ use gaugedesk_harness::{EgressGate, HarnessFactory, HarnessSpec};
 use gaugedesk_workspace::Workspace;
 
 use crate::agent_improve::{
-    adopt_evaluated_candidate, prepare_native_shadow_pair_from_authoring,
-    run_hosted_shadow_selection, run_native_shadow_selection, HostGauge, HostJudge, HostSelection,
-    HostedImprovePairAdmission, HostedImprovePairContext, PreparedShadowPair, SelectedShadowPair,
-    ShadowTurn,
+    prepare_native_shadow_pair_from_authoring, run_hosted_shadow_selection,
+    run_native_shadow_selection, HostGauge, HostJudge, HostSelection, HostedImprovePairAdmission,
+    HostedImprovePairContext, PreparedShadowPair, SelectedShadowPair, ShadowTurn,
 };
+use crate::agent_improve_adoption::{adopt_candidate, AgentDefinitionSnapshot};
 use crate::agent_improve_funding::ManagedShadowMeter;
 use crate::{library::gen_id, SharedWorkbench};
 
@@ -342,8 +342,18 @@ pub struct EvaluationScenario<'a> {
 struct EvaluatedScenario {
     id: String,
     exposure: Exposure,
-    prepared: PreparedShadowPair,
-    selected: SelectedShadowPair,
+    readings: Vec<GaugeEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CampaignLineage {
+    baseline_main_cut: String,
+    baseline_definition_ref: String,
+    candidate_definition_ref: String,
+    baseline_package_ref: String,
+    candidate_package_ref: String,
+    baseline_discipline_ref: String,
+    candidate_discipline_ref: String,
 }
 
 /// Every evaluated scenario used one authored baseline/candidate lineage and
@@ -357,6 +367,9 @@ pub struct SelectedCampaign {
     verdict: Verdict,
     sealed_available: usize,
     reservation_id: Option<String>,
+    lineage: CampaignLineage,
+    baseline_definition: AgentDefinitionSnapshot,
+    candidate_definition: AgentDefinitionSnapshot,
 }
 
 /// The only evaluation projection an edit-chat optimizer may receive. It is
@@ -463,14 +476,10 @@ impl SelectedCampaign {
         if !self.verdict.proposable {
             return Ok(None);
         }
-        let first = self
-            .scenarios
-            .first()
-            .ok_or("Agent improve campaign has no evaluated scenarios")?;
-        first
-            .prepared
-            .evaluated_candidate_definition(first.selected.evidence())
-            .map(Some)
+        if self.scenarios.is_empty() {
+            return Err("Agent improve campaign has no evaluated scenarios".to_owned());
+        }
+        Ok(Some(self.candidate_definition.clone()))
     }
 
     pub fn target_id(&self) -> &str {
@@ -541,26 +550,21 @@ impl SelectedCampaign {
         if self.reference != campaign.reference {
             return Err("Agent improve evidence names another campaign cut".to_owned());
         }
-        let first = self
-            .scenarios
-            .first()
-            .ok_or("Agent improve campaign has no evaluated scenarios")?;
-        let pair = first.selected.evidence();
+        if self.scenarios.is_empty() {
+            return Err("Agent improve campaign has no evaluated scenarios".to_owned());
+        }
         Ok(CampaignEvidenceCard {
             target_id: self.target_id.clone(),
             campaign_ref: self.reference.clone(),
             open_source_ref: campaign.open_ref().to_owned(),
             private_source_ref: campaign.private_ref().to_owned(),
-            baseline_main_cut: pair
-                .baseline_main_cut()
-                .ok_or("Agent improve evidence has no authoring Main cut")?
-                .to_owned(),
-            baseline_definition_ref: pair.baseline_definition_ref().to_owned(),
-            candidate_definition_ref: pair.candidate_definition_ref().to_owned(),
-            baseline_package_ref: pair.baseline().package_ref().to_owned(),
-            candidate_package_ref: pair.candidate().package_ref().to_owned(),
-            baseline_discipline_ref: pair.baseline().discipline_ref().to_owned(),
-            candidate_discipline_ref: pair.candidate().discipline_ref().to_owned(),
+            baseline_main_cut: self.lineage.baseline_main_cut.clone(),
+            baseline_definition_ref: self.lineage.baseline_definition_ref.clone(),
+            candidate_definition_ref: self.lineage.candidate_definition_ref.clone(),
+            baseline_package_ref: self.lineage.baseline_package_ref.clone(),
+            candidate_package_ref: self.lineage.candidate_package_ref.clone(),
+            baseline_discipline_ref: self.lineage.baseline_discipline_ref.clone(),
+            candidate_discipline_ref: self.lineage.candidate_discipline_ref.clone(),
             open_count: self.open_scenario_ids().len(),
             sealed_available: self.sealed_available,
             sealed_evaluated: self.sealed_count(),
@@ -781,7 +785,8 @@ where
     let selection = campaign.selection();
     let mut scenarios = Vec::new();
     let mut readings: BTreeMap<String, GaugeEvidence> = BTreeMap::new();
-    let mut lineage: Option<(String, String, String, String, String, String, String)> = None;
+    let mut lineage: Option<CampaignLineage> = None;
+    let mut definitions: Option<(AgentDefinitionSnapshot, AgentDefinitionSnapshot)> = None;
     let mut open_verdict = None;
     let mut reservation_id = None;
     for scenario in campaign.evaluation_scenarios() {
@@ -793,6 +798,8 @@ where
                 campaign.open.gauges.len(),
             )?;
             if !verdict.proposable {
+                let (baseline_definition, candidate_definition) =
+                    definitions.ok_or("Agent improve campaign has no evaluated definitions")?;
                 return Ok(SelectedCampaign {
                     target_id: target_id.to_owned(),
                     reference: campaign.reference.clone(),
@@ -801,6 +808,9 @@ where
                     verdict,
                     sealed_available: campaign.private.sealed_scenarios.len(),
                     reservation_id,
+                    lineage: lineage.ok_or("Agent improve campaign has no evaluated lineage")?,
+                    baseline_definition,
+                    candidate_definition,
                 });
             }
             open_verdict = Some(verdict);
@@ -829,26 +839,36 @@ where
                 "Agent improve scenario evidence differs from the pinned campaign".to_owned(),
             );
         }
-        let this_lineage = (
-            evidence.baseline_main_cut().unwrap_or("").to_owned(),
-            evidence.baseline_definition_ref().to_owned(),
-            evidence.candidate_definition_ref().to_owned(),
-            evidence.baseline().package_ref().to_owned(),
-            evidence.candidate().package_ref().to_owned(),
-            evidence.baseline().discipline_ref().to_owned(),
-            evidence.candidate().discipline_ref().to_owned(),
-        );
-        if this_lineage.0.is_empty()
+        let this_lineage = CampaignLineage {
+            baseline_main_cut: evidence.baseline_main_cut().unwrap_or("").to_owned(),
+            baseline_definition_ref: evidence.baseline_definition_ref().to_owned(),
+            candidate_definition_ref: evidence.candidate_definition_ref().to_owned(),
+            baseline_package_ref: evidence.baseline().package_ref().to_owned(),
+            candidate_package_ref: evidence.candidate().package_ref().to_owned(),
+            baseline_discipline_ref: evidence.baseline().discipline_ref().to_owned(),
+            candidate_discipline_ref: evidence.candidate().discipline_ref().to_owned(),
+        };
+        let this_definitions = prepared.evaluated_definitions(evidence)?;
+        if this_lineage.baseline_main_cut.is_empty()
             || lineage
                 .as_ref()
                 .is_some_and(|expected| expected != &this_lineage)
+            || definitions
+                .as_ref()
+                .is_some_and(|expected| expected != &this_definitions)
         {
             return Err(
                 "Agent improve campaign mixed authoring cuts or package definitions".to_owned(),
             );
         }
         lineage = Some(this_lineage);
-        for gauge in selected.gauges() {
+        definitions = Some(this_definitions);
+        let evaluated = EvaluatedScenario {
+            id: scenario.id.to_owned(),
+            exposure: scenario.exposure,
+            readings: selected.gauges().to_vec(),
+        };
+        for gauge in &evaluated.readings {
             let entry = readings
                 .entry(gauge.name.clone())
                 .or_insert_with(|| GaugeEvidence {
@@ -870,12 +890,7 @@ where
             entry.baseline.push(gauge.baseline[0].clone());
             entry.candidate.push(gauge.candidate[0].clone());
         }
-        scenarios.push(EvaluatedScenario {
-            id: scenario.id.to_owned(),
-            exposure: scenario.exposure,
-            prepared,
-            selected,
-        });
+        scenarios.push(evaluated);
     }
     let verdict = aggregate_verdict(
         &readings,
@@ -883,6 +898,8 @@ where
         scenarios.len(),
         campaign.open.gauges.len(),
     )?;
+    let (baseline_definition, candidate_definition) =
+        definitions.ok_or("Agent improve campaign has no evaluated definitions")?;
     Ok(SelectedCampaign {
         target_id: target_id.to_owned(),
         reference: campaign.reference.clone(),
@@ -891,6 +908,9 @@ where
         verdict,
         sealed_available: campaign.private.sealed_scenarios.len(),
         reservation_id,
+        lineage: lineage.ok_or("Agent improve campaign has no evaluated lineage")?,
+        baseline_definition,
+        candidate_definition,
     })
 }
 
@@ -924,9 +944,8 @@ fn same_bar(a: Option<&Bar>, b: Option<&Bar>) -> bool {
     }
 }
 
-/// Adopt only an aggregate winner. The first pair's exact Main-cut fence is
-/// sufficient because every evaluated scenario was checked against that same
-/// baseline/candidate lineage before the aggregate verdict was made.
+/// Adopt only an aggregate winner. Every evaluated scenario was checked
+/// against one exact Main, definition, package, and discipline lineage.
 pub fn adopt_selected_campaign(
     workspace: &dyn Workspace,
     selected: &SelectedCampaign,
@@ -934,11 +953,14 @@ pub fn adopt_selected_campaign(
     if !selected.verdict.proposable {
         return Err("regularized campaign did not propose this Agent candidate".to_owned());
     }
-    let first = selected
-        .scenarios
-        .first()
-        .ok_or("Agent improve campaign has no evaluated scenarios")?;
-    adopt_evaluated_candidate(workspace, &first.prepared, first.selected.evidence())
+    adopt_candidate(
+        workspace,
+        &selected.lineage.baseline_main_cut,
+        &selected.baseline_definition,
+        &selected.candidate_definition,
+        &selected.lineage.candidate_package_ref,
+        &selected.lineage.candidate_discipline_ref,
+    )
 }
 
 impl CampaignSnapshot {
@@ -1382,7 +1404,7 @@ mod tests {
     struct HostedFakeFactory;
 
     #[derive(Default)]
-    struct RecordingPairAdmission(Mutex<Vec<String>>);
+    struct RecordingPairAdmission(Mutex<Vec<String>>, Mutex<Vec<String>>);
 
     impl HostedImprovePairAdmission for RecordingPairAdmission {
         fn with_pair(
@@ -1415,6 +1437,10 @@ mod tests {
             if baseline == candidate {
                 return Err("hosted arms reused a placement".to_owned());
             }
+            self.1
+                .lock()
+                .unwrap()
+                .extend([baseline.to_owned(), candidate.to_owned()]);
             self.0.lock().unwrap().push("admit".to_owned());
             let result = run();
             self.0.lock().unwrap().push(if result.is_ok() {
@@ -1598,23 +1624,9 @@ mod tests {
             *pair_admission.0.lock().unwrap(),
             ["admit", "complete", "admit", "complete"]
         );
-        let placements = selected
-            .scenarios
+        let placement_rows = pair_admission.1.lock().unwrap();
+        let placements = placement_rows
             .iter()
-            .flat_map(|scenario| {
-                [
-                    scenario
-                        .prepared
-                        .baseline_spec()
-                        .runtime_placement_id
-                        .as_deref(),
-                    scenario
-                        .prepared
-                        .candidate_spec()
-                        .runtime_placement_id
-                        .as_deref(),
-                ]
-            })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(placements.len(), selected.scenarios.len() * 2);
         let guard = workbench.lock_unpoisoned();

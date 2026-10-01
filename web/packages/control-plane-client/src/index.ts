@@ -45,3 +45,4 @@ export * from "./product-analytics";
 export * from "./native-file-actions";
 export * from "./native-file-save-journal";
 export * from "./native-file-save-session";
+export * from "./panel-profile-wire";

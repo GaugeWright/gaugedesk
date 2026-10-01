@@ -4124,7 +4124,7 @@ async fn publishing_a_panel_agent_freezes_the_complete_profile() {
     )
     .await;
     let mut profile: serde_json::Value = serde_json::from_str(&profile_body).unwrap();
-    profile["provider"]["model"] = serde_json::json!("previewed-model");
+    profile["model"]["pinned"] = serde_json::json!("previewed-model");
     let (status, body) = send(
         &app,
         "PUT",
@@ -4145,7 +4145,7 @@ async fn publishing_a_panel_agent_freezes_the_complete_profile() {
         .as_u64()
         .unwrap();
 
-    profile["provider"]["model"] = serde_json::json!("later-draft-model");
+    profile["model"]["pinned"] = serde_json::json!("later-draft-model");
     let (status, body) = send(
         &app,
         "PUT",
@@ -4158,17 +4158,24 @@ async fn publishing_a_panel_agent_freezes_the_complete_profile() {
     let guard = wb.lock_unpoisoned();
     let agent = &guard.library.agents[&agent_id];
     assert_eq!(
-        agent.panel_profile.as_ref().unwrap().provider.model,
-        "later-draft-model"
+        agent
+            .panel_profile
+            .as_ref()
+            .unwrap()
+            .model
+            .pinned
+            .as_deref(),
+        Some("later-draft-model")
     );
     assert_eq!(
         agent.versions[&version]
             .panel_profile
             .as_ref()
             .unwrap()
-            .provider
-            .model,
-        "previewed-model",
+            .model
+            .pinned
+            .as_deref(),
+        Some("previewed-model"),
     );
 }
 
@@ -7925,4 +7932,201 @@ async fn settle_a_target_name_conflict(keep: &str, settled: &str) {
     assert_eq!(guard.library.work_targets[&target_id].name, settled);
     assert_eq!(guard.chat_target_name(&chats[1], &target_id), settled);
     assert!(guard.target_name_disagreements(&chats[1]).is_empty());
+}
+
+/// A Panel agent is tried as a disposable work chat (DR-0272 §3): an ordinary
+/// work chat running a snapshot of the draft, narrowed to the public
+/// abilities, in a project nobody sees — and ending the chat ends all of it.
+#[tokio::test]
+async fn a_panel_preview_is_a_hidden_work_chat_that_ends_with_its_chat() {
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/archetypes",
+        Some(r#"{"name":"Intake","kind":"panel"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let agent_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_, before) = send(&app, "GET", "/workspace", None).await;
+    let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{agent_id}/preview"),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let chat_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    {
+        let guard = wb.lock_unpoisoned();
+        let chat = &guard.library.chats[&chat_id];
+        let placement = &guard.library.instances[&chat.instance_id];
+        assert_eq!(placement.kind, crate::library::InstanceKind::Using);
+        assert_eq!(
+            placement.placement_kind,
+            crate::library::PlacementKind::Work
+        );
+        let preview_agent = &guard.library.agents[&placement.agent_id];
+        assert_eq!(preview_agent.agent_kind, crate::library::AgentKind::Work);
+        assert!(crate::panel_preview::is_panel_preview_agent(preview_agent));
+        assert!(guard.is_panel_preview_project_id(placement.project_id.as_deref().unwrap()));
+        // A default Panel agent offers visitors no abilities, so neither does
+        // its preview.
+        assert!(guard
+            .placement_abilities(&chat.instance_id)
+            .unwrap()
+            .is_empty());
+        assert!(guard.package_selection_for_chat(&chat_id).is_some());
+        assert!(guard.library.public_deployments.is_empty());
+    }
+
+    let (_, after) = send(&app, "GET", "/workspace", None).await;
+    let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(after["projects"], before["projects"], "no project appears");
+    assert_eq!(
+        after["recent"].as_array().unwrap().len(),
+        before["recent"].as_array().unwrap().len(),
+        "the preview chat is not a recent work chat",
+    );
+    assert_eq!(
+        after["archetypes"].as_array().unwrap().len(),
+        before["archetypes"].as_array().unwrap().len(),
+        "the preview's Agent is not listed as an Agent",
+    );
+    let panel = after["archetypes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["id"] == agent_id.as_str())
+        .unwrap();
+    assert_eq!(panel["previews"][0]["chat_id"], chat_id.as_str());
+    assert_eq!(panel["previews"][0]["chat"]["id"], chat_id.as_str());
+
+    // Trying the draft again replaces the preview rather than adding one.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{agent_id}/preview"),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let second = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(wb.lock_unpoisoned().panel_previews_of(&agent_id).len(), 1);
+    assert!(!wb.lock_unpoisoned().library.chats.contains_key(&chat_id));
+
+    let (status, body) = send(&app, "DELETE", &format!("/chats/{second}"), None).await;
+    assert!(status.is_success(), "{status} {body}");
+    let guard = wb.lock_unpoisoned();
+    assert!(guard.panel_previews_of(&agent_id).is_empty());
+    assert!(!guard
+        .library
+        .projects
+        .values()
+        .any(crate::panel_preview::is_panel_preview_project));
+    assert!(!guard
+        .library
+        .agents
+        .values()
+        .any(crate::panel_preview::is_panel_preview_agent));
+}
+
+/// Ordinary Agents are not tried this way, and a Panel agent's previews end
+/// with it instead of holding it bound.
+#[tokio::test]
+async fn a_panel_preview_is_refused_for_an_agent_and_ends_with_its_panel_agent() {
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{}/preview", crate::DEFAULT_AGENT),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/archetypes",
+        Some(r#"{"name":"Short-lived","kind":"panel"}"#),
+    )
+    .await;
+    let agent_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{agent_id}/preview"),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(&app, "DELETE", &format!("/archetypes/{agent_id}"), None).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert!(!wb
+        .lock_unpoisoned()
+        .library
+        .projects
+        .values()
+        .any(crate::panel_preview::is_panel_preview_project));
+}
+
+/// A project placement's preview runs its pinned version, not a later draft,
+/// and the chat's package is the committed snapshot the engine will load.
+#[tokio::test]
+async fn a_version_preview_runs_the_pinned_version_with_its_public_abilities() {
+    let (dir, wb) = seeded_workbench();
+    let mut profile = crate::library::PanelPublicProfile::default();
+    profile.panels.components.insert("gw-files".to_owned());
+    wb.lock_unpoisoned()
+        .seed_panel_placement("inst-pinned", profile)
+        .unwrap();
+    // A seeded placement's authoring target opens when the Home does.
+    drop(wb);
+    let wb = open_workbench(dir.path()).unwrap();
+    let agent_id = "inst-pinned-agent";
+    let chat = wb
+        .lock_unpoisoned()
+        .start_panel_preview_chat(agent_id, Some("inst-pinned"))
+        .unwrap();
+    let chat_id = chat["id"].as_str().unwrap().to_owned();
+    let guard = wb.lock_unpoisoned();
+    let previews = guard.panel_previews_of(agent_id);
+    assert_eq!(previews.len(), 1);
+    assert_eq!(previews[0].placement_id.as_deref(), Some("inst-pinned"));
+    assert_eq!(previews[0].version, Some(1));
+    let (version, package_ref) = guard.package_selection_for_chat(&chat_id).unwrap();
+    let root = guard.package_root_for_chat(&chat_id, version).unwrap();
+    let package = gaugedesk_whip_runtime::AuthoredAgentPackage::load(&root).unwrap();
+    assert_eq!(package.version_ref(), package_ref);
+    assert!(package.agent_abilities().is_empty());
+    // A draft preview of the same agent is a separate preview.
+    drop(guard);
+    wb.lock_unpoisoned()
+        .start_panel_preview_chat(agent_id, None)
+        .unwrap();
+    assert_eq!(wb.lock_unpoisoned().panel_previews_of(agent_id).len(), 2);
+    // Live previews survive a restart: startup validation accepts them.
+    drop(wb);
+    let wb = open_workbench(dir.path()).unwrap();
+    assert_eq!(wb.lock_unpoisoned().panel_previews_of(agent_id).len(), 2);
 }

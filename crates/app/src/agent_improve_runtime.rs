@@ -16,6 +16,9 @@ use crate::agent_improve_campaign::{
     CampaignSnapshot, HostedCampaignExecution, ManagedCampaignFunding, NativeCampaignGate,
     OptimizerFeedback,
 };
+use crate::agent_improve_checkpoint::{
+    HostedImproveInputCut, HostedImproveInputKey, HostedImprovePreparedCut,
+};
 use crate::agent_improve_custody::{desktop_improve_actor, desktop_improve_bearer};
 use crate::agent_improve_evidence::AgentImproveEvidenceRecord;
 use crate::engine::{
@@ -35,6 +38,8 @@ pub struct NativeImproveResult {
 struct NativeImprovePrepared {
     _scratch: tempfile::TempDir,
     agent_id: String,
+    edit_chat_id: String,
+    operation_id: Option<String>,
     target_id: String,
     target_root: PathBuf,
     candidate_repo: PathBuf,
@@ -52,7 +57,20 @@ enum ImproveExecution {
     Hosted(Box<HostedImproveAdmission>),
 }
 
+struct HostedRecovery<'a> {
+    agent_id: &'a str,
+    edit_chat_id: &'a str,
+    campaign_ref: &'a str,
+    actor: &'a str,
+    admission: &'a HostedImproveAdmission,
+    target_id: &'a str,
+    expected_main_cut: &'a str,
+    cut: HostedImprovePreparedCut,
+}
+
+#[derive(Clone)]
 pub struct HostedImproveAdmission {
+    pub operation_id: String,
     pub tenant_scope: String,
     pub funding_authority: crate::managed_funding::FundingAuthority,
     pub factory: gaugedesk_whip_runtime::WhipHarnessFactory,
@@ -143,6 +161,53 @@ impl NativeImprovePrepared {
         actor: Option<&str>,
         execution: ImproveExecution,
     ) -> Result<Self, String> {
+        if let ImproveExecution::Hosted(admission) = &execution {
+            let actor = actor.ok_or("Hosted Agent improve has no source-owner actor")?;
+            let recovered = {
+                let guard = wb.lock_unpoisoned();
+                guard.verify_agent_improve_source_owner(agent_id, Some(actor))?;
+                let target_id = guard.improve_authoring_target(agent_id)?;
+                let main = guard
+                    .targets
+                    .get(&target_id)
+                    .ok_or("Agent improve authoring target is unavailable")?
+                    .current_main_cut()
+                    .map_err(|error| error.to_string())?
+                    .ok_or("Agent improve authoring Main cut is missing")?;
+                let key = HostedImproveInputKey {
+                    operation_id: &admission.operation_id,
+                    actor,
+                    tenant_id: &admission.tenant_scope,
+                    agent_id,
+                    edit_chat_id,
+                    campaign_ref,
+                    target_id: &target_id,
+                    target_main_basis: &main,
+                };
+                if guard.hosted_improve_input_cut(&key)?.is_some() {
+                    guard
+                        .hosted_improve_prepared_cut(&key)?
+                        .map(|cut| (target_id, main, cut))
+                } else {
+                    None
+                }
+            };
+            if let Some((target_id, main, cut)) = recovered {
+                return Self::recover_hosted(
+                    wb,
+                    HostedRecovery {
+                        agent_id,
+                        edit_chat_id,
+                        campaign_ref,
+                        actor,
+                        admission,
+                        target_id: &target_id,
+                        expected_main_cut: &main,
+                        cut,
+                    },
+                );
+            }
+        }
         let (
             target_id,
             target_root,
@@ -151,6 +216,7 @@ impl NativeImprovePrepared {
             baseline,
             campaign,
             config,
+            config_json,
             actor_name,
             provider,
             model,
@@ -206,9 +272,8 @@ impl NativeImprovePrepared {
                 .ok_or("Agent improve authoring Main cut is missing")?;
             let baseline = AgentDefinitionSnapshot::from_main(workspace.as_ref())?;
             let campaign = guard.load_agent_improve_campaign(agent_id, campaign_ref)?;
-            let config =
-                AgentConfig::from_json(&guard.effective_agent_config_for_chat(edit_chat_id)?)
-                    .unwrap_or_default();
+            let config_json = guard.effective_agent_config_for_chat(edit_chat_id)?;
+            let config = AgentConfig::from_json(&config_json).unwrap_or_default();
             let actor_name = actor
                 .map(str::to_owned)
                 .unwrap_or_else(|| guard.authority().as_str().to_owned());
@@ -291,6 +356,7 @@ impl NativeImprovePrepared {
                 baseline,
                 campaign,
                 config,
+                config_json,
                 actor_name,
                 provider,
                 model,
@@ -312,6 +378,13 @@ impl NativeImprovePrepared {
         let pair_admission = match &execution {
             ImproveExecution::Native => None,
             ImproveExecution::Hosted(admission) => Some(Arc::clone(&admission.pair_admission)),
+        };
+        let hosted_checkpoint = match &execution {
+            ImproveExecution::Native => None,
+            ImproveExecution::Hosted(admission) => Some((
+                admission.operation_id.clone(),
+                admission.tenant_scope.clone(),
+            )),
         };
         let funding = match execution {
             ImproveExecution::Native => {
@@ -442,7 +515,36 @@ impl NativeImprovePrepared {
                 base_url_override,
             )
         };
-        let candidate = AgentDefinitionSnapshot::capture(&candidate_path)?;
+        let (baseline, candidate) = if let Some((operation_id, tenant_id)) = &hosted_checkpoint {
+            let key = HostedImproveInputKey {
+                operation_id,
+                actor: &actor_name,
+                tenant_id,
+                agent_id,
+                edit_chat_id,
+                campaign_ref,
+                target_id: &target_id,
+                target_main_basis: &expected_main_cut,
+            };
+            let existing = wb.lock_unpoisoned().hosted_improve_input_cut(&key)?;
+            if let Some(cut) = existing {
+                if cut.baseline.identity != baseline.identity {
+                    return Err("hosted improve Main bytes differ from the retained cut".to_owned());
+                }
+                (cut.baseline, cut.candidate)
+            } else {
+                let candidate = AgentDefinitionSnapshot::capture(&candidate_path)?;
+                let cut = HostedImproveInputCut {
+                    baseline: baseline.clone(),
+                    candidate,
+                };
+                wb.lock_unpoisoned()
+                    .retain_hosted_improve_input_cut(&key, &cut)?;
+                (cut.baseline, cut.candidate)
+            }
+        } else {
+            (baseline, AgentDefinitionSnapshot::capture(&candidate_path)?)
+        };
         if baseline.changed_paths(&candidate).is_empty() {
             return Err(
                 "Change this Agent's authored files in the edit chat before evaluating".to_owned(),
@@ -459,10 +561,9 @@ impl NativeImprovePrepared {
         .map_err(|error| error.to_string())?;
         let template_root = scratch.path().join("template");
         std::fs::create_dir(&template_root).map_err(|error| error.to_string())?;
-        let posture = egress_posture(
-            isolated,
-            gaugedesk_env::var("ALLOW_UNFILTERED_EGRESS").as_deref() == Some("1"),
-        );
+        let allow_unfiltered_egress =
+            gaugedesk_env::var("ALLOW_UNFILTERED_EGRESS").as_deref() == Some("1");
+        let posture = egress_posture(isolated, allow_unfiltered_egress);
         let hosts = if funding.is_some() || provider == "openai-generic" {
             vec![endpoint_host]
         } else {
@@ -501,7 +602,7 @@ impl NativeImprovePrepared {
             guard.compile_whipple_policy(PolicyCompilationInput {
                 chat_id: chat_id.clone(),
                 project_id: None,
-                actor: actor_name,
+                actor: actor_name.clone(),
                 actor_attributes,
                 org_policy,
                 turn_purpose: None,
@@ -542,9 +643,79 @@ impl NativeImprovePrepared {
             sandbox,
             roster,
         };
+        if let Some((operation_id, tenant_id)) = &hosted_checkpoint {
+            let key = HostedImproveInputKey {
+                operation_id,
+                actor: &actor_name,
+                tenant_id,
+                agent_id,
+                edit_chat_id,
+                campaign_ref,
+                target_id: &target_id,
+                target_main_basis: &expected_main_cut,
+            };
+            let funding = funding
+                .as_ref()
+                .ok_or("hosted improve prepared cut has no funding")?;
+            let (baseline_package_ref, baseline_discipline_ref) = baseline.package_refs()?;
+            let (candidate_package_ref, candidate_discipline_ref) = candidate.package_refs()?;
+            let cut = HostedImprovePreparedCut {
+                baseline_ref: baseline.identity.clone(),
+                candidate_ref: candidate.identity.clone(),
+                baseline_package_ref,
+                candidate_package_ref,
+                baseline_discipline_ref,
+                candidate_discipline_ref,
+                config_json,
+                isolated,
+                allow_unfiltered_egress,
+                chat_id: template.chat_id.clone(),
+                placement_id: template
+                    .runtime_placement_id
+                    .clone()
+                    .ok_or("hosted improve prepared cut has no placement")?,
+                policy_epoch: template
+                    .policy_epoch
+                    .ok_or("hosted improve prepared cut has no policy epoch")?,
+                signed_policy_envelope: template
+                    .signed_policy_envelope
+                    .clone()
+                    .ok_or("hosted improve prepared cut has no signed policy")?,
+                provider_binding_ref: template
+                    .provider_binding_ref
+                    .clone()
+                    .ok_or("hosted improve prepared cut has no provider binding")?,
+                credential_ref: template
+                    .credential_ref
+                    .clone()
+                    .ok_or("hosted improve prepared cut has no credential reference")?,
+                placement_ceiling_ref: template
+                    .placement_ceiling_ref
+                    .clone()
+                    .ok_or("hosted improve prepared cut has no placement ceiling")?,
+                provider: template
+                    .provider
+                    .clone()
+                    .ok_or("hosted improve prepared cut has no provider")?,
+                model: template
+                    .model
+                    .clone()
+                    .ok_or("hosted improve prepared cut has no model")?,
+                base_url: template.base_url.clone(),
+                thinking: template.thinking.clone(),
+                roster: template.roster.clone(),
+                account_scope: funding.account_scope.clone(),
+                billing_scope: funding.billing_scope.clone(),
+                funding_ref: funding.funding_ref.clone(),
+            };
+            wb.lock_unpoisoned()
+                .retain_hosted_improve_prepared_cut(&key, &cut)?;
+        }
         Ok(Self {
             _scratch: scratch,
             agent_id: agent_id.to_owned(),
+            edit_chat_id: edit_chat_id.to_owned(),
+            operation_id: hosted_checkpoint.map(|(operation_id, _)| operation_id),
             target_id,
             target_root,
             candidate_repo,
@@ -558,6 +729,169 @@ impl NativeImprovePrepared {
         })
     }
 
+    fn recover_hosted(wb: &SharedWorkbench, recovery: HostedRecovery<'_>) -> Result<Self, String> {
+        let HostedRecovery {
+            agent_id,
+            edit_chat_id,
+            campaign_ref,
+            actor,
+            admission,
+            target_id,
+            expected_main_cut,
+            cut,
+        } = recovery;
+        if admission.factory.kind() != "whip-do"
+            || !admission.factory.has_injected_do_transport()
+            || admission.factory.do_tenant_id() != Some(admission.tenant_scope.as_str())
+            || cut.provider != crate::managed_inference::METERED_GATEWAY_PROVIDER
+        {
+            return Err("hosted Agent improve needs the metered WhippleScript DO placement".into());
+        }
+        let key = HostedImproveInputKey {
+            operation_id: &admission.operation_id,
+            actor,
+            tenant_id: &admission.tenant_scope,
+            agent_id,
+            edit_chat_id,
+            campaign_ref,
+            target_id,
+            target_main_basis: expected_main_cut,
+        };
+        let (input, campaign, target_root, funding) = {
+            let guard = wb.lock_unpoisoned();
+            let input = guard
+                .hosted_improve_input_cut(&key)?
+                .ok_or("hosted improve has no retained input cut")?;
+            let campaign = guard.load_agent_improve_campaign(agent_id, campaign_ref)?;
+            if guard.effective_agent_config_for_chat(edit_chat_id)? != cut.config_json
+                || guard.chat_network_isolated(edit_chat_id) != cut.isolated
+                || (gaugedesk_env::var("ALLOW_UNFILTERED_EGRESS").as_deref() == Some("1"))
+                    != cut.allow_unfiltered_egress
+            {
+                return Err("hosted improve runtime settings changed after preparation".into());
+            }
+            let account_scope = guard.account_scope_for_actor(actor);
+            if account_scope != cut.account_scope {
+                return Err("hosted improve account scope changed after preparation".into());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_secs();
+            let grant = crate::managed_funding::resolve_plan(
+                guard.store_ref(),
+                &gaugedesk_core::ids::ScopeId::new(&account_scope),
+                &gaugedesk_core::ids::ScopeId::new(&admission.tenant_scope),
+                &admission.funding_authority.context(now),
+            )
+            .map_err(|error| format!("{error:?}"))?
+            .map_err(|denial| format!("Hosted Agent improve funding refused: {denial:?}"))?;
+            if grant.reference() != cut.funding_ref
+                || grant.evidence().scope.as_str() != cut.billing_scope
+            {
+                return Err("hosted improve funding changed after preparation".into());
+            }
+            let funding = ManagedCampaignFunding {
+                account_scope,
+                tenant_scope: admission.tenant_scope.clone(),
+                billing_scope: cut.billing_scope.clone(),
+                funding_ref: cut.funding_ref.clone(),
+                provider: cut.provider.clone(),
+                funding_authority: admission.funding_authority.clone(),
+            };
+            (
+                input,
+                campaign,
+                guard.targets_dir().join(target_id),
+                funding,
+            )
+        };
+        if input.baseline.identity != cut.baseline_ref
+            || input.candidate.identity != cut.candidate_ref
+        {
+            return Err("hosted improve prepared cut differs from its input".into());
+        }
+        let baseline_refs = input.baseline.package_refs()?;
+        let candidate_refs = input.candidate.package_refs()?;
+        if baseline_refs
+            != (
+                cut.baseline_package_ref.clone(),
+                cut.baseline_discipline_ref.clone(),
+            )
+            || candidate_refs
+                != (
+                    cut.candidate_package_ref.clone(),
+                    cut.candidate_discipline_ref.clone(),
+                )
+        {
+            return Err("hosted improve package bytes changed after preparation".into());
+        }
+        let route = crate::managed_inference::hosted_metered_route(&cut.model);
+        if route.model != cut.model || Some(route.base_url) != cut.base_url {
+            return Err("hosted improve model route changed after preparation".into());
+        }
+        let config = AgentConfig::from_json(&cut.config_json)
+            .map_err(|_| "hosted improve prepared config is invalid")?;
+        let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let candidate_repo = scratch.path().join("candidate");
+        input.candidate.materialize(&candidate_repo)?;
+        let template_root = scratch.path().join("template");
+        std::fs::create_dir(&template_root).map_err(|error| error.to_string())?;
+        let mut read_only = method_surface_readonly_roots(&template_root, ChatMode::Use);
+        read_only.extend([
+            template_root.join(".whipple"),
+            template_root.join(".gaugedesk-runtime"),
+        ]);
+        read_only.sort();
+        read_only.dedup();
+        let sandbox = gaugedesk_harness::sandbox::SandboxPolicy::new(vec![template_root.clone()])
+            .read_only(read_only);
+        let hosts = vec!["gateway.ai.cloudflare.com".to_owned()];
+        let sandbox = match egress_posture(cut.isolated, cut.allow_unfiltered_egress) {
+            Network::Filtered => sandbox.filter_egress(hosts),
+            Network::Allow => sandbox.allow_hosts(hosts).allow_unfiltered_egress(true),
+            Network::Deny => sandbox.allow_hosts(hosts),
+        };
+        let template = HarnessSpec {
+            chat_id: cut.chat_id,
+            worktree: template_root,
+            mode: ChatMode::Use,
+            package_root: None,
+            package_version_ref: None,
+            policy_epoch: Some(cut.policy_epoch),
+            signed_policy_envelope: Some(cut.signed_policy_envelope),
+            provider_binding_ref: Some(cut.provider_binding_ref),
+            credential_ref: Some(cut.credential_ref),
+            placement_ceiling_ref: Some(cut.placement_ceiling_ref),
+            workspace_targets: Vec::new(),
+            runtime_placement_id: Some(cut.placement_id),
+            provider: Some(cut.provider),
+            model: Some(cut.model),
+            base_url: cut.base_url,
+            thinking: cut.thinking,
+            system_prompt: None,
+            credential_capability: None,
+            sandbox,
+            roster: cut.roster,
+        };
+        Ok(Self {
+            _scratch: scratch,
+            agent_id: agent_id.to_owned(),
+            edit_chat_id: edit_chat_id.to_owned(),
+            operation_id: Some(admission.operation_id.clone()),
+            target_id: target_id.to_owned(),
+            target_root,
+            candidate_repo,
+            expected_main_cut: expected_main_cut.to_owned(),
+            campaign,
+            template,
+            factory: admission.factory.clone(),
+            pair_admission: Some(Arc::clone(&admission.pair_admission)),
+            gate: MembraneGate::new(&config, default_external_tools()).with_mode(ChatMode::Use),
+            funding: Some(funding),
+        })
+    }
+
     fn run(self, wb: &SharedWorkbench, actor: Option<&str>) -> Result<NativeImproveResult, String> {
         let workspace = Instance::open_at(&self.target_root);
         if workspace
@@ -568,9 +902,33 @@ impl NativeImprovePrepared {
         {
             return Err("Agent draft changed before improvement evaluation".to_owned());
         }
+        let operation_id = self.operation_id.clone();
+        let tenant_scope = self
+            .funding
+            .as_ref()
+            .map(|funding| funding.tenant_scope.clone());
         let mut reserve = || {
-            wb.lock_unpoisoned()
-                .reserve_agent_improve_sealed_exposure(&self.agent_id, self.campaign.reference())
+            let mut guard = wb.lock_unpoisoned();
+            if let Some(operation_id) = operation_id.as_deref() {
+                let key = HostedImproveInputKey {
+                    operation_id,
+                    actor: actor.ok_or("Hosted Agent improve has no source-owner actor")?,
+                    tenant_id: tenant_scope
+                        .as_deref()
+                        .ok_or("Hosted Agent improve has no tenant")?,
+                    agent_id: &self.agent_id,
+                    edit_chat_id: &self.edit_chat_id,
+                    campaign_ref: self.campaign.reference(),
+                    target_id: &self.target_id,
+                    target_main_basis: &self.expected_main_cut,
+                };
+                guard.reserve_hosted_agent_improve_sealed_exposure(&key)
+            } else {
+                guard.reserve_agent_improve_sealed_exposure(
+                    &self.agent_id,
+                    self.campaign.reference(),
+                )
+            }
         };
         let selected = match self.funding {
             Some(funding) => run_hosted_managed_campaign_with_reservation(

@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -8,12 +8,12 @@ use crate::agent_release::{
     ControlDeploymentRequest, DeploymentFundingSelection, ErasePublicSessionRequest,
     ImportLegacyDeploymentRequest, InspectDeploymentRequest, ListPublicCredentialsRequest,
     ProvisionPublicCredentialRequest, PublishDeploymentRequest, RevokePublicCredentialRequest,
-    StartPanelPreviewRequest,
 };
 use crate::{LockUnpoisoned, SharedWorkbench};
 
 pub async fn publish_deployment(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(mut request): Json<PublishDeploymentRequest>,
 ) -> Response {
     let structured = request.funding.clone();
@@ -88,9 +88,9 @@ pub async fn publish_deployment(
         }
     }
     let result = tokio::task::spawn_blocking(move || {
-        workbench
-            .lock_unpoisoned()
-            .publish_agent_deployment(request)
+        let mut workbench = workbench.lock_unpoisoned();
+        request.work_chat_default_model = work_chat_default_model(&workbench, &headers);
+        workbench.publish_agent_deployment(request)
     })
     .await;
     match result {
@@ -113,6 +113,16 @@ pub async fn publish_deployment(
     }
 }
 
+/// The caller's work-chat default model, which an unpinned Panel version
+/// publishes with (DR-0272).
+fn work_chat_default_model(
+    workbench: &crate::Workbench,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    let scope = workbench.account_scope_for(crate::net_http::bearer(headers));
+    workbench.work_chat_default_model_in(&scope).1
+}
+
 /// Public half of the key used for every signed publisher command. Hosted
 /// account planes use this to mint an entitlement before the Home publishes;
 /// no private key or bearer crosses this route.
@@ -126,121 +136,6 @@ pub async fn publisher_authority(State(workbench): State<SharedWorkbench>) -> Re
             Json(json!({ "error": error.to_string() })),
         )
             .into_response(),
-    }
-}
-
-pub async fn start_panel_preview(
-    State(workbench): State<SharedWorkbench>,
-    Json(mut request): Json<StartPanelPreviewRequest>,
-) -> Response {
-    let structured = request.funding.clone();
-    if structured.is_some()
-        && (!request.funding_ref.trim().is_empty()
-            || !request.credential_ref.trim().is_empty()
-            || request.managed_tenant_id.is_some()
-            || request.funding_entitlement.is_some())
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "funding selection may not also carry legacy funding fields" })),
-        )
-            .into_response();
-    }
-    match structured {
-        Some(DeploymentFundingSelection::Byok { credential_ref }) => {
-            request.funding_ref = credential_ref.clone();
-            request.credential_ref = credential_ref;
-        }
-        Some(DeploymentFundingSelection::Managed {
-            tenant_id,
-            entitlement,
-        }) => {
-            request.managed_tenant_id = Some(tenant_id);
-            request.funding_entitlement = entitlement;
-            if let Some(entitlement) = &request.funding_entitlement {
-                request.funding_ref = entitlement.claims.funding_ref.clone();
-            }
-        }
-        None => {}
-    }
-    let managed_selection =
-        matches!(
-            request.funding,
-            Some(DeploymentFundingSelection::Managed { .. })
-        ) || crate::managed_inference::is_managed_funding_ref(&request.funding_ref);
-    if managed_selection && request.funding_entitlement.is_none() {
-        let Some(tenant) = request
-            .managed_tenant_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|tenant| !tenant.is_empty())
-            .map(str::to_owned)
-        else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "managed preview requires an authenticated tenant" })),
-            )
-                .into_response();
-        };
-        let publisher_key = match workbench.lock_unpoisoned().public_publisher_key() {
-            Ok(key) => key,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": error.to_string() })),
-                )
-                    .into_response()
-            }
-        };
-        match crate::account_signin::mint_managed_entitlement(&workbench, &tenant, &publisher_key)
-            .await
-        {
-            Ok(entitlement) => {
-                request.funding_ref = entitlement.claims.funding_ref.clone();
-                request.funding_entitlement = Some(entitlement);
-            }
-            Err((status, message)) => {
-                return (status, Json(json!({ "error": message }))).into_response()
-            }
-        }
-    }
-    let result = tokio::task::spawn_blocking(move || {
-        workbench.lock_unpoisoned().start_panel_preview(request)
-    })
-    .await;
-    match result {
-        Ok(Ok(preview)) => {
-            (StatusCode::CREATED, Json(json!({ "preview": preview }))).into_response()
-        }
-        Ok(Err(error)) => (
-            collection_status(&error),
-            Json(json!({ "error": error.to_string() })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "preview task failed" })),
-        )
-            .into_response(),
-    }
-}
-
-pub async fn stop_panel_preview(
-    State(workbench): State<SharedWorkbench>,
-    Path(preview_id): Path<String>,
-) -> Response {
-    let result = tokio::task::spawn_blocking(move || {
-        workbench.lock_unpoisoned().stop_panel_preview(&preview_id)
-    })
-    .await;
-    match result {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(error)) => (
-            collection_status(&error),
-            Json(json!({ "error": error.to_string() })),
-        )
-            .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

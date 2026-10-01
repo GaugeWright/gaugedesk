@@ -3307,3 +3307,10 @@ a.firstrun-connect { display: inline-block; text-align: center; text-decoration:
 .whip-runs .whip-runs-state { min-width: 90px; color: var(--ink); }
 .project-task-claim { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
 .project-task-facts select { font: inherit; background: var(--bg); color: var(--ink); border: 1px solid var(--edge); border-radius: 4px; padding: 2px 6px; }
+
+/* A Panel-agent preview chat's note beside the composer (DR-0272). */
+.composer-preview-note {
+    margin: 0 0 6px;
+    color: var(--muted);
+    font-size: var(--fs-small);
+}

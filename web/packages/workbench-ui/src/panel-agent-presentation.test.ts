@@ -20,15 +20,15 @@ import {
     formatCents,
     formatDuration,
     panelModelChoices,
-    PROVIDER_CHOICES,
     secondsFrom,
-    withProvider,
+    withPinnedModel,
+    WORK_CHAT_DEFAULT_MODEL,
 } from "./panel-agent-presentation";
 
 const PROFILE: PanelPublicProfile = {
     panels: { components: ["gw-chat", "gw-files"], default_component: "gw-chat", attribution: "gauge_wright" },
     public_abilities: ["workspace.read", "workspace.write"],
-    provider: { provider: "openai", model: "gpt-5-mini", base_url: "https://api.openai.com", credential_class: "openai-api-key" },
+    model: { pinned: "gpt-5-mini" },
     audience_inputs: ["text"],
     initial_workspace: [{ path: "welcome.md", media_type: "text/markdown", sha256: "0".repeat(64), bytes: [1, 2, 3] }],
     retention: { idle_ttl_seconds: 86_400, absolute_ttl_seconds: 2_592_000, transcript_retained: true, workspace_retained: false },
@@ -103,52 +103,34 @@ describe("collection paths", () => {
     });
 });
 
-describe("switching provider", () => {
-    it("carries the provider's own defaults with it", () => {
-        expect(withProvider(PROFILE.provider, "anthropic")).toEqual({
-            provider: "anthropic",
-            model: "claude-sonnet-4-6",
-            base_url: "https://api.anthropic.com",
-            credential_class: "anthropic-api-key",
-        });
-    });
-
-    it("leaves a base URL or credential class the owner set by hand", () => {
-        const custom = { ...PROFILE.provider, base_url: "https://gateway.example.com" };
-        const switched = withProvider(custom, "anthropic");
-        expect(switched.base_url).toBe("https://gateway.example.com");
-        expect(switched.credential_class).toBe("openai-api-key");
-    });
-});
-
 describe("choosing a model", () => {
-    const ids = (provider: string, current?: string) =>
-        panelModelChoices(provider, current).map((choice) => choice.value);
+    const ids = (current?: string) => panelModelChoices(current).map((choice) => choice.value);
 
-    it("offers every model the catalog lists for the provider", () => {
+    it("leads with the work-chat default, which pins nothing", () => {
+        expect(ids()[0]).toBe(WORK_CHAT_DEFAULT_MODEL);
+        expect(panelModelChoices()[0]!.name).toBe("Your work-chat default");
+    });
+
+    it("offers every model the catalog lists for the providers that can serve a deployment", () => {
         // Containment, not an exact list: the catalog grows, and this follows it.
-        expect(ids("openai")).toEqual(expect.arrayContaining([
-            "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro",
-            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        expect(ids()).toEqual(expect.arrayContaining([
+            "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.6-terra",
+            "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5",
         ]));
-        expect(ids("anthropic")).toContain("claude-opus-4-7");
-        expect(ids("anthropic")).toContain("claude-sonnet-4-6");
-        expect(ids("anthropic")).toContain("claude-haiku-4-5");
         // The moving alias stands for its date-pinned snapshot, as in the chat picker.
-        expect(ids("anthropic")).not.toContain("claude-haiku-4-5-20251001");
+        expect(ids()).not.toContain("claude-haiku-4-5-20251001");
     });
 
-    it("keeps a model the profile already names, even one the catalog lacks", () => {
-        const choices = ids("openai", "gpt-5-mini");
-        expect(choices).toContain("gpt-5-mini");
-        expect(choices).toContain("gpt-5.5");
-        expect(ids("openai", "gpt-5.5").filter((id) => id === "gpt-5.5")).toHaveLength(1);
+    it("keeps a model the profile already pins, even one the catalog lacks", () => {
+        expect(ids("gpt-5-mini")).toContain("gpt-5-mini");
+        expect(ids("gpt-5.5").filter((id) => id === "gpt-5.5")).toHaveLength(1);
     });
 
-    it("lands a provider switch on a model that provider offers", () => {
-        for (const choice of PROVIDER_CHOICES) {
-            expect(ids(choice.value)).toContain(choice.defaultModel);
-        }
+    it("pins and unpins without touching the token ceilings", () => {
+        const ceilinged = { ...PROFILE, model: { pinned: "gpt-5-mini", max_output_tokens: 2048 } };
+        expect(withPinnedModel(ceilinged, "claude-sonnet-4-6").model)
+            .toEqual({ pinned: "claude-sonnet-4-6", max_output_tokens: 2048 });
+        expect(withPinnedModel(ceilinged, WORK_CHAT_DEFAULT_MODEL).model).toEqual({ max_output_tokens: 2048 });
     });
 });
 
@@ -157,7 +139,7 @@ describe("the contract, read back", () => {
         expect(contractFacts(PROFILE)).toEqual([
             { label: "Visitors see", value: "Chat and Files" },
             { label: "The agent can", value: "read files, create and edit files" },
-            { label: "Model", value: "OpenAI · gpt-5-mini" },
+            { label: "Model", value: "gpt-5-mini" },
             { label: "Starting files", value: "welcome.md" },
             { label: "History", value: "Resumable for 1 day after the last message, deleted after at most 30 days; keeps the transcript" },
             { label: "Results", value: "Not collected" },

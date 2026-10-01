@@ -117,7 +117,7 @@ case "${1:-}" in
     node --test scripts/check-client-calls.test.mjs
     node scripts/check-client-calls.mjs ;;
   advisory-classification)
-    node --test scripts/npm-audit-outcome.test.mjs
+    node --test scripts/npm-audit-outcome.test.mjs scripts/prepare-npm-dependencies.test.mjs
     bash scripts/advisory-database.test.sh
     bash scripts/apt-install-action.test.sh ;;
   build-coverage)          node scripts/check-build-coverage.mjs ;;
@@ -223,11 +223,9 @@ case "${1:-}" in
     CARGO_TARGET_DIR="$PWD/target/no-default-features" \
         cargo check -p gaugedesk-app --no-default-features --all-targets ;;
   web)
-    # Fleet slots retain node_modules between revisions. Its presence does not
-    # prove the current lockfile was installed; a newly declared test dependency
-    # must be available before this section runs. Unchanged sections are spared
-    # by the action cache, not by reusing an unverified installed tree.
-    npm --prefix web ci
+    # Fleet slots retain node_modules. Reuse only a successful, input-matched
+    # installation with bounded package checks; directory presence is insufficient.
+    node scripts/prepare-npm-dependencies.mjs web
     # The browser tunnel (DESK-7, ADR 0130) is generated and gitignored, so a
     # fresh checkout has no module for the loader's dynamic import to resolve
     # and `vite build` fails outright — it cannot bundle an unresolvable
@@ -241,8 +239,8 @@ case "${1:-}" in
         && [ -f web/packages/control-plane-client/src/generated/tunnel.js ] \
         && [ -f web/packages/control-plane-client/src/generated/directory.js ]; } \
         || scripts/build-wasm.sh
-    npm --prefix ee/web ci
-    npm --prefix ee/sidecar/saml-verify ci
+    node scripts/prepare-npm-dependencies.mjs ee/web
+    node scripts/prepare-npm-dependencies.mjs ee/sidecar/saml-verify
 
     # Everything below reads the installed trees and the generated modules above
     # and writes only its own output — the vite builds each to their own

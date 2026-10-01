@@ -10390,6 +10390,13 @@
     },
     {
       "method": "POST",
+      "path": "/archetypes/{id}/preview",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
       "path": "/auth/account/consumer-signup/complete",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
@@ -10552,20 +10559,6 @@
     {
       "method": "POST",
       "path": "/organizations/{tenant}/shared-project/materialize",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "POST",
-      "path": "/panel-previews",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "DELETE",
-      "path": "/panel-previews/{id}",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

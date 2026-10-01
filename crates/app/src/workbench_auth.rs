@@ -59,7 +59,8 @@ impl ProjectVisibility {
 /// - a listing that filters itself to the caller's visible projects or to
 ///   what is addressed to the caller;
 /// - Home-wide data that is not project data: the member directory, health,
-///   identity;
+///   identity, and the Home's Isolated workspace policy, which every active
+///   member may read (gaugewright-cloud DR-0194);
 /// - starting the caller's own shipped tutorial project;
 /// - creating a project of their own.
 ///
@@ -80,6 +81,9 @@ pub(crate) fn scoped_member_may_reach(method: &axum::http::Method, path: &str) -
         || exact(&["/home/admissions", "/home/invitations/accept"])
         || path.starts_with("/tutorials/")
         || exact(&["/health", "/whoami"])
+        // The hosted composition's machine policy: Home-wide, readable by any
+        // member, settable only by the owner, who sees every project anyway.
+        || (get && path == "/machine/execution-policy")
         // Listings that filter to the caller's visible projects or to what
         // is addressed to the caller.
         || (get
@@ -2686,5 +2690,26 @@ mod staff_project_visibility_tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["hits"], serde_json::json!([]));
+    }
+}
+
+#[cfg(test)]
+mod scoped_member_route_tests {
+    use super::scoped_member_may_reach;
+    use axum::http::Method;
+
+    /// A scoped member reads the Home's Isolated workspace policy, which is not
+    /// project data, but cannot change it through this exemption (DR-0270).
+    #[test]
+    fn the_home_execution_policy_is_readable_but_not_writable_by_a_scoped_member() {
+        assert!(scoped_member_may_reach(
+            &Method::GET,
+            "/machine/execution-policy"
+        ));
+        assert!(!scoped_member_may_reach(
+            &Method::PUT,
+            "/machine/execution-policy"
+        ));
+        assert!(!scoped_member_may_reach(&Method::GET, "/machine/other"));
     }
 }

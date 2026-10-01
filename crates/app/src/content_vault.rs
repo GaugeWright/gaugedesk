@@ -58,6 +58,8 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     "agent_improve_campaign_source",
     "agent_improve_campaign_evidence",
     "agent_improve_selected_candidate",
+    "agent_improve_hosted_input",
+    "agent_improve_hosted_prepared",
     "agent_improve_sealed_exposure",
     // GaugeApp management conversations and their generation pointer. The
     // transcript has an independent per-thread key; the pointer lives under

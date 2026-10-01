@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-use gaugedesk_app::agent_release::{PublishDeploymentRequest, StartPanelPreviewRequest};
+use gaugedesk_app::agent_release::PublishDeploymentRequest;
 use gaugedesk_app::library::{
     DeploymentBindingStatus, InstanceRecord, PanelCollectionRecipient, PanelPublicProfile,
     PublicDeploymentBindingRecord, LIBRARY_SCOPE,
@@ -30,7 +30,7 @@ fn profile_with_panels(components: &[&str]) -> PanelPublicProfile {
 }
 
 fn publish_request(placement_id: &str) -> PublishDeploymentRequest {
-    serde_json::from_value(serde_json::json!({
+    let request = serde_json::from_value(serde_json::json!({
         "placement_id": placement_id,
         "deployment_id": "seedtest",
         // Unreachable on purpose: this asserts how far the publisher gets
@@ -46,8 +46,12 @@ fn publish_request(placement_id: &str) -> PublishDeploymentRequest {
         "retention_idle_ttl_seconds": 3_600,
         "retention_absolute_ttl_seconds": 86_400,
         "end_sessions": false,
-    }))
-    .expect("the request fixture matches the published contract")
+    }));
+    let mut request: PublishDeploymentRequest =
+        request.expect("the request fixture matches the published contract");
+    // What the route fills from the publisher's account (DR-0272).
+    request.work_chat_default_model = Some("gpt-5.5".to_owned());
+    request
 }
 
 #[derive(Default)]
@@ -116,6 +120,20 @@ fn publisher_edge() -> (String, Arc<Mutex<PublisherEdgeState>>) {
                         ),
                         _ => (404, serde_json::json!({ "error": "not found" })),
                     }
+                } else if method == "GET" && path == "/v1/public-credentials" {
+                    // The registry record an owner key funds a release from.
+                    (
+                        200,
+                        serde_json::json!({
+                            "credentials": [{
+                                "credential_ref": "credential:public:seedtest:openai:key",
+                                "provider": "openai",
+                                "credential_class": "openai-api-key",
+                                "label": "seed",
+                                "created_at_unix_ms": 0
+                            }]
+                        }),
+                    )
                 } else if method == "PUT" && path.starts_with("/v1/releases/") {
                     (200, serde_json::json!({ "stored": true }))
                 } else if (method == "PUT" || method == "POST")
@@ -486,13 +504,8 @@ fn the_session_cutover_instruction_reaches_both_edge_mutation_shapes() {
 fn an_account_service_signed_managed_entitlement_is_carried_to_the_edge_configuration() {
     let dir = tempfile::tempdir().unwrap();
     let workbench = open_workbench(dir.path()).unwrap();
-    let route = gaugedesk_app::managed_inference::metered_route("gpt-5.6-terra");
     let mut profile = PanelPublicProfile::default();
-    profile.provider.provider =
-        gaugedesk_app::managed_inference::METERED_GATEWAY_PROVIDER.to_owned();
-    profile.provider.model = route.model;
-    profile.provider.base_url = route.base_url;
-    profile.provider.credential_class = "managed-openai".to_owned();
+    profile.model.pinned = Some("gpt-5.6-terra".to_owned());
     workbench
         .lock_unpoisoned()
         .seed_panel_placement("inst-seeded", profile)
@@ -538,13 +551,8 @@ fn an_account_service_signed_managed_entitlement_is_carried_to_the_edge_configur
 fn an_unchanged_managed_release_update_reuses_the_admitted_funding_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let workbench = open_workbench(dir.path()).unwrap();
-    let route = gaugedesk_app::managed_inference::metered_route("gpt-5.6-terra");
     let mut profile = PanelPublicProfile::default();
-    profile.provider.provider =
-        gaugedesk_app::managed_inference::METERED_GATEWAY_PROVIDER.to_owned();
-    profile.provider.model = route.model;
-    profile.provider.base_url = route.base_url;
-    profile.provider.credential_class = "managed-openai".to_owned();
+    profile.model.pinned = Some("gpt-5.6-terra".to_owned());
     workbench
         .lock_unpoisoned()
         .seed_panel_placement("inst-seeded", profile)
@@ -598,58 +606,6 @@ fn an_unchanged_managed_release_update_reuses_the_admitted_funding_snapshot() {
         "the local binding advances only after hosted activation",
     );
 }
-
-#[test]
-fn a_disposable_preview_uses_the_public_edge_without_creating_a_project_binding() {
-    let dir = tempfile::tempdir().unwrap();
-    let workbench = open_workbench(dir.path()).unwrap();
-    workbench
-        .lock_unpoisoned()
-        .seed_panel_placement("inst-seeded", PanelPublicProfile::default())
-        .unwrap();
-    let (edge, state) = publisher_edge();
-    let request: StartPanelPreviewRequest = serde_json::from_value(serde_json::json!({
-        "agent_id": "inst-seeded-agent",
-        "edge_origin": edge,
-        "allowed_origin": "https://desk.example",
-        "funding_ref": "credential:public:preview:openai:key",
-        "credential_ref": "credential:public:preview:openai:key"
-    }))
-    .unwrap();
-    let outcome = workbench
-        .lock_unpoisoned()
-        .start_panel_preview(request)
-        .expect("the draft publishes to a bounded disposable deployment");
-    assert!(outcome.deployment_id.starts_with("panel-preview-"));
-    assert!(deployment_records(&workbench).is_empty());
-
-    {
-        let state = state.lock().unwrap();
-        let config = &state.mutation_bodies[0]["config"];
-        assert_eq!(config["max_concurrent_sessions"], 1);
-        assert_eq!(
-            config["allowed_origins"],
-            serde_json::json!(["https://desk.example"])
-        );
-        assert!(config["preview_expires_at_unix_ms"].as_u64().is_some());
-        assert!(config.get("collection").is_none());
-    }
-
-    workbench
-        .lock_unpoisoned()
-        .stop_panel_preview(&outcome.preview_id)
-        .expect("closing Preview revokes its hosted deployment");
-    let second_stop = workbench
-        .lock_unpoisoned()
-        .stop_panel_preview(&outcome.preview_id)
-        .expect_err("the in-memory handle was retired");
-    assert_eq!(second_stop.kind(), std::io::ErrorKind::NotFound);
-    assert_eq!(
-        state.lock().unwrap().mutation_bodies[1]["command"],
-        "revoke"
-    );
-}
-
 #[test]
 fn seeding_never_overwrites_what_is_already_there() {
     let dir = tempfile::tempdir().unwrap();
@@ -772,5 +728,43 @@ fn a_frozen_profile_survives_reopening_the_workbench() {
             .to_string()
             .contains("panel placement has no frozen public profile"),
         "the profile survived the reopen: {error}"
+    );
+}
+
+/// An owner key funds a release on its own provider: the class the edge
+/// registry records is what the release and its configuration agree on, and a
+/// key the registry does not hold is refused before anything is published
+/// (DR-0272).
+#[test]
+fn an_owner_key_funds_the_release_on_its_registered_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let workbench = open_workbench(dir.path()).unwrap();
+    workbench
+        .lock_unpoisoned()
+        .seed_panel_placement("inst-seeded", PanelPublicProfile::default())
+        .unwrap();
+    let (edge, state) = publisher_edge();
+
+    let mut unknown = publish_request("inst-seeded");
+    unknown.edge_origin = edge.clone();
+    unknown.funding_ref = "credential:public:seedtest:openai:absent".to_owned();
+    unknown.credential_ref = unknown.funding_ref.clone();
+    let error = workbench
+        .lock_unpoisoned()
+        .publish_agent_deployment(unknown)
+        .expect_err("an unregistered owner key funds nothing");
+    assert!(error.to_string().contains("is not stored on"), "{error}");
+    assert!(state.lock().unwrap().mutation_bodies.is_empty());
+
+    let mut request = publish_request("inst-seeded");
+    request.edge_origin = edge;
+    workbench
+        .lock_unpoisoned()
+        .publish_agent_deployment(request)
+        .unwrap();
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state.mutation_bodies[0]["config"]["credential_class"],
+        "openai-api-key"
     );
 }

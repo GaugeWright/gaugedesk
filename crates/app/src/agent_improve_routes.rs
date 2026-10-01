@@ -192,6 +192,10 @@ pub async fn evaluate(
     if !wb.lock_unpoisoned().hosted_home_mode() {
         return problem(StatusCode::SERVICE_UNAVAILABLE, "Hosted Home required");
     }
+    let operation_id = match crate::command_idempotency::caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
     let actor = context.actor().as_str().to_owned();
     let tenant_scope = crate::workbench_auth::req_scope(&headers);
     let result = tokio::task::spawn_blocking(move || {
@@ -202,6 +206,7 @@ pub async fn evaluate(
             &body.campaign_ref,
             &actor,
             crate::HostedImproveAdmission {
+                operation_id,
                 tenant_scope,
                 funding_authority: funding,
                 factory,

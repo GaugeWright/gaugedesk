@@ -140,7 +140,8 @@ fn install_binding(workbench: &SharedWorkbench, edge: &str, hosted_deployment_id
             allowed_origins: vec!["https://example.test".to_owned()],
             audience: DeploymentAudience::default(),
             funding_ref: "managed:plan".to_owned(),
-            credential_class: profile.provider.credential_class,
+            credential_class: gaugedesk_app::agent_release::MANAGED_PANEL_CREDENTIAL_CLASS
+                .to_owned(),
             credential_ref: String::new(),
             max_spend_cents: None,
             max_session_spend_cents: None,
