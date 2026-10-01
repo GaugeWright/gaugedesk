@@ -222,3 +222,54 @@ async fn an_admitted_call_is_served_as_the_owner() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(seen.lock_unpoisoned().as_deref(), Some("account-root"));
 }
+
+#[tokio::test]
+async fn same_account_sessions_coexist_and_revoke_independently() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    crate::account_signin::store_session_for_test(&wb);
+    crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+    let app = relay_control_plane(wb, Arc::new(Owner));
+    let bearer = [("authorization", "Bearer owner-bearer")];
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let (status, body) = send(&app, "POST", "/home/admissions", &bearer).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        tokens.push(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["admission"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    for token in &tokens {
+        let headers = [
+            ("authorization", "Bearer owner-bearer"),
+            (HOME_ADMISSION_HEADER, token.as_str()),
+        ];
+        assert_eq!(
+            send(&app, "GET", "/workspace", &headers).await.0,
+            StatusCode::OK
+        );
+    }
+    let first = [
+        ("authorization", "Bearer owner-bearer"),
+        (HOME_ADMISSION_HEADER, tokens[0].as_str()),
+    ];
+    assert_eq!(
+        send(&app, "DELETE", "/home/admissions", &first).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&app, "GET", "/workspace", &first).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let second = [
+        ("authorization", "Bearer owner-bearer"),
+        (HOME_ADMISSION_HEADER, tokens[1].as_str()),
+    ];
+    assert_eq!(
+        send(&app, "GET", "/workspace", &second).await.0,
+        StatusCode::OK
+    );
+}

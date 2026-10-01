@@ -19,6 +19,15 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-10-01
+
+- Multiple browser windows and devices can connect to one Home concurrently.
+  Each session retains independent admission; closing one leaves the others
+  connected. Relay failures identify the Home connection rather than blaming
+  the account service.
+
+- Hosted Agent improvement operation status now reports its own model token
+  usage and reservation settlement counts, including after a worker retry.
 - Chats expose the admitted folder names to the model, so a new file-writing
   turn can use the paths its tools accept. Provider failures retain their reason
   in the chat. Desktop publication now requires successful first and second

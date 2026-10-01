@@ -53,13 +53,9 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a Home's crossing may carry nothing before the Home ends it and
 /// parks a fresh leg.
 ///
-/// A route holds one pair, so a Home spliced to a client is unreachable to
-/// every other client until that crossing ends — and the Home cannot see its
-/// partner. The partner's keepalives are served by the relay's auto-response and
-/// never forwarded, and when the relay closes a silent partner it does not
-/// reliably close the Home's leg with it. On 2026-09-24 a Home stayed spliced to
-/// a browser that had gone, while desk's next attempt waited thirty seconds for
-/// a Home that was never going to park, and only a relaunch recovered it.
+/// Independent clients have separate crossings. Reclaiming an abandoned
+/// crossing still bounds resources when its peer stops sending carried data.
+/// Keepalives are served by the relay and do not count as work here.
 ///
 /// Carried bytes are the one signal that crosses the relay, so silence in both
 /// directions is what ends a crossing. The edge's own idle bound, because that
@@ -809,8 +805,16 @@ async fn park_home_leg(
         }
         Err(error) => return Err(error),
     };
-    let went_idle = broker.went_idle();
     parked();
+    carry_home_leg(broker, local_control_plane, acceptor).await
+}
+
+async fn carry_home_leg(
+    broker: WebSocketByteStream,
+    local_control_plane: SocketAddr,
+    acceptor: TlsAcceptor,
+) -> std::io::Result<()> {
+    let went_idle = broker.went_idle();
     let crossing = async {
         let mut tunnel = acceptor.accept(broker).await?;
         // A client that asked to multiplex carries all of its connections in
@@ -840,16 +844,8 @@ pub async fn serve_home_forever(
     local_control_plane: SocketAddr,
     identity: TlsIdentity,
 ) -> std::io::Result<()> {
-    let mut delay = Duration::from_millis(100);
-    loop {
-        match serve_home_once(&route, local_control_plane, &identity).await {
-            Ok(()) => delay = Duration::from_millis(100),
-            Err(_) => {
-                sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(10));
-            }
-        }
-    }
+    let (_sender, receiver) = tokio::sync::watch::channel(route);
+    serve_home_supervised(receiver, local_control_plane, identity, |_| {}).await
 }
 
 /// The availability loop over a **rotatable** locator (DESK-5b).
@@ -880,45 +876,69 @@ pub async fn serve_home_supervised(
     identity: TlsIdentity,
     mut report: impl FnMut(Result<u64, (u64, std::io::Error)>),
 ) -> std::io::Result<()> {
+    const MAX_CROSSINGS: usize = 16;
+    let acceptor = TlsAcceptor::from(Arc::new(identity.home_leg_server_config()?));
+    let mut crossings = tokio::task::JoinSet::new();
     let mut delay = Duration::from_millis(100);
-    // The reason the outage in progress was reported under, or `None` while the
-    // leg is parked. Both the "say it once" and the "say it again if the reason
-    // changed" halves read this.
     let mut reported: Option<String> = None;
     loop {
+        // Finished clients do not determine whether the availability leg is up.
+        while crossings.try_join_next().is_some() {}
+        if crossings.len() >= MAX_CROSSINGS {
+            tokio::select! {
+                _ = crossings.join_next() => {},
+                changed = routes.changed() => {
+                    crossings.abort_all();
+                    while crossings.join_next().await.is_some() {}
+                    if changed.is_err() { return Ok(()); }
+                }
+            }
+            continue;
+        }
         let route = routes.borrow_and_update().clone();
         let epoch = route.epoch;
-        let outcome = {
-            // Reborrowed for the length of the select so the match below can
-            // have them back.
-            let reported = &mut reported;
-            let report = &mut report;
-            let parked = move || {
+        let result = tokio::select! {
+            ready = connect_home_stream(&route) => ready,
+            changed = routes.changed() => {
+                // Rotation revokes every old crossing, not merely the waiter.
+                crossings.abort_all();
+                while crossings.join_next().await.is_some() {}
+                if changed.is_err() { return Ok(()); }
+                delay = Duration::from_millis(100);
+                continue;
+            }
+        };
+        match result {
+            Ok(broker) => {
                 if reported.take().is_some() {
                     report(Ok(epoch));
                 }
-            };
-            tokio::select! {
-                served = park_home_leg(&route, local_control_plane, &identity, parked)
-                    => Some(served),
-                // A rotation supersedes the parked leg: its proof is already stale.
-                changed = routes.changed() => {
-                    if changed.is_err() {
-                        return Ok(());
-                    }
-                    None
-                }
+                delay = Duration::from_millis(100);
+                let acceptor = acceptor.clone();
+                crossings.spawn(carry_home_leg(broker, local_control_plane, acceptor));
+                // READY has selected this client's partner. Park another Home
+                // immediately, while TLS/admission/work proceed independently.
             }
-        };
-        match outcome {
-            Some(Ok(())) | None => delay = Duration::from_millis(100),
-            Some(Err(error)) => {
+            Err(error) if is_wait_expired(&error) => {
+                if reported.take().is_some() {
+                    report(Ok(epoch));
+                }
+                delay = Duration::from_millis(100);
+            }
+            Err(error) => {
                 let reason = error.to_string();
                 if reported.as_deref() != Some(reason.as_str()) {
                     report(Err((epoch, error)));
                     reported = Some(reason);
                 }
-                sleep(delay).await;
+                tokio::select! {
+                    () = sleep(delay) => {},
+                    changed = routes.changed() => {
+                        crossings.abort_all();
+                        while crossings.join_next().await.is_some() {}
+                        if changed.is_err() { return Ok(()); }
+                    }
+                }
                 delay = (delay * 2).min(Duration::from_secs(10));
             }
         }
@@ -2321,6 +2341,74 @@ mod tests {
         next_tick(&mut events).await;
         carrier.abort();
         home.abort();
+    }
+
+    /// Two clients, including a single-stream browser-shaped client, retain
+    /// separate pinned TLS crossings while an event stream stays open.
+    #[tokio::test]
+    async fn concurrent_clients_keep_independent_tunnels_to_one_home() {
+        let relay = crate::test_relay::TestRelay::bind().await.unwrap();
+        let endpoint = gaugedesk_env::var("LIVE_RELAY_ENDPOINT")
+            .unwrap_or_else(|| relay.endpoint().to_owned());
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = local.local_addr().unwrap();
+        let server = tokio::spawn(stream_and_ping(local));
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(endpoint, identity.fingerprint());
+        let home_route = route.clone();
+        let home = tokio::spawn(serve_home_forever(home_route, address, identity));
+        let mut first = timeout(Duration::from_secs(15), connect_client(&route))
+            .await
+            .unwrap()
+            .unwrap();
+        first
+            .write_all(b"GET /events HTTP/1.1\r\nhost: home\r\n\r\n")
+            .await
+            .unwrap();
+        let mut bytes = [0u8; 256];
+        assert!(
+            timeout(Duration::from_secs(15), first.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+        let mut second = timeout(Duration::from_secs(15), connect_client(&route))
+            .await
+            .unwrap()
+            .unwrap();
+        second
+            .write_all(b"GET /events HTTP/1.1\r\nhost: home\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(15), second.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+        first.shutdown().await.unwrap();
+        drop(first);
+        assert!(
+            timeout(Duration::from_secs(15), second.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+        let (loopback, third) = bind_client_loopback(route).await.unwrap();
+        assert!(ping(loopback).await.ends_with("pong"));
+        assert!(
+            timeout(Duration::from_secs(15), second.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+        third.abort();
+        home.abort();
+        server.abort();
     }
 
     /// A Home that answers the offer with nothing is carried the way it always

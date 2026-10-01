@@ -81,7 +81,7 @@ async fn delete_admission(
         )
             .into_response();
     }
-    wb.home_admissions.revoke(&home, &actor);
+    wb.home_admissions.revoke_session(&home, &actor, &token);
     StatusCode::NO_CONTENT.into_response()
 }
 

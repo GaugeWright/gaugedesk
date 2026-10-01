@@ -5,7 +5,7 @@
 //! opaque credential bound to `(HomeId, AuthorityId)`. Home work routes require
 //! both credentials; either one alone fails closed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use gaugedesk_core::ids::{AuthorityId, HomeId};
 
@@ -44,7 +44,7 @@ pub enum HomeAdmissionRejection {
 
 #[derive(Clone, Debug, Default)]
 pub struct HomeAdmissionStore {
-    by_principal: BTreeMap<(HomeId, AuthorityId), HomeAdmissionToken>,
+    by_principal: BTreeMap<(HomeId, AuthorityId), VecDeque<HomeAdmissionToken>>,
     by_token: BTreeMap<HomeAdmissionToken, (HomeId, AuthorityId)>,
 }
 
@@ -53,14 +53,17 @@ impl HomeAdmissionStore {
         Self::default()
     }
 
-    /// Admit and rotate one Home session for this identity.
+    /// Admit an independent session; bound retained credentials per identity.
     pub fn open(&mut self, home: HomeId, actor: AuthorityId) -> HomeAdmissionToken {
         let key = (home, actor);
-        if let Some(old) = self.by_principal.remove(&key) {
-            self.by_token.remove(&old);
+        let sessions = self.by_principal.entry(key.clone()).or_default();
+        if sessions.len() == 64 {
+            if let Some(oldest) = sessions.pop_front() {
+                self.by_token.remove(&oldest);
+            }
         }
         let token = HomeAdmissionToken::mint();
-        self.by_principal.insert(key.clone(), token.clone());
+        sessions.push_back(token.clone());
         self.by_token.insert(token.clone(), key);
         token
     }
@@ -80,11 +83,37 @@ impl HomeAdmissionStore {
         Ok(())
     }
 
+    /// Explicitly revoke every session for an exact Home/account binding.
+    /// Preserve the existing public API for callers asking for identity-wide
+    /// revocation; closing one window uses `revoke_session` instead.
     pub fn revoke(&mut self, home: &HomeId, actor: &AuthorityId) -> bool {
-        let Some(token) = self.by_principal.remove(&(home.clone(), actor.clone())) else {
+        let Some(tokens) = self.by_principal.remove(&(home.clone(), actor.clone())) else {
             return false;
         };
-        self.by_token.remove(&token);
+        for token in tokens {
+            self.by_token.remove(&token);
+        }
+        true
+    }
+
+    /// Revoke only the presented session, after checking its exact binding.
+    pub fn revoke_session(
+        &mut self,
+        home: &HomeId,
+        actor: &AuthorityId,
+        token: &HomeAdmissionToken,
+    ) -> bool {
+        if self.authorize(home, actor, token).is_err() {
+            return false;
+        }
+        self.by_token.remove(token);
+        let key = (home.clone(), actor.clone());
+        if let Some(sessions) = self.by_principal.get_mut(&key) {
+            sessions.retain(|entry| entry != token);
+            if sessions.is_empty() {
+                self.by_principal.remove(&key);
+            }
+        }
         true
     }
 }
@@ -94,7 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_is_exact_home_and_actor_bound_and_rotation_retires_old() {
+    fn independent_sessions_are_bound_and_revoke_only_the_presented_token() {
         let mut store = HomeAdmissionStore::new();
         let home = HomeId::new("home:acme");
         let alice = AuthorityId::new("alice");
@@ -111,11 +140,41 @@ mod tests {
 
         let second = store.open(home.clone(), alice.clone());
         assert_ne!(first, second);
+        assert_eq!(store.authorize(&home, &alice, &first), Ok(()));
+        assert_eq!(store.authorize(&home, &alice, &second), Ok(()));
+        assert!(!store.revoke_session(&home, &AuthorityId::new("mallory"), &first));
+        assert!(store.revoke_session(&home, &alice, &first));
         assert_eq!(
             store.authorize(&home, &alice, &first),
             Err(HomeAdmissionRejection::UnknownOrRevoked)
         );
         assert_eq!(store.authorize(&home, &alice, &second), Ok(()));
+        assert!(store.revoke(&home, &alice));
+        assert_eq!(
+            store.authorize(&home, &alice, &second),
+            Err(HomeAdmissionRejection::UnknownOrRevoked)
+        );
+    }
+
+    #[test]
+    fn admission_capacity_retires_only_the_oldest_session() {
+        let mut store = HomeAdmissionStore::new();
+        let home = HomeId::new("home:test");
+        let actor = AuthorityId::new("alice");
+        let first = store.open(home.clone(), actor.clone());
+        let second = store.open(home.clone(), actor.clone());
+        for _ in 2..64 {
+            store.open(home.clone(), actor.clone());
+        }
+        assert_eq!(store.authorize(&home, &actor, &first), Ok(()));
+        let last = store.open(home.clone(), actor.clone());
+        assert_eq!(
+            store.authorize(&home, &actor, &first),
+            Err(HomeAdmissionRejection::UnknownOrRevoked)
+        );
+        assert_eq!(store.authorize(&home, &actor, &second), Ok(()));
+        assert_eq!(store.authorize(&home, &actor, &last), Ok(()));
+        assert_eq!(store.by_token.len(), 64);
     }
 
     #[test]

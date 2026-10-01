@@ -170,8 +170,8 @@ function isHomeUnreachable(error: unknown): boolean {
     return error instanceof RouteHttpError && [502, 503, 504].includes(error.status);
 }
 
-/** A Home restart clears admissions, and a second admission for the same
- * identity replaces the first. Both refusals happen before a work route runs,
+/** A Home restart clears admissions; exceeding the retained session bound
+ * retires the oldest credential. Both refusals happen before a work route runs,
  * so either can be retried once with a fresh admission. */
 function isExpiredHomeAdmission(error: unknown): boolean {
     return error instanceof RouteHttpError

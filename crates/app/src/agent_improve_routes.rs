@@ -41,6 +41,30 @@ pub struct HostedImproveQueued {
     pub evidence_id: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct HostedImproveOperationObservation {
+    #[serde(flatten)]
+    job: HostedImproveQueued,
+    model_usage: ModelUsageObservation,
+    model_reservations: ModelReservationObservation,
+}
+
+#[derive(Serialize)]
+struct ModelUsageObservation {
+    runs: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+#[derive(Serialize)]
+struct ModelReservationObservation {
+    reserved: u64,
+    settled: u64,
+    released: u64,
+    outstanding: u64,
+}
+
 pub trait HostedImproveJobQueue: Send + Sync {
     fn enqueue(&self, input: HostedImproveJobInput) -> Result<HostedImproveQueued, String>;
     fn status(
@@ -357,12 +381,45 @@ pub async fn operation_status(
         return problem(StatusCode::FORBIDDEN, "Agent improve source owner required");
     }
     let tenant_scope = crate::workbench_auth::req_scope(&headers);
+    let engagement_scope = crate::agent_improve_funding::operation_engagement_scope(
+        &tenant_scope,
+        &agent_id,
+        &operation_id,
+    );
     let result = tokio::task::spawn_blocking(move || {
         queue.status(&operation_id, &tenant_scope, &actor, &agent_id)
     })
     .await;
     match result {
-        Ok(Ok(Some(job))) => Json(job).into_response(),
+        Ok(Ok(Some(job))) => {
+            let guard = wb.lock_unpoisoned();
+            let usage =
+                crate::managed_inference::fold_usage(guard.store_ref(), &engagement_scope, 0);
+            let reservations =
+                crate::managed_inference::fold_reservations(guard.store_ref(), &engagement_scope);
+            match (usage, reservations) {
+                (Ok(usage), Ok(reservations)) => Json(HostedImproveOperationObservation {
+                    job,
+                    model_usage: ModelUsageObservation {
+                        runs: usage.runs,
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        total_tokens: usage.total_tokens,
+                    },
+                    model_reservations: ModelReservationObservation {
+                        reserved: reservations.reserved,
+                        settled: reservations.settled,
+                        released: reservations.released,
+                        outstanding: reservations.outstanding,
+                    },
+                })
+                .into_response(),
+                _ => problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Agent improve model accounting is unavailable",
+                ),
+            }
+        }
         Ok(Ok(None)) => problem(StatusCode::NOT_FOUND, "Agent improve operation not found"),
         Ok(Err(_)) | Err(_) => problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -616,18 +673,62 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(queue.0.lock().unwrap().len(), 1);
         assert_eq!(queue.0.lock().unwrap()[0].operation_id, "op");
-        assert_eq!(
-            operation_status(
-                State(wb.clone()),
-                Path((crate::DEFAULT_AGENT.to_owned(), "op".into())),
-                HeaderMap::new(),
-                Some(owner),
-                Some(extension.clone()),
-            )
-            .await
-            .status(),
-            StatusCode::OK
+        let engagement = crate::agent_improve_funding::operation_engagement_scope(
+            &crate::org::tenant_scope(""),
+            crate::DEFAULT_AGENT,
+            "op",
         );
+        {
+            let mut guard = wb.lock_unpoisoned();
+            crate::managed_inference::reserve_turn(
+                &mut guard.store,
+                &engagement,
+                "billing:test",
+                "funding:test",
+                "reserve-1",
+            )
+            .unwrap();
+            crate::managed_inference::append_funded_usage(
+                &mut guard.store,
+                &engagement,
+                "billing:test",
+                &gaugedesk_harness::ModelUsage {
+                    usage_ref: "usage-1".into(),
+                    provider: "cloudflare-ai-gateway".into(),
+                    model: "test-model".into(),
+                    input_tokens: 7,
+                    output_tokens: 3,
+                },
+                "funding:test",
+                1,
+            )
+            .unwrap();
+            crate::managed_inference::settle_reservation(
+                &mut guard.store,
+                &engagement,
+                "billing:test",
+                "reserve-1",
+                Some("usage-1"),
+                "",
+            )
+            .unwrap();
+        }
+        let observed = operation_status(
+            State(wb.clone()),
+            Path((crate::DEFAULT_AGENT.to_owned(), "op".into())),
+            HeaderMap::new(),
+            Some(owner),
+            Some(extension.clone()),
+        )
+        .await;
+        assert_eq!(observed.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(observed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let observed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(observed["model_usage"]["total_tokens"], 10);
+        assert_eq!(observed["model_reservations"]["settled"], 1);
+        assert_eq!(observed["model_reservations"]["outstanding"], 0);
         assert_eq!(
             operation_status(
                 State(wb),

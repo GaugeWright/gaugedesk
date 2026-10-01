@@ -1,3 +1,4 @@
+import { HomeTunnelError } from "@gaugewright/control-plane-client";
 import { describe, expect, it } from "vitest";
 import {
     captureHomeDiscovery,
@@ -30,6 +31,7 @@ describe("hosted Home bootstrap failure", () => {
             kind: "failure",
             authentication: true,
             relayClosed: false,
+            homeConnection: false,
             message: "GET /account/homes: 401 authenticate to access your account",
         });
     });
@@ -70,4 +72,13 @@ describe("hosted Home bootstrap failure", () => {
         )).toBe(false);
         expect(isRelayClosedRefusal(null)).toBe(false);
     });
+    it("keeps relay capacity and connection failures separate from account discovery", async () => {
+        for (const message of ["relay connection capacity reached", "the Home tunnel could not open", "the Home tunnel timed out"]) {
+            const result = await captureHomeDiscovery(async () => { throw new HomeTunnelError(message); });
+            expect(result).toMatchObject({ kind: "failure", homeConnection: true, authentication: false });
+        }
+        const result = await captureHomeDiscovery(async () => { throw new Error("GET /account/homes: 503 unavailable"); });
+        expect(result).toMatchObject({ kind: "failure", homeConnection: false });
+    });
+
 });

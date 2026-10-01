@@ -35,7 +35,7 @@ export interface TunnelSocket {
     send(frame: Uint8Array): void;
     close(): void;
     onFrame(handler: (frame: Uint8Array) => void): void;
-    onClose(handler: () => void): void;
+    onClose(handler: (reason?: string) => void): void;
 }
 
 /** Extra headers for one call, assembled the way the direct transport does.
@@ -90,7 +90,8 @@ export interface TunnelRouteOptions {
 
 type TunnelCredentials = Pick<TunnelRouteOptions, "bearer" | "homeAdmission">;
 
-class TunnelClosed extends Error {}
+export class HomeTunnelError extends Error {}
+class TunnelClosed extends HomeTunnelError {}
 
 /**
  * A tunnel's `RouteJson`, plus the handle needed to hang it up.
@@ -127,24 +128,30 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
     // as the first call did. Refusing forever instead left a live pool entry
     // answering "the Home tunnel closed" to every call until something else
     // happened to evict it.
+    let closeReason: string | undefined;
     let hungUp = false;
     let queue: Promise<unknown> = Promise.resolve();
 
     async function ensure(): Promise<{ tunnel: TunnelFacade; socket: TunnelSocket }> {
         if (live) return live;
-        const opened = await options.open();
+        let opened: { tunnel: TunnelFacade; socket: TunnelSocket };
+        try { opened = await options.open(); }
+        catch (error) {
+            throw new HomeTunnelError(error instanceof Error ? error.message : String(error));
+        }
         if (hungUp) {
             // Hung up while this was opening: nothing will ever close it.
             opened.socket.close();
             throw new TunnelClosed("the Home tunnel closed");
         }
+        live = opened;
         opened.socket.onFrame((frame) => opened.tunnel.receiveFrame(frame));
-        opened.socket.onClose(() => {
+        closeReason = undefined;
+        opened.socket.onClose((reason) => {
             // Only its own session. A late close from a carrier already
             // replaced must not orphan the one that replaced it.
-            if (live === opened) live = null;
+            if (live === opened) { live = null; closeReason = reason; }
         });
-        live = opened;
         return opened;
     }
 
@@ -193,9 +200,11 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
                 // Not retried on a fresh session: the request may already have
                 // reached the Home, and only the caller knows whether sending it
                 // twice is safe.
-                if (live !== session) throw new TunnelClosed("the Home tunnel closed mid-request");
+                if (live !== session) throw new TunnelClosed(closeReason ?? "the Home tunnel closed mid-request");
                 if (now() > deadline) {
-                    throw new Error(`${method} ${path}: the Home tunnel timed out`);
+                    live = null;
+                    socket.close();
+                    throw new HomeTunnelError(`${method} ${path}: the Home tunnel timed out`);
                 }
                 await tick();
             }
@@ -280,7 +289,9 @@ export function browserTunnelSocket(
         const socket = new Socket(url);
         socket.binaryType = "arraybuffer";
         let onFrame: ((frame: Uint8Array) => void) | null = null;
-        let onClose: (() => void) | null = null;
+        let onClose: ((reason?: string) => void) | null = null;
+        let closedReason: string | undefined;
+        let opened = false;
         let isClosed = false;
         let keepalive: ReturnType<typeof setInterval> | undefined;
         const pending: Uint8Array[] = [];
@@ -293,14 +304,21 @@ export function browserTunnelSocket(
             if (onFrame) onFrame(frame);
             else pending.push(frame);
         };
-        socket.onclose = () => {
+        socket.onclose = (event: CloseEvent) => {
             isClosed = true;
+            closedReason = event.reason || "the Home tunnel closed";
+            if (!opened) reject(new HomeTunnelError(closedReason));
             clearInterval(keepalive);
             keepalive = undefined;
-            onClose?.();
+            onClose?.(closedReason);
         };
-        socket.onerror = () => reject(new Error(`the Home tunnel could not open: ${url}`));
+        socket.onerror = () => {
+            clearInterval(keepalive);
+            socket.close();
+            reject(new HomeTunnelError("the Home tunnel could not open"));
+        };
         socket.onopen = () => {
+            opened = true;
             // The fabric's frame first, before any tunnel bytes. Copied into a
             // plain ArrayBuffer because a wasm view is backed by shared memory,
             // which `send` will not take.
@@ -321,7 +339,7 @@ export function browserTunnelSocket(
                 },
                 onClose: (handler) => {
                     onClose = handler;
-                    if (isClosed) handler();
+                    if (isClosed) handler(closedReason);
                 },
             });
         };

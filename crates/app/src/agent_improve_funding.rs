@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gaugedesk_core::ids::ScopeId;
 use gaugedesk_harness::{HarnessSpec, TurnOutcome};
+use sha2::{Digest, Sha256};
 
 use crate::agent_improve::ShadowTurnMeter;
 use crate::agent_improve_campaign::ManagedCampaignFunding;
@@ -11,9 +12,26 @@ use crate::library::gen_id;
 use crate::{managed_funding, managed_inference};
 use crate::{LockUnpoisoned, SharedWorkbench};
 
-/// One campaign attempt uses its own private engagement scope. The billing
-/// scope is resolved again before every arm, so a plan suspended between
-/// baseline and candidate cannot fund the candidate by stale preparation.
+/// One durable operation uses a private engagement scope. A recovered attempt
+/// can add usage to that same scope without changing the billing authority.
+/// Length prefixes keep caller-chosen operation keys from aliasing another
+/// tenant or Agent.
+pub(crate) fn operation_engagement_scope(
+    tenant_scope: &str,
+    agent_id: &str,
+    operation_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for part in [tenant_scope, agent_id, operation_id] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("agent-improve-operation:{}", hex::encode(digest.finalize()))
+}
+
+/// The billing scope is resolved again before every arm, so a plan suspended
+/// between baseline and candidate cannot fund the candidate by stale
+/// preparation.
 pub(crate) struct ManagedShadowMeter<'a> {
     wb: &'a SharedWorkbench,
     engagement_scope: String,
@@ -146,5 +164,35 @@ impl ShadowTurnMeter for ManagedShadowMeter<'_> {
         )
         .map_err(|error| format!("{error:?}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::operation_engagement_scope;
+
+    #[test]
+    fn operation_accounting_is_stable_and_isolated_by_tenant_agent_and_key() {
+        let scope = operation_engagement_scope("tenant:a", "agent:one", "op");
+        assert_eq!(
+            scope,
+            operation_engagement_scope("tenant:a", "agent:one", "op")
+        );
+        assert_ne!(
+            scope,
+            operation_engagement_scope("tenant:b", "agent:one", "op")
+        );
+        assert_ne!(
+            scope,
+            operation_engagement_scope("tenant:a", "agent:two", "op")
+        );
+        assert_ne!(
+            scope,
+            operation_engagement_scope("tenant:a", "agent:one", "other")
+        );
+        assert_ne!(
+            operation_engagement_scope("ab", "c", "d"),
+            operation_engagement_scope("a", "bc", "d")
+        );
     }
 }

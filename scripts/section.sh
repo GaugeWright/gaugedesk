@@ -103,6 +103,7 @@ case "${1:-}" in
         scripts/production-wiring-canary.test.mjs \
         scripts/run-production-wiring-canaries.test.mjs \
         scripts/wiring-canary/runners.test.mjs \
+        scripts/wiring-canary/home-agent-improve.test.mjs \
         scripts/wiring-canary/administration-agent-erasure.test.mjs \
         scripts/wiring-canary/account-boxes.test.mjs \
         scripts/wiring-canary/totp.test.mjs \

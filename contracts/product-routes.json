@@ -6847,7 +6847,7 @@
       "scope": "person-home-archetype-improve-operation",
       "capability": "read-owned-archetype-improve-operation",
       "requestSchema": "http/path-archetype-and-operation-id",
-      "responseSchema": "rust:gaugedesk-app/agent_improve_routes/HostedImproveQueued",
+      "responseSchema": "rust:gaugedesk-app/agent_improve_routes/HostedImproveOperationObservation",
       "sideEffect": "none",
       "risk": "critical",
       "compatibility": {

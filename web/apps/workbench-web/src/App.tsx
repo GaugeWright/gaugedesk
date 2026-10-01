@@ -383,6 +383,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         return state?.kind === "failure" ? state : null;
     });
     const homeNeedsLogin = createMemo(() => homeFailure()?.authentication ?? false);
+    const homeConnectionFailure = createMemo(() => homeFailure()?.homeConnection ?? false);
+    const homeRelayCapacity = createMemo(() => /relay .*capacity reached/.test(homeFailure()?.message ?? ""));
     const homeRelayClosed = createMemo(() => homeFailure()?.relayClosed ?? false);
     const [homeEndpoint, setHomeEndpoint] = createSignal("");
     const [homeError, setHomeError] = createSignal("");
@@ -4193,9 +4195,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                     when={homeRelayClosed()}
                                     fallback={
                                         <>
-                                            <h1>We couldn’t load your Homes</h1>
+                                            <h1>{homeConnectionFailure() ? "We couldn’t connect to your Home" : "We couldn’t load your Homes"}</h1>
                                             <p class="homegate-lede">
-                                                The account service could not be reached. Retry when the connection is available.
+                                                {homeConnectionFailure()
+                                                    ? homeRelayCapacity()
+                                                        ? "Your Home’s relay is at its connection limit. Close unused sessions, then retry."
+                                                        : "Your Home’s connection could not be opened. Check that GaugeDesk is running on that computer, then retry."
+                                                    : "The account service could not be reached. Retry when the connection is available."}
                                             </p>
                                         </>
                                     }

@@ -1,15 +1,9 @@
 //! Many streams over one pinned tunnel (DR-0232).
 //!
-//! A route holds one pair at a time: the relay admits two live legs, and a Home
-//! parks its next leg only when its crossing ends. A client that opens several
-//! connections to one Home — the phone's WebView, which keeps an event stream
-//! open beside its calls — therefore locked itself out: the first connection
-//! held the pair, and every other one waited for a leg that could not park.
-//!
-//! So such a client carries all of its connections inside one crossing, as
-//! yamux streams, and the Home splits them apart again, copying each to its
-//! relay router as if it had arrived alone. The relay still sees one blind pair;
-//! nothing about it changes.
+//! Each client holds an independent pinned crossing. A client that opens several
+//! local connections — the phone's WebView, which keeps an event stream open
+//! beside its calls — carries those as yamux streams inside its own crossing.
+//! Other clients have separate pairs; their TLS and stream state never mix.
 //!
 //! The two ends agree on this in the TLS handshake, by ALPN: a client that can
 //! multiplex offers [`MUX_ALPN`], and a Home that can answers with it. Anything

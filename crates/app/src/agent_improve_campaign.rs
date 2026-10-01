@@ -707,7 +707,12 @@ pub fn run_hosted_managed_campaign_with_reservation(
     } else {
         None
     };
-    let mut meter = ManagedShadowMeter::new(wb, gen_id("agent-improve-attempt"), funding);
+    let engagement_scope = operation_id
+        .map(|id| {
+            crate::agent_improve_funding::operation_engagement_scope(&tenant_id, agent_id, id)
+        })
+        .unwrap_or_else(|| gen_id("agent-improve-attempt"));
+    let mut meter = ManagedShadowMeter::new(wb, engagement_scope, funding);
     run_campaign_with_reservation_replay(
         CampaignSources {
             template,

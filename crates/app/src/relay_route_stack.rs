@@ -260,7 +260,7 @@ async fn admit_relay_caller(
                         .authorize(&home, &actor, &token)
                         .is_ok() =>
                 {
-                    guard.home_admissions.revoke(&home, &actor);
+                    guard.home_admissions.revoke_session(&home, &actor, &token);
                     StatusCode::NO_CONTENT.into_response()
                 }
                 _ => refuse(StatusCode::UNAUTHORIZED, ADMISSION_REQUIRED),

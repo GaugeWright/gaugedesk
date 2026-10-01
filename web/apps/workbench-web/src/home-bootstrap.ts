@@ -1,3 +1,5 @@
+import { HomeTunnelError } from "@gaugewright/control-plane-client";
+
 /** Whether Home discovery failed because the hosted account session is absent/expired. */
 export function isHomeAuthenticationFailure(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error ?? "");
@@ -25,6 +27,7 @@ export function isRelayClosedRefusal(error: unknown): boolean {
 export type HomeDiscoveryFailure = {
     readonly kind: "failure";
     readonly authentication: boolean;
+    readonly homeConnection: boolean;
     /** The Home refused remote connections outright; see [`isRelayClosedRefusal`]. */
     readonly relayClosed: boolean;
     readonly message: string;
@@ -57,6 +60,7 @@ export async function captureHomeDiscovery<T>(
         return {
             kind: "failure",
             authentication: isHomeAuthenticationFailure(error),
+            homeConnection: error instanceof HomeTunnelError,
             relayClosed: isRelayClosedRefusal(error),
             message: error instanceof Error ? error.message : String(error ?? ""),
         };

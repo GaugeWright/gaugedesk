@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
 import {
     browserTunnelSocket,
+    HomeTunnelError,
     TUNNEL_KEEPALIVE_INTERVAL_MS,
     TUNNEL_KEEPALIVE_REQUEST,
     TUNNEL_KEEPALIVE_RESPONSE,
@@ -60,6 +61,28 @@ function build(tunnel: TunnelFacade, socket: TunnelSocket, timeoutMs = 30_000, c
         ...(clock ? { now: clock } : {}),
     });
 }
+
+describe("Home tunnel failure lifecycle", () => {
+    it("closes a timed-out carrier before the next attempt", async () => {
+        const tunnel = fakeTunnel([], 100);
+        const { socket } = fakeSocket();
+        const closed = vi.spyOn(socket, "close");
+        let now = 0;
+        const json = build(tunnel, socket, 1, () => now++);
+        await expect(json("GET", "/x")).rejects.toBeInstanceOf(HomeTunnelError);
+        expect(closed).toHaveBeenCalledOnce();
+    });
+
+    it("does not resurrect a carrier that closed before its callback was attached", async () => {
+        const tunnel = fakeTunnel([], 100);
+        const socket: TunnelSocket = {
+            send: () => undefined, close: () => undefined, onFrame: () => undefined,
+            onClose: (handler) => handler("relay connection capacity reached"),
+        };
+        await expect(build(tunnel, socket)("POST", "/home/admissions"))
+            .rejects.toThrow("relay connection capacity reached");
+    });
+});
 
 describe("routeJson over the tunnel (DESK-7)", () => {
     it("carries a request and parses the Home's reply", async () => {
@@ -404,7 +427,7 @@ class StubWebSocket {
     binaryType = "blob";
     readonly sent: Array<string | ArrayBuffer> = [];
     onopen: (() => void) | null = null;
-    onclose: (() => void) | null = null;
+    onclose: ((event: CloseEvent) => void) | null = null;
     onerror: (() => void) | null = null;
     onmessage: ((event: { data: unknown }) => void) | null = null;
 
@@ -421,7 +444,7 @@ class StubWebSocket {
     drop() {
         if (this.readyState === 3) return;
         this.readyState = 3;
-        this.onclose?.();
+        this.onclose?.({ reason: "" } as CloseEvent);
     }
     pings() { return this.sent.filter((data) => data === TUNNEL_KEEPALIVE_REQUEST).length; }
 }
