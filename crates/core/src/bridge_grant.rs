@@ -58,6 +58,22 @@ mod tests {
         }
     }
 
+    /// Complete 18-case guard domain from bridge-grant-admission.qnt.
+    #[test]
+    fn crypto_model_domain_bridge_grant() {
+        for active in [false, true] {
+            for expiry in 0..=2 {
+                let mut grant = sample_grant();
+                grant.active = active;
+                grant.expiry = expiry;
+                for now in 0..=2 {
+                    let expected = active && matches!((now, expiry), (0, 1) | (0, 2) | (1, 2));
+                    assert_eq!(grant.is_valid(now), expected);
+                }
+            }
+        }
+    }
+
     #[test]
     fn is_valid_respects_expiry() {
         let grant = sample_grant();

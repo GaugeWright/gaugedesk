@@ -156,6 +156,58 @@ mod tests {
         SigningKey::from_seed(&[4u8; 32]).unwrap()
     }
 
+    /// Finite fixture domain paired with delegation-admission.qnt; signatures
+    /// are actual P256, not a synthetic "valid" boolean. Not a crypto proof.
+    #[test]
+    fn crypto_model_domain_delegation() {
+        let roots = [root(), SigningKey::from_seed(&[9; 32]).unwrap()];
+        let subkeys = [
+            subkey().public_key(),
+            SigningKey::from_seed(&[7; 32]).unwrap().public_key(),
+        ];
+        let claimed_roots = [
+            roots[0].public_key(),
+            roots[1].public_key(),
+            PublicKey::new("malformed"),
+        ];
+        let bytes = delegation_bytes(&subkeys[0], &claimed_roots[0], 1);
+        for (root_id, claimed_root) in claimed_roots.iter().enumerate() {
+            for (subkey_id, presented_subkey) in subkeys.iter().enumerate() {
+                for expiry in 0..=2 {
+                    for (signer_id, signer) in roots.iter().enumerate() {
+                        for malformed in [false, true] {
+                            let d = DeviceDelegation {
+                                authority_root: claimed_root.clone(),
+                                subkey: presented_subkey.clone(),
+                                expiry,
+                                signature: if malformed {
+                                    Signature::new(vec![0; 3])
+                                } else {
+                                    signer.sign(&bytes)
+                                },
+                            };
+                            for now in 0..=2 {
+                                let expected = if now >= expiry {
+                                    Err(DelegationRejection::Expired)
+                                } else if root_id == 0
+                                    && subkey_id == 0
+                                    && expiry == 1
+                                    && signer_id == 0
+                                    && !malformed
+                                {
+                                    Ok(())
+                                } else {
+                                    Err(DelegationRejection::BadSignature)
+                                };
+                                assert_eq!(d.verify(now), expected, "root={root_id} subkey={subkey_id} expiry={expiry} signer={signer_id} malformed={malformed} now={now}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_genuine_revocation_verifies_and_a_forged_one_is_refused() {
         let r = SubkeyRevocation::issue(&root(), subkey().public_key(), 42);

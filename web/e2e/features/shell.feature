@@ -76,3 +76,46 @@ Feature: The workbench shell
     Then the placement in project "placefold" hides its chats
     When I collapse the placement in project "placefold"
     Then the placement in project "placefold" shows a chat
+
+  Scenario: the Projects tree chat rows are reachable and openable by keyboard
+    Given a new engagement
+    Then the chat rows are keyboard-reachable
+    When I open a chat by keyboard
+    Then the run phase is "Init"
+
+  Scenario: search has a clear control that resets the filter
+    Given the workbench is open
+    When I type "zzz" in the search box
+    And I clear the search
+    Then the search box is empty
+
+  Scenario: the selected chat row shows the chat's own name
+    Given a new engagement
+    When I task the agent with "draft a tagline for spring"
+    Then the selected chat row shows the title "draft a tagline for spring"
+
+  Scenario: renaming a chat updates its selected row live (event-driven)
+    Given a new engagement
+    When I task the agent with "draft a tagline for spring"
+    Then the selected chat row shows the title "draft a tagline for spring"
+    When I rename the open chat to "Spring campaign"
+    Then the selected chat row shows the title "Spring campaign"
+
+  Scenario: live search highlights the matched substring in a surviving row
+    Given the workbench is open
+    When I create an archetype named "Mailer"
+    And I search the facets for "mail"
+    Then the matched text "Mail" is highlighted in the results
+
+  Scenario: searching hides the "+ archetype" create affordance so it can't read as a hit
+    Given the workbench is open
+    Then I can create a new method
+    When I search the facets for "Default"
+    Then I cannot create a new method
+    When I clear the facet search
+    Then I can create a new method
+
+  Scenario: the chat lane keeps only one options button
+    Given a new engagement
+    Then the chat run state reads "Ready"
+    And the chat lane has one options button

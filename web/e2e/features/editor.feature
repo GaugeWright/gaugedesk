@@ -22,3 +22,20 @@ Feature: File editor
     Then the content viewer is on the "edit" tab
     And the "view" tab is absent
     And the file editor shows "agent-note"
+
+  Scenario: an edit chat can save authored behavior in the package draft
+    Given the workbench is open
+    When I create an edit chat under the archetype "Default"
+    And I select the file ".whipple/draft/persona.md" in the workspace
+    Then the content viewer offers the "view" tab
+    And the content viewer offers the "edit" tab
+    When I open the "edit" tab
+    And I replace the editor content with "You are a concise research assistant."
+    And I save the file
+
+  Scenario: the editor opens the plain text file a turn just changed
+    Given a new engagement
+    When I task the agent with "draft a tagline for spring"
+    Then the run phase is "Completed"
+    When I open the "edit" tab
+    Then the file editor shows "agent-note"

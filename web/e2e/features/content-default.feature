@@ -13,3 +13,25 @@ Feature: Content viewer offers modes for available content
     Given the workbench is open
     When I start a new chat in Personal
     Then the content header says only CONTENT
+
+  Scenario: the split diff toggle is hidden when the review panel is too narrow
+    Given a new engagement
+    When I task the agent with "make a change"
+    Then the run phase is "Completed"
+    When I open the "diff" tab
+    Then the split diff toggle is not offered at the default panel width
+
+  Scenario: runtime settings never enter the target review
+    Given a new engagement
+    And I task the agent with "make a change"
+    Then the run phase is "Completed"
+    When I open the "diff" tab
+    Then the changed-files review hides the internal settings file
+    And the review offers no internal-file toggle
+
+  Scenario: the changes header has no hidden runtime-config disclosure
+    Given a new engagement
+    When I task the agent with "make a change"
+    Then the run phase is "Completed"
+    When I open the "diff" tab
+    Then the review offers no internal-file toggle

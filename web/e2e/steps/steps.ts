@@ -538,7 +538,7 @@ Given("a new engagement", async ({ page }) => {
 When("I task the agent with {string}", async ({ page }, prompt: string) => {
     // Target the composer input structurally, not by placeholder: a work chat reads
     // "task the agent…" but an edit chat reads "Describe what to change about …", so
-    // a placeholder match silently fails in edit chats (round10:6).
+    // a placeholder match silently fails in edit chats (the composer surface).
     const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
     await composer.fill(prompt);
     await sendDraft(composer);

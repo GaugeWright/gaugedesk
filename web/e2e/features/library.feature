@@ -138,3 +138,18 @@ Feature: The archetype & project library
     Then an archetype is forked from "base"
     When I pull updates into the fork of "base"
     Then an archetype is forked from "base"
+
+  Scenario: placements carry no decorative version badge
+    Given a new engagement
+    Then placements carry no version badge
+
+  Scenario: the method-improve menu offers a single, honest improve entry
+    Given the workbench is open
+    When I open the context menu on the archetype "Default"
+    Then the menu offers exactly one improve entry
+    And the menu does not promise working alongside it live
+
+  Scenario: renaming a method selects the existing name so you can type over it
+    Given the workbench is open
+    When I start renaming the archetype "Default"
+    Then the rename field has the existing name selected

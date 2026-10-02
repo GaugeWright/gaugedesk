@@ -213,7 +213,7 @@ export function ContentViewer(props: ContentViewerProps = {}) {
                 // tab. We do NOT switch on a transition into "Rejected" (discard/conflict):
                 // the merge-review bar (its discarded/conflict copy + repair affordance)
                 // lives on the Changes tab, so staying put shows the honest outcome on the
-                // tab they acted from (round3/round5/merge-conflict). A file surface stays a manual pick.
+                // tab they acted from (the content viewer and merge-conflict surfaces). A file surface stays a manual pick.
                 if (phase === "Clean") setMode("diff");
             },
         ),

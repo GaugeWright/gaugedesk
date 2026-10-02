@@ -159,6 +159,8 @@ run_contracts() {
     echo "== agent guide, as an edge =="
     gate_section carries-agent-guide
     gate_section carries-agent-guide-checker
+    gate_section carries-docs-theme-stylesheet
+    gate_section carries-docs-theme-logo
     gate_section carries-docs-theme-fonts
     gate_section carries-docs-theme-mark
 

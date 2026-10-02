@@ -41,3 +41,11 @@ Feature: Tuning the chat log
     And I reopen the chat
     Then no "write" tool line is shown
     And a mediated tool line is shown
+
+  Scenario: expanding a tool line shows a plain sentence, not raw JSON
+    Given a new engagement
+    When I task the agent with "draft a tagline for spring"
+    Then the run phase is "Completed"
+    When I expand the first tool line
+    Then the first tool line is expanded
+    And the expanded tool detail reads in plain language

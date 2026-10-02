@@ -19,6 +19,15 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Crypto admission guards have four finite Quint oracles paired with real core
+  predicate fixtures. Their probes must produce invariant counterexamples.
+
+- The weekly TokenWright integration lane runs on the fleet at the compatibility
+  pin. Its matching forge job is retired after the fleet passed all eight tests.
+
+- The TokenWright integration check has a reusable fleet command that runs the
+  shipped client against the exact compatibility pin and refuses skipped tests.
+
 - The development and preview servers proxy the full inventoried control-plane
   surface, including tutorial launches. The route check now refuses a missing
   proxy prefix when a backend route is added.

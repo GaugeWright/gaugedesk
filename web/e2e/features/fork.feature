@@ -38,3 +38,16 @@ Feature: Fork (ADR 0035/0038/0141)
     And I fork the first chat
     And I open the fork tree for the first chat
     Then the fork tree shows at least 2 chats
+
+  Scenario: a forked chat shows what it was copied from
+    Given a new engagement
+    When I switch to the "Projects" facet
+    And I fork the first chat
+    Then I see a forked chat
+    And the forked chat shows it is a copy of its source
+
+  Scenario: opening a fork of a chat with no history explains what carried over
+    Given a new engagement
+    When I switch to the "Projects" facet
+    And I fork the first chat
+    Then the chat shows it started as a copy with its files

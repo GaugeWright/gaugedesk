@@ -175,6 +175,34 @@ mod tests {
         AttestationQuote::new(measurement(), "nonce-1", vec![1, 2, 3, 4])
     }
 
+    /// Complete typed-result domain from attestation-admission.qnt. Quote
+    /// bytes and nonce remain opaque inputs to the separate verifier seam.
+    #[test]
+    fn crypto_model_domain_attestation() {
+        let measurements = [measurement(), CodeMeasurement::new("b".repeat(64))];
+        let mut verdicts: Vec<_> = measurements
+            .iter()
+            .map(|m| QuoteVerificationResult::Verified {
+                measurement: m.clone(),
+            })
+            .collect();
+        for reason in [
+            QuoteRejection::UntrustedSignature,
+            QuoteRejection::StaleNonce,
+            QuoteRejection::UnknownMeasurement,
+            QuoteRejection::MalformedQuote,
+        ] {
+            verdicts.push(QuoteVerificationResult::Rejected { reason });
+        }
+        for (measurement_id, m) in measurements.iter().enumerate() {
+            for (verdict_id, verdict) in verdicts.iter().enumerate() {
+                let q = AttestationQuote::new(m.clone(), "nonce", vec![1, 2]);
+                let evidence = AttestationEvidence::new(q, verdict.clone());
+                assert_eq!(evidence.is_trustworthy(), verdict_id == measurement_id);
+            }
+        }
+    }
+
     #[test]
     fn measurements_compare_by_value() {
         assert_eq!(measurement(), CodeMeasurement::new("a".repeat(64)));

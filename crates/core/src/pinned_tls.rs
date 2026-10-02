@@ -251,6 +251,37 @@ mod tests {
         AttestedModelEgress::new("inference.model.example", pin())
     }
 
+    /// Complete host/pin/ordered-chain domain from pinned-tls-admission.qnt.
+    /// No DER, SAN, validity-time, network, or admit_leaf claim is made here.
+    #[test]
+    fn crypto_model_domain_pinned_tls() {
+        let pins = [
+            PinnedCertificate::new(Vec::<u8>::new()),
+            PinnedCertificate::new(vec![1; 32]),
+            PinnedCertificate::new(vec![2; 32]),
+        ];
+        let chains = [vec![], vec![0], vec![1], vec![2], vec![1, 2], vec![2, 1]];
+        for host in ["A", "B"] {
+            for (pin_id, pin) in pins.iter().enumerate() {
+                let policy = AttestedModelEgress::new("A", pin.clone());
+                for chain_ids in &chains {
+                    let chain: Vec<_> = chain_ids.iter().map(|id| pins[*id].clone()).collect();
+                    let expected = host == "A"
+                        && match pin_id {
+                            1 => chain_ids == &[1] || chain_ids == &[1, 2],
+                            2 => chain_ids == &[2] || chain_ids == &[2, 1],
+                            _ => false,
+                        };
+                    assert_eq!(
+                        policy.admit(host, &chain).is_ok(),
+                        expected,
+                        "host={host} pin={pin_id} chain={chain_ids:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn pinned_certificate_compares_by_value() {
         assert_eq!(pin(), PinnedCertificate::new(vec![0xaa; 32]));
