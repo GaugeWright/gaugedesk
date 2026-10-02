@@ -159,6 +159,8 @@ run_contracts() {
     echo "== agent guide, as an edge =="
     gate_section carries-agent-guide
     gate_section carries-agent-guide-checker
+    gate_section carries-docs-theme-fonts
+    gate_section carries-docs-theme-mark
 
     # The same edge for the brand tokens and the checker that verifies them.
     # The checker seals its own body (GaugeWright#282), so an EDIT to it
