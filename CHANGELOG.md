@@ -19,6 +19,20 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-10-02
+
+- WhippleScript programs now run on Wasmtime 48.0.5, which fixes seven
+  advisories published on 2026-10-02 (RUSTSEC-2026-0321 to -0327), among them a
+  native stack buffer overflow and two kinds of GC heap corruption.
+
+- On a desktop shared by more than one account, each account now has its own
+  Personal, its own Agents, and its own provider credentials, logins,
+  TokenWright boxes and model settings. Before, every account's quick-start
+  chats landed in one Personal and every account linked into and ran on one
+  set of credentials. The account that claimed the computer keeps everything it
+  held, including Agents with no recorded owner; another account signs in to
+  its providers once.
+
 - Crypto admission guards have four finite Quint oracles paired with real core
   predicate fixtures. Their probes must produce invariant counterexamples.
 
