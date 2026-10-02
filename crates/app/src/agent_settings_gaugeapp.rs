@@ -96,6 +96,7 @@ impl GaugeAppDefinition for AgentSettings {
 
     fn apply(
         wb: &mut Workbench,
+        _actor: &str,
         id: &str,
         envelope: &GaugeAppCommandEnvelope,
     ) -> Result<Applied, Box<Response>> {
@@ -361,6 +362,30 @@ mod tests {
         );
         apply_command::<AgentSettings>(&mut wb, &HeaderMap::new(), &id, &cleared).unwrap();
         assert_eq!(page_model(&wb, &id, "overview")["model"], Value::Null);
+    }
+
+    #[test]
+    fn a_new_agent_starts_chat_only_and_can_reach_every_preset() {
+        let (_root, shared, id) = home(AgentKind::Work);
+        let mut wb = shared.lock_unpoisoned();
+        assert_eq!(wb.archetype_abilities(&id).unwrap(), ["question.ask"]);
+        for preset in [
+            vec!["workspace.read"],
+            vec!["workspace.read", "workspace.write"],
+            vec!["command.run", "workspace.read", "workspace.write"],
+            vec![
+                "command.run",
+                "tracker.file",
+                "workspace.read",
+                "workspace.write",
+            ],
+            vec![],
+        ] {
+            let preset: Vec<String> = preset.into_iter().map(str::to_owned).collect();
+            wb.set_archetype_abilities(&id, preset.clone())
+                .unwrap_or_else(|error| panic!("{preset:?} is refused: {error}"));
+            assert_eq!(wb.archetype_abilities(&id).unwrap(), preset);
+        }
     }
 
     #[test]

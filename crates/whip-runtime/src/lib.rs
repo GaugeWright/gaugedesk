@@ -1630,6 +1630,72 @@ impl WhipHarnessFactory {
         })
     }
 
+    /// Carry a chat's conversation into the package it runs now.
+    ///
+    /// A chat's thread lives on the instance its turns ran on. That instance
+    /// is found by request ids that name the package, so when the package
+    /// changes — an edit chat's persona, a placement's Agent version — they
+    /// name a new instance, and the legacy-source fork below seeds it from a
+    /// source that never ran a turn. The model then answered with none of the
+    /// chat's history while the transcript still showed it (WS-631).
+    ///
+    /// So the chat's most recently active instance decides. On this package it
+    /// is reused, when it is the instance this package and policy open to. On
+    /// an older package its thread is adopted into that instance, which does
+    /// not ask for the older package to be reproducible: it may not be.
+    ///
+    /// `None` leaves the chat to the legacy-source fork: a new chat, one whose
+    /// newest instance is that source, or one whose thread cannot be carried
+    /// because it was recorded under another policy epoch or has an effect
+    /// still running.
+    fn continue_recorded_thread(
+        runtime: &mut GovernedHostRuntime,
+        source_runtime: &GovernedHostRuntime,
+        open: &OpenInstanceCommand,
+        packages: &StaticPackages,
+    ) -> io::Result<Option<OpenedInstance>> {
+        let Some(recorded) = source_runtime
+            .newest_recorded_instance()
+            .map_err(invalid_data)?
+        else {
+            return Ok(None);
+        };
+        if recorded.package_version_ref == open.package_version_ref {
+            let opened = runtime
+                .open_instance(open, packages)
+                .map_err(invalid_data)?;
+            return Ok((opened.instance_ref == recorded.instance_ref).then_some(opened));
+        }
+        if recorded.package_version_ref == packages.previous.version_ref {
+            return Ok(None);
+        }
+        let source = source_runtime
+            .current_position(&recorded.instance_ref)
+            .map_err(invalid_data)?;
+        let adopt = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: format!(
+                "gaugedesk:package-adopt:{}:{}:policy:{}:{}",
+                recorded.instance_ref,
+                open.package_version_ref,
+                open.policy.epoch,
+                open.policy.envelope_hash
+            ),
+            source,
+            target_request_id: open.request_id.clone(),
+            package_version_ref: open.package_version_ref.clone(),
+            policy: open.policy.clone(),
+        };
+        match runtime.adopt_instance_from(source_runtime, &adopt, packages) {
+            Ok(fork) => Ok(Some(fork.target)),
+            Err(
+                HostRuntimeError::Protocol(ProtocolError::Mismatch(_))
+                | HostRuntimeError::Incomplete(_),
+            ) => Ok(None),
+            Err(error) => Err(invalid_data(error)),
+        }
+    }
+
     fn open_request(
         chat_id: &str,
         package_version_ref: &str,
@@ -1688,41 +1754,48 @@ impl WhipHarnessFactory {
             }
         }
         let mut source_runtime = self.runtime_for_chat(&spec.chat_id, epoch, signed_policy)?;
-        let source_open = Self::open_request(
-            &spec.chat_id,
-            packages.previous.version_ref.as_str(),
-            source_runtime.policy_ref().clone(),
-        );
-        let source = source_runtime
-            .open_instance(&source_open, &packages)
-            .map_err(invalid_data)?;
-        let source_position = source_runtime
-            .current_position(&source.instance_ref)
-            .map_err(invalid_data)?;
         let open = Self::open_request(
             &spec.chat_id,
             package.version_ref(),
             runtime.policy_ref().clone(),
         );
-        let upgrade = ForkInstanceCommand {
-            protocol: HOST_PROTOCOL.to_owned(),
-            request_id: format!(
-                "gaugedesk:package-upgrade:{}:{}:{}:policy:{}:{}",
-                spec.chat_id,
-                packages.previous.version_ref,
-                package.version_ref(),
-                open.policy.epoch,
-                open.policy.envelope_hash
-            ),
-            source: source_position,
-            target_request_id: open.request_id,
-            package_version_ref: package.version_ref().to_owned(),
-            policy: open.policy.clone(),
+        let continued =
+            Self::continue_recorded_thread(&mut runtime, &source_runtime, &open, &packages)?;
+        let instance = match continued {
+            Some(instance) => instance,
+            None => {
+                let source_open = Self::open_request(
+                    &spec.chat_id,
+                    packages.previous.version_ref.as_str(),
+                    source_runtime.policy_ref().clone(),
+                );
+                let source = source_runtime
+                    .open_instance(&source_open, &packages)
+                    .map_err(invalid_data)?;
+                let source_position = source_runtime
+                    .current_position(&source.instance_ref)
+                    .map_err(invalid_data)?;
+                let upgrade = ForkInstanceCommand {
+                    protocol: HOST_PROTOCOL.to_owned(),
+                    request_id: format!(
+                        "gaugedesk:package-upgrade:{}:{}:{}:policy:{}:{}",
+                        spec.chat_id,
+                        packages.previous.version_ref,
+                        package.version_ref(),
+                        open.policy.epoch,
+                        open.policy.envelope_hash
+                    ),
+                    source: source_position,
+                    target_request_id: open.request_id.clone(),
+                    package_version_ref: package.version_ref().to_owned(),
+                    policy: open.policy.clone(),
+                };
+                runtime
+                    .fork_instance_from(&source_runtime, &upgrade, &packages)
+                    .map(|fork| fork.target)
+                    .map_err(invalid_data)?
+            }
         };
-        let instance = runtime
-            .fork_instance_from(&source_runtime, &upgrade, &packages)
-            .map(|fork| fork.target)
-            .map_err(invalid_data)?;
 
         validate_workspace_targets(&spec.workspace_targets).map_err(invalid_data)?;
         let sandbox_read_only = spec
@@ -5692,6 +5765,250 @@ workflow Method {
             instance
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "second poem");
+    }
+
+    /// A loopback Responses endpoint that answers `turns` requests with
+    /// "Done." and records each request body.
+    fn recording_provider(
+        turns: usize,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorded = Arc::clone(&calls);
+        let server = std::thread::spawn(move || {
+            for _ in 0..turns {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10))
+                        }
+                        result => panic!("provider accept failed: {result:?}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let start = loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..start]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while bytes.len() < start + length {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&bytes[start..start + length]).unwrap());
+                let body = serde_json::json!({"output_text":"Done.",
+                    "usage":{"input_tokens":1,"output_tokens":1}});
+                let (content_type, wire) = if headers.contains("text/event-stream") {
+                    (
+                        "text/event-stream",
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            serde_json::json!({"type":"response.completed","response":body})
+                        ),
+                    )
+                } else {
+                    ("application/json", body.to_string())
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}",
+                    wire.len()
+                )
+                .unwrap();
+            }
+        });
+        (origin, calls, server)
+    }
+
+    fn continuity_spec(
+        worktree: &Path,
+        origin: &str,
+        mode: gaugedesk_harness::ChatMode,
+        package: Option<(&Path, &str)>,
+        system_prompt: Option<&str>,
+    ) -> HarnessSpec {
+        HarnessSpec {
+            chat_id: "chat-continuity".to_owned(),
+            worktree: worktree.to_path_buf(),
+            mode,
+            package_root: package.map(|(root, _)| root.to_path_buf()),
+            package_version_ref: package.map(|(_, reference)| reference.to_owned()),
+            policy_epoch: Some(1),
+            signed_policy_envelope: Some(signed_harness_policy_at(origin)),
+            provider_binding_ref: Some("model".to_owned()),
+            credential_ref: Some(
+                "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),
+            ),
+            placement_ceiling_ref: Some("local".to_owned()),
+            workspace_targets: Vec::new(),
+            runtime_placement_id: Some("placement-test".to_owned()),
+            provider: Some("openai".to_owned()),
+            model: Some("gpt-test".to_owned()),
+            base_url: None,
+            thinking: None,
+            system_prompt: system_prompt.map(str::to_owned),
+            credential_capability: Some(test_credential_capability()),
+            sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree.to_path_buf()])
+                .read_only(vec![worktree.join(".whipple")])
+                .filter_egress(vec!["api.openai.com".to_owned(), "127.0.0.1".to_owned()]),
+            roster: Vec::new(),
+        }
+    }
+
+    fn continuity_turn(
+        factory: &WhipHarnessFactory,
+        spec: &HarnessSpec,
+        origin: &str,
+        prompt: &str,
+    ) -> String {
+        let mut harness = factory.create_harness(spec).expect("harness");
+        harness.provider.base_url = origin.to_owned();
+        let outcome = harness
+            .run_turn(&gaugedesk_harness::AllowAllGate, prompt, &[], &mut |_| {})
+            .unwrap();
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        harness.instance_ref.clone()
+    }
+
+    #[test]
+    fn an_edit_chat_keeps_its_conversation_when_the_editor_persona_changes() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (origin, calls, server) = recording_provider(3);
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            SigningKey::from_seed(&[7u8; 32]).expect("key"),
+            root.path(),
+        );
+        let edit = gaugedesk_harness::ChatMode::Edit;
+        let before = continuity_spec(worktree.path(), &origin, edit, None, Some("PERSONA ONE"));
+        let after = continuity_spec(worktree.path(), &origin, edit, None, Some("PERSONA TWO"));
+
+        continuity_turn(&factory, &before, &origin, "FIRST-REQUEST");
+        let adopted = continuity_turn(&factory, &after, &origin, "SECOND-REQUEST");
+        let reopened = continuity_turn(&factory, &after, &origin, "THIRD-REQUEST");
+        server.join().unwrap();
+
+        let calls = calls.lock().unwrap();
+        let second = calls[1].to_string();
+        assert!(second.contains("PERSONA TWO"), "the new persona applies");
+        assert!(!second.contains("PERSONA ONE"));
+        assert!(
+            second.contains("FIRST-REQUEST"),
+            "the first turn is still in the thread"
+        );
+        assert_eq!(reopened, adopted, "a reopen continues the adopted instance");
+        let third = calls[2].to_string();
+        assert!(third.contains("FIRST-REQUEST") && third.contains("SECOND-REQUEST"));
+    }
+
+    #[test]
+    fn a_work_chat_keeps_its_conversation_across_agent_versions() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (origin, calls, server) = recording_provider(2);
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            SigningKey::from_seed(&[7u8; 32]).expect("key"),
+            root.path(),
+        );
+        let version = |number: u32, persona: &str| {
+            let package_root = worktree.path().join(format!(".whipple/versions/{number}"));
+            std::fs::create_dir_all(&package_root).unwrap();
+            std::fs::write(
+                package_root.join("package.json"),
+                r#"{"schema":"whipplescript.agent_package.v0","source":"method.whip",
+"workflow":"Method","agent":"assistant","system_prompt":"persona.md",
+"capabilities":["workspace.read"],"agent_abilities":["workspace.read"],"max_steps":8}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                package_root.join("method.whip"),
+                r#"
+file store project { root "." allow read ["**"] }
+workflow Method {
+  agent assistant {
+    provider owned
+    profile "repo-writer"
+    capacity 1
+    capabilities ["workspace.read"]
+  }
+  rule converse when started => {
+    tell assistant requires ["workspace.read"]
+      with access to project { read ["**"] }
+      "Run."
+  }
+}
+"#,
+            )
+            .unwrap();
+            std::fs::write(package_root.join("persona.md"), persona).unwrap();
+            let reference = AuthoredAgentPackage::load(&package_root)
+                .unwrap()
+                .version_ref()
+                .to_owned();
+            (package_root, reference)
+        };
+        let (one_root, one_ref) = version(1, "VERSION ONE");
+        let (two_root, two_ref) = version(2, "VERSION TWO");
+        let use_mode = gaugedesk_harness::ChatMode::Use;
+        let one = continuity_spec(
+            worktree.path(),
+            &origin,
+            use_mode,
+            Some((&one_root, &one_ref)),
+            None,
+        );
+        let two = continuity_spec(
+            worktree.path(),
+            &origin,
+            use_mode,
+            Some((&two_root, &two_ref)),
+            None,
+        );
+
+        continuity_turn(&factory, &one, &origin, "FIRST-REQUEST");
+        continuity_turn(&factory, &two, &origin, "SECOND-REQUEST");
+        server.join().unwrap();
+
+        let second = calls.lock().unwrap()[1].to_string();
+        assert!(second.contains("VERSION TWO") && !second.contains("VERSION ONE"));
+        assert!(
+            second.contains("FIRST-REQUEST"),
+            "the first turn is still in the thread"
+        );
     }
 
     #[test]

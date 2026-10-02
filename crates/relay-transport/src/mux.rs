@@ -19,6 +19,7 @@ use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::wire::other;
@@ -26,6 +27,9 @@ use crate::wire::other;
 /// The ALPN identifier a multiplexing client offers and a multiplexing Home
 /// selects.
 pub const MUX_ALPN: &[u8] = b"gw-mux/1";
+
+/// How long a hung-up crossing may take to deliver what it already answered.
+const HANG_UP_FLUSH: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Streams one crossing may carry at once. A phone opens a handful; this bounds
 /// what a misbehaving one can make the Home hold open locally.
@@ -51,21 +55,37 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut connection = yamux::Connection::new(tunnel.compat(), config(), yamux::Mode::Server);
-    while let Some(stream) = poll_fn(|cx| connection.poll_next_inbound(cx))
-        .await
-        .transpose()
-        .map_err(broken)?
-    {
+    // A stream whose caller the router refused before verifying ends the whole
+    // crossing, not only itself: otherwise a stranger who negotiated streams
+    // could hold the crossing by opening one refused stream after another.
+    let (hang_up, mut hung_up) = mpsc::channel::<()>(1);
+    loop {
+        let next = tokio::select! {
+            next = poll_fn(|cx| connection.poll_next_inbound(cx)) => next,
+            _ = hung_up.recv() => {
+                // Closed, not dropped: the refusal that asked for this is still
+                // queued in the connection, and dropping it would discard the
+                // answer along with the crossing.
+                let _ = timeout(HANG_UP_FLUSH, poll_fn(|cx| connection.poll_close(cx))).await;
+                return Ok(());
+            }
+        };
+        let Some(stream) = next.transpose().map_err(broken)? else {
+            return Ok(());
+        };
+        let hang_up = hang_up.clone();
         tokio::spawn(async move {
             // A stream the router will not take ends here; the others go on.
-            let Ok(mut local) = TcpStream::connect(local).await else {
+            let Ok(local) = TcpStream::connect(local).await else {
                 return;
             };
-            let mut stream = stream.compat();
-            let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
+            let registered = crate::native::CrossingConnection::register(&local);
+            let _ = crate::native::carry_until_home_closes(stream.compat(), local).await;
+            if registered.hang_up_requested() {
+                let _ = hang_up.try_send(());
+            }
         });
     }
-    Ok(())
 }
 
 type Opened = oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>;

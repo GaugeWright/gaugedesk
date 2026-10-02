@@ -31,6 +31,7 @@ export * from "./gaugeapp-account-models";
 export * from "./gaugeapp-administration-models";
 export * from "./gaugeapp-commercial-models";
 export * from "./gaugeapp-project-host-models";
+export * from "./home-execution-policy";
 export * from "./gaugeapp-model-provider-models";
 export * from "./organization-provider-intake";
 export * from "./gaugeapp-page-models";

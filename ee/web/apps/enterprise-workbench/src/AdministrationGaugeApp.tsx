@@ -961,7 +961,7 @@ function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppS
 
         <Show when={policy()}>{(value) => <OrganizationPolicyEditor page={value()} commands={props.commands} onSubmit={props.onSubmit} />}</Show>
 
-        <Show when={hosts()}>{(value) => <ProjectHostsPage page={value()} commands={props.commands} onSubmit={props.onSubmit} onOpenProject={props.onOpenProject} />}</Show>
+        <Show when={hosts()}>{(value) => <ProjectHostsPage page={value()} commands={props.commands} onSubmit={props.onSubmit} onOpenProject={props.onOpenProject} homePolicy={props.api.homeExecutionPolicy} />}</Show>
 
         <Show when={backups()}>{(value) => <BackupsPage model={value().model} session={props.session} commands={props.commands} onSubmit={props.onSubmit} api={props.api} />}</Show>
 

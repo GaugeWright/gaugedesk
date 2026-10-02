@@ -43,6 +43,8 @@ export interface PanelAgentSurfaceApi {
 export function PanelAgentSurface(props: {
     api: PanelAgentSurfaceApi;
     agent: ArchetypeNode;
+    /** The model dropdown's default-row wording, shared with Agent settings. */
+    defaultModelLabel?: string;
     /** Present when opened from a project placement: the surface is pinned to it. */
     project?: ProjectNode;
     placement?: PlacementNode;
@@ -149,7 +151,8 @@ export function PanelAgentSurface(props: {
                             </Show>
                         </section>}>
                             {(profile) => <PanelContractEditor profile={profile()} onChange={edit}
-                                authoredAbilities={authoredAbilities()} />}
+                                authoredAbilities={authoredAbilities()}
+                                defaultModelLabel={props.defaultModelLabel} />}
                         </Show>
                     </div>
                 </Show>

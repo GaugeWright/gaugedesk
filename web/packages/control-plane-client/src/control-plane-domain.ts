@@ -524,7 +524,7 @@ export interface WorkspaceChange {
  *  lacks it: streamed deltas are operational-only and never inherited. */
 export type StreamEvent =
     | { type: "user"; text: string; entry_id?: number; forkable?: boolean; origin?: string }
-    | { type: "assistant"; text: string; entry_id?: number; forkable?: boolean; origin?: string }
+    | { type: "assistant"; text: string; entry_id?: number; forkable?: boolean; origin?: string; settled_at_unix_ms?: number }
     | { type: "text"; delta: string }
     | { type: "tool"; tool: string; mediated: boolean; call_id?: string; target?: string; args?: string; origin?: string }
     | { type: "toolresult"; call_id: string; ok: boolean; tool?: string; target?: string; result?: string; origin?: string }
@@ -550,9 +550,10 @@ export type TaskKind = "answer" | "repair" | "reply" | "screen";
  *  kind is the **ask** — the verb the person is being asked to perform (ADR
  *  0082 §2): `answer` the agent's pending question, `repair` a merge conflict,
  *  `reply` to a settled turn, or `screen` inbound material a project's gate
- *  parked. `id` is the chat; a `screen` task belongs to `project` rather than
- *  to that chat. Tracker issues arrive separately, through each project's
- *  assigned-task read (WHIP-4). */
+ *  parked. `id` is the chat, except for `screen`: that task belongs to its
+ *  project and names no chat, since screening and review need none (DR-0143
+ *  §6), so its `id` is the project's. Tracker issues arrive separately,
+ *  through each project's assigned-task read (WHIP-4). */
 export interface HumanTask {
     readonly id: string;
     readonly title: string;
@@ -561,12 +562,15 @@ export interface HumanTask {
     /** The authority this task is assigned to: always the signed-in person,
      *  since the Home returns only their own (WHIP-4). */
     readonly assignee?: string;
-    /** `screen` only: the project whose quarantine this counts. The task is
-     *  project-scoped — `id` names the chat the index opens in, which is where a
-     *  reviewer goes to look, not what the count belongs to. */
+    /** `screen` only: the project whose quarantine this counts. Its Inbox is
+     *  where the task opens. */
     readonly project?: string;
     /** `screen` only: how many items are waiting on a person. */
     readonly waiting?: number;
+    /** `screen` only: the Panel placement every waiting item came from, when
+     *  there is exactly one. Its Inbox in Panel Settings then holds all of it,
+     *  and the task opens that instead of the project's. */
+    readonly placement?: string;
 }
 
 /** The signals a chat's durable state can raise (ADR 0082 §3), in the Home's

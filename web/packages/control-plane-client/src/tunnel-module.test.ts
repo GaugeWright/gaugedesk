@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+    openEventTunnel,
     openTunnel,
     setTunnelModuleLoader,
     tunnelAvailable,
@@ -28,7 +29,20 @@ function stub(): TunnelModule {
             pollStatus() { return undefined; }
             takeBody() { return ""; }
             isHandshaking() { return true; }
+            takeCredit() { return new Uint8Array(); }
         } as unknown as TunnelModule["BrowserTunnel"],
+        BrowserEventTunnel: class {
+            constructor(
+                public fingerprint: string,
+                public path: string,
+                public headers?: Record<string, string>,
+            ) {}
+            receiveFrame() {}
+            takeOutgoing() { return new Uint8Array(); }
+            pollEvent() { return undefined; }
+            isPaired() { return false; }
+            takeCredit() { return new Uint8Array(); }
+        } as unknown as TunnelModule["BrowserEventTunnel"],
     };
 }
 
@@ -45,6 +59,18 @@ describe("the browser tunnel module seam (DESK-7)", () => {
         expect(tunnelAvailable()).toBe(true);
         const { tunnel, handshake } = await openTunnel(locator);
         expect((tunnel as unknown as { fingerprint: string }).fingerprint).toBe(locator.homeFingerprint);
+        expect(handshake).toEqual(new Uint8Array([4]));
+    });
+
+    it("opens an event stream's own tunnel with its request and the same route handshake", async () => {
+        setTunnelModuleLoader(async () => stub());
+        const headers = { "x-gaugewright-home-admission": "admitted" };
+        const { tunnel, handshake } = await openEventTunnel(locator, "/workspace/events", headers);
+        expect(tunnel).toMatchObject({
+            fingerprint: locator.homeFingerprint,
+            path: "/workspace/events",
+            headers,
+        });
         expect(handshake).toEqual(new Uint8Array([4]));
     });
 

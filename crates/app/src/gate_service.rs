@@ -34,9 +34,6 @@ use gaugedesk_whip_runtime::gate_runner::{
 use gaugedesk_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
 use sha2::{Digest, Sha256};
 
-use crate::app_support::LockUnpoisoned;
-use crate::workbench_state::SharedWorkbench;
-
 /// The gate's HTTP leg.
 ///
 /// A gate reaches exactly one outside thing — the coercion provider — so this is
@@ -77,44 +74,8 @@ fn status_and_body(response: ureq::Response) -> (u16, serde_json::Value) {
     (status, body)
 }
 
-/// Build the coercion config from this account's own credential store.
-///
-/// `GATE-3b` scoped this and never delivered it, which is why `coerce-screen`
-/// had never run against a real provider. Only the screening gate needs it;
-/// review-by-hand reaches a person and needs no model at all, which is what lets
-/// it be the seedable default (ADR 0117 §7).
-pub fn gate_coercion_config(
-    workbench: &SharedWorkbench,
-    actor: &str,
-    model: &str,
-) -> io::Result<GateCoercionConfig> {
-    let scope = crate::account::account_scope(actor);
-    let (records, token) = {
-        let guard = workbench.lock_unpoisoned();
-        let records = crate::account::credentials_in_scope(guard.store_ref(), &scope);
-        let record = records.get("openai").cloned();
-        let token = record
-            .as_ref()
-            .and_then(|record| guard.unseal_account_secret(&record.sealed_token));
-        (record, token)
-    };
-    if records.is_none() {
-        return Err(io::Error::other(
-            "screening needs a linked OpenAI credential; review-by-hand needs none",
-        ));
-    }
-    let api_key = token
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| io::Error::other("linked OpenAI credential could not be unsealed"))?;
-    Ok(GateCoercionConfig {
-        backend: CoerceBackend::OpenAi,
-        provider_id: "openai".to_owned(),
-        base_url: "https://api.openai.com/v1/responses".to_owned(),
-        api_key,
-        model: model.to_owned(),
-        max_tokens: 256,
-    })
-}
+/// The model a screening gate coerces with.
+pub const SCREENING_MODEL: &str = "gpt-4.1-mini";
 
 /// A coercion config for a gate that does not coerce.
 ///
@@ -465,6 +426,89 @@ pub fn project_gate(
 }
 
 impl crate::Workbench {
+    /// The coercion config a gate pass on `project_id` may use when `actor`
+    /// runs it.
+    ///
+    /// `GATE-3b` scoped this and never delivered it, which is why `coerce-screen`
+    /// had never run against a real provider. The credential is resolved by the
+    /// same nearest-holder rule as a chat turn in the project (ADR 0062): the
+    /// project's own OpenAI pin, then `actor`'s linked one. `actor` is the
+    /// person running the pass. The routes once passed the project id here,
+    /// which named an account scope that holds nothing, so every screening gate
+    /// fell back to [`unusable_coercion_config`] whoever had linked a key.
+    ///
+    /// Only the screening gate needs this; review-by-hand reaches a person and
+    /// needs no model at all, which is what lets it be the seedable default
+    /// (ADR 0117 §7).
+    pub fn gate_coercion_config(
+        &self,
+        project_id: &str,
+        actor: &str,
+        model: &str,
+    ) -> io::Result<GateCoercionConfig> {
+        let api_key = self
+            .project_credential_secret(project_id, "openai", actor)
+            .map_err(|missing| {
+                io::Error::other(format!(
+                    "screening needs a linked OpenAI credential ({missing}); \
+                     review-by-hand needs none"
+                ))
+            })?;
+        Ok(GateCoercionConfig {
+            backend: CoerceBackend::OpenAi,
+            provider_id: "openai".to_owned(),
+            // The kernel appends `/v1/responses`. This once named the whole
+            // path, so a screening gate that did find a key would have posted
+            // to `/v1/responses/v1/responses`.
+            base_url: "https://api.openai.com".to_owned(),
+            api_key,
+            model: model.to_owned(),
+            max_tokens: 256,
+        })
+    }
+
+    /// [`Self::gate_coercion_config`], or [`unusable_coercion_config`] when no
+    /// credential resolves.
+    ///
+    /// Whether a pass needs a model is the *gate program's* business, not the
+    /// caller's. The default gate is review-by-hand: it reads the item, files a
+    /// question, and parks, coercing nowhere — so demanding a credential would
+    /// lock every review-by-hand project out of the only pass that can park a
+    /// question for it to answer. A project that installs the screening gate
+    /// genuinely does need one, and gets an obvious refusal from an unreachable
+    /// host rather than a silent call somewhere real.
+    fn gate_coercion_or_unusable(&self, project_id: &str, actor: &str) -> GateCoercionConfig {
+        self.gate_coercion_config(project_id, actor, SCREENING_MODEL)
+            .unwrap_or_else(|_| unusable_coercion_config())
+    }
+
+    /// Screen one quarantined item through its project's gate on `actor`'s
+    /// behalf: the product's screen route, less the HTTP leg.
+    pub fn screen_quarantined_as<T: GateTransport>(
+        &mut self,
+        actor: &str,
+        project_id: &str,
+        item_id: &str,
+        transport: &T,
+    ) -> io::Result<Option<String>> {
+        let coerce = self.gate_coercion_or_unusable(project_id, actor);
+        self.run_project_gate(project_id, item_id, "", &coerce, transport)
+    }
+
+    /// Deliver `actor`'s review of one quarantined item to its project's gate:
+    /// the product's review route, less the HTTP leg.
+    pub fn review_quarantined_as<T: GateTransport>(
+        &mut self,
+        actor: &str,
+        project_id: &str,
+        item_id: &str,
+        verdict: crate::gate::Verdict,
+        transport: &T,
+    ) -> io::Result<Option<String>> {
+        let coerce = self.gate_coercion_or_unusable(project_id, actor);
+        self.review_through_gate(project_id, item_id, "", verdict, &coerce, transport)
+    }
+
     /// Run this project's gate over one quarantined item and apply what it ruled.
     ///
     /// The production path `GATE-3` never had. Returns the workspace path an

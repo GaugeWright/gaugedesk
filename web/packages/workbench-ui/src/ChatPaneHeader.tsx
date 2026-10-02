@@ -5,7 +5,7 @@ import { PanelCollapseIcon } from "./PanelCollapseIcon";
 export interface ChatPaneHeaderProps {
     readonly menu?: JSX.Element;
     readonly branch?: string;
-    readonly kind?: "work" | "edit" | "management";
+    readonly kind?: "work" | "edit" | "management" | "settings";
     /** The run state remains available to assistive technology and the browser lane. */
     readonly statusLabel?: string;
     readonly statusPhase?: string;
@@ -15,7 +15,8 @@ export interface ChatPaneHeaderProps {
 
 export function ChatPaneHeader(props: ChatPaneHeaderProps): JSX.Element {
     const kindLabel = () => props.kind === "edit" ? "Edit chat"
-        : props.kind === "management" ? "Management chat" : "Work chat";
+        : props.kind === "management" ? "Management chat"
+        : props.kind === "settings" ? "Settings chat" : "Work chat";
     return (
         <div class="chat-toolbar">
             {props.menu}

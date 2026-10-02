@@ -254,6 +254,13 @@ impl Workbench {
         self.hosted_home_mode
     }
 
+    /// A desktop or other local Project Host without an identity provider:
+    /// a request carrying an account session acts as that account, and one
+    /// without a credential is the local channel.
+    pub(crate) fn desktop_account_mode(&self) -> bool {
+        self.idp.is_none() && !crate::workbench_auth::web_account_mode() && !self.hosted_home_mode
+    }
+
     pub(crate) fn configured_home_id() -> HomeId {
         if let Some(home) = gaugedesk_env::var("HOME_ID") {
             if !home.is_empty() {

@@ -1243,6 +1243,13 @@ fn run_task_streaming_billed<G: EgressGate>(
     // them. An adapter that emits none — or a turn with no prose at all — falls
     // back to the folded `assistant_text` as a single closing line, preserving
     // the pre-segments shape.
+    //
+    // Every assistant record is admitted here, as the turn settles, so they all
+    // carry the one settle time the transcript shows for the turn.
+    let settled_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
     let mut last_assistant_entry_id: Option<i64> = None;
     for obs in &outcome.observations {
         match obs.kind {
@@ -1255,6 +1262,7 @@ fn run_task_streaming_billed<G: EgressGate>(
                     scope,
                     &ServerEvent::Assistant {
                         text: obs.detail.clone(),
+                        settled_at_unix_ms,
                     },
                 )?);
             }
@@ -1268,6 +1276,7 @@ fn run_task_streaming_billed<G: EgressGate>(
             scope,
             &ServerEvent::Assistant {
                 text: outcome.assistant_text.clone(),
+                settled_at_unix_ms,
             },
         )?,
     };

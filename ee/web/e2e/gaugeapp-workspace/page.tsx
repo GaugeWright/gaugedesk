@@ -258,6 +258,9 @@ function Harness() {
     // in the real page rather than only asserted against the server.
     const domainState = query.get("domains");
     const projectHostMode = query.get("project-host") === "managed";
+    // The managed host's own Home, as the owner, a member, or a Home with no
+    // Isolated prices. Absent, the page has no Home client and keeps the Hub path.
+    const homePolicyMode = query.get("home-policy");
     const deviceLinkMode = query.get("device-link") === "1";
     const providerLifecycleMode = query.get("provider-lifecycle") === "1";
     const accountLifecycleMode = query.get("account-lifecycle") === "1";
@@ -383,7 +386,7 @@ function Harness() {
     } : app === "administration" && subscriptionLifecycleMode ? {
         "plans-services": ["subscription.plan.change", "subscription.seats.change", "subscription.cancellation.schedule"],
     } : app === "administration" && projectHostMode ? {
-        "project-hosts": ["project-host.rename", "project-host.suspend", "project-host.reinstate", "project-host.managed-policy.set", "project-host.retire", "project-home.handoff"],
+        "project-hosts": ["project-host.rename", "project-host.suspend", "project-host.reinstate", "project-host.retire", "project-home.handoff"],
     } : app === "administration" ? {
         "enterprise-identity": [
             "enterprise-identity.scim-credential.issue",
@@ -1403,6 +1406,7 @@ function Harness() {
             });
             if (!result.ok) throw new Error(`fixture Project Host settings write returned ${result.status}`);
         },
+        homeExecutionPolicy: homePolicyMode ? fixtureHomePolicy(homePolicyMode, record) : undefined,
     } as unknown as EnterpriseControlPlane;
     function emitLive(id: string, turnId: string, event: GaugeAppAgentLiveFrame["event"]): void {
         const history = liveHistories.get(id) ?? [];
@@ -1536,3 +1540,47 @@ render(
     },
     document.getElementById("root")!,
 );
+
+/** A managed host's Home answering the owner's Isolated workspace route as the
+ *  cloud Home does (gaugewright-cloud home_execution_policy.rs): owner-only
+ *  writes, enabling refused without prices or above the reservation, and
+ *  disabling always taken. */
+function fixtureHomePolicy(mode: string, record: (entry: Record<string, unknown>) => void) {
+    const pricing = mode === "unpriced"
+        ? { reservation_nanos_usd: null, nanos_usd_per_second: null }
+        : { reservation_nanos_usd: 50_000_000, nanos_usd_per_second: 50_000 };
+    let policy = { version: 1, tenant_id: "organization:fixture", isolated_workspace_enabled: false, max_attempt_nanos_usd: 0 };
+    const reading = () => ({
+        policy,
+        isolated_workspace: {
+            available: policy.isolated_workspace_enabled && pricing.nanos_usd_per_second !== null,
+            enabled_by_tenant_policy: policy.isolated_workspace_enabled,
+            reason: policy.isolated_workspace_enabled && pricing.nanos_usd_per_second !== null ? null
+                : "Isolated workspace execution requires an enabled tenant policy and positive reservation and rate limits.",
+            metering: {
+                kind: "usage" as const,
+                reservation_nanos_usd: policy.isolated_workspace_enabled && pricing.reservation_nanos_usd !== null
+                    ? Math.min(policy.max_attempt_nanos_usd, pricing.reservation_nanos_usd) : null,
+                nanos_usd_per_second: pricing.nanos_usd_per_second,
+            },
+        },
+        pricing: pricing.nanos_usd_per_second === null ? null : pricing,
+        can_edit: mode !== "member",
+    });
+    const refuse = (status: number, message: string) => Object.assign(new Error(message), { status });
+    return {
+        read: async () => reading(),
+        set: async (_host: unknown, change: { isolated_workspace_enabled: boolean; max_attempt_nanos_usd: number }, key: string) => {
+            record({ homePolicy: change, key });
+            if (mode === "member") throw refuse(403, "only the organization's owner can change Isolated workspace policy");
+            if (change.isolated_workspace_enabled) {
+                if (pricing.reservation_nanos_usd === null) throw refuse(503, "Isolated workspace pricing is not configured");
+                if (change.max_attempt_nanos_usd <= 0 || change.max_attempt_nanos_usd > pricing.reservation_nanos_usd) {
+                    throw refuse(422, "tenant attempt spend limit must be positive and within the platform ceiling");
+                }
+            }
+            policy = { ...policy, isolated_workspace_enabled: change.isolated_workspace_enabled, max_attempt_nanos_usd: change.max_attempt_nanos_usd };
+            return reading();
+        },
+    };
+}

@@ -78,6 +78,8 @@ pub const AGENT_PROPOSABLE_IMMEDIATE_COMMANDS: &[&str] = &[
     "agent.model.set",
     "agent.abilities.set",
     "agent.panel-profile.set",
+    // The gate reads the item and only its verdict returns (ADR 0110 §3).
+    "panel.inbox.screen",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -131,6 +133,9 @@ const AGENT_HUMAN_CEREMONIES: &[&str] = &[
     "commercial-payments.checkout.create",
     "commercial-payments.processor-documents.open",
     "commercial-payments.processor-support.open",
+    // Keeping or flagging an item is a person's endorsement of what they read
+    // (ADR 0110 §3); the agent never reads the item it would be endorsing.
+    "panel.inbox.review",
 ];
 
 pub fn gaugeapp_agent_action_kind(
@@ -567,6 +572,9 @@ pub(crate) fn gaugeapp_agent_thread_owner_scope(session: &GaugeAppSession) -> St
         GaugeAppKind::AgentSettings => {
             crate::agent_settings_gaugeapp::agent_settings_scope(&session.scope.id)
         }
+        GaugeAppKind::PanelSettings => {
+            crate::panel_settings_gaugeapp::panel_settings_scope(&session.scope.id)
+        }
     }
 }
 
@@ -707,7 +715,9 @@ pub fn migrate_legacy_gaugeapp_agent_transcript(
         GaugeAppKind::AccountSettings => LegacyEnvironmentKind::Hub,
         GaugeAppKind::Administration => LegacyEnvironmentKind::Administration,
         GaugeAppKind::CommercialOperations => LegacyEnvironmentKind::Vend,
-        GaugeAppKind::ProjectSettings | GaugeAppKind::AgentSettings => return Ok(false),
+        GaugeAppKind::ProjectSettings
+        | GaugeAppKind::AgentSettings
+        | GaugeAppKind::PanelSettings => return Ok(false),
     };
     let legacy_scope = format!(
         "environment-agent:{}:{}:{}",
@@ -1609,18 +1619,61 @@ pub fn contains_secret_text(value: &str) -> bool {
     pem || vendor || bearer || assigned
 }
 
+const OPENAI_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
+
 enum AgentCredential {
-    OpenAi(String),
+    OpenAi { token: String, endpoint: String },
     Codex { access: String, account_id: String },
 }
 
 impl AgentCredential {
-    fn endpoint(&self) -> &'static str {
+    fn endpoint(&self) -> &str {
         match self {
-            Self::OpenAi(_) => "https://api.openai.com/v1/responses",
+            Self::OpenAi { endpoint, .. } => endpoint,
             Self::Codex { .. } => "https://chatgpt.com/backend-api/codex/responses",
         }
     }
+}
+
+/// Where GaugeWright-funded agent turns are sent: OpenAI's Responses endpoint,
+/// unless the operator names another Responses endpoint in
+/// `GAUGEDESK_MANAGEMENT_AGENT_ENDPOINT` — an AI gateway in front of OpenAI,
+/// or a development fabric's loopback relay to one. Only the managed key goes
+/// there; a person's own linked credential always goes to OpenAI.
+///
+/// The endpoint is HTTPS, or plain HTTP on a loopback address, and ends in
+/// `/responses` with no credentials, query or fragment in it, so a mistyped
+/// value fails here rather than sending the managed key somewhere unintended.
+fn managed_agent_endpoint(configured: Option<String>) -> Result<String, GaugeAppAgentError> {
+    let Some(raw) = configured.filter(|value| !value.trim().is_empty()) else {
+        return Ok(OPENAI_RESPONSES_ENDPOINT.to_owned());
+    };
+    let refuse = || {
+        GaugeAppAgentError::Credential(
+            "the managed GaugeApp agent endpoint must be an HTTPS (or loopback HTTP) Responses endpoint"
+                .into(),
+        )
+    };
+    let raw = raw.trim();
+    let url = url::Url::parse(raw).map_err(|_| refuse())?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(name)) => name == "localhost",
+        None => false,
+    };
+    let scheme_admitted = url.scheme() == "https" || (url.scheme() == "http" && loopback);
+    if !scheme_admitted
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.path().ends_with("/responses")
+    {
+        return Err(refuse());
+    }
+    Ok(raw.to_owned())
 }
 
 fn resolve_agent_credential(
@@ -1660,7 +1713,10 @@ fn resolve_agent_credential(
                         "managed GaugeApp agent funding is enabled without its dedicated provider credential".into(),
                     )
                 })?;
-            return Ok(AgentCredential::OpenAi(token));
+            return Ok(AgentCredential::OpenAi {
+                token,
+                endpoint: managed_agent_endpoint(gaugedesk_env::var("MANAGEMENT_AGENT_ENDPOINT"))?,
+            });
         }
         return Err(GaugeAppAgentError::NoModelAccess);
     };
@@ -1671,7 +1727,10 @@ fn resolve_agent_credential(
         .ok_or_else(|| {
             GaugeAppAgentError::Credential("linked OpenAI credential could not be unsealed".into())
         })?;
-    Ok(AgentCredential::OpenAi(token))
+    Ok(AgentCredential::OpenAi {
+        token,
+        endpoint: OPENAI_RESPONSES_ENDPOINT.to_owned(),
+    })
 }
 
 fn provider_tools() -> Value {
@@ -2121,7 +2180,7 @@ where
     let serialized = serde_json::to_string(&sent)
         .map_err(|error| GaugeAppAgentError::InvalidOutput(error.to_string()))?;
     let authorization = match credential {
-        AgentCredential::OpenAi(token) => format!("Bearer {token}"),
+        AgentCredential::OpenAi { token, .. } => format!("Bearer {token}"),
         AgentCredential::Codex { access, .. } => format!("Bearer {access}"),
     };
     let mut headers = vec![
@@ -2630,6 +2689,47 @@ mod tests {
     };
     use proptest::prelude::*;
     use serde_json::json;
+
+    #[test]
+    fn managed_turns_go_to_openai_unless_the_operator_names_a_responses_endpoint() {
+        assert_eq!(
+            managed_agent_endpoint(None).unwrap(),
+            OPENAI_RESPONSES_ENDPOINT
+        );
+        assert_eq!(
+            managed_agent_endpoint(Some("  ".into())).unwrap(),
+            OPENAI_RESPONSES_ENDPOINT
+        );
+        for admitted in [
+            "https://gateway.ai.cloudflare.com/v1/account/gateway/openai/responses",
+            "http://127.0.0.1:7904/openai/responses",
+            "http://[::1]:7904/openai/responses",
+            "http://localhost:7904/openai/responses",
+        ] {
+            assert_eq!(
+                managed_agent_endpoint(Some(admitted.into())).unwrap(),
+                admitted
+            );
+        }
+        for refused in [
+            "http://models.example/openai/responses",
+            "http://10.0.0.5:7904/openai/responses",
+            "https://gateway.example/openai/chat/completions",
+            "https://user:secret@gateway.example/responses",
+            "https://gateway.example/responses?key=secret",
+            "https://gateway.example/responses#fragment",
+            "file:///responses",
+            "not a url",
+        ] {
+            assert!(
+                matches!(
+                    managed_agent_endpoint(Some(refused.into())),
+                    Err(GaugeAppAgentError::Credential(_))
+                ),
+                "{refused} must be refused"
+            );
+        }
+    }
 
     #[test]
     fn a_management_thread_has_one_live_turn_and_stop_is_standing_intent() {

@@ -20,10 +20,11 @@ Feature: Round 5 — honest View after discard, plain chat types, reachable nav,
     When I expand the advanced settings
     Then the raw settings text is shown
 
-  Scenario: Agent settings share the workbench with its authoring chat
+  Scenario: selecting an Agent opens its settings and keeps it selected
     Given the workbench is open
-    When I open the config editor
-    Then the settings page is open beside an edit chat
+    When I select the first Agent in the Workshop
+    Then its settings are open with the Agent selected in the Workshop
+    And no edit chat was opened for it
     When I close the config editor
 
   Scenario: search has a clear control that resets the filter

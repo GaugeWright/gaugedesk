@@ -1810,6 +1810,26 @@
     },
     {
       "site": {
+        "callable": "impl inherent for Workbench::record_kept_item",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "self . collaboration_workspaces . get (& workspace_id) . ok_or_else (| | io :: Error :: other (\"project collaboration workspace is not open\")) ? . seed_main (& [(root . as_str () , body . as_str ())])",
+        "file": "crates/app/src/agent_release.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::record_kept_item",
+        "capability": "seed_main",
+        "count": 1,
+        "expression": "target . seed_main (& [])",
+        "file": "crates/app/src/agent_release.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
         "callable": "impl inherent for Workbench::ensure_collaboration_target_partition",
         "capability": "create_engagement",
         "count": 1,

@@ -176,7 +176,15 @@ impl Workbench {
             .chats
             .get(chat_id)
             .and_then(|chat| chat.owner.clone())
-            .or_else(|| self.home_owner_account())
+            .unwrap_or_else(|| self.project_addressee())
+    }
+
+    /// Who an ask is addressed to when no chat owner narrows it: the Home's
+    /// owner, or its acting authority when nobody owns it. The inbound review
+    /// count is addressed here directly, because it belongs to a project and
+    /// names no chat (DR-0143 §6).
+    pub fn project_addressee(&self) -> String {
+        self.home_owner_account()
             .unwrap_or_else(|| self.authority().as_str().to_owned())
     }
 

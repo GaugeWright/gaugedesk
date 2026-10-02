@@ -30,6 +30,7 @@ export { FirstRunOverlay } from "./FirstRunOverlay";
 export type { FirstRunApi } from "./FirstRunOverlay";
 export { AgentSettings, plainConfigError, readFormConfig, writeFormConfig } from "./AgentSettings";
 export type { AgentSettingsApi, AgentSettingsProps } from "./AgentSettings";
+export { defaultModelLabel } from "./agent-controls";
 export { buildOutgoing, classifyAttachment, documentFileType, extractDocumentAttachment, fileToBase64 } from "./attachments";
 export type { Attachment, DocumentFileType, ImageRef } from "./attachments";
 export { Carousel, applySelection } from "./CarouselIsland";
@@ -89,7 +90,6 @@ export { canCommand, deriveStatus, initialConnection, reduce as reduceConnection
 export type { ConnectionEvent, ConnectionState, ConnectionStatus } from "./connection";
 export { ContentViewer } from "./ContentViewer";
 export type { ContentViewerProps, SpecialFileRenderer } from "./ContentViewer";
-export { QuarantineIndex } from "./QuarantineIndex";
 export {
     collectionBlockerFor,
     collectionInputFrom,
@@ -171,6 +171,7 @@ export type { ChatGroup, FilterArchetype, FilterChat, FilterPlacement, FilterPro
 export { forkSource, isFork } from "./fork-lineage";
 export { FreshnessBanner } from "./FreshnessBanner";
 export { Icon } from "./icons";
+export { installTooltips } from "./tooltips";
 export type { IconName } from "./icons";
 export { LoadError } from "./LoadError";
 export { MobileContent } from "./MobileContent";
@@ -231,6 +232,9 @@ export type { PanelAgentSurfaceApi } from "./PanelAgentSurface";
 export { PanelContractEditor } from "./PanelContractEditor";
 export { editChatToOpen, panelAgentSurfacePlan } from "./panel-agent-opening";
 export type { PanelAgentSurfacePlan } from "./panel-agent-opening";
+export { PanelSettingsContent, PanelSettingsMenu } from "./PanelSettings";
+export type { PanelSettingsApi } from "./PanelSettings";
+export type { PanelSettingsPage } from "./panel-settings";
 export { ProjectInbox } from "./ProjectInbox";
 export type { ProjectInboxApi } from "./ProjectInbox";
 export { SessionProvider, useSession, localTurnActivity, TURN_ACTIVITIES } from "./session-context";
@@ -260,15 +264,6 @@ export type { ToolGroup, ToolId } from "./tool-verb";
 export { groupChatsByWorkstream, hasWorkstreams } from "./workstream-grouping";
 export type { ChatLike, GroupedChats, WorkstreamGroup } from "./workstream-grouping";
 export { Workspace } from "./Workspace";
-export { Deliverables, saveToBrowser } from "./Deliverables";
-export {
-    DELIVERABLE_ROOT,
-    deliverablesIn,
-    isDeliverablePath,
-    mediaTypeFor,
-    newDeliverables,
-    type Deliverable,
-} from "./deliverable";
 export { WorkbenchShell, createWorkbenchShellState } from "./WorkbenchShell";
 export type {
     WorkbenchShellOptions,

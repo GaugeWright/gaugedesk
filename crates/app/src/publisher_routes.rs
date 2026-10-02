@@ -404,26 +404,20 @@ pub struct ScreenQuarantinedItem {}
 /// running product at all.
 pub async fn screen_quarantined_item(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path((project_id, item_id)): axum::extract::Path<(String, String)>,
     Json(_request): Json<ScreenQuarantinedItem>,
 ) -> Response {
+    let bearer = crate::net_http::bearer(&headers).map(str::to_owned);
     let result = tokio::task::spawn_blocking(move || {
-        // Whether this pass needs a model is the *gate program's* business, not
-        // the route's. The default gate is review-by-hand: it reads the item,
-        // files a question, and parks, coercing nowhere — so demanding a
-        // credential here would lock every review-by-hand project out of the
-        // only pass that can park a question for it to answer. A project that
-        // installs the screening gate genuinely does need one, and gets an
-        // obvious refusal from an unreachable host rather than a silent call
-        // somewhere real.
-        let coerce =
-            crate::gate_service::gate_coercion_config(&workbench, &project_id, "gpt-4.1-mini")
-                .unwrap_or_else(|_| crate::gate_service::unusable_coercion_config());
-        workbench.lock_unpoisoned().run_project_gate(
+        // A screening gate coerces with the credential of the person running
+        // the pass (or the project's own pin), never one keyed by the project.
+        let mut workbench = workbench.lock_unpoisoned();
+        let actor = workbench.actor(bearer.as_deref());
+        workbench.screen_quarantined_as(
+            &actor,
             &project_id,
             &item_id,
-            "",
-            &coerce,
             &crate::gate_service::HttpGateTransport,
         )
     })
@@ -457,6 +451,7 @@ pub async fn screen_quarantined_item(
 /// which made it exactly the "privileged runtime service" ADR 0110 §2 rules out.
 pub async fn review_quarantined_item(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path((project_id, item_id)): axum::extract::Path<(String, String)>,
     Json(request): Json<ReviewQuarantinedItem>,
 ) -> Response {
@@ -471,20 +466,19 @@ pub async fn review_quarantined_item(
                 .into_response()
         }
     };
+    let bearer = crate::net_http::bearer(&headers).map(str::to_owned);
     let result = tokio::task::spawn_blocking(move || {
         // Screening needs a provider; review-by-hand asks a person and calls no
         // model. Not having a credential must therefore not stop a human review,
         // so an absent one degrades to a config the human path never reaches
         // rather than refusing the request.
-        let coerce =
-            crate::gate_service::gate_coercion_config(&workbench, &project_id, "gpt-4.1-mini")
-                .unwrap_or_else(|_| crate::gate_service::unusable_coercion_config());
-        workbench.lock_unpoisoned().review_through_gate(
+        let mut workbench = workbench.lock_unpoisoned();
+        let actor = workbench.actor(bearer.as_deref());
+        workbench.review_quarantined_as(
+            &actor,
             &project_id,
             &item_id,
-            "",
             verdict,
-            &coerce,
             &crate::gate_service::HttpGateTransport,
         )
     })

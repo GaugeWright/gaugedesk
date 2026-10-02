@@ -95,7 +95,6 @@ import {
     changedUserFiles,
     chatIdFromSearch,
     ContentViewer,
-    QuarantineIndex,
     ContextPanel,
     DeploymentPanel,
     type DeploymentSelection,
@@ -137,6 +136,9 @@ import {
     ProjectTrackerPanel,
     type PendingTrackerCompletion,
     ProjectModelAccessPanel,
+    PanelSettingsContent,
+    PanelSettingsMenu,
+    type PanelSettingsPage,
     ProjectSettingsContent,
     ProjectSettingsMenu,
     type ProjectSettingsPage,
@@ -169,6 +171,7 @@ import {
     Workspace,
     WorkbenchShell,
     createWorkbenchShellState,
+    defaultModelLabel,
     writeChatModelPin,
     UNIVERSAL_COMPOSER_CAPABILITIES,
     writeChatThinking,
@@ -841,7 +844,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
     }
     const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string; kind: AgentKind } | null>(null);
-    let agentSettingsOpenSequence = 0;
     // The per-project Engagement pane (FED-7), opened from a project node.
     const [engagement, setEngagement] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // LLM-2: the per-project model-access panel (pin a BYOK key at project scope).
@@ -861,6 +863,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         setRoutedProject(id);
         api.setCurrentProject(id);
         props.gaugeApps?.close();
+        closePanelSettings();
         setProjectSettings({ id, name: request.name });
         setProjectSettingsPage("overview");
         props.gaugeApps?.clearProjectRequest?.();
@@ -888,6 +891,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         placement?: PlacementNode;
     } | null>(null);
     const [projectInbox, setProjectInbox] = createSignal<{ id: ProjectId; name: string } | null>(null);
+    // An opened Panel placement's own settings (Panel Settings): settings in
+    // Content, pages in Menu and its management conversation in Chat. A Panel
+    // placement hosts no chats, so this is what selecting one opens.
+    const [panelSettings, setPanelSettings] = createSignal<{
+        projectId: ProjectId;
+        projectName: string;
+        placementId: PlacementId;
+        name: string;
+    } | null>(null);
+    const [panelSettingsPage, setPanelSettingsPage] = createSignal<PanelSettingsPage>("overview");
+    const closePanelSettings = () => {
+        setPanelSettings(null);
+        setPanelSettingsPage("overview");
+    };
 
     // Mirror the workspace *live* across clients over the workspace event stream
     // (the sibling of the per-chat SSE): the server pushes a "changed" ping whenever
@@ -902,6 +919,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // per keystroke-ish action and churned the tree (round-13 follow-up).
     const [navTick, setNavTick] = createSignal(0);
     const bumpNav = () => setNavTick((k) => k + 1);
+    // The open chat's tool results, which can change its worktree before the
+    // turn settles. Only the Files pane and viewer read it (`worktreeRev`).
+    const [worktreeTick, setWorktreeTick] = createSignal(0);
+    const bumpWorktree = () => setWorktreeTick((k) => k + 1);
     const [tutorialInfo, { refetch: refetchTutorial }] = createResource(
         () => tutorialsProject() ? [tutorialsProject(), navTick()] as const : false,
         () => api.getShippedTutorial("basics"),
@@ -1252,6 +1273,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             resolvedDefault() ?? null,
         ),
     );
+    // What an Agent's preferred model may be: the same reachable models, unpinned.
+    const agentModelChoices = createMemo<ModelOption[]>(() =>
+        modelOptions(linkedAccounts(), enabledModels(), undefined, modelCatalog(), resolvedDefault() ?? null));
     // The current pin as the `<select>` value: `provider:id`, or "" for Default.
     const modelValue = () => (paneModel().id ? modelKey(paneModel()) : "");
     // The reasoning-effort options follow the pinned model; the toggle only shows when the
@@ -1474,6 +1498,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // connected at once; this only decides which one serves the work in hand.
     createEffect(() => {
         const requested = projectSettings()?.id
+            ?? panelSettings()?.projectId
             ?? (projectHome()?.id === routedProject() ? routedProject() : null);
         api.setCurrentProject((requested ?? currentProject()?.id ?? null) as ProjectId | null);
     });
@@ -1710,24 +1735,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         kind: "file" | "folder";
         nonce: number;
     } | null>(null);
-    // The inbound queue the content pane is showing (ADR 0110 §7). The queue is
-    // the *project's*; the chat is only where a reviewer acts from — so both are
-    // held, and the surface closes when you navigate away from that chat rather
-    // than lingering over an unrelated one.
-    const [reviewing, setReviewing] = createSignal<{ project: string; chat: EngagementId } | null>(null);
-    const reviewingProject = () => reviewing()?.project ?? null;
-    // `chat` is passed explicitly rather than read from `selected()`: the top bar
-    // opens the chat and the surface in one gesture, and the selection signal may
-    // not have settled on the new chat yet when this runs.
-    const setReviewingProject = (project: string | null, chat?: EngagementId | null) => {
-        const on = chat ?? selected();
-        setReviewing(project && on ? { project, chat: on } : null);
-    };
     const workbenchShell = createWorkbenchShellState({
-        selection: () => ({
-            chatSelected: selected() !== null,
-            fileSelected: selectedFile() !== null,
-        }),
+        // An open settings page counts as both: its settings chat fills the chat
+        // lane and the page fills Content. Without that, the narrow carousel
+        // snapped back from the page that was just opened when no chat was open.
+        selection: () => {
+            const settings = agentSettings() !== null || projectSettings() !== null
+                || panelSettings() !== null;
+            return {
+                chatSelected: selected() !== null || settings,
+                fileSelected: selectedFile() !== null || settings
+                    || tutorialsProject() !== null || openedPanelAgent() !== null,
+            };
+        },
     });
     // Give management pages the reading width while their conversation is idle.
     // The chat rail remains one click away, and ordinary Work gets its prior
@@ -1761,10 +1781,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (!id) return;
         setStreamReady(false);
         setSelectedFile(null);
-        // Leaving the chat a review was opened from closes the surface: an inbound
-        // queue shown over an unrelated chat reads as that chat's, and the verdict
-        // is submitted from whichever chat is open.
-        if (reviewing() && reviewing()!.chat !== id) setReviewing(null);
         setSnapshot(empty);
         setLive(empty);
         void loadSnapshot(id);
@@ -1776,6 +1792,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 if (ev.type === "text") setActivity("writing…");
                 else if (ev.type === "tool") setActivity("using a tool…");
                 else if (ev.type === "blocked") setActivity("effect blocked by the membrane");
+                // A tool that finished may have written the worktree mid-turn, so
+                // the Files pane must not wait for the turn to settle (WS-637).
+                if (ev.type === "toolresult") bumpWorktree();
             },
             () => {
                 setStreamReady(true);
@@ -1807,8 +1826,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // exists before we focus it.)
     let composerEl: HTMLTextAreaElement | undefined;
     function openChat(id: EngagementId) {
-        agentSettingsOpenSequence += 1;
         closeProjectSettings();
+        closePanelSettings();
         setAgentSettings(null);
         setTutorialsProject(null);
         setOpenedPanelAgent(null);
@@ -1822,25 +1841,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         queueMicrotask(() => composerEl?.focus());
     }
 
-    async function openAgentSettings(id: ArchetypeId, name: string, kind: AgentKind) {
-        const sequence = ++agentSettingsOpenSequence;
-        try {
-            const workspace = await api.getWorkspace();
-            if (sequence !== agentSettingsOpenSequence) return;
-            const agent = workspace.archetypes.find((candidate) => candidate.id === id);
-            if (!agent) throw new Error("This Agent is no longer available.");
-            const existing = editChatToOpen(agent.chats);
-            const chat = existing ?? await api.createChatUnderArchetype(id, "edit chat");
-            if (!existing) bumpNav();
-            if (sequence !== agentSettingsOpenSequence) return;
-            openChat(chat);
-            setAgentSettings({ id, name, kind });
-            workbenchShell.openPane("content");
-        } catch (error) {
-            if (sequence === agentSettingsOpenSequence) {
-                setStatus(`Couldn't open ${name} settings: ${String(error)}`);
-            }
-        }
+    // Selecting an Agent opens its settings and nothing else: the open work or
+    // edit chat stays where it was, as it does under a GaugeApp
+    // (navigation.md), and the Agent's row stays selected in the nav.
+    function openAgentSettings(id: ArchetypeId, name: string, kind: AgentKind) {
+        closeProjectSettings();
+        closePanelSettings();
+        setTutorialsProject(null);
+        setOpenedPanelAgent(null);
+        setAgentSettings({ id, name, kind });
+        workbenchShell.openPane("content");
     }
 
     // Opening a Panel agent is one movement across the panes (navigation.md,
@@ -1850,6 +1860,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // chats.
     async function openPanelAgent(agent: ArchetypeNode, project?: ProjectNode) {
         setTutorialsProject(null);
+        closePanelSettings();
         const placement = project?.placements.find((candidate) =>
             candidate.kind === "panel" && candidate.archetypeId === agent.id);
         if (!placement) {
@@ -1860,6 +1871,49 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         }
         setOpenedPanelAgent({ agent, project, placement });
         workbenchShell.openPane("content");
+    }
+
+    // Selecting a Panel placement opens its settings and leaves the work chat
+    // that was open beneath them, as Project Settings does. It needs no Agent
+    // record, so a person who did not author the Agent can open it too.
+    function openPanelSettings(project: ProjectNode, placement: PlacementNode) {
+        props.gaugeApps?.close();
+        closeProjectSettings();
+        setAgentSettings(null);
+        setTutorialsProject(null);
+        setOpenedPanelAgent(null);
+        api.setCurrentProject(project.id);
+        setPanelSettings({
+            projectId: project.id,
+            projectName: project.name,
+            placementId: placement.placementId,
+            name: placement.archetypeName,
+        });
+        setPanelSettingsPage("overview");
+        workbenchShell.openPane("content");
+    }
+
+    // The top bar's inbound count opens an Inbox, never a chat: screening and
+    // review are project acts (DR-0143 §6). When every waiting item came from
+    // one Panel placement, its Inbox in Panel Settings holds all of it;
+    // otherwise, or once that placement is gone, the project's Inbox does.
+    async function openInbox(inbox: { project: string; projectName: string; placement?: string }) {
+        if (inbox.placement) {
+            try {
+                const workspace = await api.getWorkspace();
+                const project = workspace.projects.find((candidate) => candidate.id === inbox.project);
+                const placement = project?.placements.find((candidate) =>
+                    candidate.kind === "panel" && candidate.placementId === inbox.placement);
+                if (project && placement) {
+                    openPanelSettings(project, placement);
+                    setPanelSettingsPage("inbox");
+                    return;
+                }
+            } catch {
+                // The project's Inbox below shows the same items and more.
+            }
+        }
+        setProjectInbox({ id: inbox.project as ProjectId, name: inbox.projectName });
     }
 
     // UX-4: mirror the in-chat file selection into the URL (`?chat=<id>&file=<path>`) so a
@@ -2368,12 +2422,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             api={api}
             selected={selected()}
             onSelect={openChat}
-            onOpenArchetypeSettings={(id, name, kind) => void openAgentSettings(id, name, kind)}
+            onOpenArchetypeSettings={(id, name, kind) => openAgentSettings(id, name, kind)}
+            openedArchetype={agentSettings()?.id ?? null}
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
             onOpenProjectHome={(id, name) => {
                 props.gaugeApps?.close();
                 setOpenedPanelAgent(null);
+                closePanelSettings();
                 setRoutedProject(id);
                 api.setCurrentProject(id);
                 setProjectSettings({ id, name });
@@ -2383,6 +2439,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenProjectTasks={(id, name) => setProjectTasks({ id, name })}
             onOpenTutorials={(id) => {
                 closeProjectSettings();
+                closePanelSettings();
                 setOpenedPanelAgent(null);
                 setRoutedProject(id);
                 api.setCurrentProject(id);
@@ -2392,6 +2449,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onDeployPlacement={setDeployment}
             onOpenPanelAgent={(agent, project) => void openPanelAgent(agent, project)
                 .catch((error) => setStatus(`Couldn't open ${agent.name}: ${String(error)}`))}
+            onOpenPanelPlacement={openPanelSettings}
             onOpenInbox={(id, name) => setProjectInbox({ id, name })}
             onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
@@ -2847,30 +2905,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }>
                 {(id) => (
                     <SessionProvider value={desktopEnvironment.openSession(id).session}>
-                        {/* The review surface takes the pane rather than a fourth tab
-                            inside the viewer (ADR 0110 §7, GATE-6). A tab would imply
-                            inbound material is another view of the selected workspace
-                            file; it is the one kind of content no agent can reach, and
-                            putting it in that tab strip would place it in the file
-                            namespace the protection is stated over. */}
-                        <Show when={reviewingProject()} keyed fallback={<ContentViewer />}>
-                            {(project) => (
-                                <div class="viewer">
-                                    <div class="tabs" data-viewer-tabs>
-                                        <span class="tab active" data-tab="inbound">inbound</span>
-                                        <span class="status viewer-filename">awaiting your review</span>
-                                        <button
-                                            class="ghost"
-                                            data-inbound-close
-                                            onClick={() => setReviewingProject(null)}
-                                        >
-                                            back to files
-                                        </button>
-                                    </div>
-                                    <QuarantineIndex project={project} />
-                                </div>
-                            )}
-                        </Show>
+                        <ContentViewer />
                     </SessionProvider>
                 )}
             </Show>
@@ -2910,6 +2945,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         <Show when={tutorialsProject()} fallback={<Show when={openedPanelAgent()} fallback={contentPane()}>
             {(opened) => <PanelAgentSurface
                 api={api}
+                defaultModelLabel={defaultModelLabel(agentModelChoices())}
                 agent={opened().agent}
                 project={opened().project}
                 placement={opened().placement}
@@ -3257,7 +3293,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     // static reference was in no registry and could not be resolved.
                     defaultCredentialRef={import.meta.env.VITE_PUBLIC_CREDENTIAL_REF ?? ""}
                     onOpenInbox={() => {
-                        setProjectInbox({ id: selectedDeployment().projectId as ProjectId, name: selectedDeployment().projectName });
+                        // From a Panel placement's settings, its own Inbox is
+                        // the one meant; elsewhere, the project's.
+                        if (panelSettings()?.placementId === selectedDeployment().placementId) setPanelSettingsPage("inbox");
+                        else setProjectInbox({ id: selectedDeployment().projectId as ProjectId, name: selectedDeployment().projectName });
                         setDeployment(null);
                     }}
                     onClose={() => setDeployment(null)}
@@ -3269,6 +3308,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 project={inbox().id}
                 projectName={inbox().name}
                 onClose={() => setProjectInbox(null)}
+                onReviewed={bumpNav}
             />}</Show>
 
             <Show when={selected() && showShelf()}>
@@ -3300,7 +3340,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         api,
         engagementId: () => id,
         project: () => currentProject()?.id ?? null,
-        worktreeRev: () => `${status()}:${methodInspection()?.phase ?? ""}:${methodInspection()?.package_ref ?? ""}`,
+        // The status line moves only for the on-screen chat's own turn. A turn
+        // that settled while another chat was shown, a sibling's landing synced
+        // into this worktree, or a tool's mid-turn write moves the worktree
+        // without it, so `navTick` (every settle and workspace event) and
+        // `worktreeTick` (tool results) are folded in too (WS-637).
+        worktreeRev: () => `${navTick()}:${worktreeTick()}:${status()}:${methodInspection()?.phase ?? ""}:${methodInspection()?.package_ref ?? ""}`,
         selectedFile,
         selectFile: (path) => setSelectedFile(path),
         canEditFile: (path) => {
@@ -3316,8 +3361,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         readOnlyFileReason: (path) => path.startsWith("targets/")
             ? "This chat can read this target but cannot edit it."
             : "This file is generated or protected and cannot be edited here.",
-        reviewingProject,
-        reviewProject: (project) => setReviewingProject(project),
         diff: () => diff() ?? "",
         mergePhase: () => merge()?.phase ?? null,
         mergeConflicted: () => merge()?.phase === "Rejected" && merge()?.git_outcome === "Conflict",
@@ -4156,7 +4199,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 props.gaugeApps?.close();
                                 openChat(item);
                             }}
-                            onReviewInbound={(project, id) => setReviewingProject(project, id)}
+                            onOpenInbox={(inbox) => void openInbox(inbox)}
                             assigned={bearer() !== null ? {
                                 // The personal queue across every project this Home
                                 // lists (WHIP-4). Only with an account session: the
@@ -4181,7 +4224,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     navFooter={navFooter}
                     chat={() => <>
                         <div
-                            hidden={props.gaugeApps?.active() || !!projectSettings() || !!agentSettings()}
+                            hidden={props.gaugeApps?.active() || !!projectSettings() || !!agentSettings() || !!panelSettings()}
                             data-work-chat-slot
                             data-chat-drop-target
                             onDragEnter={chatFileDrop.enter}
@@ -4198,7 +4241,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             {/* The chat lane follows the content pane: an open
                                 Agent's settings take precedence, as they do there. */}
                             <Show when={agentSettings()} keyed fallback={
-                                <Show when={projectSettings()} keyed>{(project) => <ManagementChat
+                                <Show when={projectSettings()} keyed fallback={
+                                    <Show when={panelSettings()} keyed>{(panel) => <ManagementChat
+                                        api={api} target={{ app: "panel-settings", id: panel.placementId, project: panel.projectId }}
+                                        name={`${panel.name} · ${panel.projectName}`}
+                                        mobile={workbenchShell.isMobile()}
+                                        onCollapse={() => workbenchShell.setCollapsed("chat", true)}
+                                        onChanged={() => { bumpNav(); }}
+                                    />}</Show>
+                                }>{(project) => <ManagementChat
                                     api={api} target={{ app: "project-settings", id: project.id }} name={project.name}
                                     mobile={workbenchShell.isMobile()}
                                     onCollapse={() => workbenchShell.setCollapsed("chat", true)}
@@ -4218,7 +4269,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </>}
                     content={() => <Show when={props.gaugeApps?.active()} fallback={
                         <Show when={agentSettings()} keyed fallback={
-                            <Show when={projectSettings()} fallback={panelAgentOrContent()}>
+                            <Show when={projectSettings()} fallback={<Show when={panelSettings()} keyed fallback={panelAgentOrContent()}>
+                                {(panel) => <PanelSettingsContent
+                                    api={api}
+                                    projectId={panel.projectId}
+                                    projectName={panel.projectName}
+                                    placementId={panel.placementId}
+                                    page={panelSettingsPage()}
+                                    refreshKey={navTick()}
+                                    onSelectPage={setPanelSettingsPage}
+                                    onClose={closePanelSettings}
+                                    onDeploy={setDeployment}
+                                    onChanged={() => { bumpNav(); }}
+                                />}
+                            </Show>}>
                                 <Show when={currentProjectSettingsWorkspace()} fallback={
                                     <Show when={projectSettingsWorkspace.error} fallback={<p class="project-settings-empty" role="status">Loading project settings…</p>}>
                                         {(error) => <div class="project-settings-empty" role="alert">
@@ -4251,6 +4315,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 name={a.name}
                                 kind={a.kind}
                                 refreshKey={navRefresh()}
+                                modelChoices={agentModelChoices()}
                                 onClose={() => setAgentSettings(null)}
                                 onSaved={bumpNav}
                             />}
@@ -4258,7 +4323,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     }>
                         {props.gaugeApps?.content()}
                     </Show>}
-                    files={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={tutorialsProject()} fallback={<Show when={projectSettings()} fallback={filesPane()}>
+                    files={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={tutorialsProject()} fallback={<Show when={projectSettings()} fallback={<Show when={panelSettings()} fallback={filesPane()}>
+                        {(panel) => <PanelSettingsMenu
+                            name={panel().name}
+                            page={panelSettingsPage()}
+                            onSelect={setPanelSettingsPage}
+                            onClose={closePanelSettings}
+                        />}
+                    </Show>}>
                         {(request) => <ProjectSettingsMenu
                             projectName={request().name}
                             isPersonal={currentProjectSettingsWorkspace()?.project.isPersonal}

@@ -272,7 +272,6 @@
             { "id": "add-project-host", "operation": "project-host.add", "lifecycle": "project-host-enrollment", "capability": "project-hosts.manage", "secretBoundary": "claim/pair proof is consumed" },
             { "id": "inspect-project-host", "operation": "project-host.read", "lifecycle": "project-host", "capability": "project-hosts.read", "secretBoundary": "operational evidence only" },
             { "id": "rename-project-host", "operation": "project-host.rename", "lifecycle": "project-host", "capability": "project-hosts.manage", "secretBoundary": "metadata only" },
-            { "id": "set-managed-policy", "operation": "project-host.managed-policy.set", "lifecycle": "managed-project-host", "capability": "project-hosts.manage", "secretBoundary": "policy reference only" },
             { "id": "suspend-project-host", "operation": "project-host.suspend", "lifecycle": "project-host", "capability": "project-hosts.manage", "secretBoundary": "future admission only" },
             { "id": "reinstate-project-host", "operation": "project-host.reinstate", "lifecycle": "project-host", "capability": "project-hosts.manage", "secretBoundary": "current proofs rechecked" },
             { "id": "handoff-project-home", "operation": "project-home.handoff", "lifecycle": "project-handoff", "capability": "project-hosts.handoff", "secretBoundary": "Home content moves authority-to-authority and never through the page" },

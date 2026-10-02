@@ -67,6 +67,8 @@ type ProjectLens = "chats" | "archetype";
 type ProjectStatus = "active" | "archived" | "all";
 const GROUPING_KEY = "ui.projectsGrouping";
 const STATUS_KEY = "ui.projectsStatus";
+/** The projects filter menu's width; `.facet-filter-menu` in styles.css. */
+const FILTER_MENU_WIDTH = 236;
 
 function readStoredChoice<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
     try {
@@ -175,6 +177,8 @@ export function FacetBrowser(props: {
     selected: EngagementId | null;
     onSelect: (id: EngagementId) => void;
     onOpenArchetypeSettings: (id: ArchetypeId, name: string, kind: AgentKind) => void;
+    /** The Agent whose settings are open, shown selected in the tree. */
+    openedArchetype?: ArchetypeId | null;
     /** Open the per-project Engagement pane (hand off / share a project, FED-7). */
     onOpenEngagement: (id: ProjectId, name: string) => void;
     onOpenModelAccess: (id: ProjectId, name: string) => void;
@@ -194,6 +198,10 @@ export function FacetBrowser(props: {
     /** Open a Panel agent — its edit chat in Chat, the agent itself in Content — or,
      *  with a project, the same surface pinned to that project's placement (PANEL-12). */
     onOpenPanelAgent?: (agent: Workspace["archetypes"][number], project?: Workspace["projects"][number]) => void;
+    /** Open a Panel placement's settings — its pinned version, deployments and
+     *  Inbox — with its management conversation (Panel Settings). Needs no
+     *  Agent record, so it opens for a person who did not author the Agent. */
+    onOpenPanelPlacement?: (project: Workspace["projects"][number], placement: Workspace["projects"][number]["placements"][number]) => void;
     onOpenInbox?: (project: ProjectId, name: string) => void;
     onAttachTarget?: (id: ProjectId, name: string, kind: "external-vcs" | "external-folder") => void;
     onOpenForkTree: (chat: EngagementId) => void;
@@ -221,6 +229,19 @@ export function FacetBrowser(props: {
     const [searchOpen, setSearchOpen] = createSignal(false);
     const [filterOpen, setFilterOpen] = createSignal(false);
     const [filterPage, setFilterPage] = createSignal<"root" | "status" | "grouping">("root");
+    // The menu is wider than a docked navigator, which clips what overflows it,
+    // so it is placed against the window: from the button's left edge
+    // rightward, over the pane beside the navigator, and kept on screen.
+    const [filterAt, setFilterAt] = createSignal({ left: 0, top: 0 });
+    const toggleFilter = (button: HTMLElement) => {
+        const rect = button.getBoundingClientRect();
+        setFilterAt({
+            left: Math.max(6, Math.min(rect.left, window.innerWidth - FILTER_MENU_WIDTH - 6)),
+            top: rect.bottom + 4,
+        });
+        setFilterPage("root");
+        setFilterOpen((value) => !value);
+    };
     const [grouping, setGroupingSignal] = createSignal<ProjectLens>(readStoredChoice(GROUPING_KEY, ["chats", "archetype"], "chats"));
     const [projectStatus, setProjectStatus] = createSignal<ProjectStatus>(readStoredChoice(STATUS_KEY, ["active", "archived", "all"], "active"));
     // The nav's initial/repair read uses the workspace **freshness carriage** (ADR
@@ -1130,13 +1151,22 @@ export function FacetBrowser(props: {
         ];
     };
 
+    // A Panel placement opens its own settings (Panel Settings). Without that
+    // surface wired, it falls back to the Panel-agent surface pinned to it,
+    // which needs the Agent record a non-author is not shown.
+    const openPanelPlacement = (p: ProjectNode, pl: ProjectNode["placements"][number]) => {
+        if (props.onOpenPanelPlacement) {
+            props.onOpenPanelPlacement(p, pl);
+            return;
+        }
+        const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
+        if (agent) props.onOpenPanelAgent?.(agent, p);
+    };
+
     // A placement row's menu (shared by right-click and the row's ⋯ button).
     const placementMenuItems = (p: ProjectNode, pl: ProjectNode["placements"][number]): MenuState["items"] => pl.kind === "panel" ? [
         ...(props.api.previewPanelAgent ? [{ label: "preview this version", icon: "eye" as const, hint: `Run version ${pl.version} in a disposable work chat on your usual model and funding`, run: () => void previewPanelAgent(pl.archetypeId, pl.placementId) }] : []),
-        ...(props.onOpenPanelAgent ? [{ label: "open", hint: "Open this placement: its pinned contract and deployments", run: () => {
-            const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
-            if (agent) props.onOpenPanelAgent?.(agent, p);
-        } }] : []),
+        ...(props.onOpenPanelPlacement || props.onOpenPanelAgent ? [{ label: "open", hint: "Open this placement's settings: its pinned version, deployments and Inbox", run: () => openPanelPlacement(p, pl) }] : []),
         ...(props.onDeployPlacement && pl.panelProfile ? [{
             label: pl.deployments.length ? "manage deployments…" : "deploy…",
             hint: "Publish this pinned Panel-agent version for this project",
@@ -1178,15 +1208,11 @@ export function FacetBrowser(props: {
                 tabindex="0"
                 aria-label={`Panel agent ${pl.archetypeName} on ${p.name}`}
                 title="Open this placement: pinned contract, deployments, Inbox"
-                onClick={() => {
-                    const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                    if (agent) props.onOpenPanelAgent?.(agent, p);
-                }}
+                onClick={() => openPanelPlacement(p, pl)}
                 onKeyDown={(event) => {
                     if (event.key !== "Enter" && event.key !== " ") return;
                     event.preventDefault();
-                    const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                    if (agent) props.onOpenPanelAgent?.(agent, p);
+                    openPanelPlacement(p, pl);
                 }}
                 onContextMenu={(event) => openMenu(event, placementMenuItems(p, pl))}
             >
@@ -1201,17 +1227,9 @@ export function FacetBrowser(props: {
                         void withRefresh(() => props.api.upgradePlacement(pl.placementId), "upgraded to the latest version");
                     }}
                 >update available</button></Show>
+                {/* No primary action: the row itself opens the placement, and a
+                    duplicate button would hold its width from the name at rest. */}
                 {rowActions({
-                    primary: props.onOpenPanelAgent ? {
-                        icon: "panel",
-                        title: "Open this Panel agent placement",
-                        aria: `open ${pl.archetypeName}`,
-                        data: "open-panel-agent",
-                        run: () => {
-                            const agent = tree()?.archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                            if (agent) props.onOpenPanelAgent?.(agent, p);
-                        },
-                    } : undefined,
                     menuAria: `actions for ${pl.archetypeName} on ${p.name}`,
                     menuItems: () => placementMenuItems(p, pl),
                 })}
@@ -1883,13 +1901,14 @@ export function FacetBrowser(props: {
                 <Show when={facet() === "projects"}>
                     <button type="button" class="facet-toolbar-icon" classList={{ active: filterOpen() || grouping() !== "chats" || projectStatus() !== "active" }}
                         data-project-filter title="Filter projects" aria-label="Filter projects" aria-haspopup="menu"
-                        aria-expanded={filterOpen()} onClick={() => { setFilterPage("root"); setFilterOpen((value) => !value); }}>
+                        aria-expanded={filterOpen()} onClick={(event) => toggleFilter(event.currentTarget)}>
                         <Icon name="sliders" />
                     </button>
                 </Show>
                 <Show when={filterOpen() && facet() === "projects"}>
                     <div class="facet-filter-backdrop" onClick={() => setFilterOpen(false)} />
-                    <div class="facet-filter-menu" role="menu" aria-label="Projects filter" onKeyDown={(event) => event.key === "Escape" && setFilterOpen(false)}>
+                    <div class="facet-filter-menu" role="menu" aria-label="Projects filter"
+                        style={{ left: `${filterAt().left}px`, top: `${filterAt().top}px` }} onKeyDown={(event) => event.key === "Escape" && setFilterOpen(false)}>
                         <Show when={filterPage() === "root"}>
                             <button type="button" role="menuitem" onClick={() => setFilterPage("status")}>
                                 <span>Status</span><span>{projectStatus() === "active" ? "Active" : projectStatus() === "archived" ? "Archived" : "All"}</span><Icon name="chevron" />
@@ -2101,8 +2120,7 @@ export function FacetBrowser(props: {
                                                         onClick={() =>
                                                             pl.kind === "panel"
                                                                 ? (() => {
-                                                                    const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                                                                    if (agent) props.onOpenPanelAgent?.(agent, p);
+                                                                    openPanelPlacement(p, pl);
                                                                 })()
                                                                 : activeChatCount(pl.chats) > 0
                                                                 ? toggleCollapse(pl.placementId)
@@ -2112,8 +2130,7 @@ export function FacetBrowser(props: {
                                                             if (e.key === "Enter" || e.key === " ") {
                                                                 e.preventDefault();
                                                                 if (pl.kind === "panel") {
-                                                                    const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                                                                    if (agent) props.onOpenPanelAgent?.(agent, p);
+                                                                    openPanelPlacement(p, pl);
                                                                 } else if (activeChatCount(pl.chats) > 0) toggleCollapse(pl.placementId);
                                                                 else void newWorkChat(p.id, pl.placementId);
                                                             }
@@ -2165,15 +2182,6 @@ export function FacetBrowser(props: {
                                                                 aria: `new chat with ${pl.archetypeName}`,
                                                                 data: "new-placement-chat",
                                                                 run: () => void newWorkChat(p.id, pl.placementId),
-                                                            } : props.onOpenPanelAgent ? {
-                                                                icon: "panel",
-                                                                title: "Open this Panel agent placement",
-                                                                aria: `open ${pl.archetypeName}`,
-                                                                data: "open-panel-agent",
-                                                                run: () => {
-                                                                    const agent = t().archetypes.find((candidate) => candidate.id === pl.archetypeId);
-                                                                    if (agent) props.onOpenPanelAgent?.(agent, p);
-                                                                },
                                                             } : undefined,
                                                             menuAria: `actions for ${pl.archetypeName} on ${p.name}`,
                                                             menuItems: () => placementMenuItems(p, pl),
@@ -2204,7 +2212,8 @@ export function FacetBrowser(props: {
                                     <div class="tree-group" data-archetype={a.id}>
                                         <div
                                             class="tree-node archetype"
-                                            classList={{ "row-hot": hotRow() === a.id }}
+                                            classList={{ "row-hot": hotRow() === a.id, active: props.openedArchetype === a.id }}
+                                            aria-selected={props.openedArchetype === a.id}
                                             onPointerEnter={() => setHotRow(a.id)}
                                             onPointerLeave={() => setHotRow((v) => (v === a.id ? null : v))}
                                             role="treeitem"

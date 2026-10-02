@@ -22,7 +22,14 @@ pub enum ServerEvent {
     /// A durable user message (the task prompt) — admitted run evidence.
     User { text: String },
     /// A durable assistant message (the turn's final text) — admitted run evidence.
-    Assistant { text: String },
+    /// `settled_at_unix_ms` is when the turn it belongs to settled, which every
+    /// assistant record of that turn shares; records admitted before it was
+    /// recorded carry none.
+    Assistant {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        settled_at_unix_ms: Option<u64>,
+    },
     /// A streamed operational text delta.
     Text { delta: String },
     /// A tool effect that passed the membrane (boundary-mediated). The structured

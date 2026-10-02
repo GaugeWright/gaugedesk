@@ -29,7 +29,6 @@ import {
 } from "./latency";
 import { createRemoteSession } from "./remote-session";
 import { ChatPanel } from "@gaugewright/workbench-ui/ChatPanel";
-import { Deliverables } from "@gaugewright/workbench-ui/Deliverables";
 import { AudienceChats } from "@gaugewright/workbench-ui/AudienceChats";
 import { ContentViewer } from "@gaugewright/workbench-ui/ContentViewer";
 import {
@@ -817,7 +816,6 @@ export class GwChatElement extends GwPanelElement {
                 openingMessage={this.getAttribute("opening-message") ?? undefined}
                 agentName={this.getAttribute("agent-name") ?? undefined}
                 notice={this.sessionNotice()}
-                transcriptTail={<Deliverables session={session} />}
             />
         );
     }
@@ -839,7 +837,7 @@ export class GwFilesElement extends GwPanelElement {
     protected override readonly defaultHeight = "auto";
 
     protected view(): JSX.Element {
-        return <Workspace />;
+        return <Workspace download />;
     }
 }
 

@@ -17,12 +17,32 @@ declare module "@gaugewright/control-plane-client/generated/tunnel.js" {
             epoch: number,
         ): Uint8Array;
         receiveFrame(frame: Uint8Array): void;
-        sendRequest(method: string, path: string, body?: string): void;
+        sendRequest(
+            method: string,
+            path: string,
+            body?: string,
+            headers?: Record<string, string>,
+        ): void;
         takeOutgoing(): Uint8Array;
         pollStatus(): number | undefined;
         takeBody(): string;
         isHandshaking(): boolean;
         isPaired(): boolean;
+        takeCredit(): Uint8Array;
+    }
+    /** One event stream on its own pinned session (WS-634). */
+    export class BrowserEventTunnel {
+        constructor(homeFingerprint: string, path: string, headers?: Record<string, string>);
+        receiveFrame(frame: Uint8Array): void;
+        takeOutgoing(): Uint8Array;
+        pollEvent():
+            | { kind: "opened" }
+            | { kind: "event"; data: string }
+            | { kind: "refused"; status: number; body: string }
+            | { kind: "ended" }
+            | undefined;
+        isPaired(): boolean;
+        takeCredit(): Uint8Array;
     }
 }
 

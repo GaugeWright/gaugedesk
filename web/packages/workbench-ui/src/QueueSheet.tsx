@@ -11,6 +11,9 @@
  * command itself. Tapping a row resolves to the same *(selection, pane)* the badge
  * jump does — opening that chat — so the sheet is a navigation surface, not a
  * second review-command path (consent/keep stay on the inline chat card, MOB-031).
+ *
+ * The one task that names no chat is the inbound count: it belongs to a project
+ * (DR-0143 §6), and the phone has no Inbox to open, so its row is a note.
  */
 
 import { For, Show, type JSX } from "solid-js";
@@ -56,20 +59,37 @@ export function QueueSheet(props: QueueSheetProps): JSX.Element {
                     >
                         {(t: HumanTask, i) => (
                             <li>
-                                <button
-                                    type="button"
-                                    class="queue-sheet-item"
-                                    classList={{ current: i() === 0 }}
-                                    data-queue-task={t.id}
-                                    onClick={() => props.onJump(t.id as EngagementId)}
+                                <Show
+                                    when={t.kind !== "screen"}
+                                    fallback={
+                                        <div
+                                            class="queue-sheet-item"
+                                            classList={{ current: i() === 0 }}
+                                            data-queue-task={t.id}
+                                            role="note"
+                                            title={`Review it in ${t.title}'s Inbox`}
+                                        >
+                                            <span class="queue-item-kind">inbound</span>
+                                            <span class="queue-item-title">{t.title}</span>
+                                            <span class="queue-item-agent">{t.waiting ?? 0} waiting</span>
+                                        </div>
+                                    }
                                 >
-                                    <Show when={i() === 0}>
-                                        <span class="queue-item-current">current</span>
-                                    </Show>
-                                    <span class="queue-item-kind">{t.kind}</span>
-                                    <span class="queue-item-title">{displayChatTitle(t.title)}</span>
-                                    <span class="queue-item-agent">{t.agent}</span>
-                                </button>
+                                    <button
+                                        type="button"
+                                        class="queue-sheet-item"
+                                        classList={{ current: i() === 0 }}
+                                        data-queue-task={t.id}
+                                        onClick={() => props.onJump(t.id as EngagementId)}
+                                    >
+                                        <Show when={i() === 0}>
+                                            <span class="queue-item-current">current</span>
+                                        </Show>
+                                        <span class="queue-item-kind">{t.kind}</span>
+                                        <span class="queue-item-title">{displayChatTitle(t.title)}</span>
+                                        <span class="queue-item-agent">{t.agent}</span>
+                                    </button>
+                                </Show>
                             </li>
                         )}
                     </For>

@@ -15,6 +15,10 @@
 import { createEffect, createMemo, createResource, createSignal, Show } from "solid-js";
 import { PanelContractEditor } from "./PanelContractEditor";
 import { Option } from "./PanelAgentControls";
+import { AbilityPresets, defaultModelLabel, ModelSelect, optionalAbilities } from "./agent-controls";
+import type { ModelOption } from "./model-picker";
+
+export { AGENT_ABILITY_PRESETS, optionalAbilities, presetAbilities } from "./agent-controls";
 import "./panel-agent.css";
 import {
     type AgentAbility,
@@ -78,36 +82,31 @@ export interface AgentSettingsProps {
     name: string;
     kind: AgentKind;
     refreshKey?: number;
+    /** The models this person can reach, as the composer offers them. */
+    modelChoices?: readonly ModelOption[];
     onClose: () => void;
     onSaved?: () => void;
 }
 
-export const AGENT_ABILITY_PRESETS: ReadonlyArray<{
-    name: string;
-    detail: string;
-    value: AgentAbility[];
-}> = [
-    {
-        name: "Chat only",
-        detail: "Conversation and reasoning, with no workspace tools.",
-        value: [],
-    },
-    {
-        name: "Read workspace",
-        detail: "Read, search, find, and list files.",
-        value: ["workspace.read"],
-    },
-    {
-        name: "Create artifacts",
-        detail: "Read files, then write and edit artifacts.",
-        value: ["workspace.read", "workspace.write"],
-    },
-    {
-        name: "Run workspace commands",
-        detail: "Create artifacts and run virtual bash. Commands are write-capable.",
-        value: ["workspace.read", "workspace.write", "command.run"],
-    },
-];
+
+/** The preferred-model options: the default row first, then each reachable
+ *  model once by id (the Agent's config pins an id, not a provider), with a
+ *  saved model kept even when it is no longer reachable. */
+export function preferredModelChoices(
+    choices: readonly ModelOption[],
+    current: string,
+): { value: string; label: string }[] {
+    const options = [{ value: "", label: defaultModelLabel(choices) }];
+    for (const choice of choices) {
+        if (choice.id && !options.some((option) => option.value === choice.id)) {
+            options.push({ value: choice.id, label: choice.label });
+        }
+    }
+    if (current && !options.some((option) => option.value === current)) {
+        options.push({ value: current, label: current });
+    }
+    return options;
+}
 
 export function AgentSettings(props: AgentSettingsProps) {
     const [loaded, { refetch: refetchConfig }] = createResource(
@@ -182,16 +181,15 @@ export function AgentSettings(props: AgentSettingsProps) {
 
     return (
         <main class="agent-settings-content pa-root" data-config-editor>
-            <article class="agent-settings-page">
-            <header class="agent-settings-page-head">
-                <div><span>Agent settings</span><h1>{props.name}</h1></div>
-                <button type="button" onClick={props.onClose}>Close</button>
+            {/* The pane's own top strip, shared with its fold control, as the
+                chat pane's "MAIN · EDIT CHAT" is. */}
+            <header class="agent-settings-head">
+                <span class="content-empty-title" data-agent-settings-title>Agent settings · {props.name}</span>
+                <button type="button" class="agent-settings-close" data-agent-settings-close aria-label="Close agent settings"
+                    title="Close" onClick={props.onClose}>×</button>
             </header>
-            <p class="pa-hint">
-                {props.kind === "panel"
-                    ? "What visitors get when a project deploys this agent. Publishing freezes these settings into a version that deployments can't change."
-                    : "These settings apply to test chats now and are frozen into the next published version."}
-            </p>
+            <div class="agent-settings-body">
+            <article class="agent-settings-page">
 
             <Show
                 when={
@@ -205,56 +203,40 @@ export function AgentSettings(props: AgentSettingsProps) {
                         {(profile) => <PanelContractEditor
                             profile={profile()}
                             authoredAbilities={abilities()}
+                            defaultModelLabel={defaultModelLabel(props.modelChoices ?? [])}
                             onChange={(next) => { setPanelDraft(next); setPanelDirty(true); setMsg(""); }} />}
                     </Show>
 
                     {/* A Panel agent's own model and abilities are not what visitors
-                        get: the contract above is. Say so, and say that the
-                        abilities here bound the ones offered above. */}
+                        get — the contract above is — so its heading names them apart. */}
                     <section class={props.kind === "panel" ? "pa-section divided" : "pa-section"}>
-                        <div class="pa-section-head">
-                            <h3>{props.kind === "panel" ? "The agent itself" : "Model and abilities"}</h3>
-                            <p>{props.kind === "panel"
-                                ? "How the agent runs in your own chats with it. Visitors can be given only abilities it has here."
-                                : "The model this agent prefers, and what it may do in a workspace."}</p>
-                        </div>
+                        <Show when={props.kind === "panel"}>
+                            <div class="pa-section-head"><h3>The agent itself</h3></div>
+                        </Show>
                         <label class="pa-field">
                             <span>Preferred model</span>
-                            <input
-                                class="pa-input"
-                                data-settings-model
-                                placeholder="Leave blank to use your default"
+                            <ModelSelect data-settings-model
+                                options={preferredModelChoices(props.modelChoices ?? [], form().model)}
                                 value={form().model}
-                                onInput={(e) => updateForm({ model: e.currentTarget.value })}
-                            />
-                            <Show when={props.kind === "panel"}><small>For your own chats with it. Visitors are answered by the model chosen above.</small></Show>
+                                onChange={(model) => updateForm({ model })} />
                         </label>
 
                         <fieldset class="pa-field pa-fieldset" data-settings-abilities>
                             <legend>Abilities</legend>
-                            <div class="pa-options" role="radiogroup" aria-label="Abilities">
-                                {AGENT_ABILITY_PRESETS.map((preset) => {
-                                    const checked = () =>
-                                        JSON.stringify(abilities().filter((ability) => ability !== "tracker.file").sort()) ===
-                                        JSON.stringify([...preset.value].sort());
-                                    return <Option type="radio" name="agent-abilities" checked={checked()}
-                                        label={preset.name} detail={preset.detail}
-                                        onChange={() => {
-                                            setSelectedAbilities(abilities().includes("tracker.file")
-                                                ? [...preset.value, "tracker.file"] : preset.value);
-                                            setMsg("");
-                                        }} />;
-                                })}
+                            <AbilityPresets name="agent-abilities" abilities={abilities()}
+                                onChange={(preset) => {
+                                    setSelectedAbilities([...preset, ...optionalAbilities(abilities())]);
+                                    setMsg("");
+                                }}>
                                 <Option type="checkbox" checked={abilities().includes("tracker.file")}
                                     label="File project tasks"
-                                    detail="Create real items in the current project's task bar. Publish the draft to make this available to placed Agents."
                                     onChange={(checked) => {
                                         setSelectedAbilities(checked
                                             ? [...abilities(), "tracker.file"]
                                             : abilities().filter((ability) => ability !== "tracker.file"));
                                         setMsg("");
                                     }} />
-                            </div>
+                            </AbilityPresets>
                         </fieldset>
                     </section>
                 </div>
@@ -267,12 +249,9 @@ export function AgentSettings(props: AgentSettingsProps) {
                     data-settings-advanced-toggle
                     onClick={() => setShowAdvanced((v) => !v)}
                 >
-                    {showAdvanced() ? "▾" : "▸"} Advanced (raw settings)
+                    {showAdvanced() ? "▾" : "▸"} Advanced
                 </button>
                 <Show when={showAdvanced()}>
-                    <p class="status" style={{ margin: "4px 0 6px" }}>
-                        The exact settings text. Leave it as <code>{"{}"}</code> to use the defaults.
-                    </p>
                     <textarea
                         class="config-text"
                         data-config-text
@@ -281,7 +260,7 @@ export function AgentSettings(props: AgentSettingsProps) {
                         onInput={(e) => { setRaw(e.currentTarget.value); setMsg(""); }}
                     />
                     <Show when={!rawIsValid()}>
-                        <div class="status" data-config-status>That isn't valid settings text — check for a stray character or a missing comma, bracket, or quote.</div>
+                        <div class="status" data-config-status>Not valid JSON.</div>
                     </Show>
                 </Show>
             </Show>
@@ -291,6 +270,7 @@ export function AgentSettings(props: AgentSettingsProps) {
                 <span class="status" data-config-status>{msg()}</span>
             </div>
             </article>
+            </div>
         </main>
     );
 }

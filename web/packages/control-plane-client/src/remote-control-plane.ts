@@ -270,6 +270,20 @@ export class RemoteControlPlane implements ControlPlane {
         return result.review_count;
     }
 
+    /** The admitted Home's own Isolated workspace policy and prices
+     * (GaugeWright DR-0194). Callers must admit the Home first. */
+    homeExecutionPolicy(): Promise<unknown> {
+        return this.route("GET", "/machine/execution-policy");
+    }
+
+    /** Owner only. The key is the caller's, kept across a retry of one change. */
+    setHomeExecutionPolicy(
+        change: { readonly isolated_workspace_enabled: boolean; readonly max_attempt_nanos_usd: number },
+        idempotencyKey: string,
+    ): Promise<unknown> {
+        return this.route("PUT", "/machine/execution-policy", change, { idempotencyKey });
+    }
+
     private currentBearer(): string | null {
         return this.bearerProvider?.() ?? this.bearer;
     }

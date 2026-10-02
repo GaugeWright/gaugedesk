@@ -53,7 +53,9 @@ export type IconName =
     | "pin"
     | "archive"
     | "search"
-    | "sliders";
+    | "sliders"
+    | "copy"
+    | "check";
 
 // Each entry is a *factory*, not a stored element: Solid evaluates JSX into real
 // DOM nodes eagerly, and a node can only live under one parent. An icon used by
@@ -326,6 +328,15 @@ const PATHS: Record<IconName, () => JSX.Element> = {
     pencil: () => (
         <path d="M4 20l1.2-4.2L16.5 4.5a1.9 1.9 0 0 1 2.7 0l.3.3a1.9 1.9 0 0 1 0 2.7L8.2 18.8 4 20Z" />
     ),
+    // Two stacked sheets — copy this message's text to the clipboard.
+    copy: () => (
+        <>
+            <rect x="8" y="8" width="14" height="14" rx="2" />
+            <path d="M4 16a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2" />
+        </>
+    ),
+    // A tick — the brief acknowledgement that a copy landed.
+    check: () => <path d="M20 6 9 17l-5-5" />,
 };
 
 export function Icon(props: { name: IconName; class?: string }): JSX.Element {

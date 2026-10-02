@@ -65,6 +65,11 @@ fn marker_of(
         .and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
+/// What a preview's hidden project previews, if `project` is one.
+pub fn preview_marker(project: &ProjectRecord) -> Option<PanelPreviewMarker> {
+    marker_of(&project.extra)
+}
+
 /// Whether `project` is a preview's hidden project.
 pub fn is_panel_preview_project(project: &ProjectRecord) -> bool {
     project.extra.contains_key(PANEL_PREVIEW_EXTRA)

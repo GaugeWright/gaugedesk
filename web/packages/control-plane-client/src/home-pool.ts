@@ -65,6 +65,9 @@ interface MutableHomeConnection<Api> {
  * are how a client reports trouble back without the pool knowing its shape. */
 export interface HomeClientContext {
     readonly endpoint: string;
+    /** The route this client serves. A relay-only Home has no endpoint, and its
+     * locator is what a stream needs to open a tunnel of its own (WS-634). */
+    readonly route: OpaqueHomeRoute;
     readonly routeJson: RouteJson;
     readonly bearer: () => string | null;
     readonly homeAdmission: () => string | null;
@@ -387,6 +390,7 @@ export class HomePool<Api> {
         let connection: MutableHomeConnection<Api>;
         const api = this.makeClient({
             endpoint,
+            route,
             routeJson: json,
             bearer: this.bearer,
             homeAdmission: () => admission,

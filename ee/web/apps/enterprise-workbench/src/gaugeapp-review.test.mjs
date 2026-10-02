@@ -125,7 +125,6 @@ const examples = {
     "project-host.suspend": [{ id: "host-a" }, hosts],
     "project-host.reinstate": [{ id: "host-a" }, hosts],
     "project-host.retire": [{ id: "host-a", phase: "retention" }, hosts],
-    "project-host.managed-policy.set": [{ id: "host-a", isolated_workspace_enabled: true, max_attempt_nanos_usd: 1500000000 }, hosts],
     "project-host.export": [{ id: "host-a", holder_id: "holder-a" }, hosts],
     "project-home.handoff": [{ project_id: "project-a", expected_current_home_id: "home-a", target_home_id: "home-b" }, handoffHosts],
     "backups.enable": [{ schedule_days: 2, retention_days: 45 }, { ...backups, facility: null }],
@@ -277,9 +276,10 @@ test("new Administration review commands require a presentation here", () => {
     assert.deepEqual(commands.sort(), Object.keys(REVIEW_COMMANDS).filter((id) => REVIEW_COMMANDS[id][0] === "administration" && !Object.hasOwn(CLOUD_ADMIN_REVIEW_COMMANDS, id)).sort());
 });
 
-test("Project Host review uses exact targets, current policy and the declared service location", () => {
-    const policy = summary("project-host.managed-policy.set", ...examples["project-host.managed-policy.set"]);
-    assert.deepEqual(policy.fields.find((field) => field.label === "Maximum per-attempt reservation"), { label: "Maximum per-attempt reservation", value: "USD 1.5", before: "USD 0" });
+test("Project Host review uses exact targets and the declared service location", () => {
+    // Isolated workspace policy is not a reviewed Hub change: the owner sets it
+    // on the host's own Home (GaugeWright DR-0194).
+    assert.equal(REVIEW_COMMANDS["project-host.managed-policy.set"], undefined);
     const add = summary("project-host.add", ...examples["project-host.add"]);
     assert.equal(add.fields.find((field) => field.label === "Service location").value, "test-region");
     assert.equal(add.fields.find((field) => field.label === "Plan capacity").value, "0.01 GB · 2 concurrent agents");

@@ -354,6 +354,8 @@ where
         // either direction. A keepalive does not count: it is between this leg
         // and the relay, and says nothing about whether the partner is there.
         let mut idle_at = idle.map(|bound| tokio::time::Instant::now() + bound);
+        // What this leg has consumed and not yet told the relay (DR-0302).
+        let mut meter = wire::CreditMeter::new();
         loop {
             if sent_fin && received_fin && fin_acknowledged {
                 let _ = socket.close(None).await;
@@ -436,6 +438,11 @@ where
                             if let Some(bound) = idle {
                                 idle_at = Some(tokio::time::Instant::now() + bound);
                             }
+                            // Reported only after the frame has been handed to
+                            // the local side below, so a local side that stops
+                            // reading stops this leg reporting, and the relay
+                            // sees which reader is the slow one.
+                            meter.consumed(bytes.len());
                             match bytes[0] {
                                 WSS_DATA if !received_fin => {
                                     if pump_side.write_all(&bytes[1..]).await.is_err() {
@@ -453,6 +460,11 @@ where
                                     fin_acknowledged = true;
                                 }
                                 _ => break,
+                            }
+                            if let Some(credit) = meter.take_credit() {
+                                if socket.send(Message::Binary(credit.to_vec().into())).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                         Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -809,6 +821,102 @@ async fn park_home_leg(
     carry_home_leg(broker, local_control_plane, acceptor).await
 }
 
+/// The connections crossings have opened to their Home's router, by the
+/// address the router sees each one arrive from, and whether the router has
+/// asked for its crossing to be hung up (DR-0302).
+///
+/// The router is behind a socket, so this is how it reaches the crossing: it
+/// knows only the peer address of the connection it is answering, and that is
+/// the local address the crossing connected from. Process-wide because a Home
+/// has one relay router; a live loopback connection's address is unique to it.
+fn crossing_connections() -> &'static std::sync::Mutex<std::collections::HashMap<SocketAddr, bool>>
+{
+    static CONNECTIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<SocketAddr, bool>>,
+    > = std::sync::OnceLock::new();
+    CONNECTIONS.get_or_init(Default::default)
+}
+
+/// Hang up the crossing that carries the connection arriving from `peer`, once
+/// the router has finished answering on it.
+///
+/// A Home's relay router calls this when it refuses a caller it has not
+/// verified. The locator is public, so without it a stranger could hold a
+/// crossing for as long as they kept sending; with it they hold one for its
+/// answer and the teardown grace. A peer that is no crossing's connection is
+/// ignored.
+pub fn hang_up_crossing(peer: SocketAddr) {
+    if let Ok(mut connections) = crossing_connections().lock() {
+        if let Some(refused) = connections.get_mut(&peer) {
+            *refused = true;
+        }
+    }
+}
+
+/// One crossing connection to the router, registered for as long as it lives.
+pub(crate) struct CrossingConnection(Option<SocketAddr>);
+
+impl CrossingConnection {
+    pub(crate) fn register(local: &TcpStream) -> Self {
+        let address = local.local_addr().ok();
+        if let (Some(address), Ok(mut connections)) = (address, crossing_connections().lock()) {
+            connections.insert(address, false);
+        }
+        Self(address)
+    }
+
+    /// Whether the router asked for this connection's crossing to be hung up.
+    pub(crate) fn hang_up_requested(&self) -> bool {
+        self.0.is_some_and(|address| {
+            crossing_connections()
+                .lock()
+                .is_ok_and(|connections| connections.get(&address) == Some(&true))
+        })
+    }
+}
+
+impl Drop for CrossingConnection {
+    fn drop(&mut self) {
+        if let (Some(address), Ok(mut connections)) = (self.0, crossing_connections().lock()) {
+            connections.remove(&address);
+        }
+    }
+}
+
+/// Carry one connection between a client and the Home's router until the
+/// router closes it.
+///
+/// The router's close ends it, not the client's: a router that has closed a
+/// connection will answer nothing more on it, so a crossing left open behind
+/// it would only hold a slot for a caller who keeps writing. A client that
+/// finishes first is still answered — what it already sent is served — and
+/// the carry ends when the router then closes.
+pub(crate) async fn carry_until_home_closes<T>(tunnel: T, local: TcpStream) -> std::io::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut from_client, mut to_client) = tokio::io::split(tunnel);
+    let (mut from_home, mut to_home) = local.into_split();
+    let downstream = async {
+        let carried = tokio::io::copy(&mut from_home, &mut to_client).await;
+        let _ = to_client.shutdown().await;
+        carried.map(|_| ())
+    };
+    let upstream = async {
+        let carried = tokio::io::copy(&mut from_client, &mut to_home).await;
+        let _ = to_home.shutdown().await;
+        carried.map(|_| ())
+    };
+    tokio::pin!(downstream);
+    tokio::select! {
+        home_closed = &mut downstream => home_closed,
+        client_finished = upstream => {
+            client_finished?;
+            downstream.await
+        }
+    }
+}
+
 async fn carry_home_leg(
     broker: WebSocketByteStream,
     local_control_plane: SocketAddr,
@@ -816,15 +924,15 @@ async fn carry_home_leg(
 ) -> std::io::Result<()> {
     let went_idle = broker.went_idle();
     let crossing = async {
-        let mut tunnel = acceptor.accept(broker).await?;
+        let tunnel = acceptor.accept(broker).await?;
         // A client that asked to multiplex carries all of its connections in
         // this one crossing; anything else is a single connection, as before.
         if tunnel.get_ref().1.alpn_protocol() == Some(crate::mux::MUX_ALPN) {
             return crate::mux::serve_streams(tunnel, local_control_plane).await;
         }
-        let mut local = TcpStream::connect(local_control_plane).await?;
-        tokio::io::copy_bidirectional(&mut tunnel, &mut local).await?;
-        Ok(())
+        let local = TcpStream::connect(local_control_plane).await?;
+        let _registered = CrossingConnection::register(&local);
+        carry_until_home_closes(tunnel, local).await
     }
     .await;
     // A crossing the pump ended for silence reads as a truncated TLS stream,
@@ -876,7 +984,10 @@ pub async fn serve_home_supervised(
     identity: TlsIdentity,
     mut report: impl FnMut(Result<u64, (u64, std::io::Error)>),
 ) -> std::io::Result<()> {
-    const MAX_CROSSINGS: usize = 16;
+    // As many as the relay pairs on one route (DR-0302). An idle crossing is a
+    // parked task and a loopback connection; a stranger's is hung up once
+    // refused, so this bounds a misbehaving relay, not a person.
+    const MAX_CROSSINGS: usize = 1024;
     let acceptor = TlsAcceptor::from(Arc::new(identity.home_leg_server_config()?));
     let mut crossings = tokio::task::JoinSet::new();
     let mut delay = Duration::from_millis(100);
@@ -1188,8 +1299,12 @@ mod tests {
         assert_eq!(u16::from_be_bytes(frame[8..10].try_into().unwrap()), 1);
         assert_eq!(frame[10], WebSocketRelayRole::Home as u8);
         // A Home is durable, so it promises keepalives; the edge accepts the bit
-        // and holds a pair to it only when both legs set it.
-        assert_eq!(frame[11], crate::wire::WSS_KEEPALIVE_FLAG);
+        // and holds a pair to it only when both legs set it. Every leg reports
+        // what it consumes (DR-0302).
+        assert_eq!(
+            frame[11],
+            crate::wire::WSS_KEEPALIVE_FLAG | crate::wire::WSS_ACCOUNTING_FLAG
+        );
         assert_eq!(u64::from_be_bytes(frame[12..20].try_into().unwrap()), 9);
         assert_eq!(&frame[20..52], &[7; 32]);
         assert_eq!(&frame[52..84], &[0; 32]);
@@ -1201,8 +1316,11 @@ mod tests {
             ..route
         };
         let frame = websocket_handshake(&rotated, WebSocketRelayRole::Home).unwrap();
-        // Rotation and the keepalive promise are independent bits.
-        assert_eq!(frame[11], 1 | crate::wire::WSS_KEEPALIVE_FLAG);
+        // Rotation, the keepalive promise and accounting are independent bits.
+        assert_eq!(
+            frame[11],
+            1 | crate::wire::WSS_KEEPALIVE_FLAG | crate::wire::WSS_ACCOUNTING_FLAG
+        );
         assert_eq!(&frame[20..52], &[8; 32]);
         assert_eq!(&frame[52..84], &[7; 32]);
         assert!(websocket_handshake(&rotated, WebSocketRelayRole::Client).is_err());
@@ -2436,6 +2554,221 @@ mod tests {
         let (loopback, second) = bind_client_loopback(route).await.unwrap();
         assert!(ping(loopback).await.ends_with("pong"));
         second.abort();
+        home.abort();
+    }
+
+    /// A Home router that refuses every caller the way the relay router does
+    /// a stranger: it answers, asks for the crossing to be hung up, and closes.
+    async fn refuse_everyone(
+        listener: TcpListener,
+        callers: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+    ) {
+        loop {
+            let Ok((mut stream, peer)) = listener.accept().await else {
+                return;
+            };
+            let _ = callers.send(peer);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                hang_up_crossing(peer);
+                let _ = stream
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 4\r\nconnection: close\r\n\r\nnope")
+                    .await;
+            });
+        }
+    }
+
+    async fn refusing_home() -> (
+        crate::test_relay::TestRelay,
+        RelayRoute,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<SocketAddr>,
+    ) {
+        let relay = crate::test_relay::TestRelay::bind().await.unwrap();
+        let control_plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = control_plane.local_addr().unwrap();
+        let (callers, arrived) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(refuse_everyone(control_plane, callers));
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(relay.endpoint().to_owned(), identity.fingerprint());
+        let home_route = route.clone();
+        let home = tokio::spawn(async move {
+            let _ = serve_home_forever(home_route, local, identity).await;
+        });
+        (relay, route, home, arrived)
+    }
+
+    /// Whether the Home is still carrying the crossing whose connection
+    /// arrived from `peer`.
+    fn still_carried(peer: SocketAddr) -> bool {
+        crossing_connections()
+            .lock()
+            .is_ok_and(|connections| connections.contains_key(&peer))
+    }
+
+    /// DR-0302: a stranger holding the public locator is answered and hung up
+    /// on, and cannot keep the crossing by sitting on it after the refusal:
+    /// it is released within the teardown grace.
+    #[tokio::test]
+    async fn a_refused_caller_holds_its_crossing_for_one_round_trip() {
+        let (_relay, route, home, mut callers) = refusing_home().await;
+        let mut tunnel = timeout(Duration::from_secs(15), connect_client(&route))
+            .await
+            .unwrap()
+            .unwrap();
+        tunnel
+            .write_all(b"GET /workspace HTTP/1.1\r\nhost: home\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        let ended = timeout(Duration::from_secs(15), async {
+            let mut buffer = [0u8; 1024];
+            loop {
+                match tunnel.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    // Neither writing more nor closing: a caller that just
+                    // sits on the crossing is the one this must end.
+                    Ok(read) => answer.extend_from_slice(&buffer[..read]),
+                }
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the refusal must arrive and its stream end");
+        assert!(
+            String::from_utf8_lossy(&answer).contains("401"),
+            "the refusal is still delivered"
+        );
+        // The client has neither written nor closed since. The crossing must
+        // still be released: that is the slot a stranger would otherwise hold.
+        let peer = callers.recv().await.unwrap();
+        // Within the teardown grace a closing leg gives its partner, rather
+        // than for as long as the caller cares to sit there.
+        let released = timeout(TEARDOWN_GRACE + Duration::from_secs(3), async {
+            while still_carried(peer) {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "the Home kept carrying a crossing it had refused"
+        );
+        drop(tunnel);
+        home.abort();
+    }
+
+    /// The same for a stranger who negotiated streams: one refused stream ends
+    /// the whole crossing, or opening another each time would hold it.
+    #[tokio::test]
+    async fn a_refused_stream_ends_its_whole_multiplexed_crossing() {
+        let (_relay, route, home, _callers) = refusing_home().await;
+        let tunnel = timeout(
+            Duration::from_secs(15),
+            connect_client_offering(&route, &[crate::mux::MUX_ALPN]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            tunnel.get_ref().1.alpn_protocol(),
+            Some(crate::mux::MUX_ALPN)
+        );
+        let mux = crate::mux::MuxClient::start(tunnel);
+        let mut stream = mux.open().await.unwrap();
+        stream
+            .write_all(b"GET /workspace HTTP/1.1\r\nhost: home\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        let _ = timeout(Duration::from_secs(15), stream.read_to_end(&mut answer)).await;
+        assert!(String::from_utf8_lossy(&answer).contains("401"));
+        let closed = timeout(Duration::from_secs(15), async {
+            while !mux.is_closed() {
+                // Each attempt to open another stream is what a stranger would do.
+                let _ = mux.open().await;
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the Home must hang the whole crossing up");
+        home.abort();
+    }
+
+    /// A stream the client finishes first is answered and leaves the crossing
+    /// open, as the phone's do: hanging up is for refusals alone.
+    #[tokio::test]
+    async fn an_answered_stream_leaves_its_multiplexed_crossing_open() {
+        let (_relay, route, home) = reachable_home(true).await;
+        let (loopback, carrier) = bind_client_loopback(route).await.unwrap();
+        for _ in 0..3 {
+            assert!(ping(loopback).await.ends_with("pong"));
+        }
+        carrier.abort();
+        home.abort();
+    }
+
+    /// DR-0302: a leg reports what it consumes, so the relay can tell a slow
+    /// reader from a busy one. A client taking a large answer reports nearly
+    /// all of it — everything but what it owes below one report's threshold.
+    #[tokio::test]
+    async fn a_leg_reports_what_it_consumes_to_the_relay() {
+        const BODY: usize = 256 * 1024;
+        let relay = crate::test_relay::TestRelay::bind().await.unwrap();
+        let control_plane = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = control_plane.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = control_plane.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {BODY}\r\nconnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&vec![b'x'; BODY]).await;
+                });
+            }
+        });
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(relay.endpoint().to_owned(), identity.fingerprint());
+        let home_route = route.clone();
+        let home = tokio::spawn(async move {
+            let _ = serve_home_forever(home_route, local, identity).await;
+        });
+        let before = crate::test_relay::CREDITED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut tunnel = timeout(Duration::from_secs(15), connect_client(&route))
+            .await
+            .unwrap()
+            .unwrap();
+        tunnel
+            .write_all(b"GET /big HTTP/1.1\r\nhost: home\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        timeout(Duration::from_secs(15), tunnel.read_to_end(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(answer.len() > BODY);
+        let reported = timeout(Duration::from_secs(5), async {
+            loop {
+                let credited =
+                    crate::test_relay::CREDITED.load(std::sync::atomic::Ordering::Relaxed) - before;
+                if credited as usize >= BODY - crate::wire::WSS_CREDIT_THRESHOLD {
+                    return credited;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(reported.is_ok(), "the client never reported what it took");
         home.abort();
     }
 }

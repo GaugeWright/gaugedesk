@@ -25,6 +25,7 @@ import { type Session } from "@gaugewright/workbench-ui/session-context";
 import { type ImageRef } from "@gaugewright/workbench-ui/attachments";
 import { type EmbedSessionApi } from "./session-api";
 import { type TurnObservation } from "./session-api";
+import { isVisitorVisible, visitorApi } from "./visitor-files";
 import { UNIVERSAL_COMPOSER_CAPABILITIES } from "@gaugewright/workbench-ui/session-composer-controller";
 
 export interface RemoteSessionOptions {
@@ -35,7 +36,9 @@ export interface RemoteSessionOptions {
 }
 
 export function createRemoteSession(opts: RemoteSessionOptions): { session: Session; dispose: () => void } {
-    const { api } = opts;
+    // Every panel reads the workspace through this, so a visitor is shown only
+    // `artifacts/` wherever a file appears (DR-0310).
+    const api = visitorApi(opts.api);
     const id = opts.engagementId;
     const [engagementId] = createSignal<EngagementId | null>(id);
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
@@ -170,7 +173,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         engagementId,
         worktreeRev,
         selectedFile,
-        selectFile: (path) => setSelectedFile(path),
+        selectFile: (path) => setSelectedFile(path !== null && isVisitorVisible(path) ? path : null),
         diff: () => diff() ?? "",
         mergePhase: () => merge()?.phase ?? null,
         mergeConflicted: () => merge()?.phase === "Rejected" && merge()?.git_outcome === "Conflict",

@@ -48,6 +48,7 @@ use crate::{
 pub fn routes() -> Router<SharedWorkbench> {
     mount::<crate::project_settings_gaugeapp::ProjectSettings>()
         .merge(mount::<crate::agent_settings_gaugeapp::AgentSettings>())
+        .merge(mount::<crate::panel_settings_gaugeapp::PanelSettings>())
 }
 
 /// What makes one GaugeApp different from another. The host supplies the rest.
@@ -82,9 +83,11 @@ pub trait GaugeAppDefinition: 'static {
     /// tool can refuse it within the turn.
     fn validate(envelope: &GaugeAppCommandEnvelope) -> Result<(), Box<Response>>;
 
-    /// Apply an admitted command through the scope's own state methods.
+    /// Apply an admitted command through the scope's own state methods, on
+    /// behalf of `actor`, the person the session admitted.
     fn apply(
         wb: &mut Workbench,
+        actor: &str,
         id: &str,
         envelope: &GaugeAppCommandEnvelope,
     ) -> Result<Applied, Box<Response>>;
@@ -443,7 +446,7 @@ pub fn apply_command<D: GaugeAppDefinition>(
     let Applied {
         mut facts,
         committed,
-    } = D::apply(wb, id, envelope)?;
+    } = D::apply(wb, &session.actor, id, envelope)?;
     let receipt = gaugeapp_receipt(session, envelope, "applied");
     let change = GaugeAppChangeRecord {
         id: change_id,
@@ -689,8 +692,11 @@ mod tests {
     async fn every_definition_is_served_at_its_own_path() {
         let root = tempfile::tempdir().unwrap();
         let shared = crate::open_workbench(root.path()).unwrap();
+        let placement = "inst-panel-host".to_owned();
         let (project, agent) = {
             let mut wb = shared.lock_unpoisoned();
+            wb.seed_panel_placement(&placement, crate::library::PanelPublicProfile::default())
+                .unwrap();
             let project = crate::library_routes::create_named_project(&mut wb, "proj-host", "Host")
                 .unwrap()["id"]
                 .as_str()
@@ -708,6 +714,7 @@ mod tests {
         for (base, app_id, kind, id) in [
             ("/projects", "project-settings", "project", &project),
             ("/archetypes", "agent-settings", "agent", &agent),
+            ("/placements", "panel-settings", "placement", &placement),
         ] {
             let (status, opened) = call(
                 &app,
@@ -769,6 +776,7 @@ mod tests {
         for (app, declared) in [
             commands::<crate::project_settings_gaugeapp::ProjectSettings>(),
             commands::<crate::agent_settings_gaugeapp::AgentSettings>(),
+            commands::<crate::panel_settings_gaugeapp::PanelSettings>(),
         ] {
             for id in declared {
                 let grant = GaugeAppCommandGrant {

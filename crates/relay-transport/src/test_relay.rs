@@ -323,7 +323,9 @@ fn parse_handshake(bytes: &[u8]) -> std::io::Result<Handshake> {
     // holds nobody to their silence, so it accepts the bit and ignores it —
     // but it must accept it, or every durable leg fails its handshake here
     // while succeeding against the edge.
-    if flags & !(1 | crate::wire::WSS_KEEPALIVE_FLAG) != 0 {
+    // Bit 2 is the promise to report consumption. This relay holds nothing
+    // back, so it counts nothing; it takes the reports and forwards none.
+    if flags & !(1 | crate::wire::WSS_KEEPALIVE_FLAG | crate::wire::WSS_ACCOUNTING_FLAG) != 0 {
         return Err(invalid("relay handshake flags are invalid"));
     }
     let epoch = u64::from_be_bytes(bytes[12..20].try_into().expect("fixed epoch"));
@@ -404,6 +406,15 @@ async fn forward(
     target: &mut WebSocketStream<TcpStream>,
 ) -> bool {
     match message {
+        // A report of consumption is the relay's, never the partner's: one
+        // forwarded would be an unknown frame to the other leg.
+        Some(Ok(Message::Binary(bytes))) if crate::wire::parse_credit(&bytes).is_some() => {
+            CREDITED.fetch_add(
+                u64::from(crate::wire::parse_credit(&bytes).unwrap_or(0)),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            true
+        }
         Some(Ok(Message::Binary(bytes))) if bytes.len() <= WSS_MAX_FRAME_BYTES => {
             target.send(Message::Binary(bytes)).await.is_ok()
         }
@@ -412,6 +423,9 @@ async fn forward(
         _ => false,
     }
 }
+
+/// Every byte any leg of any test relay in this process has reported consuming.
+pub static CREDITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 async fn refuse(socket: &mut WebSocketStream<TcpStream>, reason: &str) -> std::io::Result<()> {
     socket

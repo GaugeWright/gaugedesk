@@ -315,19 +315,23 @@ export function WorkbenchShell(props: WorkbenchShellProps) {
         </div>
     );
 
-    const Mobile = () => (
-        <div class="workbench mobile" data-mobile>
+    // Build the four panes once per narrow layout. Passing `panes()` itself
+    // rebuilt every pane on each carousel move, remounting the nav (its facet
+    // fell back to Projects) and every other pane's local state with it.
+    const Mobile = () => {
+        const built = panes();
+        return <div class="workbench mobile" data-mobile>
             <Carousel
                 state={props.state.carousel()}
                 onState={props.state.setCarousel}
-                panes={panes()}
+                panes={built}
                 paneOrder={props.files ? undefined : ["nav", "chat", "content"]}
                 paneLabels={{ files: title("files") }}
                 onNewChat={props.onNewChat}
             />
             {props.overlays?.()}
-        </div>
-    );
+        </div>;
+    };
 
     return <Show when={props.state.isMobile()} fallback={<Desktop />}><Mobile /></Show>;
 }

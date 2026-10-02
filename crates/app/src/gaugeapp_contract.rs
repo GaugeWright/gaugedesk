@@ -19,6 +19,7 @@ pub enum GaugeAppKind {
     Administration,
     AgentSettings,
     CommercialOperations,
+    PanelSettings,
     ProjectSettings,
 }
 
@@ -29,6 +30,7 @@ impl GaugeAppKind {
             Self::Administration => "administration",
             Self::AgentSettings => "agent-settings",
             Self::CommercialOperations => "commercial-operations",
+            Self::PanelSettings => "panel-settings",
             Self::ProjectSettings => "project-settings",
         }
     }

@@ -205,8 +205,21 @@ describe("createRemoteSession", () => {
             const f = fakeApi();
             const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
             expect(session.selectedFile()).toBeNull();
-            session.selectFile("src/index.ts");
-            expect(session.selectedFile()).toBe("src/index.ts");
+            session.selectFile("artifacts/readout.html");
+            expect(session.selectedFile()).toBe("artifacts/readout.html");
+            dispose();
+        });
+    });
+
+    it("selects nothing outside the visitor's artifacts/ (DR-0310)", () => {
+        createRoot((dispose) => {
+            const f = fakeApi();
+            const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
+            session.selectFile("artifacts/readout.html");
+            session.selectFile("outbox/record.json");
+            expect(session.selectedFile()).toBeNull();
+            session.selectFile("work/notes.md");
+            expect(session.selectedFile()).toBeNull();
             dispose();
         });
     });

@@ -1045,7 +1045,11 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 url.searchParams.set("path", path);
                 return url.toString();
             })(),
-            { credentials: "omit", cache: "no-store" },
+            {
+                headers: this.projectionHeaders(),
+                credentials: "omit",
+                cache: "no-store",
+            },
         );
         if (!response.ok) throw new Error(`read ${path}: ${response.status}`);
         return { bytes: new Uint8Array(await response.arrayBuffer()), cut: null };

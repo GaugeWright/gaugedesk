@@ -25,7 +25,7 @@ export interface Choice<T> {
 export const PANEL_CHOICES: readonly Choice<PublicPanelComponent>[] = [
     { value: "gw-chat", name: "Chat", detail: "Visitors talk with the agent." },
     { value: "gw-viewer", name: "Viewer", detail: "Shows the file the agent is working on." },
-    { value: "gw-files", name: "Files", detail: "Visitors browse and download the session's files." },
+    { value: "gw-files", name: "Files", detail: "Visitors browse and download the files the agent puts in artifacts/." },
     { value: "gw-chats", name: "Conversations", detail: "Visitors return to their earlier conversations." },
 ];
 
@@ -70,7 +70,7 @@ export const WORK_CHAT_DEFAULT_MODEL = "";
 export function panelModelChoices(current = ""): readonly Choice<string>[] {
     const models: Choice<string>[] = [{
         value: WORK_CHAT_DEFAULT_MODEL,
-        name: "Your work-chat default",
+        name: "Default",
         detail: "Whatever model your work chats use when you deploy.",
     }];
     for (const model of pickableModels(KEY_PROVIDERS.map((provider) => provider.value)).filter(isDefaultVisible)) {
@@ -152,14 +152,14 @@ export function formatAge(thenMs: number, nowMs: number): string {
 export const MAX_COLLECTED_FILE_MB = 8;
 
 /** The collection selector a new collecting contract starts with: every file the
- *  agent leaves directly in `artifacts/`. */
-export const DEFAULT_COLLECTED_PATH = "artifacts/*";
+ *  agent leaves directly in `outbox/` (DR-0310). */
+export const DEFAULT_COLLECTED_PATH = "outbox/*";
 
 /** Why a collection path would be refused, in the owner's terms, or "" when it is
- *  a bounded selector inside `artifacts/` (`library_state.rs`, `validate_panel_profile`). */
+ *  a bounded selector inside `outbox/` (`library_state.rs`, `validate_panel_profile`). */
 export function collectionPathProblem(path: string): string {
     const selector = path.endsWith("/*") ? path.slice(0, -2) : path;
-    if (!path.startsWith("artifacts/")) return `“${path}” must be inside artifacts/.`;
+    if (!path.startsWith("outbox/")) return `“${path}” must be inside outbox/.`;
     if (path.includes("**")) return `“${path}” can't use **. Name a file, or a folder followed by /*.`;
     if (!selector || selector.startsWith("/") || selector.includes("\\")
         || selector.split("/").some((part) => !part || part === "." || part === "..")) {
@@ -196,7 +196,7 @@ export function contractFacts(profile: PanelPublicProfile): ContractFact[] {
         { label: "Visitors see", value: list(panels) },
         // Commas, not "and": "create and edit files" already has one.
         { label: "The agent can", value: abilities.length ? abilities.join(", ") : "only chat" },
-        { label: "Model", value: profile.model.pinned ?? "Your work-chat default when deployed" },
+        { label: "Model", value: profile.model.pinned ?? "Default" },
         { label: "Starting files", value: files.length ? list(files) : "None" },
         {
             label: "History",

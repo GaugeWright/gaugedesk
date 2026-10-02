@@ -18,6 +18,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./attention": "./src/attention.ts",
+    "./tooltips": "./src/tooltips.ts",
     "./AccessRequestPanel": "./src/AccessRequestPanel.tsx",
     "./AccountPanel": "./src/AccountPanel.tsx",
     "./AgentSettings": "./src/AgentSettings.tsx",
@@ -29,7 +30,6 @@
     "./ConfigEditor": "./src/ConfigEditor.tsx",
     "./ConnectionBanner": "./src/ConnectionBanner.tsx",
     "./ContentViewer": "./src/ContentViewer.tsx",
-    "./Deliverables": "./src/Deliverables.tsx",
     "./ContextMenu": "./src/ContextMenu.tsx",
     "./ContextPanel": "./src/ContextPanel.tsx",
     "./DevicesModal": "./src/DevicesModal.tsx",

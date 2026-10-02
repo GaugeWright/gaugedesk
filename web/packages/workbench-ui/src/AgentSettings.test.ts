@@ -7,6 +7,9 @@
 import { describe, expect, it } from "vitest";
 import {
     AGENT_ABILITY_PRESETS,
+    optionalAbilities,
+    preferredModelChoices,
+    presetAbilities,
     plainConfigError,
     readFormConfig,
     writeFormConfig,
@@ -77,5 +80,42 @@ describe("plainConfigError", () => {
         expect(plainConfigError("`policy` is package-owned; edit `.whipple/draft/package.json`")).toMatch(
             /package-owned/,
         );
+    });
+});
+
+describe("ability preset matching", () => {
+    it("ignores the optional abilities, so a new Chat only agent selects Chat only", () => {
+        expect(presetAbilities(["question.ask"])).toEqual([]);
+        expect(presetAbilities(["workspace.write", "tracker.file", "workspace.read", "question.ask"]))
+            .toEqual(["workspace.read", "workspace.write"]);
+    });
+
+    it("keeps the optional abilities when a preset changes", () => {
+        expect(optionalAbilities(["command.run", "tracker.file", "question.ask"]))
+            .toEqual(["tracker.file", "question.ask"]);
+    });
+});
+
+describe("preferred model choices", () => {
+    const choice = (id: string, provider: string, label: string) => ({ id, provider, label, thinking: ["off"] });
+
+    it("leads with the default row and lists each reachable model once", () => {
+        expect(preferredModelChoices([
+            choice("", "", "GPT-6.1 Sol (default)"),
+            choice("gpt-6.1", "openai", "GPT-6.1 Sol"),
+            choice("gpt-6.1", "openrouter", "GPT-6.1 Sol"),
+            choice("claude-opus-5-5", "anthropic", "Claude Opus 5.5"),
+        ], "")).toEqual([
+            { value: "", label: "GPT-6.1 Sol (default)" },
+            { value: "gpt-6.1", label: "GPT-6.1 Sol" },
+            { value: "claude-opus-5-5", label: "Claude Opus 5.5" },
+        ]);
+    });
+
+    it("keeps a saved model that is no longer reachable", () => {
+        expect(preferredModelChoices([], "old-model")).toEqual([
+            { value: "", label: "Default" },
+            { value: "old-model", label: "old-model" },
+        ]);
     });
 });

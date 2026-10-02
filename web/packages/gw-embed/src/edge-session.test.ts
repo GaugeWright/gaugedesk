@@ -208,6 +208,16 @@ describe("EdgeSessionApi", () => {
         expect(new Headers(init?.headers).get("x-gw-connection-capability")).toBe(
             "connection-capability",
         );
+
+        // The byte read is the same projection and needs the same capability;
+        // without it the edge refuses every PDF, image, and download.
+        const bytes = await api.getFileBytes("ignored" as EngagementId, "artifacts/readout.pdf");
+        expect(new TextDecoder().decode(bytes.bytes)).toBe("contents");
+        const [bytesInput, bytesInit] = fetchMock.mock.calls[1]!;
+        expect(new URL(String(bytesInput)).searchParams.get("path")).toBe("artifacts/readout.pdf");
+        expect(new Headers(bytesInit?.headers).get("x-gw-connection-capability")).toBe(
+            "connection-capability",
+        );
         api.dispose();
     });
 

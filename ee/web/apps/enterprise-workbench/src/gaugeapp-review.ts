@@ -37,7 +37,6 @@ export const CLOUD_ADMIN_REVIEW_COMMANDS = {
     ...MODEL_PROVIDER_REVIEW_COMMANDS,
     "project-host.add": ["administration", "project-hosts", "Add managed Project Host"],
     "project-host.rename": ["administration", "project-hosts", "Rename Project Host"],
-    "project-host.managed-policy.set": ["administration", "project-hosts", "Change compute policy"],
     "project-host.suspend": ["administration", "project-hosts", "Suspend Project Host"],
     "project-host.reinstate": ["administration", "project-hosts", "Reinstate Project Host"],
     "project-host.retire": ["administration", "project-hosts", "Retire Project Host"],
@@ -143,12 +142,6 @@ const optionalText = (value: unknown, fallback = "Not set"): string =>
 const number = (value: unknown): number => {
     if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("Missing number");
     return value;
-};
-const nanoDollars = (value: unknown): string => {
-    const amount = number(value);
-    if (!Number.isSafeInteger(amount) || amount < 0) throw new Error("Invalid compute cap");
-    const digits = BigInt(amount).toString().padStart(10, "0");
-    return `USD ${digits.slice(0, -9)}.${digits.slice(-9)}`.replace(/0+$/, "").replace(/\.$/, "");
 };
 const list = (value: unknown): unknown[] => {
     if (!Array.isArray(value)) throw new Error("Missing list");
@@ -310,15 +303,6 @@ export function summarizeGaugeAppChange(proposal: GaugeAppProposal, page: GaugeA
                 const host = target("Project Host", m.homes);
                 field("Name", string(p.name), string(host.name));
                 note = "Only the display name changes.";
-                break;
-            }
-            case "project-host.managed-policy.set": {
-                const host = target("Project Host", m.homes);
-                if (host.kind !== "cloud") throw new Error("Managed host required");
-                const policy = data(host.managed_policy);
-                field("Metered Isolated workspace", enabled(p.isolated_workspace_enabled), enabled(policy.isolated_workspace_enabled));
-                field("Maximum per-attempt reservation", nanoDollars(p.max_attempt_nanos_usd), nanoDollars(policy.max_attempt_nanos_usd));
-                note = "Retries require a new reservation. Included workflows and project permissions are unchanged.";
                 break;
             }
             case "project-home.handoff": {

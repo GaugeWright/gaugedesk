@@ -89,17 +89,19 @@ describe("collection paths", () => {
         expect(collectionPathProblem(DEFAULT_COLLECTED_PATH)).toBe("");
     });
 
-    it("accepts a file or a folder's direct files inside artifacts/", () => {
-        expect(collectionPathProblem("artifacts/brief.pdf")).toBe("");
-        expect(collectionPathProblem("artifacts/reports/*")).toBe("");
+    it("accepts a file or a folder's direct files inside outbox/", () => {
+        expect(collectionPathProblem("outbox/brief.pdf")).toBe("");
+        expect(collectionPathProblem("outbox/reports/*")).toBe("");
     });
 
     it("refuses what validate_panel_profile refuses, saying why", () => {
         // The old default. The Home has always refused it.
-        expect(collectionPathProblem("outputs/**")).toMatch(/inside artifacts\//);
-        expect(collectionPathProblem("artifacts/**")).toMatch(/can't use \*\*/);
-        expect(collectionPathProblem("artifacts/../secrets")).toMatch(/isn't a file or folder path/);
-        expect(collectionPathProblem("artifacts//x")).toMatch(/isn't a file or folder path/);
+        expect(collectionPathProblem("outputs/**")).toMatch(/inside outbox\//);
+        // What the visitor sees is not what the owner receives (DR-0310).
+        expect(collectionPathProblem("artifacts/*")).toMatch(/inside outbox\//);
+        expect(collectionPathProblem("outbox/**")).toMatch(/can't use \*\*/);
+        expect(collectionPathProblem("outbox/../secrets")).toMatch(/isn't a file or folder path/);
+        expect(collectionPathProblem("outbox//x")).toMatch(/isn't a file or folder path/);
     });
 });
 
@@ -108,7 +110,7 @@ describe("choosing a model", () => {
 
     it("leads with the work-chat default, which pins nothing", () => {
         expect(ids()[0]).toBe(WORK_CHAT_DEFAULT_MODEL);
-        expect(panelModelChoices()[0]!.name).toBe("Your work-chat default");
+        expect(panelModelChoices()[0]!.name).toBe("Default");
     });
 
     it("offers every model the catalog lists for the providers that can serve a deployment", () => {
@@ -155,7 +157,7 @@ describe("the contract, read back", () => {
             ...PROFILE,
             public_abilities: [],
             collection: {
-                exportable_paths: ["artifacts/*"],
+                exportable_paths: ["outbox/*"],
                 transcript_eligible: true,
                 schema_ref: "gaugewright.panel-output/v1",
                 recipient_class: "project",
@@ -163,6 +165,6 @@ describe("the contract, read back", () => {
             },
         });
         expect(facts.find((fact) => fact.label === "The agent can")?.value).toBe("only chat");
-        expect(facts.find((fact) => fact.label === "Results")?.value).toBe("Sent to the project Inbox: artifacts/* and the transcript");
+        expect(facts.find((fact) => fact.label === "Results")?.value).toBe("Sent to the project Inbox: outbox/* and the transcript");
     });
 });

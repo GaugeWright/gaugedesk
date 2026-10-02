@@ -16,6 +16,9 @@ const go = async (page: Page, app = "administration") => {
     await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
 };
 const click = (page: Page, name: string) => page.getByRole("button", { name, exact: true }).click();
+// WebAuthn needs a registrable domain rather than an IP address, so a passkey
+// ceremony opens the loopback fixture as localhost, on whichever port it serves.
+const onLocalhost = (baseURL: string | undefined, path: string) => { const url = new URL(path, baseURL); url.hostname = "localhost"; return url.href; };
 const calls = async (page: Page) => JSON.parse(await page.getByTestId("calls").textContent() ?? "[]") as Record<string, unknown>[];
 const noTransient = async (page: Page) => {
     await expect(page.locator(".gaugeapp-one-time")).toHaveCount(0);
@@ -47,6 +50,10 @@ const everyGaugeAppPage = [
     { app: "administration", query: "all-pages=1", pages: ["Organization", "Plans & services", "People", "Sessions", "Enterprise Identity", "Projects", "Model Providers", "Organization Policy", "Project Hosts", "Backups", "Software policy", "Billing"] },
     { app: "commercial-operations", query: "commercial-lifecycle=draft", pages: ["Products", "Clients", "Engagements", "Payments"] },
 ] as const;
+// A page is headed by its menu name, except Organization: it is headed by the
+// organization it administers, under an "Organization settings" eyebrow, and
+// the fixture's organization is administrationEmptyModels' "Example Organization".
+const pageHeading = (name: string) => name === "Organization" ? "Example Organization" : name;
 
 test("disabled GaugeApp actions are visibly inactive", async ({ page }) => {
     await page.goto("/?app=administration&all-pages=1&shell=1");
@@ -259,7 +266,7 @@ for (const fixture of everyGaugeAppPage) test(`${fixture.app} renders every admi
     await page.goto(`/?app=${fixture.app}&${fixture.query}`);
     for (const name of fixture.pages) {
         await page.getByRole("button", { name, exact: true }).click();
-        await expect(page.getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
+        await expect(page.getByRole("heading", { name: pageHeading(name), exact: true, level: 1 })).toBeVisible();
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
     }
 });
@@ -286,7 +293,7 @@ for (const fixture of everyGaugeAppPage) test(`${fixture.app} keeps every admitt
         await panes.getByRole("tab", { name: "Menu", exact: true }).click();
         await page.getByRole("button", { name, exact: true }).click();
         await panes.getByRole("tab", { name: "Content", exact: true }).click();
-        await expect(page.getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
+        await expect(page.getByRole("heading", { name: pageHeading(name), exact: true, level: 1 })).toBeVisible();
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
     }
 });
@@ -348,7 +355,7 @@ for (const fixture of everyGaugeAppPage) test(`${fixture.app} exposes every admi
         await views.getByRole("button", { name: "Menu", exact: true }).click();
         await page.getByRole("button", { name, exact: true }).click();
         await views.getByRole("button", { name: "Page", exact: true }).click();
-        await expect(page.getByRole("article").getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
+        await expect(page.getByRole("article").getByRole("heading", { name: pageHeading(name), exact: true, level: 1 })).toBeVisible();
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
     }
 });
@@ -358,7 +365,7 @@ for (const fixture of everyGaugeAppPage) test(`${fixture.app} keeps every admitt
     await expect(page.getByText("Updates are delayed. Showing the last loaded data.", { exact: false })).toBeVisible();
     for (const name of fixture.pages) {
         await page.getByRole("button", { name, exact: true }).click();
-        await expect(page.getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
+        await expect(page.getByRole("heading", { name: pageHeading(name), exact: true, level: 1 })).toBeVisible();
     }
     await click(page, "Restore updates");
     await expect(page.locator(".gaugeapp-update-delayed")).toHaveCount(0);
@@ -505,7 +512,7 @@ test("a lapsed organization plan re-enrolls without claiming checkout is entitle
 test("managed Project Host retirement requires retention before separately confirmed erasure", async ({ page }) => {
     await page.goto("/?app=administration&project-host=managed");
     await expect(page.getByRole("heading", { name: "Project Hosts", level: 1 })).toBeVisible();
-    await click(page, "View");
+    await click(page, "view");
     await click(page, "Retire");
     await expect(page.getByText("Retirement stops new work", { exact: false })).toBeVisible();
     const confirmation = page.getByRole("textbox", { name: "Type Studio Host A to confirm" });
@@ -527,6 +534,59 @@ test("managed Project Host retirement requires retention before separately confi
         expect.objectContaining({ command: "project-host.retire", payload: { id: "cloud-home", phase: "retention" } }),
         expect.objectContaining({ command: "project-host.retire", payload: { id: "cloud-home", phase: "erase" } }),
     ]));
+});
+
+test("a managed host's Isolated policy is read and set on its own Home, as its owner", async ({ page }) => {
+    // GaugeWright DR-0194: the policy an Isolated turn enforces is the Home's,
+    // and only the organization's owner sets it there.
+    await page.goto("/?app=administration&project-host=managed&home-policy=owner");
+    await expect(page.getByRole("heading", { name: "Project Hosts", level: 1 })).toBeVisible();
+    await click(page, "view");
+    await click(page, "Compute policy");
+    const editor = page.locator(".gaugeapp-host-editor");
+    await expect(editor).toContainText("Current rate: USD 0.00005 / second.");
+    await expect(editor).toContainText("This host allows at most USD 0.05 per attempt.");
+    await editor.getByRole("checkbox", { name: "Allow metered Isolated workspace compute" }).check();
+    const cap = editor.getByRole("textbox", { name: "Maximum reservation per attempt (USD)" });
+    await cap.fill("0.06");
+    await editor.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(page.getByRole("alert")).toHaveText("The per-attempt limit must be more than zero and no more than this host allows.");
+    await cap.fill("0.01");
+    await editor.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(page.locator(".gaugeapp-host-detail")).toContainText("Enabled · USD 0.01 per-attempt cap");
+
+    const recorded = await calls(page);
+    const changes = recorded.filter((entry) => entry.homePolicy);
+    expect(changes.map((entry) => entry.homePolicy)).toEqual([
+        { isolated_workspace_enabled: true, max_attempt_nanos_usd: 60_000_000 },
+        { isolated_workspace_enabled: true, max_attempt_nanos_usd: 10_000_000 },
+    ]);
+    // A different change is a different command; only a retry of the same one replays.
+    expect(new Set(changes.map((entry) => entry.key)).size).toBe(2);
+    // The Hub's copy, which no turn enforces, is not written.
+    expect(recorded.some((entry) => entry.command === "project-host.managed-policy.set")).toBe(false);
+});
+
+test("a member reads a managed host's Isolated policy but cannot change it", async ({ page }) => {
+    await page.goto("/?app=administration&project-host=managed&home-policy=member");
+    await click(page, "view");
+    await click(page, "Compute policy");
+    const editor = page.locator(".gaugeapp-host-editor");
+    await expect(editor).toContainText("Only the organization's owner can change this.");
+    await expect(editor).toContainText("Current rate: USD 0.00005 / second.");
+    await expect(editor.getByRole("checkbox", { name: "Allow metered Isolated workspace compute" })).toBeDisabled();
+    await expect(editor.getByRole("textbox", { name: "Maximum reservation per attempt (USD)" })).toBeDisabled();
+    await expect(editor.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+});
+
+test("a host without Isolated prices can only have it turned off", async ({ page }) => {
+    await page.goto("/?app=administration&project-host=managed&home-policy=unpriced");
+    await click(page, "view");
+    await click(page, "Compute policy");
+    const editor = page.locator(".gaugeapp-host-editor");
+    await expect(editor).toContainText("This host has no Isolated workspace prices, so it can only be turned off.");
+    await expect(editor).not.toContainText("Current rate");
+    await expect(editor.getByRole("checkbox", { name: "Allow metered Isolated workspace compute" })).toBeDisabled();
 });
 
 test("product revision and proposal editing reread the populated commercial ledger", async ({ page }, info) => {
@@ -1092,11 +1152,16 @@ test("clearing a management conversation requires confirmation and rereads serve
     await composer.press("Enter");
     await expect(page.getByText("Reply for A", { exact: true })).toBeVisible();
 
-    await click(page, "Clear");
+    // Clearing is offered from the chat's options menu, beside the header.
+    const clearChat = async () => {
+        await click(page, "Management chat menu");
+        await page.getByRole("menuitem", { name: "Clear chat", exact: true }).click();
+    };
+    await clearChat();
     await expect(page.getByRole("alert")).toContainText("cannot be recovered");
     await click(page, "Cancel");
     await expect(page.getByText("Reply for A", { exact: true })).toBeVisible();
-    await click(page, "Clear");
+    await clearChat();
     await click(page, "Clear conversation");
     await expect(page.getByText("Reply for A", { exact: true })).toHaveCount(0);
     expect(await calls(page)).toContainEqual({ erase: "A" });
@@ -1183,7 +1248,7 @@ test("recovery codes are visible only in the issuing account visit", async ({ pa
     await expect(page.getByLabel("Display name", { exact: true })).toHaveValue("Person B");
 });
 
-test("Chromium WebAuthn completes the add-passkey ceremony", async ({ page, browserName }) => {
+test("Chromium WebAuthn completes the add-passkey ceremony", async ({ page, browserName, baseURL }) => {
     test.skip(browserName !== "chromium", "Chromium CDP supplies the hermetic platform authenticator");
     const cdp = await page.context().newCDPSession(page);
     await cdp.send("WebAuthn.enable");
@@ -1201,7 +1266,7 @@ test("Chromium WebAuthn completes the add-passkey ceremony", async ({ page, brow
         // WebAuthn's relying-party id is a registrable domain, not an IP
         // address. Keep the hermetic server on loopback while exercising the
         // browser ceremony from the sanctioned localhost secure context.
-        await page.goto("http://localhost:7662/?app=account-settings");
+        await page.goto(onLocalhost(baseURL, "/?app=account-settings"));
         await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
         await click(page, "Add passkey");
         await expect.poll(async () => (await calls(page)).filter((call) => call.command === "account.authenticator.complete-add").length).toBe(1);
@@ -1235,7 +1300,7 @@ test("Chromium WebAuthn completes the add-passkey ceremony", async ({ page, brow
     }
 });
 
-test("reviewed account deletion uses a fresh passkey and one retry coordinate through terminal eviction", async ({ page, browserName }, info) => {
+test("reviewed account deletion uses a fresh passkey and one retry coordinate through terminal eviction", async ({ page, browserName, baseURL }, info) => {
     test.skip(browserName !== "chromium", "Chromium CDP supplies the hermetic platform authenticator");
     const cdp = await page.context().newCDPSession(page);
     await cdp.send("WebAuthn.enable");
@@ -1250,7 +1315,7 @@ test("reviewed account deletion uses a fresh passkey and one retry coordinate th
         },
     });
     try {
-        await page.goto("http://localhost:7662/?app=account-settings&account-erasure=1");
+        await page.goto(onLocalhost(baseURL, "/?app=account-settings&account-erasure=1"));
         await expect(page.getByRole("heading", { name: "Account Settings", exact: true, level: 1 })).toBeVisible();
 
         // Establish a real discoverable credential for the subsequent fresh

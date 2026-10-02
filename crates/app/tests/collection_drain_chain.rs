@@ -37,6 +37,8 @@ use gaugedesk_app::{open_control_plane, open_workbench, LockUnpoisoned, SharedWo
 
 const PROJECT: &str = "proj-default";
 const PLACEMENT: &str = "inst-placement-default";
+/// The Panel placement whose deployment the drain reads.
+const PANEL_PLACEMENT: &str = "inst-panel-collection";
 const DEPLOYMENT: &str = "dep-collect-1";
 const BINDING: &str = "public-deployment-collect-1";
 const RECIPIENT: &str = "theory-a";
@@ -111,7 +113,7 @@ fn install_binding(workbench: &SharedWorkbench, edge: &str, hosted_deployment_id
     let placement = InstanceRecord {
         schema: LIBRARY_RECORD_SCHEMA,
         extra: Default::default(),
-        id: "inst-panel-collection".to_owned(),
+        id: PANEL_PLACEMENT.to_owned(),
         op: RecordOp::Upsert,
         kind: InstanceKind::Using,
         placement_kind: PlacementKind::Panel,
@@ -1022,7 +1024,25 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     let (dir, workbench, app, edge, _log) = setup();
     let reviewer = owner_bearer(&workbench);
     drain(&workbench, &edge, PROJECT);
-    let chat = a_chat(&app).await;
+    // No chat anywhere in the project: screening and review are project-gate
+    // acts (DR-0143 §6), and a project whose only placement in use is a Panel
+    // placement must still be told what waits for it.
+    let (_, workspace) = send(&app, "GET", "/workspace", None).await;
+    let placements = workspace["projects"]
+        .as_array()
+        .expect("workspace lists projects")
+        .iter()
+        .find(|project| project["id"] == PROJECT)
+        .expect("the default project is present")["placements"]
+        .as_array()
+        .expect("the project lists placements")
+        .clone();
+    assert!(
+        placements
+            .iter()
+            .all(|placement| placement["chats"].as_array().is_some_and(Vec::is_empty)),
+        "the project has no chat: {placements:?}",
+    );
 
     let coerce = gaugedesk_whip_runtime::gate_runner::GateCoercionConfig {
         backend: gaugedesk_whip_runtime::gate_runner::CoerceBackend::OpenAi,
@@ -1050,7 +1070,7 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     // Pass one: the gate files its question and parks. Nothing settles.
     let parked = workbench
         .lock_unpoisoned()
-        .run_project_gate(PROJECT, ARTIFACT, &chat, &coerce, &NoModel)
+        .run_project_gate(PROJECT, ARTIFACT, "", &coerce, &NoModel)
         .expect("the gate runs");
     assert!(parked.is_none(), "review-by-hand parks on a person");
 
@@ -1066,7 +1086,8 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     );
 
     // And the top bar says so while it waits (ADR 0110 §7, GATE-6): one
-    // `screen` task, project-scoped, naming the chat a reviewer opens to look.
+    // `screen` task, the project's, naming no chat. Every parked item came from
+    // one Panel placement, so it names that placement, whose Inbox the bar opens.
     let waiting_now = get_as(&app, "/tasks", &reviewer).await;
     let screen: Vec<&Value> = waiting_now["tasks"]
         .as_array()
@@ -1081,11 +1102,11 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
     );
     assert_eq!(screen[0]["project"], PROJECT);
     assert_eq!(screen[0]["waiting"], 1);
-    assert!(
-        screen[0]["id"].as_str().is_some_and(|id| !id.is_empty()),
-        "the pill opens a chat: {}",
-        screen[0]["id"],
+    assert_eq!(
+        screen[0]["id"], PROJECT,
+        "the pill is the project's, not a chat's"
     );
+    assert_eq!(screen[0]["placement"], PANEL_PLACEMENT);
 
     let held = quarantine::list(workbench.lock_unpoisoned().store_ref(), PROJECT).unwrap();
     assert!(
@@ -1100,7 +1121,7 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
         .review_through_gate(
             PROJECT,
             ARTIFACT,
-            &chat,
+            "",
             gaugedesk_app::gate::Verdict::Keep,
             &coerce,
             &NoModel,
@@ -1134,5 +1155,163 @@ async fn a_reviewers_answer_settles_the_item_through_the_gate() {
             .any(|task| task["kind"] == "screen"),
         "no inbound pill once nothing awaits a person: {}",
         after["tasks"],
+    );
+}
+
+/// A scripted screener that remembers which credential each call carried.
+#[derive(Default)]
+struct KeyedScreener(Mutex<Vec<(String, String)>>);
+
+impl gaugedesk_whip_runtime::gate_runner::GateTransport for KeyedScreener {
+    fn fetch(
+        &self,
+        request: &gaugedesk_whip_runtime::sansio_types::HttpRequest,
+    ) -> Result<
+        gaugedesk_whip_runtime::sansio_types::HttpResponse,
+        gaugedesk_whip_runtime::sansio_types::TransportError,
+    > {
+        let authorization = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        self.0
+            .lock()
+            .unwrap()
+            .push((request.url.clone(), authorization));
+        Screener("keep").fetch(request)
+    }
+}
+
+/// Screen the drained item the way the screen route does: the actor comes from
+/// the caller's session, and the credential from the actor and the project.
+fn screen_as_the_route_does(
+    dir: &std::path::Path,
+    workbench: &SharedWorkbench,
+) -> (Option<String>, Vec<(String, String)>) {
+    gaugedesk_app::gate::install(
+        &project_repo(dir),
+        gaugedesk_app::gate::GateKind::CoerceScreen,
+    )
+    .unwrap();
+    let reviewer = owner_bearer(workbench);
+    let screener = KeyedScreener::default();
+    let mut guard = workbench.lock_unpoisoned();
+    let actor = guard.actor(Some(&reviewer));
+    let landed = guard
+        .screen_quarantined_as(&actor, PROJECT, ARTIFACT, &screener)
+        .expect("the screening gate runs");
+    drop(guard);
+    (landed, screener.0.into_inner().unwrap())
+}
+
+/// A screening gate reached through the product coerces with the reviewing
+/// person's linked key.
+///
+/// The screen and review routes once resolved the credential with the project
+/// id as the actor. An account scope keyed by a project holds nothing, so every
+/// `coerce-screen` project fell back to the unusable config and failed to
+/// screen whoever had linked a key — and the only test that ran this gate built
+/// its coercion config by hand, which is how that went unseen.
+#[tokio::test]
+async fn a_screening_gate_coerces_with_the_reviewing_persons_linked_key() {
+    let (dir, workbench, app, edge, _log) = setup();
+    drain(&workbench, &edge, PROJECT);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(r#"{"provider":"openai","token":"person-key"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "link the person's key: {body}");
+
+    let (landed, calls) = screen_as_the_route_does(dir.path(), &workbench);
+
+    assert!(landed.is_some(), "a kept item lands in the workspace");
+    assert_eq!(
+        calls,
+        vec![(
+            "https://api.openai.com/v1/responses".to_owned(),
+            "Bearer person-key".to_owned()
+        )],
+        "the gate called the provider once, with the person's key",
+    );
+}
+
+/// The project's own pin outranks the person's key, as it does for a chat in
+/// the project (ADR 0062's nearest-holder rule).
+#[tokio::test]
+async fn a_projects_own_openai_pin_screens_before_the_persons_key() {
+    let (dir, workbench, app, edge, _log) = setup();
+    drain(&workbench, &edge, PROJECT);
+    for (uri, token) in [
+        ("/account/credentials".to_owned(), "person-key"),
+        (format!("/projects/{PROJECT}/credentials"), "project-key"),
+    ] {
+        let body = json!({ "provider": "openai", "token": token }).to_string();
+        let (status, reply) = send(&app, "POST", &uri, Some(&body)).await;
+        assert_eq!(status, 200, "link {token}: {reply}");
+    }
+
+    let (landed, calls) = screen_as_the_route_does(dir.path(), &workbench);
+
+    assert!(landed.is_some(), "a kept item lands in the workspace");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(_, auth)| auth.as_str())
+            .collect::<Vec<_>>(),
+        ["Bearer project-key"],
+    );
+}
+
+/// The inbound pill names a placement only while that placement's Inbox in
+/// Panel Settings holds everything waiting. An item it cannot trace to one live
+/// Panel placement — here because the placement has been removed — sends the
+/// reviewer to the project's Inbox, which shows every item, instead.
+#[tokio::test]
+async fn an_inbound_pill_without_one_live_placement_opens_the_project_inbox() {
+    use gaugedesk_app::library::{InstanceRecord, RecordOp, LIBRARY_SCOPE};
+
+    let (_dir, workbench, app, edge, _log) = setup();
+    let reviewer = owner_bearer(&workbench);
+    drain(&workbench, &edge, PROJECT);
+    park_for_review(&workbench, "");
+    {
+        let mut guard = workbench.lock_unpoisoned();
+        let mut placement: InstanceRecord = guard
+            .store_ref()
+            .records(LIBRARY_SCOPE, "instance")
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| serde_json::from_str::<InstanceRecord>(&row).ok())
+            .rfind(|placement| placement.id == PANEL_PLACEMENT)
+            .expect("the Panel placement is recorded");
+        placement.op = RecordOp::Tombstone;
+        guard
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "instance",
+                &serde_json::to_string(&placement).unwrap(),
+            )
+            .unwrap();
+        guard.rebuild_library();
+    }
+
+    let tasks = get_as(&app, "/tasks", &reviewer).await;
+    let screen = tasks["tasks"]
+        .as_array()
+        .expect("the task queue is a list")
+        .iter()
+        .find(|task| task["kind"] == "screen")
+        .expect("what the gate parked still waits on a person");
+    assert_eq!(screen["id"], PROJECT);
+    assert_eq!(screen["waiting"], 1);
+    assert!(
+        screen.get("placement").is_none(),
+        "no live placement holds the item, so the project's Inbox opens: {screen}",
     );
 }

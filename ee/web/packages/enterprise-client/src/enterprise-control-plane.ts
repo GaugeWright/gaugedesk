@@ -1,5 +1,7 @@
 import {
     bearer,
+    homeExecutionPolicyClient,
+    type HomeExecutionPolicyClient,
     accountSetSetting,
     accountSettings,
     browserRouteEventStream,
@@ -99,6 +101,11 @@ export class EnterpriseControlPlane implements EnterpriseAdminApi {
     private readonly json: RouteJson;
     private readonly request: RouteRequest;
     private readonly events: RouteEventStream;
+
+    /** The organization owner's Isolated workspace switch on each managed
+     *  Project Host's own Home (GaugeWright DR-0194), reached with Home
+     *  admission rather than through the Hub, whose copy is not enforced. */
+    readonly homeExecutionPolicy: HomeExecutionPolicyClient = homeExecutionPolicyClient({ bearer: () => bearer() });
 
     constructor(
         base = controlPlaneBase(),

@@ -87,8 +87,8 @@ function fixtureApi(): EmbedSessionApi {
     // it the turn goes straight from thinking to streaming, which is what a
     // tool-less deployment actually does.
     const fixtureTool = params.get("tool");
-    const fixtureDeliverable = params.get("deliverable") === "1";
-    const FIXTURE_DELIVERABLE = "deliverable/oai-readout.html";
+    const fixtureWorkspace = params.get("workspace") === "1";
+    const FIXTURE_READOUT = "artifacts/oai-readout.html";
     return {
         getTurnActivity: () => observation,
         subscribeTurnActivity: (listener: (value: TurnObservation) => void) => {
@@ -154,23 +154,25 @@ function fixtureApi(): EmbedSessionApi {
         runTask: () => new Promise<never>(() => undefined),
         mergeCommand: async (_id: EngagementId, _action: MergeAction) =>
             emptyMerge,
-        // `?deliverable=1` rehearses a session whose agent wrote a report for
-        // the visitor (ADR 0163): the card after the transcript offers it, and
-        // the download fetches this HTML through the same `getFile` seam the
-        // real projection answers.
+        // `?workspace=1` rehearses a session whose agent wrote into all three
+        // of its folders (DR-0310): the visitor's Files panel shows the readout
+        // in artifacts/ and neither the scratchpad nor the outbox.
         getFile: async (_id: EngagementId, path: string) =>
-            fixtureDeliverable && path === FIXTURE_DELIVERABLE
+            fixtureWorkspace && path === FIXTURE_READOUT
                 ? "<!doctype html><title>Your readout</title><h1>Your readout</h1><p>Fixture report.</p>"
                 : "",
         putFile: async () => {
             throw new Error("fixture files are read-only");
         },
         getTree: async () =>
-            (fixtureDeliverable
+            (fixtureWorkspace
                 ? [
-                      { path: "oai/flow.md", isDir: false },
-                      { path: "record/oai-record.json", isDir: false },
-                      { path: FIXTURE_DELIVERABLE, isDir: false },
+                      { path: "artifacts", isDir: true },
+                      { path: FIXTURE_READOUT, isDir: false },
+                      { path: "work", isDir: true },
+                      { path: "work/notes.md", isDir: false },
+                      { path: "outbox", isDir: true },
+                      { path: "outbox/oai-record.json", isDir: false },
                   ]
                 : []) as FileEntry[],
         embedMyChats: async () => [],

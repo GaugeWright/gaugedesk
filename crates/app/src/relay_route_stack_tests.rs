@@ -273,3 +273,80 @@ async fn same_account_sessions_coexist_and_revoke_independently() {
         StatusCode::OK
     );
 }
+
+struct Stranger;
+
+impl BearerAccounts for Stranger {
+    fn account_for(&self, _bearer: &str) -> Result<Option<String>, String> {
+        Ok(Some("someone-else".to_owned()))
+    }
+}
+
+async fn connection_header(
+    app: &Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Option<String>) {
+    let mut builder = Request::builder().method("GET").uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let close = response
+        .headers()
+        .get(axum::http::header::CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (response.status(), close)
+}
+
+/// DR-0302: a caller the Home has not verified is answered and hung up, so
+/// holding the public locator holds a crossing for seconds, not for as long as
+/// the caller likes.
+#[tokio::test]
+async fn a_caller_the_home_has_not_verified_is_hung_up_on() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    crate::account_signin::store_session_for_test(&wb);
+    crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+    let strangers = relay_control_plane(wb.clone(), Arc::new(Stranger));
+    for (uri, headers) in [
+        ("/workspace", &[][..]),
+        (
+            "/workspace",
+            &[("authorization", "Bearer not-the-owner")][..],
+        ),
+        ("/auth/login", &[][..]),
+        ("/health", &[][..]),
+    ] {
+        let (status, close) = connection_header(&strangers, uri, headers).await;
+        assert_eq!(
+            close.as_deref(),
+            Some("close"),
+            "{uri} answered {status} and kept the connection"
+        );
+    }
+}
+
+/// The owner keeps their connection even when refused, because a refusal they
+/// meet — an expired admission — is answered by admitting again over it.
+#[tokio::test]
+async fn the_owner_keeps_the_connection_through_a_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    crate::account_signin::store_session_for_test(&wb);
+    crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+    let app = relay_control_plane(wb.clone(), Arc::new(Owner));
+    let (status, close) = connection_header(
+        &app,
+        "/workspace",
+        &[("authorization", "Bearer owner-bearer")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(close, None);
+}

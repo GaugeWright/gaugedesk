@@ -9,7 +9,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::http_stream::{encode_request, HttpResponse, ResponseReader};
+use crate::http_stream::{
+    encode_request, BodyPart, EventReader, HttpResponse, ResponseReader, ServerEvent,
+};
 use crate::session::PinnedSession;
 use crate::wire::CertFingerprint;
 
@@ -82,6 +84,144 @@ impl TunnelClient {
     pub fn poll(&mut self) -> std::io::Result<Option<HttpResponse>> {
         self.pump()?;
         Ok(self.completed.pop_front())
+    }
+}
+
+/// What one poll of a [`TunnelEventStream`] produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamPoll {
+    /// The Home accepted the stream. Events follow.
+    Opened,
+    /// One event with data. Keep-alive comments and events without data are
+    /// not reported, exactly as `EventSource` does not dispatch them.
+    Event(ServerEvent),
+    /// The Home answered with something other than a stream: its status, and
+    /// the whole of its body, which carries the reason.
+    Refused { status: u16, body: Vec<u8> },
+    /// The stream's body ended. Nothing further will arrive on this session.
+    Ended,
+}
+
+#[derive(Debug)]
+enum StreamState {
+    AwaitingHead,
+    Open,
+    Refusing { status: u16, body: Vec<u8> },
+    Finished,
+}
+
+/// One event stream over its own pinned tunnel (WS-634).
+///
+/// A Home's `events` responses never end in normal operation, so a stream
+/// cannot share a session with [`TunnelClient`], whose calls are answered one
+/// whole response at a time: the first stream would hold every later call
+/// behind it. A stream is therefore its own crossing — the Home serves up to
+/// sixteen at once (DR-0284) — and is read head-then-body as bytes arrive.
+pub struct TunnelEventStream {
+    session: PinnedSession,
+    responses: ResponseReader,
+    events: EventReader,
+    state: StreamState,
+    /// What a pump decoded and no poll has taken yet, for the same reason
+    /// [`TunnelClient`] holds completed responses: a carrier pumps for
+    /// ciphertext as well as for news, and either may decode the last record.
+    ready: VecDeque<StreamPoll>,
+}
+
+impl TunnelEventStream {
+    /// Begin a session pinned to `expected` and queue `GET path` on it, asking
+    /// for an event stream.
+    pub fn open(
+        expected: CertFingerprint,
+        path: &str,
+        headers: &BTreeMap<String, String>,
+    ) -> std::io::Result<Self> {
+        let mut headers = headers.clone();
+        headers.insert("accept".to_owned(), "text/event-stream".to_owned());
+        let encoded = encode_request("GET", path, &headers, None)?;
+        let mut responses = ResponseReader::new();
+        responses.sent_request("GET");
+        let mut session = PinnedSession::new(expected)?;
+        session.send(&encoded)?;
+        Ok(Self {
+            session,
+            responses,
+            events: EventReader::new(),
+            state: StreamState::AwaitingHead,
+            ready: VecDeque::new(),
+        })
+    }
+
+    /// The carrier pumps this: feed it ciphertext, take ciphertext from it.
+    pub fn session_mut(&mut self) -> &mut PinnedSession {
+        &mut self.session
+    }
+
+    pub fn handshaking(&self) -> bool {
+        self.session.handshaking()
+    }
+
+    /// Advance the session and decode whatever it yields, without taking it.
+    pub fn pump(&mut self) -> std::io::Result<()> {
+        self.session.pump()?;
+        let plaintext = self.session.take_plaintext();
+        if !plaintext.is_empty() {
+            self.responses.feed(&plaintext);
+        }
+        loop {
+            match &mut self.state {
+                StreamState::AwaitingHead => {
+                    let Some(head) = self.responses.take_head()? else {
+                        break;
+                    };
+                    if (200..300).contains(&head.status) {
+                        self.state = StreamState::Open;
+                        self.ready.push_back(StreamPoll::Opened);
+                    } else {
+                        self.state = StreamState::Refusing {
+                            status: head.status,
+                            body: Vec::new(),
+                        };
+                    }
+                }
+                StreamState::Open => match self.responses.read_body()? {
+                    BodyPart::Chunk(bytes) => {
+                        self.events.feed(&bytes)?;
+                        while let Some(event) = self.events.take() {
+                            if !event.data.is_empty() {
+                                self.ready.push_back(StreamPoll::Event(event));
+                            }
+                        }
+                    }
+                    BodyPart::End => {
+                        self.state = StreamState::Finished;
+                        self.ready.push_back(StreamPoll::Ended);
+                    }
+                    BodyPart::Pending => break,
+                },
+                StreamState::Refusing { status, body } => match self.responses.read_body()? {
+                    BodyPart::Chunk(bytes) => body.extend_from_slice(&bytes),
+                    BodyPart::End => {
+                        let refused = StreamPoll::Refused {
+                            status: *status,
+                            body: std::mem::take(body),
+                        };
+                        self.state = StreamState::Finished;
+                        self.ready.push_back(refused);
+                    }
+                    BodyPart::Pending => break,
+                },
+                StreamState::Finished => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Take the next thing the stream produced, or `None` while more bytes are
+    /// needed.
+    pub fn poll(&mut self) -> std::io::Result<Option<StreamPoll>> {
+        self.pump()?;
+        Ok(self.ready.pop_front())
     }
 }
 
@@ -256,5 +396,179 @@ mod tests {
             outcome.is_err() || outcome.unwrap().is_none(),
             "a mismatched pin must never yield a response",
         );
+    }
+
+    /// Shuttle bytes between a stream and a Home until nothing more moves,
+    /// collecting everything the stream reports. The Home's side reads the
+    /// request once and then writes `reply` in the pieces given.
+    fn stream_exchange(
+        stream: &mut TunnelEventStream,
+        server: &mut ServerConnection,
+        pieces: &[&[u8]],
+    ) -> (Vec<StreamPoll>, String) {
+        let mut seen = Vec::new();
+        let mut request = Vec::new();
+        let mut pieces = pieces.iter();
+        for _ in 0..128 {
+            while let Some(polled) = stream.poll().expect("poll") {
+                seen.push(polled);
+            }
+            let out = stream.session_mut().take_outgoing();
+            if !out.is_empty() {
+                let mut cursor = std::io::Cursor::new(out);
+                while (cursor.position() as usize) < cursor.get_ref().len() {
+                    server.read_tls(&mut cursor).expect("server reads");
+                    server.process_new_packets().expect("server processes");
+                }
+            }
+            let _ = server.reader().read_to_end(&mut request);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                // One piece per round, so the stream sees each as it arrives.
+                if let Some(piece) = pieces.next() {
+                    server.writer().write_all(piece).expect("server writes");
+                }
+            }
+            let mut back = Vec::new();
+            server.write_tls(&mut back).ok();
+            if !back.is_empty() {
+                stream.session_mut().received(&back);
+            }
+        }
+        (seen, String::from_utf8_lossy(&request).into_owned())
+    }
+
+    fn event(data: &str) -> StreamPoll {
+        StreamPoll::Event(ServerEvent {
+            event: None,
+            data: data.to_owned(),
+        })
+    }
+
+    /// The case this exists for: a Home's event stream never ends, and each
+    /// event must arrive while it is still open, carrying the credentials the
+    /// Home demands of every work route.
+    #[test]
+    fn an_event_stream_delivers_each_event_while_it_stays_open() {
+        let (identity, config) = home();
+        let mut server = ServerConnection::new(Arc::new(config)).expect("server");
+        let headers = BTreeMap::from([(
+            "x-gaugewright-home-admission".to_owned(),
+            "admitted".to_owned(),
+        )]);
+        let mut stream =
+            TunnelEventStream::open(identity.fingerprint(), "/chats/c1/events", &headers)
+                .expect("open");
+
+        let (seen, request) = stream_exchange(
+            &mut stream,
+            &mut server,
+            &[
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n",
+                b"d\r\ndata: first\n\n\r\n",
+                // axum's keep-alive: a comment, which no subscriber should see.
+                b"3\r\n:\n\n\r\n",
+                b"e\r\ndata: second\n\n\r\n",
+            ],
+        );
+        assert!(request.starts_with("GET /chats/c1/events HTTP/1.1\r\n"));
+        assert!(request.contains("accept: text/event-stream\r\n"));
+        assert!(request.contains("x-gaugewright-home-admission: admitted\r\n"));
+        assert_eq!(
+            seen,
+            vec![StreamPoll::Opened, event("first"), event("second")],
+            "events must arrive while the stream is open, and nothing else",
+        );
+    }
+
+    /// A refusal is a whole response, and its body is the reason desk acts on
+    /// — `target Home admission required` is what makes it admit again.
+    #[test]
+    fn a_refused_stream_reports_its_status_and_reason() {
+        let (identity, config) = home();
+        let mut server = ServerConnection::new(Arc::new(config)).expect("server");
+        let mut stream = TunnelEventStream::open(
+            identity.fingerprint(),
+            "/workspace/events",
+            &BTreeMap::new(),
+        )
+        .expect("open");
+        let body = br#"{"error":"target Home admission required"}"#;
+        let head = format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        let (seen, _) = stream_exchange(
+            &mut stream,
+            &mut server,
+            &[head.as_bytes(), &body[..10], &body[10..]],
+        );
+        assert_eq!(
+            seen,
+            vec![StreamPoll::Refused {
+                status: 401,
+                body: body.to_vec()
+            }],
+        );
+    }
+
+    /// A stream the Home ends says so, so its subscriber can open another.
+    #[test]
+    fn a_stream_that_ends_reports_the_end_after_its_events() {
+        let (identity, config) = home();
+        let mut server = ServerConnection::new(Arc::new(config)).expect("server");
+        let mut stream =
+            TunnelEventStream::open(identity.fingerprint(), "/chats/c1/events", &BTreeMap::new())
+                .expect("open");
+        let (seen, _) = stream_exchange(
+            &mut stream,
+            &mut server,
+            &[b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nc\r\ndata: last\n\n\r\n0\r\n\r\n"],
+        );
+        assert_eq!(
+            seen,
+            vec![StreamPoll::Opened, event("last"), StreamPoll::Ended]
+        );
+    }
+
+    /// Pumping for ciphertext must not swallow what it decoded, as for calls.
+    #[test]
+    fn pumping_a_stream_for_ciphertext_keeps_what_it_decoded() {
+        let (identity, config) = home();
+        let mut server = ServerConnection::new(Arc::new(config)).expect("server");
+        let mut stream =
+            TunnelEventStream::open(identity.fingerprint(), "/chats/c1/events", &BTreeMap::new())
+                .expect("open");
+        let reply: &[u8] =
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n";
+        let mut answered = false;
+        for _ in 0..64 {
+            stream.pump().expect("pump");
+            let out = stream.session_mut().take_outgoing();
+            if !out.is_empty() {
+                let mut cursor = std::io::Cursor::new(out);
+                while (cursor.position() as usize) < cursor.get_ref().len() {
+                    server.read_tls(&mut cursor).expect("server reads");
+                    server.process_new_packets().expect("server processes");
+                }
+            }
+            if !answered {
+                let mut request = Vec::new();
+                let _ = server.reader().read_to_end(&mut request);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    server.writer().write_all(reply).expect("server writes");
+                    answered = true;
+                }
+            }
+            let mut back = Vec::new();
+            server.write_tls(&mut back).ok();
+            if !back.is_empty() {
+                stream.session_mut().received(&back);
+                // Pump once more before polling, the way a carrier flushes
+                // after every arrival.
+                stream.pump().expect("pump");
+            }
+        }
+        assert_eq!(stream.poll().expect("poll"), Some(StreamPoll::Opened));
+        assert_eq!(stream.poll().expect("poll"), Some(event("one")));
     }
 }

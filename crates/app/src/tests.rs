@@ -561,6 +561,47 @@ async fn transcript_is_durable_across_a_fresh_read() {
 }
 
 #[tokio::test]
+async fn a_settled_turns_assistant_record_carries_its_settle_time() {
+    let _fake_agent = fake_agent_env();
+    let (_d, wb) = workbench();
+    let app = open_control_plane(wb);
+    send(&app, "POST", "/chats", Some(r#"{"id":"t1"}"#)).await;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    send(
+        &app,
+        "POST",
+        "/chats/t1/task",
+        Some(r#"{"prompt":"do the thing"}"#),
+    )
+    .await;
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let (s, body) = send(&app, "GET", "/chats/t1/transcript", None).await;
+    assert_eq!(s, StatusCode::OK, "got {body}");
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    let assistants: Vec<_> = rows.iter().filter(|r| r["type"] == "assistant").collect();
+    assert!(!assistants.is_empty(), "assistant rows: {body}");
+    for row in assistants {
+        let settled = row["settled_at_unix_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("settle time on {row}"));
+        assert!(
+            (before..=after).contains(&settled),
+            "{settled} within the turn [{before}, {after}]"
+        );
+    }
+    // Only the turn's reply says when the turn settled; the prompt does not.
+    let user = rows.iter().find(|r| r["type"] == "user").unwrap();
+    assert!(user.get("settled_at_unix_ms").is_none(), "{user}");
+}
+
+#[tokio::test]
 async fn point_fork_rejects_an_unmapped_transcript_entry() {
     let (_d, wb) = workbench();
     let app = open_control_plane(wb);

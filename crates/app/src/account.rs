@@ -1029,14 +1029,33 @@ impl Workbench {
         actor: &str,
         class: ModelExecutionClass,
     ) -> Option<SelectedCredential> {
-        if let Some(project_id) = self.library_project_of_chat(chat_id) {
-            if let Some(record) =
-                credentials_in_scope(self.store_ref(), &project_scope(&project_id))
-                    .remove(provider)
-                    .filter(|record| record.admits(class))
+        self.selected_credential_for_project_in_class(
+            self.library_project_of_chat(chat_id).as_deref(),
+            provider,
+            actor,
+            class,
+        )
+    }
+
+    /// ADR 0062's nearest-holder rule for work in `project_id`: the project's
+    /// own pin, then the account credential of `actor` — the authenticated
+    /// person doing the work — and otherwise nothing. `actor` is a person,
+    /// never a project id: an account scope keyed by a project holds no
+    /// credential, so passing one silently resolves to nothing.
+    fn selected_credential_for_project_in_class(
+        &self,
+        project_id: Option<&str>,
+        provider: &str,
+        actor: &str,
+        class: ModelExecutionClass,
+    ) -> Option<SelectedCredential> {
+        if let Some(project_id) = project_id {
+            if let Some(record) = credentials_in_scope(self.store_ref(), &project_scope(project_id))
+                .remove(provider)
+                .filter(|record| record.admits(class))
             {
                 return Some(SelectedCredential {
-                    scope: SelectedCredentialScope::Project(project_id),
+                    scope: SelectedCredentialScope::Project(project_id.to_owned()),
                     record,
                 });
             }
@@ -1126,19 +1145,46 @@ impl Workbench {
     ) -> Option<Arc<dyn CredentialCapability>> {
         let selected =
             self.selected_credential_for_chat_in_class(chat_id, provider, actor, class)?;
-        let secret = match &selected.scope {
-            SelectedCredentialScope::Project(project_id) => {
-                self.unseal_project_secret(project_id, &selected.record.sealed_token)?
-            }
-            SelectedCredentialScope::Account(_) => {
-                unseal_token(self.account_key(), &selected.record.sealed_token)?
-            }
-        };
+        let secret = self.unseal_selected_credential(&selected)?;
         Some(resolved_credential_capability(
             Self::versioned_credential_ref(&selected.scope, provider, selected.record.version),
             secret,
             None,
         ))
+    }
+
+    fn unseal_selected_credential(&self, selected: &SelectedCredential) -> Option<String> {
+        match &selected.scope {
+            SelectedCredentialScope::Project(project_id) => {
+                self.unseal_project_secret(project_id, &selected.record.sealed_token)
+            }
+            SelectedCredentialScope::Account(_) => {
+                unseal_token(self.account_key(), &selected.record.sealed_token)
+            }
+        }
+    }
+
+    /// The nearest-scope secret for `provider` in work on `project_id` run by
+    /// `actor`, in this composition's execution class. `Err` names what is
+    /// missing without the secret: no credential resolves, or the one that
+    /// does cannot be unsealed.
+    pub(crate) fn project_credential_secret(
+        &self,
+        project_id: &str,
+        provider: &str,
+        actor: &str,
+    ) -> Result<String, &'static str> {
+        let selected = self
+            .selected_credential_for_project_in_class(
+                Some(project_id),
+                provider,
+                actor,
+                self.model_execution_class(),
+            )
+            .ok_or("no credential resolves")?;
+        self.unseal_selected_credential(&selected)
+            .filter(|secret| !secret.trim().is_empty())
+            .ok_or("the credential could not be unsealed")
     }
 
     /// The non-secret OpenAI-compatible endpoint of the nearest-scope credential for

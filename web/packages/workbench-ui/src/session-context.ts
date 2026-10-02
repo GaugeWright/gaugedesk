@@ -26,7 +26,6 @@ import {
     type MergeAction,
     type MergePhase,
     type MergePreviewResult,
-    type QuarantineIndex,
     type RegionResolution,
     type SaveBase,
     type SaveFileResult,
@@ -66,19 +65,6 @@ export interface SessionApi {
     stopChatWhip?(id: EngagementId, stop: { path: string; launchedBy: string; requestId: string; key: string }): Promise<void>;
     /** The Home's people, for choosing who a person input names. */
     getRoster?(): Promise<RosterPerson[]>;
-    /** The project's quarantine index — provenance only, never payload
-     *  (ADR 0110 §7). Optional: only a session that can review inbound material
-     *  serves it. */
-    listQuarantine?(project: string): Promise<QuarantineIndex>;
-    /** One quarantined item's bytes, for a person to read. */
-    readQuarantinedItem?(project: string, item: string): Promise<string>;
-    /** Carry a reviewer's verdict to the project gate. Inbox custody and review
-     *  are project acts and do not require a work chat. */
-    reviewQuarantinedItem?(
-        project: string,
-        item: string,
-        verdict: "keep" | "flag",
-    ): Promise<{ workspacePath: string | null }>;
     /** `getFile` plus the cut the read serves (SUB-6 §12) — the base a
      *  cut-carrying save sends back. Optional: sessions without it fall
      *  back to content-based bases. */
@@ -208,20 +194,6 @@ export interface Session {
     readonly canEditFile?: (path: string) => boolean;
     /** Environment-specific explanation for a file refused by `canEditFile`. */
     readonly readOnlyFileReason?: (path: string) => string;
-
-    /** Optional: the project whose quarantine index the content viewer shows,
-     *  and the setter the top bar's inbound pill drives (ADR 0110 §7, GATE-6).
-     *
-     *  Deliberately *not* modelled as a `selectedFile` path. Quarantine is a path
-     *  boundary no agent file store resolves into (ADR 0110 §1), and giving it a
-     *  file-shaped address — even a virtual one — would put it in the same
-     *  namespace the protection is stated over. It is its own surface because it
-     *  is its own kind of thing: the reviewer's, never an agent's.
-     *
-     *  Absent in sessions with nothing to review: an embed reviews no inbound
-     *  material, so the panel simply never shows the surface. */
-    readonly reviewingProject?: Accessor<string | null>;
-    readonly reviewProject?: (project: string | null) => void;
 
     // Engagement-scoped read projections (`INV-5`). The desktop exposes its existing
     // resources here; an embed exposes the same shapes over its scoped session.

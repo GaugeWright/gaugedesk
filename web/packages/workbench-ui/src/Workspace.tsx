@@ -11,6 +11,7 @@ import { ContextMenu, type MenuItem, type MenuState } from "./ContextMenu";
 import { Icon } from "./icons";
 import { LoadError } from "./LoadError";
 import { RunDot, runsLaunched } from "./WhipRun";
+import { readForDownload, saveToBrowser } from "./file-download";
 
 // Generated packages and control files are available in the advanced view.
 // The ordinary tree starts with the authored Agent files and run results.
@@ -21,6 +22,8 @@ export interface WorkspaceProps {
     readonly creationRequest?: { chat: string; kind: "file" | "folder"; nonce: number } | null;
     readonly onCreationHandled?: () => void;
     readonly onChanged?: (message: string) => void;
+    /** Offer each file as a download (the embedded Files panel, DR-0310). */
+    readonly download?: boolean;
 }
 
 type FileDialog =
@@ -207,9 +210,21 @@ export function Workspace(props: WorkspaceProps = {}) {
             ? "" : selected;
         void apply({ action: "delete", path: entry.path }, nextSelection, `deleted ${displayName(entry.path)}`);
     };
+    const [downloadError, setDownloadError] = createSignal("");
+    const download = async (path: string) => {
+        const id = session.engagementId();
+        if (!id) return;
+        setDownloadError("");
+        try {
+            saveToBrowser(path, await readForDownload(session.api, id, path));
+        } catch (cause) {
+            setDownloadError(`${leafOf(path)} could not be downloaded: ${actionError(cause)}`);
+        }
+    };
     const actionsFor = (entry: FileEntry): MenuItem[] => {
         const items: MenuItem[] = [];
         if (!entry.isDir) items.push({ label: "Open", run: () => session.selectFile(entry.path) });
+        if (!entry.isDir && props.download) items.push({ label: "Download", run: () => void download(entry.path) });
         if (entry.isDir && canManage(entry.path)) {
             items.push({ label: "New file here", run: () => openCreate("file", entry.path) });
             items.push({ label: "New folder here", run: () => openCreate("folder", entry.path) });
@@ -286,6 +301,7 @@ export function Workspace(props: WorkspaceProps = {}) {
                 </Show>
             </Show>
         </Show>
+        <Show when={downloadError()}><p class="file-dialog-error" role="alert">{downloadError()}</p></Show>
         <ContextMenu menu={menu()} onClose={() => setMenu(null)} />
         <Show when={dialog()}>
             {(current) => <div class="modal-overlay" data-file-dialog onClick={() => !saving() && setDialog(null)}>

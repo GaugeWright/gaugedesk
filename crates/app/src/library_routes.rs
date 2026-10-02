@@ -1063,6 +1063,7 @@ pub async fn project_whip_costs(
 
 pub async fn create_project(
     State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
     Json(body): Json<CreateProject>,
 ) -> axum::response::Response {
     let mut wb = wb.lock_unpoisoned();
@@ -1079,7 +1080,13 @@ pub async fn create_project(
             .into_response();
     }
     let id = gen_id("proj");
-    match create_named_project(&mut wb, &id, &body.name) {
+    // The creating account owns the project (DR-0268 §6). The local channel
+    // creates as the computer's local account.
+    let mut extra = std::collections::BTreeMap::new();
+    if let Some(actor) = workspace_actor(&wb, &headers) {
+        crate::project_owner::record_owner(&mut extra, &actor);
+    }
+    match create_named_project_with_extra(&mut wb, &id, &body.name, extra) {
         Ok(project) => (StatusCode::CREATED, Json(project)).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3058,6 +3065,7 @@ mod search_tests {
             "chat-2",
             ServerEvent::Assistant {
                 text: "nothing relevant in this log".into(),
+                settled_at_unix_ms: None,
             },
         )
         .unwrap();

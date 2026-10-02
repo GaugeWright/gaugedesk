@@ -25,6 +25,7 @@
 import { For, Show, type JSX } from "solid-js";
 import type { AgentAbility, PanelPublicProfile, PublicPanelComponent } from "@gaugewright/control-plane-client";
 import { Option } from "./PanelAgentControls";
+import { AbilityPresets, ModelSelect } from "./agent-controls";
 import {
     collectionPathProblem,
     DEFAULT_COLLECTED_PATH,
@@ -32,9 +33,9 @@ import {
     MAX_COLLECTED_FILE_MB,
     PANEL_CHOICES,
     panelModelChoices,
-    PUBLIC_ABILITY_CHOICES,
     secondsFrom,
     withPinnedModel,
+    WORK_CHAT_DEFAULT_MODEL,
     type DurationUnit,
 } from "./panel-agent-presentation";
 import "./panel-agent.css";
@@ -63,6 +64,8 @@ function DurationInput(props: {
 }
 
 export function PanelContractEditor(props: {
+    /** The default row's wording, shared with the agent's own model field. */
+    defaultModelLabel?: string;
     profile: PanelPublicProfile;
     onChange: (next: PanelPublicProfile) => void;
     /** The abilities the authored agent has. A public ability outside them is
@@ -119,7 +122,6 @@ export function PanelContractEditor(props: {
         <section class="pa-section" data-panel-contract-panels>
             <div class="pa-section-head">
                 <h3>What visitors see</h3>
-                <p>The panels a website can show. Your site decides how to lay them out.</p>
             </div>
             <div class="pa-chips" role="group" aria-label="Panels">
                 <For each={PANEL_CHOICES}>{(choice) => {
@@ -137,19 +139,19 @@ export function PanelContractEditor(props: {
         <section class="pa-section" data-panel-contract-abilities>
             <div class="pa-section-head">
                 <h3>What the agent can do for visitors</h3>
-                <p>Never more than the agent itself can do. With nothing ticked, it only chats.</p>
             </div>
-            <div class="pa-options">
-                <For each={PUBLIC_ABILITY_CHOICES}>{(choice) => {
-                    const checked = () => profile().public_abilities.includes(choice.value);
-                    const unavailable = () => abilityUnavailable(choice.value);
-                    return <Option type="checkbox" checked={checked()} disabled={unavailable() && !checked()}
-                        title={unavailable() ? "The agent itself can't do this, so visitors can't be given it." : undefined}
-                        label={choice.name}
-                        detail={unavailable() ? "The agent itself can't do this." : choice.detail}
-                        onChange={(next) => toggleAbility(choice.value, next)} />;
-                }}</For>
-            </div>
+            {/* The same presets as the agent's own abilities, capped by them. */}
+            <AbilityPresets name="panel-public-abilities" abilities={profile().public_abilities}
+                ceiling={props.authoredAbilities}
+                onChange={(preset) => update((current) => ({
+                    ...current,
+                    public_abilities: [...preset, ...current.public_abilities.filter((ability) => ability === "question.ask")],
+                }))}>
+                <Option type="checkbox" checked={profile().public_abilities.includes("question.ask")}
+                    disabled={abilityUnavailable("question.ask") && !profile().public_abilities.includes("question.ask")}
+                    label="Ask questions"
+                    onChange={(next) => toggleAbility("question.ask", next)} />
+            </AbilityPresets>
             <Show when={props.authoredAbilities !== undefined
                 && profile().public_abilities.some((ability) => !props.authoredAbilities!.includes(ability))}>
                 <p class="pa-error">Something ticked here is beyond what the agent itself can do, so saving will be refused. Untick it.</p>
@@ -159,32 +161,28 @@ export function PanelContractEditor(props: {
         <section class="pa-section" data-panel-contract-model>
             <div class="pa-section-head">
                 <h3>Model</h3>
-                <p>The model that answers visitors. Who pays is chosen when you deploy: GaugeWright billing by default, or your own key.</p>
             </div>
             <div class="pa-fields">
                 {/* A select, not an input with a datalist: a datalist offers only the
                     suggestions matching what the field already holds, so a saved model
                     hid every other one (WS-597). */}
                 <label class="pa-field"><span>Model</span>
-                    <select class="pa-input" data-panel-contract-model-choice value={pinned()}
-                        onChange={(event) => setModel(event.currentTarget.value)}>
-                        <For each={models()}>{(choice) =>
-                            <option value={choice.value} title={choice.detail}
-                                selected={choice.value === pinned()}>{choice.name}</option>}</For>
-                    </select></label>
+                    <ModelSelect data-panel-contract-model-choice value={pinned()} onChange={setModel}
+                        options={models().map((choice) => ({
+                            value: choice.value,
+                            label: choice.value === WORK_CHAT_DEFAULT_MODEL ? props.defaultModelLabel ?? "Default" : choice.name,
+                        }))} /></label>
             </div>
             <details class="pa-advanced"><summary>Advanced</summary><div class="pa-fields">
                 <label class="pa-field"><span>Model ID</span>
-                    <input class="pa-input" spellcheck={false} value={pinned()}
-                        onInput={(event) => setModel(event.currentTarget.value)} />
-                    <small>Exactly as the model's maker names it, for a model the list doesn't carry. Empty uses your work-chat default.</small></label>
+                    <input class="pa-input" spellcheck={false} placeholder="Work-chat default" value={pinned()}
+                        onInput={(event) => setModel(event.currentTarget.value)} /></label>
             </div></details>
         </section>
 
         <section class="pa-section" data-panel-contract-retention>
             <div class="pa-section-head">
                 <h3>Conversation history</h3>
-                <p>The longest any deployment may keep a visitor's conversation. Each deployment can choose shorter.</p>
             </div>
             <div class="pa-fields">
                 <label class="pa-field"><span>Resumable for</span>
@@ -199,10 +197,10 @@ export function PanelContractEditor(props: {
             <Show when={retentionProblem()}><p class="pa-error">{retentionProblem()}</p></Show>
             <div class="pa-options">
                 <Option type="checkbox" checked={profile().retention.transcript_retained}
-                    label="Keep the transcript" detail="A returning visitor sees the conversation so far."
+                    label="Keep the transcript"
                     onChange={(transcript_retained) => update((current) => ({ ...current, retention: { ...current.retention, transcript_retained } }))} />
                 <Option type="checkbox" checked={profile().retention.workspace_retained}
-                    label="Keep the visitor's files" detail="Files made in the session are still there when they return."
+                    label="Keep the visitor's files"
                     onChange={(workspace_retained) => update((current) => ({ ...current, retention: { ...current.retention, workspace_retained } }))} />
             </div>
         </section>
@@ -210,10 +208,9 @@ export function PanelContractEditor(props: {
         <section class="pa-section" data-panel-contract-collection>
             <div class="pa-section-head">
                 <h3>Send results to the project Inbox</h3>
-                <p>Collect what the agent produces for visitors. It arrives sealed in the Inbox of the project that deploys it, and stays apart from your work until you admit it.</p>
             </div>
             <Option type="checkbox" checked={profile().collection !== null}
-                label="Collect results" detail="Off: nothing leaves a visitor's session."
+                label="Collect results"
                 onChange={(checked) => update((current) => ({ ...current, collection: checked ? {
                     exportable_paths: [DEFAULT_COLLECTED_PATH],
                     transcript_eligible: false,
@@ -223,13 +220,13 @@ export function PanelContractEditor(props: {
                 } : null }))} />
             <Show when={profile().collection}>{(collection) => <>
                 <label class="pa-field"><span>Files to collect</span>
-                    <textarea class="pa-input" rows={2} spellcheck={false} aria-invalid={pathProblems().length > 0}
+                    <textarea class="pa-input" rows={2} spellcheck={false} placeholder="outbox/*" aria-invalid={pathProblems().length > 0}
                         value={collection().exportable_paths.join("\n")}
                         onInput={(event) => update((current) => ({ ...current, collection: current.collection && {
                             ...current.collection,
                             exportable_paths: event.currentTarget.value.split("\n").map((line) => line.trim()).filter(Boolean),
-                        } }))} />
-                    <small>One per line, inside <code>artifacts/</code>: a file such as <code>artifacts/brief.pdf</code>, or every file in a folder, such as <code>artifacts/*</code>.</small></label>
+                        } }))} /></label>
+                <small>Files the agent puts in outbox/. The visitor's panels never show them.</small>
                 <For each={pathProblems()}>{(problem) => <p class="pa-error">{problem}</p>}</For>
                 <div class="pa-fields">
                     <label class="pa-field"><span>Largest file</span>
@@ -242,11 +239,10 @@ export function PanelContractEditor(props: {
                                     ...current.collection,
                                     max_artifact_bytes: Math.min(MAX_COLLECTED_FILE_MB, Math.round(megabytes)) * MEGABYTE,
                                 } }));
-                            }} /><span>MB</span></span>
-                        <small>Up to {MAX_COLLECTED_FILE_MB} MB.</small></label>
+                            }} /><span>MB</span></span></label>
                 </div>
                 <Option type="checkbox" checked={collection().transcript_eligible}
-                    label="Include the conversation transcript" detail="Collect what was said, as well as the files."
+                    label="Include the conversation transcript"
                     onChange={(transcript_eligible) => update((current) => ({ ...current, collection: current.collection && { ...current.collection, transcript_eligible } }))} />
                 <Show when={!collection().exportable_paths.length && !collection().transcript_eligible}>
                     <p class="pa-error">Name at least one file to collect, or include the transcript.</p>

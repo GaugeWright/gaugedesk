@@ -148,6 +148,7 @@ export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask
             assignee?: string;
             project?: string;
             waiting?: number;
+            placement?: string;
         }[];
     };
     const kinds = new Set(["answer", "repair", "reply", "screen"]);
@@ -159,6 +160,7 @@ export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask
         assignee: t.assignee,
         project: t.project,
         waiting: t.waiting,
+        placement: t.placement,
     }));
 }
 

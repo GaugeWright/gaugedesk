@@ -19,6 +19,29 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- An operator can send GaugeWright-funded GaugeApp agent turns to a Responses
+  endpoint other than OpenAI's, such as an AI gateway in front of it, with
+  `GAUGEDESK_MANAGEMENT_AGENT_ENDPOINT`. It must be HTTPS, or HTTP on a
+  loopback address, and only the managed key is sent there; a person's own
+  linked OpenAI credential still goes to OpenAI.
+- A connection through the relay that stops reading no longer puts every
+  other connection to the same Home at risk. Desktops, phones and browsers
+  now tell the relay what they have taken, and when a Home's relay runs short
+  of buffer space it closes the connections that have fallen furthest behind,
+  which reconnect, instead of letting one stalled reader exhaust it for all.
+- A Home reached through the relay serves up to 1,024 connections at once
+  instead of 16, and hangs up on a caller it has refused before knowing who
+  they are, so someone who has only the Home's public relay address can no
+  longer hold its connections open.
+- A project whose gate screens inbound material with a model now screens. It
+  uses the project's own OpenAI key if one is pinned, and otherwise the OpenAI
+  key linked by the person running the screen or review. Before, it looked for
+  a key in an account named after the project, never found one, and every
+  screening pass failed. A project that reviews by hand still needs no key.
+- GaugeDesk in a browser now updates live for a Home it reaches through the
+  relay, such as a desktop at home. A message sent from the desktop app, and
+  its reply, appear in an open browser tab as they happen instead of after a
+  reload.
 - An Agent's settings have their own chat. Selecting an Agent in Workshop shows
   its settings and, in the chat lane, an Agent Settings conversation that can
   explain and change its preferred model, its abilities and, for a Panel
@@ -40,6 +63,14 @@ Releases up to and including 0.4.30 are recorded on the
   Sol or Grok 4.7, billed to that key, instead of asking you to pick a model.
   A Panel agent that pins no model publishes with the same default, so pin a
   model if you want a cheaper one for visitors.
+
+- A chat's messages offer copy and fork as small icons in place of the "Fork
+  here" button, and each agent turn shows the time it finished. Turns from
+  before this release show no time.
+- The Projects filter menu opens rightward from its button instead of past
+  the window's left edge.
+- Hover help across the app appears in a quarter of a second, in the app's
+  own type and colours, instead of the browser's slower, smaller tooltip.
 
 ## [0.5.3] — 2026-10-01
 

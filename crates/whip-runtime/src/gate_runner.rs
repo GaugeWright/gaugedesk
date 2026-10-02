@@ -1116,12 +1116,22 @@ fn pending_request_for(
 /// into and leaves the *review* issue that asked the question open, so an open-
 /// issue count would keep counting questions that have already been answered.
 pub fn reviews_awaiting_a_person(state_dir: &Path) -> Result<usize, GateRunError> {
+    Ok(items_awaiting_a_person(state_dir)?.len())
+}
+
+/// The items behind [`reviews_awaiting_a_person`], one entry per parked review.
+///
+/// An entry is the quarantine item id its `Pending` fact names, or `None` when
+/// the fact names none this can read. That review still awaits a person, so it
+/// is listed rather than dropped: the count must not shrink because a caller
+/// also wants to know where the material came from.
+pub fn items_awaiting_a_person(state_dir: &Path) -> Result<Vec<Option<String>>, GateRunError> {
     if !state_dir
         .join("runtime.sqlite")
         .try_exists()
         .map_err(|error| GateRunError::NoDisposition(error.to_string()))?
     {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let store = NativeStores::open(
         state_dir.join("runtime.sqlite"),
@@ -1129,13 +1139,17 @@ pub fn reviews_awaiting_a_person(state_dir: &Path) -> Result<usize, GateRunError
         state_dir.join("items.sqlite"),
     )?;
     let kernel = RuntimeKernel::new(store);
-    let mut waiting = 0;
+    let mut waiting = Vec::new();
     // The durable instance registry, not rebuildable marker files, owns every
     // previous version's pending reviews.
     for instance in gate_instances(&kernel)? {
         for fact in kernel.store().list_facts(&instance.instance_id)? {
             if fact.name == PENDING_FACT {
-                waiting += 1;
+                waiting.push(
+                    serde_json::from_str::<serde_json::Value>(&fact.value_json)
+                        .ok()
+                        .and_then(|value| value.get("item")?.as_str().map(str::to_owned)),
+                );
             }
         }
     }

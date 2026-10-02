@@ -71,6 +71,8 @@ pub struct BrowserTunnel {
     /// Body of the response whose status was last reported, held so the two
     /// halves cross the boundary as separate calls.
     pending: Option<Vec<u8>>,
+    /// What this leg has taken from the relay and not yet reported (DR-0302).
+    meter: crate::wire::CreditMeter,
 }
 
 #[wasm_bindgen]
@@ -79,26 +81,12 @@ impl BrowserTunnel {
     /// fingerprint — the `home_fingerprint` its opaque route carries.
     #[wasm_bindgen(constructor)]
     pub fn new(home_fingerprint: &str) -> Result<BrowserTunnel, JsValue> {
-        let mut expected = [0u8; 32];
-        if home_fingerprint.len() != 64 {
-            return Err(JsValue::from_str("home fingerprint must be 32 hex bytes"));
-        }
-        for (slot, pair) in expected
-            .iter_mut()
-            .zip(home_fingerprint.as_bytes().chunks(2))
-        {
-            *slot = u8::from_str_radix(
-                std::str::from_utf8(pair)
-                    .map_err(|_| JsValue::from_str("fingerprint is not hex"))?,
-                16,
-            )
-            .map_err(|_| JsValue::from_str("fingerprint is not hex"))?;
-        }
-        crate::tunnel_client::TunnelClient::new(expected)
+        crate::tunnel_client::TunnelClient::new(parse_fingerprint(home_fingerprint)?)
             .map(|client| BrowserTunnel {
                 client,
                 pending: None,
                 paired: false,
+                meter: crate::wire::CreditMeter::new(),
             })
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -135,11 +123,27 @@ impl BrowserTunnel {
                 Ok(())
             }
             RelayFrame::Data(bytes) => {
+                // A page buffers whatever it is given, so a frame is consumed
+                // the moment it arrives.
+                self.meter.consumed(frame.len());
                 self.client.session_mut().received(&bytes);
                 Ok(())
             }
-            RelayFrame::Fin | RelayFrame::FinAck => Ok(()),
+            RelayFrame::Fin | RelayFrame::FinAck => {
+                self.meter.consumed(frame.len());
+                Ok(())
+            }
         }
+    }
+
+    /// The report of consumption the relay is owed now, or empty: send it on
+    /// the socket as it is, after the frame that earned it (DR-0302).
+    #[wasm_bindgen(js_name = takeCredit)]
+    pub fn take_credit(&mut self) -> Vec<u8> {
+        self.meter
+            .take_credit()
+            .map(|credit| credit.to_vec())
+            .unwrap_or_default()
     }
 
     /// Queue a request. It is encrypted on the next [`Self::take_outgoing`], so
@@ -159,19 +163,7 @@ impl BrowserTunnel {
         body: Option<String>,
         headers: Option<js_sys::Object>,
     ) -> Result<(), JsValue> {
-        let mut headers_map = std::collections::BTreeMap::new();
-        if let Some(extra) = headers {
-            for entry in js_sys::Object::entries(&extra).iter() {
-                let pair: js_sys::Array = entry.into();
-                let (name, value) = (pair.get(0).as_string(), pair.get(1).as_string());
-                if let (Some(name), Some(value)) = (name, value) {
-                    // Lowercased because HTTP header names are case-insensitive
-                    // and the map below is not.
-                    headers_map.insert(name.to_ascii_lowercase(), value);
-                }
-            }
-        }
-        let mut headers = headers_map;
+        let mut headers = header_map(headers);
         if body.is_some() {
             headers.insert("content-type".to_owned(), "application/json".to_owned());
         }
@@ -234,5 +226,159 @@ impl BrowserTunnel {
     #[wasm_bindgen(js_name = isHandshaking)]
     pub fn is_handshaking(&self) -> bool {
         self.client.handshaking()
+    }
+}
+
+/// A Home fingerprint as the route carries it: 32 bytes of lowercase hex.
+fn parse_fingerprint(home_fingerprint: &str) -> Result<[u8; 32], JsValue> {
+    let mut expected = [0u8; 32];
+    if home_fingerprint.len() != 64 {
+        return Err(JsValue::from_str("home fingerprint must be 32 hex bytes"));
+    }
+    for (slot, pair) in expected
+        .iter_mut()
+        .zip(home_fingerprint.as_bytes().chunks(2))
+    {
+        *slot = u8::from_str_radix(
+            std::str::from_utf8(pair).map_err(|_| JsValue::from_str("fingerprint is not hex"))?,
+            16,
+        )
+        .map_err(|_| JsValue::from_str("fingerprint is not hex"))?;
+    }
+    Ok(expected)
+}
+
+/// A plain object of extra request headers, lowercased because HTTP header
+/// names are case-insensitive and the map they go into is not.
+fn header_map(headers: Option<js_sys::Object>) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(extra) = headers {
+        for entry in js_sys::Object::entries(&extra).iter() {
+            let pair: js_sys::Array = entry.into();
+            if let (Some(name), Some(value)) = (pair.get(0).as_string(), pair.get(1).as_string()) {
+                map.insert(name.to_ascii_lowercase(), value);
+            }
+        }
+    }
+    map
+}
+
+fn set(object: &js_sys::Object, key: &str, value: &JsValue) -> Result<(), JsValue> {
+    js_sys::Reflect::set(object, &JsValue::from_str(key), value).map(|_| ())
+}
+
+/// One Home event stream over its own pinned tunnel, as JavaScript sees it
+/// (WS-634).
+///
+/// A stream never ends in normal operation, so it cannot share
+/// [`BrowserTunnel`]'s one-call-at-a-time session: it is its own crossing,
+/// pump-driven the same way, opening with the request already queued.
+#[wasm_bindgen]
+pub struct BrowserEventTunnel {
+    stream: crate::tunnel_client::TunnelEventStream,
+    paired: bool,
+    meter: crate::wire::CreditMeter,
+}
+
+#[wasm_bindgen]
+impl BrowserEventTunnel {
+    /// Begin a session pinned to the Home's fingerprint with `GET path` queued
+    /// on it as an event stream. `headers` is a plain object, or `undefined`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        home_fingerprint: &str,
+        path: &str,
+        headers: Option<js_sys::Object>,
+    ) -> Result<BrowserEventTunnel, JsValue> {
+        crate::tunnel_client::TunnelEventStream::open(
+            parse_fingerprint(home_fingerprint)?,
+            path,
+            &header_map(headers),
+        )
+        .map(|stream| BrowserEventTunnel {
+            stream,
+            paired: false,
+            meter: crate::wire::CreditMeter::new(),
+        })
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Feed one binary frame received from the relay, as [`BrowserTunnel`]
+    /// does.
+    #[wasm_bindgen(js_name = receiveFrame)]
+    pub fn receive_frame(&mut self, frame: &[u8]) -> Result<(), JsValue> {
+        match classify_frame(frame).map_err(|error| JsValue::from_str(&error.to_string()))? {
+            RelayFrame::Ready => self.paired = true,
+            RelayFrame::Data(bytes) => {
+                self.meter.consumed(frame.len());
+                self.stream.session_mut().received(&bytes);
+            }
+            RelayFrame::Fin | RelayFrame::FinAck => self.meter.consumed(frame.len()),
+        }
+        Ok(())
+    }
+
+    /// The report of consumption the relay is owed now, or empty, as
+    /// [`BrowserTunnel::take_credit`].
+    #[wasm_bindgen(js_name = takeCredit)]
+    pub fn take_credit(&mut self) -> Vec<u8> {
+        self.meter
+            .take_credit()
+            .map(|credit| credit.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Ciphertext to write to the socket as a relay `DATA` frame, or empty.
+    #[wasm_bindgen(js_name = takeOutgoing)]
+    pub fn take_outgoing(&mut self) -> Result<Vec<u8>, JsValue> {
+        self.stream
+            .pump()
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let ciphertext = self.stream.session_mut().take_outgoing();
+        Ok(if ciphertext.is_empty() {
+            Vec::new()
+        } else {
+            data_frame(&ciphertext)
+        })
+    }
+
+    /// The next thing the stream produced, or `undefined`: `{ kind: "opened" }`,
+    /// `{ kind: "event", data }`, `{ kind: "refused", status, body }`, or
+    /// `{ kind: "ended" }`.
+    #[wasm_bindgen(js_name = pollEvent)]
+    pub fn poll_event(&mut self) -> Result<JsValue, JsValue> {
+        use crate::tunnel_client::StreamPoll;
+        let polled = self
+            .stream
+            .poll()
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let Some(polled) = polled else {
+            return Ok(JsValue::UNDEFINED);
+        };
+        let out = js_sys::Object::new();
+        match polled {
+            StreamPoll::Opened => set(&out, "kind", &"opened".into())?,
+            StreamPoll::Event(event) => {
+                set(&out, "kind", &"event".into())?;
+                set(&out, "data", &event.data.into())?;
+            }
+            StreamPoll::Refused { status, body } => {
+                set(&out, "kind", &"refused".into())?;
+                set(&out, "status", &JsValue::from(status))?;
+                set(
+                    &out,
+                    "body",
+                    &String::from_utf8_lossy(&body).into_owned().into(),
+                )?;
+            }
+            StreamPoll::Ended => set(&out, "kind", &"ended".into())?,
+        }
+        Ok(out.into())
+    }
+
+    /// Whether the relay has paired this leg; nothing may be sent before.
+    #[wasm_bindgen(js_name = isPaired)]
+    pub fn is_paired(&self) -> bool {
+        self.paired
     }
 }

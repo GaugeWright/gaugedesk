@@ -27,6 +27,7 @@ import type {
     PublicDeploymentInspection,
     PublicDeploymentOutcome,
 } from "@gaugewright/control-plane-client";
+import { deploymentEmbedHtml } from "./deployment-embed";
 import { startDeploymentMonitor } from "./deployment-monitor";
 import { normalizeOrigin, withOrigin, wwwCounterpart } from "./deployment-origins";
 import { PanelContractSummary } from "./PanelContractSummary";
@@ -181,8 +182,7 @@ export function DeploymentPanel(props: {
     const managing = () => binding() !== null;
     const provider = () => providerName(keyProvider());
     const address = () => `${edgeOrigin().replace(/\/+$/, "")}/d/${deploymentId()}`;
-    const embedSnippet = () => `<gw-session host="${address()}" panels="${profile().panels.components
-        .map((panel) => panel.replace(/^gw-/, "")).join(",")}"></gw-session>`;
+    const embedSnippet = () => deploymentEmbedHtml(address(), profile().panels.components);
     const spendCents = () => {
         const text = spendText();
         return { total: centsFromDollars(text.total), session: centsFromDollars(text.session), turn: centsFromDollars(text.turn) };

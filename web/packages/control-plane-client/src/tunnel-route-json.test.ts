@@ -6,8 +6,11 @@ import {
     TUNNEL_KEEPALIVE_INTERVAL_MS,
     TUNNEL_KEEPALIVE_REQUEST,
     TUNNEL_KEEPALIVE_RESPONSE,
+    tunnelRouteEventStream,
     tunnelRouteJson,
+    type EventTunnelFacade,
     type TunnelFacade,
+    type TunnelStreamPoll,
     type TunnelSocket,
 } from "./tunnel-route-json";
 
@@ -38,6 +41,7 @@ function fakeTunnel(
         },
         takeBody: () => replies.shift()?.body ?? "",
         isHandshaking: () => false,
+        takeCredit: () => new Uint8Array(),
     };
 }
 
@@ -245,6 +249,7 @@ describe("routeJson over the tunnel (DESK-7)", () => {
             takeBody: () => "",
             isHandshaking: () => true,
             isPaired: () => true,
+            takeCredit: () => new Uint8Array(),
         };
         const { socket } = fakeSocket();
         let clock = 0;
@@ -530,3 +535,232 @@ describe("the browser carrier's keepalive (DESK-7)", () => {
         expect(Math.max(TUNNEL_KEEPALIVE_INTERVAL_MS, 60_000) * 2).toBeLessThan(EDGE_IDLE_MILLIS);
     });
 });
+
+/** An event tunnel whose output is released frame by frame: each frame the
+ * relay delivers makes the next batch of polls available, which is how the
+ * real one behaves — nothing changes in a client's session except on arrival. */
+function fakeEventTunnel(batches: TunnelStreamPoll[][]): EventTunnelFacade & { frames: number } {
+    const ready: TunnelStreamPoll[] = [];
+    let paired = false;
+    const tunnel = {
+        frames: 0,
+        receiveFrame: () => {
+            tunnel.frames += 1;
+            paired = true;
+            ready.push(...(batches.shift() ?? []));
+        },
+        takeOutgoing: () => new Uint8Array(paired ? [9] : []),
+        pollEvent: () => ready.shift(),
+        isPaired: () => paired,
+        // Owed after every third frame, so a test sees both answers.
+        takeCredit: () => new Uint8Array(tunnel.frames % 3 === 0 ? [3, 0, 0, 64, 0] : []),
+    };
+    return tunnel;
+}
+
+function eventSocket() {
+    let deliver: (frame: Uint8Array) => void = () => {};
+    let closed: (reason?: string) => void = () => {};
+    const sent: Uint8Array[] = [];
+    let closes = 0;
+    const socket: TunnelSocket = {
+        send: (frame) => sent.push(frame),
+        close: () => { closes += 1; closed(); },
+        onFrame: (handler) => { deliver = handler; },
+        onClose: (handler) => { closed = handler; },
+    };
+    return {
+        socket,
+        sent,
+        frame: () => deliver(new Uint8Array([1])),
+        drop: (reason?: string) => closed(reason),
+        closes: () => closes,
+    };
+}
+
+const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+describe("event streams over the tunnel (WS-634)", () => {
+    it("delivers each event as it arrives, after reporting the stream open", async () => {
+        const tunnel = fakeEventTunnel([
+            [],
+            [{ kind: "opened" }, { kind: "event", data: "one" }],
+            [{ kind: "event", data: "two" }],
+        ]);
+        const carrier = eventSocket();
+        const opened: Array<{ path: string; headers?: Record<string, string> }> = [];
+        const events = tunnelRouteEventStream({
+            open: async (path, headers) => {
+                opened.push({ path, headers });
+                return { tunnel, socket: carrier.socket };
+            },
+            bearer: () => "account-bearer",
+            homeAdmission: () => "home-admission",
+        });
+        const seen: string[] = [];
+        const onOpen = vi.fn();
+        const onClose = vi.fn();
+        const stop = events("/chats/c1/events", (data) => seen.push(data), onOpen, onClose);
+        await flush();
+
+        expect(opened).toEqual([{
+            path: "/chats/c1/events",
+            headers: {
+                authorization: "Bearer account-bearer",
+                "x-gaugewright-home-admission": "home-admission",
+            },
+        }]);
+        carrier.frame(); // READY: the handshake goes out, nothing to report
+        expect(carrier.sent.length).toBe(1);
+        expect(onOpen).not.toHaveBeenCalled();
+        carrier.frame();
+        expect(onOpen).toHaveBeenCalledOnce();
+        expect(seen).toEqual(["one"]);
+        carrier.frame();
+        expect(seen).toEqual(["one", "two"]);
+        expect(onClose).not.toHaveBeenCalled();
+
+        stop();
+        expect(carrier.closes()).toBe(1);
+        expect(onClose).not.toHaveBeenCalled();
+    });
+
+    it("reports a refusal with the Home's reason, so an expired admission is admitted again", async () => {
+        const tunnel = fakeEventTunnel([[{
+            kind: "refused",
+            status: 401,
+            body: JSON.stringify({ error: "target Home admission required" }),
+        }]]);
+        const carrier = eventSocket();
+        const events = tunnelRouteEventStream({ open: async () => ({ tunnel, socket: carrier.socket }) });
+        const onClose = vi.fn();
+        events("/workspace/events", () => undefined, undefined, onClose);
+        await flush();
+        carrier.frame();
+        expect(onClose).toHaveBeenCalledWith({ status: 401, detail: "target Home admission required" });
+        expect(carrier.closes()).toBe(1);
+    });
+
+    it("reports a stream the Home ended, and a carrier that closed under it", async () => {
+        const ended = eventSocket();
+        const dropped = eventSocket();
+        const sockets = [ended, dropped];
+        const tunnels = [
+            fakeEventTunnel([[{ kind: "opened" }, { kind: "ended" }]]),
+            fakeEventTunnel([[{ kind: "opened" }]]),
+        ];
+        const events = tunnelRouteEventStream({
+            open: async () => ({ tunnel: tunnels.shift()!, socket: sockets.shift()!.socket }),
+        });
+        const first = vi.fn();
+        const second = vi.fn();
+        events("/workspace/events", () => undefined, undefined, first);
+        events("/chats/c1/events", () => undefined, undefined, second);
+        await flush();
+        ended.frame();
+        expect(first).toHaveBeenCalledWith(undefined);
+        dropped.frame();
+        dropped.drop("relay keepalive missed");
+        expect(second).toHaveBeenCalledWith({ detail: "relay keepalive missed" });
+    });
+
+    it("gives up on a Home that never answers the stream", async () => {
+        vi.useFakeTimers();
+        try {
+            const carrier = eventSocket();
+            const events = tunnelRouteEventStream({
+                open: async () => ({ tunnel: fakeEventTunnel([]), socket: carrier.socket }),
+                openTimeoutMs: 1_000,
+            });
+            const onClose = vi.fn();
+            events("/workspace/events", () => undefined, undefined, onClose);
+            await vi.advanceTimersByTimeAsync(1_001);
+            expect(onClose).toHaveBeenCalledWith({ detail: "the Home event stream did not open in time" });
+            expect(carrier.closes()).toBe(1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("reports a stream that could not be opened at all", async () => {
+        const events = tunnelRouteEventStream({
+            open: async () => { throw new Error("relay connection capacity reached"); },
+        });
+        const onClose = vi.fn();
+        events("/workspace/events", () => undefined, undefined, onClose);
+        await flush();
+        expect(onClose).toHaveBeenCalledWith({ detail: "relay connection capacity reached" });
+    });
+
+    it("closes a carrier that finished opening after its subscriber left", async () => {
+        const carrier = eventSocket();
+        let release: () => void = () => {};
+        const events = tunnelRouteEventStream({
+            open: () => new Promise((resolve) => {
+                release = () => resolve({ tunnel: fakeEventTunnel([]), socket: carrier.socket });
+            }),
+        });
+        const onClose = vi.fn();
+        const stop = events("/workspace/events", () => undefined, undefined, onClose);
+        stop();
+        release();
+        await flush();
+        expect(carrier.closes()).toBe(1);
+        expect(onClose).not.toHaveBeenCalled();
+    });
+
+    it("ends every open stream when its route closes, as closed under the subscriber", async () => {
+        const carriers = [eventSocket(), eventSocket()];
+        const sockets = [...carriers];
+        const events = tunnelRouteEventStream({
+            open: async () => ({ tunnel: fakeEventTunnel([[{ kind: "opened" }]]), socket: sockets.shift()!.socket }),
+        });
+        const closes = [vi.fn(), vi.fn()];
+        events("/workspace/events", () => undefined, undefined, closes[0]);
+        events("/chats/c1/events", () => undefined, undefined, closes[1]);
+        await flush();
+        events.closeAll();
+        expect(carriers.map((carrier) => carrier.closes())).toEqual([1, 1]);
+        for (const close of closes) expect(close).toHaveBeenCalledWith({ detail: "the Home tunnel closed" });
+    });
+});
+
+describe("reporting consumption to the relay (DR-0302)", () => {
+    it("sends a stream's credit on its carrier after the frame that earned it", async () => {
+        const tunnel = fakeEventTunnel([[], [{ kind: "opened" }], []]);
+        const carrier = eventSocket();
+        const events = tunnelRouteEventStream({ open: async () => ({ tunnel, socket: carrier.socket }) });
+        events("/workspace/events", () => undefined);
+        await flush();
+        carrier.frame();
+        carrier.frame();
+        expect(carrier.sent.some((frame) => frame[0] === 3)).toBe(false);
+        carrier.frame();
+        expect(carrier.sent.filter((frame) => frame[0] === 3)).toEqual([new Uint8Array([3, 0, 0, 64, 0])]);
+    });
+
+    it("sends the calls' credit on their carrier, and nothing when none is owed", async () => {
+        let deliver: (frame: Uint8Array) => void = () => {};
+        const sent: Uint8Array[] = [];
+        let owed = false;
+        const tunnel = { ...fakeTunnel([{ status: 200, body: "{}" }]), takeCredit: () => {
+            const credit = owed ? new Uint8Array([3, 0, 0, 0, 7]) : new Uint8Array();
+            owed = false;
+            return credit;
+        } };
+        const socket: TunnelSocket = {
+            send: (frame) => sent.push(frame),
+            close: () => undefined,
+            onFrame: (handler) => { deliver = handler; },
+            onClose: () => undefined,
+        };
+        const json = build(tunnel, socket);
+        await json("GET", "/x");
+        deliver(new Uint8Array([0, 1]));
+        expect(sent.some((frame) => frame[0] === 3)).toBe(false);
+        owed = true;
+        deliver(new Uint8Array([0, 1]));
+        expect(sent.at(-1)).toEqual(new Uint8Array([3, 0, 0, 0, 7]));
+    });
+});
+

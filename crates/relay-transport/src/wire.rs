@@ -38,6 +38,17 @@ pub const WSS_HANDSHAKE_LEN: usize = 84;
 /// that sets it can never reach an older relay. That ordering is why the edge
 /// half landed first.
 pub const WSS_KEEPALIVE_FLAG: u8 = 2;
+/// Handshake flag bit 2: this leg reports what it consumes in [`credit_frame`]s,
+/// so the relay may count what it sends to it against the route's byte budget
+/// and close the slowest pairs first when that runs out (DR-0302).
+///
+/// The relay rejected this bit until it shipped support, like the keepalive
+/// bit, so the edge half landed first.
+pub const WSS_ACCOUNTING_FLAG: u8 = 4;
+/// How much a leg takes before it reports it. Small enough that what every leg
+/// holds back unreported is a small part of a route's budget, large enough
+/// that a report is rare beside the data it describes.
+pub const WSS_CREDIT_THRESHOLD: usize = 16 * 1024;
 /// The liveness exchange. Text, because the relay serves it from its Durable
 /// Object auto-response: the ping never reaches the object's message handler,
 /// never wakes it, and is never forwarded to the peer.
@@ -53,6 +64,10 @@ pub const RELAY_WAIT_EXPIRED: &str = "relay wait expired";
 pub(crate) const WSS_DATA: u8 = 0;
 pub(crate) const WSS_FIN: u8 = 1;
 pub(crate) const WSS_FIN_ACK: u8 = 2;
+/// A leg's report to the relay of carried bytes it has consumed: this type
+/// byte, then a big-endian u32. The relay answers it and never forwards it.
+pub(crate) const WSS_CREDIT: u8 = 3;
+pub(crate) const WSS_CREDIT_LEN: usize = 5;
 /// The pinned session authenticates by certificate fingerprint, never by name,
 /// so the SNI is a fixed placeholder rather than a resolvable host.
 pub(crate) const PIN_SNI: &str = "gaugewright-home";
@@ -194,6 +209,7 @@ pub fn websocket_handshake(
     frame[8..10].copy_from_slice(&WSS_PROTOCOL_VERSION.to_be_bytes());
     frame[10] = role as u8;
     frame[11] = u8::from(route.previous_proof.is_some())
+        | WSS_ACCOUNTING_FLAG
         | if role.sends_keepalives() {
             WSS_KEEPALIVE_FLAG
         } else {
@@ -205,6 +221,53 @@ pub fn websocket_handshake(
         frame[52..84].copy_from_slice(previous.as_bytes());
     }
     Ok(frame)
+}
+
+/// What a leg owes the relay a report of (DR-0302).
+///
+/// Every frame the relay delivered after `READY` counts, whole — the relay
+/// counts what it sent the same way. A native carrier records a frame once its
+/// bytes have been handed to the local side, so a reader that stops reading
+/// stops reporting and shows the relay it is the slow one; a browser records it
+/// on arrival, because the page buffers everything it is given.
+#[derive(Debug, Default)]
+pub struct CreditMeter {
+    owed: usize,
+}
+
+impl CreditMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A relay frame of `len` bytes has been consumed.
+    pub fn consumed(&mut self, len: usize) {
+        self.owed = self.owed.saturating_add(len);
+    }
+
+    /// The report to send now, if enough is owed to be worth one.
+    pub fn take_credit(&mut self) -> Option<[u8; WSS_CREDIT_LEN]> {
+        if self.owed < WSS_CREDIT_THRESHOLD {
+            return None;
+        }
+        let reported = u32::try_from(self.owed).unwrap_or(u32::MAX);
+        self.owed -= reported as usize;
+        Some(credit_frame(reported))
+    }
+}
+
+/// A `CREDIT` frame reporting `consumed` bytes.
+pub fn credit_frame(consumed: u32) -> [u8; WSS_CREDIT_LEN] {
+    let mut frame = [0u8; WSS_CREDIT_LEN];
+    frame[0] = WSS_CREDIT;
+    frame[1..].copy_from_slice(&consumed.to_be_bytes());
+    frame
+}
+
+/// The count a frame reports, if it is a `CREDIT` frame.
+pub fn parse_credit(frame: &[u8]) -> Option<u32> {
+    (frame.len() == WSS_CREDIT_LEN && frame[0] == WSS_CREDIT)
+        .then(|| u32::from_be_bytes(frame[1..].try_into().expect("four bytes")))
 }
 
 /// Derive the edge object's opaque handle and proof from a 32-byte rendezvous
@@ -411,8 +474,8 @@ mod tests {
         assert_eq!(frame[10], WebSocketRelayRole::Client as u8);
         // A client is a durable leg, so it promises keepalives. The relay
         // rejected this bit until it shipped support, which is why the edge half
-        // deployed before this one.
-        assert_eq!(frame[11], WSS_KEEPALIVE_FLAG);
+        // deployed before this one. Every leg reports what it consumes.
+        assert_eq!(frame[11], WSS_KEEPALIVE_FLAG | WSS_ACCOUNTING_FLAG);
         assert_eq!(&frame[12..20], &3u64.to_be_bytes());
         assert_eq!(&frame[20..52], &[9u8; 32]);
     }
@@ -425,8 +488,9 @@ mod tests {
         assert!(websocket_handshake(&rotating, WebSocketRelayRole::Target).is_err());
         let frame =
             websocket_handshake(&rotating, WebSocketRelayRole::Home).expect("initializer rotates");
-        // Rotating and promising keepalives are independent bits, both set here.
-        assert_eq!(frame[11], 1 | WSS_KEEPALIVE_FLAG);
+        // Rotating, promising keepalives and reporting consumption are
+        // independent bits, all set here.
+        assert_eq!(frame[11], 1 | WSS_KEEPALIVE_FLAG | WSS_ACCOUNTING_FLAG);
         assert_eq!(&frame[52..84], &[1u8; 32]);
     }
 
@@ -537,17 +601,48 @@ mod tests {
     fn the_keepalive_promise_rides_beside_rotation_without_disturbing_it() {
         let route = route();
         let durable = websocket_handshake(&route, WebSocketRelayRole::Home).expect("handshake");
-        assert_eq!(durable[11], WSS_KEEPALIVE_FLAG, "a durable leg promises");
+        assert_eq!(
+            durable[11],
+            WSS_KEEPALIVE_FLAG | WSS_ACCOUNTING_FLAG,
+            "a durable leg promises"
+        );
         let crossing = websocket_handshake(&route, WebSocketRelayRole::Source).expect("handshake");
-        assert_eq!(crossing[11], 0, "a crossing promises nothing");
+        assert_eq!(
+            crossing[11], WSS_ACCOUNTING_FLAG,
+            "a crossing promises no keepalives, but still reports what it takes"
+        );
 
         // Rotating and promising at once must set both bits, not one.
         let mut rotating = route;
         rotating.previous_proof = Some(RouteProof::new([9u8; 32]));
         let both = websocket_handshake(&rotating, WebSocketRelayRole::Home).expect("handshake");
-        assert_eq!(both[11], 1 | WSS_KEEPALIVE_FLAG);
-        // And the relay refuses anything outside those two bits, so no third
+        assert_eq!(both[11], 1 | WSS_KEEPALIVE_FLAG | WSS_ACCOUNTING_FLAG);
+        // And the relay refuses anything outside those bits, so no further
         // meaning can be smuggled into this byte.
-        assert_eq!(both[11] & !(1 | WSS_KEEPALIVE_FLAG), 0);
+        assert_eq!(
+            both[11] & !(1 | WSS_KEEPALIVE_FLAG | WSS_ACCOUNTING_FLAG),
+            0
+        );
+    }
+
+    /// DR-0302: a leg reports what it consumes once it owes enough to be worth
+    /// a frame, and never reports a byte twice.
+    #[test]
+    fn a_leg_reports_consumption_in_threshold_sized_credits() {
+        let mut meter = CreditMeter::new();
+        meter.consumed(WSS_CREDIT_THRESHOLD - 1);
+        assert_eq!(meter.take_credit(), None, "too little to be worth a frame");
+        meter.consumed(10);
+        let credit = meter.take_credit().expect("owed past the threshold");
+        assert_eq!(
+            parse_credit(&credit),
+            Some((WSS_CREDIT_THRESHOLD + 9) as u32)
+        );
+        assert_eq!(meter.take_credit(), None, "reported once");
+        assert_eq!(credit[0], WSS_CREDIT);
+        assert_eq!(parse_credit(&[WSS_DATA, 0, 0, 0, 1]), None);
+        assert_ne!(WSS_CREDIT, WSS_DATA);
+        assert_ne!(WSS_CREDIT, WSS_FIN);
+        assert_ne!(WSS_CREDIT, WSS_FIN_ACK);
     }
 }

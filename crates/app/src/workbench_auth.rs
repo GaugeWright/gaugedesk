@@ -41,6 +41,12 @@ pub enum ProjectVisibility {
     /// A scoped member sees **only** these explicitly-granted project ids (fail-closed: an
     /// empty set means no client projects are visible).
     Only(BTreeSet<String>),
+    /// A desktop's owner or admin sees the projects it owns or holds a grant
+    /// to (DR-0268, DR-0309). Listings and project routes are limited to these
+    /// exactly as for [`Only`](Self::Only), but the caller is a whole account
+    /// rather than a member limited to specific projects, so routes naming no
+    /// project stay open to it.
+    Account(BTreeSet<String>),
 }
 
 impl ProjectVisibility {
@@ -48,7 +54,9 @@ impl ProjectVisibility {
     pub fn allows(&self, project_id: &str) -> bool {
         match self {
             ProjectVisibility::All => true,
-            ProjectVisibility::Only(set) => set.contains(project_id),
+            ProjectVisibility::Only(set) | ProjectVisibility::Account(set) => {
+                set.contains(project_id)
+            }
         }
     }
 }
@@ -915,7 +923,15 @@ impl Workbench {
             ));
         }
         if let Some(project) = project {
-            if !org.can_access_project(authority.as_str(), project) {
+            // On a desktop an account reaches a project it owns or was
+            // granted; an organization role does not reach every project.
+            let admitted = if self.desktop_account_mode() {
+                self.account_project_ids(authority.as_str(), &org)
+                    .contains(project)
+            } else {
+                org.can_access_project(authority.as_str(), project)
+            };
+            if !admitted {
                 return Err((StatusCode::FORBIDDEN, "not in scope for this project"));
             }
         }
@@ -1038,6 +1054,26 @@ impl Workbench {
         let Ok(org) = org::Org::rebuild_in(self.store_ref(), org_scope) else {
             return ProjectVisibility::Only(BTreeSet::new()); // directory unreadable: leak nothing
         };
+        // A desktop's signed-in account sees what it owns or was granted, and
+        // no role widens that (DR-0268 §1, §6). The computer's owner or admin
+        // is a whole account. Anyone else stays a member limited to those
+        // projects, so routes naming no project stay closed to them (WS-580)
+        // until those routes answer per account (WS-655).
+        if self.desktop_account_mode() {
+            let Some(account) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
+                return ProjectVisibility::Only(BTreeSet::new());
+            };
+            let projects = self.account_project_ids(account.as_str(), &org);
+            return match org.role_of(account.as_str()) {
+                Some(role)
+                    if role == gaugedesk_core::abac::Role::owner()
+                        || role == gaugedesk_core::abac::Role::admin() =>
+                {
+                    ProjectVisibility::Account(projects)
+                }
+                _ => ProjectVisibility::Only(projects),
+            };
+        }
         let provisioned = org
             .members
             .values()
@@ -1069,7 +1105,7 @@ impl Workbench {
     pub fn chat_visible(&self, chat_id: &str, vis: &ProjectVisibility) -> bool {
         match vis {
             ProjectVisibility::All => true,
-            ProjectVisibility::Only(_) => self
+            ProjectVisibility::Only(_) | ProjectVisibility::Account(_) => self
                 .library
                 .project_of_chat(chat_id)
                 .map(|p| vis.allows(p))
@@ -1153,7 +1189,7 @@ impl Workbench {
             return None;
         }
         match self.project_visibility_in(bearer, org_scope) {
-            ProjectVisibility::All => None,
+            ProjectVisibility::All | ProjectVisibility::Account(_) => None,
             ProjectVisibility::Only(_) => Some((
                 StatusCode::FORBIDDEN,
                 "this is not available to a member limited to specific projects",
@@ -2501,7 +2537,11 @@ mod staff_project_visibility_tests {
         let outsider = wb.mint_account_session("outsider", "passkey", 60).unwrap();
         assert!(wb.idp.is_none());
         assert_eq!(wb.project_visibility(None), ProjectVisibility::All);
-        assert_eq!(wb.project_visibility(Some(&owner)), ProjectVisibility::All);
+        // DR-0309: the owner role sees what it owns, which here is nothing.
+        assert_eq!(
+            wb.project_visibility(Some(&owner)),
+            ProjectVisibility::Account(BTreeSet::new())
+        );
         assert_eq!(
             wb.project_visibility(Some(&staff)),
             ProjectVisibility::Only(BTreeSet::from(["allowed".into()]))

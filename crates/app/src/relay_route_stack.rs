@@ -20,6 +20,7 @@
 //! Anything the caller brought besides is removed before it gets there.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -156,14 +157,46 @@ pub fn relay_control_plane(wb: SharedWorkbench, accounts: Arc<dyn BearerAccounts
         wb: wb.clone(),
         accounts,
     };
-    crate::open_control_plane(wb).layer(axum::middleware::from_fn_with_state(
-        relay,
-        admit_relay_caller,
-    ))
+    // The gate runs inside the relay's own admission, so it sees the session
+    // the crossing is served under, never the caller's Hub bearer.
+    crate::open_control_plane(wb.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            wb,
+            crate::project_owner::account_project_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            relay,
+            admit_relay_caller,
+        ))
 }
 
 fn refuse(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
+}
+
+/// Answer a caller this Home has not verified, then hang up (DR-0302).
+///
+/// The locator is public, so anyone may open a crossing; refusing their
+/// requests is not enough when the crossing itself is what they hold. Closing
+/// the connection after the answer, and asking the crossing that carried it to
+/// end, means a stranger holds one for its answer and a few seconds of teardown. A verified owner keeps
+/// their connection whatever this router answers them.
+fn hang_up(peer: Option<SocketAddr>, mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CONNECTION,
+        HeaderValue::from_static("close"),
+    );
+    if let Some(peer) = peer {
+        gaugedesk_relay_transport::hang_up_crossing(peer);
+    }
+    response
+}
+
+fn peer_of(request: &Request) -> Option<SocketAddr> {
+    request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0)
 }
 
 /// Whether a route is this computer's own business, and so is never served
@@ -190,20 +223,30 @@ async fn admit_relay_caller(
 ) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
+    let peer = peer_of(&request);
+    // Everything until the Hub names the owner is answered to a stranger, and
+    // then the crossing is hung up — `/health` included, which nobody needs
+    // to hold a crossing open for.
     if path == "/health" {
         for name in STRIPPED {
             request.headers_mut().remove(*name);
         }
-        return next.run(request).await;
+        return hang_up(peer, next.run(request).await);
     }
     if local_only(&method, &path) {
-        return refuse(
-            StatusCode::FORBIDDEN,
-            "this is done on the computer itself, not from elsewhere",
+        return hang_up(
+            peer,
+            refuse(
+                StatusCode::FORBIDDEN,
+                "this is done on the computer itself, not from elsewhere",
+            ),
         );
     }
     let Some(bearer) = net_http::bearer(request.headers()).map(str::to_owned) else {
-        return refuse(StatusCode::UNAUTHORIZED, "sign in to reach this Home");
+        return hang_up(
+            peer,
+            refuse(StatusCode::UNAUTHORIZED, "sign in to reach this Home"),
+        );
     };
 
     // Off the async runtime: this may be a network call to the Hub.
@@ -211,18 +254,29 @@ async fn admit_relay_caller(
     let answered = tokio::task::spawn_blocking(move || accounts.account_for(&bearer)).await;
     let account = match answered {
         Ok(Ok(Some(account))) => account,
-        Ok(Ok(None)) => return refuse(StatusCode::UNAUTHORIZED, "sign in to reach this Home"),
+        Ok(Ok(None)) => {
+            return hang_up(
+                peer,
+                refuse(StatusCode::UNAUTHORIZED, "sign in to reach this Home"),
+            )
+        }
         Ok(Err(error)) => {
             tracing::warn!("relay caller not verified: {error}");
-            return refuse(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the account service could not be reached to check who you are",
+            return hang_up(
+                peer,
+                refuse(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the account service could not be reached to check who you are",
+                ),
             );
         }
         Err(_) => {
-            return refuse(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "could not check who you are",
+            return hang_up(
+                peer,
+                refuse(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "could not check who you are",
+                ),
             )
         }
     };
@@ -232,9 +286,12 @@ async fn admit_relay_caller(
         (guard.home_owner_account(), guard.home_id().clone())
     };
     if owner.as_deref() != Some(account.as_str()) {
-        return refuse(
-            StatusCode::FORBIDDEN,
-            "this Home belongs to another account",
+        return hang_up(
+            peer,
+            refuse(
+                StatusCode::FORBIDDEN,
+                "this Home belongs to another account",
+            ),
         );
     }
     let actor = AuthorityId::new(account.clone());

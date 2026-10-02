@@ -1140,6 +1140,7 @@ describe("work carried to a relay-only Home (DESK-7, HOME-1)", () => {
             takeOutgoing(): Uint8Array { return new Uint8Array(); }
             isHandshaking(): boolean { return false; }
             isPaired(): boolean { return true; }
+            takeCredit(): Uint8Array { return new Uint8Array(); }
             pollStatus(): number | undefined { return this.reply?.status; }
             takeBody(): string {
                 const body = this.reply?.body ?? "";
@@ -1169,23 +1170,49 @@ describe("work carried to a relay-only Home (DESK-7, HOME-1)", () => {
                 }
             }
         }
+        const streamed: Array<{ path: string; headers: Record<string, string> | undefined }> = [];
+        /** The Home's event stream, on a session of its own: it opens and sends
+         * one change once the relay has delivered a frame. */
+        class EventTunnel {
+            private pending: Array<{ kind: string; data?: string }> = [];
+            constructor(_fingerprint: string, path: string, headers?: Record<string, string>) {
+                streamed.push({ path, headers });
+            }
+            receiveFrame(): void {
+                this.pending.push(
+                    { kind: "opened" },
+                    { kind: "event", data: '{"type":"workspacechanged","record":"chat","id":"c1","op":"upsert"}' },
+                );
+            }
+            takeOutgoing(): Uint8Array { return new Uint8Array(); }
+            pollEvent() { return this.pending.shift(); }
+            isPaired(): boolean { return true; }
+            takeCredit(): Uint8Array { return new Uint8Array(); }
+        }
         setTunnelModuleLoader(async () => ({
             BrowserTunnel: Object.assign(Tunnel, {
                 relayHandshake: () => new Uint8Array([1]),
             }) as never,
+            BrowserEventTunnel: EventTunnel as never,
         }));
         setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        const sockets: Socket[] = [];
         class Socket {
             readonly OPEN = 1;
             readyState = 1;
             binaryType = "blob";
             onopen: (() => void) | null = null;
-            onclose: (() => void) | null = null;
+            onclose: ((event: CloseEvent) => void) | null = null;
             onmessage: ((event: MessageEvent) => void) | null = null;
             onerror: (() => void) | null = null;
-            constructor() { setTimeout(() => this.onopen?.(), 0); }
+            constructor() {
+                sockets.push(this);
+                setTimeout(() => this.onopen?.(), 0);
+            }
             send(): void {}
-            close(): void { this.readyState = 3; this.onclose?.(); }
+            close(): void { this.readyState = 3; this.onclose?.({ reason: "" } as CloseEvent); }
+            /** The relay delivers one binary frame. */
+            deliver(): void { this.onmessage?.({ data: new ArrayBuffer(1) } as MessageEvent); }
         }
         vi.stubGlobal("WebSocket", Socket);
         const held = new Map<string, string>();
@@ -1227,8 +1254,33 @@ describe("work carried to a relay-only Home (DESK-7, HOME-1)", () => {
         const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
         api.setBearer("person-token");
         api.setCurrentProject("proj-relay" as never);
-        return { api, carried };
+        return { api, carried, streamed, sockets };
     }
+
+    it("streams a relay-only Home's changes over a tunnel of its own (WS-634)", async () => {
+        // The tunnel used to carry calls only, so desk opened no stream to such
+        // a Home at all: a turn sent from the desktop appeared only on reload.
+        const { api, streamed, sockets } = relayOnlyHome();
+        const changes: unknown[] = [];
+        const opened = vi.fn();
+        const stop = api.subscribeWorkspace((change) => changes.push(change), opened);
+        await vi.waitFor(() => expect(streamed).toHaveLength(1));
+        expect(streamed[0]).toEqual({
+            path: "/workspace/events",
+            headers: {
+                authorization: "Bearer person-token",
+                "x-gaugewright-home-admission": "minted",
+            },
+        });
+        // Its own carrier: one for the calls, one for the stream.
+        await vi.waitFor(() => expect(sockets).toHaveLength(2));
+        await vi.waitFor(() => expect(sockets[1]?.onmessage).toBeTruthy());
+        sockets[1]!.deliver();
+        await vi.waitFor(() => expect(opened).toHaveBeenCalledOnce());
+        expect(changes).toEqual([{ record: "chat", id: "c1", op: "upsert" }]);
+        stop();
+        expect(sockets[1]!.readyState).toBe(3);
+    });
 
     it("carries the bearer and the Home's admission on the work after admission", async () => {
         // The direct route sent both and the tunnel sent neither, so a Home
@@ -1402,5 +1454,36 @@ describe("GaugeApp management on the one host", () => {
             ["agent-settings", "agent.model.set", "basis-agent"],
             ["project-settings", "project.name.set", "basis-project"],
         ]);
+    });
+
+    it("reads a Panel placement's pages and sends a person's verdict to its own command route", async () => {
+        const calls: string[] = [];
+        const bodies: Record<string, unknown>[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input).replace("http://127.0.0.1:4919", "");
+            calls.push(`${init?.method ?? "GET"} ${url.split("?")[0]}`);
+            if (init?.body) bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+            if (url.endsWith("/settings/sessions")) {
+                return new Response(JSON.stringify({
+                    session: {
+                        id: "session-panel", generation: "g", scope: { kind: "placement", id: "inst-1" }, actor: "local",
+                        pages: [{ id: "inbox", resource_basis: "basis-inbox" }], update_cursor: "c",
+                    },
+                    pages: [{ id: "inbox", model: { pending: 1, items: [] } }],
+                }));
+            }
+            return new Response(JSON.stringify({ receipt: { status: "applied" } }));
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        await expect(api.panelSettingsPages("proj-1", "inst-1")).resolves.toEqual([{ id: "inbox", model: { pending: 1, items: [] } }]);
+        await api.reviewPanelInboxItem("proj-1", "inst-1", "item-1", "keep");
+        expect(calls).toEqual([
+            "POST /placements/inst-1/settings/sessions",
+            "POST /placements/inst-1/settings/sessions",
+            "POST /placements/inst-1/settings/commands",
+        ]);
+        const command = bodies.find((body) => "command_id" in body)!;
+        expect([command.app, command.page_id, command.command_id, command.expected_basis, command.payload])
+            .toEqual(["panel-settings", "inbox", "panel.inbox.review", "basis-inbox", { item_id: "item-1", verdict: "keep" }]);
     });
 });

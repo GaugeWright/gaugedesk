@@ -1,6 +1,6 @@
 import { createMemo, createSignal, For, Show, type JSX } from "solid-js";
-import { parseProjectHostsPage, type GaugeAppCommandResult, type GaugeAppPageModel, type ProjectHost } from "@gaugewright/control-plane-client";
-import { hostBytes, hostKind, hostStanding, nanoUsdInput, parseNanoUsd, retiredHost } from "./project-host-presentation";
+import { newIdempotencyKey, parseProjectHostsPage, type GaugeAppCommandResult, type GaugeAppPageModel, type HomeExecutionPolicy, type HomeExecutionPolicyChange, type HomeExecutionPolicyClient, type ProjectHost } from "@gaugewright/control-plane-client";
+import { homePolicyRefusal, hostBytes, hostKind, hostStanding, nanoUsdInput, parseNanoUsd, retiredHost } from "./project-host-presentation";
 import { Metric, Notice, Resource, SectionHeading } from "./gaugeapp-design";
 
 export function ProjectHostsPage(props: {
@@ -8,6 +8,11 @@ export function ProjectHostsPage(props: {
     commands: readonly string[];
     onSubmit: (command: string, payload: Readonly<Record<string, unknown>>) => Promise<GaugeAppCommandResult>;
     onOpenProject?: (project: { readonly id: string; readonly name: string }) => void;
+    /** A managed host's Isolated workspace policy lives in its own Home, and
+     *  only the organization's owner sets it there (GaugeWright DR-0194). The
+     *  dialog reads and saves it only through this; without it the page offers
+     *  no Compute policy, since no Hub command sets one. */
+    homePolicy?: HomeExecutionPolicyClient;
 }): JSX.Element {
     const model = createMemo(() => parseProjectHostsPage(props.page).model);
     const [selectedId, setSelectedId] = createSignal("");
@@ -21,16 +26,65 @@ export function ProjectHostsPage(props: {
     const [retireConfirmation, setRetireConfirmation] = createSignal("");
     const [busy, setBusy] = createSignal(false);
     const [error, setError] = createSignal("");
+    // The Home's own reading for the host it was read from, so a reading never
+    // describes a host other than the selected one.
+    const [homeReading, setHomeReading] = createSignal<{ readonly hostId: string; readonly reading: HomeExecutionPolicy } | null>(null);
+    // One key per change, so a retry of the same change replays on the Home
+    // rather than being recorded twice.
+    const [policyKey, setPolicyKey] = createSignal<{ readonly body: string; readonly key: string } | null>(null);
+    const homePolicyFor = createMemo(() => {
+        const host = managed(); const read = homeReading();
+        return host && read?.hostId === host.id ? read.reading : undefined;
+    });
+    const homeRate = () => {
+        const reading = homePolicyFor();
+        return reading?.pricing?.nanos_usd_per_second ?? reading?.isolated_workspace.metering.nanos_usd_per_second ?? null;
+    };
+    const homeCeiling = () => homePolicyFor()?.pricing?.reservation_nanos_usd ?? null;
+    const canEditPolicy = () => homePolicyFor()?.can_edit === true;
+    const readHomePolicy = async (host: ProjectHost) => {
+        if (!props.homePolicy || host.kind !== "cloud") return;
+        const reading = await props.homePolicy.read(host);
+        setHomeReading({ hostId: host.id, reading });
+        return reading;
+    };
     const can = (operation: string) => props.commands.includes(operation);
-    const choose = (host: ProjectHost) => { setSelectedId(host.id); setMode(null); setError(""); };
+    const choose = (host: ProjectHost) => {
+        setSelectedId(host.id); setMode(null); setError("");
+        void readHomePolicy(host).catch(() => {});
+    };
     const close = () => { setMode(null); setError(""); };
     const beginAdd = () => { setName("Managed Project Host"); setMode("add"); setError(""); };
     const beginRename = () => { setName(selected()?.name ?? ""); setMode("rename"); setError(""); };
-    const beginPolicy = () => {
-        const host = managed(); if (!host) return;
-        setEnabled(host.managed_policy.isolated_workspace_enabled);
-        setCap(nanoUsdInput(host.managed_policy.max_attempt_nanos_usd));
-        setMode("policy"); setError("");
+    const beginPolicy = async () => {
+        const host = managed(); if (!host || busy()) return;
+        setError("");
+        if (!props.homePolicy) return;
+        setBusy(true);
+        try {
+            const reading = await readHomePolicy(host);
+            if (!reading) return;
+            setEnabled(reading.policy.isolated_workspace_enabled);
+            setCap(nanoUsdInput(reading.policy.max_attempt_nanos_usd));
+            setPolicyKey(null);
+            setMode("policy");
+        } catch (reason) { setError(homePolicyRefusal(reason)); }
+        finally { setBusy(false); }
+    };
+    const savePolicy = async (host: ProjectHost, change: HomeExecutionPolicyChange) => {
+        if (busy() || !props.homePolicy) return;
+        const body = JSON.stringify(change);
+        const prior = policyKey();
+        const key = prior?.body === body ? prior.key : newIdempotencyKey();
+        setPolicyKey({ body, key });
+        setBusy(true); setError("");
+        try {
+            const reading = await props.homePolicy.set(host, change, key);
+            setHomeReading({ hostId: host.id, reading });
+            setPolicyKey(null);
+            setMode(null);
+        } catch (reason) { setError(homePolicyRefusal(reason)); }
+        finally { setBusy(false); }
     };
     const beginRetire = () => { setRetireConfirmation(""); setMode("retire"); setError(""); };
     // Projects this Home could hand to the selected one. A host that reports no
@@ -58,7 +112,8 @@ export function ProjectHostsPage(props: {
         else if (mode() === "rename" && host) void submit("project-host.rename", { id: host.id, name: name().trim() });
         else if (mode() === "policy" && host) {
             const amount = parseNanoUsd(cap());
-            if (amount !== null) void submit("project-host.managed-policy.set", { id: host.id, isolated_workspace_enabled: enabled(), max_attempt_nanos_usd: amount });
+            if (amount === null) return;
+            if (host.kind === "cloud") void savePolicy(host, { isolated_workspace_enabled: enabled(), max_attempt_nanos_usd: amount });
         }
         else if (mode() === "handoff" && host) {
             const project = movable().find((candidate) => candidate.id === movingProjectId());
@@ -74,7 +129,8 @@ export function ProjectHostsPage(props: {
             });
         }
     };
-    const policyValid = () => parseNanoUsd(cap()) !== null && (!enabled() || parseNanoUsd(cap())! > 0);
+    const policyValid = () => canEditPolicy() && parseNanoUsd(cap()) !== null
+        && (!enabled() || (parseNanoUsd(cap())! > 0 && homeRate() !== null));
     // Posture belongs on the row rather than in a status column: a host that is
     // unreachable or retired is the one the reader is looking for.
     const hostTone = (host: ProjectHost): "ready" | "warn" | "neutral" =>
@@ -139,7 +195,7 @@ export function ProjectHostsPage(props: {
             <header class="gaugeapp-host-section-head"><div><span class="gaugeapp-eyebrow">{hostKind(host())}</span><h2>{host().name}</h2></div><button type="button" onClick={() => { setSelectedId(""); close(); }}>Close</button></header>
             <div class="gaugeapp-host-actions">
                 <Show when={!retiredHost(host()) && can("project-host.rename")}><button type="button" disabled={busy()} onClick={beginRename}>Rename</button></Show>
-                <Show when={managed() && !retiredHost(host()) && can("project-host.managed-policy.set")}><button type="button" disabled={busy()} onClick={beginPolicy}>Compute policy</button></Show>
+                <Show when={managed() && !retiredHost(host()) && props.homePolicy !== undefined}><button type="button" disabled={busy()} onClick={() => void beginPolicy()}>Compute policy</button></Show>
                 <Show when={managed() && host().lifecycle === "active" && can("project-host.suspend")}><button type="button" class="danger" disabled={busy()} onClick={() => void submit("project-host.suspend", { id: host().id })}>Suspend</button></Show>
                 <Show when={managed() && ["suspended", "retention"].includes(host().lifecycle) && can("project-host.reinstate")}><button type="button" class="primary" disabled={busy()} onClick={() => void submit("project-host.reinstate", { id: host().id })}>Reinstate</button></Show>
                 <Show when={!retiredHost(host()) && can("project-home.handoff")}><button type="button" disabled={busy() || movable().length === 0} title={movable().length === 0 ? "No other Project Host is reporting a project inventory to move from." : undefined} onClick={beginHandoff}>Move a project here</button></Show>
@@ -153,7 +209,12 @@ export function ProjectHostsPage(props: {
                     <div><dt>Plan capacity</dt><dd>{hostBytes(managedHost().capacity.storage_bytes)} storage · {managedHost().capacity.concurrent_agents} concurrent agents</dd></div>
                     <Show when={managedHost().retention_until !== null}><div><dt>Retained until</dt><dd>{new Date(managedHost().retention_until! * 1000).toLocaleString()}</dd></div></Show>
                     <div><dt>Included workflows</dt><dd>{managedHost().execution.profiles.durable_workflow.available ? "Available" : "Unavailable"}</dd></div>
-                    <div><dt>Isolated workspace</dt><dd>{managedHost().managed_policy.isolated_workspace_enabled ? `Enabled · USD ${nanoUsdInput(managedHost().managed_policy.max_attempt_nanos_usd)} per-attempt cap` : "Disabled"}</dd></div>
+                    <div><dt>Isolated workspace</dt><dd>{(() => {
+                        // The Home's own policy is the one its turns enforce.
+                        const policy = homePolicyFor()?.policy;
+                        if (!policy) return "Not reported by the host";
+                        return policy.isolated_workspace_enabled ? `Enabled · USD ${nanoUsdInput(policy.max_attempt_nanos_usd)} per-attempt cap` : "Disabled";
+                    })()}</dd></div>
                     <div><dt>Running / queued</dt><dd>{managedHost().execution.compute.active_attempts === null || managedHost().execution.queue === null ? "Unavailable" : `${managedHost().execution.compute.active_attempts} / ${managedHost().execution.queue!.total}`}</dd></div>
                     <div><dt>Compute charged</dt><dd>{managedHost().execution.usage === null ? "Unavailable" : `USD ${nanoUsdInput(managedHost().execution.usage!.charged_nanos_usd)}`}</dd></div>
                 </>}</Show>
@@ -178,10 +239,13 @@ export function ProjectHostsPage(props: {
                 <Show when={mode() !== "policy" && mode() !== "retire" && mode() !== "handoff"}><label><span>Name</span><input value={name()} maxLength={120} required onInput={(event) => setName(event.currentTarget.value)} /></label></Show>
                 <Show when={mode() === "add"}><dl class="gaugeapp-host-facts"><div><dt>Service location</dt><dd>{model().managed_enrollment.region}</dd></div><div><dt>Plan capacity</dt><dd>{model().managed_enrollment.capacity ? `${hostBytes(model().managed_enrollment.capacity!.storage_bytes)} · ${model().managed_enrollment.capacity!.concurrent_agents} concurrent agents` : "Unavailable"}</dd></div></dl><p class="gaugeapp-host-note">Uses this organization's current hosting plan. Your plan is not changed.</p></Show>
                 <Show when={mode() === "policy"}>
-                    <label class="gaugeapp-host-toggle"><input type="checkbox" checked={enabled()} onChange={(event) => setEnabled(event.currentTarget.checked)} /><span>Allow metered Isolated workspace compute</span></label>
-                    <label><span>Maximum reservation per attempt (USD)</span><input inputmode="decimal" value={cap()} onInput={(event) => setCap(event.currentTarget.value)} required /></label>
+                    <label class="gaugeapp-host-toggle"><input type="checkbox" checked={enabled()} disabled={!canEditPolicy() || (!enabled() && homeRate() === null)} onChange={(event) => setEnabled(event.currentTarget.checked)} /><span>Allow metered Isolated workspace compute</span></label>
+                    <label><span>Maximum reservation per attempt (USD)</span><input inputmode="decimal" value={cap()} disabled={!canEditPolicy()} onInput={(event) => setCap(event.currentTarget.value)} required /></label>
+                    <Show when={!canEditPolicy()}><p class="gaugeapp-host-note">Only the organization's owner can change this.</p></Show>
+                    <Show when={canEditPolicy() && homeRate() === null}><p class="gaugeapp-host-note">This host has no Isolated workspace prices, so it can only be turned off.</p></Show>
                     <p class="gaugeapp-host-note">Retries require a new reservation. Included workflows are unaffected.</p>
-                    <Show when={managed()?.execution.profiles.isolated_workspace.metering.nanos_usd_per_second != null}><p class="gaugeapp-host-note">Current rate: USD {nanoUsdInput(managed()!.execution.profiles.isolated_workspace.metering.nanos_usd_per_second!)} / second.</p></Show>
+                    <Show when={homeRate() !== null}><p class="gaugeapp-host-note">Current rate: USD {nanoUsdInput(homeRate()!)} / second.</p></Show>
+                    <Show when={homeCeiling() !== null}><p class="gaugeapp-host-note">This host allows at most USD {nanoUsdInput(homeCeiling()!)} per attempt.</p></Show>
                 </Show>
                 <Show when={mode() === "retire"}>
                     <Show when={managed()?.lifecycle === "retention"} fallback={<p class="gaugeapp-host-note">Retirement stops new work and begins the plan's retention period. You can reinstate the host while its data is retained.</p>}>

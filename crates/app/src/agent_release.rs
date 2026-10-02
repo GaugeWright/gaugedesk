@@ -844,14 +844,14 @@ impl Workbench {
             .versions
             .get(&instance.version)
             .ok_or_else(|| invalid("deployment archetype version is not published"))?;
-        // New releases obey the authored collection closure even when they
-        // refer to a version frozen before the Agent-files migration. Signed
-        // releases already in use are not rebuilt or reinterpreted here.
+        // New releases collect only from outbox/ (DR-0310), even when they
+        // refer to a version frozen under an older rule. Signed releases
+        // already in use are not rebuilt or reinterpreted here.
         if let Some(collection) = &spec.collection {
             for path in &collection.exportable_paths {
-                if !path.starts_with("artifacts/") {
+                if !path.starts_with("outbox/") {
                     return Err(invalid(format!(
-                        "collection path `{path}` must be inside artifacts/"
+                        "collection path `{path}` must be inside outbox/"
                     )));
                 }
             }
@@ -1829,8 +1829,50 @@ impl Workbench {
             &worktree,
             verdict,
         )?;
+        if let Some(path) = &landed {
+            self.record_kept_item(project_id, &worktree, path)?;
+        }
         self.notify_library_changed("quarantine", project_id, "upsert");
         Ok(landed)
+    }
+
+    /// Make a kept item part of the project's history, where a work chat
+    /// reads it. The gate writes it into the project folder's checkout, but a
+    /// chat starts from the project's shared main line, which copies a folder
+    /// in once, from the folder's own recorded history — so a file that was
+    /// only written to disk reached no chat. Record it on the folder's line,
+    /// then on the shared one.
+    fn record_kept_item(
+        &mut self,
+        project_id: &str,
+        worktree: &std::path::Path,
+        landed: &str,
+    ) -> io::Result<()> {
+        let target_id = crate::library_state::managed_project_target_id(project_id);
+        let body = std::fs::read_to_string(worktree.join(landed))?;
+        if let Some(target) = self.targets.get(&target_id) {
+            target.seed_main(&[]).map_err(io::Error::other)?;
+        }
+        // A project whose folder has not been copied onto the shared line yet
+        // is copied now, kept item included; one that has gets the item added.
+        self.ensure_collaboration_target_partition(project_id, &target_id)
+            .map_err(io::Error::other)?;
+        let workspace_id = self
+            .library
+            .project_collaboration_workspaces
+            .get(project_id)
+            .map(|record| record.workspace_id.clone())
+            .ok_or_else(|| io::Error::other("project collaboration workspace is unresolved"))?;
+        let root = format!(
+            "targets/{}/{landed}",
+            crate::library::target_id_path_v1(&target_id).map_err(io::Error::other)?
+        );
+        self.collaboration_workspaces
+            .get(&workspace_id)
+            .ok_or_else(|| io::Error::other("project collaboration workspace is not open"))?
+            .seed_main(&[(root.as_str(), body.as_str())])
+            .map_err(io::Error::other)?;
+        Ok(())
     }
 
     /// Every agent file store root that can reach quarantine. Empty is the
@@ -2596,7 +2638,7 @@ mod publisher_tests {
     }
 
     #[test]
-    fn new_panel_collection_only_selects_artifacts() {
+    fn new_panel_collection_only_selects_outbox() {
         let root = tempfile::tempdir().unwrap();
         let workbench = crate::open_workbench(root.path()).unwrap();
         let mut guard = workbench.lock_unpoisoned();
@@ -2614,13 +2656,19 @@ mod publisher_tests {
             max_artifact_bytes: 1024,
         };
 
-        for path in ["work/notes.md", "agent/AGENTS.md", "report.md"] {
+        // artifacts/ is what the visitor sees, not what the owner receives.
+        for path in [
+            "artifacts/*",
+            "work/notes.md",
+            "agent/AGENTS.md",
+            "report.md",
+        ] {
             let mut profile = guard.panel_profile("inst-artifact-paths-agent").unwrap();
             profile.collection = Some(collection(path));
             assert!(guard
                 .set_panel_profile("inst-artifact-paths-agent", profile)
                 .unwrap_err()
-                .contains("must be inside artifacts/"));
+                .contains("must be inside outbox/"));
 
             // The public release builder also refuses a direct spec that
             // bypassed profile editing or names an older frozen profile.
@@ -2639,11 +2687,11 @@ mod publisher_tests {
                 .build_agent_release("inst-artifact-paths", spec)
                 .unwrap_err()
                 .to_string()
-                .contains("must be inside artifacts/"));
+                .contains("must be inside outbox/"));
         }
 
         let mut profile = guard.panel_profile("inst-artifact-paths-agent").unwrap();
-        profile.collection = Some(collection("artifacts/*"));
+        profile.collection = Some(collection("outbox/*"));
         guard
             .set_panel_profile("inst-artifact-paths-agent", profile)
             .unwrap();

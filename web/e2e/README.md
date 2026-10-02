@@ -86,6 +86,10 @@ personal-key field disposal and embedded payment-session cleanup. Its test-only
 Stripe adapter makes no processor request. This is browser lifetime evidence,
 not an authenticated service or payment-provider journey.
 
+Its fixture server binds 127.0.0.1:7662 strictly and is never reused, so while
+another checkout holds that port the run is refused. Set
+`GAUGEDESK_GAUGEAPP_WORKSPACE_PORT` to a free port to run beside it.
+
 1. Write/extend a `.feature` file with Given/When/Then.
 2. Reuse a step in `steps/steps.ts`, or add a new one (drive the UI by visible
    label or `data-testid`; assert on rendered text/projections).

@@ -19,3 +19,13 @@ Feature: Panel agents belong to the Workshop and deploy through projects
     And deployment exposes publication and Inbox controls
     When I open the deployment Inbox
     Then the project Inbox for "Customer site" is open
+
+  Scenario: a Panel placement opens its own settings
+    Given the workbench is open
+    When I create a Panel agent named "Number survey"
+    And I create a project named "Survey site"
+    And I place the Panel agent "Number survey" on project "Survey site"
+    And I select the Panel-agent placement in project "Survey site"
+    Then Panel Settings for "Number survey" is open with its management conversation
+    When I open the Panel Settings page "Inbox"
+    Then the Panel Settings Inbox says what a kept item becomes

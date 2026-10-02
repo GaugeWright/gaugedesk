@@ -178,10 +178,8 @@ fn validate_panel_profile(
                     "collection path `{path}` is not a bounded selector"
                 ));
             }
-            if !path.starts_with("artifacts/") {
-                return Err(format!(
-                    "collection path `{path}` must be inside artifacts/"
-                ));
+            if !path.starts_with("outbox/") {
+                return Err(format!("collection path `{path}` must be inside outbox/"));
             }
         }
     }
@@ -215,13 +213,37 @@ fn archetype_files(
     Ok(files)
 }
 
-fn default_archetype_files() -> Vec<(String, String)> {
-    archetype_files(
+/// A created Agent starts as Chat only (DR-0308): its ability ceiling holds
+/// `question.ask` alone, the conversational ask-the-person tool, which has no
+/// Settings control of its own. Its package keeps the full capability
+/// registry, because the ability setter admits only what the registry
+/// declares — a Chat only registry would leave no preset to raise it to.
+fn new_archetype_files() -> Vec<(String, String)> {
+    let mut files = archetype_files(
         &crate::app_support::default_agent_definition(),
         BTreeSet::new(),
         true,
     )
-    .expect("the built-in Default archetype is valid")
+    .expect("the built-in Default archetype is valid");
+    for (path, content) in &mut files {
+        if !path.ends_with(&format!(
+            "/{}",
+            gaugedesk_boundary::definition::MANIFEST_FILE
+        )) {
+            continue;
+        }
+        let Ok(mut manifest) = serde_json::from_str::<serde_json::Value>(content) else {
+            continue;
+        };
+        if manifest.get("agent_abilities").is_some() {
+            manifest["agent_abilities"] = serde_json::json!(["question.ask"]);
+            *content = format!(
+                "{}\n",
+                serde_json::to_string_pretty(&manifest).expect("manifest is JSON")
+            );
+        }
+    }
+    files
 }
 
 pub(crate) enum AgentDeleteError {
@@ -4532,11 +4554,33 @@ impl Workbench {
                 });
             }
         }
+        let panel_placement = self
+            .library
+            .instances
+            .get(inst_id)
+            .is_some_and(|instance| instance.placement_kind == PlacementKind::Panel);
         if let Some(existing) = self.library.instances.get(inst_id).cloned() {
             self.write_instance_record(InstanceRecord {
                 op: RecordOp::Tombstone,
                 ..existing
             });
+        }
+        if panel_placement {
+            // Its Panel Settings conversations end with it, for every person
+            // who held one, as an Agent's settings conversations end with the
+            // Agent.
+            let settings = crate::gaugeapp_contract::GaugeAppScope {
+                kind: "placement".into(),
+                id: inst_id.into(),
+            };
+            let _ = crate::gaugeapp_agent::crypto_erase_gaugeapp_agent_threads_for_scope(
+                self,
+                crate::gaugeapp_contract::GaugeAppKind::PanelSettings,
+                &settings,
+            );
+            self.crypto_erase_content(&crate::panel_settings_gaugeapp::panel_settings_scope(
+                inst_id,
+            ));
         }
         if let Some(existing) = self.library.placement_targets.get(inst_id).cloned() {
             self.write_placement_targets_record(PlacementTargetsRecord {
@@ -5857,7 +5901,7 @@ impl Workbench {
         let workspace = provider
             .init_at(&dir)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
-        let files = default_archetype_files();
+        let files = new_archetype_files();
         let files = files
             .iter()
             .map(|(path, content)| (path.as_str(), content.as_str()))
@@ -8222,8 +8266,9 @@ impl Workbench {
 
         // Inbound items waiting on a person (ADR 0110 §7, ADR 0117 §5). Project-
         // scoped, which makes this the first task source that is not a chat's
-        // own signal — the count belongs to the project, and the chat it names
-        // is only where a reviewer goes to look.
+        // own signal: the count belongs to the project and names no chat, since
+        // screening and review are project-gate acts that need none (DR-0143
+        // §6). A project whose only placement is a Panel placement counts too.
         //
         // The count is the gate's parked questions, not every `Pending`
         // quarantine row: an item still being screened awaits the *gate*, and
@@ -8235,9 +8280,9 @@ impl Workbench {
                 continue;
             }
             let state_dir = crate::gate_service::gate_state_dir(&self.root_path(), &project.id);
-            let waiting =
-                match gaugedesk_whip_runtime::gate_runner::reviews_awaiting_a_person(&state_dir) {
-                    Ok(waiting) => waiting,
+            let parked =
+                match gaugedesk_whip_runtime::gate_runner::items_awaiting_a_person(&state_dir) {
+                    Ok(parked) => parked,
                     Err(error) => {
                         tracing::warn!(
                             project = %project.id,
@@ -8247,30 +8292,22 @@ impl Workbench {
                         continue;
                     }
                 };
-            if waiting == 0 {
+            if parked.is_empty() {
                 continue;
             }
-            // The door needs somewhere to open. A project with no chat has
-            // nowhere to show the index, so the count waits rather than
-            // rendering a pill that goes nowhere.
-            let Some(chat) = self
-                .library
-                .project_chats(&project.id)
-                .first()
-                .map(|c| c.id.clone())
-            else {
-                continue;
-            };
-            let assignee = self.default_addressee(&chat);
-            tasks.push(serde_json::json!({
-                "id": chat,
+            let mut task = serde_json::json!({
+                "id": project.id,
                 "title": project.name,
                 "agent": "",
                 "kind": "screen",
-                "assignee": assignee,
+                "assignee": self.project_addressee(),
                 "project": project.id,
-                "waiting": waiting,
-            }));
+                "waiting": parked.len(),
+            });
+            if let Some(placement) = self.sole_returning_placement(&project.id, &parked) {
+                task["placement"] = serde_json::Value::String(placement);
+            }
+            tasks.push(task);
         }
 
         // Ask-typed chat tasks (ADR 0082 §2–3), current-first. Each chat raises
@@ -8336,6 +8373,37 @@ impl Workbench {
         tasks.retain(|task| task["assignee"].as_str() == Some(actor));
 
         serde_json::json!({ "tasks": tasks })
+    }
+
+    /// The Panel placement every parked item came from, when there is exactly
+    /// one: then its Inbox in Panel Settings is the whole of what waits, and the
+    /// task bar opens that instead of the project's. Any item it cannot trace to
+    /// a live Panel placement — one from another source, or whose placement has
+    /// gone — means the project's Inbox, which shows everything.
+    fn sole_returning_placement(&self, project: &str, parked: &[Option<String>]) -> Option<String> {
+        let held = crate::quarantine::list(self.store_ref(), project).ok()?;
+        let mut sole: Option<&str> = None;
+        for item_id in parked {
+            let item = held
+                .iter()
+                .find(|item| Some(item.item_id.as_str()) == item_id.as_deref())?;
+            let placement = self
+                .library
+                .public_deployments
+                .values()
+                .find(|binding| {
+                    binding.project_id == project
+                        && crate::panel_settings_gaugeapp::returned(binding, item)
+                })?
+                .placement_id
+                .as_str();
+            match sole {
+                Some(seen) if seen != placement => return None,
+                _ => sole = Some(placement),
+            }
+        }
+        sole.filter(|placement| crate::panel_settings_gaugeapp::opens(self, placement))
+            .map(str::to_owned)
     }
 
     fn pairing_status_json(state: &BoundaryState) -> serde_json::Value {

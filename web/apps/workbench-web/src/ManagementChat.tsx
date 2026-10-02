@@ -3,26 +3,17 @@ import { engagementId } from "@gaugewright/control-plane-client";
 import { ChatPanel, ChatPaneHeader, localTurnActivity, type Session, type Transcript } from "@gaugewright/workbench-ui";
 import type { ManagementSession, ManagementTarget, WorkbenchControlPlane } from "./workbench-control-plane";
 
-/** How the chat names its GaugeApp. */
+/** How the chat names its GaugeApp. It carries no notice or placeholder: an
+ *  empty settings chat is an empty composer (DR-0308). */
 export interface ManagementChatCopy {
     /** "Project settings" — the agent's name and the loading/error subject. */
     readonly label: string;
-    /** The empty-conversation notice. */
-    readonly notice: string;
-    readonly placeholder: string;
 }
 
 export const MANAGEMENT_CHAT_COPY: Record<ManagementTarget["app"], ManagementChatCopy> = {
-    "project-settings": {
-        label: "Project settings",
-        notice: "Ask about this project's settings or request a change.",
-        placeholder: "ask about this project…",
-    },
-    "agent-settings": {
-        label: "Agent settings",
-        notice: "Ask about this Agent's model, abilities or Panel contract, or request a change.",
-        placeholder: "ask about this Agent…",
-    },
+    "project-settings": { label: "Project settings" },
+    "agent-settings": { label: "Agent settings" },
+    "panel-settings": { label: "Panel settings" },
 };
 
 interface Props {
@@ -90,7 +81,8 @@ export function ManagementChat(props: Props): JSX.Element {
         return {
             api: { getTree: async () => [], getFile: async () => "", putFile: async () => undefined },
             engagementId: () => engagementId(admitted.id),
-            project: () => target.app === "project-settings" ? target.id : null,
+            project: () => target.app === "project-settings" ? target.id
+                : target.app === "panel-settings" ? target.project : null,
             worktreeRev: () => admitted.update_cursor,
             selectedFile: () => null,
             selectFile: () => undefined,
@@ -119,7 +111,7 @@ export function ManagementChat(props: Props): JSX.Element {
                 : `Opening ${copy().label.toLowerCase()}…`}
         </div>}>
             {(active) => <>
-                <ChatPaneHeader branch={props.name} kind="management" statusLabel={busy() ? "Working" : "Ready"}
+                <ChatPaneHeader branch={props.name} kind="settings" statusLabel={busy() ? "Working" : "Ready"}
                     mobile={props.mobile} onCollapse={props.onCollapse}
                     menu={<button type="button" class="management-chat-menu" title={clearLabel()}
                         aria-label={clearLabel()} onClick={() => setConfirmClear(true)}>⋯</button>} />
@@ -138,8 +130,7 @@ export function ManagementChat(props: Props): JSX.Element {
                 <Show when={messages.error}><p class="management-chat-error" role="alert">Could not load this conversation. <button type="button" onClick={() => void refetchMessages()}>Retry</button></p></Show>
                 <Show when={error()}>{(reason) => <p class="management-chat-error" role="alert">{reason()}</p>}</Show>
                 <ChatPanel session={active()} bare agentName={copy().label}
-                    notice={copy().notice}
-                    composerPlaceholder={copy().placeholder} />
+                    composerPlaceholder="" />
             </>}
         </Show>
     </div>;

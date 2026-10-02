@@ -15,6 +15,7 @@
 
 import { TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
 import { newIdempotencyKey, type RouteJson, type RouteOptions } from "./control-plane-transport";
+import type { RouteEventClose, RouteEventStream } from "./browser-route-json";
 
 /** The `BrowserTunnel` facade, as a structural type so a test can stand one in
  * without loading wasm. Method names match the exported binding exactly. */
@@ -28,6 +29,9 @@ export interface TunnelFacade {
     isHandshaking(): boolean;
     /** Whether the relay has spliced this leg to the Home's. */
     isPaired(): boolean;
+    /** The report of consumption the relay is owed after the last frame, or
+     * empty (DR-0302). */
+    takeCredit(): Uint8Array;
 }
 
 /** The socket, narrowed to what the loop uses. */
@@ -145,7 +149,10 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
             throw new TunnelClosed("the Home tunnel closed");
         }
         live = opened;
-        opened.socket.onFrame((frame) => opened.tunnel.receiveFrame(frame));
+        opened.socket.onFrame((frame) => {
+            opened.tunnel.receiveFrame(frame);
+            sendCredit(opened.tunnel, opened.socket);
+        });
         closeReason = undefined;
         opened.socket.onClose((reason) => {
             // Only its own session. A late close from a carrier already
@@ -222,6 +229,170 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
         },
     });
     return route;
+}
+
+/** What one poll of an event tunnel produced, as the binding reports it. */
+export type TunnelStreamPoll =
+    | { readonly kind: "opened" }
+    | { readonly kind: "event"; readonly data: string }
+    | { readonly kind: "refused"; readonly status: number; readonly body: string }
+    | { readonly kind: "ended" };
+
+/** The `BrowserEventTunnel` facade: one event stream on its own pinned
+ * session, opened with its request already queued. */
+export interface EventTunnelFacade {
+    receiveFrame(frame: Uint8Array): void;
+    takeOutgoing(): Uint8Array;
+    pollEvent(): TunnelStreamPoll | undefined;
+    isPaired(): boolean;
+    takeCredit(): Uint8Array;
+}
+
+/** Tell the relay what this leg has consumed, when it owes a report. The relay
+ * counts what it sends a leg until the leg says it has taken it, and under
+ * pressure closes the pairs holding the most (DR-0302). */
+function sendCredit(tunnel: { takeCredit(): Uint8Array }, socket: TunnelSocket): void {
+    const credit = tunnel.takeCredit();
+    if (credit.length > 0) socket.send(credit);
+}
+
+export interface TunnelEventStreamOptions {
+    /** Open a pinned session for `GET path` as an event stream, and its
+     * carrier. Each stream is its own crossing: a Home's stream never ends, so
+     * sharing the calls' one-at-a-time session would hold every call behind it. */
+    readonly open: (
+        path: string,
+        headers: Record<string, string> | undefined,
+    ) => Promise<{ tunnel: EventTunnelFacade; socket: TunnelSocket }>;
+    /** Bounds the wait for the Home to answer. Once open, a stream is bounded
+     * by its carrier instead: the Home's keep-alive and the relay's idle rule. */
+    readonly openTimeoutMs?: number;
+    readonly bearer?: () => string | null;
+    readonly homeAdmission?: () => string | null;
+}
+
+/** A tunnel's `RouteEventStream`, plus the handle to end every stream it has
+ * open — which a closing route needs, because each holds a Home crossing. */
+export type TunnelEventStream = RouteEventStream & {
+    /** End every open stream as closed under its subscriber, so a reconnecting
+     * subscriber resolves its Home again rather than waiting on a dead one. */
+    closeAll(reason?: string): void;
+};
+
+/** The reason a refusal carries, as the direct transport reads it: a Home
+ * answers `{ "error": "…" }`, and `target Home admission required` is what
+ * makes desk admit again. */
+function refusal(status: number, body: string): RouteEventClose {
+    try {
+        const parsed = JSON.parse(body) as { error?: unknown };
+        if (typeof parsed.error === "string") return { status, detail: parsed.error };
+    } catch {
+        /* not JSON — the status is the whole reason */
+    }
+    return { status };
+}
+
+/**
+ * Carry a relay-only Home's event streams over the pinned tunnel (WS-634).
+ *
+ * Without this a browser opened no stream to such a Home at all, so a turn
+ * sent from another window or device appeared only on reload. Each
+ * subscription opens its own session and carrier, sends the same credentials
+ * the calls carry, and reports a refusal or a close the way the direct
+ * transport does, so the reconnecting wrapper above it re-admits and reopens
+ * exactly as it does for a Home it reaches directly.
+ *
+ * The loop is driven by arrivals, not by a timer: every change in a client's
+ * TLS state follows a frame from the relay — `READY`, the Home's handshake,
+ * its data — so pumping after each frame is all a stream needs.
+ */
+export function tunnelRouteEventStream(options: TunnelEventStreamOptions): TunnelEventStream {
+    const openTimeoutMs = options.openTimeoutMs ?? 30_000;
+    const live = new Set<(reason?: string) => void>();
+    const stream: RouteEventStream = (path, onMessage, onOpen, onClose) => {
+        let unsubscribed = false;
+        let finished = false;
+        let socket: TunnelSocket | null = null;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const finish = (reason?: RouteEventClose) => {
+            if (finished) return;
+            finished = true;
+            live.delete(hangUp);
+            clearTimeout(timer);
+            socket?.close();
+            if (!unsubscribed) onClose?.(reason);
+        };
+        const hangUp = (detail?: string) => finish(detail ? { detail } : undefined);
+        live.add(hangUp);
+        timer = setTimeout(
+            () => finish({ detail: "the Home event stream did not open in time" }),
+            openTimeoutMs,
+        );
+        void (async () => {
+            let opened: { tunnel: EventTunnelFacade; socket: TunnelSocket };
+            try {
+                opened = await options.open(path, headersFor(options, "GET"));
+            } catch (error) {
+                finish({ detail: error instanceof Error ? error.message : String(error) });
+                return;
+            }
+            if (finished) {
+                opened.socket.close();
+                return;
+            }
+            socket = opened.socket;
+            const { tunnel } = opened;
+            const drain = () => {
+                try {
+                    if (tunnel.isPaired()) {
+                        const outgoing = tunnel.takeOutgoing();
+                        if (outgoing.length > 0) opened.socket.send(outgoing);
+                    }
+                    for (let next = tunnel.pollEvent(); next && !finished; next = tunnel.pollEvent()) {
+                        switch (next.kind) {
+                            case "opened":
+                                clearTimeout(timer);
+                                onOpen?.();
+                                break;
+                            case "event":
+                                onMessage(next.data);
+                                break;
+                            case "refused":
+                                finish(refusal(next.status, next.body));
+                                break;
+                            case "ended":
+                                finish();
+                                break;
+                        }
+                    }
+                } catch (error) {
+                    finish({ detail: error instanceof Error ? error.message : String(error) });
+                }
+            };
+            opened.socket.onFrame((frame) => {
+                if (finished) return;
+                try {
+                    tunnel.receiveFrame(frame);
+                    sendCredit(tunnel, opened.socket);
+                } catch (error) {
+                    finish({ detail: error instanceof Error ? error.message : String(error) });
+                    return;
+                }
+                drain();
+            });
+            opened.socket.onClose((reason) => finish({ detail: reason ?? "the Home tunnel closed" }));
+            drain();
+        })();
+        return () => {
+            unsubscribed = true;
+            finish();
+        };
+    };
+    return Object.assign(stream, {
+        closeAll(reason?: string) {
+            for (const hangUp of [...live]) hangUp(reason ?? "the Home tunnel closed");
+        },
+    });
 }
 
 /** Copy a view into its own buffer: frames come out of wasm memory, and a

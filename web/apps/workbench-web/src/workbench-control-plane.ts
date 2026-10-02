@@ -46,14 +46,17 @@ import type {
     HomeId,
     OpaqueHomeRoute,
     CreatedHomeInvitation,
+    TunnelEventStream,
     TunnelRoute,
     StopTurnResult,
 } from "@gaugewright/control-plane-client";
 import {
     browserTunnelSocket,
     HomePool,
+    openEventTunnel,
     openTunnel,
     tunnelAvailable,
+    tunnelRouteEventStream,
     tunnelRouteJson,
     UnroutedHomeError,
 } from "@gaugewright/control-plane-client";
@@ -95,7 +98,9 @@ export type HomeBootstrapState =
  *  (`crates/app/src/gaugeapp_host.rs`), and the exact thing it manages. */
 export type ManagementTarget =
     | { readonly app: "project-settings"; readonly id: ProjectId }
-    | { readonly app: "agent-settings"; readonly id: ArchetypeId };
+    | { readonly app: "agent-settings"; readonly id: ArchetypeId }
+    /** A Panel placement is managed at its project's Home, so it names the project. */
+    | { readonly app: "panel-settings"; readonly id: PlacementId; readonly project: ProjectId };
 
 /** Where each GaugeApp's management routes are. The host serves `/sessions`,
  *  `/agent/messages`, `/agent/stop`, `/agent/erase` and `/commands` under each,
@@ -103,6 +108,7 @@ export type ManagementTarget =
 const MANAGEMENT_BASES = {
     "project-settings": (id: string) => `/projects/${encodeURIComponent(id)}/settings`,
     "agent-settings": (id: string) => `/archetypes/${encodeURIComponent(id)}/settings`,
+    "panel-settings": (id: string) => `/placements/${encodeURIComponent(id)}/settings`,
 } as const;
 
 export interface ManagementSession {
@@ -628,6 +634,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         // never re-parks, so the *next* attempt to reach it waits for a splice
         // that cannot happen. The pool tells us when a Home is done with.
         const tunnels = new Map<HomeId, TunnelRoute>();
+        // Each relay-only Home's event streams, each holding a crossing of its
+        // own. Closing the route ends them as closed rather than as abandoned,
+        // so a subscriber resolves its Home again instead of going quiet.
+        const streams = new Map<HomeId, TunnelEventStream>();
         this.pool = new HomePool<workbenchClient.WorkbenchTransport>(
             routes,
             () => this.nativeRemote ? "selected desktop session" : this.bearer,
@@ -667,6 +677,8 @@ export class WorkbenchControlPlane implements ControlPlane {
                 closeRoute: async (homeId) => {
                     tunnels.get(homeId)?.close();
                     tunnels.delete(homeId);
+                    streams.get(homeId)?.closeAll();
+                    streams.delete(homeId);
                 },
                 client: (context) => {
                     if (this.nativeRemote) {
@@ -682,16 +694,31 @@ export class WorkbenchControlPlane implements ControlPlane {
                         bearer: context.bearer,
                         homeAdmission: context.homeAdmission,
                     };
-                    // The tunnel carries JSON calls and nothing else: raw
-                    // fetches and the SSE stream are still browser-native, and a
-                    // Home with no endpoint gives them no origin to aim at.
-                    // Omitting them makes callers say so — `workTransport`
-                    // raises "Home raw transport unavailable" and the event
-                    // subscription simply does not start — rather than firing
+                    // A relay-only Home has no origin to aim a browser-native
+                    // request at. Its event streams each cross the tunnel on a
+                    // pinned session of their own, because a stream never ends
+                    // and the calls' session answers one reply at a time
+                    // (WS-634). Raw fetches are still omitted, so callers say
+                    // "Home raw transport unavailable" rather than firing
                     // relative requests at desk's own origin, where they would
                     // come back as this page's HTML.
                     if (!context.endpoint) {
-                        return { base: "", json: context.routeJson };
+                        const relay = context.route.relay;
+                        if (!relay || !tunnelAvailable()) {
+                            return { base: "", json: context.routeJson };
+                        }
+                        const events = tunnelRouteEventStream({
+                            open: async (path, headers) => {
+                                const { tunnel, handshake } = await openEventTunnel(relay, path, headers);
+                                const url = `${relay.endpoint}/v1/relay/${relay.handle}`;
+                                return { tunnel, socket: await browserTunnelSocket(url, handshake) };
+                            },
+                            bearer: context.bearer,
+                            homeAdmission: context.homeAdmission,
+                        });
+                        streams.get(context.route.homeId)?.closeAll();
+                        streams.set(context.route.homeId, events);
+                        return { base: "", json: context.routeJson, events };
                     }
                     return {
                         base: context.endpoint,
@@ -1121,19 +1148,28 @@ export class WorkbenchControlPlane implements ControlPlane {
         return (await this.projectTrackerTransport(project)).json;
     }
 
-    /** A project's routes are reached at its Home; an Agent's at the Home
-     *  serving this workbench, which owns it. */
+    /** A project's routes, and a Panel placement's, are reached at the
+     *  project's Home; an Agent's at the Home serving this workbench, which
+     *  owns it. */
     private async managementRoute(target: ManagementTarget): Promise<{ json: RouteJson; base: string }> {
         const json = target.app === "project-settings"
             ? await this.projectManagementJson(target.id)
+            : target.app === "panel-settings"
+            ? await this.projectManagementJson(target.project)
             : this.workbenchTransport().json;
         return { json, base: MANAGEMENT_BASES[target.app](target.id) };
     }
 
     async openManagement(target: ManagementTarget): Promise<ManagementSession> {
+        return (await this.openManagementPages(target)).session;
+    }
+
+    /** A freshly admitted session with its pages' read models: what the
+     *  GaugeApp shows, and what its management agent reads. */
+    async openManagementPages(target: ManagementTarget): Promise<{ session: ManagementSession; pages: readonly { id: string; model: unknown }[] }> {
         const { json, base } = await this.managementRoute(target);
-        const result = await json("POST", `${base}/sessions`) as { session: ManagementSession };
-        return result.session;
+        const result = await json("POST", `${base}/sessions`) as { session: ManagementSession; pages?: { id: string; model: unknown }[] };
+        return { session: result.session, pages: result.pages ?? [] };
     }
 
     async managementMessages(target: ManagementTarget, session: ManagementSession): Promise<readonly ManagementMessage[]> {
@@ -1397,6 +1433,19 @@ export class WorkbenchControlPlane implements ControlPlane {
     renameProjectTarget(project: ProjectId, target: string, name: string): Promise<void> {
         return this.submitManagementCommand({ app: "project-settings", id: project }, "work-data",
             "project.target.name.set", { target_id: target, name });
+    }
+
+    /** A Panel placement's settings pages (Panel Settings). */
+    async panelSettingsPages(project: string, placement: string): Promise<readonly { id: string; model: unknown }[]> {
+        return (await this.openManagementPages({
+            app: "panel-settings", id: placement as PlacementId, project: project as ProjectId,
+        })).pages;
+    }
+
+    /** A person keeps or flags one item in a Panel placement's Inbox. */
+    reviewPanelInboxItem(project: string, placement: string, item: string, verdict: "keep" | "flag"): Promise<void> {
+        return this.submitManagementCommand({ app: "panel-settings", id: placement as PlacementId, project: project as ProjectId },
+            "inbox", "panel.inbox.review", { item_id: item, verdict });
     }
 
     setProjectNetworkIsolated(id: ProjectId, isolated: boolean): Promise<void> {

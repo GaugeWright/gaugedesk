@@ -17,6 +17,9 @@ export function ProjectInbox(props: {
     project: string;
     projectName: string;
     onClose: () => void;
+    /** A verdict reached the gate, so what waits on a person may have changed:
+     *  the top bar's inbound count re-reads on this. */
+    onReviewed?: () => void;
 }): JSX.Element {
     const [refreshKey, setRefreshKey] = createSignal(0);
     const [open, setOpen] = createSignal<string | null>(null);
@@ -38,6 +41,7 @@ export function ProjectInbox(props: {
             const result = await props.api.reviewQuarantinedItem(props.project, item, verdict);
             setOpen(null);
             setRefreshKey((value) => value + 1);
+            props.onReviewed?.();
             setMessage(result.workspacePath
                 ? `The project gate kept this at ${result.workspacePath}.`
                 : "The project gate escalated this item. It remains isolated in Inbox.");

@@ -740,9 +740,11 @@ When("I create an archetype named {string}", async ({ page }, name: string) => {
 When("I create a Panel agent named {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Workshop" }).click();
     await page.getByText("+ agent", { exact: true }).click();
-    await page.getByRole("button", { name: "Panel agent", exact: true }).click();
-    await page.locator(".inline-edit").fill(name);
-    await page.locator(".inline-edit").press("Enter");
+    const dialog = page.getByRole("dialog", { name: "Create an agent" });
+    await dialog.getByRole("button", { name: /^Panel agent/ }).click();
+    await dialog.getByPlaceholder("Give this agent a name").fill(name);
+    await dialog.getByRole("button", { name: "Create Panel agent" }).click();
+    await expect(dialog).toHaveCount(0);
 });
 
 Then("the Panel agent {string} is in the Workshop", async ({ page }, name: string) => {
@@ -785,7 +787,7 @@ Then("its Panel contract editor is open", async ({ page }) => {
 });
 
 When("I close the Agent settings", async ({ page }) => {
-    await page.locator("[data-config-editor]").getByRole("button", { name: "close" }).click();
+    await page.locator("[data-config-editor] [data-agent-settings-close]").click();
 });
 
 When("I place the Panel agent {string} on project {string}", async ({ page }, agent: string, project: string) => {
@@ -795,14 +797,22 @@ When("I place the Panel agent {string} on project {string}", async ({ page }, ag
     await page.locator("[data-picker-archetype]", { hasText: agent }).click();
 });
 
+// Projects open folded in the tree; a step about a placement row unfolds its project.
+async function expandProject(page: import("@playwright/test").Page, project: string) {
+    const expand = page.locator("[data-project]", { hasText: project }).getByRole("button", { name: `Expand ${project}`, exact: true });
+    if (await expand.count()) await expand.first().click();
+}
+
 Then("project {string} has a Panel-agent placement without a new-chat action", async ({ page }, project: string) => {
+    await expandProject(page, project);
     const placement = page.locator("[data-project]", { hasText: project }).locator('.tree-subgroup[data-placement]', { has: page.locator('[data-agent-kind="panel"]') });
     await expect(placement).toBeVisible();
     await expect(placement.locator("[data-create='new-placement-chat']")).toHaveCount(0);
-    await expect(placement.locator("[data-create='open-panel-agent']")).toBeVisible();
+    await expect(placement.locator("[data-row-menu]")).toHaveCount(1);
 });
 
 When("I open deployment for the Panel agent in project {string}", async ({ page }, project: string) => {
+    await expandProject(page, project);
     await page.locator("[data-project]", { hasText: project }).locator('.tree-subgroup[data-placement]', { has: page.locator('[data-agent-kind="panel"]') }).locator(".tree-node.placement").click({ button: "right" });
     await page.locator(".menu-item-label", { hasText: /^deploy…$/ }).click();
 });
@@ -831,6 +841,33 @@ When("I open the deployment Inbox", async ({ page }) => {
 Then("the project Inbox for {string} is open", async ({ page }, project: string) => {
     await expect(page.getByRole("dialog", { name: `${project} Inbox` })).toBeVisible();
     await expect(page.getByText(/stays isolated until this project’s gate admits it/)).toBeVisible();
+});
+
+// Selecting a Panel placement opens its own settings GaugeApp (DR-0305), not
+// the Workshop surface and not a chat.
+When("I select the Panel-agent placement in project {string}", async ({ page }, project: string) => {
+    await expandProject(page, project);
+    await page.locator("[data-project]", { hasText: project }).locator('.tree-subgroup[data-placement]', { has: page.locator('[data-agent-kind="panel"]') }).locator(".tree-node.placement").click();
+});
+
+Then("Panel Settings for {string} is open with its management conversation", async ({ page }, name: string) => {
+    const settings = page.locator("[data-panel-settings]");
+    await expect(settings).toBeVisible();
+    await expect(settings.getByRole("heading", { name, exact: true })).toBeVisible();
+    await expect(settings.getByText(/This project runs version \d+/)).toBeVisible();
+    await expect(page.locator('[data-management-chat="panel-settings"]')).toBeVisible();
+    await expect(page.locator("[data-panel-agent-surface]")).toHaveCount(0);
+});
+
+When("I open the Panel Settings page {string}", async ({ page }, label: string) => {
+    await page.getByRole("navigation", { name: /^Settings for / }).getByRole("button", { name: label, exact: true }).click();
+});
+
+Then("the Panel Settings Inbox says what a kept item becomes", async ({ page }) => {
+    const inbox = page.locator("[data-panel-settings-inbox]");
+    await expect(inbox).toBeVisible();
+    await expect(inbox.getByText(/where the project's work chats can read it/)).toBeVisible();
+    await expect(inbox.getByText("Nothing has arrived from this placement's deployments.")).toBeVisible();
 });
 
 When("I create a project named {string}", async ({ page }, name: string) => {
@@ -1350,7 +1387,7 @@ Then("the config status shows {string}", async ({ page }, text: string) => {
 });
 
 When("I close the config editor", async ({ page }) => {
-    await page.getByRole("button", { name: "close", exact: true }).click();
+    await page.locator("[data-config-editor] [data-agent-settings-close]").click();
     await expect(page.locator("[data-config-editor]")).toBeHidden();
 });
 
@@ -2093,9 +2130,19 @@ Then("the raw settings text is shown", async ({ page }) => {
     await expect(page.locator("[data-config-text]")).toBeVisible();
 });
 
-Then("the settings page is open beside an edit chat", async ({ page }) => {
+When("I select the first Agent in the Workshop", async ({ page }) => {
+    await page.locator(".facet", { hasText: "Workshop" }).click();
+    await page.locator("[data-archetype] .tree-node.archetype").first().click();
+});
+
+Then("its settings are open with the Agent selected in the Workshop", async ({ page }) => {
     await expect(page.locator("[data-config-editor]")).toBeVisible();
-    await expect(page.locator("[data-work-chat-slot]")).toContainText(/Edit chat/i);
+    await expect(page.locator(".facet.active")).toHaveText(/Workshop/i);
+    await expect(page.locator("[data-archetype] .tree-node.archetype").first()).toHaveAttribute("aria-selected", "true");
+});
+
+Then("no edit chat was opened for it", async ({ page }) => {
+    await expect(page.locator("[data-work-chat-slot]")).not.toContainText(/Edit chat/i);
 });
 
 // Search has a clear control that resets the filter (#6).

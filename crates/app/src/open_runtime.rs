@@ -15,6 +15,10 @@ pub(crate) fn desktop_operator_plane(wb: crate::SharedWorkbench) -> axum::Router
         )
         .with_state(wb.clone());
     open_control_plane(wb.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            wb.clone(),
+            crate::project_owner::account_project_gate,
+        ))
         .merge(home_broker)
         .layer(axum::Extension(crate::account_signin::DesktopOperatorPlane))
         .layer(axum::middleware::from_fn_with_state(

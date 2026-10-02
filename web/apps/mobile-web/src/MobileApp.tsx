@@ -1496,10 +1496,11 @@ function MobileSession(props: {
         setQueueOpen(false);
         void selectEngagement(id);
     }
-    // The badge tap jumps to the *current* (first) task; a no-op on an empty
-    // queue. Every ask names a chat.
+    // The badge tap jumps to the *current* (first) task that names a chat; a
+    // no-op when none does. The inbound count names a project, not a chat
+    // (DR-0143 §6), and the phone has no Inbox to open.
     function jumpToCurrentTask() {
-        const first = (tasks() ?? [])[0];
+        const first = (tasks() ?? []).find((task) => task.kind !== "screen");
         if (first) jumpToTask(first.id as EngagementId);
     }
 

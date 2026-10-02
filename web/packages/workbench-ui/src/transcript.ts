@@ -32,6 +32,9 @@ export interface TranscriptLine {
      *  their authoring chat — so a fork at this line targets `origin`. Absent
      *  on the chat's own lines. */
     readonly origin?: string;
+    /** When the turn an admitted assistant line belongs to settled (unix ms).
+     *  Absent on every other line, and on replies recorded before it was kept. */
+    readonly settledAt?: number;
     /** Tool-line metadata (B4): target opens the content viewer; args/result expand. */
     readonly tool?: ToolLine;
 }
@@ -77,6 +80,7 @@ export function reduce(t: Transcript, ev: StreamEvent): Transcript {
             const line: TranscriptLine = {
                 seq, tier: "admitted", kind: "assistant", text: ev.text,
                 entryId: ev.entry_id, forkable: ev.forkable, origin: ev.origin,
+                settledAt: ev.settled_at_unix_ms,
             };
             // The admitted message is the durable form of the prose that just
             // streamed. Replace the open operational echo in place — admission
@@ -220,7 +224,7 @@ function sameLine(a: TranscriptLine, b: TranscriptLine): boolean {
     if (
         a.seq !== b.seq || a.tier !== b.tier || a.kind !== b.kind || a.text !== b.text ||
         a.code !== b.code || a.entryId !== b.entryId || a.forkable !== b.forkable ||
-        a.origin !== b.origin
+        a.origin !== b.origin || a.settledAt !== b.settledAt
     ) {
         return false;
     }

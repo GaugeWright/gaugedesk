@@ -10,7 +10,7 @@
  * rather than a second, drifting copy.
  */
 
-import { createMemo, createSignal, For, lazy, onMount, Show, Suspense, type JSX } from "solid-js";
+import { createMemo, createSignal, For, lazy, onCleanup, onMount, Show, Suspense, type JSX } from "solid-js";
 import {
     groupTurns,
     reconcileLines,
@@ -30,6 +30,7 @@ import { isBoilerplateResult, partitionedToolTarget, toolDetail, toolHeaderTarge
 import { targetNameForRoot, type TargetName } from "./target-names";
 import type { ChoiceCard, ChoiceSelection } from "@gaugewright/control-plane-client";
 import { ChoiceCardView } from "./ChoiceCardView";
+import { Icon } from "./icons";
 
 function cardIdFromTool(line: TranscriptLine): string | null {
     if (line.tool?.name !== "ask_choices" || !line.tool.result) return null;
@@ -194,6 +195,131 @@ export function ToolLineView(props: {
     );
 }
 
+/** The prose a settled turn said, as the Markdown it was written in: every
+ *  agent prose run, in order, without the tool lines between them. */
+export function turnProse(lines: readonly TranscriptLine[]): string {
+    return lines
+        .filter((l) => l.kind === "assistant" || l.kind === "text")
+        .map((l) => l.text.trim())
+        .filter(Boolean)
+        .join("\n\n");
+}
+
+/** When the turn settled, from the latest admitted reply that records it. */
+export function turnSettledAt(lines: readonly TranscriptLine[]): number | undefined {
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].settledAt !== undefined) return lines[i].settledAt;
+    }
+    return undefined;
+}
+
+/** The turn's point-fork entry: its forkable admitted reply, if it has one. */
+export function turnForkPoint(lines: readonly TranscriptLine[]): TranscriptLine | undefined {
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].forkable && lines[i].entryId !== undefined) return lines[i];
+    }
+    return undefined;
+}
+
+/** A settle time, briefly: the clock time today, the date and time otherwise,
+ *  and the year only when it is not this one. */
+export function settledLabel(unixMs: number, now: Date = new Date()): string {
+    const date = new Date(unixMs);
+    if (date.toDateString() === now.toDateString()) {
+        return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    }
+    return date.toLocaleString([], {
+        year: date.getFullYear() === now.getFullYear() ? undefined : "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+    });
+}
+
+/** Copy a message's text. The glyph turns to a tick for a moment once the
+ *  clipboard has taken it; a refused write leaves it as it was. */
+function CopyAction(props: { text: string; label: string }): JSX.Element {
+    const [copied, setCopied] = createSignal(false);
+    let reset: ReturnType<typeof setTimeout> | undefined;
+    onCleanup(() => clearTimeout(reset));
+    const copy = () => {
+        navigator.clipboard?.writeText(props.text).then(
+            () => {
+                setCopied(true);
+                clearTimeout(reset);
+                reset = setTimeout(() => setCopied(false), 1500);
+            },
+            () => {},
+        );
+    };
+    return (
+        <button
+            type="button"
+            class="message-action"
+            classList={{ done: copied() }}
+            data-copy-message
+            aria-label={copied() ? "Copied" : props.label}
+            title={copied() ? "Copied" : props.label}
+            onClick={copy}
+        >
+            <Icon name={copied() ? "check" : "copy"} />
+        </button>
+    );
+}
+
+/** Fork the chat at a durable message (the UX-8 point fork). */
+function ForkAction(props: {
+    line: TranscriptLine;
+    label: string;
+    onFork: (entryId: number, origin?: string) => void;
+}): JSX.Element {
+    return (
+        <button
+            type="button"
+            class="message-action fork-action"
+            data-fork-entry={props.line.entryId}
+            aria-label={props.label}
+            title={props.label}
+            onClick={() => props.onFork(props.line.entryId!, props.line.origin)}
+        >
+            <Icon name="fork" />
+        </button>
+    );
+}
+
+/** The foot of a settled agent turn: copy its reply, fork after it, and when
+ *  it settled. A turn still streaming has no foot. */
+function TurnFoot(props: {
+    lines: readonly TranscriptLine[];
+    onFork?: (entryId: number, origin?: string) => void;
+}): JSX.Element {
+    const prose = () => turnProse(props.lines);
+    const settledAt = () => turnSettledAt(props.lines);
+    const forkPoint = () => (props.onFork ? turnForkPoint(props.lines) : undefined);
+    return (
+        <div class="message-actions turn-foot" data-turn-foot>
+            <Show when={prose()}>
+                {(text) => <CopyAction text={text()} label="Copy reply" />}
+            </Show>
+            <Show when={forkPoint()}>
+                {(line) => <ForkAction line={line()} label="Fork after this reply" onFork={props.onFork!} />}
+            </Show>
+            <Show when={settledAt()}>
+                {(at) => (
+                    <time
+                        class="turn-settled"
+                        dateTime={new Date(at()).toISOString()}
+                        title={`Finished ${new Date(at()).toLocaleString()}`}
+                    >
+                        {settledLabel(at())}
+                    </time>
+                )}
+            </Show>
+        </div>
+    );
+}
+
 /** One transcript line, routed by kind: a tool line gets the expandable
  *  {@link ToolLineView} (opened by default per its own category's pref —
  *  command / write / read), everything else a friendly-language row. */
@@ -240,16 +366,13 @@ function LineView(props: {
                                     />
                                 </Suspense>
                             </Show>
-                            <Show when={props.line.forkable && props.line.entryId !== undefined && props.onFork}>
-                                <button
-                                    type="button"
-                                    class="line-action fork-action"
-                                    data-fork-entry={props.line.entryId}
-                                    title={props.line.kind === "user" ? "Fork before this message" : "Fork after this message"}
-                                    onClick={() => props.onFork?.(props.line.entryId!, props.line.origin)}
-                                >
-                                    Fork here
-                                </button>
+                            <Show when={props.line.kind === "user"}>
+                                <div class="message-actions line-actions">
+                                    <CopyAction text={props.line.text} label="Copy message" />
+                                    <Show when={props.line.forkable && props.line.entryId !== undefined && props.onFork}>
+                                        <ForkAction line={props.line} label="Fork before this message" onFork={props.onFork!} />
+                                    </Show>
+                                </div>
                             </Show>
                         </div>
                     }
@@ -338,6 +461,9 @@ function TurnView(props: {
                         )}
                     </For>
                 </div>
+            </Show>
+            <Show when={props.lines.some((l) => l.kind === "assistant")}>
+                <TurnFoot lines={props.lines} onFork={props.onFork} />
             </Show>
         </div>
     );

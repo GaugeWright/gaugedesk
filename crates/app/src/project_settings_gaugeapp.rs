@@ -32,44 +32,7 @@ impl GaugeAppDefinition for ProjectSettings {
     const COMMANDS: &'static [&'static str] = &[NAME_SET, ISOLATION_SET, TARGET_NAME_SET];
 
     fn admit(wb: &Workbench, headers: &HeaderMap, id: &str) -> Result<Admission, Box<Response>> {
-        let actor = wb
-            .admit_data_request_with_client(
-                net_http::bearer(headers),
-                Some(id),
-                &req_scope(headers),
-                ClientBuild::from_headers(headers),
-                true,
-            )
-            .map_err(|(status, reason)| boxed_error(status, reason))?;
-        if !wb
-            .project_visibility_in(net_http::bearer(headers), &req_scope(headers))
-            .allows(id)
-        {
-            return Err(boxed_error(
-                StatusCode::FORBIDDEN,
-                "project access required",
-            ));
-        }
-        let project = current_project(wb, id)?;
-        if &project.home_id != wb.home_id() {
-            return Err(boxed_error(
-                StatusCode::CONFLICT,
-                "use the project's authoritative Home",
-            ));
-        }
-        let directory =
-            crate::org::Org::rebuild_in(wb.store_ref(), &req_scope(headers)).map_err(|_| {
-                boxed_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "project membership is unavailable",
-                )
-            })?;
-        let provisioned = directory
-            .members
-            .values()
-            .any(|member| member.status == crate::org::MembershipStatus::Active);
-        let can_manage = can_manage_project(directory.role_of(&actor), provisioned);
-        Ok(Admission { actor, can_manage })
+        admit_project(wb, headers, id)
     }
 
     fn pages(wb: &Workbench, id: &str) -> Vec<Page> {
@@ -150,6 +113,7 @@ impl GaugeAppDefinition for ProjectSettings {
 
     fn apply(
         wb: &mut Workbench,
+        _actor: &str,
         id: &str,
         envelope: &GaugeAppCommandEnvelope,
     ) -> Result<Applied, Box<Response>> {
@@ -202,6 +166,54 @@ impl GaugeAppDefinition for ProjectSettings {
             }
         }
     }
+}
+
+/// Admit a person to one project at its authoritative Home, and say whether
+/// they may change it. Every project-scoped GaugeApp admits through this, so a
+/// placement's settings never admit more than its project's do.
+pub(crate) fn admit_project(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<Admission, Box<Response>> {
+    let actor = wb
+        .admit_data_request_with_client(
+            net_http::bearer(headers),
+            Some(id),
+            &req_scope(headers),
+            ClientBuild::from_headers(headers),
+            true,
+        )
+        .map_err(|(status, reason)| boxed_error(status, reason))?;
+    if !wb
+        .project_visibility_in(net_http::bearer(headers), &req_scope(headers))
+        .allows(id)
+    {
+        return Err(boxed_error(
+            StatusCode::FORBIDDEN,
+            "project access required",
+        ));
+    }
+    let project = current_project(wb, id)?;
+    if &project.home_id != wb.home_id() {
+        return Err(boxed_error(
+            StatusCode::CONFLICT,
+            "use the project's authoritative Home",
+        ));
+    }
+    let directory =
+        crate::org::Org::rebuild_in(wb.store_ref(), &req_scope(headers)).map_err(|_| {
+            boxed_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "project membership is unavailable",
+            )
+        })?;
+    let provisioned = directory
+        .members
+        .values()
+        .any(|member| member.status == crate::org::MembershipStatus::Active);
+    let can_manage = can_manage_project(directory.role_of(&actor), provisioned);
+    Ok(Admission { actor, can_manage })
 }
 
 fn can_manage_project(role: Option<Role>, provisioned: bool) -> bool {

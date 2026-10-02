@@ -386,6 +386,9 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     background: color-mix(in srgb, var(--bg) 38%, transparent); white-space: nowrap; }
 .task-tab:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--edge)); }
 .task-tab.active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+/* A pill that opens nothing — an inbound count with no Inbox here — is a note. */
+.task-tab[role="note"] { cursor: default; }
+.task-tab[role="note"]:hover { border-color: var(--edge); }
 /* The kind is a quiet status dot + label, NOT a bordered pill nested inside the
    task chip (round-11 #4): a pill-in-pill with two competing border colors read
    as visual noise. One chip, one border; the dot carries the status colour. */
@@ -505,24 +508,6 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     box-shadow: 0 2px 10px rgb(0 0 0 / 25%); }
 .jump-latest:hover { color: var(--accent); }
 .jump-latest .icon { width: 16px; height: 16px; }
-/* Deliverables (ADR 0163): what the agent wrote for the visitor, offered from the
-   chat. The double rule is the one frame the composition system grants a live
-   panel's contents; the download is an engraved label, not a filled button. */
-.deliverables { margin: 10px 10px 4px; padding: 10px 12px; border-top: 3px double var(--edge);
-    border-bottom: 3px double var(--edge); }
-.deliverables-caption { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--accent); margin-bottom: 6px; }
-.deliverable { display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    padding: 4px 0; }
-.deliverable.fresh .deliverable-name::after { content: " · new"; color: var(--muted); font-size: 12px; }
-.deliverable-name { font-family: var(--font-mono, ui-monospace, monospace); font-size: 13px;
-    overflow-wrap: anywhere; }
-.deliverable-download { background: none; border: 1px solid var(--edge); border-radius: 3px;
-    padding: 4px 12px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--ink); cursor: pointer; }
-.deliverable-download:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
-.deliverable-download:disabled { opacity: 0.6; cursor: default; }
-.deliverables-failure { margin-top: 6px; color: var(--danger, #b3261e); font-size: 12px; }
 .turn-activity { display: flex; align-items: center; gap: 7px; padding: 7px 10px;
     color: var(--muted); font-size: var(--fs-ui); }
 .turn-activity-dots { display: inline-flex; align-items: center; gap: 3px; }
@@ -1160,9 +1145,29 @@ h2 { font-family: var(--serif); font-size: var(--fs-ui); font-weight: 400; text-
 .line-action { font: inherit; font-size: var(--fs-small); cursor: pointer; color: var(--accent);
     background: transparent; border: 1px solid var(--accent); border-radius: 4px; padding: 2px 8px; }
 .line-action:hover { background: var(--edge); }
-.fork-action { margin-left: 8px; opacity: 0; transition: opacity 120ms ease; }
-.line.user:hover .fork-action, .line.assistant:hover .fork-action,
-.fork-action:focus-visible { opacity: 1; }
+
+/* A message's actions: small icon buttons drawn in the muted chrome colour, so a
+   row of them under every turn stays quieter than the conversation. A settled
+   agent turn's foot also says when the turn finished. */
+.message-actions { display: flex; align-items: center; gap: 2px; font-family: var(--font-chrome); }
+.message-action { display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; padding: 0; border: none; border-radius: 4px;
+    background: transparent; color: var(--muted); cursor: pointer; }
+.message-action .icon { width: 13px; height: 13px; }
+.message-action:hover { color: var(--ink); background: var(--edge); }
+.message-action:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.message-action.done { color: var(--accent); }
+.turn-foot { margin: 2px 0 0 -4px; }
+.turn-settled { margin-left: 4px; font-size: var(--fs-label); color: var(--muted);
+    font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* A message you sent keeps its actions at the end of its "you" row, out of the
+   text's way, and shows them while it is pointed at. A touch screen has no
+   pointing, so it always shows them. */
+.line.user { position: relative; }
+.line-actions { position: absolute; top: 0; right: 0; opacity: 0; transition: opacity 120ms ease; }
+.line-actions .message-action { width: 20px; height: 20px; }
+.line.user:hover .line-actions, .line-actions:focus-within { opacity: 1; }
+@media (hover: none) { .line-actions { opacity: 1; } }
 
 .line.tool { color: var(--accent); padding: 1px 0; }
 /* A tool line is only clickable when it has additive detail to reveal; a file
@@ -1579,8 +1584,10 @@ input {
 .facet-toolbar-icon .icon { width: 17px; height: 17px; }
 .facet-toolbar-icon:hover, .facet-toolbar-icon.active { color: var(--accent); background: var(--edge); }
 .facet-filter-backdrop { position: fixed; inset: 0; z-index: 70; }
-.facet-filter-menu { position: absolute; z-index: 71; top: calc(100% + 2px); right: 6px;
-    width: min(236px, calc(100vw - 24px)); padding: 5px; border: 1px solid var(--edge);
+/* Placed by FacetBrowser against the window, from the filter button's left edge
+   rightward; the width is FILTER_MENU_WIDTH there. */
+.facet-filter-menu { position: fixed; z-index: 71;
+    width: min(236px, calc(100vw - 12px)); padding: 5px; border: 1px solid var(--edge);
     border-radius: 9px; background: var(--panel); box-shadow: 0 12px 28px rgba(0, 0, 0, .4); }
 .facet-filter-menu button { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px;
     width: 100%; padding: 8px 9px; border: 0; border-radius: 5px; background: transparent; color: var(--fg);
@@ -1750,12 +1757,18 @@ input {
    instruction "set what this method does" lands on real, plain controls — not the
    raw {} JSON, which is now a collapsed Advanced surface. */
 .settings-form { display: flex; flex-direction: column; gap: 12px; margin: 4px 0 12px; }
-.agent-settings-content { box-sizing: border-box; height: 100%; min-height: 0; overflow: auto; padding: 24px clamp(12px, 2vw, 28px); }
+.agent-settings-content { box-sizing: border-box; display: flex; flex-direction: column; height: 100%; min-height: 0; }
+/* Same slot and geometry as the content pane's mode strip: it shares the
+   pane's top edge with the fold control on its left. */
+.agent-settings-head { position: relative; display: flex; align-items: center; justify-content: center;
+    flex: none; box-sizing: border-box; height: 18px; margin: -5px -6px 5px; padding: 0 28px; }
+.agent-settings-head .content-empty-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-settings-close { position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+    width: 18px; height: 18px; padding: 0; border: 0; background: none; color: var(--muted);
+    font-size: 14px; line-height: 18px; cursor: pointer; }
+.agent-settings-close:hover { color: var(--accent); background: var(--edge); }
+.agent-settings-body { flex: 1; min-height: 0; overflow: auto; padding: 18px clamp(12px, 2vw, 28px) 24px; }
 .agent-settings-page { width: min(100%, 680px); margin: 0 auto; }
-.agent-settings-page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 24px; }
-.agent-settings-page-head span { color: var(--muted); font-size: var(--fs-small); }
-.agent-settings-page-head h1 { margin: 4px 0 0; font-size: 1.5em; font-weight: 600; line-height: 1.2; }
-.agent-settings-page-head button { flex: none; }
 .agent-settings-content .settings-form { margin-top: 20px; }
 .settings-field { display: flex; flex-direction: column; gap: 4px; border: none; padding: 0;
     margin: 0; }
@@ -1882,7 +1895,7 @@ input {
    one obvious next step, not dead-end. A short line + a primary-tinted button. */
 .tree-group { margin-bottom: 4px; }
 .tree-subgroup { margin-left: 10px; }
-.panel-agent-list { margin: 7px 6px 0 18px; padding-top: 5px; border-top: 1px solid; border-image: var(--shell-gold-rule) 1; }
+.panel-agent-list { margin: 7px 0 0 18px; padding-top: 5px; border-top: 1px solid; border-image: var(--shell-gold-rule) 1; }
 .panel-agent-list .tree-subgroup { margin-left: 0; }
 .tree-node { display: flex; align-items: center; gap: 3px; padding: 3px 4px; border-radius: 4px;
     cursor: default; }
@@ -1942,7 +1955,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .tutorial-actions button { padding: 8px 14px; border: 1px solid var(--accent); border-radius: 6px; color: var(--ink); background: transparent; cursor: pointer; }
 .tutorial-source { max-height: 50vh; padding: 16px; overflow: auto; border: 1px solid var(--edge); border-radius: 8px; font-size: var(--fs-small); }
 .tree-leaf:hover { background: color-mix(in srgb, var(--accent) 7%, var(--edge)); }
-.tree-leaf.active { background: color-mix(in srgb, var(--accent) 13%, var(--edge)); color: #c9dcff; }
+.tree-leaf.active, .tree-node.archetype.active { background: color-mix(in srgb, var(--accent) 13%, var(--edge)); color: #c9dcff; }
 .chat-collection { padding: 3px 0 5px; border-bottom: 1px solid; border-image: var(--shell-gold-rule) 1; }
 .chat-collection-heading { display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 9px;
     color: var(--muted); font: 600 var(--fs-label) var(--font-chrome); text-transform: uppercase; letter-spacing: .06em; }
@@ -2177,6 +2190,17 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .context-menu { position: fixed; z-index: 50; background: var(--panel); border: 1px solid var(--edge);
     border-radius: 6px; padding: 4px; min-width: 130px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
     display: flex; flex-direction: column; gap: 1px; }
+/* Hover help (tooltips.ts): a control's own title, in the chrome face at the
+   control size, on the panel surface — not the browser's small system tooltip.
+   It never takes the pointer, and it sits above every menu and modal. */
+.app-tooltip { position: fixed; z-index: 2000; display: none; box-sizing: border-box;
+    max-width: min(320px, calc(100vw - 12px)); padding: 5px 9px;
+    border: 1px solid var(--edge); border-radius: 6px; background: var(--panel); color: var(--ink);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4); font: 400 var(--fs-ui)/1.35 var(--font-chrome);
+    white-space: pre-line; overflow-wrap: anywhere; pointer-events: none; }
+.app-tooltip.visible { display: block; animation: app-tooltip-in 90ms ease-out; }
+@keyframes app-tooltip-in { from { opacity: 0; transform: translateY(-2px); } }
+
 /* Menu surfaces carry the same fading rule without changing their shape or text. */
 .chat-options-popover, .account-popover, .facet-filter-menu, .context-menu {
     background-image: var(--shell-gold-rule), var(--shell-gold-rule);
@@ -2265,6 +2289,7 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     padding: 10px 12px; background: none; border: none; border-bottom: 1px solid var(--edge);
     color: var(--ink); font-size: var(--fs-body); text-align: left; cursor: pointer; }
 .queue-sheet-item.current { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.queue-sheet-item[role="note"] { cursor: default; }
 .queue-item-current { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.05em;
     color: var(--accent); }
 .queue-item-kind { font-size: var(--fs-small); color: var(--muted); }
