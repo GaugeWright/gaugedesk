@@ -19,6 +19,32 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- The development and preview servers proxy the full inventoried control-plane
+  surface, including tutorial launches. The route check now refuses a missing
+  proxy prefix when a backend route is added.
+
+- GaugeDesk in a browser can now open, edit and upload files, read and change a
+  chat's configuration, and preview a merge on a Home it reaches through the
+  relay, such as a desktop at home. Before, each of these failed with "Home raw
+  transport unavailable".
+
+- Existing Agent drafts that can read files gain `offer_download`, so they can
+  offer a file from `artifacts/` in the chat. Published versions stay unchanged;
+  publish the updated draft to give an existing placement or deployment the tool.
+
+- Hosted clients avoid desktop-only account-session and federation reads. Projects
+  without a published route reuse their selected Home connection instead of
+  repeatedly reading account directory discovery.
+
+- GaugeApp agents now remember the recent admitted exchanges in their exact
+  management conversation when you send a follow-up. Clearing the conversation
+  starts their context fresh.
+
+- In the hosted Console you can open your work chats' files again, the
+  agent's output included, and Files lists them. Since 2026-09-28 every file
+  nobody had granted you was withheld, your own work with it. A file another
+  person uploaded into a shared chat still needs their approval.
+
 ## [0.6.0] — 2026-10-02
 
 - A Panel session now has a folder each for the visitor, the agent and you.

@@ -174,7 +174,7 @@ fn codex_status(wb: &SharedWorkbench, headers: &HeaderMap, hosted: bool) -> Json
     let (scope, class) = {
         let workbench = wb.lock_unpoisoned();
         (
-            workbench.account_scope_for(net_http::bearer(headers)),
+            workbench.credential_scope_for(net_http::bearer(headers)),
             if hosted {
                 ModelExecutionClass::PrivateHome
             } else {
@@ -659,7 +659,7 @@ pub async fn post_home_codex_login_start(
 ) -> impl IntoResponse {
     let scope = wb
         .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers));
     match start_home_login_for_scope(wb, scope).await {
         Ok(login) => Json(json!({ "mode": "device", "login": login })).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response(),
@@ -672,7 +672,7 @@ pub async fn post_home_codex_login_cancel(
 ) -> impl IntoResponse {
     let scope = wb
         .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers));
     match cancel_home_login_for_scope(&scope) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
@@ -739,7 +739,7 @@ fn end_browser_login_child(child: &Arc<Mutex<Child>>) {
 
 /// Start the helper, return the authorization URL, then retain its private pipe
 /// in a background thread until the credential bundle can be sealed.
-fn start_login_blocking(wb: SharedWorkbench) -> Result<String, String> {
+fn start_login_blocking(wb: SharedWorkbench, scope: String) -> Result<String, String> {
     // An earlier attempt still holds the callback port, and the person asking for
     // this one is not going back to it. Superseding here is what keeps a start
     // from failing on the wait the previous start is still doing.
@@ -825,7 +825,15 @@ fn start_login_blocking(wb: SharedWorkbench) -> Result<String, String> {
                                 if let Ok(credential) =
                                     serde_json::from_value::<CodexOAuthCredential>(event)
                                 {
-                                    let _ = store_credential(&wb, &credential);
+                                    // Into the account that started the
+                                    // sign-in, not whichever is selected
+                                    // when the browser answers (DR-0313).
+                                    let _ = store_credential_in(
+                                        &wb,
+                                        &scope,
+                                        &credential,
+                                        BTreeSet::from([ModelExecutionClass::LocalInteractive]),
+                                    );
                                 }
                             }
                         }
@@ -882,8 +890,14 @@ pub async fn post_codex_login_cancel() -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
 
-pub async fn post_codex_login_start(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
-    match tokio::task::spawn_blocking(move || start_login_blocking(wb)).await {
+pub async fn post_codex_login_start(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let scope = wb
+        .lock_unpoisoned()
+        .credential_scope_for(net_http::bearer(&headers));
+    match tokio::task::spawn_blocking(move || start_login_blocking(wb, scope)).await {
         Ok(Ok(url)) => Json(json!({ "mode": "browser", "url": url })).into_response(),
         Ok(Err(error)) => {
             (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response()
@@ -946,7 +960,10 @@ pub fn resolve_turn_credential(
     execution_class: ModelExecutionClass,
 ) -> Result<Option<CodexRuntimeCredential>, String> {
     match execution_class {
-        ModelExecutionClass::LocalInteractive => resolve_runtime_credential(wb),
+        ModelExecutionClass::LocalInteractive => {
+            let scope = wb.lock_unpoisoned().account_scope_for_actor(actor);
+            resolve_runtime_credential_in(wb, &scope, ModelExecutionClass::LocalInteractive)
+        }
         ModelExecutionClass::PrivateHome => resolve_runtime_credential_in(
             wb,
             &crate::account::account_scope(actor),
@@ -1397,11 +1414,11 @@ setInterval(() => {}, 60000);
         .unwrap();
         std::env::set_var("GAUGEDESK_CODEX_LOGIN", &helper);
 
-        let url = start_login_blocking(workbench.clone()).unwrap();
+        let url = start_login_blocking(workbench.clone(), ACCOUNT_SCOPE.to_owned()).unwrap();
         assert_eq!(url, "https://example.invalid/authorize");
         let first = browser_login().lock().unwrap().clone().unwrap();
 
-        start_login_blocking(workbench.clone()).unwrap();
+        start_login_blocking(workbench.clone(), ACCOUNT_SCOPE.to_owned()).unwrap();
         let second = browser_login().lock().unwrap().clone().unwrap();
         assert_ne!(first.lock().unwrap().id(), second.lock().unwrap().id());
         // Killed and reaped by the start that replaced it, not merely dropped:

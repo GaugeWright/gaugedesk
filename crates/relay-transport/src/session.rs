@@ -80,6 +80,13 @@ impl PinnedSession {
         Ok(())
     }
 
+    /// Bytes queued to go out and not yet taken: plaintext waiting for the
+    /// handshake or the next pump, and ciphertext waiting for the carrier. A
+    /// carrier feeding a large body reads this to send no faster than it drains.
+    pub fn buffered(&self) -> usize {
+        self.pending_app_data.len() + self.outgoing.len()
+    }
+
     /// Take whatever plaintext has been decrypted so far.
     pub fn take_plaintext(&mut self) -> Vec<u8> {
         self.plaintext.drain(..).collect()

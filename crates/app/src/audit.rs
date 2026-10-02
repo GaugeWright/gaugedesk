@@ -352,6 +352,8 @@ impl Workbench {
     /// crypto-erase. The same vault should also be set as the store's codec. Builder.
     pub fn with_content_vault(mut self, vault: Arc<content_vault::ContentVault>) -> Self {
         self.content_vault = Some(vault);
+        // Key each project's scopes under its own key, as startup does (DR-0312).
+        self.attach_scope_index();
         self
     }
 

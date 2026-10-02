@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
+import controlPlanePrefixes from "./control-plane-proxy-prefixes.json";
 // The control-plane base for this run (default :7878; the e2e harness shifts it per run for
 // concurrency-safety — see e2e/ports.mjs). The browser opens streams same-origin and the
 // preview/dev server proxies them to this backend, so the proxy target must track the CP port.
@@ -12,44 +13,14 @@ import { aliceCP, ports } from "./e2e/ports.mjs";
 // the proxy target follows it rather than the harness's fixed default.
 const controlPlane = process.env.GAUGEDESK_DEV_CONTROL_PLANE_TARGET ?? aliceCP;
 
-// Every top-level path the control plane owns (`crates/app/src/local_routes.rs`
-// and its sibling route modules). The client's CP base is this same origin — the
+// The consumed prefix table is checked against the product-route discovery
+// (`scripts/check-product-contracts.mjs`), including its enterprise/debug surface.
+// The client's CP base is this same origin — the
 // fabric serves `desk` from this server — so anything missing here is answered by
 // Vite's SPA fallback instead of the backend: a 404 for an XHR, and index.html for
 // anything that accepts HTML, which surfaces as `Unexpected token '<'`. The
 // workbench has no client-side URL router, so no entry here can shadow a route of
 // the app's own.
-const controlPlanePrefixes = [
-    "/account",
-    "/archetypes",
-    "/auth",
-    "/boundaries",
-    "/chats",
-    "/collection-recipients",
-    "/console",
-    "/engagements",
-    "/federation",
-    "/file",
-    "/fork-tree",
-    "/health",
-    "/home",
-    "/mobile",
-    "/notices",
-    "/pairing-requests",
-    "/pairing-status",
-    "/placements",
-    "/projections",
-    "/projects",
-    "/public-deployments",
-    "/roster",
-    "/scopes",
-    "/search",
-    "/targets",
-    "/tasks",
-    "/work-items",
-    "/workspace",
-    "/workstreams",
-];
 const proxy = Object.fromEntries(
     controlPlanePrefixes.map((prefix) => [prefix, controlPlane]),
 );

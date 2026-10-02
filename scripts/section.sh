@@ -72,7 +72,9 @@ case "${1:-}" in
   check-composition)       node --test scripts/check-lanes.test.mjs scripts/check-live-fabric.test.mjs ;;
   architecture-boundaries) python3 scripts/architecture-check.py ;;
   license-boundary)        python3 scripts/check-license-boundary.py ;;
-  product-contracts)       node scripts/check-product-contracts.mjs --enforce-local-evidence ;;
+  product-contracts)
+    node --test scripts/control-plane-proxy.test.mjs
+    node scripts/check-product-contracts.mjs --enforce-local-evidence ;;
   gaugeapp-contract)
     node scripts/check-gaugeapps-contract.mjs
     node scripts/check-gaugeapp-operation-coverage.mjs ;;

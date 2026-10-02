@@ -2561,9 +2561,98 @@ where
     )
 }
 
+// Replay only a suffix of complete admitted exchanges. The transcript stores
+// user/assistant text, not provider tool frames; inventing tool outputs here
+// would give the next request results with no corresponding admitted call.
+const MAX_HISTORY_EXCHANGES: usize = 32;
+const MAX_HISTORY_TEXT_BYTES: usize = 64 * 1024;
+
+fn gaugeapp_agent_turn_input(
+    store: &Store,
+    session: &GaugeAppSession,
+    message: &str,
+) -> Result<Vec<Value>, GaugeAppAgentError> {
+    let transcript = gaugeapp_agent_transcript(store, session)
+        .map_err(|error| GaugeAppAgentError::Store(format!("{error:?}")))?;
+    if !transcript.len().is_multiple_of(2) {
+        return Err(GaugeAppAgentError::InvalidOutput(
+            "management transcript has an incomplete exchange".into(),
+        ));
+    }
+    let mut exchanges = Vec::new();
+    let mut bytes = 0;
+    for pair in transcript.chunks_exact(2).rev().take(MAX_HISTORY_EXCHANGES) {
+        if pair[0].role != GaugeAppAgentMessageRole::User
+            || pair[1].role != GaugeAppAgentMessageRole::Assistant
+            || pair[0].sequence.checked_add(1) != Some(pair[1].sequence)
+        {
+            break;
+        }
+        let size = pair[0].text.len().saturating_add(pair[1].text.len());
+        if size > MAX_HISTORY_TEXT_BYTES - bytes {
+            break;
+        }
+        bytes += size;
+        exchanges.push(pair);
+    }
+    let mut input = Vec::new();
+    for pair in exchanges.into_iter().rev() {
+        input.push(
+            json!({"role": "user", "content": [{"type": "input_text", "text": pair[0].text}]}),
+        );
+        input.push(json!({"role": "assistant", "content": [{"type": "output_text", "text": pair[1].text}]}));
+    }
+    input.push(json!({"role": "user", "content": [{"type": "input_text", "text": message}]}));
+    Ok(input)
+}
+
 // The callback tuple is the caller's exact authority and execution boundary.
 #[allow(clippy::too_many_arguments)]
 pub fn run_gaugeapp_agent_turn_with_direct_actions<F, S, E, V>(
+    workbench: &SharedWorkbench,
+    context: GaugeAppAgentContext,
+    message: &str,
+    refresh: F,
+    is_stopped: S,
+    emit: E,
+    validate_proposal: V,
+    direct_action: Option<DirectAction<'_>>,
+    direct_key: &str,
+) -> Result<GaugeAppAgentTurn, GaugeAppAgentError>
+where
+    F: FnMut() -> Result<GaugeAppAgentContext, GaugeAppAgentError>,
+    S: FnMut() -> bool,
+    E: FnMut(GaugeAppAgentLiveEvent) -> Result<(), GaugeAppAgentError>,
+    V: FnMut(&GaugeAppAgentContext, &GaugeAppAgentProposal) -> Result<(), GaugeAppAgentError>,
+{
+    let actor = context.session.actor.clone();
+    let mut credential = None;
+    run_gaugeapp_agent_turn_with_provider(
+        workbench,
+        context,
+        message,
+        refresh,
+        is_stopped,
+        emit,
+        validate_proposal,
+        direct_action,
+        direct_key,
+        |body, stopped, events| {
+            if credential.is_none() {
+                credential = Some(resolve_agent_credential(workbench, &actor)?);
+            }
+            provider_request(
+                credential.as_ref().expect("resolved credential"),
+                body,
+                stopped,
+                events,
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gaugeapp_agent_turn_with_provider<F, S, E, V, P>(
     workbench: &SharedWorkbench,
     context: GaugeAppAgentContext,
     message: &str,
@@ -2573,12 +2662,14 @@ pub fn run_gaugeapp_agent_turn_with_direct_actions<F, S, E, V>(
     mut validate_proposal: V,
     mut direct_action: Option<DirectAction<'_>>,
     direct_key: &str,
+    mut request_provider: P,
 ) -> Result<GaugeAppAgentTurn, GaugeAppAgentError>
 where
     F: FnMut() -> Result<GaugeAppAgentContext, GaugeAppAgentError>,
     S: FnMut() -> bool,
     E: FnMut(GaugeAppAgentLiveEvent) -> Result<(), GaugeAppAgentError>,
     V: FnMut(&GaugeAppAgentContext, &GaugeAppAgentProposal) -> Result<(), GaugeAppAgentError>,
+    P: FnMut(&Value, &mut S, &mut E) -> Result<Value, GaugeAppAgentError>,
 {
     let message = message.trim();
     if message.is_empty() {
@@ -2587,6 +2678,20 @@ where
     if contains_secret_text(message) {
         return Err(GaugeAppAgentError::Rejected(
             GaugeAppAgentRejection::SecretBearingArguments,
+        ));
+    }
+    if is_stopped() {
+        return Err(GaugeAppAgentError::Interrupted);
+    }
+    // Fresh authorization precedes even a transcript read or a plain model
+    // answer. The opening identity must still name the same authorization epoch.
+    let current = refresh()?;
+    if current.session.id != context.session.id
+        || current.session.generation != context.session.generation
+        || gaugeapp_thread_id(&current.session) != gaugeapp_thread_id(&context.session)
+    {
+        return Err(GaugeAppAgentError::Rejected(
+            GaugeAppAgentRejection::SessionMismatch,
         ));
     }
     if is_stopped() {
@@ -2606,13 +2711,13 @@ where
         })?;
         return Ok(turn);
     }
-    let credential = resolve_agent_credential(workbench, &context.session.actor)?;
     let agent_session = GaugeAppAgentSession::from_gaugeapp(&context.session);
     let system = gaugeapp_agent_instructions(&context.session);
-    let mut input = vec![json!({
-        "role": "user",
-        "content": [{ "type": "input_text", "text": message }]
-    })];
+    let mut input = gaugeapp_agent_turn_input(
+        workbench.lock_unpoisoned().store_ref(),
+        &current.session,
+        message,
+    )?;
     let mut proposals = Vec::new();
     let mut direct_used = false;
     for _ in 0..MAX_TOOL_ROUNDS {
@@ -2625,7 +2730,7 @@ where
             "parallel_tool_calls": false,
             "store": false
         });
-        let response = provider_request(&credential, &body, &mut is_stopped, &mut emit)?;
+        let response = request_provider(&body, &mut is_stopped, &mut emit)?;
         if is_stopped() {
             return Err(GaugeAppAgentError::Interrupted);
         }
@@ -2723,6 +2828,243 @@ mod tests {
     };
     use proptest::prelude::*;
     use serde_json::json;
+
+    #[test]
+    fn follow_up_provider_request_replays_only_its_admitted_exchange() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let context = GaugeAppAgentContext {
+            session: gaugeapp(),
+            pages: Vec::new(),
+        };
+        let mut requests = Vec::new();
+        for (key, user, answer) in [
+            ("first", "Which name should I use?", "Use Orchard."),
+            ("second", "Use that name.", "I will use Orchard."),
+        ] {
+            let turn = run_gaugeapp_agent_turn_with_provider(
+                &workbench,
+                context.clone(),
+                user,
+                || Ok(context.clone()),
+                || false,
+                |_| Ok(()),
+                |_, _| Ok(()),
+                None,
+                key,
+                |body, _, _| {
+                    requests.push(body.clone());
+                    Ok(json!({"output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": answer}]}]}))
+                },
+            )
+            .unwrap();
+            append_gaugeapp_agent_exchange(&workbench, &context.session, key, user, &turn).unwrap();
+        }
+        assert_eq!(requests[0]["input"].as_array().unwrap().len(), 1);
+        let second = requests[1]["input"].as_array().unwrap();
+        assert_eq!(second.len(), 3);
+        assert_eq!(second[0]["content"][0]["text"], "Which name should I use?");
+        assert_eq!(second[1]["role"], "assistant");
+        assert_eq!(second[1]["content"][0]["type"], "output_text");
+        assert_eq!(second[1]["content"][0]["text"], "Use Orchard.");
+        assert_eq!(second[2]["content"][0]["text"], "Use that name.");
+
+        let guard = workbench.lock_unpoisoned();
+        let mut other_person = context.session.clone();
+        other_person.actor = "another-person".into();
+        assert_eq!(
+            gaugeapp_agent_turn_input(guard.store_ref(), &other_person, "next")
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut other_scope = context.session.clone();
+        other_scope.scope.id = "another-tenant".into();
+        assert_eq!(
+            gaugeapp_agent_turn_input(guard.store_ref(), &other_scope, "next")
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut other_app = context.session.clone();
+        other_app.app = GaugeAppKind::AccountSettings;
+        assert_eq!(
+            gaugeapp_agent_turn_input(guard.store_ref(), &other_app, "next")
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(guard);
+        erase_gaugeapp_agent_transcript(&workbench, &context.session, "clear").unwrap();
+        assert_eq!(
+            gaugeapp_agent_turn_input(
+                workbench.lock_unpoisoned().store_ref(),
+                &context.session,
+                "next"
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn prior_context_is_not_read_or_sent_after_revocation() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let context = GaugeAppAgentContext {
+            session: gaugeapp(),
+            pages: Vec::new(),
+        };
+        let result = run_gaugeapp_agent_turn_with_provider(
+            &workbench,
+            context,
+            "follow up",
+            || {
+                Err(GaugeAppAgentError::Rejected(
+                    GaugeAppAgentRejection::SessionRevoked,
+                ))
+            },
+            || false,
+            |_| Ok(()),
+            |_, _| Ok(()),
+            None,
+            "next",
+            |_, _, _| panic!("revoked context must not reach the provider"),
+        );
+        assert!(matches!(
+            result,
+            Err(GaugeAppAgentError::Rejected(
+                GaugeAppAgentRejection::SessionRevoked
+            ))
+        ));
+    }
+
+    #[test]
+    fn changed_conversation_or_authorization_epoch_never_reaches_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let context = GaugeAppAgentContext {
+            session: gaugeapp(),
+            pages: Vec::new(),
+        };
+        let mut changed = vec![context.clone(); 5];
+        changed[0].session.actor = "another-person".into();
+        changed[1].session.app = GaugeAppKind::AccountSettings;
+        changed[2].session.scope.id = "another-tenant".into();
+        changed[3].session.generation = "new-epoch".into();
+        changed[4].session.id = "another-session".into();
+        for current in changed {
+            let result = run_gaugeapp_agent_turn_with_provider(
+                &workbench,
+                context.clone(),
+                "follow up",
+                || Ok(current.clone()),
+                || false,
+                |_| Ok(()),
+                |_, _| Ok(()),
+                None,
+                "next",
+                |_, _, _| panic!("changed admission must not reach the provider"),
+            );
+            assert!(matches!(
+                result,
+                Err(GaugeAppAgentError::Rejected(
+                    GaugeAppAgentRejection::SessionMismatch
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn an_incomplete_transcript_does_not_replay_older_exchanges() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let session = gaugeapp();
+        append_gaugeapp_agent_exchange(
+            &workbench,
+            &session,
+            "first",
+            "question",
+            &GaugeAppAgentTurn {
+                message: "answer".into(),
+                proposals: Vec::new(),
+            },
+        )
+        .unwrap();
+        let orphan = GaugeAppAgentMessage {
+            id: "orphan".into(),
+            thread_id: gaugeapp_thread_id(&session),
+            app: session.app,
+            scope: session.scope.clone(),
+            actor: session.actor.clone(),
+            sequence: 2,
+            role: GaugeAppAgentMessageRole::User,
+            text: "unfinished question".into(),
+            proposals: Vec::new(),
+        };
+        let mut guard = workbench.lock_unpoisoned();
+        let scope = gaugeapp_agent_active_content_scope(guard.store_ref(), &session)
+            .unwrap()
+            .unwrap();
+        guard
+            .store_mut()
+            .append_record(
+                &scope,
+                GAUGEAPP_AGENT_MESSAGE_KIND,
+                &serde_json::to_string(&orphan).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            gaugeapp_agent_turn_input(guard.store_ref(), &session, "next"),
+            Err(GaugeAppAgentError::InvalidOutput(_))
+        ));
+    }
+
+    #[test]
+    fn history_keeps_a_bounded_suffix_of_whole_exchanges() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let session = gaugeapp();
+        for index in 0..MAX_HISTORY_EXCHANGES + 2 {
+            append_gaugeapp_agent_exchange(
+                &workbench,
+                &session,
+                &format!("turn-{index}"),
+                &format!("question-{index}"),
+                &GaugeAppAgentTurn {
+                    message: format!("answer-{index}"),
+                    proposals: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        let input =
+            gaugeapp_agent_turn_input(workbench.lock_unpoisoned().store_ref(), &session, "next")
+                .unwrap();
+        assert_eq!(input.len(), MAX_HISTORY_EXCHANGES * 2 + 1);
+        assert_eq!(input[0]["content"][0]["text"], "question-2");
+        append_gaugeapp_agent_exchange(
+            &workbench,
+            &session,
+            "large",
+            &"é".repeat(MAX_HISTORY_TEXT_BYTES / 2),
+            &GaugeAppAgentTurn {
+                message: "answer".into(),
+                proposals: Vec::new(),
+            },
+        )
+        .unwrap();
+        let input =
+            gaugeapp_agent_turn_input(workbench.lock_unpoisoned().store_ref(), &session, "next")
+                .unwrap();
+        assert_eq!(
+            input.len(),
+            1,
+            "an oversized newest exchange is omitted whole"
+        );
+    }
 
     #[test]
     fn managed_turns_go_to_openai_unless_the_operator_names_a_responses_endpoint() {

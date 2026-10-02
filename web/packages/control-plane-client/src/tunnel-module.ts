@@ -13,14 +13,14 @@
  */
 
 import type { OpaqueRelayLocator } from "./home-routing";
-import type { EventTunnelFacade, TunnelFacade } from "./tunnel-route-json";
+import type { EventTunnelFacade, RawTunnelFacade } from "./tunnel-route-json";
 
 /** What the generated module exports. Declared so a change to the Rust
  * binding's names is a type error here rather than a runtime failure in a
  * browser. */
 export interface TunnelModule {
     readonly BrowserTunnel: {
-        new (homeFingerprint: string): TunnelFacade;
+        new (homeFingerprint: string): RawTunnelFacade;
         relayHandshake(endpoint: string, handle: string, proof: string, epoch: number): Uint8Array;
     };
     readonly BrowserEventTunnel: {
@@ -73,7 +73,7 @@ export function tunnelAvailable(): boolean {
 /** A tunnel pinned to one Home, and the handshake for its route. */
 export async function openTunnel(
     locator: OpaqueRelayLocator,
-): Promise<{ tunnel: TunnelFacade; handshake: Uint8Array }> {
+): Promise<{ tunnel: RawTunnelFacade; handshake: Uint8Array }> {
     const module = await load();
     return {
         tunnel: new module.BrowserTunnel(locator.homeFingerprint),

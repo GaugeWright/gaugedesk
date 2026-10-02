@@ -87,8 +87,26 @@ function fixtureApi(): EmbedSessionApi {
     // it the turn goes straight from thinking to streaming, which is what a
     // tool-less deployment actually does.
     const fixtureTool = params.get("tool");
-    const fixtureWorkspace = params.get("workspace") === "1";
+    // `?offer=1` also has the agent offer the readout from the chat (DR-0314):
+    // the transcript carries the `offer_download` call, which the chat turns
+    // into a Download card, with or without the Files panel.
+    const fixtureOffer = params.get("offer") === "1";
+    const fixtureWorkspace = params.get("workspace") === "1" || fixtureOffer;
     const FIXTURE_READOUT = "artifacts/oai-readout.html";
+    if (fixtureOffer) {
+        durable.push(
+            { type: "assistant", text: "Thanks. Your readout is ready." } as StreamEvent,
+            {
+                type: "tool",
+                tool: "offer_download",
+                mediated: true,
+                call_id: "fixture-offer",
+                target: FIXTURE_READOUT,
+                args: JSON.stringify({ path: FIXTURE_READOUT, title: "Your Organizational Agency readout" }),
+            } as StreamEvent,
+            { type: "toolresult", call_id: "fixture-offer", ok: true, result: '{"external_call_id":"fixture-offer"}' } as StreamEvent,
+        );
+    }
     return {
         getTurnActivity: () => observation,
         subscribeTurnActivity: (listener: (value: TurnObservation) => void) => {

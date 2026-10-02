@@ -1162,6 +1162,9 @@ pub const GAUGEDESK_ATTESTATION_ALGORITHM: &str = "p256-sha256";
 /// resources, and app re-exports these so the manifest, the gate, and the record
 /// cannot drift onto three different strings.
 pub const QUESTION_ASK_CAPABILITY: &str = "question.ask";
+/// The tool an Agent calls to hand the person in its chat a file (DR-0314).
+/// GaugeDesk's package builder declares it under `workspace.read`.
+pub const OFFER_DOWNLOAD_TOOL: &str = "offer_download";
 
 /// The turn resource admitted when the ceiling carries [`QUESTION_ASK_CAPABILITY`].
 /// `execute_tool` refuses `ask` without it, exactly as `bash` refuses without
@@ -3587,6 +3590,43 @@ impl ResourceResolver for TurnResources<'_> {
             let id = filer.file_task(&call.id, content, assigned_to)?;
             return Ok(serde_json::json!({"id": id}).to_string());
         }
+        // DR-0314: the chat renders this call as a Download card, so the call
+        // itself only proves the offer is real. The path must be a file under
+        // `artifacts/`, and the turn must be able to read it: the check is the
+        // workspace's own `read`, under the same admitted resources, so an
+        // offer never reaches a file the agent could not have read. The
+        // receipt carries no file content.
+        if call.name == OFFER_DOWNLOAD_TOOL {
+            let path = call
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            let Some(rest) = path.strip_prefix("artifacts/") else {
+                return Err("`offer_download` offers only files under artifacts/".to_owned());
+            };
+            if rest.is_empty()
+                || rest
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment.starts_with('.'))
+            {
+                return Err(format!("`{path}` is not a file path under artifacts/"));
+            }
+            self.workspace.execute_tool(
+                admitted_resources,
+                &ToolCall {
+                    id: call.id.clone(),
+                    name: "read".to_owned(),
+                    arguments: serde_json::json!({ "path": path }),
+                },
+            )?;
+            return Ok(serde_json::json!({
+                "offered": path,
+                "note": "The person sees a Download card for this file in the chat."
+            })
+            .to_string());
+        }
         if call.name == "ask_choices" {
             if !admitted_resources
                 .iter()
@@ -4106,6 +4146,79 @@ mod tests {
             gaugedesk_harness::ChatMode::Edit,
         )
         .is_none());
+    }
+
+    #[test]
+    fn offer_download_offers_only_a_readable_file_under_artifacts() {
+        use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("artifacts")).unwrap();
+        std::fs::create_dir_all(root.path().join("outbox")).unwrap();
+        std::fs::write(
+            root.path().join("artifacts/readout.html"),
+            "<h1>Readout</h1>",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("outbox/record.json"), "{}").unwrap();
+        let workspace = NativeWorkspaceResolver::new(root.path()).unwrap();
+        let mut sink = |_observation: &gaugedesk_harness::Observation| {};
+        let resources = super::TurnResources {
+            workspace: &workspace,
+            workspace_resources: &[],
+            chat_id: "test-chat",
+            mode: gaugedesk_harness::ChatMode::Use,
+            images: &[],
+            task_filer: None,
+            asked: std::cell::RefCell::new(Vec::new()),
+            external_tool_handler: None,
+            command_id: "test-turn".to_owned(),
+            live: std::cell::RefCell::new(&mut sink),
+            streamed: std::cell::Cell::new(false),
+        };
+        let project = super::ResourceRef {
+            handle: "project".into(),
+            kind: "file_store".into(),
+            selector: None,
+            writable: None,
+            presented_as: None,
+        };
+        let offer = |path: &str| super::ToolCall {
+            id: "call-1".into(),
+            name: super::OFFER_DOWNLOAD_TOOL.into(),
+            arguments: serde_json::json!({ "path": path }),
+        };
+
+        let receipt = resources
+            .execute_tool(
+                std::slice::from_ref(&project),
+                &offer("artifacts/readout.html"),
+            )
+            .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["offered"], "artifacts/readout.html");
+        assert!(
+            !receipt.to_string().contains("<h1>"),
+            "the receipt carries no file content"
+        );
+
+        // Only the person's folder, only a real file, only what the turn can read.
+        for refused in [
+            "outbox/record.json",
+            "artifacts/../outbox/record.json",
+            "artifacts/.hidden.html",
+            "artifacts/",
+            "artifacts/missing.html",
+        ] {
+            assert!(
+                resources
+                    .execute_tool(std::slice::from_ref(&project), &offer(refused))
+                    .is_err(),
+                "{refused} must not be offered"
+            );
+        }
+        assert!(resources
+            .execute_tool(&[], &offer("artifacts/readout.html"))
+            .is_err());
     }
 
     #[test]

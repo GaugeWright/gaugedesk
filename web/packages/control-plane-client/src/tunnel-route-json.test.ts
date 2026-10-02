@@ -8,6 +8,8 @@ import {
     TUNNEL_KEEPALIVE_RESPONSE,
     tunnelRouteEventStream,
     tunnelRouteJson,
+    tunnelRouteRequest,
+    type RawTunnelFacade,
     type EventTunnelFacade,
     type TunnelFacade,
     type TunnelStreamPoll,
@@ -22,6 +24,8 @@ function fakeTunnel(
     paired = true,
 ): TunnelFacade & { sent: string[]; headers: Array<Record<string, string> | undefined> } {
     let pumps = 0;
+    // What one request leaves to send. Taken once, as the binding hands it out.
+    let unsent = new Uint8Array();
     const sent: string[] = [];
     const headers: Array<Record<string, string> | undefined> = [];
     return {
@@ -31,10 +35,15 @@ function fakeTunnel(
         receiveFrame: () => undefined,
         sendRequest: (method, path, body, extra) => {
             pumps = 0;
+            unsent = new Uint8Array([0, 1, 2]);
             sent.push(`${method} ${path} ${body ?? ""}`.trim());
             headers.push(extra);
         },
-        takeOutgoing: () => (pumps === 0 ? new Uint8Array([0, 1, 2]) : new Uint8Array()),
+        takeOutgoing: () => {
+            const out = unsent;
+            unsent = new Uint8Array();
+            return out;
+        },
         pollStatus: () => {
             pumps += 1;
             return pumps > afterPumps ? replies[0]?.status : undefined;
@@ -542,14 +551,21 @@ describe("the browser carrier's keepalive (DESK-7)", () => {
 function fakeEventTunnel(batches: TunnelStreamPoll[][]): EventTunnelFacade & { frames: number } {
     const ready: TunnelStreamPoll[] = [];
     let paired = false;
+    // One frame of handshake or request bytes per arrival, taken once.
+    let unsent = new Uint8Array();
     const tunnel = {
         frames: 0,
         receiveFrame: () => {
             tunnel.frames += 1;
             paired = true;
+            unsent = new Uint8Array([9]);
             ready.push(...(batches.shift() ?? []));
         },
-        takeOutgoing: () => new Uint8Array(paired ? [9] : []),
+        takeOutgoing: () => {
+            const out = unsent;
+            unsent = new Uint8Array();
+            return out;
+        },
         pollEvent: () => ready.shift(),
         isPaired: () => paired,
         // Owed after every third frame, so a test sees both answers.
@@ -761,6 +777,182 @@ describe("reporting consumption to the relay (DR-0302)", () => {
         owed = true;
         deliver(new Uint8Array([0, 1]));
         expect(sent.at(-1)).toEqual(new Uint8Array([3, 0, 0, 0, 7]));
+    });
+});
+
+/** A raw tunnel that answers once its whole declared body has arrived, and
+ * records what it was sent. `buffered` stands in for bytes not yet taken. */
+function fakeRawTunnel(reply: { status: number; headers?: Record<string, string>; body?: Uint8Array }) {
+    const state = {
+        heads: [] as Array<{ method: string; path: string; headers?: Record<string, string>; length: number }>,
+        parts: [] as Uint8Array[],
+        buffered: 0,
+        frames: 0,
+    };
+    let declared = -1;
+    let received = 0;
+    let answered = false;
+    const tunnel: RawTunnelFacade = {
+        receiveFrame: () => undefined,
+        sendRequest: () => { throw new Error("the raw route sends heads and bodies"); },
+        sendRequestHead: (method, path, headers, length) => {
+            state.heads.push({ method, path, headers, length });
+            declared = length;
+            received = 0;
+            answered = false;
+        },
+        sendBody: (chunk) => {
+            state.parts.push(chunk.slice());
+            received += chunk.length;
+            state.buffered += chunk.length;
+        },
+        bufferedBytes: () => state.buffered,
+        takeOutgoing: () => {
+            if (state.buffered === 0) return new Uint8Array();
+            state.buffered = 0;
+            state.frames += 1;
+            return new Uint8Array([0]);
+        },
+        pollStatus: () => {
+            if (answered || declared < 0 || received < declared) return undefined;
+            answered = true;
+            return reply.status;
+        },
+        takeBody: () => "",
+        takeBodyBytes: () => reply.body ?? new Uint8Array(),
+        takeHeaders: () => reply.headers ?? {},
+        isHandshaking: () => false,
+        isPaired: () => true,
+        takeCredit: () => new Uint8Array(),
+    };
+    return { tunnel, state };
+}
+
+function rawRoute(tunnel: RawTunnelFacade, socket: TunnelSocket, extra: Partial<Parameters<typeof tunnelRouteRequest>[0]> = {}) {
+    return tunnelRouteRequest({
+        open: async () => ({ tunnel, socket }),
+        tick: async () => undefined,
+        bearer: () => "account-bearer",
+        homeAdmission: () => "home-admission",
+        ...extra,
+    });
+}
+
+describe("raw requests over the tunnel (WS-678)", () => {
+    it("answers like fetch: a Response with the Home's status, headers and exact bytes", async () => {
+        const bytes = new Uint8Array([0, 159, 146, 150, 255]);
+        const { tunnel, state } = fakeRawTunnel({
+            status: 200,
+            headers: { "content-type": "application/octet-stream", "x-gaugedesk-cut": "c7" },
+            body: bytes,
+        });
+        const request = rawRoute(tunnel, fakeSocket().socket);
+        const response = await request("/chats/c1/file?path=a.bin");
+        expect(response.status).toBe(200);
+        expect(response.headers.get("x-gaugedesk-cut")).toBe("c7");
+        expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
+        expect(state.heads).toEqual([{
+            method: "GET",
+            path: "/chats/c1/file?path=a.bin",
+            headers: { authorization: "Bearer account-bearer", "x-gaugewright-home-admission": "home-admission" },
+            length: 0,
+        }]);
+    });
+
+    it("sends a large body in parts, whole and in order, keeping the caller's key and type", async () => {
+        const content = new Uint8Array(700_000).map((_, index) => index % 251);
+        const { tunnel, state } = fakeRawTunnel({ status: 200, body: new TextEncoder().encode("{\"ingested\":1}") });
+        const request = rawRoute(tunnel, fakeSocket().socket);
+        const response = await request("/chats/c1/context/stream?name=a.bin", {
+            method: "POST",
+            headers: { "idempotency-key": "upload-1", "content-type": "application/octet-stream" },
+            body: new Blob([content]),
+        });
+        expect(await response.json()).toEqual({ ingested: 1 });
+        const [head] = state.heads;
+        expect(head?.length).toBe(content.length);
+        expect(head?.headers?.["idempotency-key"]).toBe("upload-1");
+        expect(head?.headers?.["content-type"]).toBe("application/octet-stream");
+        expect(state.parts.length).toBeGreaterThan(1);
+        const joined = new Uint8Array(content.length);
+        let at = 0;
+        for (const part of state.parts) { joined.set(part, at); at += part.length; }
+        expect(joined).toEqual(content);
+    });
+
+    it("mints a key for a mutation that brought none, and types a string body as fetch would", async () => {
+        const { tunnel, state } = fakeRawTunnel({ status: 204 });
+        const request = rawRoute(tunnel, fakeSocket().socket);
+        const response = await request("/chats/c1/config", { method: "PUT", body: "{}" });
+        expect(response.status).toBe(204);
+        expect(response.body).toBeNull();
+        expect(state.heads[0]?.headers?.["idempotency-key"]).toMatch(/.+/);
+        expect(state.heads[0]?.headers?.["content-type"]).toBe("text/plain;charset=UTF-8");
+    });
+
+    it("feeds a body no faster than the socket drains", async () => {
+        const { tunnel, state } = fakeRawTunnel({ status: 200 });
+        let waiting = 4 * 1024 * 1024;
+        let fedWhileFull = 0;
+        const socket: TunnelSocket = {
+            send: () => undefined,
+            close: () => undefined,
+            onFrame: () => undefined,
+            onClose: () => undefined,
+            bufferedAmount: () => waiting,
+        };
+        let ticks = 0;
+        const request = rawRoute(tunnel, socket, {
+            tick: async () => {
+                ticks += 1;
+                if (waiting > 0) fedWhileFull = state.parts.length;
+                if (ticks === 5) waiting = 0;
+            },
+        });
+        await request("/chats/c1/file?path=big", { method: "PUT", body: new Uint8Array(3 * 1024 * 1024) });
+        expect(fedWhileFull).toBe(0);
+        expect(state.parts.length).toBeGreaterThan(0);
+    });
+
+    it("drops the session and rejects as an abort when the caller aborts", async () => {
+        const { tunnel } = fakeRawTunnel({ status: 200 });
+        const { socket } = fakeSocket();
+        const closed = vi.spyOn(socket, "close");
+        const controller = new AbortController();
+        controller.abort();
+        const request = rawRoute(tunnel, socket);
+        await expect(request("/chats/c1/file?path=a", { signal: controller.signal }))
+            .rejects.toMatchObject({ name: "AbortError" });
+        expect(closed).toHaveBeenCalledOnce();
+    });
+
+    it("times out from the last progress, not from the start", async () => {
+        const { tunnel } = fakeRawTunnel({ status: 200 });
+        let clock = 0;
+        const request = rawRoute(
+            { ...tunnel, pollStatus: () => undefined },
+            fakeSocket().socket,
+            { timeoutMs: 100, now: () => (clock += 30) },
+        );
+        await expect(request("/chats/c1/file?path=a")).rejects.toBeInstanceOf(HomeTunnelError);
+    });
+});
+
+describe("frames the relay accepts (WS-678)", () => {
+    it("hands the socket every frame a large call leaves, not one per pass", async () => {
+        const tunnel = fakeTunnel([{ status: 200, body: "{}" }]);
+        const frames = [new Uint8Array([0, 1]), new Uint8Array([0, 2]), new Uint8Array([0, 3])];
+        const sent: Uint8Array[] = [];
+        let first = true;
+        const json = tunnelRouteJson({
+            open: async () => ({
+                tunnel: { ...tunnel, takeOutgoing: () => (first ? frames.shift() ?? ((first = false), new Uint8Array()) : new Uint8Array()) },
+                socket: { send: (frame) => sent.push(frame), close: () => undefined, onFrame: () => undefined, onClose: () => undefined },
+            }),
+            tick: async () => undefined,
+        });
+        await json("POST", "/task", { message: "x".repeat(200_000) });
+        expect(sent).toEqual([new Uint8Array([0, 1]), new Uint8Array([0, 2]), new Uint8Array([0, 3])]);
     });
 });
 

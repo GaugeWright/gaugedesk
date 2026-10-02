@@ -183,6 +183,11 @@ export interface SessionComposerController {
         readonly images: readonly ImageRef[];
         readonly restore: () => void;
     } | null;
+    /** Put a message this controller sent back into the box, for a host that
+     *  accepted it and then could not deliver it — the quick-start target
+     *  picker, closed or failed. Its images return as attachments, and anything
+     *  typed since stays after it. */
+    readonly returnMessage: (message: { readonly text?: string; readonly images: readonly ImageRef[] }) => void;
     readonly stop: () => void;
     /** Move one queued message between ready and held. Releasing the head of the
      *  line starts it, which is what "release" has to mean. */
@@ -422,19 +427,24 @@ export function createSessionComposerController(
         }));
     };
 
-    /** A scope that shows no queue (the quick-start composer) cannot show a held
-     *  row either, so a send that fails there would be set aside where nobody can
-     *  see it. It goes back into the box instead: its images as attachments
-     *  again, and anything typed since kept after it. */
-    const returnToBox = (row: OutboxRow) => {
-        const notes = new Set(row.images.map((image) => `[attached image: ${image.name}]`));
-        const text = row.text.split("\n\n").filter((part) => !notes.has(part)).join("\n\n");
+    const returnMessage = (message: { readonly text?: string; readonly images: readonly ImageRef[] }) => {
+        // The image notes `buildOutgoing` appended stand for the attachments
+        // restored below, so they come out of the text rather than doubling.
+        const notes = new Set(message.images.map((image) => `[attached image: ${image.name}]`));
+        const text = (message.text ?? "").split("\n\n").filter((part) => !notes.has(part)).join("\n\n");
         const typedSince = draft().trim();
-        setDraft(typedSince ? `${text}\n\n${typedSince}` : text);
+        setDraft(text && typedSince ? `${text}\n\n${typedSince}` : text || typedSince);
         setAttachments((current) => [
-            ...row.images.map((image) => ({ kind: "image" as const, ...image })),
+            ...message.images.map((image) => ({ kind: "image" as const, ...image })),
             ...current,
         ]);
+    };
+
+    /** A scope that shows no queue (the quick-start composer) cannot show a held
+     *  row either, so a send that fails there would be set aside where nobody can
+     *  see it. It goes back into the box instead. */
+    const returnToBox = (row: OutboxRow) => {
+        returnMessage(row);
         drop(row.id);
     };
 
@@ -858,6 +868,7 @@ export function createSessionComposerController(
         steer,
         stash,
         takeComposed,
+        returnMessage,
         stop,
         holdQueued,
         attachFiles,

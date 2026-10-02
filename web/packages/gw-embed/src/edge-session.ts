@@ -120,6 +120,10 @@ export function describeTurnFailure(status: number, reason: string | undefined):
 }
 
 /** One canonical, cursor-resumable WebSocket to the engagement's Session DO. */
+/** External tools whose call a chat renders as a card: a question to answer
+ *  (DR-0228) and a file offered for download (DR-0314). */
+const RESTORED_EXTERNAL_TOOLS: ReadonlySet<string> = new Set(["ask_choices", "offer_download"]);
+
 export class EdgeSessionApi implements EmbedSessionApi {
     private socket: WebSocket | null = null;
     private openPromise: Promise<WebSocket> | null = null;
@@ -811,7 +815,9 @@ export class EdgeSessionApi implements EmbedSessionApi {
         const existing = new Set(transcript.flatMap((event) =>
             event.type === "toolresult" ? [event.call_id] : []));
         const restored = (this.snapshot?.external_calls ?? [])
-            .filter((call) => call.name === "ask_choices" && !existing.has(call.id))
+            // A reload replays prose only, so the tool lines a chat renders as
+            // cards are rebuilt from the session's recorded external calls.
+            .filter((call) => RESTORED_EXTERNAL_TOOLS.has(call.name) && !existing.has(call.id))
             .flatMap((call): StreamEvent[] => [
                 { type: "tool", tool: call.name, mediated: true, call_id: call.id, args: call.arguments_json },
                 { type: "toolresult", call_id: call.id, ok: true, result: JSON.stringify({ external_call_id: call.id }) },

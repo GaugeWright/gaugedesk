@@ -1274,9 +1274,39 @@ impl Workbench {
     pub(crate) fn account_scope_for_actor(&self, actor: &str) -> String {
         if self.hosted_home_mode || web_account_mode() {
             crate::account::account_scope(actor)
+        } else if self.desktop_account_mode() {
+            self.desktop_account_store_scope(actor)
         } else {
             crate::account::ACCOUNT_SCOPE.to_string()
         }
+    }
+
+    /// Where a desktop keeps one account's provider credentials, OAuth
+    /// logins, boxes and model settings (DR-0313). The claimant keeps the
+    /// install's account scope, which already holds the computer's, and the
+    /// local channel shares it until the claim is removed (WS-588). Every
+    /// other account has its own.
+    pub(crate) fn desktop_account_store_scope(&self, account: &str) -> String {
+        if account == self.authority().as_str() || account == self.legacy_project_owner() {
+            crate::account::ACCOUNT_SCOPE.to_string()
+        } else {
+            crate::account::account_scope(account)
+        }
+    }
+
+    /// The account scope for a request's provider credentials, OAuth logins,
+    /// boxes and model settings: [`account_scope_for`](Self::account_scope_for),
+    /// except that a desktop keys them by the account session's own account
+    /// (DR-0313). The other account records — Homes, routes, devices,
+    /// sessions, tenants — stay where `account_scope_for` puts them.
+    pub fn credential_scope_for(&self, bearer: Option<&str>) -> String {
+        if self.desktop_account_mode() {
+            return bearer
+                .and_then(|token| self.resolve_account_session(token))
+                .map(|(account, _)| self.desktop_account_store_scope(&account))
+                .unwrap_or_else(|| crate::account::ACCOUNT_SCOPE.to_string());
+        }
+        self.account_scope_for(bearer)
     }
 
     /// Gate an export by the org's resource-floor policy (`RBAC-6`; the export half

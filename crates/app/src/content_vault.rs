@@ -36,7 +36,7 @@ use crate::workbench_state::Workbench;
 const MARKER: &str = "gwenc:1:";
 
 mod scope_key;
-pub use scope_key::{PreparedScopeKey, PreparedScopeTransfer, ScopeKeyCapsule};
+pub use scope_key::{PreparedScopeKey, PreparedScopeTransfer, ScopeKeyCapsule, ScopeProjectIndex};
 
 /// The content record kinds sealed at rest by default.
 ///
@@ -237,6 +237,12 @@ pub(crate) fn open_startup_store(
 impl Workbench {
     pub(crate) fn apply_startup_content_vault(&mut self, content_vault: Option<Arc<ContentVault>>) {
         self.content_vault = content_vault;
+        // The library was loaded before the vault was attached.
+        self.attach_scope_index();
+        let moved = self.adopt_project_content_custody();
+        if moved > 0 {
+            tracing::info!(moved, "content keys moved under their projects' keys");
+        }
     }
 }
 
@@ -259,6 +265,11 @@ pub struct ContentVault {
     /// means the vault keeps no durable erasure record (erasure is then only as durable
     /// as file deletion — undone by a restore); production always injects a backend.
     ledger: Option<Box<dyn ErasureLedger>>,
+    /// Which project each scope belongs to, kept current by the library, so a
+    /// project's scopes are wrapped under its own key (DR-0312, WS-586).
+    scope_projects: Arc<scope_key::ScopeProjectIndex>,
+    /// Unwrapped project keys, by key id.
+    project_keys: scope_key::ProjectKeyCache,
 }
 
 #[derive(Default)]
@@ -283,6 +294,8 @@ impl ContentVault {
                 .collect(),
             key_state: Mutex::new(VaultKeyState::default()),
             ledger: None,
+            scope_projects: Arc::default(),
+            project_keys: scope_key::ProjectKeyCache::default(),
         }
     }
 
@@ -419,6 +432,9 @@ impl ContentVault {
         }
         let mut count = 0;
         for key_id in &recorded {
+            if self.local_erasure_in_force(key_id) {
+                continue;
+            }
             match self.erase_local_scope(key_id) {
                 Ok(true) => count += 1,
                 Ok(false) => {}

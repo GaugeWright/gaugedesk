@@ -73,7 +73,7 @@ pub mod definition {
     pub const SOURCE_FILE: &str = "method.whip";
     pub const GENERATED_CHAT_SOURCE_FILE: &str = "__gaugedesk_default_chat.whip";
     pub const PERSONA_FILE: &str = "persona.md";
-    pub const HUMAN_GUIDE: &str = "# Agent files\n\nSYSTEM.md contains the Agent's editable system-level method instructions. AGENTS.md contains standing developer guidance. Edit either in an edit chat to change how this Agent works. Runtime rules and effective tools are supplied automatically.\n\nPut reusable skills in skills/<name>/SKILL.md, with a name and description in the skill frontmatter. Descriptions are discoverable at turn start; full instructions are read when needed. Other files are references until a workflow explicitly uses them.\n\nPublishing freezes these files. A work chat or Panel session uses that pinned version; draft edits do not change a running placement. Each run has its own artifacts/ for results people should find and work/ for notes and intermediate files. These are separate from attached work targets. In a Panel session, the visitor sees artifacts/ in the Files panel, and only files the agent puts in outbox/ can be sent to the owner's Inbox; the visitor's panels never show outbox/ or work/.\n\nThe .whipple/ folder contains generated packages and frozen versions. It is available in the advanced file view.\n";
+    pub const HUMAN_GUIDE: &str = "# Agent files\n\nSYSTEM.md contains the Agent's editable system-level method instructions. AGENTS.md contains standing developer guidance. Edit either in an edit chat to change how this Agent works. Runtime rules and effective tools are supplied automatically.\n\nPut reusable skills in skills/<name>/SKILL.md, with a name and description in the skill frontmatter. Descriptions are discoverable at turn start; full instructions are read when needed. Other files are references until a workflow explicitly uses them.\n\nPublishing freezes these files. A work chat or Panel session uses that pinned version; draft edits do not change a running placement. Each run has its own artifacts/ for results people should find and work/ for notes and intermediate files. These are separate from attached work targets. In a Panel session, the visitor sees artifacts/ in the Files panel, and only files the agent puts in outbox/ can be sent to the owner's Inbox; the visitor's panels never show outbox/ or work/. To hand the person in a chat a file from artifacts/, the Agent calls offer_download, which shows a Download card in the chat.\n\nThe .whipple/ folder contains generated packages and frozen versions. It is available in the advanced file view.\n";
     /// GaugeDesk-owned provider/model/thinking selection. Authentication and
     /// credentials never enter the authored package.
     pub const CONFIG_PATH: &str = ".agent-config.json";
@@ -134,6 +134,24 @@ pub mod definition {
 
     const CHOICE_TOOL: &str = r#"{"name":"ask_choices","capability":"question.ask","description":"Ask the person one to three short questions. The answer arrives in a later turn; stop if you need it before continuing.","input_schema":{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"object","properties":{"prompt":{"type":"string","minLength":1,"maxLength":300},"options":{"type":"array","minItems":2,"maxItems":4,"items":{"type":"object","properties":{"label":{"type":"string","minLength":1,"maxLength":80},"description":{"type":"string","minLength":1,"maxLength":240}},"required":["label","description"]}},"multiple":{"type":"boolean"},"recommended":{"type":"integer","minimum":0,"maximum":3}},"required":["prompt"]}},"to":{"type":"string","description":"Recipient; omit for the chat owner."},"blocking":{"type":"boolean"}},"required":["questions"],"additionalProperties":false}}"#;
 
+    /// DR-0314: hand the person in the chat a file the agent wrote, as a
+    /// Download card. It needs only `workspace.read`: an offered file is one
+    /// the agent could already read, under `artifacts/`, which is the person's
+    /// own folder, so offering it grants nothing new.
+    pub const OFFER_DOWNLOAD_TOOL_NAME: &str = "offer_download";
+    pub const OFFER_DOWNLOAD_TOOL: &str = r#"{"name":"offer_download","capability":"workspace.read","description":"Offer the person in this chat a file you wrote under artifacts/ to download. The chat shows it as a card with a Download button; the file is saved only when they click it. Write the file first, then call this once for it.","input_schema":{"type":"object","properties":{"path":{"type":"string","minLength":11,"maxLength":512,"description":"The file's workspace path, under artifacts/ (for example artifacts/report.html)."},"title":{"type":"string","minLength":1,"maxLength":120,"description":"What the file is, in the words the person should read. Optional; the filename is shown otherwise."}},"required":["path"],"additionalProperties":false}}"#;
+
+    fn external_tools(capabilities: PackageCapabilities) -> String {
+        let mut tools = Vec::new();
+        if capabilities.workspace_read {
+            tools.push(OFFER_DOWNLOAD_TOOL);
+        }
+        if capabilities.question_ask {
+            tools.push(CHOICE_TOOL);
+        }
+        format!("[{}]", tools.join(","))
+    }
+
     pub fn package_paths(root: &str) -> Vec<(String, String)> {
         package_documents(root, "", PackageCapabilities::default())
     }
@@ -155,7 +173,7 @@ pub mod definition {
             .join(", ");
         let manifest = format!(
             "{{\n  \"schema\": \"whipplescript.agent_package.v0\",\n  \"source\": \"method.whip\",\n  \"workflow\": \"GaugeDeskMethod\",\n  \"agent\": \"assistant\",\n  \"system_prompt\": \"persona.md\",\n  \"capabilities\": [{json_names}],\n  \"agent_abilities\": [{json_names}],\n  \"external_tools\": {external_tools},\n  \"max_steps\": 32\n}}\n",
-            external_tools = if capabilities.question_ask { format!("[{CHOICE_TOOL}]") } else { "[]".to_owned() },
+            external_tools = external_tools(capabilities),
         );
         let capability_list = format!("[{}]", json_names);
         let mut resources = String::new();
@@ -725,8 +743,41 @@ mod tests {
             .iter()
             .find(|(path, _)| path.ends_with("package.json"))
             .unwrap();
-        assert!(manifest.1.contains("\"external_tools\": []"));
+        assert!(!manifest.1.contains("ask_choices"));
         assert!(!manifest.1.contains("question.ask"));
+    }
+
+    #[test]
+    fn authored_package_offers_downloads_wherever_it_can_read() {
+        let manifest_of = |capabilities| {
+            definition::package_documents("method", "persona", capabilities)
+                .into_iter()
+                .find(|(path, _)| path.ends_with("package.json"))
+                .unwrap()
+                .1
+        };
+        let reading = manifest_of(definition::PackageCapabilities::default());
+        let parsed: serde_json::Value = serde_json::from_str(&reading).unwrap();
+        let offer = parsed["external_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == definition::OFFER_DOWNLOAD_TOOL_NAME)
+            .expect("a reading agent can offer a download");
+        assert_eq!(offer["capability"], "workspace.read");
+        assert_eq!(
+            offer["input_schema"]["required"],
+            serde_json::json!(["path"])
+        );
+
+        let chat_only = manifest_of(definition::PackageCapabilities {
+            workspace_read: false,
+            workspace_write: false,
+            command_run: false,
+            tracker_file: false,
+            question_ask: false,
+        });
+        assert!(chat_only.contains("\"external_tools\": []"));
     }
 
     use proptest::prelude::*;

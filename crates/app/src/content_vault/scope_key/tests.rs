@@ -455,3 +455,46 @@ fn published_native_input_store_retains_the_actual_scope_key_through_publication
         }
     }
 }
+
+#[test]
+fn the_reerase_sweep_skips_erasures_already_in_force_and_repairs_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let v = vault(dir.path());
+    v.initialize_scope_key("applied").unwrap();
+    v.initialize_scope_key("restored").unwrap();
+    v.initialize_scope_key("untombstoned").unwrap();
+    let restored_key = std::fs::read(v.key_path("restored")).unwrap();
+    for scope in ["applied", "restored", "untombstoned"] {
+        assert!(v.erase_scope_key(scope).unwrap());
+    }
+    let locks = dir.path().join("scope-locks");
+    std::fs::remove_dir_all(&locks).unwrap();
+    // A restore brings one key file back and loses another scope's tombstone.
+    std::fs::write(v.key_path("restored"), &restored_key).unwrap();
+    let untombstoned = crate::org::sha256_hex("untombstoned");
+    std::fs::remove_file(dir.path().join(format!("{untombstoned}.erased"))).unwrap();
+
+    let reopened = vault(dir.path());
+    assert_eq!(
+        reopened.reerase_recorded(),
+        1,
+        "only the restored key file is erased again"
+    );
+    assert!(!reopened.key_path("restored").exists());
+    assert!(
+        dir.path().join(format!("{untombstoned}.erased")).exists(),
+        "the lost tombstone is written again"
+    );
+    // The erasure already in force was never locked, so never touched.
+    let applied = crate::org::sha256_hex("applied");
+    assert!(
+        !locks.join(format!("{applied}.lock")).exists(),
+        "an erasure already in force was erased again"
+    );
+    for scope in ["applied", "restored", "untombstoned"] {
+        assert!(
+            reopened.initialize_scope_key(scope).is_err(),
+            "{scope} can be minted again"
+        );
+    }
+}

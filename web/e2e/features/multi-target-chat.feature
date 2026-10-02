@@ -22,6 +22,12 @@ Feature: One chat spans several work targets
     When I submit the empty-state composer
     Then quick start asks for an explicit target set
 
+  Scenario: cancelling the quick-start target choice keeps the message
+    Given Personal has two eligible work targets
+    When I submit the empty-state composer
+    And I cancel the quick-start target choice
+    Then the empty-state composer holds "work across my selected files"
+
   Scenario: one project workstream groups chats across placements and settles separately
     Given a project with two eligible work targets
     And two placements have chats in one project workstream

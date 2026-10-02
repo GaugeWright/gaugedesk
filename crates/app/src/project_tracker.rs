@@ -228,7 +228,9 @@ fn current_project(
         || &workspace.home_id != home
         || workspace.project_id != project
         || workspace.workspace_id.trim().is_empty()
-        || (!local_personal && !org.can_access_project(context.actor().as_str(), project))
+        || (!local_personal
+            && !org.can_access_project(context.actor().as_str(), project)
+            && crate::project_owner::recorded_owner(record) != Some(context.actor().as_str()))
         || library
             .project_collaboration_workspaces
             .values()

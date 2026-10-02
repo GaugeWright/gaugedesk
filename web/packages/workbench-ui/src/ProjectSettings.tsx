@@ -32,6 +32,7 @@ export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi 
     handoffStatus(project: ProjectId): Promise<HandoffStatus>;
     handoffParticipants(project: ProjectId): Promise<Participant[]>;
     listPeers(): Promise<FederationPeer[]>;
+    readonly desktopFederationAvailable?: boolean;
     handoffRelocate(project: ProjectId, peer: string): Promise<HandoffStatus>;
     handoffRevoke(project: ProjectId, authority: string, owns: string): Promise<void>;
     createHomeInvitation(
@@ -89,7 +90,10 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
     const source = () => props.project.isPersonal ? false : [props.project.id, refresh()] as const;
     const [participants] = createResource(source, ([project]) => props.api.handoffParticipants(project));
     const [handoff] = createResource(source, ([project]) => props.api.handoffStatus(project));
-    const [peers] = createResource(source, () => props.api.listPeers());
+    const [peers] = createResource(
+        () => props.api.desktopFederationAvailable !== false && source(),
+        () => props.api.listPeers(),
+    );
     const [shareCandidates, { refetch: refetchShareCandidates }] = createResource(
         () => props.project.isPersonal || !props.projectShareCandidates ? false : refresh(),
         () => props.projectShareCandidates?.() ?? Promise.resolve([]),

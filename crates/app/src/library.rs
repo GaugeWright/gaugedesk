@@ -994,6 +994,10 @@ pub struct Library {
     pub chat_target_bases: BTreeMap<String, BTreeMap<String, ChatTargetBasisRecord>>,
     pub project_collaboration_workspaces: BTreeMap<String, ProjectCollaborationWorkspaceRecord>,
     pub workstream_roots: BTreeMap<String, WorkstreamRootRecord>,
+    /// The content vault's scope→project index, written through as chats and
+    /// placements are applied, so each project's scopes are keyed under its
+    /// own key (DR-0312). Attached by the workbench; absent in a bare library.
+    pub(crate) scope_index: Option<std::sync::Arc<crate::content_vault::ScopeProjectIndex>>,
 }
 
 /// Apply one record to its map: `Tombstone` removes the id, `Upsert` sets it.
@@ -1129,6 +1133,11 @@ impl Library {
             .map(|project| &project.home_id)
     }
     pub fn apply_instance(&mut self, r: InstanceRecord) {
+        if let Some(index) = &self.scope_index {
+            if r.op == RecordOp::Upsert {
+                index.record_instance(&r.id, r.project_id.as_deref());
+            }
+        }
         fold_one(&mut self.instances, &r.id.clone(), r.op, r);
     }
     pub fn apply_public_deployment(&mut self, r: PublicDeploymentBindingRecord) {
@@ -1144,6 +1153,9 @@ impl Library {
                 forked_from_cut: r.forked_from_cut,
             },
         );
+        if let Some(index) = &self.scope_index {
+            index.record_chat(&r.id, &r.instance_id);
+        }
         fold_one(&mut self.chats, &r.id.clone(), r.op, r);
     }
     pub fn apply_workstream(&mut self, r: WorkstreamRecord) {

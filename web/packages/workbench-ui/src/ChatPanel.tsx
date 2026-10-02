@@ -20,6 +20,7 @@ import {
 import { type FilterPrefs } from "./transcript-filter";
 import { type TranscriptLine } from "./transcript";
 import { TranscriptView } from "./TranscriptView";
+import { readForDownload, saveToBrowser } from "./file-download";
 import { storedTargetPath } from "./target-names";
 import { ChatLogNavigation } from "./ChatLogNavigation";
 import {
@@ -295,6 +296,13 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
             await loadChoiceCards(id);
         }
     };
+    // A file the agent offered (DR-0314) is read through this session's own
+    // projection, so a visitor saves exactly what their panels may open.
+    const downloadOffered = async (path: string) => {
+        const id = session().engagementId();
+        if (!id) throw new Error("This conversation has no files yet.");
+        saveToBrowser(path, await readForDownload(session().api, id, path));
+    };
     const lines = (): readonly TranscriptLine[] => {
         const opening = props.openingMessage?.trim();
         const transcript = session().transcript().lines;
@@ -356,6 +364,7 @@ export function ChatPanel(props: ChatPanelProps): JSX.Element {
                                 onFork={session().forkAt}
                                 choiceCards={choiceCards()}
                                 onAnswerChoice={session().api.answerChoiceCard ? answerChoice : undefined}
+                                onDownload={downloadOffered}
                             />
                             <TurnActivity session={session()} agentName={props.agentName} />
                             {props.transcriptTail}

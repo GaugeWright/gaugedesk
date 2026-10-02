@@ -57,6 +57,7 @@ export function friendlyToolVerb(name: string): string {
     if (n === "search" || n === "grep" || n === "find") return "Searched";
     if (n === "delete" || n === "rm") return "Deleted";
     if (n === "ls" || n === "list") return "Listed files";
+    if (n === "offer_download") return "Offered a download";
     return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
@@ -67,6 +68,7 @@ export function friendlyToolVerb(name: string): string {
  * another way in the history.
  */
 export function liveToolVerb(name: string): string {
+    if (name.toLowerCase() === "offer_download") return "offering a download";
     switch (toolId(name)) {
         case "write":
             return "writing a file";

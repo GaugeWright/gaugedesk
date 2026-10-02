@@ -603,8 +603,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // plane custodies the session; this resource is the surfaces' non-secret
     // view. Reading status also lets the control plane refresh a session
     // nearing expiry, so the periodic read keeps an open desktop signed in.
-    const [hubSession, { refetch: refetchHubSession }] = createResource(() =>
-        api.hubSessionStatus().catch(() => null),
+    const [hubSession, { refetch: refetchHubSession }] = createResource(
+        () => api.desktopSessionAvailable,
+        () => api.hubSessionStatus().catch(() => null),
     );
     const localUpdateMode = createMemo(() => hubSession()?.local === true);
     if (isTauri()) {
@@ -766,7 +767,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             throw new Error("Your browser could not be opened. Try Sign in again.");
         }
     };
-    if (typeof window !== "undefined") {
+    if (typeof window !== "undefined" && api.desktopSessionAvailable) {
         const keepAlive = window.setInterval(() => void refetchHubSession(), 5 * 60 * 1000);
         onCleanup(() => window.clearInterval(keepAlive));
     }
@@ -2004,7 +2005,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // ambiguous singular create request that the server must refuse.
     //
     // This throws, so the composer, which holds the message being sent, keeps it
-    // as a held row and says why; `startNewChat` is the caller with no message.
+    // and says why; `startNewChat` is the caller with no message. When it opens
+    // the target picker instead, the picker holds the message from here on, and
+    // gives it back to the composer if it ends without a chat.
     async function createNewChat(initialPrompt?: string, images: ImageRef[] = []) {
         const prompt = initialPrompt?.trim() || undefined;
         try {
@@ -2051,22 +2054,40 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         setQuickTargetChoice({ ...choice, selected });
     }
 
+    // The composer counted the first message as sent when the picker took it,
+    // so the picker is its only holder: ending without a chat — closed, or a
+    // create that failed — hands it back rather than dropping it.
+    function returnQuickTargetMessage(choice: { prompt?: string; images: ImageRef[] }) {
+        if (choice.prompt || choice.images.length > 0) desktopComposerController.returnMessage({ text: choice.prompt, images: choice.images });
+    }
+
+    function abandonQuickTargets() {
+        const choice = quickTargetChoice();
+        setQuickTargetChoice(null);
+        if (choice) returnQuickTargetMessage(choice);
+    }
+
     async function confirmQuickTargets() {
         const choice = quickTargetChoice();
         if (!choice || choice.selected.length === 0) return;
         setQuickTargetChoice(null);
+        let id: EngagementId;
         try {
-            const id = await api.createChatUnderPlacement(
+            id = await api.createChatUnderPlacement(
                 choice.projectId,
                 choice.placementId,
                 "new chat",
                 choice.selected,
             );
-            await finishNewChat(id, choice.prompt, choice.images);
         } catch (error) {
             recordFeature("chat.create", "failed");
+            returnQuickTargetMessage(choice);
             reportFailure("chat", `couldn't start a chat — ${failureReason(error)}`);
+            return;
         }
+        // The chat exists now, so the message is its first turn and does not go back.
+        await finishNewChat(id, choice.prompt, choice.images)
+            .catch((error) => reportFailure("chat", `couldn't open the new chat — ${failureReason(error)}`));
     }
 
 
@@ -3209,18 +3230,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         <>
             <Show when={quickTargetChoice()}>
                 {(choice) => (
-                    <div class="modal-overlay" data-quick-target-picker onClick={() => setQuickTargetChoice(null)}>
+                    <div class="modal-overlay" data-quick-target-picker onClick={abandonQuickTargets}>
                         <div
                             class="modal place-picker"
                             role="dialog"
                             aria-modal="true"
                             aria-label="Choose work targets for the new chat"
                             onClick={(event) => event.stopPropagation()}
-                            onKeyDown={(event) => event.key === "Escape" && setQuickTargetChoice(null)}
+                            onKeyDown={(event) => event.key === "Escape" && abandonQuickTargets()}
                         >
                             <div class="modal-head">
                                 <h3>Choose one or more targets</h3>
-                                <button type="button" onClick={() => setQuickTargetChoice(null)}>close</button>
+                                <button type="button" onClick={abandonQuickTargets}>close</button>
                             </div>
                             <p class="status" style={{ margin: "0 0 8px" }}>
                                 The chat can modify only the targets selected here. Each target keeps its own basis and settlement.
@@ -3242,7 +3263,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 </For>
                             </div>
                             <div class="modal-actions">
-                                <button type="button" onClick={() => setQuickTargetChoice(null)}>Cancel</button>
+                                <button type="button" onClick={abandonQuickTargets}>Cancel</button>
                                 <button
                                     type="button"
                                     data-confirm-quick-targets

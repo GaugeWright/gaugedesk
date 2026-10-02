@@ -13,6 +13,14 @@ Feature: A workbench action that fails says why (error path)
     Then the composer says "couldn't start a chat — the selected account has no admission to this local Home"
     And the message "draft a welcome note" is back in the composer
 
+  Scenario: a refused chat start from the target choice keeps the message
+    Given Personal has two eligible work targets
+    When starting a chat is refused with "the selected account has no admission to this local Home"
+    And I submit the empty-state composer
+    And I start the quick-start chat with the first target
+    Then the chat pane shows the action error "couldn't start a chat — the selected account has no admission to this local Home"
+    And the empty-state composer holds "work across my selected files"
+
   Scenario: a file dropped with no chat open says why in Files
     Given the workbench is open
     Then the files pane shows no action error

@@ -10,7 +10,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::http_stream::{
-    encode_request, BodyPart, EventReader, HttpResponse, ResponseReader, ServerEvent,
+    encode_request, encode_request_head, BodyPart, EventReader, HttpResponse, ResponseReader,
+    ServerEvent,
 };
 use crate::session::PinnedSession;
 use crate::wire::CertFingerprint;
@@ -60,6 +61,30 @@ impl TunnelClient {
         // reply to HEAD carries no body however it frames one.
         self.responses.sent_request(method);
         self.session.send(&encoded)
+    }
+
+    /// Queue a request's head declaring `content_length` body bytes, which the
+    /// caller then hands over with [`Self::send_body`] as it reads them.
+    pub fn send_head(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &BTreeMap<String, String>,
+        content_length: usize,
+    ) -> std::io::Result<()> {
+        let encoded = encode_request_head(method, path, headers, content_length)?;
+        self.responses.sent_request(method);
+        self.session.send(&encoded)
+    }
+
+    /// Queue the next part of the body a [`Self::send_head`] declared.
+    pub fn send_body(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.session.send(bytes)
+    }
+
+    /// Bytes queued to go out and not yet taken by the carrier.
+    pub fn buffered(&self) -> usize {
+        self.session.buffered()
     }
 
     /// Advance the session and decode whatever it yields, without taking a
@@ -570,5 +595,89 @@ mod tests {
         }
         assert_eq!(stream.poll().expect("poll"), Some(StreamPoll::Opened));
         assert_eq!(stream.poll().expect("poll"), Some(event("one")));
+    }
+
+    /// WS-678: a file sent in parts arrives whole, and a binary reply keeps its
+    /// bytes and its headers. A Home's file routes are not JSON.
+    #[test]
+    fn a_body_sent_in_parts_crosses_whole_and_a_binary_reply_keeps_its_headers() {
+        let (identity, config) = home();
+        let mut server = ServerConnection::new(Arc::new(config)).expect("server");
+        let mut client = TunnelClient::new(identity.fingerprint()).expect("client");
+        let body: Vec<u8> = (0..300_000u32).map(|index| (index % 251) as u8).collect();
+        client
+            .send_head(
+                "PUT",
+                "/chats/c1/file?path=a.bin",
+                &BTreeMap::new(),
+                body.len(),
+            )
+            .expect("queue head");
+        for part in body.chunks(64 * 1024) {
+            client.send_body(part).expect("queue part");
+        }
+        let reply_body = [0u8, 159, 146, 150, 255];
+        let reply = [
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: 5\r\n\r\n".as_slice(),
+            &reply_body,
+        ]
+        .concat();
+
+        let mut received = Vec::new();
+        let mut answered = false;
+        let mut response = None;
+        for _ in 0..512 {
+            if let Some(done) = client.poll().expect("poll") {
+                response = Some(done);
+                break;
+            }
+            let out = client.session_mut().take_outgoing();
+            if !out.is_empty() {
+                let mut cursor = std::io::Cursor::new(out);
+                while (cursor.position() as usize) < cursor.get_ref().len() {
+                    server.read_tls(&mut cursor).expect("server reads");
+                    server.process_new_packets().expect("server processes");
+                    // Read as it decrypts, as a Home's socket would, or the
+                    // server's own plaintext buffer fills first.
+                    let _ = server.reader().read_to_end(&mut received);
+                }
+            }
+            let _ = server.reader().read_to_end(&mut received);
+            if !answered && received.len() >= body.len() {
+                server.writer().write_all(&reply).expect("server writes");
+                answered = true;
+            }
+            let mut back = Vec::new();
+            server.write_tls(&mut back).ok();
+            if !back.is_empty() {
+                client.session_mut().received(&back);
+            }
+        }
+        let head_end = received
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("a head")
+            + 4;
+        let head = String::from_utf8_lossy(&received[..head_end]);
+        assert!(head.contains(&format!("content-length: {}\r\n", body.len())));
+        assert_eq!(
+            &received[head_end..],
+            body.as_slice(),
+            "the body crossed whole and in order"
+        );
+        let response = response.expect("a reply must arrive");
+        assert_eq!(
+            response.body, reply_body,
+            "binary bytes are not decoded as text"
+        );
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            client.buffered(),
+            0,
+            "nothing is left queued once it has all gone"
+        );
     }
 }

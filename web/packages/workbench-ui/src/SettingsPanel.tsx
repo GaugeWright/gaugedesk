@@ -165,6 +165,7 @@ export interface SettingsPanelApi extends AccountPanelApi {
     /** The separate authorities admitted to work here (FED-1). Their pairing is a
      *  handshake of its own; Settings lists the standing result. */
     listPeers(): Promise<FederationPeer[]>;
+    readonly desktopFederationAvailable?: boolean;
     revokePeer(authority: string): Promise<void>;
 }
 
@@ -232,7 +233,10 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
     const [invitations] = createResource(tick, soft(() => props.api.accountInvitations()));
     const [managed] = createResource(tick, soft(() => props.api.accountManagedInference()));
     const [facilities] = createResource(tick, soft(() => props.api.accountFacilities()));
-    const [peers] = createResource(tick, soft(() => props.api.listPeers()));
+    const [peers] = createResource(
+        () => props.api.desktopFederationAvailable !== false && tick(),
+        soft(() => props.api.listPeers()),
+    );
     const [codex] = createResource(tick, soft(() => props.api.codexStatus()));
     const [xaiGrok] = createResource(tick, soft(() => props.api.xaiGrokStatus()));
     const [settings, { refetch: refetchSettings }] = createResource(
@@ -240,7 +244,7 @@ export function SettingsPanel(props: SettingsPanelProps): JSX.Element {
         soft(() => props.api.accountSettings()),
     );
     const [hubSession] = createResource(
-        tick,
+        () => props.api.desktopSessionAvailable !== false && tick(),
         soft(() => props.api.hubSessionStatus?.() ?? Promise.resolve(null)),
     );
 

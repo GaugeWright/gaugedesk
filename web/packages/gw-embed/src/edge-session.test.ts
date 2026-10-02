@@ -52,7 +52,11 @@ describe("EdgeSessionApi", () => {
             cursor: 4,
             transcript: [{ type: "user", text: "hello" }],
             files: [],
-            external_calls: [{ id: "turn%2Fcall", name: "ask_choices", arguments_json: '{"questions":[]}' }],
+            external_calls: [
+                { id: "turn%2Fcall", name: "ask_choices", arguments_json: '{"questions":[]}' },
+                { id: "turn%2Foffer", name: "offer_download", arguments_json: '{"path":"artifacts/readout.html"}' },
+                { id: "turn%2Fother", name: "some_tool", arguments_json: "{}" },
+            ],
         };
         vi.stubGlobal("fetch", vi.fn(async () => Response.json(snapshot)));
         vi.stubGlobal("WebSocket", class extends FakeWebSocket {
@@ -75,6 +79,8 @@ describe("EdgeSessionApi", () => {
             { type: "user", text: "hello" },
             { type: "tool", tool: "ask_choices", mediated: true, call_id: "turn%2Fcall", args: '{"questions":[]}' },
             { type: "toolresult", call_id: "turn%2Fcall", ok: true, result: '{"external_call_id":"turn%2Fcall"}' },
+            { type: "tool", tool: "offer_download", mediated: true, call_id: "turn%2Foffer", args: '{"path":"artifacts/readout.html"}' },
+            { type: "toolresult", call_id: "turn%2Foffer", ok: true, result: '{"external_call_id":"turn%2Foffer"}' },
         ]);
         api.dispose();
     });

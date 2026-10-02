@@ -15,6 +15,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use gaugedesk_relay_transport::test_relay::TestRelay;
 use gaugedesk_relay_transport::tunnel_client::{StreamPoll, TunnelClient, TunnelEventStream};
+use gaugedesk_relay_transport::FrameQueue;
 use gaugedesk_relay_transport::{
     classify_frame, data_frame, serve_home_forever, websocket_handshake, HomeRelayConfig,
     RelayFrame, TlsIdentity, WebSocketRelayRole,
@@ -328,4 +329,113 @@ async fn an_event_stream_crosses_on_its_own_leg_beside_the_calls() {
         matches!(&second, StreamPoll::Event(event) if event.data == "second"),
         "the stream must keep delivering after the call, got {second:?}",
     );
+}
+
+/// A Home that reads one request's whole body by its declared length and
+/// answers with how many bytes it got and a checksum of them.
+async fn count_the_body(listener: TcpListener) {
+    while let Ok((mut stream, _)) = listener.accept().await {
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            let head_end = loop {
+                let read = stream.read(&mut chunk).await.unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            while buffer.len() - head_end < length {
+                let read = stream.read(&mut chunk).await.unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let body = &buffer[head_end..head_end + length];
+            let sum: u64 = body.iter().map(|byte| u64::from(*byte)).sum();
+            let reply = format!("{} {sum}", body.len());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
+}
+
+/// WS-678: a body many relay frames long crosses a real relay to a real Home
+/// whole, because no frame the browser's queue hands out exceeds what the
+/// relay accepts. The test relay, like the edge, ends a pair for one that does.
+#[tokio::test]
+async fn a_large_body_crosses_the_relay_in_frames_it_accepts() {
+    let relay = TestRelay::bind().await.expect("relay");
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = TlsIdentity::load_or_generate(directory.path()).expect("identity");
+    let config = HomeRelayConfig::load_or_mint(directory.path(), relay.endpoint()).expect("config");
+    let route = config.relay_route(&identity).expect("route");
+    let stub = TcpListener::bind("127.0.0.1:0").await.expect("stub");
+    let stub_addr = stub.local_addr().expect("stub addr");
+    tokio::spawn(count_the_body(stub));
+    let parked = route.clone();
+    tokio::spawn(async move {
+        let _ = serve_home_forever(parked, stub_addr, identity).await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let wire_route = gaugedesk_relay_transport::WebSocketRelayRoute {
+        endpoint: route.endpoint.clone(),
+        handle: route.handle.clone(),
+        epoch: route.epoch,
+        proof: route.proof,
+        previous_proof: None,
+    };
+    let mut socket = client_leg(&wire_route).await;
+    let mut client = TunnelClient::new(route.home_fingerprint).expect("client");
+    let body: Vec<u8> = (0..1_000_000u32).map(|index| (index % 251) as u8).collect();
+    let expected = format!(
+        "{} {}",
+        body.len(),
+        body.iter().map(|b| u64::from(*b)).sum::<u64>()
+    );
+    client
+        .send_head(
+            "PUT",
+            "/chats/c1/file?path=big.bin",
+            &BTreeMap::new(),
+            body.len(),
+        )
+        .expect("head");
+    for part in body.chunks(256 * 1024) {
+        client.send_body(part).expect("part");
+    }
+    let mut frames = FrameQueue::new();
+    let mut paired = false;
+    let response = loop {
+        if paired {
+            client.pump().expect("pump");
+            frames.push(client.session_mut().take_outgoing());
+            while let Some(frame) = frames.next_frame() {
+                assert!(frame.len() <= gaugedesk_relay_transport::WSS_MAX_FRAME_BYTES);
+                socket
+                    .send(Message::Binary(frame.into()))
+                    .await
+                    .expect("send");
+            }
+            if let Some(response) = client.poll().expect("poll") {
+                break response;
+            }
+        }
+        paired |= next_frame(&mut socket, |bytes| client.session_mut().received(bytes)).await;
+    };
+    assert_eq!(response.status, 200);
+    assert_eq!(String::from_utf8_lossy(&response.body), expected);
 }

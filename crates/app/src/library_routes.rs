@@ -217,6 +217,41 @@ pub fn scope_workspace_value(
                 .unwrap_or(false)
         });
     }
+    // Personal is the caller's own (DR-0268 §5): another account's Personal
+    // is never marked as this one's, and quick-start chats land in it.
+    let personal = actor
+        .and_then(|actor| wb.account_personal(actor))
+        .filter(|project| vis.allows(project));
+    if let Some(projects) = value.get_mut("projects").and_then(|p| p.as_array_mut()) {
+        for project in projects.iter_mut() {
+            let mine = project["id"]
+                .as_str()
+                .is_some_and(|id| Some(id) == personal.as_deref());
+            project["is_personal"] = serde_json::Value::Bool(mine);
+        }
+        projects.sort_by_key(|project| project["is_personal"] != serde_json::Value::Bool(true));
+    }
+    if let Some(placement) = personal
+        .as_deref()
+        .and_then(|project| wb.personal_placement_of(project))
+    {
+        value["personal_placement"] = serde_json::Value::String(placement);
+    }
+    // A target or workstream names its project; one outside the caller's
+    // projects is not listed either.
+    if let Some(targets) = value.get_mut("work_targets").and_then(|v| v.as_array_mut()) {
+        targets.retain(|target| {
+            target["owner_kind"] != "project"
+                || target["owner_id"].as_str().is_some_and(|id| vis.allows(id))
+        });
+    }
+    if let Some(streams) = value.get_mut("workstreams").and_then(|v| v.as_array_mut()) {
+        streams.retain(|stream| {
+            stream["project_id"]
+                .as_str()
+                .is_none_or(|id| vis.allows(id))
+        });
+    }
     if let Some(recent) = value.get_mut("recent").and_then(|r| r.as_array_mut()) {
         recent.retain(|c| {
             c.get("id")
@@ -1276,6 +1311,39 @@ fn create_named_project_with_extra(
     requested_name: &str,
     extra: std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    create_project_lifecycle(wb, id, requested_name, extra, false)
+}
+
+/// Create `account`'s own Personal project at `id` (DR-0268 §5): the ordinary
+/// project lifecycle, marked Personal and owned by the account, with every
+/// built-in Agent placed on it as the install's Personal has them.
+pub(crate) fn create_personal_project(
+    wb: &mut Workbench,
+    id: &str,
+    account: &str,
+) -> Result<(), String> {
+    let mut extra = std::collections::BTreeMap::new();
+    crate::project_owner::record_owner(&mut extra, account);
+    create_project_lifecycle(wb, id, "Personal", extra, true)?;
+    for agent in [
+        crate::app_support::SOFTWARE_ENGINEER_AGENT,
+        crate::app_support::OFFICE_WORKER_AGENT,
+    ] {
+        let placement = format!("placement-{}-{id}", agent.trim_start_matches("agent-"));
+        if wb.library.agents.contains_key(agent) && !wb.library.instances.contains_key(&placement) {
+            place_archetype_with_id(wb, id, agent, &placement)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_project_lifecycle(
+    wb: &mut Workbench,
+    id: &str,
+    requested_name: &str,
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
+    is_default: bool,
+) -> Result<serde_json::Value, String> {
     let name = requested_name.trim();
     if wb
         .library
@@ -1322,7 +1390,7 @@ fn create_named_project_with_extra(
                 id: id.to_owned(),
                 op: RecordOp::Upsert,
                 name: name.to_owned(),
-                is_default: false,
+                is_default,
                 home_id: home_id.clone(),
                 network_isolated: false,
                 run_purpose: None,
@@ -1541,12 +1609,34 @@ fn place_archetype_with_id(
     )
 }
 
+/// On a desktop, an account session may place or use only a built-in Agent
+/// or one it owns. The local channel and hosted Homes keep their own rules.
+fn use_or_place_admitted(wb: &Workbench, headers: &HeaderMap, agent: &str) -> bool {
+    match net_http::bearer(headers)
+        .filter(|_| wb.desktop_account_mode())
+        .and_then(|token| wb.resolve_account_session(token))
+    {
+        Some((account, _)) => wb.agent_placeable_by(agent, &account),
+        None => true,
+    }
+}
+
 pub async fn bind_agent(
     State(wb): State<SharedWorkbench>,
     Path(pid): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<BindAgent>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    if wb.library.agents.contains_key(&body.agent_id)
+        && !use_or_place_admitted(&wb, &headers, &body.agent_id)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "this Agent belongs to another account" })),
+        )
+            .into_response();
+    }
     match wb.bind_agent_to_project(&pid, &body.agent_id, body.collection_recipient) {
         Ok(inst_id) => {
             (StatusCode::CREATED, Json(json!({ "instance_id": inst_id }))).into_response()
@@ -1887,8 +1977,26 @@ pub async fn use_archetype(
     Json(body): Json<CreateChat>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    // An Agent is used in the caller's own Personal (DR-0268 §5).
+    let personal = match wb.request_personal(&headers) {
+        Ok(personal) => personal.unwrap_or_else(|| DEFAULT_PROJECT.to_owned()),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    if !use_or_place_admitted(&wb, &headers, &id) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "this Agent belongs to another account" })),
+        )
+            .into_response();
+    }
     let creator = if crate::method_access::account_backed(&wb, &headers) {
-        match wb.admit_data_request(net_http::bearer(&headers), Some(DEFAULT_PROJECT)) {
+        match wb.admit_data_request(net_http::bearer(&headers), Some(&personal)) {
             Ok(actor) if actor != "anonymous" => Some(actor),
             Ok(_) => {
                 return (StatusCode::UNAUTHORIZED, "authenticate to use an Agent").into_response()
@@ -1898,7 +2006,7 @@ pub async fn use_archetype(
     } else {
         None
     };
-    match wb.use_archetype_chat(&id, &body.title) {
+    match wb.use_archetype_chat(&id, &body.title, &personal) {
         Ok(v) => {
             if let (Some(creator), Some(chat)) = (creator, v["id"].as_str()) {
                 wb.claim_chat_owner(chat, &creator);

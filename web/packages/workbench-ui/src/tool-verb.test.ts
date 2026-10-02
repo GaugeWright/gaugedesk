@@ -44,5 +44,6 @@ describe("friendlyToolVerb — plain-language verb (unchanged contract)", () => 
         expect(friendlyToolVerb("write")).toBe("Wrote");
         expect(friendlyToolVerb("bash")).toBe("Ran a command");
         expect(friendlyToolVerb("grep")).toBe("Searched");
+        expect(friendlyToolVerb("offer_download")).toBe("Offered a download");
     });
 });

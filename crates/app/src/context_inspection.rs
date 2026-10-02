@@ -160,6 +160,54 @@ pub(crate) fn file_readable(
             .is_some()
 }
 
+/// Whether `viewer` may read a worktree file of an account-backed chat.
+///
+/// A source grant protects someone else's imported content (DR-0242). A file
+/// no one but the reader has a stake in — the agent's output, the reader's own
+/// edits, the reader's own upload — is the chat's own work, readable by whoever
+/// may read the chat, as it is in every other chat (DR-0317). Everything else is
+/// read under [`file_readable`]'s exact source grant.
+pub(crate) fn worktree_file_readable(
+    wb: &Workbench,
+    chat_id: &str,
+    viewer: &str,
+    path: &str,
+    expected_hash: Option<&str>,
+) -> bool {
+    !others_have_a_stake(wb, chat_id, viewer, path)
+        || file_readable(wb, chat_id, viewer, path, expected_hash)
+}
+
+/// Whether anyone but `viewer` may have supplied `path`, or erasure closed it:
+/// an import that claims it for another person, or claims it for content since
+/// erased, or another person's import whose path set is unknown and so might
+/// have supplied any path. An unreadable resource store answers yes, so the
+/// read falls to the grant.
+fn others_have_a_stake(wb: &Workbench, chat_id: &str, viewer: &str, path: &str) -> bool {
+    let (Ok(imports), Ok(resources)) = (
+        resource_store::context_imports(wb.store_ref(), chat_id),
+        resource_store::list(wb.store_ref(), chat_id),
+    ) else {
+        return true;
+    };
+    resources
+        .iter()
+        .filter(|record| record.resource.kind == ResourceKind::context())
+        .any(|record| {
+            let readers_alone = !record.stakeholders.is_empty()
+                && record
+                    .stakeholders
+                    .iter()
+                    .all(|party| party.as_str() == viewer);
+            match imports.get(record.resource.id.as_str()) {
+                Some(import) if import.complete => {
+                    import.files.contains_key(path) && (record.tombstoned || !readers_alone)
+                }
+                _ => !readers_alone,
+            }
+        })
+}
+
 pub(crate) fn file_readable_from_resource(
     wb: &Workbench,
     chat_id: &str,
@@ -171,7 +219,7 @@ pub(crate) fn file_readable_from_resource(
     let [(record, _)] = claims.as_slice() else {
         return false;
     };
-    record.resource.id.as_str() == rid && file_readable(wb, chat_id, viewer, path, None)
+    record.resource.id.as_str() == rid && worktree_file_readable(wb, chat_id, viewer, path, None)
 }
 
 /// A directory witness includes negative facts, so every current entry below
@@ -192,7 +240,7 @@ pub(crate) fn directory_readable(wb: &Workbench, chat_id: &str, viewer: &str, pa
     {
         if !entry.is_dir {
             saw_file = true;
-            if !file_readable(wb, chat_id, viewer, &entry.path, None) {
+            if !worktree_file_readable(wb, chat_id, viewer, &entry.path, None) {
                 return false;
             }
         } else if !entries.iter().any(|candidate| {
@@ -204,18 +252,23 @@ pub(crate) fn directory_readable(wb: &Workbench, chat_id: &str, viewer: &str, pa
     saw_file
 }
 
-/// The Files tree may show a directory name once it contains an authorized
-/// file. This does not authorize a Raw directory listing's negative facts.
+/// The Files tree may show a directory name once it contains a file the
+/// viewer may read, or while it holds no file at all and nobody else's import
+/// could account for it. This does not authorize a Raw directory listing's
+/// negative facts.
 pub(crate) fn directory_visible(wb: &Workbench, chat_id: &str, viewer: &str, path: &str) -> bool {
     let Some(Ok(entries)) = wb.engagement_tree(chat_id) else {
         return false;
     };
     let prefix = format!("{path}/");
-    entries.iter().any(|entry| {
-        !entry.is_dir
-            && entry.path.starts_with(&prefix)
-            && file_readable(wb, chat_id, viewer, &entry.path, None)
-    })
+    let mut files = entries
+        .iter()
+        .filter(|entry| !entry.is_dir && entry.path.starts_with(&prefix))
+        .peekable();
+    if files.peek().is_none() {
+        return !others_have_a_stake(wb, chat_id, viewer, path);
+    }
+    files.any(|entry| worktree_file_readable(wb, chat_id, viewer, &entry.path, None))
 }
 
 fn admitted_actor(
@@ -458,7 +511,7 @@ pub(crate) async fn revoke_own(
 
 #[cfg(test)]
 mod tests {
-    use super::{file_readable, source_basis};
+    use super::{directory_visible, file_readable, source_basis, worktree_file_readable};
     use crate::{LockUnpoisoned, Workbench};
     use axum::{
         extract::{Path, State},
@@ -596,6 +649,116 @@ mod tests {
         )
         .unwrap();
         assert!(!file_readable(&wb, &chat.id, "bob", &path, None));
+    }
+
+    /// Write a file into the chat's worktree that no import claims, as the
+    /// agent's output or the reader's own edit is.
+    fn written(wb: &mut Workbench, chat_id: &str, name: &str) -> String {
+        let path = wb.engagement_workspace_path(chat_id, name);
+        wb.engagements
+            .get(chat_id)
+            .unwrap()
+            .write_file(&path, "the chat's own work")
+            .unwrap();
+        path
+    }
+
+    /// The hosted file reader: what Files opens for an account-backed viewer.
+    fn opens(wb: &Workbench, chat_id: &str, viewer: &str, path: &str) -> bool {
+        matches!(
+            wb.read_engagement_file_bytes_for_viewer(chat_id, path, 1024, Some(viewer), true),
+            Some(Ok(Some(_)))
+        )
+    }
+
+    #[test]
+    fn a_file_no_one_else_has_a_stake_in_needs_no_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        let chat = wb
+            .create_default_engagement("own-files-chat".into(), "Own files".into())
+            .unwrap_or_else(|_| panic!("create own files chat"));
+        let (rid, upload) = imported(&mut wb, &chat.id, "alice", "alice-upload", b"mine");
+        let output = written(&mut wb, &chat.id, "agent-note.txt");
+
+        // The chat's own work is readable by whoever may read the chat.
+        for viewer in ["alice", "bob"] {
+            assert!(worktree_file_readable(&wb, &chat.id, viewer, &output, None));
+            assert!(opens(&wb, &chat.id, viewer, &output));
+        }
+        // An upload is its source's: alice reads her own, bob needs her grant.
+        assert!(worktree_file_readable(
+            &wb, &chat.id, "alice", &upload, None
+        ));
+        assert!(opens(&wb, &chat.id, "alice", &upload));
+        assert!(!worktree_file_readable(&wb, &chat.id, "bob", &upload, None));
+        assert!(!opens(&wb, &chat.id, "bob", &upload));
+        grant(&mut wb, &chat.id, &rid, "bob");
+        assert!(opens(&wb, &chat.id, "bob", &upload));
+
+        // The Files tree shows what the viewer may open, folders included.
+        let folder = upload
+            .rsplit_once('/')
+            .map(|(folder, _)| folder.to_owned())
+            .unwrap();
+        assert!(directory_visible(&wb, &chat.id, "alice", &folder));
+
+        // Erasure closes the upload even to its source; the chat's own work stays.
+        wb.tombstone_resource_context(&chat.id, &gaugedesk_core::resource::ResourceId::new(rid))
+            .unwrap();
+        assert!(!worktree_file_readable(
+            &wb, &chat.id, "alice", &upload, None
+        ));
+        assert!(worktree_file_readable(
+            &wb, &chat.id, "alice", &output, None
+        ));
+    }
+
+    #[test]
+    fn another_persons_unbounded_import_keeps_unclaimed_files_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        let chat = wb
+            .create_default_engagement("unbounded-import-chat".into(), "Unbounded".into())
+            .unwrap_or_else(|_| panic!("create unbounded import chat"));
+        let output = written(&mut wb, &chat.id, "agent-note.txt");
+        // The reader's own legacy import could only have supplied their own bytes.
+        let legacy = wb
+            .mint_resource_context(
+                &chat.id,
+                "alice",
+                "alice-legacy",
+                "older-cut",
+                Default::default(),
+            )
+            .unwrap();
+        assert!(worktree_file_readable(
+            &wb, &chat.id, "alice", &output, None
+        ));
+        assert!(!worktree_file_readable(&wb, &chat.id, "bob", &output, None));
+        // Erasing it, as a fork that inherits an erased upload does, closes
+        // nothing more to its source: whatever it supplied was hers.
+        wb.tombstone_resource_context(&chat.id, &legacy.resource.id)
+            .unwrap();
+        assert!(worktree_file_readable(
+            &wb, &chat.id, "alice", &output, None
+        ));
+        assert!(!worktree_file_readable(&wb, &chat.id, "bob", &output, None));
+        // Another person's might have supplied any path, so nothing is assumed.
+        wb.mint_resource_context(
+            &chat.id,
+            "carol",
+            "carol-legacy",
+            "older-cut",
+            Default::default(),
+        )
+        .unwrap();
+        assert!(!worktree_file_readable(
+            &wb, &chat.id, "alice", &output, None
+        ));
+        assert!(!opens(&wb, &chat.id, "alice", &output));
     }
 
     #[tokio::test]

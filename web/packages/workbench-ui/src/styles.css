@@ -508,6 +508,21 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
     box-shadow: 0 2px 10px rgb(0 0 0 / 25%); }
 .jump-latest:hover { color: var(--accent); }
 .jump-latest .icon { width: 16px; height: 16px; }
+/* An offered download (DR-0314): a file the agent handed the person in the chat.
+   The double rule is the one frame the composition system grants a live panel's
+   contents; the download is an engraved label, not a filled button. */
+.offered-download { margin: 10px 10px 4px; padding: 10px 12px; border-top: 3px double var(--edge);
+    border-bottom: 3px double var(--edge); }
+.offered-download-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.offered-download-title { overflow-wrap: anywhere; }
+.offered-download-name { display: block; margin-top: 2px; color: var(--muted);
+    font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; overflow-wrap: anywhere; }
+.offered-download-button { flex: none; background: none; border: 1px solid var(--edge); border-radius: 3px;
+    padding: 4px 12px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--ink); cursor: pointer; }
+.offered-download-button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.offered-download-button:disabled { opacity: 0.6; cursor: default; }
+.offered-download-failure { margin-top: 6px; color: var(--danger, #b3261e); font-size: 12px; }
 .turn-activity { display: flex; align-items: center; gap: 7px; padding: 7px 10px;
     color: var(--muted); font-size: var(--fs-ui); }
 .turn-activity-dots { display: inline-flex; align-items: center; gap: 3px; }
@@ -1961,8 +1976,19 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     color: var(--muted); font: 600 var(--fs-label) var(--font-chrome); text-transform: uppercase; letter-spacing: .06em; }
 .chat-collection-heading .icon { width: 15px; height: 15px; }
 .chat-collection-heading span { margin-left: auto; }
-.chat-hover-actions { display: inline-flex; flex: 0 0 auto; gap: 1px; opacity: 0; pointer-events: none; }
-.chat-item:hover .chat-hover-actions, .chat-item:focus-within .chat-hover-actions { opacity: 1; pointer-events: auto; }
+/* Unlike a container row's actions, a chat row's take no width at rest: the title
+   runs to the row's edge and gives way to Pin and Archive only while the row is
+   hovered or keyboard-focused. At rest they are clipped out of the row's flow
+   rather than display: none, because a button that is not rendered cannot take
+   focus, and Tab from the row would drop focus to the page in the instant the row
+   loses :focus-visible. A click focuses the row too, so plain :focus-within on the
+   row would keep the selected chat's title cut short; the last rule keeps the pair
+   while tabbing through it. */
+.chat-hover-actions { position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip-path: inset(50%); white-space: nowrap; display: inline-flex; flex: 0 0 auto; gap: 1px; }
+.chat-item:hover .chat-hover-actions { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+.chat-item:focus-visible .chat-hover-actions { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
+.chat-hover-actions:focus-within { position: static; width: auto; height: auto; overflow: visible; clip-path: none; }
 .chat-hover-actions button { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px;
     padding: 2px; border: 0; border-radius: 3px; background: transparent; color: var(--muted); cursor: pointer; }
 .chat-hover-actions button:hover { color: var(--gold); background: var(--bg); }

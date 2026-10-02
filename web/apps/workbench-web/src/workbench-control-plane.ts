@@ -48,6 +48,7 @@ import type {
     CreatedHomeInvitation,
     TunnelEventStream,
     TunnelRoute,
+    TunnelRouteRequest,
     StopTurnResult,
 } from "@gaugewright/control-plane-client";
 import {
@@ -58,6 +59,7 @@ import {
     tunnelAvailable,
     tunnelRouteEventStream,
     tunnelRouteJson,
+    tunnelRouteRequest,
     UnroutedHomeError,
 } from "@gaugewright/control-plane-client";
 import {
@@ -535,7 +537,19 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     private async desktopSessionJson(): Promise<RouteJson> {
-        return this.nativeShell ? this.route : this.runtimeAccountJson();
+        if (!this.desktopSessionAvailable) throw new Error("Desktop account sessions are unavailable in this composition");
+        return this.route;
+    }
+
+    /** Desktop-only jurisdictions are served by the co-resident control plane,
+     * never by a hosted Hub or selected Home. A native remote account still
+     * keeps its desktop session and federation authority on this computer. */
+    get desktopSessionAvailable(): boolean {
+        return this.nativeShell || !this.splitHomes;
+    }
+
+    get desktopFederationAvailable(): boolean {
+        return this.nativeShell || !this.splitHomes;
     }
 
     /** Open a project, so subsequent work resolves to *its* Home. Passing null
@@ -564,7 +578,9 @@ export class WorkbenchControlPlane implements ControlPlane {
                 // A project with no granted route is not an error: it predates
                 // authorship, so the selected Home still serves it.
                 if (String(error).includes("no granted Home route")) {
-                    this.homeTransport = null;
+                    // Cache this fallback just like a routed connection. Clearing
+                    // it here re-reads directory discovery on every project call.
+                    // Project/account/admission changes already invalidate it.
                     return this.connectSelectedHome();
                 }
                 throw error;
@@ -638,6 +654,9 @@ export class WorkbenchControlPlane implements ControlPlane {
         // own. Closing the route ends them as closed rather than as abandoned,
         // so a subscriber resolves its Home again instead of going quiet.
         const streams = new Map<HomeId, TunnelEventStream>();
+        // And its raw requests — files, config — on a carrier of their own, so a
+        // large file never holds the calls behind it (WS-678).
+        const raws = new Map<HomeId, TunnelRouteRequest>();
         this.pool = new HomePool<workbenchClient.WorkbenchTransport>(
             routes,
             () => this.nativeRemote ? "selected desktop session" : this.bearer,
@@ -679,6 +698,8 @@ export class WorkbenchControlPlane implements ControlPlane {
                     tunnels.delete(homeId);
                     streams.get(homeId)?.closeAll();
                     streams.delete(homeId);
+                    raws.get(homeId)?.close();
+                    raws.delete(homeId);
                 },
                 client: (context) => {
                     if (this.nativeRemote) {
@@ -695,22 +716,34 @@ export class WorkbenchControlPlane implements ControlPlane {
                         homeAdmission: context.homeAdmission,
                     };
                     // A relay-only Home has no origin to aim a browser-native
-                    // request at. Its event streams each cross the tunnel on a
-                    // pinned session of their own, because a stream never ends
-                    // and the calls' session answers one reply at a time
-                    // (WS-634). Raw fetches are still omitted, so callers say
-                    // "Home raw transport unavailable" rather than firing
-                    // relative requests at desk's own origin, where they would
-                    // come back as this page's HTML.
+                    // request at, so everything crosses the pinned tunnel. Its
+                    // event streams each take a session of their own, because a
+                    // stream never ends and the calls' session answers one reply
+                    // at a time (WS-634); its raw requests share one more, so a
+                    // large file never holds a call behind it (WS-678). A build
+                    // with no tunnel omits both, so callers say "Home raw
+                    // transport unavailable" rather than firing relative
+                    // requests at desk's own origin, where they would come back
+                    // as this page's HTML.
                     if (!context.endpoint) {
                         const relay = context.route.relay;
                         if (!relay || !tunnelAvailable()) {
                             return { base: "", json: context.routeJson };
                         }
+                        const url = `${relay.endpoint}/v1/relay/${relay.handle}`;
+                        const request = tunnelRouteRequest({
+                            open: async () => {
+                                const { tunnel, handshake } = await openTunnel(relay);
+                                return { tunnel, socket: await browserTunnelSocket(url, handshake) };
+                            },
+                            bearer: context.bearer,
+                            homeAdmission: context.homeAdmission,
+                        });
+                        raws.get(context.route.homeId)?.close();
+                        raws.set(context.route.homeId, request);
                         const events = tunnelRouteEventStream({
                             open: async (path, headers) => {
                                 const { tunnel, handshake } = await openEventTunnel(relay, path, headers);
-                                const url = `${relay.endpoint}/v1/relay/${relay.handle}`;
                                 return { tunnel, socket: await browserTunnelSocket(url, handshake) };
                             },
                             bearer: context.bearer,
@@ -718,7 +751,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                         });
                         streams.get(context.route.homeId)?.closeAll();
                         streams.set(context.route.homeId, events);
-                        return { base: "", json: context.routeJson, events };
+                        return { base: "", json: context.routeJson, request, events };
                     }
                     return {
                         base: context.endpoint,
@@ -2052,7 +2085,8 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     listPeers(): Promise<federationClient.FederationPeer[]> {
-        return federationClient.listPeers(this.routeJson());
+        if (!this.desktopFederationAvailable) return Promise.reject(new Error("Desktop federation is unavailable in this composition"));
+        return federationClient.listPeers(this.route);
     }
 
     revokePeer(authority: string): Promise<void> {

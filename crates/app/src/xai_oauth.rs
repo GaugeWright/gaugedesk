@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use crate::account::{
     credentials_in_scope, seal_token, unseal_token, CredentialAuthentication, ModelExecutionClass,
-    ACCOUNT_SCOPE,
 };
 use crate::{net_http, LockUnpoisoned, SharedWorkbench};
 
@@ -331,7 +330,7 @@ fn start_login(
 fn status(wb: &SharedWorkbench, headers: &HeaderMap, class: ModelExecutionClass) -> Json<Value> {
     let scope = wb
         .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(headers));
+        .credential_scope_for(net_http::bearer(headers));
     let credential = load_credential_in(wb, &scope, class).map(|(credential, _)| credential);
     Json(json!({
         "provider": PROVIDER,
@@ -396,7 +395,7 @@ async fn start(
 ) -> axum::response::Response {
     let scope = wb
         .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers));
     match tokio::task::spawn_blocking(move || start_login(wb, scope, class)).await {
         Ok(Ok(login)) => Json(json!({ "mode": "device", "login": login })).into_response(),
         Ok(Err(error)) => {
@@ -419,7 +418,7 @@ pub async fn post_home_start(
 ) -> impl IntoResponse {
     let scope = wb
         .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers));
     match start_home_login_for_scope(wb, scope).await {
         Ok(login) => Json(json!({ "mode": "device", "login": login })).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response(),
@@ -432,7 +431,7 @@ pub async fn post_cancel(
 ) -> impl IntoResponse {
     let scope = wb
         .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers));
     cancel_home_login_for_scope(&scope);
     StatusCode::NO_CONTENT
 }
@@ -489,7 +488,8 @@ pub fn resolve_turn_credential(
 ) -> Result<Option<XaiRuntimeCredential>, String> {
     match execution_class {
         ModelExecutionClass::LocalInteractive => {
-            resolve_in(wb, ACCOUNT_SCOPE, ModelExecutionClass::LocalInteractive)
+            let scope = wb.lock_unpoisoned().account_scope_for_actor(actor);
+            resolve_in(wb, &scope, ModelExecutionClass::LocalInteractive)
         }
         ModelExecutionClass::PrivateHome => resolve_in(
             wb,

@@ -223,6 +223,7 @@ export function DevicesModal(props: {
         }
     };
     const [peers, { refetch: refetchPeers }] = createResource(
+        () => props.api.desktopFederationAvailable !== false,
         emptyOnFailure(() => props.api.listPeers()),
     );
     const [incoming, { refetch: refetchIncoming }] = createResource(
@@ -897,6 +898,7 @@ export interface DevicesModalApi {
     listMachineControllers(): Promise<MachineController[]>;
     revokeMachineController(controllerId: string): Promise<void>;
     listPeers(): Promise<FederationPeer[]>;
+    readonly desktopFederationAvailable?: boolean;
     revokePeer(authority: string): Promise<void>;
     handoffIncoming(): Promise<IncomingHandoff[]>;
     mintPairingTicket(): Promise<PairingTicket>;

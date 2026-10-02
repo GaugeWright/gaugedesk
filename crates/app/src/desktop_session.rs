@@ -88,6 +88,13 @@ fn session_for(wb: &SharedWorkbench, which: Slot, account: Option<&str>) -> Opti
         revoke_held(wb, which);
         return None;
     }
+    // The account working in this window has a Personal of its own here
+    // (DR-0268 §5). A relay caller works on its own host, so gets none.
+    if matches!(which, Slot::Ui) {
+        if let Err(error) = wb.lock_unpoisoned().ensure_account_personal(&hub.person) {
+            tracing::warn!("could not prepare this account's Personal: {error}");
+        }
+    }
     let mut guard = wb.lock_unpoisoned();
     if let Some(held) = slot(&mut guard, which).clone() {
         // Kept while it is the same sign-in, not near its end, and live here.

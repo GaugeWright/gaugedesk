@@ -252,10 +252,21 @@ impl Workbench {
         id: String,
         title: String,
     ) -> Result<CreatedEngagement, EngagementCreateError> {
+        let root_id = self.default_instance.clone();
+        self.create_personal_engagement(id, title, root_id)
+    }
+
+    /// Quick-start a chat on one Personal's general placement: the install's
+    /// own, or a signed-in account's (DR-0268 §5).
+    pub(crate) fn create_personal_engagement(
+        &mut self,
+        id: String,
+        title: String,
+        root_id: String,
+    ) -> Result<CreatedEngagement, EngagementCreateError> {
         if self.engagements.contains_key(&id) {
             return Err(EngagementCreateError::Exists);
         }
-        let root_id = self.default_instance.clone();
         let target = self
             .resolve_placement_target(&root_id, None)
             .map_err(EngagementCreateError::Git)?;
@@ -792,7 +803,7 @@ impl Workbench {
             && !self.is_installed_method_path(chat_id, path)
             && !self.authoring_draft_readable(chat_id, path, viewer)
             && !viewer.is_some_and(|viewer| {
-                crate::context_inspection::file_readable(
+                crate::context_inspection::worktree_file_readable(
                     self,
                     chat_id,
                     viewer,
@@ -1505,7 +1516,31 @@ pub(crate) async fn create_engagement(
         Some(id) => (id.clone(), id),
         None => (crate::library::gen_id("chat"), "new chat".to_string()),
     };
-    match wb.create_default_engagement(id, title) {
+    // A desktop's signed-in account starts chats in its own Personal, never
+    // in another account's (DR-0268 §5). The local channel, a phone and a
+    // hosted Home keep the install's Personal.
+    let personal = match wb.request_personal(&headers).and_then(|project| {
+        project
+            .map(|project| {
+                wb.personal_placement_of(&project)
+                    .ok_or_else(|| "this Personal has no placement to start a chat on".to_owned())
+            })
+            .transpose()
+    }) {
+        Ok(placement) => placement,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let created = match personal {
+        Some(placement) => wb.create_personal_engagement(id, title, placement),
+        None => wb.create_default_engagement(id, title),
+    };
+    match created {
         Ok(created) => {
             if let Some(creator) = &creator {
                 wb.claim_chat_owner(&created.id, creator);
@@ -1915,7 +1950,13 @@ fn current_workspace_file_source_with_grants(
     }
     if account_backed
         && !viewer.is_some_and(|viewer| {
-            crate::context_inspection::file_readable(wb, chat_id, viewer, path, Some(digest))
+            crate::context_inspection::worktree_file_readable(
+                wb,
+                chat_id,
+                viewer,
+                path,
+                Some(digest),
+            )
         })
     {
         return false;
@@ -3604,7 +3645,7 @@ pub(crate) async fn post_choice_answer(
     let (account_scope, tenant_scope) = {
         let g = wb.lock_unpoisoned();
         (
-            g.account_scope_for(account_bearer.as_deref()),
+            g.credential_scope_for(account_bearer.as_deref()),
             crate::workbench_auth::req_scope(&headers),
         )
     };
@@ -3754,7 +3795,7 @@ pub(crate) async fn get_tree(
                         || if e.is_dir {
                             crate::context_inspection::directory_visible(&wb, &id, &viewer, &e.path)
                         } else {
-                            crate::context_inspection::file_readable(
+                            crate::context_inspection::worktree_file_readable(
                                 &wb, &id, &viewer, &e.path, None,
                             )
                         }
@@ -4226,7 +4267,7 @@ pub(crate) async fn post_task(
     let (account_scope, tenant_scope) = {
         let g = wb.lock_unpoisoned();
         (
-            g.account_scope_for(account_bearer.as_deref()),
+            g.credential_scope_for(account_bearer.as_deref()),
             crate::workbench_auth::req_scope(&headers),
         )
     };

@@ -15,7 +15,7 @@
 
 import { TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
 import { newIdempotencyKey, type RouteJson, type RouteOptions } from "./control-plane-transport";
-import type { RouteEventClose, RouteEventStream } from "./browser-route-json";
+import type { RouteEventClose, RouteEventStream, RouteRequest } from "./browser-route-json";
 
 /** The `BrowserTunnel` facade, as a structural type so a test can stand one in
  * without loading wasm. Method names match the exported binding exactly. */
@@ -34,10 +34,25 @@ export interface TunnelFacade {
     takeCredit(): Uint8Array;
 }
 
+/** The same binding, read raw: a request whose body follows in parts, and a
+ * reply's bytes and headers rather than its text (WS-678). */
+export interface RawTunnelFacade extends TunnelFacade {
+    sendRequestHead(method: string, path: string, headers: Record<string, string> | undefined,
+                    contentLength: number): void;
+    sendBody(chunk: Uint8Array): void;
+    /** Bytes queued and not yet handed to the socket. */
+    bufferedBytes(): number;
+    takeBodyBytes(): Uint8Array;
+    takeHeaders(): Record<string, string>;
+}
+
 /** The socket, narrowed to what the loop uses. */
 export interface TunnelSocket {
     send(frame: Uint8Array): void;
     close(): void;
+    /** Bytes the socket has accepted and not yet put on the wire, when the
+     * carrier can say. A body is fed no faster than this drains. */
+    bufferedAmount?(): number;
     onFrame(handler: (frame: Uint8Array) => void): void;
     onClose(handler: (reason?: string) => void): void;
 }
@@ -115,17 +130,33 @@ export type TunnelRoute = RouteJson & {
     close(): void;
 };
 
-/**
- * Build a `RouteJson` that carries each call over the pinned tunnel.
- *
- * Requests are serialized: the wire is one request/response at a time, so a
- * second caller waits rather than interleaving frames into the same session.
- */
-export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
-    const timeoutMs = options.timeoutMs ?? 30_000;
-    const now = options.now ?? Date.now;
-    const tick = options.tick ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
-    let live: { tunnel: TunnelFacade; socket: TunnelSocket } | null = null;
+/** One carrier to a Home, opened on first use and reopened after it closes,
+ * that runs one exchange at a time over it. Shared by the JSON calls and the
+ * raw requests, which each hold one of their own. */
+interface Carrier<F> {
+    /** Run one exchange on the live session, after every exchange before it. */
+    run<T>(exchange: (session: CarrierSession<F>) => Promise<T>): Promise<T>;
+    close(): void;
+}
+
+interface CarrierSession<F> {
+    readonly tunnel: F;
+    readonly socket: TunnelSocket;
+    /** Whether this session is still the carrier's live one. */
+    live(): boolean;
+    /** Why it stopped being, if it has. */
+    closeReason(): string | undefined;
+    /** When the relay last delivered a frame on it. */
+    lastFrameAt(): number;
+    /** Abandon it mid-exchange: the next exchange opens a fresh one. */
+    drop(): void;
+}
+
+function tunnelCarrier<F extends { receiveFrame(frame: Uint8Array): void; takeCredit(): Uint8Array }>(
+    open: () => Promise<{ tunnel: F; socket: TunnelSocket }>,
+    now: () => number,
+): Carrier<F> {
+    let live: { tunnel: F; socket: TunnelSocket } | null = null;
     // Only the caller hangs a route up for good. A carrier that closes under it
     // — the Home ending an idle crossing, the relay closing a leg — takes the
     // session with it, not the route: the next call opens a fresh one, exactly
@@ -134,12 +165,13 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
     // happened to evict it.
     let closeReason: string | undefined;
     let hungUp = false;
+    let lastFrameAt = now();
     let queue: Promise<unknown> = Promise.resolve();
 
-    async function ensure(): Promise<{ tunnel: TunnelFacade; socket: TunnelSocket }> {
+    async function ensure(): Promise<{ tunnel: F; socket: TunnelSocket }> {
         if (live) return live;
-        let opened: { tunnel: TunnelFacade; socket: TunnelSocket };
-        try { opened = await options.open(); }
+        let opened: { tunnel: F; socket: TunnelSocket };
+        try { opened = await open(); }
         catch (error) {
             throw new HomeTunnelError(error instanceof Error ? error.message : String(error));
         }
@@ -150,6 +182,7 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
         }
         live = opened;
         opened.socket.onFrame((frame) => {
+            lastFrameAt = now();
             opened.tunnel.receiveFrame(frame);
             sendCredit(opened.tunnel, opened.socket);
         });
@@ -162,73 +195,241 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
         return opened;
     }
 
-    const route: TunnelRoute = Object.assign((
-        method: string,
-        path: string,
-        body?: unknown,
-        routeOptions?: RouteOptions,
-    ) => {
-        // One at a time: the tunnel carries a single stream, so interleaving two
-        // requests would splice their frames together.
-        const run = queue.then(async () => {
-            if (hungUp) throw new TunnelClosed("the Home tunnel closed");
-            const session = await ensure();
-            const { tunnel, socket } = session;
-            tunnel.sendRequest(
-                method, path,
-                body === undefined ? undefined : JSON.stringify(body),
-                headersFor(options, method, routeOptions),
-            );
-            const deadline = now() + timeoutMs;
-            for (;;) {
-                // Not before the relay has spliced this leg. Ciphertext written
-                // into an unpaired route has no other end, and relying on the
-                // relay to hold it is relying on a component whose whole design
-                // is to be dumb. It accumulates in the session either way.
-                if (tunnel.isPaired()) {
-                    const outgoing = tunnel.takeOutgoing();
-                    if (outgoing.length > 0) socket.send(outgoing);
-                }
-                const status = tunnel.pollStatus();
-                if (status !== undefined) {
-                    const text = tunnel.takeBody();
-                    // A stopped turn is not a delivery failure on this transport
-                    // either. The hosted split composition carries `/task` through
-                    // here whenever a project's Home is relay-only, so decoding
-                    // `499` only in the direct browser route would leave exactly
-                    // those turns reported as broken — and the composer holding
-                    // the cancelled message for a retry nobody asked for.
-                    if (status === TURN_STOPPED_STATUS) throw new TurnStopped();
-                    if (status >= 400) {
-                        throw new Error(`${method} ${path}: ${status} ${text}`.trim());
-                    }
-                    return text ? (JSON.parse(text) as unknown) : {};
-                }
-                // Not retried on a fresh session: the request may already have
-                // reached the Home, and only the caller knows whether sending it
-                // twice is safe.
-                if (live !== session) throw new TunnelClosed(closeReason ?? "the Home tunnel closed mid-request");
-                if (now() > deadline) {
-                    live = null;
-                    socket.close();
-                    throw new HomeTunnelError(`${method} ${path}: the Home tunnel timed out`);
-                }
-                await tick();
-            }
-        });
-        // Keep the chain alive after a rejection so one failure does not wedge
-        // every later request behind it.
-        queue = run.catch(() => undefined);
-        return run;
-    }, {
+    return {
+        run<T>(exchange: (session: CarrierSession<F>) => Promise<T>): Promise<T> {
+            // One at a time: the tunnel carries a single stream, so interleaving
+            // two requests would splice their frames together.
+            const run = queue.then(async () => {
+                if (hungUp) throw new TunnelClosed("the Home tunnel closed");
+                const opened = await ensure();
+                return exchange({
+                    tunnel: opened.tunnel,
+                    socket: opened.socket,
+                    live: () => live === opened,
+                    closeReason: () => closeReason,
+                    lastFrameAt: () => lastFrameAt,
+                    drop: () => {
+                        if (live === opened) live = null;
+                        opened.socket.close();
+                    },
+                });
+            });
+            // Keep the chain alive after a rejection so one failure does not
+            // wedge every later request behind it.
+            queue = run.catch(() => undefined);
+            return run;
+        },
         close() {
             hungUp = true;
             const open = live;
             live = null;
             open?.socket.close();
         },
-    });
+    };
+}
+
+/** Hand the socket every frame the tunnel has ready, holding back while the
+ * socket already has `limit` bytes waiting. */
+function flushFrames(tunnel: { takeOutgoing(): Uint8Array }, socket: TunnelSocket,
+                     limit = Number.POSITIVE_INFINITY): void {
+    while ((socket.bufferedAmount?.() ?? 0) < limit) {
+        const outgoing = tunnel.takeOutgoing();
+        if (outgoing.length === 0) return;
+        socket.send(outgoing);
+    }
+}
+
+/**
+ * Build a `RouteJson` that carries each call over the pinned tunnel.
+ *
+ * Requests are serialized: the wire is one request/response at a time, so a
+ * second caller waits rather than interleaving frames into the same session.
+ */
+export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
+    const timeoutMs = options.timeoutMs ?? 30_000;
+    const now = options.now ?? Date.now;
+    const tick = options.tick ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+    const carrier = tunnelCarrier(options.open, now);
+
+    const route: TunnelRoute = Object.assign((
+        method: string,
+        path: string,
+        body?: unknown,
+        routeOptions?: RouteOptions,
+    ) => carrier.run(async (session) => {
+        const { tunnel, socket } = session;
+        tunnel.sendRequest(
+            method, path,
+            body === undefined ? undefined : JSON.stringify(body),
+            headersFor(options, method, routeOptions),
+        );
+        const deadline = now() + timeoutMs;
+        for (;;) {
+            // Not before the relay has spliced this leg. Ciphertext written
+            // into an unpaired route has no other end, and relying on the
+            // relay to hold it is relying on a component whose whole design
+            // is to be dumb. It accumulates in the session either way.
+            if (tunnel.isPaired()) flushFrames(tunnel, socket);
+            const status = tunnel.pollStatus();
+            if (status !== undefined) {
+                const text = tunnel.takeBody();
+                // A stopped turn is not a delivery failure on this transport
+                // either. The hosted split composition carries `/task` through
+                // here whenever a project's Home is relay-only, so decoding
+                // `499` only in the direct browser route would leave exactly
+                // those turns reported as broken — and the composer holding
+                // the cancelled message for a retry nobody asked for.
+                if (status === TURN_STOPPED_STATUS) throw new TurnStopped();
+                if (status >= 400) {
+                    throw new Error(`${method} ${path}: ${status} ${text}`.trim());
+                }
+                return text ? (JSON.parse(text) as unknown) : {};
+            }
+            // Not retried on a fresh session: the request may already have
+            // reached the Home, and only the caller knows whether sending it
+            // twice is safe.
+            if (!session.live()) {
+                throw new TunnelClosed(session.closeReason() ?? "the Home tunnel closed mid-request");
+            }
+            if (now() > deadline) {
+                session.drop();
+                throw new HomeTunnelError(`${method} ${path}: the Home tunnel timed out`);
+            }
+            await tick();
+        }
+    }), { close: () => carrier.close() });
     return route;
+}
+
+/** Whether a reply with this status carries no body, as `Response` requires. */
+function nullBodyStatus(status: number): boolean {
+    return status === 101 || status === 204 || status === 205 || status === 304;
+}
+
+/** A request body, readable in parts so a large one is never copied whole. */
+interface PartedBody {
+    readonly length: number;
+    /** The content type `fetch` would have sent for it, if any. */
+    readonly contentType?: string;
+    read(offset: number, size: number): Promise<Uint8Array>;
+}
+
+function partedBody(body: RequestInit["body"]): PartedBody {
+    if (body === undefined || body === null) {
+        return { length: 0, read: async () => new Uint8Array() };
+    }
+    const whole = (bytes: Uint8Array, contentType?: string): PartedBody => ({
+        length: bytes.length,
+        ...(contentType ? { contentType } : {}),
+        read: async (offset, size) => bytes.subarray(offset, offset + size),
+    });
+    if (typeof body === "string") {
+        return whole(new TextEncoder().encode(body), "text/plain;charset=UTF-8");
+    }
+    if (body instanceof ArrayBuffer) return whole(new Uint8Array(body));
+    if (ArrayBuffer.isView(body)) {
+        return whole(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+    }
+    if (typeof Blob !== "undefined" && body instanceof Blob) {
+        return {
+            length: body.size,
+            ...(body.type ? { contentType: body.type } : {}),
+            read: async (offset, size) =>
+                new Uint8Array(await body.slice(offset, offset + size).arrayBuffer()),
+        };
+    }
+    throw new HomeTunnelError("this request body cannot be carried over the Home tunnel");
+}
+
+/** How much of a body may wait unsent before the next part is read. */
+const RAW_HIGH_WATER_BYTES = 1024 * 1024;
+const RAW_PART_BYTES = 256 * 1024;
+
+export type TunnelRouteRequest = RouteRequest & {
+    /** Hang up: close the carrier and refuse further requests. Idempotent. */
+    close(): void;
+};
+
+/**
+ * Carry the raw requests — files, config, a merge preview, a context upload —
+ * to a Home with no address of its own, over a pinned tunnel (WS-678).
+ *
+ * Until this, a relay-only Home in a browser had no way to take them: the
+ * calls' tunnel carried JSON and nothing else, and every file and config
+ * request said "Home raw transport unavailable". It answers the way `fetch`
+ * does, with a `Response`, so its callers cannot tell the two apart.
+ *
+ * It has a carrier of its own, so a large file never holds the JSON calls
+ * behind it, and it feeds a body in parts no faster than the socket drains.
+ * Its deadline counts from the last progress either way rather than from the
+ * start, because a large file legitimately takes longer than a call.
+ */
+export function tunnelRouteRequest(
+    options: Omit<TunnelRouteOptions, "open"> & {
+        readonly open: () => Promise<{ tunnel: RawTunnelFacade; socket: TunnelSocket }>;
+    },
+): TunnelRouteRequest {
+    const timeoutMs = options.timeoutMs ?? 30_000;
+    const now = options.now ?? Date.now;
+    const tick = options.tick ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+    const carrier = tunnelCarrier(options.open, now);
+
+    const request = (path: string, init: RequestInit = {}) => carrier.run(async (session) => {
+        const { tunnel, socket } = session;
+        const method = (init.method ?? "GET").toUpperCase();
+        const body = partedBody(init.body);
+        const given: Record<string, string> = {};
+        new Headers(init.headers).forEach((value, name) => { given[name] = value; });
+        if (body.contentType && !given["content-type"]) given["content-type"] = body.contentType;
+        const key = given["idempotency-key"];
+        const headers = {
+            ...given,
+            ...headersFor(options, method, key ? { idempotencyKey: key } : undefined),
+        };
+        tunnel.sendRequestHead(method, path, headers, body.length);
+        let offset = 0;
+        let progressAt = now();
+        for (;;) {
+            if (init.signal?.aborted) {
+                // Mid-request: what crossed already cannot be called back, so
+                // the session goes with it and the next request opens another.
+                session.drop();
+                throw new DOMException("the request was aborted", "AbortError");
+            }
+            while (offset < body.length
+                   && tunnel.bufferedBytes() + (socket.bufferedAmount?.() ?? 0) < RAW_HIGH_WATER_BYTES) {
+                const part = await body.read(offset, Math.min(RAW_PART_BYTES, body.length - offset));
+                tunnel.sendBody(part);
+                offset += part.length;
+                progressAt = now();
+            }
+            if (tunnel.isPaired()) {
+                const before = socket.bufferedAmount?.() ?? 0;
+                flushFrames(tunnel, socket, RAW_HIGH_WATER_BYTES);
+                if ((socket.bufferedAmount?.() ?? 0) !== before) progressAt = now();
+            }
+            const status = tunnel.pollStatus();
+            if (status !== undefined) {
+                // Copied into a buffer of its own: `Response` takes no view over
+                // memory it does not own, and wasm memory is not.
+                const bytes = new Uint8Array(tunnel.takeBodyBytes());
+                const replyHeaders = tunnel.takeHeaders();
+                return new Response(
+                    nullBodyStatus(status) || method === "HEAD" ? null : bytes,
+                    { status, headers: replyHeaders },
+                );
+            }
+            if (!session.live()) {
+                throw new TunnelClosed(session.closeReason() ?? "the Home tunnel closed mid-request");
+            }
+            if (now() - Math.max(progressAt, session.lastFrameAt()) > timeoutMs) {
+                session.drop();
+                throw new HomeTunnelError(`${method} ${path}: the Home tunnel timed out`);
+            }
+            await tick();
+        }
+    });
+    return Object.assign(request, { close: () => carrier.close() });
 }
 
 /** What one poll of an event tunnel produced, as the binding reports it. */
@@ -344,10 +545,7 @@ export function tunnelRouteEventStream(options: TunnelEventStreamOptions): Tunne
             const { tunnel } = opened;
             const drain = () => {
                 try {
-                    if (tunnel.isPaired()) {
-                        const outgoing = tunnel.takeOutgoing();
-                        if (outgoing.length > 0) opened.socket.send(outgoing);
-                    }
+                    if (tunnel.isPaired()) flushFrames(tunnel, opened.socket);
                     for (let next = tunnel.pollEvent(); next && !finished; next = tunnel.pollEvent()) {
                         switch (next.kind) {
                             case "opened":
@@ -499,6 +697,7 @@ export function browserTunnelSocket(
             }, keepaliveMs);
             resolve({
                 send: (frame) => socket.send(copyOut(frame)),
+                bufferedAmount: () => socket.bufferedAmount,
                 close: () => {
                     clearInterval(keepalive);
                     keepalive = undefined;

@@ -63,7 +63,7 @@ impl ContentVault {
         let _lease = shared(&root, &key_id)?;
         available(&root, &key_id)?;
         let wrapped = std::fs::read(key_path(&root, &key_id))?;
-        let data_key = self.wrap.unwrap(&wrapped).map_err(custody_error)?;
+        let data_key = self.unwrap_dek(&wrapped)?;
         let payload = KeyPayload {
             protocol: PROTOCOL.into(),
             scope: scope.into(),
@@ -124,7 +124,7 @@ impl ContentVault {
         let path = key_path(&root, &key_id);
         let wrapped = match std::fs::read(&path) {
             Ok(wrapped) => {
-                if self.wrap.unwrap(&wrapped).map_err(custody_error)? != payload.data_key {
+                if self.unwrap_dek(&wrapped)? != payload.data_key {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
                         "receiving scope has conflicting content-key custody",
@@ -133,7 +133,10 @@ impl ContentVault {
                 wrapped
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let wrapped = self.wrap.wrap(&payload.data_key).map_err(custody_error)?;
+                // Received custody is wrapped under the scope's project key when
+                // the receiving library already places it; otherwise the startup
+                // sweep adopts it once the project's records are imported.
+                let wrapped = self.wrap_dek(expected_scope, &payload.data_key)?;
                 persist_new(&root, &path, &wrapped)?;
                 wrapped
             }

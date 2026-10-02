@@ -24,6 +24,22 @@ pub fn encode_request(
     headers: &BTreeMap<String, String>,
     body: Option<&[u8]>,
 ) -> std::io::Result<Vec<u8>> {
+    let mut out = encode_request_head(method, path, headers, body.map_or(0, <[u8]>::len))?;
+    if let Some(bytes) = body {
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+/// Encode a request's head, declaring a body of `content_length` bytes that the
+/// caller sends after it. A large body then crosses as it is read rather than
+/// held whole beside its own copy.
+pub fn encode_request_head(
+    method: &str,
+    path: &str,
+    headers: &BTreeMap<String, String>,
+    content_length: usize,
+) -> std::io::Result<Vec<u8>> {
     if method.is_empty() || !path.starts_with('/') {
         return Err(invalid_data("request needs a method and an absolute path"));
     }
@@ -35,16 +51,18 @@ pub fn encode_request(
     }
     let mut out = format!("{method} {path} HTTP/1.1\r\nhost: gaugewright-home\r\n").into_bytes();
     for (name, value) in headers {
+        // The length is this encoder's to state: a caller's would disagree with
+        // the body actually sent, and a Home would wait on or cut it short.
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("host")
+        {
+            continue;
+        }
         out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
-    match body {
-        Some(bytes) => {
-            out.extend_from_slice(format!("content-length: {}\r\n\r\n", bytes.len()).as_bytes());
-            out.extend_from_slice(bytes);
-        }
-        // A bodyless request still declares zero, so a Home never waits on one.
-        None => out.extend_from_slice(b"content-length: 0\r\n\r\n"),
-    }
+    // A bodyless request still declares zero, so a Home never waits on one.
+    out.extend_from_slice(format!("content-length: {content_length}\r\n\r\n").as_bytes());
     Ok(out)
 }
 
@@ -394,6 +412,24 @@ mod tests {
         assert!(text.starts_with("POST /home/admissions HTTP/1.1\r\n"));
         assert!(text.contains("content-length: 0\r\n"));
         assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    /// The encoder states the length of what is actually sent. A caller's own
+    /// framing header would disagree with it, and a Home would wait on, or cut
+    /// short, a body it was told the wrong length of (WS-678).
+    #[test]
+    fn a_caller_cannot_frame_the_body_itself() {
+        let framing = headers(&[
+            ("Content-Length", "1"),
+            ("transfer-encoding", "chunked"),
+            ("host", "elsewhere"),
+        ]);
+        let text =
+            String::from_utf8(encode_request_head("PUT", "/f", &framing, 5).unwrap()).unwrap();
+        assert!(text.contains("content-length: 5\r\n"));
+        assert!(!text.contains("Content-Length: 1"));
+        assert!(!text.contains("chunked"));
+        assert_eq!(text.matches("host:").count(), 1);
     }
 
     #[test]

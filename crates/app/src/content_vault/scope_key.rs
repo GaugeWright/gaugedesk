@@ -4,7 +4,10 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::rc::{Rc, Weak};
 
+mod project_keys;
 mod transfer;
+pub(crate) use project_keys::ProjectKeyCache;
+pub use project_keys::ScopeProjectIndex;
 pub use transfer::{PreparedScopeTransfer, ScopeKeyCapsule};
 
 const TOMBSTONE: &[u8] = b"gaugedesk.content-key-erased.v1\n";
@@ -231,7 +234,7 @@ impl ContentVault {
             scope: scope.to_owned(),
             key_id,
             wrapped_fingerprint: fingerprint(wrapped),
-            cipher: LocalAeadEncryptor::new(self.wrap.unwrap(wrapped).map_err(custody_error)?),
+            cipher: LocalAeadEncryptor::new(self.unwrap_dek(wrapped)?),
         })
     }
 
@@ -254,13 +257,14 @@ impl ContentVault {
         let root = std::fs::canonicalize(&self.dir)?;
         let _lease = exclusive(&root, &key_id)?;
         available(&root, &key_id)?;
-        let wrapped = self.existing_or_new_key(&root, &key_id, true)?;
+        let wrapped = self.existing_or_new_key(&root, scope, &key_id, true)?;
         self.prepared(root, scope, key_id, &wrapped)
     }
 
     fn existing_or_new_key(
         &self,
         root: &Path,
+        scope: &str,
         key_id: &str,
         create: bool,
     ) -> std::io::Result<Vec<u8>> {
@@ -272,7 +276,7 @@ impl ContentVault {
                 SystemRandom::new()
                     .fill(&mut dek)
                     .map_err(|_| std::io::Error::other("scope key generation failed"))?;
-                let wrapped = self.wrap.wrap(&dek).map_err(custody_error)?;
+                let wrapped = self.wrap_dek(scope, &dek)?;
                 persist_new(root, &path, &wrapped)?;
                 Ok(wrapped)
             }
@@ -301,14 +305,14 @@ impl ContentVault {
                 return use_key(key);
             }
         }
-        let wrapped = match self.existing_or_new_key(&root, &key_id, false) {
+        let wrapped = match self.existing_or_new_key(&root, scope, &key_id, false) {
             Ok(wrapped) => wrapped,
             Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
                 drop(lease);
                 let _exclusive = exclusive(&root, &key_id).ok()?;
                 available(&root, &key_id).ok()?;
-                let wrapped = self.existing_or_new_key(&root, &key_id, true).ok()?;
-                let key = self.wrap.unwrap(&wrapped).ok()?;
+                let wrapped = self.existing_or_new_key(&root, scope, &key_id, true).ok()?;
+                let key = self.unwrap_dek(&wrapped).ok()?;
                 {
                     // The fence and the cache share a lock so a writer either
                     // completes before erasure or observes the fence; minting a
@@ -323,7 +327,7 @@ impl ContentVault {
             }
             Err(_) => return None,
         };
-        let key = self.wrap.unwrap(&wrapped).ok()?;
+        let key = self.unwrap_dek(&wrapped).ok()?;
         {
             let mut state = self.key_state.lock().unwrap();
             if state.erased_key_ids.contains(&key_id) {
@@ -332,6 +336,24 @@ impl ContentVault {
             state.cache.insert(scope.to_owned(), key);
         }
         use_key(key)
+    }
+
+    /// Whether a recorded erasure is already in force on disk: its tombstone is
+    /// present and intact and no key file exists beside it. The re-erase sweep
+    /// skips such a scope, because erasing it again changes nothing yet costs a
+    /// lock and a directory flush, and a Hub with a thousand recorded erasures
+    /// spent four seconds of every start on them. A missing or malformed
+    /// tombstone, or a key file a restore brought back, is not in force, and
+    /// the sweep repairs it as before.
+    pub(super) fn local_erasure_in_force(&self, key_id: &str) -> bool {
+        let Ok(root) = std::fs::canonicalize(&self.dir) else {
+            return false;
+        };
+        matches!(std::fs::read(tombstone_path(&root, key_id)), Ok(bytes) if bytes == TOMBSTONE)
+            && matches!(
+                std::fs::symlink_metadata(key_path(&root, key_id)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
     }
 
     pub(super) fn erase_local_scope(&self, key_id: &str) -> std::io::Result<bool> {

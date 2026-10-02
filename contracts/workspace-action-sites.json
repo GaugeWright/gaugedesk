@@ -980,7 +980,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::create_default_engagement",
+        "callable": "impl inherent for Workbench::create_personal_engagement",
         "capability": "create_engagement_subset",
         "count": 1,
         "expression": "workspace . create_engagement_subset (& id , workspace . mainline () , & roots)",
@@ -2384,6 +2384,86 @@
         "capability": "write_file",
         "count": 1,
         "expression": "engagement . write_file (& source_path , & source)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_download_tools",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (\"give the Agent draft offer_download\")",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_download_tools",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_download_tools",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_download_tools",
+        "capability": "open_at",
+        "count": 1,
+        "expression": "provider_for (providers , & target . id) . open_at (& targets_dir . join (& target . id))",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_download_tools",
+        "capability": "read_file",
+        "count": 1,
+        "expression": "engagement . read_file (& manifest_path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_download_tools",
+        "capability": "read_main_file",
+        "count": 1,
+        "expression": "workspace . read_main_file (& manifest_path)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_download_tools",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& engagement_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "startup-and-migration"
+    },
+    {
+      "site": {
+        "callable": "migrate_agent_download_tools",
+        "capability": "write_file",
+        "count": 1,
+        "expression": "engagement . write_file (& manifest_path , & format ! (\"{}\\n\" , serde_json :: to_string_pretty (& manifest) . map_err (io) ?) ,)",
         "file": "crates/app/src/library_state.rs"
       },
       "profile": "startup-and-migration"

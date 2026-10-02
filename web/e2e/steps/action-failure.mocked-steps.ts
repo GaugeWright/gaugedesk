@@ -37,6 +37,19 @@ Then("the message {string} is back in the composer", async ({ page }, text: stri
     await expect(page.locator('[data-desktop-composer] textarea[aria-label="Message"]')).toHaveValue(text);
 });
 
+When("I start the quick-start chat with the first target", async ({ page }) => {
+    const picker = page.locator("[data-quick-target-picker]");
+    await picker.locator("[data-quick-target-choice]").first().click();
+    await picker.locator("[data-confirm-quick-targets]").click();
+    await expect(picker).toHaveCount(0);
+});
+
+Then("the chat pane shows the action error {string}", async ({ page }, reason: string) => {
+    const notice = page.locator('[data-action-error="chat"]');
+    await expect(notice).toHaveAttribute("role", "alert");
+    await expect(notice).toContainText(reason);
+});
+
 When("I dismiss the files pane's action error", async ({ page }) => {
     await page.locator('[data-action-error="files"] button').click();
 });

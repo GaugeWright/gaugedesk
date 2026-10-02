@@ -100,6 +100,7 @@ export interface EngagementPaneApi {
     handoffParticipants(project: ProjectId): Promise<Participant[]>;
     handoffData(project: ProjectId): Promise<ConnectedData[]>;
     listPeers(): Promise<FederationPeer[]>;
+    readonly desktopFederationAvailable?: boolean;
     runQueue(): Promise<QueuedRun[]>;
     handoffRelocate(project: ProjectId, peer: string): Promise<HandoffStatus>;
     getPlacementDistribution(placement: PlacementId): Promise<PlacementDistributionStatus>;
@@ -167,7 +168,10 @@ export function EngagementPane(props: {
         () => props.project,
         (p) => props.api.handoffData(p),
     );
-    const [peers] = createResource(() => props.api.listPeers());
+    const [peers] = createResource(
+        () => props.api.desktopFederationAvailable !== false,
+        () => props.api.listPeers(),
+    );
     const [workspace] = createResource(() => props.api.getWorkspace());
     const [accountTenants] = createResource(async () => {
         try {

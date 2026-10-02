@@ -119,7 +119,7 @@ fn work_chat_default_model(
     workbench: &crate::Workbench,
     headers: &axum::http::HeaderMap,
 ) -> Option<String> {
-    let scope = workbench.account_scope_for(crate::net_http::bearer(headers));
+    let scope = workbench.credential_scope_for(crate::net_http::bearer(headers));
     workbench.work_chat_default_model_in(&scope).1
 }
 

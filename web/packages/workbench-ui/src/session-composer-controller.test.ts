@@ -339,6 +339,17 @@ describe("createSessionComposerController", () => {
         h.dispose();
     });
 
+    it("returns a message a host could not deliver, images as attachments", () => {
+        const h = harness(undefined, BASIC_COMPOSER_CAPABILITIES);
+        const image = { name: "plan.png", mimeType: "image/png", data: "AAAA" };
+        h.controller.setDraft("typed since");
+        h.controller.returnMessage({ text: "first paragraph\n\nsecond\n\n[attached image: plan.png]", images: [image] });
+        // The image note stands for the attachment, so it does not come back twice.
+        expect(h.controller.draft()).toBe("first paragraph\n\nsecond\n\ntyped since");
+        expect(h.controller.attachments()).toEqual([{ kind: "image", ...image }]);
+        h.dispose();
+    });
+
     it("retires client-only state when the Session scope changes", async () => {
         const h = harness();
         h.setBusy(true);

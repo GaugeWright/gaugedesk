@@ -317,6 +317,16 @@ Then("quick start asks for an explicit target set", async ({ page }) => {
     await expect(picker.locator("[data-confirm-quick-targets]")).toBeDisabled();
 });
 
+When("I cancel the quick-start target choice", async ({ page }) => {
+    const picker = page.locator("[data-quick-target-picker]");
+    await picker.getByRole("button", { name: "Cancel" }).click();
+    await expect(picker).toHaveCount(0);
+});
+
+Then("the empty-state composer holds {string}", async ({ page }, text: string) => {
+    await expect(page.locator("[data-empty-chat-composer] textarea[aria-label='Message']")).toHaveValue(text);
+});
+
 Given("two placements have chats in one project workstream", async ({ page, request }) => {
     const workspaceResponse = await request.get(`${aliceCP}/workspace`);
     const workspace = await workspaceResponse.json() as {

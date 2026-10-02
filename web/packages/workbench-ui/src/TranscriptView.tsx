@@ -30,6 +30,8 @@ import { isBoilerplateResult, partitionedToolTarget, toolDetail, toolHeaderTarge
 import { targetNameForRoot, type TargetName } from "./target-names";
 import type { ChoiceCard, ChoiceSelection } from "@gaugewright/control-plane-client";
 import { ChoiceCardView } from "./ChoiceCardView";
+import { offeredDownload } from "./offered-download";
+import { OfferedDownloadView } from "./OfferedDownloadView";
 import { Icon } from "./icons";
 
 function cardIdFromTool(line: TranscriptLine): string | null {
@@ -335,6 +337,9 @@ function LineView(props: {
     onFork?: (entryId: number, origin?: string) => void;
     choiceCards?: readonly ChoiceCard[];
     onAnswerChoice?: (cardId: string, selections: ChoiceSelection[]) => Promise<void>;
+    /** Save a file the agent offered with `offer_download` (DR-0314). Without
+     *  it the offer stays an ordinary tool line. */
+    onDownload?: (path: string) => Promise<void>;
 }): JSX.Element {
     // A model-credential refusal (LLM-1) carries a machine-readable code: render the
     // reason *with* an action into settings, so the user can act from the chat log
@@ -342,7 +347,9 @@ function LineView(props: {
     const isCredentialError = () =>
         props.line.kind === "error" && props.line.code === "no_credential" && !!props.onResolveCredential;
     const choiceCard = () => props.choiceCards?.find((card) => card.id === cardIdFromTool(props.line));
+    const offer = () => (props.onDownload ? offeredDownload(props.line) : null);
     return (
+        <Show when={offer()} fallback={
         <Show when={choiceCard() && props.onAnswerChoice} fallback={
         <Show
             when={props.line.kind === "tool" && props.line.tool}
@@ -403,6 +410,9 @@ function LineView(props: {
                 onAnswer={(selections) => props.onAnswerChoice!(choiceCard()!.id, selections)}
             />
         </Show>
+        }>
+            <OfferedDownloadView offer={offer()!} onDownload={props.onDownload!} />
+        </Show>
     );
 }
 
@@ -429,6 +439,9 @@ function TurnView(props: {
     onFork?: (entryId: number, origin?: string) => void;
     choiceCards?: readonly ChoiceCard[];
     onAnswerChoice?: (cardId: string, selections: ChoiceSelection[]) => Promise<void>;
+    /** Save a file the agent offered with `offer_download` (DR-0314). Without
+     *  it the offer stays an ordinary tool line. */
+    onDownload?: (path: string) => Promise<void>;
 }): JSX.Element {
     const [collapsed, setCollapsed] = createSignal(false);
     return (
@@ -457,6 +470,7 @@ function TurnView(props: {
                                 onFork={props.onFork}
                                 choiceCards={props.choiceCards}
                                 onAnswerChoice={props.onAnswerChoice}
+                                onDownload={props.onDownload}
                             />
                         )}
                     </For>
@@ -489,6 +503,9 @@ export function TranscriptView(props: {
     onFork?: (entryId: number, origin?: string) => void;
     choiceCards?: readonly ChoiceCard[];
     onAnswerChoice?: (cardId: string, selections: ChoiceSelection[]) => Promise<void>;
+    /** Save a file the agent offered with `offer_download` (DR-0314). Without
+     *  it the offer stays an ordinary tool line. */
+    onDownload?: (path: string) => Promise<void>;
 }): JSX.Element {
     const prefs = () => props.prefs ?? defaultPrefs;
     const agentName = () => displayAgentName(props.agentName);
@@ -553,6 +570,7 @@ export function TranscriptView(props: {
                             onFork={props.onFork}
                             choiceCards={props.choiceCards}
                             onAnswerChoice={props.onAnswerChoice}
+                            onDownload={props.onDownload}
                         />
                     ) : (
                         <LineView
@@ -564,6 +582,7 @@ export function TranscriptView(props: {
                             onFork={props.onFork}
                             choiceCards={props.choiceCards}
                             onAnswerChoice={props.onAnswerChoice}
+                            onDownload={props.onDownload}
                         />
                     )}
                 </>

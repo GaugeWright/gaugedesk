@@ -300,3 +300,377 @@ async fn each_account_creates_its_own_projects_and_reaches_only_those() {
         ProjectOwner::Account(local)
     );
 }
+
+fn listed_ids(workspace: &serde_json::Value, key: &str, id: &str) -> Vec<String> {
+    workspace[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row[id].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn each_account_gets_its_own_personal_and_the_claimant_keeps_the_installs() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let mut guard = wb.lock_unpoisoned();
+    // DR-0309: the claimant's Personal is the one the install already had.
+    assert_eq!(
+        guard.ensure_account_personal(CLAIMANT).unwrap(),
+        DEFAULT_PROJECT
+    );
+
+    let personal = guard.ensure_account_personal(OTHER).unwrap();
+    assert_eq!(personal, personal_project_id(OTHER));
+    assert!(!personal.contains(OTHER), "no account id reaches the id");
+    let record = &guard.library.projects[&personal];
+    assert!(record.is_default);
+    assert_eq!(record.name, "Personal");
+    assert_eq!(recorded_owner(record), Some(OTHER));
+    let placement = guard.personal_placement_of(&personal).unwrap();
+    assert_eq!(
+        placement,
+        crate::library_routes::general_placement_id(&personal)
+    );
+    for agent in [
+        crate::DEFAULT_AGENT,
+        crate::app_support::SOFTWARE_ENGINEER_AGENT,
+        crate::app_support::OFFICE_WORKER_AGENT,
+    ] {
+        assert!(
+            guard.library.instances.values().any(|instance| {
+                instance.agent_id == agent && instance.project_id.as_deref() == Some(&personal)
+            }),
+            "{agent} is placed on the new Personal as on the install's"
+        );
+    }
+
+    let before = guard.library.projects.len();
+    assert_eq!(guard.ensure_account_personal(OTHER).unwrap(), personal);
+    assert_eq!(
+        guard.library.projects.len(),
+        before,
+        "ensuring twice makes one"
+    );
+}
+
+#[tokio::test]
+async fn a_quick_chat_starts_in_the_callers_own_personal() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = gated(&wb);
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+    let project_of = |chat: &serde_json::Value| {
+        wb.lock_unpoisoned()
+            .library
+            .project_of_chat(chat["id"].as_str().unwrap())
+            .map(str::to_owned)
+    };
+
+    let (status, chat) = send(
+        &app,
+        "POST",
+        "/chats",
+        Some(&other),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{chat}");
+    assert_eq!(project_of(&chat), Some(personal_project_id(OTHER)));
+
+    let (status, chat) = send(
+        &app,
+        "POST",
+        "/chats",
+        Some(&claimant),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{chat}");
+    assert_eq!(project_of(&chat).as_deref(), Some(DEFAULT_PROJECT));
+
+    let (status, chat) = send(&app, "POST", "/chats", None, Some(serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{chat}");
+    assert_eq!(
+        project_of(&chat).as_deref(),
+        Some(DEFAULT_PROJECT),
+        "the local channel keeps the install's Personal until WS-588"
+    );
+}
+
+#[tokio::test]
+async fn the_navigator_marks_only_the_callers_personal_and_hides_other_projects_rows() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = gated(&wb);
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+    let personal = wb.lock_unpoisoned().ensure_account_personal(OTHER).unwrap();
+
+    let (_, theirs) = send(&app, "GET", "/workspace", Some(&other), None).await;
+    let personals: Vec<_> = theirs["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|project| project["is_personal"] == true)
+        .map(|project| project["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(personals, vec![personal.clone()]);
+    assert_eq!(
+        listed_ids(&theirs, "projects", "id")[0],
+        personal,
+        "Personal first"
+    );
+    assert_eq!(
+        theirs["personal_placement"],
+        crate::library_routes::general_placement_id(&personal)
+    );
+    let targets = listed_ids(&theirs, "work_targets", "owner_id");
+    assert!(
+        !targets.iter().any(|owner| owner == DEFAULT_PROJECT),
+        "another account's project targets are not listed: {targets:?}"
+    );
+
+    let (_, mine) = send(&app, "GET", "/workspace", Some(&claimant), None).await;
+    assert!(!listed_ids(&mine, "projects", "id").contains(&personal));
+    assert!(!listed_ids(&mine, "work_targets", "owner_id").contains(&personal));
+    assert_eq!(mine["personal_placement"], crate::DEFAULT_PLACEMENT);
+}
+
+#[tokio::test]
+async fn an_account_reads_the_tracker_of_a_project_it_owns_without_a_role() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = gated(&wb);
+    let other = session(&wb, OTHER);
+    let personal = wb.lock_unpoisoned().ensure_account_personal(OTHER).unwrap();
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/projects/{personal}/trackers"),
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let claimant = session(&wb, CLAIMANT);
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/projects/{personal}/trackers"),
+        Some(&claimant),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// An Agent made before Agents recorded owners.
+fn legacy_agent(wb: &SharedWorkbench) -> String {
+    let mut guard = wb.lock_unpoisoned();
+    let created = guard
+        .create_archetype("Legacy".into(), crate::library::AgentKind::Work, None)
+        .unwrap_or_else(|_| panic!("create an Agent"));
+    let mut agent = guard.library.agents[&created.id].clone();
+    agent.authoring_owner = None;
+    guard.write_agent_record(agent);
+    created.id
+}
+
+#[test]
+fn an_agent_with_no_recorded_owner_follows_the_claim_and_built_ins_stay_shared() {
+    let (_root, wb) = open();
+    let agent = legacy_agent(&wb);
+    let local = wb.lock_unpoisoned().authority().as_str().to_owned();
+    assert_eq!(
+        wb.lock_unpoisoned().agent_authoring_owner(&agent),
+        Some(local.clone())
+    );
+
+    claim(&wb, CLAIMANT);
+    let guard = wb.lock_unpoisoned();
+    assert_eq!(
+        guard.agent_authoring_owner(&agent),
+        Some(CLAIMANT.to_owned())
+    );
+    assert_eq!(
+        guard.agent_authoring_owner(crate::DEFAULT_AGENT),
+        Some(local),
+        "the built-in Agents stay the library's own"
+    );
+    assert!(guard.agent_placeable_by(crate::DEFAULT_AGENT, OTHER));
+    assert!(guard.agent_placeable_by(&agent, CLAIMANT));
+    assert!(!guard.agent_placeable_by(&agent, OTHER));
+}
+
+#[tokio::test]
+async fn an_account_places_and_uses_its_own_agents_in_its_own_personal() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let theirs = legacy_agent(&wb);
+    // Until the claim goes (WS-588) a desktop admits an account to act only
+    // once it holds a role here, as an invited member does.
+    append(
+        &wb,
+        "membership",
+        &MembershipRecord {
+            id: OTHER.into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: OTHER.into(),
+            email: String::new(),
+            role: "member".into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        },
+    );
+    let app = gated(&wb);
+    let other = session(&wb, OTHER);
+    let personal = wb.lock_unpoisoned().ensure_account_personal(OTHER).unwrap();
+
+    // A new Agent is placed on its owner's Personal, not the install's.
+    let mine = wb
+        .lock_unpoisoned()
+        .create_archetype(
+            "Mine".into(),
+            crate::library::AgentKind::Work,
+            Some(OTHER.into()),
+        )
+        .unwrap_or_else(|_| panic!("create an Agent"))
+        .id;
+    let placed_on = |agent: &str| {
+        wb.lock_unpoisoned()
+            .library
+            .instances
+            .values()
+            .filter(|instance| {
+                instance.agent_id == agent && instance.kind == crate::library::InstanceKind::Using
+            })
+            .filter_map(|instance| instance.project_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(placed_on(&mine), vec![personal.clone()]);
+
+    // Another account's Agent is not this one's to place or use.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{personal}/placements"),
+        Some(&other),
+        Some(serde_json::json!({ "agent_id": theirs })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{theirs}/use"),
+        Some(&other),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Its own Agent is used in its own Personal.
+    let (status, chat) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{mine}/use"),
+        Some(&other),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{chat}");
+    assert_eq!(
+        wb.lock_unpoisoned()
+            .library
+            .project_of_chat(chat["id"].as_str().unwrap()),
+        Some(personal.as_str())
+    );
+
+    // Deleting it ends its placement in that Personal too.
+    assert!(wb.lock_unpoisoned().delete_agent_cascade(&mine).is_ok());
+    assert!(placed_on(&mine).is_empty());
+}
+
+#[test]
+fn the_claimant_keeps_the_installs_credentials_and_another_account_has_its_own() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+    let guard = wb.lock_unpoisoned();
+    let install = crate::account::ACCOUNT_SCOPE.to_owned();
+    assert_eq!(guard.credential_scope_for(Some(&claimant)), install);
+    assert_eq!(
+        guard.credential_scope_for(None),
+        install,
+        "the local channel shares the claimant's until WS-588"
+    );
+    assert_eq!(
+        guard.credential_scope_for(Some(&other)),
+        crate::account::account_scope(OTHER)
+    );
+    // A turn resolves its actor's credentials the same way.
+    assert_eq!(guard.account_scope_for_actor(CLAIMANT), install);
+    assert_eq!(
+        guard.account_scope_for_actor(OTHER),
+        crate::account::account_scope(OTHER)
+    );
+}
+
+#[tokio::test]
+async fn an_account_sees_and_links_only_its_own_provider_credentials() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = gated(&wb);
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+    let link =
+        |provider: &'static str| serde_json::json!({ "provider": provider, "token": "sk-test" });
+    let linked = |body: serde_json::Value| {
+        body["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["provider"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(&claimant),
+        Some(link("anthropic")),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(&other),
+        Some(link("openai")),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+
+    let (_, mine) = send(&app, "GET", "/account/credentials", Some(&claimant), None).await;
+    assert_eq!(linked(mine), vec!["anthropic".to_owned()]);
+    let (_, theirs) = send(&app, "GET", "/account/credentials", Some(&other), None).await;
+    assert_eq!(linked(theirs), vec!["openai".to_owned()]);
+
+    // The turn path picks the actor's own link and never borrows another's.
+    let guard = wb.lock_unpoisoned();
+    let class = crate::account::ModelExecutionClass::LocalInteractive;
+    assert!(guard
+        .linked_providers_in_class(&guard.account_scope_for_actor(OTHER), class)
+        .contains(&"openai".to_owned()));
+    assert!(!guard
+        .linked_providers_in_class(&guard.account_scope_for_actor(OTHER), class)
+        .contains(&"anthropic".to_owned()));
+}

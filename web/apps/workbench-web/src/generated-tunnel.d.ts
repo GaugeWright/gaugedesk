@@ -26,6 +26,16 @@ declare module "@gaugewright/control-plane-client/generated/tunnel.js" {
         takeOutgoing(): Uint8Array;
         pollStatus(): number | undefined;
         takeBody(): string;
+        sendRequestHead(
+            method: string,
+            path: string,
+            headers: Record<string, string> | undefined,
+            contentLength: number,
+        ): void;
+        sendBody(chunk: Uint8Array): void;
+        bufferedBytes(): number;
+        takeBodyBytes(): Uint8Array;
+        takeHeaders(): Record<string, string>;
         isHandshaking(): boolean;
         isPaired(): boolean;
         takeCredit(): Uint8Array;

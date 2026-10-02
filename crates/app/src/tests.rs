@@ -18,6 +18,16 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 #[test]
+fn the_package_builder_and_the_harness_name_one_offer_download_tool() {
+    // The builder declares the tool the harness implements (DR-0314); a rename
+    // on one side would leave the model a tool nothing answers.
+    assert_eq!(
+        gaugedesk_boundary::definition::OFFER_DOWNLOAD_TOOL_NAME,
+        gaugedesk_whip_runtime::OFFER_DOWNLOAD_TOOL
+    );
+}
+
+#[test]
 fn context_attributes_map_labels_and_fail_closed_on_unknown() {
     use gaugedesk_core::abac::{Classification, Region};
     // SECAUD-5: known labels map; region is carried.
@@ -2236,6 +2246,93 @@ fn legacy_default_source_migrates_without_creating_a_visible_method() {
         gaugedesk_boundary::definition::GENERATED_CHAT_SOURCE_FILE
     );
     workspace.remove_engagement(&read_id).unwrap();
+}
+
+#[test]
+fn startup_backfills_download_tool_in_the_draft_only_and_is_read_only_when_current() {
+    use gaugedesk_boundary::definition as files;
+    let (dir, wb) = seeded_workbench();
+    let target_id = library_state::authoring_target_id(DEFAULT_AGENT);
+    let draft_path = format!("{}/{}", files::DRAFT_ROOT, files::MANIFEST_FILE);
+    let frozen_path = format!("{}/{}", files::version_root(1), files::MANIFEST_FILE);
+    let (legacy_manifest, frozen_text, frozen_ref) = {
+        let guard = wb.lock_unpoisoned();
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let edit_id = library::gen_id("pre-download-tool-draft");
+        let edit = workspace.create_engagement(&edit_id).unwrap();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&edit.read_file(&draft_path).unwrap()).unwrap();
+        manifest["external_tools"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|tool| tool["name"] != files::OFFER_DOWNLOAD_TOOL_NAME);
+        edit.write_file(
+            &draft_path,
+            &serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        edit.commit_turn("restore the pre-download draft").unwrap();
+        assert_eq!(
+            edit.merge_into_main().unwrap(),
+            gaugedesk_workspace::MergeOutcome::Clean
+        );
+        workspace.remove_engagement(&edit_id).unwrap();
+        (
+            manifest,
+            workspace.read_main_file(&frozen_path).unwrap().unwrap(),
+            guard.library.agents[DEFAULT_AGENT].versions[&1]
+                .package_ref
+                .clone(),
+        )
+    };
+    drop(wb);
+
+    let migrated = open_workbench(dir.path()).unwrap();
+    let migrated_cut = {
+        let guard = migrated.lock_unpoisoned();
+        let workspace = guard.targets.get(&target_id).unwrap();
+        let text = workspace.read_main_file(&draft_path).unwrap().unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut expected = legacy_manifest;
+        expected["external_tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::from_str(files::OFFER_DOWNLOAD_TOOL).unwrap());
+        assert_eq!(
+            actual, expected,
+            "append the canonical tool, preserving every authored field"
+        );
+        assert_eq!(
+            workspace.read_main_file(&frozen_path).unwrap().unwrap(),
+            frozen_text
+        );
+        assert_eq!(
+            guard.library.agents[DEFAULT_AGENT].versions[&1].package_ref,
+            frozen_ref
+        );
+        assert_eq!(guard.library.agents[DEFAULT_AGENT].current_version, 1);
+        assert!(!workspace
+            .active_engagements()
+            .unwrap()
+            .iter()
+            .any(|id| id.starts_with("download-tool-migration")));
+        workspace.current_main_cut().unwrap()
+    };
+    drop(migrated);
+
+    let reopened = open_workbench(dir.path()).unwrap();
+    let guard = reopened.lock_unpoisoned();
+    let workspace = guard.targets.get(&target_id).unwrap();
+    assert_eq!(
+        workspace.current_main_cut().unwrap(),
+        migrated_cut,
+        "current opens create no migration commit"
+    );
+    assert!(!workspace
+        .active_engagements()
+        .unwrap()
+        .iter()
+        .any(|id| id.starts_with("download-tool-migration")));
 }
 
 #[test]

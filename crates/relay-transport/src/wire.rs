@@ -418,6 +418,46 @@ pub fn data_frame(ciphertext: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Ciphertext waiting to cross, handed out one relay frame at a time.
+///
+/// The relay closes a pair for a frame over [`WSS_MAX_FRAME_BYTES`], so a
+/// carrier that wrapped everything pending in one frame was safe only while
+/// everything it sent was small. A file is not.
+#[derive(Debug, Default)]
+pub struct FrameQueue {
+    unsent: std::collections::VecDeque<u8>,
+}
+
+impl FrameQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, ciphertext: Vec<u8>) {
+        self.unsent.extend(ciphertext);
+    }
+
+    /// The next `DATA` frame, no larger than the relay accepts, or `None`.
+    pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+        if self.unsent.is_empty() {
+            return None;
+        }
+        let take = self.unsent.len().min(WSS_MAX_FRAME_BYTES - 1);
+        let mut frame = Vec::with_capacity(take + 1);
+        frame.push(WSS_DATA);
+        frame.extend(self.unsent.drain(..take));
+        Some(frame)
+    }
+
+    pub fn len(&self) -> usize {
+        self.unsent.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.unsent.is_empty()
+    }
+}
+
 /// What a received relay frame means to the carrier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayFrame {
@@ -623,6 +663,26 @@ mod tests {
             both[11] & !(1 | WSS_KEEPALIVE_FLAG | WSS_ACCOUNTING_FLAG),
             0
         );
+    }
+
+    /// A large send leaves in frames the relay accepts, in order, and nothing
+    /// is lost between them (WS-678).
+    #[test]
+    fn ciphertext_leaves_in_frames_the_relay_accepts() {
+        let mut queue = FrameQueue::new();
+        let sent: Vec<u8> = (0..(3 * WSS_MAX_FRAME_BYTES + 17))
+            .map(|index| index as u8)
+            .collect();
+        queue.push(sent[..1000].to_vec());
+        queue.push(sent[1000..].to_vec());
+        let mut received = Vec::new();
+        while let Some(frame) = queue.next_frame() {
+            assert!(frame.len() <= WSS_MAX_FRAME_BYTES);
+            assert_eq!(frame[0], WSS_DATA);
+            received.extend_from_slice(&frame[1..]);
+        }
+        assert_eq!(received, sent);
+        assert!(queue.is_empty());
     }
 
     /// DR-0302: a leg reports what it consumes once it owes enough to be worth

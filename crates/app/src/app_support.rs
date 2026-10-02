@@ -135,6 +135,13 @@ pub(crate) fn builtin_archetypes() -> &'static [BuiltinArchetype] {
     &BUILTIN_ARCHETYPES
 }
 
+/// Whether `id` is one of the library's own built-in Agents.
+pub(crate) fn is_builtin_agent(id: &str) -> bool {
+    BUILTIN_ARCHETYPES
+        .iter()
+        .any(|archetype| archetype.id == id)
+}
+
 pub(crate) fn builtin_agent_definition(
     archetype: &BuiltinArchetype,
 ) -> gaugedesk_boundary::definition::AgentDefinition {

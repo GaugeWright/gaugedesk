@@ -17,7 +17,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::wire::{
-    classify_frame, data_frame, other, websocket_handshake, RelayFrame, WebSocketRelayRole,
+    classify_frame, other, websocket_handshake, RelayFrame, WebSocketRelayRole,
     WebSocketRelayRoute, WSS_HANDSHAKE_LEN,
 };
 
@@ -71,8 +71,13 @@ pub struct BrowserTunnel {
     /// Body of the response whose status was last reported, held so the two
     /// halves cross the boundary as separate calls.
     pending: Option<Vec<u8>>,
+    /// Headers of that response, for a caller that reads it raw (WS-678).
+    pending_headers: std::collections::BTreeMap<String, String>,
     /// What this leg has taken from the relay and not yet reported (DR-0302).
     meter: crate::wire::CreditMeter,
+    /// Ciphertext taken from the session and not yet sent, in frames the relay
+    /// accepts.
+    frames: crate::wire::FrameQueue,
 }
 
 #[wasm_bindgen]
@@ -85,8 +90,10 @@ impl BrowserTunnel {
             .map(|client| BrowserTunnel {
                 client,
                 pending: None,
+                pending_headers: Default::default(),
                 paired: false,
                 meter: crate::wire::CreditMeter::new(),
+                frames: crate::wire::FrameQueue::new(),
             })
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -172,8 +179,43 @@ impl BrowserTunnel {
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Ciphertext to write to the socket, already framed as a relay `DATA`
-    /// record. Empty when there is nothing to send.
+    /// Queue a request whose body follows in parts: its head declares
+    /// `content_length` bytes, and [`Self::send_body`] hands them over as the
+    /// caller reads them (WS-678). `headers` is a plain object, or `undefined`.
+    #[wasm_bindgen(js_name = sendRequestHead)]
+    pub fn send_request_head(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: Option<js_sys::Object>,
+        content_length: f64,
+    ) -> Result<(), JsValue> {
+        if !(content_length >= 0.0 && content_length.fract() == 0.0) {
+            return Err(JsValue::from_str("content length must be a whole number"));
+        }
+        self.client
+            .send_head(method, path, &header_map(headers), content_length as usize)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// The next part of a body [`Self::send_request_head`] declared.
+    #[wasm_bindgen(js_name = sendBody)]
+    pub fn send_body(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        self.client
+            .send_body(chunk)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Bytes queued and not yet handed to the socket. A caller feeding a body
+    /// adds the socket's own `bufferedAmount` and holds the next part back
+    /// while the sum is large.
+    #[wasm_bindgen(js_name = bufferedBytes)]
+    pub fn buffered_bytes(&self) -> f64 {
+        (self.client.buffered() + self.frames.len()) as f64
+    }
+
+    /// The next relay `DATA` frame to write to the socket, or empty. A large
+    /// send takes several calls: no frame exceeds what the relay accepts.
     #[wasm_bindgen(js_name = takeOutgoing)]
     pub fn take_outgoing(&mut self) -> Result<Vec<u8>, JsValue> {
         // `pump`, not `poll`: taking a response here would consume the one
@@ -181,12 +223,8 @@ impl BrowserTunnel {
         self.client
             .pump()
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let ciphertext = self.client.session_mut().take_outgoing();
-        Ok(if ciphertext.is_empty() {
-            Vec::new()
-        } else {
-            data_frame(&ciphertext)
-        })
+        self.frames.push(self.client.session_mut().take_outgoing());
+        Ok(self.frames.next_frame().unwrap_or_default())
     }
 
     /// The response status, or `undefined` while more bytes are needed. Call
@@ -200,6 +238,7 @@ impl BrowserTunnel {
         {
             Some(response) => {
                 self.pending = Some(response.body);
+                self.pending_headers = response.headers;
                 Ok(Some(response.status))
             }
             None => Ok(None),
@@ -213,6 +252,24 @@ impl BrowserTunnel {
             .take()
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default()
+    }
+
+    /// The body of the response most recently reported, as bytes: a file is
+    /// not text, and decoding it as such would corrupt it (WS-678).
+    #[wasm_bindgen(js_name = takeBodyBytes)]
+    pub fn take_body_bytes(&mut self) -> Vec<u8> {
+        self.pending.take().unwrap_or_default()
+    }
+
+    /// The headers of the response most recently reported, as a plain object
+    /// with lowercase names.
+    #[wasm_bindgen(js_name = takeHeaders, unchecked_return_type = "Record<string, string>")]
+    pub fn take_headers(&mut self) -> Result<js_sys::Object, JsValue> {
+        let out = js_sys::Object::new();
+        for (name, value) in std::mem::take(&mut self.pending_headers) {
+            set(&out, &name, &value.into())?;
+        }
+        Ok(out)
     }
 
     /// Whether the relay has paired this leg. A caller must not send tunnel
@@ -278,6 +335,7 @@ pub struct BrowserEventTunnel {
     stream: crate::tunnel_client::TunnelEventStream,
     paired: bool,
     meter: crate::wire::CreditMeter,
+    frames: crate::wire::FrameQueue,
 }
 
 #[wasm_bindgen]
@@ -299,6 +357,7 @@ impl BrowserEventTunnel {
             stream,
             paired: false,
             meter: crate::wire::CreditMeter::new(),
+            frames: crate::wire::FrameQueue::new(),
         })
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -334,12 +393,8 @@ impl BrowserEventTunnel {
         self.stream
             .pump()
             .map_err(|error| JsValue::from_str(&error.to_string()))?;
-        let ciphertext = self.stream.session_mut().take_outgoing();
-        Ok(if ciphertext.is_empty() {
-            Vec::new()
-        } else {
-            data_frame(&ciphertext)
-        })
+        self.frames.push(self.stream.session_mut().take_outgoing());
+        Ok(self.frames.next_frame().unwrap_or_default())
     }
 
     /// The next thing the stream produced, or `undefined`: `{ kind: "opened" }`,

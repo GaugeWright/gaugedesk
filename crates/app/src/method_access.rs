@@ -73,28 +73,48 @@ impl Workbench {
                 || gaugedesk_boundary::is_control_surface_path(path))
     }
 
-    /// DR-0271: legacy local drafts stay local; compatibility ownership never
-    /// supplies the frozen source provenance used by installed-method grants.
-    pub(crate) fn agent_authoring_owner(&self, id: &str) -> Option<&str> {
+    /// An Agent with no recorded owner belongs, on a local Project Host, to
+    /// the account that claimed the computer, as its projects do, or to the
+    /// local account where nobody claimed it (DR-0313, narrowing DR-0271). The
+    /// built-in Agents stay the local account's: they are the library's own,
+    /// placed for everyone and edited by no account. Compatibility ownership
+    /// never supplies the frozen source provenance used by installed-method
+    /// grants.
+    pub(crate) fn agent_authoring_owner(&self, id: &str) -> Option<String> {
         let agent = self.library.agents.get(id)?;
         agent
             .authoring_owner
-            .as_deref()
+            .clone()
             .or_else(|| {
                 agent
                     .versions
                     .get(&agent.current_version)
-                    .and_then(|version| version.source_owner_authority.as_deref())
+                    .and_then(|version| version.source_owner_authority.clone())
             })
             .or_else(|| {
-                (!self.hosted_home_mode() && !crate::workbench_auth::web_account_mode())
-                    .then(|| self.authority().as_str())
+                (!self.hosted_home_mode() && !crate::workbench_auth::web_account_mode()).then(
+                    || {
+                        if crate::app_support::is_builtin_agent(id) {
+                            self.authority().as_str().to_owned()
+                        } else {
+                            self.legacy_project_owner()
+                        }
+                    },
+                )
             })
-            .filter(|owner| !owner.is_empty() && *owner != "anonymous")
+            .filter(|owner| !owner.is_empty() && owner != "anonymous")
+    }
+
+    /// Whether `actor` may place Agent `id` on a project: a built-in Agent,
+    /// or one the actor owns (DR-0268 §5). Accounts are independent, so one
+    /// account's Agent is not another's to place.
+    pub(crate) fn agent_placeable_by(&self, id: &str, actor: &str) -> bool {
+        crate::app_support::is_builtin_agent(id)
+            || self.agent_authoring_owner(id).as_deref() == Some(actor)
     }
 
     pub(crate) fn agent_authoring_visible(&self, id: &str, actor: Option<&str>) -> bool {
-        actor.is_some_and(|actor| self.agent_authoring_owner(id) == Some(actor))
+        actor.is_some_and(|actor| self.agent_authoring_owner(id).as_deref() == Some(actor))
     }
 
     /// None denotes a work chat, whose project admission remains separate.
@@ -108,8 +128,9 @@ impl Workbench {
             self.agent_authoring_visible(&instance.agent_id, actor)
                 && actor.is_some_and(|actor| {
                     chat.owner
-                        .as_deref()
+                        .clone()
                         .or_else(|| self.agent_authoring_owner(&instance.agent_id))
+                        .as_deref()
                         == Some(actor)
                 }),
         )
@@ -876,7 +897,9 @@ mod workshop_upgrade_tests {
         };
         let shared = crate::open_workbench(root.path()).unwrap();
         let app = crate::open_control_plane(shared.clone());
-        let assert_context = |token: Option<String>, local: bool| {
+        // Which context sees the Agent drafted signed out, and which the one
+        // drafted signed in.
+        let assert_context = |token: Option<String>, local: bool, owned: bool| {
             let app = app.clone();
             let (local_agent, local_chat, owned_agent, owned_chat) = (
                 local_agent.clone(),
@@ -890,7 +913,7 @@ mod workshop_upgrade_tests {
                 let workspace: serde_json::Value = serde_json::from_str(&body).unwrap();
                 for (agent, chat, visible) in [
                     (&local_agent, &local_chat, local),
-                    (&owned_agent, &owned_chat, !local),
+                    (&owned_agent, &owned_chat, owned),
                 ] {
                     assert_eq!(
                         workspace["archetypes"]
@@ -976,11 +999,13 @@ mod workshop_upgrade_tests {
                 }
             }
         };
-        assert_context(None, true).await;
+        assert_context(None, true, false).await;
         crate::account_signin::store_session_for_test(&shared);
         crate::home_owner::claim_if_never_claimed(&shared).unwrap();
         let signed = crate::desktop_session::home_session(&shared).unwrap();
-        assert_context(Some(signed.clone()), false).await;
+        // DR-0313: the claim gives the claimant the computer's earlier Agents,
+        // as DR-0309 gave it the projects.
+        assert_context(Some(signed.clone()), true, true).await;
         // Another independently admitted account still cannot borrow either
         // account's draft, even with org-wide project visibility.
         let other = shared
@@ -1033,7 +1058,7 @@ mod workshop_upgrade_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_context(None, true).await;
+        assert_context(None, false, false).await;
         assert_eq!(shared.lock_unpoisoned().authority().as_str(), local_actor);
         assert!(
             shared.lock_unpoisoned().library.agents[&local_agent].versions[&1]
@@ -1053,13 +1078,13 @@ mod workshop_upgrade_tests {
             reopened
                 .lock_unpoisoned()
                 .agent_authoring_owner(&local_agent),
-            Some(local_actor.as_str())
+            Some("account-root".to_owned())
         );
         assert_eq!(
             reopened
                 .lock_unpoisoned()
                 .agent_authoring_owner(&owned_agent),
-            Some("account-root")
+            Some("account-root".to_owned())
         );
     }
 

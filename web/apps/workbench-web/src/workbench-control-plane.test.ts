@@ -4,11 +4,84 @@ import {
     type ProjectId,
     setDirectoryModuleLoader,
     setTunnelModuleLoader,
-    type TunnelFacade,
+    type RawTunnelFacade,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane } from "./workbench-control-plane";
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("desktop-only route placement (WS-675)", () => {
+    it("refuses native session and federation reads without contacting a hosted plane", async () => {
+        const fetch = vi.fn();
+        vi.stubGlobal("fetch", fetch);
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        expect(api.desktopSessionAvailable).toBe(false);
+        expect(api.desktopFederationAvailable).toBe(false);
+        await expect(api.hubSessionStatus()).rejects.toThrow("unavailable in this composition");
+        await expect(api.hubSessionAccounts()).rejects.toThrow("unavailable in this composition");
+        await expect(api.listPeers()).rejects.toThrow("unavailable in this composition");
+        expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it.each([false, true])("keeps desktop reads local when remote-selected=%s", async (remote) => {
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        const paths: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            paths.push(url);
+            if (url === "http://127.0.0.1:4919/account/hub-session") return new Response(JSON.stringify({ linked: true, person: "alice" }));
+            if (url === "http://127.0.0.1:4919/federation/peers") return new Response(JSON.stringify({ peers: [] }));
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        api.setNativeRemote(remote);
+        expect(api.desktopSessionAvailable).toBe(true);
+        expect(api.desktopFederationAvailable).toBe(true);
+        await expect(api.hubSessionStatus()).resolves.toMatchObject({ linked: true, person: "alice" });
+        await expect(api.listPeers()).resolves.toEqual([]);
+        expect(paths).toEqual([
+            "http://127.0.0.1:4919/account/hub-session",
+            "http://127.0.0.1:4919/federation/peers",
+        ]);
+    });
+});
+
+describe("unpublished directory discovery (WS-675)", () => {
+    afterEach(() => setDirectoryModuleLoader(null));
+    it("reads once per route resolution, reusing the fallback until the project or account changes", async () => {
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        const paths: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            paths.push(url);
+            if (url === "https://hub.example/account/homes") return new Response(JSON.stringify({
+                homes: [{ id: "home:cloud", kind: "cloud", endpoint: "https://home.example" }], selected_home: "home:cloud",
+            }));
+            if (url === "https://hub.example/account/home-routes") return new Response(JSON.stringify({ routes: [] }));
+            if (url === "https://hub.example/account/directory") return new Response(null, { status: 404 });
+            if (url === "https://home.example/home/admissions") return new Response(JSON.stringify({ home: "home:cloud", admission: "home-token" }));
+            if (url === "https://home.example/workspace") return new Response(JSON.stringify({
+                archetypes: [], projects: [], recent: [], workstreams: [], work_targets: [], personal_placement: null,
+            }));
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("account-token");
+        api.setCurrentProject("project:a" as ProjectId);
+        for (let i = 0; i < 6; i++) await expect(api.getWorkspace()).resolves.toMatchObject({ projects: [] });
+        const discoveryCount = () => paths.filter((path) => path.endsWith("/account/directory")).length;
+        // Initial pool discovery, then one repair read for the ungranted project.
+        expect(discoveryCount()).toBe(2);
+        expect(paths.filter((path) => path.endsWith("/home/admissions"))).toHaveLength(1);
+        api.setCurrentProject("project:b" as ProjectId);
+        await api.getWorkspace();
+        expect(discoveryCount()).toBe(3);
+        api.setBearer("next-account-token");
+        await api.getWorkspace();
+        expect(discoveryCount()).toBe(5);
+        expect(paths.filter((path) => path.endsWith("/home/admissions"))).toHaveLength(2);
+    });
+});
 
 describe("organization shared project creation", () => {
     it("keeps Desktop organization account calls on the sealed local account route", async () => {
@@ -406,6 +479,9 @@ describe("hosted Home bootstrap", () => {
             throw new Error(`unexpected fetch ${url}`);
         }));
         const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        // The unrouted-project fallback keeps one attempted transport, but a
+        // failed bootstrap still clears it so Retry can establish a fresh one.
+        api.setCurrentProject("project:unpublished" as ProjectId);
 
         const asleep = await api.bootstrapHome();
         expect(asleep).toMatchObject({ kind: "none", selectedHome: "home:laptop" });
@@ -1134,14 +1210,35 @@ describe("work carried to a relay-only Home (DESK-7, HOME-1)", () => {
      * minted is refused, whatever bearer comes with it. */
     function relayOnlyHome() {
         const carried: Array<{ call: string; headers: Record<string, string> | undefined }> = [];
-        class Tunnel implements TunnelFacade {
+        class Tunnel implements RawTunnelFacade {
             private reply: { status: number; body: string } | null = null;
+            private raw: { status: number; body: Uint8Array } | null = null;
+            private rawHeaders: Record<string, string> = {};
+            /** A raw request, answered the way the Home's file route is. */
+            sendRequestHead(method: string, path: string, headers: Record<string, string> | undefined): void {
+                const call = `${method} ${path}`;
+                carried.push({ call, headers });
+                const admitted = headers?.["x-gaugewright-home-admission"] === "minted"
+                    && headers?.authorization === "Bearer person-token";
+                this.rawHeaders = { "content-type": "text/plain; charset=utf-8" };
+                this.raw = admitted && path.startsWith("/chats/c1/file?")
+                    ? { status: 200, body: new TextEncoder().encode("hello from the Home") }
+                    : { status: 401, body: new TextEncoder().encode('{"error":"present the Home admission"}') };
+            }
+            sendBody(): void {}
+            bufferedBytes(): number { return 0; }
+            takeBodyBytes(): Uint8Array {
+                const body = this.raw?.body ?? new Uint8Array();
+                this.raw = null;
+                return body;
+            }
+            takeHeaders(): Record<string, string> { return this.rawHeaders; }
             receiveFrame(): void {}
             takeOutgoing(): Uint8Array { return new Uint8Array(); }
             isHandshaking(): boolean { return false; }
             isPaired(): boolean { return true; }
             takeCredit(): Uint8Array { return new Uint8Array(); }
-            pollStatus(): number | undefined { return this.reply?.status; }
+            pollStatus(): number | undefined { return this.reply?.status ?? this.raw?.status; }
             takeBody(): string {
                 const body = this.reply?.body ?? "";
                 this.reply = null;
@@ -1256,6 +1353,20 @@ describe("work carried to a relay-only Home (DESK-7, HOME-1)", () => {
         api.setCurrentProject("proj-relay" as never);
         return { api, carried, streamed, sockets };
     }
+
+    it("reads a relay-only Home's files over a tunnel of their own (WS-678)", async () => {
+        // The tunnel used to carry JSON alone, so every file and config read
+        // from a relay-only Home said "Home raw transport unavailable".
+        const { api, carried, sockets } = relayOnlyHome();
+        expect(await api.getFile("c1" as never, "notes.md")).toBe("hello from the Home");
+        const read = carried.find((entry) => entry.call === "GET /chats/c1/file?path=notes.md");
+        expect(read?.headers).toMatchObject({
+            authorization: "Bearer person-token",
+            "x-gaugewright-home-admission": "minted",
+        });
+        // Its own carrier: one for the calls, one for the raw requests.
+        expect(sockets).toHaveLength(2);
+    });
 
     it("streams a relay-only Home's changes over a tunnel of its own (WS-634)", async () => {
         // The tunnel used to carry calls only, so desk opened no stream to such

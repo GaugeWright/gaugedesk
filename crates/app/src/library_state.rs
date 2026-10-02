@@ -466,6 +466,7 @@ pub(crate) fn load_startup_library_state(
     if migrate_default_task_ability(store, &library, targets_dir, providers)? {
         library = crate::library::Library::rebuild(store).map_err(io)?;
     }
+    migrate_agent_download_tools(&library, targets_dir, providers)?;
     validate_archetype_versions(&library, targets_dir)?;
     let deleted_chats = explicitly_deleted_chats(store)?;
     let (targets, mut engagements, mut engagement_index) =
@@ -1127,6 +1128,137 @@ fn migrate_exact_pre_target_defaults(
         ])
         .map_err(io)?;
     Ok(true)
+}
+
+/// DR-0314 gives every reading Agent this tool without widening its abilities.
+/// Backfill only mutable drafts; published packages and their references stand.
+fn migrate_agent_download_tools(
+    library: &crate::library::Library,
+    targets_dir: &std::path::Path,
+    providers: &WorkspaceProviders,
+) -> std::io::Result<()> {
+    use gaugedesk_boundary::definition as files;
+
+    let manifest_path = format!("{}/{}", files::DRAFT_ROOT, files::MANIFEST_FILE);
+    for archetype in library.agents.values() {
+        let target = library.authoring_target_for(&archetype.id).ok_or_else(|| {
+            invalid_data(format!(
+                "archetype {} has no authoring target",
+                archetype.id
+            ))
+        })?;
+        if target.kind != WorkTargetKind::Managed {
+            continue;
+        }
+        let workspace = provider_for(providers, &target.id).open_at(&targets_dir.join(&target.id));
+        let text = workspace
+            .read_main_file(&manifest_path)
+            .map_err(io)?
+            .ok_or_else(|| {
+                invalid_data(format!("archetype {} has no draft manifest", archetype.id))
+            })?;
+        let mut manifest = serde_json::from_str(&text).map_err(invalid_data)?;
+        // The usual open is read-only: do not create a branch/worktree just to
+        // discover the current draft already has the tool.
+        if !append_offer_download_tool(&mut manifest)? {
+            continue;
+        }
+        let engagement_id = library::gen_id("download-tool-migration");
+        let engagement = workspace.create_engagement(&engagement_id).map_err(io)?;
+        let result = (|| {
+            // Re-read this branch's basis rather than overwriting a draft that
+            // changed between the mainline check and engagement creation.
+            let mut manifest =
+                serde_json::from_str(&engagement.read_file(&manifest_path).map_err(io)?)
+                    .map_err(invalid_data)?;
+            if !append_offer_download_tool(&mut manifest)? {
+                return Ok(());
+            }
+            engagement
+                .write_file(
+                    &manifest_path,
+                    &format!("{}\n", serde_json::to_string_pretty(&manifest).map_err(io)?),
+                )
+                .map_err(io)?;
+            engagement
+                .commit_turn("give the Agent draft offer_download")
+                .map_err(io)?;
+            if engagement.merge_into_main().map_err(io)? != MergeOutcome::Clean {
+                return Err(invalid_data(
+                    "archetype changed during download-tool migration",
+                ));
+            }
+            Ok(())
+        })();
+        let _ = workspace.remove_engagement(&engagement_id);
+        result?;
+    }
+    Ok(())
+}
+
+fn append_offer_download_tool(manifest: &mut serde_json::Value) -> std::io::Result<bool> {
+    use gaugedesk_boundary::definition as files;
+    let capabilities = manifest
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid_data("Agent draft has no capability registry"))?;
+    if !capabilities
+        .iter()
+        .any(|capability| capability.as_str() == Some("workspace.read"))
+    {
+        return Ok(false);
+    }
+    if manifest.get("external_tools").is_none() {
+        manifest["external_tools"] = serde_json::json!([]);
+    }
+    let tools = manifest
+        .get_mut("external_tools")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| invalid_data("Agent draft external_tools is not an array"))?;
+    if tools.iter().any(|tool| {
+        tool.get("name").and_then(serde_json::Value::as_str)
+            == Some(files::OFFER_DOWNLOAD_TOOL_NAME)
+    }) {
+        return Ok(false);
+    }
+    tools.push(serde_json::from_str(files::OFFER_DOWNLOAD_TOOL).map_err(invalid_data)?);
+    Ok(true)
+}
+
+#[cfg(test)]
+mod download_tool_migration_tests {
+    use super::append_offer_download_tool;
+
+    #[test]
+    fn download_tool_migration_adds_a_missing_external_tools_list_once() {
+        let mut manifest = serde_json::json!({"capabilities": ["workspace.read"]});
+        assert!(append_offer_download_tool(&mut manifest).unwrap());
+        let canonical: serde_json::Value =
+            serde_json::from_str(gaugedesk_boundary::definition::OFFER_DOWNLOAD_TOOL).unwrap();
+        assert_eq!(manifest["external_tools"], serde_json::json!([canonical]));
+        assert!(!append_offer_download_tool(&mut manifest).unwrap());
+    }
+
+    #[test]
+    fn download_tool_migration_preserves_non_readers_and_existing_declarations() {
+        for mut manifest in [
+            serde_json::json!({"capabilities": ["tracker.file"]}),
+            serde_json::json!({"capabilities": ["workspace.read"], "external_tools": [{"name": "offer_download", "description": "authored"}]}),
+        ] {
+            let before = manifest.clone();
+            assert!(!append_offer_download_tool(&mut manifest).unwrap());
+            assert_eq!(manifest, before);
+        }
+    }
+
+    #[test]
+    fn download_tool_migration_refuses_malformed_tools_without_replacing_them() {
+        let mut manifest =
+            serde_json::json!({"capabilities": ["workspace.read"], "external_tools": "malformed"});
+        let before = manifest.clone();
+        assert!(append_offer_download_tool(&mut manifest).is_err());
+        assert_eq!(manifest, before);
+    }
 }
 
 /// Project an existing draft into the visible Agent file layout. Frozen
@@ -3321,6 +3453,7 @@ impl Workbench {
         self.engagements = state.engagements;
         self.engagement_index = state.engagement_index;
         self.library = state.library;
+        self.attach_scope_index();
         self.default_instance = DEFAULT_PLACEMENT.to_owned();
     }
 
@@ -3599,7 +3732,44 @@ impl Workbench {
     pub fn rebuild_library(&mut self) {
         if let Ok(lib) = crate::library::Library::rebuild(self.store_ref()) {
             self.library = lib;
+            self.attach_scope_index();
         }
+    }
+
+    /// Point the rebuilt library at the content vault's scope→project index and
+    /// refill it, so new content in a project is keyed under that project's
+    /// key (DR-0312). A workbench without content encryption has no index.
+    pub(crate) fn attach_scope_index(&mut self) {
+        if let Some(vault) = &self.content_vault {
+            let index = vault.scope_index();
+            index.replace_from(&self.library);
+            self.library.scope_index = Some(index);
+        }
+    }
+
+    /// Re-wrap every project scope still under the install key under its
+    /// project's own key (DR-0312, WS-586). Data keys do not change; a scope
+    /// another holder retains is left for the next start.
+    pub(crate) fn adopt_project_content_custody(&self) -> usize {
+        let Some(vault) = &self.content_vault else {
+            return 0;
+        };
+        let mut scopes: Vec<String> = self.library.chat_lineage.keys().cloned().collect();
+        for project in self.library.projects.keys() {
+            scopes.push(format!("project::{project}"));
+            if let Ok(workflow) = crate::project_workflow::content_scope(project) {
+                scopes.push(workflow);
+            }
+        }
+        let mut moved = 0;
+        for scope in scopes {
+            match vault.adopt_project_custody(&scope) {
+                Ok(true) => moved += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, "content key not yet under its project's key"),
+            }
+        }
+        moved
     }
 
     pub(crate) fn library_project_display_name(&self, project_id: &str) -> String {
@@ -5613,10 +5783,19 @@ impl Workbench {
         // A Panel agent's previews are placements of its hidden forks on
         // hidden projects; they end with it rather than holding it bound.
         self.end_panel_previews_of(id);
+        // Every account's Personal holds the Agents its owner made; a
+        // placement there ends with the Agent, as in the install's Personal.
+        let in_personal = |instance: &InstanceRecord| {
+            instance
+                .project_id
+                .as_deref()
+                .and_then(|project| self.library.projects.get(project))
+                .is_some_and(|project| project.is_default)
+        };
         let bound_elsewhere = self.library.instances.values().any(|instance| {
             instance.agent_id == id
                 && instance.kind == InstanceKind::Using
-                && instance.project_id.as_deref() != Some(DEFAULT_PROJECT)
+                && !in_personal(instance)
         });
         if bound_elsewhere {
             return Err(AgentDeleteError::BoundElsewhere);
@@ -5628,7 +5807,7 @@ impl Workbench {
             .filter(|instance| {
                 instance.agent_id == id
                     && instance.kind == InstanceKind::Using
-                    && instance.project_id.as_deref() == Some(DEFAULT_PROJECT)
+                    && in_personal(instance)
             })
             .map(|instance| instance.id.clone())
             .collect();
@@ -5973,8 +6152,9 @@ impl Workbench {
             basis,
         ));
         if agent_kind == AgentKind::Work {
+            let personal = self.agent_owner_personal(&agent_id);
             let _ = self.place_archetype_on_project(
-                DEFAULT_PROJECT,
+                &personal,
                 &agent_id,
                 crate::library::Admission::Active,
             );
@@ -6039,7 +6219,7 @@ impl Workbench {
         activate_instance(self.store_mut(), &new_inst);
         let name = name.unwrap_or_else(|| format!("{} (fork)", src.name));
         self.write_agent_record(AgentRecord {
-            authoring_owner: self.agent_authoring_owner(id).map(str::to_owned),
+            authoring_owner: self.agent_authoring_owner(id),
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
             id: new_agent.clone(),
@@ -6065,8 +6245,9 @@ impl Workbench {
             basis,
         ));
         if src.agent_kind == AgentKind::Work {
+            let personal = self.agent_owner_personal(&new_agent);
             let _ = self.place_archetype_on_project(
-                DEFAULT_PROJECT,
+                &personal,
                 &new_agent,
                 crate::library::Admission::Active,
             );
@@ -6740,6 +6921,7 @@ impl Workbench {
         &mut self,
         agent_id: &str,
         title: &str,
+        personal: &str,
     ) -> Result<serde_json::Value, CreateArchetypeChatError> {
         let agent = self
             .library
@@ -6759,13 +6941,13 @@ impl Workbench {
             .find(|instance| {
                 instance.kind == InstanceKind::Using
                     && instance.agent_id == agent_id
-                    && instance.project_id.as_deref() == Some(DEFAULT_PROJECT)
+                    && instance.project_id.as_deref() == Some(personal)
             })
             .map(|instance| instance.id.clone());
         let placement_id = match existing {
             Some(placement_id) => placement_id,
             None => self
-                .place_archetype_on_project(DEFAULT_PROJECT, agent_id, Admission::Active)
+                .place_archetype_on_project(personal, agent_id, Admission::Active)
                 .map_err(CreateArchetypeChatError::Create)?,
         };
         self.create_chat_in_instance(&placement_id, title)
