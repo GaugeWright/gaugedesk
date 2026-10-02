@@ -2327,6 +2327,16 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
     color: var(--accent); font-size: var(--fs-ui); cursor: pointer;
     white-space: nowrap; text-decoration: underline; }
 
+/* An action's failure, shown in the pane where the action was taken
+   (ActionError). Renders nothing until something fails. */
+.action-error { display: flex; align-items: flex-start; gap: 6px; flex: 0 0 auto;
+    margin: 0 6px 8px; padding: 6px 8px; border-radius: 4px;
+    background: rgba(248, 81, 73, 0.14); color: var(--bad);
+    font-size: var(--fs-small); overflow-wrap: anywhere; }
+.action-error span { flex: 1 1 auto; min-width: 0; }
+.action-error button { flex: 0 0 auto; border: 0; background: none; padding: 0 2px;
+    color: inherit; cursor: pointer; }
+
 /* --- durable resource listings (RF-E1: context sources + output catalog) --- */
 .context-drawer .resource-list, .output-catalog .resource-list { display: flex;
     flex-direction: column; gap: 2px; }

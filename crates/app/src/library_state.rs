@@ -218,13 +218,15 @@ fn archetype_files(
 /// Settings control of its own. Its package keeps the full capability
 /// registry, because the ability setter admits only what the registry
 /// declares — a Chat only registry would leave no preset to raise it to.
-fn new_archetype_files() -> Vec<(String, String)> {
-    let mut files = archetype_files(
-        &crate::app_support::default_agent_definition(),
-        BTreeSet::new(),
-        true,
-    )
-    .expect("the built-in Default archetype is valid");
+/// A work Agent starts from the Default Agent's files and a Panel agent from
+/// the Panel starter.
+fn new_archetype_files(agent_kind: AgentKind) -> Vec<(String, String)> {
+    let definition = match agent_kind {
+        AgentKind::Work => crate::app_support::default_agent_definition(),
+        AgentKind::Panel => crate::app_support::panel_agent_definition(),
+    };
+    let mut files = archetype_files(&definition, BTreeSet::new(), true)
+        .expect("the built-in Default archetype is valid");
     for (path, content) in &mut files {
         if !path.ends_with(&format!(
             "/{}",
@@ -5901,7 +5903,7 @@ impl Workbench {
         let workspace = provider
             .init_at(&dir)
             .map_err(|error| CreateArchetypeError::Create(error.to_string()))?;
-        let files = new_archetype_files();
+        let files = new_archetype_files(agent_kind);
         let files = files
             .iter()
             .map(|(path, content)| (path.as_str(), content.as_str()))
@@ -8922,5 +8924,44 @@ mod chat_title_tests {
         let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
         let workbench = shared.lock_unpoisoned();
         assert_eq!(workbench.library.chats[&id].title, "Authentication repair");
+    }
+}
+
+#[cfg(test)]
+mod new_agent_files_tests {
+    use super::{new_archetype_files, AgentKind};
+    use crate::app_support;
+    use gaugedesk_boundary::definition::{AGENTS_FILE, AUTHORING_ROOT, SYSTEM_FILE};
+
+    fn file(files: &[(String, String)], name: &str) -> String {
+        files
+            .iter()
+            .find(|(path, _)| path == &format!("{AUTHORING_ROOT}/{name}"))
+            .map(|(_, body)| body.clone())
+            .unwrap_or_else(|| panic!("{name} is seeded"))
+    }
+
+    #[test]
+    fn a_new_panel_agent_starts_from_the_panel_starter_and_a_work_agent_from_default() {
+        let work = new_archetype_files(AgentKind::Work);
+        assert_eq!(
+            file(&work, SYSTEM_FILE),
+            app_support::DEFAULT_AGENT_SYSTEM_MD.trim()
+        );
+        assert_eq!(
+            file(&work, AGENTS_FILE),
+            app_support::DEFAULT_AGENT_AGENTS_MD.trim()
+        );
+
+        let panel = new_archetype_files(AgentKind::Panel);
+        assert_eq!(
+            file(&panel, SYSTEM_FILE),
+            app_support::PANEL_AGENT_SYSTEM_MD.trim()
+        );
+        assert_eq!(
+            file(&panel, AGENTS_FILE),
+            app_support::PANEL_AGENT_AGENTS_MD.trim()
+        );
+        assert!(!file(&panel, SYSTEM_FILE).contains("one person in GaugeDesk"));
     }
 }

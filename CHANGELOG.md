@@ -19,6 +19,24 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-02
+
+- A Panel session now has a folder each for the visitor, the agent and you.
+  The visitor sees what the agent puts in `artifacts/`, in the Files panel,
+  which now offers Download beside Open. `work/` is the agent's own and is
+  never shown, and only files under `outbox/` can be collected into your
+  Inbox. The download card in the chat is gone, so a deployment that shows
+  only the chat offers the visitor no files, and `deliverable/` is no longer
+  offered at all. An embedded PDF or image now opens, and a binary file now
+  downloads; before, every such read was refused.
+
+  This breaks Panel agents that collect files. One whose "Files to collect"
+  names `artifacts/`, as 0.5.3 required, can no longer be saved, published
+  or deployed. Change it to a path under `outbox/`, have the agent write what
+  you should receive there (and what the visitor should download to
+  `artifacts/`, with the Files panel on), and publish a new version.
+  Deployments already running keep collecting as before.
+
 - An operator can send GaugeWright-funded GaugeApp agent turns to a Responses
   endpoint other than OpenAI's, such as an AI gateway in front of it, with
   `GAUGEDESK_MANAGEMENT_AGENT_ENDPOINT`. It must be HTTPS, or HTTP on a
@@ -42,11 +60,59 @@ Releases up to and including 0.4.30 are recorded on the
   relay, such as a desktop at home. A message sent from the desktop app, and
   its reply, appear in an open browser tab as they happen instead of after a
   reload.
-- An Agent's settings have their own chat. Selecting an Agent in Workshop shows
-  its settings and, in the chat lane, an Agent Settings conversation that can
-  explain and change its preferred model, its abilities and, for a Panel
-  agent, its public profile. The Agent's edit chats stay rows under it.
-  Deleting the Agent ends those conversations.
+- Selecting an Agent in Workshop opens its settings and keeps its row
+  selected, with a Settings chat in the chat lane that can explain and change
+  its preferred model, its abilities and, for a Panel agent, its public
+  profile. The Agent's edit chats stay rows under it. Deleting the Agent ends
+  those conversations.
+- Agent settings is a plain page, without the explanatory text under each
+  control. The preferred model is a dropdown of the models you can reach, and
+  every model dropdown names its default ("GPT-6.1 Sol (default)"). A Panel
+  agent's public contract uses the same ability presets and model dropdown,
+  so visitors' abilities are one of the four presets, plus Ask questions.
+- A new Agent starts as Chat only: it can talk and ask you questions, but
+  cannot read or write files or run commands until you choose a preset in its
+  settings. Existing Agents and the Default agent are unchanged.
+- Selecting a Panel placement opens Panel Settings for anyone in its project,
+  not only the Agent's author. It shows the pinned version and its public
+  profile, the placement's deployments, what they returned to the Inbox, and
+  a Settings chat. Before, it did nothing unless you had authored the Agent.
+- An item you keep from an Inbox now reaches the project's work chats started
+  afterwards, at `inbound/` in the project folder. Before, it was written to
+  disk and no chat ever saw it.
+- Reopening a deployment shows its full embed code, with the loader script
+  and panel elements. Before, it showed a bare `<gw-session>` tag that
+  rendered nothing where it was pasted.
+- The top bar's inbound count now appears for a project with items waiting on
+  a person even when it has no chat, such as a project whose only placement
+  is a Panel placement. It opens the project's Inbox, or the placement's
+  Inbox in Panel Settings when every item came from that placement, and it
+  updates as soon as you keep or flag one. On the phone it is a note in the
+  queue.
+- A chat keeps its conversation when its Agent changes underneath it. A work
+  chat whose placement moves to a new Agent version, or an edit chat after
+  its editor is updated, carries on and answers under the new version.
+  Before, the model lost the whole conversation while the transcript still
+  showed it.
+- An Agent's edit chat now knows what it is editing. It explains the Agent's
+  files and when each is loaded, treats them as material rather than as
+  instructions to follow, and has WhippleScript's authoring guide and
+  examples to hand. Try the Agent's behaviour with "test in a chat".
+- A project now records the account that created it. On the desktop, a
+  signed-in account sees and opens only the projects it owns or was given
+  access to; an owner or admin role no longer reaches every project on the
+  computer. Projects from before this release belong to the account that
+  claimed the computer, so its view is unchanged.
+- On a managed Project Host, the Compute policy dialog reads and saves the
+  Isolated workspace policy on the host's own Home, the one its turns
+  enforce, and shows that Home's prices and limit per attempt. Only the
+  organization's owner can change it; other members see it read-only.
+  Before, it saved a copy on the Hub that no turn enforced. Without a
+  connection to the Home, the dialog no longer offers the policy.
+- In Commercial Operations, a product can be retired, which takes it out of
+  the Products list and the new-proposal picker while its engagements carry
+  on, and restored from the retired view. A product that no engagement uses
+  can be deleted, after review.
 - The Agent improvement campaign controls and hosted comparison routes have
   been removed. Agent editing, preview, publishing, and placement remain
   available; WhippleScript's standalone `improve` function is unaffected.
@@ -71,6 +137,20 @@ Releases up to and including 0.4.30 are recorded on the
   the window's left edge.
 - Hover help across the app appears in a quarter of a second, in the app's
   own type and colours, instead of the browser's slower, smaller tooltip.
+- When something you do in the workbench fails, such as starting a chat,
+  setting the model, forking, attaching files or keeping a change, the
+  failure now shows as a dismissable message in the pane where you did it.
+  Before, it was recorded nowhere you could see, so the control seemed to do
+  nothing. A first message sent from the empty chat whose chat could not be
+  started goes back into the box instead of disappearing.
+- The Files pane follows changes made while you look elsewhere: a turn that
+  finished in another chat, work synced in from another chat, or a tool
+  writing mid-turn. Before, it kept showing the old files until you
+  reselected the chat.
+- A Panel agent's name uses the nav row's full width. The redundant "open"
+  button beside its ⋯ menu is gone; the row itself opens the agent.
+- The rail of your messages rests in the chat pane's margin instead of
+  pushing the transcript over.
 
 ## [0.5.3] — 2026-10-01
 

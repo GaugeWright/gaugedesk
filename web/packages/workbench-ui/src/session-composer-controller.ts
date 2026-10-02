@@ -422,6 +422,22 @@ export function createSessionComposerController(
         }));
     };
 
+    /** A scope that shows no queue (the quick-start composer) cannot show a held
+     *  row either, so a send that fails there would be set aside where nobody can
+     *  see it. It goes back into the box instead: its images as attachments
+     *  again, and anything typed since kept after it. */
+    const returnToBox = (row: OutboxRow) => {
+        const notes = new Set(row.images.map((image) => `[attached image: ${image.name}]`));
+        const text = row.text.split("\n\n").filter((part) => !notes.has(part)).join("\n\n");
+        const typedSince = draft().trim();
+        setDraft(typedSince ? `${text}\n\n${typedSince}` : text);
+        setAttachments((current) => [
+            ...row.images.map((image) => ({ kind: "image" as const, ...image })),
+            ...current,
+        ]);
+        drop(row.id);
+    };
+
     const drain = () => {
         if (blocked()) return;
         // Nothing may be sent from a scope whose stored rows have not arrived.
@@ -499,7 +515,8 @@ export function createSessionComposerController(
                     drop(next.id);
                     return;
                 }
-                setAside(next.id);
+                if (options.scope() === dispatchScope && !options.capabilities().queue) returnToBox(next);
+                else setAside(next.id);
                 report(failureMessage(cause));
             })
             .finally(() => {

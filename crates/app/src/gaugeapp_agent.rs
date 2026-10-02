@@ -1733,6 +1733,43 @@ fn resolve_agent_credential(
     })
 }
 
+/// The management agent's instructions for one GaugeApp session. One text
+/// serves all six GaugeApps; the app's name, what its scope is, and a line
+/// for the two apps whose boundary a person most often crosses are filled in.
+fn gaugeapp_agent_instructions(session: &GaugeAppSession) -> String {
+    let (app, scope, app_line) = match session.app {
+        GaugeAppKind::AccountSettings => ("Account Settings", "the person's own account", ""),
+        GaugeAppKind::Administration => ("Administration", "this Personal space or organization", ""),
+        GaugeAppKind::CommercialOperations => ("Commercial Operations", "this provider tenant", ""),
+        GaugeAppKind::ProjectSettings => ("Project Settings", "this project", ""),
+        GaugeAppKind::AgentSettings => (
+            "Agent Settings",
+            "this Agent",
+            "You change this Agent's model, abilities and Panel profile. Its instructions, files and workflow are edited in its edit chats; send the person there.\n",
+        ),
+        GaugeAppKind::PanelSettings => (
+            "Panel Settings",
+            "this Panel placement",
+            "You see what a deployment returned only as an index, never its content. You may ask the project's gate to screen an item; keeping or flagging it is the person's decision.\n",
+        ),
+    };
+    format!(
+        "You are the {app} assistant in GaugeDesk. You help one person understand and operate the {app} pages for {scope}.
+
+You can list and read the pages this session admits, submit the commands those pages declare, and ask the person a question. You have no other access: no files, shell, browser, or other scopes.
+
+- Read the current page before you answer about it or change it. Pages change, so don't rely on an earlier read.
+- A command either applies immediately or becomes a proposal the person reviews. Say which happened. Report success only after the tool returns an applied receipt, and never approve your own proposal.
+- Ask before making a change the person did not clearly request, and when required information is missing.
+- Never ask for, show, guess, or put a secret in a command: passwords, keys, tokens, codes. Passkeys, secret entry, device approval and provider sign-in are done by the person in the page's own controls; point them there.
+- If something is outside these pages or your scope, say so, and tell the person where in GaugeDesk to go if you know.
+{app_line}Your scope is {kind}:{id}, acting as {actor}.",
+        kind = session.scope.kind,
+        id = session.scope.id,
+        actor = session.actor,
+    )
+}
+
 fn provider_tools() -> Value {
     json!([
         { "type": "function", "name": "gaugeapp_pages_list", "description": "List the typed pages admitted in this exact GaugeApp session.", "parameters": { "type": "object", "properties": {}, "additionalProperties": false }, "strict": true },
@@ -2571,10 +2608,7 @@ where
     }
     let credential = resolve_agent_credential(workbench, &context.session.actor)?;
     let agent_session = GaugeAppAgentSession::from_gaugeapp(&context.session);
-    let system = format!(
-        "You are the {} agent for one exact GaugeApp scope. Explain the admitted page models and help the person operate them. Use only the declared tools. A command with immediate review policy may apply directly when the tool returns an applied receipt; a human-reviewed command remains a proposal until the person reviews it. Never claim success without the tool's applied receipt. Never request, display, infer, or place secrets in tool arguments. Ask the person when required data is missing. Your exact scope is {}:{} and your actor is {}.",
-        context.session.app.as_str(), context.session.scope.kind, context.session.scope.id, context.session.actor,
-    );
+    let system = gaugeapp_agent_instructions(&context.session);
     let mut input = vec![json!({
         "role": "user",
         "content": [{ "type": "input_text", "text": message }]
@@ -3047,6 +3081,38 @@ mod tests {
             scope: session.scope.clone(),
             tool: tool.into(),
             arguments,
+        }
+    }
+
+    #[test]
+    fn each_gaugeapp_agent_is_told_its_own_app_scope_and_boundaries() {
+        let apps = [
+            (GaugeAppKind::AccountSettings, "Account Settings"),
+            (GaugeAppKind::Administration, "Administration"),
+            (GaugeAppKind::CommercialOperations, "Commercial Operations"),
+            (GaugeAppKind::ProjectSettings, "Project Settings"),
+            (GaugeAppKind::AgentSettings, "Agent Settings"),
+            (GaugeAppKind::PanelSettings, "Panel Settings"),
+        ];
+        for (app, name) in apps {
+            let mut session = gaugeapp();
+            session.app = app;
+            let text = gaugeapp_agent_instructions(&session);
+            assert!(text.starts_with(&format!("You are the {name} assistant in GaugeDesk.")));
+            assert!(text.ends_with("Your scope is tenant:tenant-a, acting as person:alice."));
+            assert!(text.contains("Report success only after the tool returns an applied receipt"));
+            assert!(text.contains("never approve your own proposal"));
+            assert!(text.contains("Never ask for, show, guess, or put a secret in a command"));
+            assert_eq!(
+                text.contains("edited in its edit chats"),
+                app == GaugeAppKind::AgentSettings,
+                "{name}"
+            );
+            assert_eq!(
+                text.contains("only as an index, never its content"),
+                app == GaugeAppKind::PanelSettings,
+                "{name}"
+            );
         }
     }
 

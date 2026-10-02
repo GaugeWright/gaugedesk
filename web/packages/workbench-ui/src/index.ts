@@ -170,6 +170,7 @@ export { archetypeVisible, childrenFor, groupChatsByArchetype, hit, lineageVarie
 export type { ChatGroup, FilterArchetype, FilterChat, FilterPlacement, FilterProject, MatchSplit, RecentChat } from "./facet-filter";
 export { forkSource, isFork } from "./fork-lineage";
 export { FreshnessBanner } from "./FreshnessBanner";
+export { ActionError } from "./ActionError";
 export { Icon } from "./icons";
 export { installTooltips } from "./tooltips";
 export type { IconName } from "./icons";

@@ -117,6 +117,7 @@ import {
     ProjectInbox,
     forkSource,
     FreshnessBanner,
+    ActionError,
     fromSnapshot,
     type ImageRef,
     ComposerModelBar,
@@ -460,6 +461,25 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     const [selected, setSelected] = createSignal<EngagementId | null>(null);
     const [status, setStatus] = createSignal("ready");
+    // `status` is a refresh key, not something on screen: panels re-read when it
+    // changes. A failure written only there was invisible, so an action that
+    // fails also reports itself in the pane where it was taken, until it is
+    // dismissed or replaced by the next failure. Success stays in `status`.
+    type FailurePane = "nav" | "chat" | "content" | "files";
+    const [actionFailure, setActionFailure] = createSignal<{ pane: FailurePane; message: string } | null>(null);
+    const reportFailure = (pane: FailurePane, message: string) => {
+        setStatus(message);
+        setActionFailure({ pane, message });
+    };
+    const failureReason = (e: unknown) =>
+        e instanceof Rejected ? e.reason : e instanceof Error ? e.message : String(e);
+    const failureNotice = (pane: FailurePane) => (
+        <ActionError
+            where={pane}
+            message={actionFailure()?.pane === pane ? actionFailure()!.message : ""}
+            onDismiss={() => setActionFailure(null)}
+        />
+    );
     const clientBuild = reportedClientBuild();
     const recordFeature = (feature: "chat.create" | "chat.turn", outcome: "completed" | "failed") => {
         const tenant = props.gaugeApps?.selectedTenant()?.id;
@@ -1249,7 +1269,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [modelsRequest, setModelsRequest] = createSignal(0);
     // With no chat open, the same picker pins the model/effort the FIRST message
     // will run with — held here, applied to the new chat's config by
-    // startNewChat, then cleared. The composer is one component either way.
+    // createNewChat, then cleared. The composer is one component either way.
     const [pendingPin, setPendingPin] = createSignal<{ id: string; provider: string } | null>(null);
     const [pendingThinking, setPendingThinking] = createSignal("");
     const [quickTargetChoice, setQuickTargetChoice] = createSignal<{
@@ -1299,7 +1319,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             await api.putConfig(id, writeChatModelPin(chatConfig() ?? "{}", pin));
             await refetchChatConfig();
         } catch (e) {
-            setStatus(`couldn't set the model — ${String(e)}`);
+            reportFailure("chat", `couldn't set the model — ${failureReason(e)}`);
         }
     }
     // Pin the reasoning effort for this chat; "" clears it (model default).
@@ -1313,7 +1333,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             await api.putConfig(id, writeChatThinking(chatConfig() ?? "{}", level));
             await refetchChatConfig();
         } catch (e) {
-            setStatus(`couldn't set reasoning effort — ${String(e)}`);
+            reportFailure("chat", `couldn't set reasoning effort — ${failureReason(e)}`);
         }
     }
     // The files a turn actually changed, read from the diff (round-7 #3). The
@@ -1600,7 +1620,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             if (!isTauri()) return;
             const chat = selected();
             const file = selectedFile();
-            if (!chat || !file) { setStatus("Open the synthetic test file in its chat before saving evidence."); return; }
+            if (!chat || !file) { reportFailure("chat", "Open the synthetic test file in its chat before saving evidence."); return; }
             try {
                 const [transcript, session, context, content] = await Promise.all([
                     api.getTranscript(chat), api.hubSessionStatus(), api.getContextUsage(chat), api.getFile(chat, file),
@@ -1612,8 +1632,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 const evidence = await chatAcceptanceEvidence({ transcript, session, context, content, chat, file },
                     (text) => invoke<string>("hash_chat_acceptance_text", { text }));
                 const saved = await invoke<boolean>("save_chat_acceptance", { evidence });
-                setStatus(saved ? "Chat test evidence saved. It contains hashes and outcomes only." : "Chat test evidence was not saved.");
-            } catch (error) { setStatus(`Chat test evidence could not be saved: ${error instanceof Error ? error.message : String(error)}`); }
+                if (saved) setStatus("Chat test evidence saved. It contains hashes and outcomes only.");
+                else reportFailure("chat", "Chat test evidence was not saved.");
+            } catch (error) { reportFailure("chat", `Chat test evidence could not be saved: ${failureReason(error)}`); }
         };
         const captureChatEvidence = () => { void saveChatEvidence(); };
         window.addEventListener("gw-chat-acceptance", captureChatEvidence);
@@ -1954,7 +1975,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 if (thinking) cfg = writeChatThinking(cfg, thinking);
                 await api.putConfig(id, cfg);
             } catch {
-                setStatus("couldn't carry the model choice onto the new chat");
+                reportFailure("chat", "couldn't carry the model choice onto the new chat");
             }
             setPendingPin(null);
             setPendingThinking("");
@@ -1966,7 +1987,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (prompt) {
             // Let the selected-chat effect subscribe before the first turn starts;
             // otherwise an eager turn can race the fresh transcript reset.
-            queueMicrotask(() => void runPrompt(id, prompt, images).catch(() => undefined));
+            queueMicrotask(() => void runPrompt(id, prompt, images).catch((e) => {
+                // No composer row owns this first turn, so nothing else reports it.
+                if (!turnStopped(e) && selected() === id) {
+                    reportFailure("chat", e instanceof Rejected
+                        ? describeFailure("run that turn", e)
+                        : `couldn't run that turn — ${failureReason(e)}`);
+                }
+            }));
         }
     }
 
@@ -1974,7 +2002,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // placement can read several targets, the prominent empty-state path uses the
     // same explicit target-set rule as navigation instead of submitting an
     // ambiguous singular create request that the server must refuse.
-    async function startNewChat(initialPrompt?: string, images: ImageRef[] = []) {
+    //
+    // This throws, so the composer, which holds the message being sent, keeps it
+    // as a held row and says why; `startNewChat` is the caller with no message.
+    async function createNewChat(initialPrompt?: string, images: ImageRef[] = []) {
         const prompt = initialPrompt?.trim() || undefined;
         try {
             const workspace = await api.getWorkspace();
@@ -1999,7 +2030,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             await finishNewChat(eng.id, prompt, images);
         } catch (e) {
             recordFeature("chat.create", "failed");
-            setStatus(`couldn't start a chat — ${String(e)}`);
+            throw new Error(`couldn't start a chat — ${failureReason(e)}`);
+        }
+    }
+
+    async function startNewChat() {
+        try {
+            await createNewChat();
+        } catch (e) {
+            reportFailure("chat", failureReason(e));
         }
     }
 
@@ -2026,7 +2065,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             await finishNewChat(id, choice.prompt, choice.images);
         } catch (error) {
             recordFeature("chat.create", "failed");
-            setStatus(`couldn't start a chat — ${String(error)}`);
+            reportFailure("chat", `couldn't start a chat — ${failureReason(error)}`);
         }
     }
 
@@ -2181,7 +2220,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             bumpNav(); // keep/discard changes the task queue → refresh nav + review dots
             await Promise.all([refetchMerge(), refetchDiff(), loadSnapshot(id)]);
         } catch (e) {
-            setStatus(e instanceof Rejected ? `couldn't do that — ${e.reason}` : `something went wrong — ${String(e)}`);
+            reportFailure("content", e instanceof Rejected ? `couldn't do that — ${e.reason}` : `something went wrong — ${failureReason(e)}`);
         }
     }
 
@@ -2190,7 +2229,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (!info || info.kind === "edit") return undefined;
         const writable = info.targets.filter((target) => target.participation === "writable");
         if (writable.length === 0) {
-            setStatus("context needs a writable target; every selected target is read-only");
+            reportFailure("files", "context needs a writable target; every selected target is read-only");
             return null;
         }
         if (writable.length === 1) return writable[0].targetId;
@@ -2201,7 +2240,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (answer === null) return null;
         const selected = writable[Number(answer.trim()) - 1];
         if (!selected) {
-            setStatus("context was not ingested — choose one listed target");
+            reportFailure("files", "context was not ingested — choose one listed target");
             return null;
         }
         return selected.targetId;
@@ -2217,7 +2256,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setStatus(`ingested ${c} file(s)`);
             await Promise.all([refetchDiff(), refetchMerge()]);
         } catch (e) {
-            setStatus(`context error: ${String(e)}`);
+            reportFailure("files", `context error: ${failureReason(e)}`);
         }
     }
 
@@ -2282,7 +2321,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }
         }
         if (!files.length && !streamed.length) {
-            setStatus(`nothing ingested — ${skipped.length} file(s) too large or unreadable`);
+            reportFailure("files", `nothing ingested — ${skipped.length} file(s) too large or unreadable`);
             return;
         }
         try {
@@ -2298,7 +2337,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             setStatus(skipped.length ? `ingested ${n} file(s); skipped ${skipped.length}` : `ingested ${n} file(s)`);
             await Promise.all([refetchDiff(), refetchMerge()]);
         } catch (e) {
-            setStatus(`context error: ${String(e)}`);
+            reportFailure("files", `context error: ${failureReason(e)}`);
         }
     }
 
@@ -2389,9 +2428,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         projectId: import("@gaugewright/control-plane-client").ProjectId,
         _projectName: string,
         kind: "external-vcs" | "external-folder",
+        where: FailurePane = "nav",
     ) {
         if (!isTauri()) {
-            setStatus("attaching an existing Project Host folder is available in the desktop app");
+            reportFailure(where, "attaching an existing Project Host folder is available in the desktop app");
             return;
         }
         const { open } = await import("@tauri-apps/plugin-dialog");
@@ -2409,7 +2449,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 : `attached ${name} with compare-before-write concurrency`);
             bumpNav();
         } catch (error) {
-            setStatus(`couldn't attach ${name} — ${String(error)}`);
+            reportFailure(where, `couldn't attach ${name} — ${failureReason(error)}`);
         }
     }
 
@@ -2417,7 +2457,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // grid and the mobile Carousel). They are plain accessors so the island stays
     // projection-agnostic: it receives ready-rendered panes and only decides which
     // one is on screen.
-    const navPane = () => (
+    const navPane = () => (<>
+        {failureNotice("nav")}
         <FacetBrowser
             api={api}
             selected={selected()}
@@ -2448,7 +2489,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }}
             onDeployPlacement={setDeployment}
             onOpenPanelAgent={(agent, project) => void openPanelAgent(agent, project)
-                .catch((error) => setStatus(`Couldn't open ${agent.name}: ${String(error)}`))}
+                .catch((error) => reportFailure("nav", `Couldn't open ${agent.name}: ${failureReason(error)}`))}
             onOpenPanelPlacement={openPanelSettings}
             onOpenInbox={(id, name) => setProjectInbox({ id, name })}
             onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
@@ -2458,7 +2499,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             runToneOf={runToneOf}
             refreshKey={navRefresh()}
         />
-    );
+    </>);
 
     const navFooter = () => (
         <div class="nav-footer">
@@ -2785,7 +2826,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             if (id) {
                 await runPrompt(id, text, [...images], composedId);
             } else {
-                await startNewChat(text, [...images]);
+                await createNewChat(text, [...images]);
             }
         },
         // With a chat selected this sends a turn, which carries the composed id as
@@ -2817,7 +2858,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const chatFileDrop = createFileDropTarget((files) => void desktopComposerController.attachFiles(files));
     const workspaceFileDrop = createFileDropTarget((files) => {
         if (!selected()) {
-            setStatus("Open a chat before importing files.");
+            reportFailure("files", "Open a chat before importing files.");
             return;
         }
         void uploadFiles(files);
@@ -2873,7 +2914,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             await runPrompt(branch, composed.text, [...composed.images]);
         } catch (error) {
             composed.restore();
-            setStatus(`couldn't fork this chat — ${String(error)}`);
+            reportFailure("chat", `couldn't fork this chat — ${failureReason(error)}`);
         }
     }
 
@@ -2928,7 +2969,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                     bumpNav();
                                     const next = await refetchTutorial();
                                     setProjectTasks({ id: (next?.runProject ?? info().project) as ProjectId, name: "Tutorials", queue: "tutorials" });
-                                } catch (error) { setStatus(`Could not start Basics: ${String(error)}`); }
+                                } catch (error) { reportFailure("content", `Could not start Basics: ${failureReason(error)}`); }
                             }}>Start Basics</button>
                         </Show>
                         <span>{info().status === "complete" ? "Completed" : info().openTasks ? `${info().openTasks} open task${info().openTasks === 1 ? "" : "s"}` : ""}</span>
@@ -3001,6 +3042,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 onAddFiles={addFiles}
                 onAddFile={addFile}
             />
+            {failureNotice("files")}
             {/* Hidden native pickers behind the menu's import actions
                 actions (browser build). `webkitdirectory` (set via ref — it isn't a
                 typed JSX attribute) makes the first a folder picker; the second is a
@@ -3070,6 +3112,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </Show>
                 }
             />
+            {failureNotice("chat")}
             <Show when={selected()}>
                 <Show when={pendingApprovals().length > 0}>
                     <div class="approval-notice" data-pending-approvals role="status">
@@ -3405,7 +3448,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // — the new branch becomes the ancestor's child in the fork tree.
             void forkWithDestinationRetry((origin as EngagementId | undefined) ?? id, entryId)
                 .then(openChat)
-                .catch((error) => setStatus(`couldn't fork this point — ${String(error)}`));
+                .catch((error) => reportFailure("chat", `couldn't fork this point — ${failureReason(error)}`));
         },
     });
     const desktopEnvironment = new Environment({
@@ -4267,7 +4310,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             onCollapse: () => workbenchShell.setCollapsed("chat", true),
                         })}</Show>
                     </>}
-                    content={() => <Show when={props.gaugeApps?.active()} fallback={
+                    content={() => <>{failureNotice("content")}<Show when={props.gaugeApps?.active()} fallback={
                         <Show when={agentSettings()} keyed fallback={
                             <Show when={projectSettings()} fallback={<Show when={panelSettings()} keyed fallback={panelAgentOrContent()}>
                                 {(panel) => <PanelSettingsContent
@@ -4300,7 +4343,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                         onClose={closeProjectSettings}
                                         onChanged={refreshProjectSettings}
                                         onAttachTarget={isTauri()
-                                            ? (kind) => void attachTarget(workspace().project.id, workspace().project.name, kind)
+                                            ? (kind) => void attachTarget(workspace().project.id, workspace().project.name, kind, "content")
                                             : undefined}
                                         onManageDeployment={setDeployment}
                                         projectShareCandidates={props.gaugeApps?.projectShareCandidates}
@@ -4322,7 +4365,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         </Show>
                     }>
                         {props.gaugeApps?.content()}
-                    </Show>}
+                    </Show></>}
                     files={() => <Show when={props.gaugeApps?.active()} fallback={<Show when={tutorialsProject()} fallback={<Show when={projectSettings()} fallback={<Show when={panelSettings()} fallback={filesPane()}>
                         {(panel) => <PanelSettingsMenu
                             name={panel().name}

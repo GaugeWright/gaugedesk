@@ -1,6 +1,7 @@
 import { createRoot, createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 import {
+    BASIC_COMPOSER_CAPABILITIES,
     UNIVERSAL_COMPOSER_CAPABILITIES,
     createSessionComposerController,
 } from "./session-composer-controller";
@@ -12,7 +13,7 @@ const flush = async () => {
     for (let i = 0; i < 20; i++) await Promise.resolve();
 };
 
-function harness(send = vi.fn(async () => undefined)) {
+function harness(send = vi.fn(async () => undefined), capabilities = UNIVERSAL_COMPOSER_CAPABILITIES) {
     const [scope, setScope] = createSignal("chat-1");
     const [busy, setBusy] = createSignal(false);
     const [canCommand, setCanCommand] = createSignal(true);
@@ -23,7 +24,7 @@ function harness(send = vi.fn(async () => undefined)) {
         return createSessionComposerController({
             scope,
             busy,
-            capabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES,
+            capabilities: () => capabilities,
             canCommand,
             send,
             stop,
@@ -318,6 +319,23 @@ describe("createSessionComposerController", () => {
         await flush();
         expect(h.controller.error()).toBe("provider unavailable");
         expect(send).toHaveBeenNthCalledWith(2, "second", [], expect.any(String));
+        h.dispose();
+    });
+
+    it("returns a failed send to the box where no queue is shown", async () => {
+        // The quick-start composer shows no queue, so a held row there would be a
+        // message nobody can see: the send that failed goes back where it came from.
+        const send = vi.fn().mockRejectedValueOnce(new Error("couldn't start a chat — offline"));
+        const h = harness(send, BASIC_COMPOSER_CAPABILITIES);
+        await flush();
+        h.controller.setDraft("draft a welcome note");
+        h.controller.submit();
+        expect(h.controller.draft()).toBe("");
+        await flush();
+        await flush();
+        expect(h.controller.error()).toBe("couldn't start a chat — offline");
+        expect(h.controller.draft()).toBe("draft a welcome note");
+        expect(h.controller.queue()).toHaveLength(0);
         h.dispose();
     });
 
