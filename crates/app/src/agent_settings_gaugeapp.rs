@@ -27,6 +27,8 @@ pub fn agent_settings_scope(agent_id: &str) -> String {
 }
 
 impl GaugeAppDefinition for AgentSettings {
+    type Services = ();
+
     const APP: GaugeAppKind = GaugeAppKind::AgentSettings;
     const PATH: &'static str = "/archetypes/{id}/settings";
     const SCOPE: &'static str = "agent";

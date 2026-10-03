@@ -24,6 +24,8 @@ const ISOLATION_SET: &str = "project.network-isolation.set";
 const TARGET_NAME_SET: &str = "project.target.name.set";
 
 impl GaugeAppDefinition for ProjectSettings {
+    type Services = ();
+
     const APP: GaugeAppKind = GaugeAppKind::ProjectSettings;
     const PATH: &'static str = "/projects/{id}/settings";
     const SCOPE: &'static str = "project";

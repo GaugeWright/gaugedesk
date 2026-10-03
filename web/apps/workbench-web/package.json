@@ -18,6 +18,7 @@
     ".": "./src/index.ts",
     "./App": "./src/App.tsx",
     "./main": "./src/main.tsx",
+    "./ManagementChat": "./src/ManagementChat.tsx",
     "./workbench-control-plane": "./src/workbench-control-plane.ts"
   },
   "scripts": {

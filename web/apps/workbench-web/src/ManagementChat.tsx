@@ -1,4 +1,4 @@
-import { createMemo, createResource, createSignal, onCleanup, Show, type JSX } from "solid-js";
+import { createMemo, createResource, createSignal, onCleanup, Show, type Accessor, type JSX } from "solid-js";
 import { engagementId } from "@gaugewright/control-plane-client";
 import { ChatPanel, ChatPaneHeader, localTurnActivity, type Session, type Transcript } from "@gaugewright/workbench-ui";
 import type { ManagementSession, ManagementTarget, WorkbenchControlPlane } from "./workbench-control-plane";
@@ -16,7 +16,7 @@ export const MANAGEMENT_CHAT_COPY: Record<ManagementTarget["app"], ManagementCha
     "panel-settings": { label: "Panel settings" },
 };
 
-interface Props {
+interface SettingsProps {
     readonly api: WorkbenchControlPlane;
     readonly target: ManagementTarget;
     /** The managed thing's name, shown in the chat header. */
@@ -26,8 +26,45 @@ interface Props {
     readonly onChanged: () => void | Promise<void>;
 }
 
+/** An admitted controller owns its transport, streaming transcript and command
+ * lifetimes. Sharing the chat surface must not admit a second session or move
+ * that controller's scope onto the settings Home transport. */
+interface OwnedProps {
+    readonly ownedSession: Accessor<Session | undefined>;
+    readonly label: string;
+    readonly name: string;
+    readonly kind: "management" | "settings";
+    readonly mobile: boolean;
+    readonly onCollapse: () => void;
+    readonly composerPlaceholder: string;
+    readonly fallback: JSX.Element;
+    readonly menu: JSX.Element;
+    readonly beforeComposer: JSX.Element;
+    readonly afterComposer: JSX.Element;
+}
+
 /** The bounded management conversation of any GaugeApp the Home serves. */
-export function ManagementChat(props: Props): JSX.Element {
+export function ManagementChat(props: SettingsProps | OwnedProps): JSX.Element {
+    return "ownedSession" in props
+        ? <ManagementChatPresentation {...props} />
+        : <SettingsManagementChat {...props} />;
+}
+
+function ManagementChatPresentation(props: OwnedProps): JSX.Element {
+    return <Show when={props.ownedSession()} fallback={props.fallback}>
+        {(active) => <>
+            <ChatPaneHeader branch={props.name} kind={props.kind}
+                statusLabel={active().busy() ? "Working" : "Ready"}
+                mobile={props.mobile} onCollapse={props.onCollapse} menu={props.menu} />
+            {props.beforeComposer}
+            <ChatPanel session={active()} bare agentName={props.label}
+                composerPlaceholder={props.composerPlaceholder} />
+            {props.afterComposer}
+        </>}
+    </Show>;
+}
+
+function SettingsManagementChat(props: SettingsProps): JSX.Element {
     const copy = () => MANAGEMENT_CHAT_COPY[props.target.app];
     const [session, { refetch: refetchSession }] = createResource(() => props.target,
         (target) => props.api.openManagement(target));
@@ -105,16 +142,17 @@ export function ManagementChat(props: Props): JSX.Element {
     });
     const clearLabel = () => `Clear ${copy().label.toLowerCase()} conversation`;
     return <div class="management-chat" data-management-chat={props.target.app}>
-        <Show when={chatSession()} fallback={<div class="management-chat-loading" role="status">
-            {session.error
-                ? <><p>{copy().label} chat is unavailable: {String(session.error)}</p><button type="button" onClick={() => void refetchSession()}>Retry</button></>
-                : `Opening ${copy().label.toLowerCase()}…`}
-        </div>}>
-            {(active) => <>
-                <ChatPaneHeader branch={props.name} kind="settings" statusLabel={busy() ? "Working" : "Ready"}
-                    mobile={props.mobile} onCollapse={props.onCollapse}
-                    menu={<button type="button" class="management-chat-menu" title={clearLabel()}
-                        aria-label={clearLabel()} onClick={() => setConfirmClear(true)}>⋯</button>} />
+        <ManagementChatPresentation ownedSession={chatSession} label={copy().label}
+            name={props.name} kind="settings" mobile={props.mobile} onCollapse={props.onCollapse}
+            composerPlaceholder=""
+            fallback={<div class="management-chat-loading" role="status">
+                {session.error
+                    ? <><p>{copy().label} chat is unavailable: {String(session.error)}</p><button type="button" onClick={() => void refetchSession()}>Retry</button></>
+                    : `Opening ${copy().label.toLowerCase()}…`}
+            </div>}
+            menu={<button type="button" class="management-chat-menu" title={clearLabel()}
+                aria-label={clearLabel()} onClick={() => setConfirmClear(true)}>⋯</button>}
+            beforeComposer={<>
                 <Show when={confirmClear()}><div class="management-chat-confirm" role="alert">
                     <span>Clear this conversation?</span>
                     <button type="button" onClick={() => setConfirmClear(false)}>Cancel</button>
@@ -129,9 +167,8 @@ export function ManagementChat(props: Props): JSX.Element {
                 </div></Show>
                 <Show when={messages.error}><p class="management-chat-error" role="alert">Could not load this conversation. <button type="button" onClick={() => void refetchMessages()}>Retry</button></p></Show>
                 <Show when={error()}>{(reason) => <p class="management-chat-error" role="alert">{reason()}</p>}</Show>
-                <ChatPanel session={active()} bare agentName={copy().label}
-                    composerPlaceholder="" />
             </>}
-        </Show>
+            afterComposer={null}
+        />
     </div>;
 }

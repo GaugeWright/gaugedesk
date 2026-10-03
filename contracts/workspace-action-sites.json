@@ -4810,41 +4810,41 @@
     },
     {
       "site": {
-        "callable": "agent_message",
+        "callable": "message",
         "capability": "publish",
         "count": 1,
-        "expression": "live_turn . publish (GaugeAppAgentLiveEvent :: Failed)",
-        "file": "ee/app/src/gaugeapp_routes.rs"
+        "expression": "live . publish (GaugeAppAgentLiveEvent :: Failed)",
+        "file": "crates/app/src/gaugeapp_host.rs"
       },
       "profile": "publication-review"
     },
     {
       "site": {
-        "callable": "agent_message",
+        "callable": "message",
         "capability": "publish",
         "count": 1,
-        "expression": "live_turn . publish (GaugeAppAgentLiveEvent :: Settled)",
-        "file": "ee/app/src/gaugeapp_routes.rs"
+        "expression": "live . publish (GaugeAppAgentLiveEvent :: Settled)",
+        "file": "crates/app/src/gaugeapp_host.rs"
       },
       "profile": "publication-review"
     },
     {
       "site": {
-        "callable": "agent_message",
+        "callable": "message",
         "capability": "publish",
-        "count": 2,
-        "expression": "live_turn . publish (event)",
-        "file": "ee/app/src/gaugeapp_routes.rs"
+        "count": 1,
+        "expression": "live . publish (event)",
+        "file": "crates/app/src/gaugeapp_host.rs"
       },
       "profile": "publication-review"
     },
     {
       "site": {
-        "callable": "agent_message",
+        "callable": "publish_terminal",
         "capability": "publish",
         "count": 1,
-        "expression": "runtime_live_turn . publish (event)",
-        "file": "ee/app/src/gaugeapp_routes.rs"
+        "expression": "live . publish (event)",
+        "file": "crates/app/src/gaugeapp_host.rs"
       },
       "profile": "publication-review"
     },

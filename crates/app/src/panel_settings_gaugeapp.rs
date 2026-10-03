@@ -39,6 +39,8 @@ pub fn panel_settings_scope(placement_id: &str) -> String {
 }
 
 impl GaugeAppDefinition for PanelSettings {
+    type Services = ();
+
     const APP: GaugeAppKind = GaugeAppKind::PanelSettings;
     const PATH: &'static str = "/placements/{id}/settings";
     const SCOPE: &'static str = "placement";

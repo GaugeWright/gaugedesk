@@ -50,12 +50,11 @@ import {
     type GaugeAppScope,
     type GaugeAppSession,
 } from "@gaugewright/control-plane-client";
+import { ManagementChat } from "@gaugewright/workbench-web/ManagementChat";
 import { EnterpriseControlPlane } from "@gaugewright/enterprise-client";
 import { ProjectHostsPage } from "./ProjectHostsPage";
 import { ModelProvidersPage } from "./ModelProvidersPage";
 import {
-    ChatPaneHeader,
-    ChatPanel,
     ContextMenu,
     Icon,
     type MenuState,
@@ -4057,20 +4056,18 @@ export function createGaugeAppWorkspace(options: {
             request.finish();
         }
     };
-    const chat = (controls: { readonly mobile: boolean; readonly onCollapse: () => void }) => <Show keyed when={sessionOperations.identity()}><Show when={chatSession()} fallback={<p class="gaugeapp-loading">Opening {APP_LABELS[options.app]}…</p>}>
-            {(active) => <>
-                <ChatPaneHeader
-                    branch={APP_LABELS[options.app]}
-                    kind="management"
-                    statusLabel={busy() ? "Working" : "Ready"}
-                    mobile={controls.mobile}
-                    onCollapse={controls.onCollapse}
-                    menu={<GaugeAppChatMenu
-                        busy={busy()}
-                        hasMessages={(messages()?.messages.length ?? 0) > 0}
-                        onClear={() => setConfirmingClear(true)}
-                    />}
-                />
+    const chat = (controls: { readonly mobile: boolean; readonly onCollapse: () => void }) => <Show keyed when={sessionOperations.identity()}>
+        <ManagementChat ownedSession={chatSession} label={APP_LABELS[options.app]}
+            name={APP_LABELS[options.app]} kind="management"
+            mobile={controls.mobile} onCollapse={controls.onCollapse}
+            composerPlaceholder={`ask ${APP_LABELS[options.app].toLowerCase()}…`}
+            fallback={<p class="gaugeapp-loading">Opening {APP_LABELS[options.app]}…</p>}
+            menu={<GaugeAppChatMenu
+                busy={busy()}
+                hasMessages={(messages()?.messages.length ?? 0) > 0}
+                onClear={() => setConfirmingClear(true)}
+            />}
+            beforeComposer={<>
                 <Show when={confirmingClear()}>
                     <div class="gaugeapp-chat-clear" role="alert">
                         <span>Clear this conversation? Its messages cannot be recovered.</span>
@@ -4081,15 +4078,10 @@ export function createGaugeAppWorkspace(options: {
                     </div>
                 </Show>
                 <Show when={clearError()}>{(message) => <p class="gaugeapp-chat-error" role="alert">Could not clear this conversation: {message()}</p>}</Show>
-                <ChatPanel
-                    session={active()}
-                    bare
-                    agentName={APP_LABELS[options.app]}
-                    composerPlaceholder={`ask ${APP_LABELS[options.app].toLowerCase()}…`}
-                />
-                <Show when={messages.error}><p class="gaugeapp-loading" role="alert">Could not load this conversation. <button type="button" onClick={retry}>Retry</button></p></Show>
             </>}
-        </Show></Show>;
+            afterComposer={<Show when={messages.error}><p class="gaugeapp-loading" role="alert">Could not load this conversation. <button type="button" onClick={retry}>Retry</button></p></Show>}
+        />
+    </Show>;
     const content = () => <main class="gaugeapp-content">
             <Show when={updatesDelayed()}><p class="gaugeapp-loading gaugeapp-update-delayed" role="status">
                 Updates are delayed. Showing the last loaded data. <button type="button" onClick={retry}>Refresh</button>

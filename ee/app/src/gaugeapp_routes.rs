@@ -12,9 +12,8 @@ pub use external_review::{
     stored_administration_approval, ApprovedAdministrationChange, ExternalReviewOutcome,
 };
 
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -23,14 +22,8 @@ use gaugedesk_app::account_auth::{
     normalize_email_contact, AccountAuth, ExternalSubjectKind, ExternalSubjectRecord,
 };
 use gaugedesk_app::gaugeapp_agent::{
-    append_gaugeapp_agent_exchange_prepared_current, begin_gaugeapp_agent_live_turn,
-    claim_gaugeapp_agent_turn, erase_gaugeapp_agent_transcript_current,
-    gaugeapp_agent_live_subscription, gaugeapp_agent_page_commands, gaugeapp_agent_transcript,
-    gaugeapp_agent_turn_was_stopped, gaugeapp_thread_id, migrate_legacy_gaugeapp_agent_transcript,
-    replayed_gaugeapp_agent_turn, request_gaugeapp_agent_stop,
-    run_gaugeapp_agent_turn_with_direct_actions, GaugeAppAgentContext, GaugeAppAgentError,
-    GaugeAppAgentLiveEvent, GaugeAppAgentLiveFrame, GaugeAppAgentMessage, GaugeAppAgentPage,
-    GaugeAppAgentRejection,
+    gaugeapp_agent_page_commands, migrate_legacy_gaugeapp_agent_transcript, GaugeAppAgentContext,
+    GaugeAppAgentError, GaugeAppAgentPage, GaugeAppAgentRejection,
 };
 use gaugedesk_app::gaugeapp_contract::{
     decide_gaugeapp_command, decide_reviewed_gaugeapp_command, fold_gaugeapp_changes,
@@ -39,6 +32,7 @@ use gaugedesk_app::gaugeapp_contract::{
     GaugeAppCommandGrant, GaugeAppKind, GaugeAppPageAvailability, GaugeAppPageGrant,
     GaugeAppRejection, GaugeAppScope, GaugeAppSession, ReviewPolicy, GAUGEAPP_CHANGE_KIND,
 };
+use gaugedesk_app::gaugeapp_host::GaugeAppDefinition;
 use gaugedesk_app::model_provider_management::projection::{ModelProvidersPage, UnavailableReason};
 use gaugedesk_app::org::{
     sha256_hex, ArchetypeApprovalPolicyRecord, BillingContactRecord, GroupMappingRecord,
@@ -56,9 +50,7 @@ use gaugedesk_store::{AdmitError, CommandRecordFact};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{convert::Infallible, sync::Arc, time::Instant};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
+use std::{sync::Arc, time::Instant};
 
 use crate::org_routes::{bearer, req_scope};
 
@@ -100,14 +92,7 @@ pub struct AdministrationExtensionPage {
     pub commands: Vec<AdministrationExtensionCommand>,
 }
 
-#[derive(Clone, Debug)]
-pub struct AdministrationMutationPlan {
-    pub facts: Vec<CommandRecordFact>,
-    pub notices: Vec<(&'static str, String, &'static str)>,
-    pub audit_action: &'static str,
-    pub audit_target: String,
-    pub transient_result: Option<Value>,
-}
+pub type AdministrationMutationPlan = gaugedesk_app::gaugeapp_host::CommandPlan;
 
 #[derive(Clone, Debug)]
 pub struct AdministrationExtensionError {
@@ -575,18 +560,530 @@ pub fn administration_route_inventory() -> Vec<GaugeAppRouteInventoryEntry> {
         .collect()
 }
 
-pub fn routes() -> Router<SharedWorkbench> {
-    Router::new()
-        .route("/gaugeapps/administration/sessions", post(open_session))
-        .route("/gaugeapps/administration/pages/{id}", get(read_page))
-        .route("/gaugeapps/administration/updates", get(read_updates))
-        .route(
-            "/gaugeapps/administration/agent/messages",
-            get(agent_messages).post(agent_message),
+/// The tenant-owned Administration definition. Its exact context still comes
+/// from the same domain projection and current authority checks.
+pub struct Administration;
+
+#[derive(Clone, Default)]
+pub struct AdministrationServices {
+    extension: Option<AdministrationGaugeAppExtensionHandle>,
+    captured: bool,
+    auth: Option<crate::auth_oidc::AuthShellState>,
+    saml_tests: Option<crate::identity_saml::SamlBrowserState>,
+}
+
+impl GaugeAppDefinition for Administration {
+    type Services = AdministrationServices;
+    const APP: GaugeAppKind = GaugeAppKind::Administration;
+    const PATH: &'static str = "/gaugeapps/administration";
+    const SCOPE: &'static str = "tenant";
+    const LABEL: &'static str = "Administration";
+    const CAPABILITY: &'static str = "administration-gaugeapp";
+    // Grants are projected per current tenant role, entitlement and extension,
+    // not widened from a static host-wide list.
+    const COMMANDS: &'static [&'static str] = &[];
+    const OPEN_SCOPE_BODY: bool = true;
+    const RESUMABLE_CONVERSATION: bool = true;
+    const LIVE_EVENTS: bool = true;
+    const PAGE_UPDATES: bool = true;
+
+    fn message_idempotency(headers: &HeaderMap, key: &str) -> Result<(), Box<Response>> {
+        idempotency(headers, key).map(|_| ()).map_err(Box::new)
+    }
+
+    fn direct_key(session: &GaugeAppSession, key: &str) -> String {
+        format!(
+            "agent-direct:{}",
+            hex::encode(Sha256::digest(format!("{}:{}", session.id, key).as_bytes()))
         )
-        .route("/gaugeapps/administration/agent/events", get(agent_events))
-        .route("/gaugeapps/administration/agent/stop", post(agent_stop))
-        .route("/gaugeapps/administration/agent/erase", post(agent_erase))
+    }
+
+    fn invoke_agent(
+        wb: &SharedWorkbench,
+        headers: &HeaderMap,
+        _id: &str,
+        opening: &GaugeAppSession,
+        proposal: &gaugedesk_app::gaugeapp_agent::GaugeAppAgentProposal,
+        key: &str,
+        services: &Self::Services,
+    ) -> Result<Value, GaugeAppAgentError> {
+        if proposal.command_id != "enterprise-identity.connection.validate" {
+            return Err(GaugeAppAgentError::InvalidOutput(
+                "This action needs its page-owned human flow.".into(),
+            ));
+        }
+        let envelope = {
+            let guard = wb.lock_unpoisoned();
+            let (current, _) = build_session(&guard, headers, services.extension.as_ref())
+                .map_err(|_| {
+                    GaugeAppAgentError::Rejected(GaugeAppAgentRejection::SessionRevoked)
+                })?;
+            if current.id != opening.id
+                || current.generation != opening.generation
+                || current.actor != opening.actor
+                || current.scope != opening.scope
+            {
+                return Err(GaugeAppAgentError::Rejected(
+                    GaugeAppAgentRejection::SessionMismatch,
+                ));
+            }
+            GaugeAppCommandEnvelope {
+                session_id: current.id,
+                generation: current.generation,
+                app: current.app,
+                scope: current.scope,
+                page_id: proposal.page_id.clone(),
+                command_id: proposal.command_id.clone(),
+                expected_basis: proposal.expected_basis.clone(),
+                idempotency_key: key.to_owned(),
+                payload: proposal.payload.clone(),
+                client: GaugeAppClient::Agent,
+            }
+        };
+        let response =
+            tokio::runtime::Handle::current().block_on(submit_sso_configuration_validation(
+                wb.clone(),
+                services.extension.clone().map(Extension),
+                headers.clone(),
+                envelope,
+                key.to_owned(),
+            ));
+        let status = response.status();
+        let bytes = tokio::runtime::Handle::current()
+            .block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
+            .map_err(|error| GaugeAppAgentError::Store(format!("command response: {error}")))?;
+        let body: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| GaugeAppAgentError::Store(format!("command result: {error}")))?;
+        if !status.is_success() {
+            return Err(GaugeAppAgentError::InvalidOutput(
+                body["error"]
+                    .as_str()
+                    .unwrap_or("Configuration validation was refused.")
+                    .to_owned(),
+            ));
+        }
+        let page = {
+            let guard = wb.lock_unpoisoned();
+            build_session(&guard, headers, services.extension.as_ref())
+                .ok()
+                .map(|(session, projected)| agent_context(session, projected))
+                .and_then(|current| {
+                    current
+                        .pages
+                        .into_iter()
+                        .find(|page| page.id == proposal.page_id)
+                })
+        };
+        Ok(json!({ "receipt": body["receipt"], "page": page }))
+    }
+
+    fn validate_agent(
+        wb: &Workbench,
+        headers: &HeaderMap,
+        context: &GaugeAppAgentContext,
+        envelope: &GaugeAppCommandEnvelope,
+        services: &Self::Services,
+    ) -> Result<(), GaugeAppAgentError> {
+        decide_gaugeapp_command(&context.session, envelope).map_err(|error| {
+            GaugeAppAgentError::InvalidOutput(format!("Proposal refused: {error:?}"))
+        })?;
+        plan_command(wb, headers, envelope, services.extension.as_ref()).map_err(|_| {
+            GaugeAppAgentError::InvalidOutput(format!(
+                "{} has invalid values for this page; read the current page and correct the payload",
+                envelope.command_id
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn prepare_agent_proposal(
+        wb: &Workbench,
+        headers: &HeaderMap,
+        envelope: &GaugeAppCommandEnvelope,
+        services: &Self::Services,
+    ) -> Result<CommandRecordFact, GaugeAppAgentError> {
+        let rejected = |_| {
+            GaugeAppAgentError::InvalidOutput(format!(
+            "Cannot prepare {} with the current authority and values. Refresh its page and try again.",
+            envelope.command_id
+        ))
+        };
+        let (current, _) =
+            build_session(wb, headers, services.extension.as_ref()).map_err(rejected)?;
+        decide_gaugeapp_command(&current, envelope).map_err(|error| {
+            GaugeAppAgentError::InvalidOutput(format!("Proposal refused: {error:?}"))
+        })?;
+        plan_command(wb, headers, envelope, services.extension.as_ref()).map_err(rejected)?;
+        fact(
+            &req_scope(headers),
+            GAUGEAPP_CHANGE_KIND,
+            proposed_change(&current, envelope),
+        )
+        .map_err(rejected)
+    }
+
+    const HUMAN_REVIEW: bool = true;
+
+    fn command_ceremony(
+        wb: SharedWorkbench,
+        headers: HeaderMap,
+        envelope: GaugeAppCommandEnvelope,
+        key: String,
+        services: Self::Services,
+    ) -> gaugedesk_app::gaugeapp_host::CeremonyFuture {
+        Box::pin(async move {
+            let extension = services.extension.map(Extension);
+            match envelope.command_id.as_str() {
+                "enterprise-identity.connection.validate" => Some(
+                    submit_sso_configuration_validation(wb, extension, headers, envelope, key).await),
+                "enterprise-identity.test.begin" => Some(submit_sso_browser_test_start(
+                    wb, services.auth.map(Extension), services.saml_tests.map(Extension),
+                    extension, headers, envelope, key,
+                ).await),
+                "enterprise-identity.connection.credential.set" |
+                "enterprise-identity.connection.credential.remove" => Some((
+                    StatusCode::UNPROCESSABLE_ENTITY, Json(json!({
+                        "error": "submit connection credentials through the write-only credential route"
+                    }))).into_response()),
+                _ => None,
+            }
+        })
+    }
+
+    fn plan_command(
+        wb: &Workbench,
+        headers: &HeaderMap,
+        envelope: &GaugeAppCommandEnvelope,
+        services: &Self::Services,
+    ) -> Result<MutationPlan, Box<Response>> {
+        plan_command(wb, headers, envelope, services.extension.as_ref()).map_err(Box::new)
+    }
+
+    fn requires_external_review(command: &str, services: &Self::Services) -> bool {
+        services
+            .extension
+            .as_ref()
+            .is_some_and(|extension| extension.requires_external_review(command))
+    }
+
+    fn apply_plan(
+        wb: &mut Workbench,
+        headers: &HeaderMap,
+        session: &GaugeAppSession,
+        envelope: &GaugeAppCommandEnvelope,
+        operation_key: &str,
+        plan: MutationPlan,
+        services: &Self::Services,
+    ) -> Result<MutationPlan, Box<Response>> {
+        if Self::requires_external_review(&envelope.command_id, services) {
+            return Err(Box::new(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": "external review requires the durable handoff path"
+                    })),
+                )
+                    .into_response(),
+            ));
+        }
+        if let Some(extension) = &services.extension {
+            return extension
+                .apply(
+                    wb,
+                    &tenant_id(headers),
+                    &req_scope(headers),
+                    &session.actor,
+                    envelope,
+                    operation_key,
+                    plan,
+                )
+                .map_err(extension_error)
+                .map_err(Box::new);
+        }
+        if envelope.command_id == "project.create" {
+            let value: ProjectCreatePayload = parse(&envelope.payload)?;
+            let digest = sha256_hex(operation_key);
+            let project_id = format!("proj-{}", &digest[..24]);
+            let result =
+                gaugedesk_app::library_routes::create_named_project(wb, &project_id, &value.name)
+                    .map_err(|message| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": message })),
+                    )
+                        .into_response()
+                })?;
+            return Ok(MutationPlan {
+                transient_result: Some(json!({ "project": result })),
+                audit_target: project_id,
+                ..plan
+            });
+        }
+        Ok(plan)
+    }
+
+    fn visible_change(
+        wb: &Workbench,
+        headers: &HeaderMap,
+        change: &GaugeAppChangeRecord,
+        _services: &Self::Services,
+    ) -> bool {
+        wb.admit_sso_recovery(bearer(headers), &req_scope(headers))
+            .is_err()
+            || change.command_id == "enterprise-identity.enforcement.disable"
+    }
+
+    fn review_evidence(
+        wb: SharedWorkbench,
+        headers: HeaderMap,
+        id: String,
+        body: ReviewBody,
+        services: Self::Services,
+    ) -> gaugedesk_app::gaugeapp_host::ReviewEvidenceFuture {
+        Box::pin(async move {
+            verify_domain_review_evidence(&wb, &headers, &id, &body, services.extension.as_ref())
+                .await
+                .map_err(Box::new)
+        })
+    }
+
+    fn recover_review(
+        wb: &mut Workbench,
+        headers: &HeaderMap,
+        session: &GaugeAppSession,
+        change: &GaugeAppChangeRecord,
+        body: &ReviewBody,
+        services: &Self::Services,
+    ) -> Option<Result<gaugedesk_app::gaugeapp_host::PendingAuthority, Box<Response>>> {
+        external_review::recover_if_approved(
+            wb,
+            headers,
+            session,
+            change,
+            body,
+            services.extension.as_ref(),
+        )
+        .map(|result| {
+            result
+                .map(|job| {
+                    gaugedesk_app::gaugeapp_host::PendingAuthority::new(move |wb, headers| {
+                        external_review::execute(wb, headers, job)
+                    })
+                })
+                .map_err(Box::new)
+        })
+    }
+
+    fn begin_external_review(
+        wb: &mut Workbench,
+        headers: &HeaderMap,
+        session: &GaugeAppSession,
+        review: gaugedesk_app::gaugeapp_host::ExternalReview<'_>,
+        services: &Self::Services,
+    ) -> Result<gaugedesk_app::gaugeapp_host::PendingAuthority, Box<Response>> {
+        let gaugedesk_app::gaugeapp_host::ExternalReview {
+            envelope,
+            key,
+            change,
+            plan,
+        } = review;
+        let Some(extension) = &services.extension else {
+            return Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "external review handoff is not configured" })),
+                )
+                    .into_response(),
+            ));
+        };
+        external_review::begin(wb, headers, session, envelope, key, change, extension, plan)
+            .map(|job| {
+                gaugedesk_app::gaugeapp_host::PendingAuthority::new(move |wb, headers| {
+                    external_review::execute(wb, headers, job)
+                })
+            })
+            .map_err(Box::new)
+    }
+
+    fn accept_stale_proposal(
+        wb: &Workbench,
+        envelope: &GaugeAppCommandEnvelope,
+        change: &GaugeAppChangeRecord,
+    ) -> bool {
+        if envelope.command_id != "project.create" {
+            return false;
+        }
+        serde_json::from_value::<ProjectCreatePayload>(envelope.payload.clone())
+            .ok()
+            .is_some_and(|payload| {
+                let digest = sha256_hex(&change.id);
+                gaugedesk_app::library_routes::named_project_matches(
+                    wb,
+                    &format!("proj-{}", &digest[..24]),
+                    &payload.name,
+                )
+            })
+    }
+
+    fn authorize_review(
+        session: &GaugeAppSession,
+        envelope: &GaugeAppCommandEnvelope,
+        body: &ReviewBody,
+        services: &Self::Services,
+    ) -> Result<(), Box<Response>> {
+        if !requires_fresh_authorization(&envelope.command_id) {
+            return Ok(());
+        }
+        let Some(runtime) = services.auth.as_ref().and_then(|auth| auth.account_auth()) else {
+            return Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "fresh account authorization is unavailable" })),
+                )
+                    .into_response(),
+            ));
+        };
+        if !runtime.consume_authorization_proof(
+            body.authorization_proof.as_deref().unwrap_or_default(),
+            &session.actor,
+            &envelope.command_id,
+            gaugedesk_app::account::session_now_ms() / 1_000,
+        ) {
+            return Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(
+                        json!({ "error": "confirm this operation with a current account passkey" }),
+                    ),
+                )
+                    .into_response(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reviewed_committed(
+        wb: SharedWorkbench,
+        envelope: &GaugeAppCommandEnvelope,
+        freshly_applied: bool,
+    ) {
+        if freshly_applied && envelope.command_id == "enterprise-identity.connection.set" {
+            if let Ok(sso) = serde_json::from_value::<SsoConnectionRecord>(envelope.payload.clone())
+            {
+                tokio::spawn(async move {
+                    let _ = crate::auth_oidc::activate_updated_idp(&wb, sso).await;
+                });
+            }
+        }
+    }
+
+    fn command_scope(headers: &HeaderMap) -> String {
+        command_scope(headers)
+    }
+
+    fn after_command(
+        wb: &mut Workbench,
+        headers: &HeaderMap,
+        session: &GaugeAppSession,
+        envelope: &GaugeAppCommandEnvelope,
+    ) -> Result<(), Box<Response>> {
+        if envelope.command_id == "organization.delete" {
+            // Each person's Administration/Commercial transcript has its own key,
+            // outside the parent tenant scope. A retry repeats this scan before the
+            // parent key is destroyed, so an interrupted erasure never silently
+            // strands readable child content.
+            if let Err(error) =
+                gaugedesk_app::gaugeapp_agent::crypto_erase_gaugeapp_agent_threads_for_tenant(
+                    wb,
+                    &session.scope.id,
+                )
+            {
+                return Err(Box::new(store_error(error)));
+            }
+            // The command tombstoned every live organization authority in the
+            // transaction above. Destroying the parent key completes organization
+            // erasure and is idempotent on retries and unencrypted local profiles.
+            let _ = wb.crypto_erase_content(&req_scope(headers));
+        }
+        Ok(())
+    }
+
+    fn session_stale() -> Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "GaugeApp session is stale or cross-scope"
+            })),
+        )
+            .into_response()
+    }
+
+    fn transcript_error(reason: String) -> Response {
+        agent_error(GaugeAppAgentError::Store(reason))
+    }
+
+    fn services(extensions: &axum::http::Extensions) -> Self::Services {
+        AdministrationServices {
+            extension: extensions
+                .get::<AdministrationGaugeAppExtensionHandle>()
+                .cloned(),
+            captured: true,
+            auth: extensions
+                .get::<crate::auth_oidc::AuthShellState>()
+                .cloned(),
+            saml_tests: extensions
+                .get::<crate::identity_saml::SamlBrowserState>()
+                .cloned(),
+        }
+    }
+
+    fn context(
+        wb: &Workbench,
+        headers: &HeaderMap,
+        _id: &str,
+        services: &Self::Services,
+    ) -> Result<GaugeAppAgentContext, Box<Response>> {
+        if !services.captured {
+            return Err(Box::new(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "Administration requires its composition's authority"
+                    })),
+                )
+                    .into_response(),
+            ));
+        }
+        let (session, projected) =
+            build_session(wb, headers, services.extension.as_ref()).map_err(Box::new)?;
+        Ok(agent_context(session, projected))
+    }
+
+    fn opened(context: &GaugeAppAgentContext) -> Value {
+        json!({ "session": context.session })
+    }
+
+    fn prepare_transcript(
+        wb: &mut Workbench,
+        session: &GaugeAppSession,
+    ) -> Result<(), GaugeAppAgentError> {
+        migrate_legacy_gaugeapp_agent_transcript(wb, session).map(|_| ())
+    }
+
+    fn agent_error(reason: GaugeAppAgentError) -> Response {
+        agent_error(reason)
+    }
+    fn agent_stale() -> Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "agent session is stale or cross-scope" })),
+        )
+            .into_response()
+    }
+}
+
+pub fn routes() -> Router<SharedWorkbench> {
+    gaugedesk_app::gaugeapp_host::mount::<Administration>()
         .route(
             "/gaugeapps/administration/organization/domain-verification",
             get(domain_verification_challenge),
@@ -595,43 +1092,11 @@ pub fn routes() -> Router<SharedWorkbench> {
             "/gaugeapps/administration/enterprise-identity/credential",
             post(submit_sso_credential),
         )
-        .route("/gaugeapps/administration/commands", post(submit_command))
-        .route(
-            "/gaugeapps/administration/proposals",
-            get(list_changes).post(submit_proposal),
-        )
-        .route(
-            "/gaugeapps/administration/proposals/{id}/review",
-            post(review_change),
-        )
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentMessageBody {
-    session_id: String,
-    generation: String,
-    scope: GaugeAppScope,
-    idempotency_key: String,
-    message: String,
-}
+pub type AgentStopBody = gaugedesk_app::gaugeapp_host::Identity;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentStopBody {
-    session_id: String,
-    generation: String,
-    scope: GaugeAppScope,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentEraseBody {
-    session_id: String,
-    generation: String,
-    scope: GaugeAppScope,
-    idempotency_key: String,
-}
+pub type AgentEraseBody = gaugedesk_app::gaugeapp_host::EraseBody;
 
 fn agent_error(error: GaugeAppAgentError) -> Response {
     // The reason reaches the client and, until now, nowhere else: the only
@@ -688,80 +1153,6 @@ fn agent_error(error: GaugeAppAgentError) -> Response {
         GaugeAppAgentError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(json!({ "error": error.to_string() }))).into_response()
-}
-
-async fn agent_stop(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    headers: HeaderMap,
-    Json(body): Json<AgentStopBody>,
-) -> Response {
-    // Keep the Store lock through both re-admission and stop intent. Final
-    // transcript admission takes the same lock, so either Stop wins and the
-    // final response is refused, or the completed turn wins and Stop truthfully
-    // reports that nothing remains live.
-    let guard = wb.lock_unpoisoned();
-    let (session, _) = match build_session(&guard, &headers, extension_ref(&extension)) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if body.session_id != session.id
-        || body.generation != session.generation
-        || body.scope != session.scope
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "agent session is stale or cross-scope" })),
-        )
-            .into_response();
-    }
-    let stopped = request_gaugeapp_agent_stop(&gaugeapp_thread_id(&session));
-    (StatusCode::OK, Json(json!({ "stopped": stopped }))).into_response()
-}
-
-async fn agent_erase(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    headers: HeaderMap,
-    Json(body): Json<AgentEraseBody>,
-) -> Response {
-    let session = {
-        let guard = wb.lock_unpoisoned();
-        let (session, _) = match build_session(&guard, &headers, extension_ref(&extension)) {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-        if body.session_id != session.id
-            || body.generation != session.generation
-            || body.scope != session.scope
-        {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "agent session is stale or cross-scope" })),
-            )
-                .into_response();
-        }
-        session
-    };
-    match erase_gaugeapp_agent_transcript_current(&wb, &session, &body.idempotency_key, &|guard| {
-        let rejected = |_| GaugeAppAgentError::Rejected(GaugeAppAgentRejection::SessionRevoked);
-        let (current, _) =
-            build_session(guard, &headers, extension_ref(&extension)).map_err(rejected)?;
-        if current.id != session.id
-            || current.generation != session.generation
-            || current.app != session.app
-            || current.scope != session.scope
-            || current.actor != session.actor
-        {
-            return Err(GaugeAppAgentError::Rejected(
-                GaugeAppAgentRejection::SessionMismatch,
-            ));
-        }
-        Ok(())
-    }) {
-        Ok(receipt) => (StatusCode::OK, Json(json!({ "erasure": receipt }))).into_response(),
-        Err(error) => agent_error(error),
-    }
 }
 
 fn tenant_id(headers: &HeaderMap) -> String {
@@ -1614,59 +2005,7 @@ fn extension_ref(
     extension.as_ref().map(|Extension(extension)| extension)
 }
 
-#[derive(Deserialize)]
-struct OpenBody {
-    #[serde(default)]
-    scope: Option<GaugeAppScope>,
-}
-
-async fn open_session(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    headers: HeaderMap,
-    Json(body): Json<OpenBody>,
-) -> Response {
-    let guard = wb.lock_unpoisoned();
-    match build_session(&guard, &headers, extension_ref(&extension)) {
-        Ok((session, _))
-            if body
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope != &session.scope) =>
-        {
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "requested scope is not the admitted tenant" })),
-            )
-                .into_response()
-        }
-        Ok((session, _)) => (StatusCode::OK, Json(json!({ "session": session }))).into_response(),
-        Err(response) => response,
-    }
-}
-
-#[derive(Deserialize)]
-struct SessionQuery {
-    session: String,
-    generation: String,
-    scope: String,
-}
-
-#[derive(Deserialize)]
-struct AgentMessagesQuery {
-    session: String,
-    generation: String,
-    scope: String,
-    after: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct UpdatesQuery {
-    session: String,
-    generation: String,
-    scope: String,
-    after: String,
-}
+pub type OpenBody = gaugedesk_app::gaugeapp_host::OpenScopeBody;
 
 #[derive(Deserialize)]
 struct DomainChallengeQuery {
@@ -1728,448 +2067,6 @@ async fn domain_verification_challenge(
         .into_response()
 }
 
-async fn read_page(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    Path(id): Path<String>,
-    Query(query): Query<SessionQuery>,
-    headers: HeaderMap,
-) -> Response {
-    let guard = wb.lock_unpoisoned();
-    let (session, projected) = match build_session(&guard, &headers, extension_ref(&extension)) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if query.session != session.id
-        || query.generation != session.generation
-        || query.scope != session.scope.id
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "GaugeApp session is stale or cross-scope" })),
-        )
-            .into_response();
-    }
-    let Some(page) = projected.into_iter().find(|page| page.id == id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "page is not admitted" })),
-        )
-            .into_response();
-    };
-    let grant = session
-        .pages
-        .iter()
-        .find(|page| page.id == id)
-        .expect("projected page has grant");
-    (
-        StatusCode::OK,
-        Json(json!({ "page": {
-            "app": session.app,
-            "scope": session.scope,
-            "id": page.id,
-            "read_model": page.read_model,
-            "version": page.version,
-            "resource_basis": grant.resource_basis,
-            "freshness": grant.freshness,
-            "model": page.model,
-    } })),
-    )
-        .into_response()
-}
-
-async fn read_updates(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    Query(query): Query<UpdatesQuery>,
-    headers: HeaderMap,
-) -> Response {
-    let guard = wb.lock_unpoisoned();
-    let (session, _) = match build_session(&guard, &headers, extension_ref(&extension)) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if query.session != session.id
-        || query.generation != session.generation
-        || query.scope != session.scope.id
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "GaugeApp session is stale or cross-scope" })),
-        )
-            .into_response();
-    }
-
-    let invalidations = if query.after == session.update_cursor {
-        Vec::new()
-    } else {
-        session
-            .pages
-            .iter()
-            .map(|page| {
-                json!({
-                    "page_id": page.id,
-                    "resource_basis": page.resource_basis,
-                })
-            })
-            .collect()
-    };
-    (
-        StatusCode::OK,
-        Json(json!({
-            "cursor": session.update_cursor,
-            "invalidations": invalidations,
-        })),
-    )
-        .into_response()
-}
-
-async fn agent_message(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    headers: HeaderMap,
-    Json(body): Json<AgentMessageBody>,
-) -> Response {
-    if let Err(response) = idempotency(&headers, &body.idempotency_key) {
-        return response;
-    }
-    let (context, turn_claim, turn_thread_id, live_turn) = {
-        let mut guard = wb.lock_unpoisoned();
-        let (session, projected) = match build_session(&guard, &headers, extension_ref(&extension))
-        {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-        if body.session_id != session.id
-            || body.generation != session.generation
-            || body.scope != session.scope
-        {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "agent session is stale or cross-scope" })),
-            )
-                .into_response();
-        }
-        if let Err(error) = migrate_legacy_gaugeapp_agent_transcript(&mut guard, &session) {
-            return agent_error(error);
-        }
-        match replayed_gaugeapp_agent_turn(
-            guard.store_ref(),
-            &session,
-            &body.idempotency_key,
-            &body.message,
-        ) {
-            Ok(Some(turn)) => {
-                let transcript = match gaugeapp_agent_transcript(guard.store_ref(), &session) {
-                    Ok(transcript) => transcript,
-                    Err(error) => {
-                        return agent_error(GaugeAppAgentError::Store(format!("{error:?}")))
-                    }
-                };
-                let payload = match agent_transcript_payload(&session, transcript, None) {
-                    Ok(payload) => payload,
-                    Err(response) => return response,
-                };
-                return (
-                    StatusCode::OK,
-                    Json(json!({ "turn": turn, "thread": payload })),
-                )
-                    .into_response();
-            }
-            Ok(None) => {}
-            Err(error) => return agent_error(error),
-        }
-        let thread_id = gaugeapp_thread_id(&session);
-        let Some(claim) = claim_gaugeapp_agent_turn(&thread_id) else {
-            return agent_error(GaugeAppAgentError::Busy);
-        };
-        let live = match begin_gaugeapp_agent_live_turn(&session, &body.idempotency_key) {
-            Ok(live) => live,
-            Err(error) => return agent_error(error),
-        };
-        (agent_context(session, projected), claim, thread_id, live)
-    };
-    let transcript_session = context.session.clone();
-    let transcript_idempotency_key = body.idempotency_key.clone();
-    let transcript_user = body.message.clone();
-    let runtime_wb = wb.clone();
-    let runtime_headers = headers.clone();
-    let runtime_extension = extension.clone();
-    let refresh_wb = wb.clone();
-    let validate_wb = wb.clone();
-    let validate_headers = headers.clone();
-    let validate_extension = extension.clone();
-    let action_wb = wb.clone();
-    let action_headers = headers.clone();
-    let action_extension = extension.clone();
-    let action_session = context.session.clone();
-    let direct_key = format!(
-        "agent-direct:{}",
-        hex::encode(Sha256::digest(
-            format!("{}:{}", context.session.id, body.idempotency_key).as_bytes()
-        ))
-    );
-    let runtime_thread_id = turn_thread_id.clone();
-    let runtime_live_turn = live_turn.clone();
-    match tokio::task::spawn_blocking(move || {
-        let mut invoke = |proposal: &gaugedesk_app::gaugeapp_agent::GaugeAppAgentProposal,
-                          key: &str|
-         -> Result<Value, GaugeAppAgentError> {
-            if proposal.command_id != "enterprise-identity.connection.validate" {
-                return Err(GaugeAppAgentError::InvalidOutput(
-                    "This action needs its page-owned human flow.".into(),
-                ));
-            }
-            let envelope = {
-                let guard = action_wb.lock_unpoisoned();
-                let (current, _) = build_session(
-                    &guard,
-                    &action_headers,
-                    extension_ref(&action_extension),
-                )
-                .map_err(|_| {
-                    GaugeAppAgentError::Rejected(GaugeAppAgentRejection::SessionRevoked)
-                })?;
-                if current.id != action_session.id
-                    || current.generation != action_session.generation
-                    || current.actor != action_session.actor
-                    || current.scope != action_session.scope
-                {
-                    return Err(GaugeAppAgentError::Rejected(
-                        GaugeAppAgentRejection::SessionMismatch,
-                    ));
-                }
-                GaugeAppCommandEnvelope {
-                    session_id: current.id,
-                    generation: current.generation,
-                    app: current.app,
-                    scope: current.scope,
-                    page_id: proposal.page_id.clone(),
-                    command_id: proposal.command_id.clone(),
-                    expected_basis: proposal.expected_basis.clone(),
-                    idempotency_key: key.to_owned(),
-                    payload: proposal.payload.clone(),
-                    client: GaugeAppClient::Agent,
-                }
-            };
-            let response = tokio::runtime::Handle::current().block_on(
-                submit_sso_configuration_validation(
-                    action_wb.clone(),
-                    action_extension.clone(),
-                    action_headers.clone(),
-                    envelope,
-                    key.to_owned(),
-                ),
-            );
-            let status = response.status();
-            let bytes = tokio::runtime::Handle::current()
-                .block_on(axum::body::to_bytes(response.into_body(), 1024 * 1024))
-                .map_err(|error| GaugeAppAgentError::Store(format!("command response: {error}")))?;
-            let body: Value = serde_json::from_slice(&bytes)
-                .map_err(|error| GaugeAppAgentError::Store(format!("command result: {error}")))?;
-            if !status.is_success() {
-                return Err(GaugeAppAgentError::InvalidOutput(
-                    body["error"]
-                        .as_str()
-                        .unwrap_or("Configuration validation was refused.")
-                        .to_owned(),
-                ));
-            }
-            let page = {
-                let guard = action_wb.lock_unpoisoned();
-                build_session(&guard, &action_headers, extension_ref(&action_extension))
-                    .ok()
-                    .map(|(session, projected)| agent_context(session, projected))
-                    .and_then(|current| {
-                        current
-                            .pages
-                            .into_iter()
-                            .find(|page| page.id == proposal.page_id)
-                    })
-            };
-            Ok(json!({ "receipt": body["receipt"], "page": page }))
-        };
-        let result = run_gaugeapp_agent_turn_with_direct_actions(
-            &runtime_wb,
-            context,
-            &body.message,
-            move || {
-                let guard = refresh_wb.lock_unpoisoned();
-                let (session, projected) =
-                    build_session(&guard, &runtime_headers, extension_ref(&runtime_extension))
-                        .map_err(|_| {
-                            GaugeAppAgentError::Rejected(GaugeAppAgentRejection::SessionRevoked)
-                        })?;
-                Ok(agent_context(session, projected))
-            },
-            || gaugeapp_agent_turn_was_stopped(&runtime_thread_id),
-            |event| runtime_live_turn.publish(event),
-            |current, proposal| {
-                let guard = validate_wb.lock_unpoisoned();
-                let envelope = GaugeAppCommandEnvelope {
-                    session_id: current.session.id.clone(),
-                    generation: current.session.generation.clone(),
-                    app: current.session.app,
-                    scope: current.session.scope.clone(),
-                    page_id: proposal.page_id.clone(),
-                    command_id: proposal.command_id.clone(),
-                    expected_basis: proposal.expected_basis.clone(),
-                    idempotency_key: "agent:validation".into(),
-                    payload: proposal.payload.clone(),
-                    client: GaugeAppClient::Agent,
-                };
-                decide_gaugeapp_command(&current.session, &envelope).map_err(|error| {
-                    GaugeAppAgentError::InvalidOutput(format!("Proposal refused: {error:?}"))
-                })?;
-                plan_command(
-                    &guard,
-                    &validate_headers,
-                    &envelope,
-                    extension_ref(&validate_extension),
-                )
-                .map_err(|_| {
-                    GaugeAppAgentError::InvalidOutput(format!(
-                        "{} has invalid values for this page; read the current page and correct the payload",
-                        proposal.command_id
-                    ))
-                })?;
-                Ok(())
-            },
-            Some(&mut invoke),
-            &direct_key,
-        );
-        (turn_claim, result)
-    })
-    .await
-    {
-        Ok((_turn_claim, Ok(turn))) => match append_gaugeapp_agent_exchange_prepared_current(
-            &wb,
-            &transcript_session,
-            &transcript_idempotency_key,
-            &transcript_user,
-            &turn,
-            &|guard| {
-                if gaugeapp_agent_turn_was_stopped(&turn_thread_id) {
-                    return Err(GaugeAppAgentError::Interrupted);
-                }
-                let rejected =
-                    |_| GaugeAppAgentError::Rejected(GaugeAppAgentRejection::SessionRevoked);
-                let (current, _) =
-                    build_session(guard, &headers, extension_ref(&extension)).map_err(rejected)?;
-                if current.id != transcript_session.id
-                    || current.generation != transcript_session.generation
-                    || current.app != transcript_session.app
-                    || current.scope != transcript_session.scope
-                    || current.actor != transcript_session.actor
-                {
-                    return Err(GaugeAppAgentError::Rejected(
-                        GaugeAppAgentRejection::SessionMismatch,
-                    ));
-                }
-                Ok(())
-            },
-            &|guard, envelope| {
-                let rejected = |_| {
-                    GaugeAppAgentError::InvalidOutput(format!(
-                    "Cannot prepare {} with the current authority and values. Refresh its page and try again.", envelope.command_id))
-                };
-                let (current, _) =
-                    build_session(guard, &headers, extension_ref(&extension)).map_err(rejected)?;
-                decide_gaugeapp_command(&current, envelope).map_err(|error| {
-                    GaugeAppAgentError::InvalidOutput(format!("Proposal refused: {error:?}"))
-                })?;
-                plan_command(guard, &headers, envelope, extension_ref(&extension))
-                    .map_err(rejected)?;
-                fact(
-                    &req_scope(&headers),
-                    GAUGEAPP_CHANGE_KIND,
-                    proposed_change(&current, envelope),
-                )
-                .map_err(rejected)
-            },
-        ) {
-            Ok(transcript) => {
-                let _ = live_turn.publish(GaugeAppAgentLiveEvent::Settled);
-                match agent_transcript_payload(&transcript_session, transcript, None) {
-                    Ok(thread) => (
-                        StatusCode::OK,
-                        Json(json!({ "turn": turn, "thread": thread })),
-                    )
-                        .into_response(),
-                    Err(response) => response,
-                }
-            }
-            Err(error) => {
-                let event = if matches!(&error, GaugeAppAgentError::Interrupted) {
-                    GaugeAppAgentLiveEvent::Stopped
-                } else {
-                    GaugeAppAgentLiveEvent::Failed
-                };
-                let _ = live_turn.publish(event);
-                agent_error(error)
-            }
-        },
-        Ok((_turn_claim, Err(error))) => {
-            let event = if matches!(&error, GaugeAppAgentError::Interrupted) {
-                GaugeAppAgentLiveEvent::Stopped
-            } else {
-                GaugeAppAgentLiveEvent::Failed
-            };
-            let _ = live_turn.publish(event);
-            agent_error(error)
-        }
-        Err(_) => {
-            let _ = live_turn.publish(GaugeAppAgentLiveEvent::Failed);
-            agent_error(GaugeAppAgentError::Provider("agent task failed".into()))
-        }
-    }
-}
-
-fn live_event(frame: GaugeAppAgentLiveFrame) -> Result<Event, Infallible> {
-    Ok(Event::default()
-        .data(serde_json::to_string(&frame).expect("GaugeApp live frame serializes")))
-}
-
-async fn agent_events(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    Query(query): Query<AgentMessagesQuery>,
-    headers: HeaderMap,
-) -> Response {
-    let thread_id = {
-        let guard = wb.lock_unpoisoned();
-        let (session, _) = match build_session(&guard, &headers, extension_ref(&extension)) {
-            Ok(value) => value,
-            Err(response) => return response,
-        };
-        if query.session != session.id
-            || query.generation != session.generation
-            || query.scope != session.scope.id
-        {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "agent session is stale or cross-scope" })),
-            )
-                .into_response();
-        }
-        gaugeapp_thread_id(&session)
-    };
-    let (retained, receiver) = gaugeapp_agent_live_subscription(&thread_id, query.after.as_deref());
-    let retained = tokio_stream::iter(retained.into_iter().map(live_event));
-    let broadcast_thread = thread_id.clone();
-    // A lagged broadcast subscriber closes so the browser reconnects with its
-    // last cursor and repairs from the retained server buffer.
-    let current = BroadcastStream::new(receiver)
-        .take_while(|message| message.is_ok())
-        .filter_map(move |message| match message {
-            Ok(frame) if frame.thread_id == broadcast_thread => Some(live_event(frame)),
-            _ => None,
-        });
-    Sse::new(retained.chain(current))
-        .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
-}
-
 fn agent_context(
     session: GaugeAppSession,
     projected: Vec<AdministrationExtensionPage>,
@@ -2196,78 +2093,6 @@ fn agent_context(
         })
         .collect();
     GaugeAppAgentContext { session, pages }
-}
-
-async fn agent_messages(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    Query(query): Query<AgentMessagesQuery>,
-    headers: HeaderMap,
-) -> Response {
-    let mut guard = wb.lock_unpoisoned();
-    let (session, _) = match build_session(&guard, &headers, extension_ref(&extension)) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if query.session != session.id
-        || query.generation != session.generation
-        || query.scope != session.scope.id
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "agent session is stale or cross-scope" })),
-        )
-            .into_response();
-    }
-    if let Err(error) = migrate_legacy_gaugeapp_agent_transcript(&mut guard, &session) {
-        return agent_error(error);
-    }
-    match gaugeapp_agent_transcript(guard.store_ref(), &session) {
-        Ok(transcript) => {
-            match agent_transcript_payload(&session, transcript, query.after.as_deref()) {
-                Ok(thread) => (StatusCode::OK, Json(json!({ "thread": thread }))).into_response(),
-                Err(response) => response,
-            }
-        }
-        Err(error) => agent_error(GaugeAppAgentError::Store(format!("{error:?}"))),
-    }
-}
-
-fn agent_transcript_payload(
-    session: &GaugeAppSession,
-    transcript: Vec<GaugeAppAgentMessage>,
-    after: Option<&str>,
-) -> Result<Value, Response> {
-    let thread_id = gaugeapp_thread_id(session);
-    let start_cursor = format!("{thread_id}:start");
-    let start = match after {
-        None => 0,
-        Some(cursor) if cursor == start_cursor => 0,
-        Some(cursor) => transcript
-            .iter()
-            .position(|message| message.id == cursor)
-            .map(|index| index + 1)
-            .ok_or_else(|| {
-                (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": "management conversation cursor is stale or belongs to another thread",
-                        "thread_id": thread_id,
-                        "restart_cursor": start_cursor,
-                    })),
-                )
-                    .into_response()
-            })?,
-    };
-    let cursor = transcript
-        .last()
-        .map(|message| message.id.clone())
-        .unwrap_or_else(|| start_cursor.clone());
-    Ok(json!({
-        "id": thread_id,
-        "cursor": cursor,
-        "messages": transcript.into_iter().skip(start).collect::<Vec<_>>(),
-    }))
 }
 
 fn command_policy(id: &str) -> Option<CommandPolicy> {
@@ -4561,196 +4386,6 @@ async fn submit_sso_credential(
     finish_command(&mut guard, &headers, &session, &envelope, &key, None, plan).0
 }
 
-async fn submit_command(
-    State(wb): State<SharedWorkbench>,
-    auth: Option<Extension<crate::auth_oidc::AuthShellState>>,
-    saml_tests: Option<Extension<crate::identity_saml::SamlBrowserState>>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    headers: HeaderMap,
-    Json(envelope): Json<GaugeAppCommandEnvelope>,
-) -> Response {
-    let key = match idempotency(&headers, &envelope.idempotency_key) {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-    if envelope.command_id == "enterprise-identity.connection.validate" {
-        return submit_sso_configuration_validation(wb, extension, headers, envelope, key).await;
-    }
-    if envelope.command_id == "enterprise-identity.test.begin" {
-        return submit_sso_browser_test_start(
-            wb, auth, saml_tests, extension, headers, envelope, key,
-        )
-        .await;
-    }
-    if matches!(
-        envelope.command_id.as_str(),
-        "enterprise-identity.connection.credential.set"
-            | "enterprise-identity.connection.credential.remove"
-    ) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "submit connection credentials through the write-only credential route" })),
-        )
-            .into_response();
-    }
-    let mut guard = wb.lock_unpoisoned();
-    let (session, _) = match build_session(&guard, &headers, extension_ref(&extension)) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if envelope.session_id == session.id
-        && envelope.generation == session.generation
-        && envelope.app == session.app
-        && envelope.scope == session.scope
-    {
-        match replayed_command_response(&guard, &headers, &session, &envelope, &key) {
-            Ok(Some(response)) => return response,
-            Ok(None) => {}
-            Err(response) => return response,
-        }
-    }
-    let admission = match decide_gaugeapp_command(&session, &envelope) {
-        Ok(value) => value,
-        Err(error) => return reject_gaugeapp(error),
-    };
-    if extension_ref(&extension)
-        .is_some_and(|extension| extension.requires_external_review(&envelope.command_id))
-        && admission.command.review != ReviewPolicy::Human
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "external authority changes require human review" })),
-        )
-            .into_response();
-    }
-    if contains_secret(&envelope.payload) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "secret-bearing fields are forbidden in GaugeApp commands" })),
-        )
-            .into_response();
-    }
-    // Parse and validate the owning GaugeApp's closed command before a
-    // proposal becomes durable. Review re-runs this planner against fresh state.
-    if let Err(response) = plan_command(&guard, &headers, &envelope, extension_ref(&extension)) {
-        return response;
-    }
-    match admission.disposition {
-        AdmissionDisposition::Propose => {
-            let change = proposed_change(&session, &envelope);
-            let change_fact = match fact(&req_scope(&headers), GAUGEAPP_CHANGE_KIND, &change) {
-                Ok(fact) => fact,
-                Err(response) => return response,
-            };
-            let audit_link = gaugedesk_app::audit::link(
-                &session.actor,
-                "gaugeapp.proposal.proposed",
-                &change.id,
-            );
-            let store_scope = req_scope(&headers);
-            let audit_scope = gaugedesk_app::audit::scope_for(&store_scope);
-            let result = match guard.store_mut().admit_record_facts_chained(
-                &command_scope(&headers),
-                &key,
-                &snapshot(&envelope),
-                &[change_fact],
-                Some(gaugedesk_app::audit::chained_in(&audit_scope, &audit_link)),
-            ) {
-                Ok(result) => result,
-                Err(error) => return store_error(error),
-            };
-            if let Some(entry) =
-                gaugedesk_app::audit::committed_entry(result.chained_payload.as_deref())
-            {
-                gaugedesk_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
-            }
-            (StatusCode::OK, Json(json!({ "receipt": gaugeapp_receipt(&session, &envelope, "proposed"), "proposal": change }))).into_response()
-        }
-        AdmissionDisposition::Apply => {
-            apply_command(
-                &mut guard,
-                &headers,
-                &session,
-                &envelope,
-                &key,
-                None,
-                extension_ref(&extension),
-            )
-            .0
-        }
-    }
-}
-
-fn apply_command(
-    wb: &mut Workbench,
-    headers: &HeaderMap,
-    session: &GaugeAppSession,
-    envelope: &GaugeAppCommandEnvelope,
-    key: &str,
-    change: Option<GaugeAppChangeRecord>,
-    extension: Option<&AdministrationGaugeAppExtensionHandle>,
-) -> (Response, bool) {
-    let plan = match plan_command(wb, headers, envelope, extension) {
-        Ok(plan) => plan,
-        Err(response) => return (response, false),
-    };
-    if extension.is_some_and(|extension| extension.requires_external_review(&envelope.command_id)) {
-        return (
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "external review requires the durable handoff path" })),
-            )
-                .into_response(),
-            false,
-        );
-    }
-    let operation_key = change
-        .as_ref()
-        .map(|change| change.id.as_str())
-        .unwrap_or(key);
-    let plan = if let Some(extension) = extension {
-        match extension.apply(
-            wb,
-            &tenant_id(headers),
-            &req_scope(headers),
-            &session.actor,
-            envelope,
-            operation_key,
-            plan,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => return (extension_error(error), false),
-        }
-    } else if envelope.command_id == "project.create" {
-        let value: ProjectCreatePayload = match parse(&envelope.payload) {
-            Ok(value) => value,
-            Err(response) => return (response, false),
-        };
-        let digest = sha256_hex(operation_key);
-        let project_id = format!("proj-{}", &digest[..24]);
-        match gaugedesk_app::library_routes::create_named_project(wb, &project_id, &value.name) {
-            Ok(result) => AdministrationMutationPlan {
-                transient_result: Some(json!({ "project": result })),
-                audit_target: project_id,
-                ..plan
-            },
-            Err(message) => {
-                return (
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": message })),
-                    )
-                        .into_response(),
-                    false,
-                )
-            }
-        }
-    } else {
-        plan
-    };
-    finish_command(wb, headers, session, envelope, key, change, plan)
-}
-
 fn finish_command(
     wb: &mut Workbench,
     headers: &HeaderMap,
@@ -4783,63 +4418,16 @@ fn finish_command_in(
     plan: MutationPlan,
     receipt_scope: &str,
 ) -> (Response, bool) {
-    let mut applied_change = change.unwrap_or_else(|| proposed_change(session, envelope));
-    applied_change.status = GaugeAppChangeStatus::Applied;
-    applied_change.reviewed_by = Some(session.actor.clone());
-    let mut facts = plan.facts.clone();
-    let change_fact = match fact(&req_scope(headers), GAUGEAPP_CHANGE_KIND, &applied_change) {
-        Ok(fact) => fact,
-        Err(response) => return (response, false),
-    };
-    facts.push(change_fact);
-    let audit_link =
-        gaugedesk_app::audit::link(&session.actor, plan.audit_action, &plan.audit_target);
-    let store_scope = req_scope(headers);
-    let audit_scope = gaugedesk_app::audit::scope_for(&store_scope);
-    let result = match wb.store_mut().admit_record_facts_chained(
-        receipt_scope,
+    gaugedesk_app::gaugeapp_host::finish_command_in::<Administration>(
+        wb,
+        headers,
+        session,
+        envelope,
         key,
-        &snapshot(envelope),
-        &facts,
-        Some(gaugedesk_app::audit::chained_in(&audit_scope, &audit_link)),
-    ) {
-        Ok(result) => result,
-        Err(error) => return (store_error(error), false),
-    };
-    if !result.replayed {
-        for (kind, id, op) in &plan.notices {
-            wb.notify_library_changed(kind, id, op);
-        }
-        if let Some(entry) =
-            gaugedesk_app::audit::committed_entry(result.chained_payload.as_deref())
-        {
-            gaugedesk_app::audit::finish_committed_in(wb, &store_scope, &entry);
-        }
-    }
-    if envelope.command_id == "organization.delete" {
-        // Each person's Administration/Commercial transcript has its own key,
-        // outside the parent tenant scope. A retry repeats this scan before the
-        // parent key is destroyed, so an interrupted erasure never silently
-        // strands readable child content.
-        if let Err(error) =
-            gaugedesk_app::gaugeapp_agent::crypto_erase_gaugeapp_agent_threads_for_tenant(
-                wb,
-                &session.scope.id,
-            )
-        {
-            return (store_error(error), false);
-        }
-        // The command tombstoned every live organization authority in the
-        // transaction above. Destroying the parent key completes organization
-        // erasure and is idempotent on retries and unencrypted local profiles.
-        let _ = wb.crypto_erase_content(&store_scope);
-    }
-    let freshly_applied = !result.replayed;
-    ((StatusCode::OK, Json(json!({
-        "receipt": gaugeapp_receipt(session, envelope, "applied"),
-        "proposal": applied_change,
-        "result": if result.replayed { Value::Null } else { plan.transient_result.unwrap_or(Value::Null) },
-    }))).into_response(), freshly_applied)
+        change,
+        plan,
+        receipt_scope,
+    )
 }
 
 fn store_error(error: AdmitError) -> Response {
@@ -4853,87 +4441,7 @@ fn store_error(error: AdmitError) -> Response {
     }
 }
 
-async fn submit_proposal(
-    State(wb): State<SharedWorkbench>,
-    auth: Option<Extension<crate::auth_oidc::AuthShellState>>,
-    saml_tests: Option<Extension<crate::identity_saml::SamlBrowserState>>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    headers: HeaderMap,
-    Json(envelope): Json<GaugeAppCommandEnvelope>,
-) -> Response {
-    if envelope.client != GaugeAppClient::Agent {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "proposal preparation is reserved for the GaugeApp agent" })),
-        )
-            .into_response();
-    }
-    submit_command(
-        State(wb),
-        auth,
-        saml_tests,
-        extension,
-        headers,
-        Json(envelope),
-    )
-    .await
-}
-
-async fn list_changes(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    Query(query): Query<SessionQuery>,
-    headers: HeaderMap,
-) -> Response {
-    let guard = wb.lock_unpoisoned();
-    let (session, _) = match build_session(&guard, &headers, extension_ref(&extension)) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if query.session != session.id
-        || query.generation != session.generation
-        || query.scope != session.scope.id
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "GaugeApp session is stale or cross-scope" })),
-        )
-            .into_response();
-    }
-    let changes = match fold_gaugeapp_changes(guard.store_ref(), &req_scope(&headers)) {
-        Ok(changes) => changes,
-        Err(error) => return internal(error),
-    };
-    let recovery_only = guard
-        .admit_sso_recovery(bearer(&headers), &req_scope(&headers))
-        .is_ok();
-    let values = changes
-        .into_values()
-        .filter(|change| {
-            change.app == GAUGEAPP
-                && change.scope == session.scope
-                && (!recovery_only
-                    || change.command_id == "enterprise-identity.enforcement.disable")
-        })
-        .collect::<Vec<_>>();
-    (StatusCode::OK, Json(json!({ "proposals": values }))).into_response()
-}
-
-#[derive(Deserialize)]
-struct ReviewBody {
-    session_id: String,
-    generation: String,
-    app: GaugeAppKind,
-    scope: GaugeAppScope,
-    decision: String,
-    #[serde(default = "web_client")]
-    client: GaugeAppClient,
-    #[serde(default)]
-    authorization_proof: Option<String>,
-}
-fn web_client() -> GaugeAppClient {
-    GaugeAppClient::Web
-}
+pub type ReviewBody = gaugedesk_app::gaugeapp_host::ReviewBody;
 
 async fn verify_domain_review_evidence(
     wb: &SharedWorkbench,
@@ -4990,321 +4498,6 @@ async fn verify_domain_review_evidence(
         .into_response())
 }
 
-async fn review_change(
-    State(wb): State<SharedWorkbench>,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    auth: Option<Extension<gaugedesk_app::auth_oidc::AuthShellState>>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<ReviewBody>,
-) -> Response {
-    let key = match gaugedesk_app::command_idempotency::caller_idempotency_key(&headers) {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-    if let Err(response) =
-        verify_domain_review_evidence(&wb, &headers, &id, &body, extension_ref(&extension)).await
-    {
-        return response;
-    }
-    match prepare_review(wb.clone(), extension, auth, id, headers.clone(), body, key) {
-        Ok(response) => response,
-        Err(job) => external_review::execute(wb, headers, job).await,
-    }
-}
-
-// Keep the state guard in this synchronous phase; no network await can carry it.
-fn prepare_review(
-    wb: SharedWorkbench,
-    extension: Option<Extension<AdministrationGaugeAppExtensionHandle>>,
-    auth: Option<Extension<gaugedesk_app::auth_oidc::AuthShellState>>,
-    id: String,
-    headers: HeaderMap,
-    body: ReviewBody,
-    key: String,
-) -> Result<Response, external_review::ReviewJob> {
-    if body.client == GaugeAppClient::Agent {
-        return Ok((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "management reviews require a human client" })),
-        )
-            .into_response());
-    }
-    let mut guard = wb.lock_unpoisoned();
-    let (session, _) = match build_session(&guard, &headers, extension_ref(&extension)) {
-        Ok(value) => value,
-        Err(response) => return Ok(response),
-    };
-    if body.session_id != session.id
-        || body.generation != session.generation
-        || body.app != GAUGEAPP
-        || body.scope != session.scope
-    {
-        return Ok((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "GaugeApp session is stale or cross-scope" })),
-        )
-            .into_response());
-    }
-    let changes = match fold_gaugeapp_changes(guard.store_ref(), &req_scope(&headers)) {
-        Ok(changes) => changes,
-        Err(error) => return Ok(internal(error)),
-    };
-    let Some(mut change) = changes.get(&id).cloned() else {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "no such GaugeApp proposal" })),
-        )
-            .into_response());
-    };
-    let envelope = GaugeAppCommandEnvelope {
-        session_id: session.id.clone(),
-        generation: session.generation.clone(),
-        app: GAUGEAPP,
-        scope: session.scope.clone(),
-        page_id: change.page_id.clone(),
-        command_id: change.command_id.clone(),
-        expected_basis: change.expected_basis.clone(),
-        idempotency_key: key.clone(),
-        payload: change.payload.clone(),
-        client: body.client,
-    };
-    if let Some(recovery) = external_review::recover_if_approved(
-        &mut guard,
-        &headers,
-        &session,
-        &change,
-        &body,
-        extension_ref(&extension),
-    ) {
-        drop(guard);
-        return match recovery {
-            Ok(job) => Err(job),
-            Err(response) => Ok(response),
-        };
-    }
-    let external = extension_ref(&extension)
-        .is_some_and(|extension| extension.requires_external_review(&change.command_id));
-    let claim_key = external_review::claim_key(&change.id);
-    let claim_snapshot = serde_json::to_string(&json!({ "proposal": id, "decision": body.decision, "actor": session.actor, "command": envelope })).expect("review metadata serializes");
-    let terminal_claim = external.then_some(gaugedesk_store::RecordCommandClaim {
-        key: &claim_key,
-        snapshot: &claim_snapshot,
-    });
-    if external
-        && (change.app != session.app
-            || change.scope != session.scope
-            || !session.commands.iter().any(|command| {
-                command.id == change.command_id
-                    && session.capabilities.contains(&command.capability)
-            }))
-    {
-        return Ok((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "current capability is required to review this change" })),
-        )
-            .into_response());
-    }
-    if change.status != GaugeAppChangeStatus::Proposed {
-        let expected_snapshot = if body.decision == "accept" {
-            snapshot(&envelope)
-        } else {
-            serde_json::to_string(&json!({ "proposal": id, "decision": body.decision })).unwrap()
-        };
-        if let Ok(Some(record)) = guard
-            .store_ref()
-            .command_for_key(&command_scope(&headers), &key)
-        {
-            if record.status == "applied" && record.snapshot_json == expected_snapshot {
-                let status = match change.status {
-                    GaugeAppChangeStatus::Applied => "applied",
-                    GaugeAppChangeStatus::Rejected => "rejected",
-                    GaugeAppChangeStatus::Conflict => "conflict",
-                    GaugeAppChangeStatus::Proposed | GaugeAppChangeStatus::Applying => {
-                        unreachable!()
-                    }
-                };
-                let code = if change.status == GaugeAppChangeStatus::Conflict {
-                    StatusCode::CONFLICT
-                } else {
-                    StatusCode::OK
-                };
-                return Ok((
-                    code,
-                    Json(json!({ "receipt": gaugeapp_receipt(&session, &envelope, status), "proposal": change })),
-                )
-                    .into_response());
-            }
-        }
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "GaugeApp proposal is already terminal" })),
-        )
-            .into_response());
-    }
-    if body.decision == "reject" {
-        change.status = GaugeAppChangeStatus::Rejected;
-        change.reviewed_by = Some(session.actor.clone());
-        let change_fact = match fact(&req_scope(&headers), GAUGEAPP_CHANGE_KIND, &change) {
-            Ok(fact) => fact,
-            Err(response) => return Ok(response),
-        };
-        let audit_link =
-            gaugedesk_app::audit::link(&session.actor, "gaugeapp.proposal.rejected", &id);
-        let store_scope = req_scope(&headers);
-        let audit_scope = gaugedesk_app::audit::scope_for(&store_scope);
-        let result = match guard.store_mut().admit_record_facts_with_claims(
-            &command_scope(&headers),
-            &key,
-            &serde_json::to_string(&json!({ "proposal": id, "decision": "reject" })).unwrap(),
-            &[change_fact],
-            Some(gaugedesk_app::audit::chained_in(&audit_scope, &audit_link)),
-            terminal_claim.as_slice(),
-        ) {
-            Ok(result) => result,
-            Err(error) => return Ok(store_error(error)),
-        };
-        if let Some(entry) =
-            gaugedesk_app::audit::committed_entry(result.chained_payload.as_deref())
-        {
-            gaugedesk_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
-        }
-        return Ok((StatusCode::OK, Json(json!({ "receipt": gaugeapp_receipt(&session, &envelope, "rejected"), "proposal": change }))).into_response());
-    }
-    if body.decision != "accept" {
-        return Ok((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "review decision must be accept or reject" })),
-        )
-            .into_response());
-    }
-    let local_project_receipt_recovery = if !external && envelope.command_id == "project.create" {
-        serde_json::from_value::<ProjectCreatePayload>(envelope.payload.clone())
-            .ok()
-            .is_some_and(|payload| {
-                let digest = sha256_hex(&change.id);
-                gaugedesk_app::library_routes::named_project_matches(
-                    &guard,
-                    &format!("proj-{}", &digest[..24]),
-                    &payload.name,
-                )
-            })
-    } else {
-        false
-    };
-    if let Err(error) = decide_reviewed_gaugeapp_command(&session, &envelope) {
-        if matches!(error, GaugeAppRejection::StaleBasis) && local_project_receipt_recovery {
-            // The exact deterministic Home operation already committed, but
-            // the command receipt did not. Resume the same operation below;
-            // every other stale proposal still conflicts normally.
-        } else if matches!(error, GaugeAppRejection::StaleBasis) {
-            change.status = GaugeAppChangeStatus::Conflict;
-            change.reviewed_by = Some(session.actor.clone());
-            let conflict_fact = match fact(&req_scope(&headers), GAUGEAPP_CHANGE_KIND, &change) {
-                Ok(fact) => fact,
-                Err(response) => return Ok(response),
-            };
-            let audit_link =
-                gaugedesk_app::audit::link(&session.actor, "gaugeapp.proposal.conflict", &id);
-            let store_scope = req_scope(&headers);
-            let audit_scope = gaugedesk_app::audit::scope_for(&store_scope);
-            let result = match guard.store_mut().admit_record_facts_with_claims(
-                &command_scope(&headers),
-                &key,
-                &snapshot(&envelope),
-                &[conflict_fact],
-                Some(gaugedesk_app::audit::chained_in(&audit_scope, &audit_link)),
-                terminal_claim.as_slice(),
-            ) {
-                Ok(result) => result,
-                Err(error) => return Ok(store_error(error)),
-            };
-            if let Some(entry) =
-                gaugedesk_app::audit::committed_entry(result.chained_payload.as_deref())
-            {
-                gaugedesk_app::audit::finish_committed_in(&mut guard, &store_scope, &entry);
-            }
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "receipt": gaugeapp_receipt(&session, &envelope, "conflict"),
-                    "proposal": change,
-                    "error": error.message(),
-                    "rejection": error,
-                })),
-            )
-                .into_response());
-        }
-        return Ok(reject_gaugeapp(error));
-    }
-    if requires_fresh_authorization(&envelope.command_id) {
-        let Some(runtime) = auth.and_then(|Extension(auth)| auth.account_auth()) else {
-            return Ok((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": "fresh account authorization is unavailable" })),
-            )
-                .into_response());
-        };
-        let proof = body.authorization_proof.as_deref().unwrap_or_default();
-        if !runtime.consume_authorization_proof(
-            proof,
-            &session.actor,
-            &envelope.command_id,
-            gaugedesk_app::account::session_now_ms() / 1_000,
-        ) {
-            return Ok((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({
-                    "error": "confirm this operation with a current account passkey"
-                })),
-            )
-                .into_response());
-        }
-    }
-    // The review intent gets its own idempotency key, while the applied change
-    // retains the original proposal identity.
-    if let Some(extension) = extension_ref(&extension)
-        .filter(|extension| extension.requires_external_review(&envelope.command_id))
-    {
-        let plan = match plan_command(&guard, &headers, &envelope, Some(extension)) {
-            Ok(plan) => plan,
-            Err(response) => return Ok(response),
-        };
-        let prepared = external_review::begin(
-            &mut guard, &headers, &session, &envelope, &key, &change, extension, plan,
-        );
-        drop(guard);
-        return match prepared {
-            Ok(job) => Err(job),
-            Err(response) => Ok(response),
-        };
-    }
-    let sso = if envelope.command_id == "enterprise-identity.connection.set" {
-        serde_json::from_value::<SsoConnectionRecord>(envelope.payload.clone()).ok()
-    } else {
-        None
-    };
-    let (response, freshly_applied) = apply_command(
-        &mut guard,
-        &headers,
-        &session,
-        &envelope,
-        &key,
-        Some(change),
-        extension_ref(&extension),
-    );
-    drop(guard);
-    if freshly_applied {
-        if let Some(sso) = sso {
-            let activation_wb = wb.clone();
-            tokio::spawn(async move {
-                let _ = crate::auth_oidc::activate_updated_idp(&activation_wb, sso).await;
-            });
-        }
-    }
-    Ok(response)
-}
-
 fn requires_fresh_authorization(command_id: &str) -> bool {
     matches!(
         command_id,
@@ -5319,6 +4512,13 @@ fn requires_fresh_authorization(command_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gaugedesk_app::gaugeapp_agent::{
+        begin_gaugeapp_agent_live_turn, claim_gaugeapp_agent_turn,
+        gaugeapp_agent_live_subscription, gaugeapp_agent_transcript,
+        gaugeapp_agent_turn_was_stopped, gaugeapp_thread_id, GaugeAppAgentLiveEvent,
+        GaugeAppAgentMessage,
+    };
+    use gaugedesk_app::gaugeapp_host::agent_transcript_payload;
 
     #[test]
     fn every_administration_command_has_an_agent_action_kind() {
@@ -6504,6 +5704,287 @@ mod tests {
         assert!(invalidations
             .iter()
             .all(|entry| { entry["page_id"].is_string() && entry["resource_basis"].is_string() }));
+    }
+
+    #[tokio::test]
+    async fn shared_host_requires_captured_services_without_requiring_optional_services() {
+        let (_dir, shared, app) = test_app();
+        let session = open(&app).await;
+        assert_eq!(
+            read_page_json(&app, &session, "organization").await["page"]["scope"],
+            session["scope"]
+        );
+        let guard = shared.lock_unpoisoned();
+        let headers = HeaderMap::new();
+        assert_eq!(
+            gaugedesk_app::gaugeapp_host::context::<Administration>(&guard, &headers, "")
+                .unwrap_err()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let envelope: GaugeAppCommandEnvelope = serde_json::from_value(json!({
+            "session_id": session["id"], "generation": session["generation"],
+            "app": "administration", "scope": session["scope"], "page_id": "organization",
+            "command_id": "organization.display-name.set", "expected_basis": "unused",
+            "idempotency_key": "missing-services", "payload": { "display_name": "Unused" }, "client": "web"
+        })).unwrap();
+        drop(guard);
+        assert_eq!(
+            gaugedesk_app::gaugeapp_host::apply_command::<Administration>(
+                &mut shared.lock_unpoisoned(),
+                &headers,
+                "",
+                &envelope
+            )
+            .unwrap_err()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_host_event_subscription_refuses_wrong_scope_and_revoked_membership() {
+        let (_dir, shared, app) = test_app();
+        let session = open(&app).await;
+        let uri = |scope: &str| {
+            format!(
+                "/gaugeapps/administration/agent/events?session={}&generation={}&scope={scope}",
+                session["id"].as_str().unwrap(),
+                session["generation"].as_str().unwrap()
+            )
+        };
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(&app, Method::GET, &uri("other-tenant"), Value::Null, None),
+        )
+        .await
+        .expect("refused subscription must settle");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body,
+            json!({ "error": "agent session is stale or cross-scope" })
+        );
+        let mut owner = Org::rebuild(shared.lock_unpoisoned().store_ref())
+            .unwrap()
+            .members["owner"]
+            .clone();
+        owner.status = MembershipStatus::Deprovisioned;
+        shared
+            .lock_unpoisoned()
+            .store_mut()
+            .append_record("org", "membership", &serde_json::to_string(&owner).unwrap())
+            .unwrap();
+        let (status, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            request(
+                &app,
+                Method::GET,
+                &uri(session["scope"]["id"].as_str().unwrap()),
+                Value::Null,
+                None,
+            ),
+        )
+        .await
+        .expect("revoked subscription must settle");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn shared_host_dynamic_commands_refuse_nested_secret_fields_before_journaling() {
+        let (_dir, shared, _) = test_app();
+        let extension: AdministrationGaugeAppExtensionHandle =
+            Arc::new(TestAdministrationExtension);
+        let app = routes()
+            .layer(Extension(extension))
+            .with_state(shared.clone());
+        let session = open(&app).await;
+        let grant = session["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|page| page["id"] == "backups")
+            .unwrap();
+        for (index, payload) in [
+            json!({ "nested": { "token": "synthetic-dummy" } }),
+            json!({ "nested": [ { "private_key": "synthetic-dummy" } ] }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = format!("nested-secret-{index}");
+            let envelope = json!({ "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"], "page_id": "backups", "command_id": "backup.enable",
+                "expected_basis": grant["resource_basis"], "idempotency_key": key, "payload": payload, "client": "web" });
+            let (status, body) = request(
+                &app,
+                Method::POST,
+                "/gaugeapps/administration/commands",
+                envelope,
+                Some(&key),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                body,
+                json!({ "error": "secret-bearing fields are forbidden in GaugeApp commands" })
+            );
+            let guard = shared.lock_unpoisoned();
+            assert!(guard
+                .store_ref()
+                .command_for_key(&command_scope(&HeaderMap::new()), &key)
+                .unwrap()
+                .is_none());
+            assert!(fold_gaugeapp_changes(guard.store_ref(), "org")
+                .unwrap()
+                .is_empty());
+            assert!(guard
+                .store_ref()
+                .records("org", "test_backup")
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_host_legacy_read_erase_and_reread_cannot_repopulate_transcript() {
+        let tenant = "org-host-legacy-erasure";
+        let (_dir, shared, app) = test_app_as_in("owner", tenant);
+        let session = open_in_tenant(&app, Some(tenant)).await;
+        for (id, sequence, role, text) in [
+            ("legacy-user", 0, "user", "Old question"),
+            ("legacy-assistant", 1, "assistant", "Old answer"),
+        ] {
+            shared.lock_unpoisoned().store_mut().append_record(
+                &format!("environment-agent:administration:tenant:{tenant}"), "environment_agent_message",
+                &json!({ "id": id, "session_id": "legacy-session", "environment": "administration",
+                    "scope": session["scope"], "actor": session["actor"], "sequence": sequence,
+                    "role": role, "text": text }).to_string()).unwrap();
+        }
+        let uri = format!(
+            "/gaugeapps/administration/agent/messages?session={}&generation={}&scope={tenant}",
+            session["id"].as_str().unwrap(),
+            session["generation"].as_str().unwrap()
+        );
+        let (status, read) =
+            request_in_tenant(&app, Method::GET, &uri, Value::Null, None, Some(tenant)).await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["thread"]["messages"].as_array().unwrap().len(), 2);
+        let body = json!({ "session_id": session["id"], "generation": session["generation"],
+            "scope": session["scope"], "idempotency_key": "erase-legacy" });
+        let (status, erased) = request_in_tenant(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/agent/erase",
+            body,
+            None,
+            Some(tenant),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{erased}");
+        for _ in 0..2 {
+            let (status, read) =
+                request_in_tenant(&app, Method::GET, &uri, Value::Null, None, Some(tenant)).await;
+            assert_eq!(status, StatusCode::OK, "{read}");
+            assert_eq!(read["thread"]["messages"], json!([]));
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_host_page_and_update_stale_refusals_preserve_the_wire_error() {
+        let (_dir, _shared, app) = test_app();
+        let session = open(&app).await;
+        for suffix in ["pages/organization", "updates"] {
+            let uri = format!(
+                "/gaugeapps/administration/{suffix}?session={}&generation=stale&scope={}&after=older",
+                session["id"].as_str().unwrap(),
+                session["scope"]["id"].as_str().unwrap(),
+            );
+            let (status, body) = request(&app, Method::GET, &uri, Value::Null, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                body,
+                json!({ "error": "GaugeApp session is stale or cross-scope" })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_host_agent_post_preserves_admission_replay_and_claim_refusal() {
+        let (_dir, shared, app) = test_app();
+        let session = open(&app).await;
+        let typed: GaugeAppSession = serde_json::from_value(session.clone()).unwrap();
+        let body = json!({ "session_id": session["id"], "generation": session["generation"],
+            "scope": session["scope"], "idempotency_key": "retained-turn", "message": "Retained question" });
+        let (status, _) = request(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/agent/messages",
+            body.clone(),
+            Some("wrong-key"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let mut stale = body.clone();
+        stale["generation"] = json!("stale");
+        let (status, refused) = request(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/agent/messages",
+            stale,
+            Some("retained-turn"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refused,
+            json!({ "error": "agent session is stale or cross-scope" })
+        );
+        let thread = gaugeapp_thread_id(&typed);
+        let claim = claim_gaugeapp_agent_turn(&thread).unwrap();
+        let (status, _) = request(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/agent/messages",
+            body.clone(),
+            Some("retained-turn"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        drop(claim);
+        let turn = gaugedesk_app::gaugeapp_agent::GaugeAppAgentTurn {
+            message: "Retained answer".into(),
+            proposals: Vec::new(),
+        };
+        gaugedesk_app::gaugeapp_agent::append_gaugeapp_agent_exchange(
+            &shared,
+            &typed,
+            "retained-turn",
+            "Retained question",
+            &turn,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let (status, replay) = request(
+                &app,
+                Method::POST,
+                "/gaugeapps/administration/agent/messages",
+                body.clone(),
+                Some("retained-turn"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{replay}");
+            assert_eq!(replay["turn"]["message"], "Retained answer");
+            assert_eq!(replay["thread"]["id"], thread);
+            assert_eq!(replay["thread"]["messages"].as_array().unwrap().len(), 2);
+            assert!(replay["thread"]["cursor"].as_str().unwrap() != format!("{thread}:start"));
+        }
+        assert_eq!(
+            gaugeapp_agent_transcript(shared.lock_unpoisoned().store_ref(), &typed)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(claim_gaugeapp_agent_turn(&thread).is_some());
     }
 
     #[tokio::test]
