@@ -19,6 +19,6 @@
   },
   "devDependencies": {
     "xml-crypto": "^6.0.0",
-    "selfsigned": "^2.4.1"
+    "selfsigned": "^5.5.0"
   }
 }

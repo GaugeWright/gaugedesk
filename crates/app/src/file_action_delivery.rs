@@ -303,6 +303,7 @@ impl Workbench {
             .read_only_sibling()
             .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
         let issuer = self.authority().clone();
+        let roots = self.local_project_policy_roots(&authority.project_id)?;
         let receipt = self
             .store_mut()
             .with_dispatch_basis(&basis, || {
@@ -312,6 +313,7 @@ impl Workbench {
                     authority,
                     issuer,
                     key.clone(),
+                    roots,
                 );
                 guard.authorize_read(target.branch(), target.path(), target.base())?;
                 inputs.publish(std::slice::from_ref(input), || {

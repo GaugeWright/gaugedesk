@@ -24,9 +24,11 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 pub mod command_dispatch;
 pub mod command_scope_archive;
+mod durable_registry;
 mod home_reference_catalog;
 pub mod home_reference_journal;
 mod home_reference_storage;
+pub mod project_authority;
 mod record_admission;
 #[cfg(test)]
 mod record_claim_tests;
@@ -242,7 +244,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 9;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 10;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -604,6 +606,31 @@ const MIGRATIONS: &[Migration] = &[
                   BEGIN SELECT RAISE(ABORT, 'Home journal readiness is immutable'); END;",
     },
 
+    Migration {
+        version: 10,
+        name: "project-authority-keys",
+        sql: "CREATE TABLE IF NOT EXISTS project_authority_keys (
+                  project_id TEXT PRIMARY KEY CHECK(length(project_id) > 0),
+                  authority_id TEXT NOT NULL UNIQUE CHECK(length(authority_id) > 0),
+                  public_key TEXT NOT NULL UNIQUE CHECK(length(public_key) = 130
+                      AND substr(public_key, 1, 2) = '04'
+                      AND public_key NOT GLOB '*[^0-9a-f]*'),
+                  custody TEXT NOT NULL CHECK(custody IN ('project-v1', 'incoming-project-v1', 'loopback-v1')),
+                  wrapped_seed BLOB NOT NULL CHECK(length(wrapped_seed) > 0)
+              );
+              CREATE TRIGGER IF NOT EXISTS project_authority_no_update
+                  BEFORE UPDATE ON project_authority_keys
+                  BEGIN SELECT RAISE(ABORT, 'project authority key is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS project_authority_no_delete
+                  BEFORE DELETE ON project_authority_keys
+                  BEGIN SELECT RAISE(ABORT, 'project authority key is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS project_authority_no_replace
+                  BEFORE INSERT ON project_authority_keys
+                  WHEN EXISTS (SELECT 1 FROM project_authority_keys
+                      WHERE project_id = NEW.project_id OR authority_id = NEW.authority_id
+                        OR public_key = NEW.public_key)
+                  BEGIN SELECT RAISE(ABORT, 'project authority key is immutable'); END;",
+    },
 ];
 
 /// The fail-closed downgrade-guard error (DR-0054 Phase B): diagnosable — it

@@ -466,6 +466,7 @@ impl Workbench {
             .read_only_sibling()
             .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
         let issuer = self.authority().clone();
+        let roots = self.local_project_policy_roots(&authority.project_id)?;
         self.store_mut()
             .with_dispatch_basis(&preparation_basis, || {
                 let guard = version_authority::NativeSaveVersionAuthority::new(
@@ -474,6 +475,7 @@ impl Workbench {
                     authority.clone(),
                     issuer,
                     signing_key.clone(),
+                    roots,
                 );
                 guard.authorize_read(target.branch(), target.path(), target.base())
             })
@@ -579,6 +581,7 @@ impl Workbench {
             .read_only_sibling()
             .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
         let issuer = self.authority().clone();
+        let roots = self.local_project_policy_roots(&current.project_id)?;
         let admitted = self
             .store_mut()
             .with_dispatch_record_admission(&basis, |writer| {
@@ -588,6 +591,7 @@ impl Workbench {
                     current,
                     issuer,
                     signing_key,
+                    roots,
                 );
                 guard.authorize_read(target.branch(), target.path(), target.base())?;
                 inputs.publish(std::slice::from_ref(&input), || {

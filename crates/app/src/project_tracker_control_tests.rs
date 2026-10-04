@@ -49,6 +49,7 @@ fn a_claim_is_leased_renewed_and_released_by_request_key() {
     let claimed = wb
         .control_project_tracker_issue(&context, &claim, LIMITS)
         .unwrap();
+    super::completion::assert_project_policy(&wb, &claim.project, &claimed.snapshot.command);
     assert!(claimed.executed_effect.is_some());
     let held = issue(&wb, &context, &close);
     assert_eq!(held.claimed_by.as_deref(), Some(LOCAL_AUTHORITY));
@@ -209,5 +210,55 @@ fn a_closed_task_says_who_closed_it_after_its_claim_is_gone() {
     assert_eq!(
         closed.closing_summary.as_deref(),
         Some(close.summary.as_str())
+    );
+}
+
+#[test]
+fn lost_project_custody_refuses_tracker_control_and_completion_without_any_write() {
+    let (root, shared, context, invocation, close) = super::completion::setup();
+    let mut wb = shared.lock_unpoisoned();
+    let path = root
+        .path()
+        .join("content-keys/projects")
+        .join(format!("{}.key", crate::org::sha256_hex(&close.project)));
+    let before = stores(&wb, &invocation)
+        .runtime
+        .items
+        .export_events()
+        .unwrap();
+    let product = wb.store_ref().scope_high_water_marks().unwrap();
+    let retained = wb
+        .store_ref()
+        .project_authority_key(&close.project)
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let claim = control(
+        &close,
+        "missing-custody",
+        TrackerIssueControl::Claim {
+            lease_seconds: 3600,
+        },
+    );
+    assert!(wb
+        .control_project_tracker_issue(&context, &claim, LIMITS)
+        .is_err());
+    assert!(wb
+        .complete_project_tracker_issue(&context, &close, LIMITS)
+        .is_err());
+    assert!(!path.exists());
+    assert!(
+        wb.store_ref()
+            .project_authority_key(&close.project)
+            .unwrap()
+            == retained
+    );
+    assert_eq!(wb.store_ref().scope_high_water_marks().unwrap(), product);
+    assert_eq!(
+        stores(&wb, &invocation)
+            .runtime
+            .items
+            .export_events()
+            .unwrap(),
+        before
     );
 }

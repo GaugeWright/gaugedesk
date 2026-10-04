@@ -64,8 +64,7 @@ impl Workbench {
             .store_ref()
             .read_only_sibling()
             .map_err(|e| format!("retained policy observer unavailable: {e:?}"))?;
-        let key = SigningKey::from_seed(&self.governance_seed()).map_err(|e| e.reason)?;
-        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        let roots = self.local_project_policy_roots(&authority.project_id)?;
         self.store_mut()
             .with_dispatch_basis(&basis, || {
                 let mut restrictions = None;
@@ -80,7 +79,7 @@ impl Workbench {
                             ));
                         }
                         restrictions =
-                            version_authority::original_policy(&target, &observer, cut, &root)?;
+                            version_authority::original_policy(&target, &observer, cut, &roots)?;
                         if let Some(source) = &restrictions {
                             version_authority::authorize_reader(&authority, source)
                                 .map_err(whipplescript_store::StoreError::Conflict)?;

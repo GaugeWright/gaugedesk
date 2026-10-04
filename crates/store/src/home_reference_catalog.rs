@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
 use crate::home_reference_journal::{
@@ -70,38 +70,11 @@ fn durable_catalog_write<T>(
     conn: &mut Connection,
     write: impl FnOnce(&Transaction<'_>) -> Result<T, JournalError>,
 ) -> Result<T, JournalError> {
-    if !conn.is_autocommit() {
-        return Err(JournalError::Conflict(
-            "Home journal creation must precede the product writer",
-        ));
-    }
-    let original: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
-    let fullfsync: i64 = conn.query_row("PRAGMA fullfsync", [], |row| row.get(0))?;
-    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-    // Rollback journals need EXTRA's directory synchronization for durability.
-    let durable = if mode == "wal" { 2 } else { 3 };
-    conn.execute_batch(&format!(
-        "PRAGMA synchronous={durable}; PRAGMA fullfsync=ON;"
-    ))?;
-    let result = (|| {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = write(&tx)?;
-        tx.commit()?;
-        Ok(value)
-    })();
-    let restored = conn.execute_batch(&format!(
-        "PRAGMA synchronous={original}; PRAGMA fullfsync={fullfsync};"
-    ));
-    match result {
-        Ok(value) => {
-            restored?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = restored;
-            Err(error)
-        }
-    }
+    crate::durable_registry::write(
+        conn,
+        JournalError::Conflict("Home journal creation must precede the product writer"),
+        write,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +299,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::home_reference_journal::NewReferenceOperation;
+    use rusqlite::TransactionBehavior;
 
     const TARGET: &str = "0123456789abcdef0123456789abcdef";
 

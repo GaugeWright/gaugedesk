@@ -70,6 +70,7 @@ pub(super) fn fixture() -> (
         ),
         content: Vec::new(),
         credential_key: None,
+        project_authority: None,
         shared_route: None,
         signature: subkey.sign(&signed_bytes),
         source_pubkey: subkey.public_key().as_str().into(),

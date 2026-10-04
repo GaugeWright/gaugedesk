@@ -70,8 +70,10 @@ pub(super) fn validate(wire: &HandoffWire) -> Result<(), &'static str> {
     for bundle in &wire.content {
         let protected_format = bundle.format == PROTECTED_EXPORT_FORMAT;
         if protected_format || bundle.workflow_key.is_some() {
-            if wire.kind != HandoffMsgKind::OfferWithWorkflowKeys
-                || !bundle.collaboration
+            if !matches!(
+                wire.kind,
+                HandoffMsgKind::OfferWithWorkflowKeys | HandoffMsgKind::OfferWithProjectAuthority
+            ) || !bundle.collaboration
                 || !protected_format
                 || bundle.workflow_key.is_none()
             {
@@ -80,7 +82,7 @@ pub(super) fn validate(wire: &HandoffWire) -> Result<(), &'static str> {
             protected += 1;
         }
     }
-    if wire.kind == HandoffMsgKind::OfferWithWorkflowKeys && protected != 1 {
+    if protected > 1 || (wire.kind == HandoffMsgKind::OfferWithWorkflowKeys && protected != 1) {
         return Err("workflow key offer must carry one protected collaboration workspace");
     }
     Ok(())

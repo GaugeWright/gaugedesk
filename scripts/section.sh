@@ -365,7 +365,11 @@ case "${1:-}" in
     cargo metadata --manifest-path src-tauri/Cargo.toml --locked --format-version 1 >/dev/null
 
     if desktop_prerequisites_present; then
-        cargo check --manifest-path src-tauri/Cargo.toml --locked
+        # Cargo creates temporary siblings when creating a new target directory.
+        # Keep those probes beneath the writable build-output mount, rather
+        # than beside this shell's read-only manifest in the fleet sandbox.
+        cargo check --manifest-path src-tauri/Cargo.toml --locked \
+          --target-dir "${CARGO_TARGET_DIR:-$PWD/target/desktop}"
         exit 0
     fi
 

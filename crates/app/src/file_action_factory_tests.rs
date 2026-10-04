@@ -189,7 +189,8 @@ pub(super) fn governed_fixture_write(
     let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
     let identity = ActionPolicyIdentity {
         issuer: wb.authority().as_str().into(),
-        scope: format!("fixture-source:{chat}"),
+        scope: serde_json::to_string(&("gaugedesk.editor-file.v1", &authority.project_id, chat))
+            .unwrap(),
         request_id: request.into(),
     };
     let policy = prepare_action_policy(wb.store_mut(), &identity, &authority.policy, &key).unwrap();

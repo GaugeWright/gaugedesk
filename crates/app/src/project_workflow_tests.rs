@@ -115,6 +115,36 @@ fn ordinary_folder_launch_retains_source_inputs_and_one_native_root_across_resta
     let original = wb
         .launch_project_workflow(&context, &request, LIMITS)
         .unwrap();
+    let (project_authority, project_key) = wb.project_authority_identity(DEFAULT_PROJECT).unwrap();
+    assert_eq!(original.command.issuer, project_authority.as_str());
+    assert_ne!(project_key, wb.governance_public_key());
+    let identity = crate::action_policy::ActionPolicyIdentity {
+        issuer: original.command.issuer.clone(),
+        scope: original.command.scope.clone(),
+        request_id: original.command.request_id.clone(),
+    };
+    let project_root =
+        gaugedesk_whip_runtime::GovernanceRootVerifier::new(project_authority.clone(), project_key);
+    assert!(crate::action_policy::load_project_action_policy(
+        wb.store_ref(),
+        DEFAULT_PROJECT,
+        &identity,
+        &original.command.policy,
+        &project_root,
+    )
+    .is_ok());
+    let host_root = gaugedesk_whip_runtime::GovernanceRootVerifier::new(
+        project_authority,
+        wb.governance_public_key(),
+    );
+    assert!(crate::action_policy::load_project_action_policy(
+        wb.store_ref(),
+        DEFAULT_PROJECT,
+        &identity,
+        &original.command.policy,
+        &host_root,
+    )
+    .is_err());
     assert_eq!(wb.library.chats.len(), chats);
     assert_eq!(original.command.provenance.initiator, LOCAL_AUTHORITY);
     assert_eq!(original.command.provenance.origin, "folder.launch");
@@ -181,6 +211,47 @@ fn ordinary_folder_launch_retains_source_inputs_and_one_native_root_across_resta
     assert_ne!(
         another.command.program_version_ref,
         original.command.program_version_ref
+    );
+}
+
+#[test]
+fn missing_project_signing_custody_stops_workflow_use_without_recreating_keys() {
+    let (root, shared, context, request) = fixture(ECHO);
+    let mut wb = shared.lock_unpoisoned();
+    let original = wb
+        .launch_project_workflow(&context, &request, LIMITS)
+        .unwrap();
+    let before = stores(&wb, &original)
+        .runtime
+        .list_events(&original.admission.instance_ref)
+        .unwrap();
+    let retained = wb
+        .store_ref()
+        .project_authority_key(DEFAULT_PROJECT)
+        .unwrap()
+        .unwrap();
+    let path = root
+        .path()
+        .join("content-keys/projects")
+        .join(format!("{}.key", crate::org::sha256_hex(DEFAULT_PROJECT)));
+    std::fs::remove_file(&path).unwrap();
+    assert!(wb
+        .resume_project_workflow(&context, DEFAULT_PROJECT, "first", LIMITS)
+        .is_err());
+    assert!(!path.exists());
+    assert!(
+        wb.store_ref()
+            .project_authority_key(DEFAULT_PROJECT)
+            .unwrap()
+            .unwrap()
+            == retained
+    );
+    assert_eq!(
+        stores(&wb, &original)
+            .runtime
+            .list_events(&original.admission.instance_ref)
+            .unwrap(),
+        before
     );
 }
 

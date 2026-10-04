@@ -1899,7 +1899,14 @@ async fn relocated_workstream_chat(protected: bool) {
         assert_eq!(resumed.command, original.command);
         assert_eq!(resumed.admission, original.admission);
         assert_eq!(resumed.workspace, original.workspace);
-        assert_eq!(resumed.command.issuer, "alice");
+        assert_eq!(
+            resumed.command.issuer,
+            guard
+                .project_authority_identity(&project_id)
+                .unwrap()
+                .0
+                .as_str()
+        );
         let progress = guard
             .step_project_workflow(
                 &context,
@@ -2083,10 +2090,17 @@ async fn relocated_workstream_chat(protected: bool) {
                 launch_limits,
             )
             .expect("a relocated run outlives its origin's pairing");
-        assert_eq!(resumed.command.issuer, "alice");
+        assert_eq!(
+            resumed.command.issuer,
+            guard
+                .project_authority_identity(&project_id)
+                .unwrap()
+                .0
+                .as_str()
+        );
 
-        // A pin is only what the verifying pairing vouched for: a forged one
-        // for this issuer takes precedence and so must fail the signature check.
+        // Historical transport signer pins cannot replace this project root.
+        // Corrupting that older pin does not change the received project key.
         guard
             .store_mut()
             .append_record(
@@ -2101,6 +2115,36 @@ async fn relocated_workstream_chat(protected: bool) {
                 &project_id,
                 "relocated-folder-launch",
                 launch_limits,
+            )
+            .is_ok());
+        // An ordinary writer cannot replace the retained project root. A
+        // deliberately damaged restored binding cannot verify the original
+        // policy and must not be repaired by reopening the moved workflow.
+        let connection = rusqlite::Connection::open(guard.store_ref().path()).unwrap();
+        let foreign = gaugedesk_core::signature::SigningKey::from_seed(&[99; 32])
+            .unwrap()
+            .public_key();
+        assert!(connection
+            .execute(
+                "UPDATE project_authority_keys SET public_key = ?1 WHERE project_id = ?2",
+                rusqlite::params![foreign.as_str(), &project_id]
+            )
+            .is_err());
+        connection
+            .execute_batch("DROP TRIGGER project_authority_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE project_authority_keys SET public_key = ?1 WHERE project_id = ?2",
+                rusqlite::params![foreign.as_str(), &project_id],
+            )
+            .unwrap();
+        assert!(guard
+            .resume_project_workflow(
+                &context,
+                &project_id,
+                "relocated-folder-launch",
+                launch_limits
             )
             .is_err());
     }

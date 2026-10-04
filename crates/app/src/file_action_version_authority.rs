@@ -14,6 +14,7 @@ pub(super) struct NativeSaveVersionAuthority {
     current: FileAuthority,
     issuer: gaugedesk_core::ids::AuthorityId,
     key: SigningKey,
+    roots: crate::project_policy_authority::LocalProjectPolicyRoots,
 }
 
 impl NativeSaveVersionAuthority {
@@ -25,6 +26,7 @@ impl NativeSaveVersionAuthority {
         current: FileAuthority,
         issuer: gaugedesk_core::ids::AuthorityId,
         key: SigningKey,
+        roots: crate::project_policy_authority::LocalProjectPolicyRoots,
     ) -> Self {
         Self {
             target,
@@ -32,6 +34,7 @@ impl NativeSaveVersionAuthority {
             current,
             issuer,
             key,
+            roots,
         }
     }
 }
@@ -81,7 +84,7 @@ pub(super) fn original_policy(
     target: &gaugedesk_workspace::NativeFileActionTarget,
     product: &Store,
     cut: &str,
-    root: &GovernanceRootVerifier,
+    roots: &crate::project_policy_authority::LocalProjectPolicyRoots,
 ) -> StoreResult<Option<ResourcePolicy>> {
     let refuse = |reason: String| StoreError::Conflict(reason);
     let version = target.version_origin(
@@ -109,9 +112,22 @@ pub(super) fn original_policy(
             "retained file version has no supported target label".into(),
         ));
     }
-    crate::action_policy::load_action_label(product, &evidence.label_ref, root)
-        .map(Some)
-        .map_err(refuse)
+    crate::action_policy::load_action_label(product, &evidence.label_ref, |identity| {
+        let Ok((format, project, chat)) =
+            serde_json::from_str::<(String, String, String)>(&identity.scope)
+        else {
+            return Ok(None);
+        };
+        if format != "gaugedesk.editor-file.v1" || project != roots.project() {
+            return Ok(None);
+        }
+        if chat.trim().is_empty() {
+            return Err("retained content policy has no native file chat scope".into());
+        }
+        roots.root(&identity.issuer).cloned().map(Some)
+    })
+    .map(Some)
+    .map_err(refuse)
 }
 
 impl SaveVersionReadAuthority for NativeSaveVersionAuthority {
@@ -126,8 +142,12 @@ impl SaveVersionReadAuthority for NativeSaveVersionAuthority {
             .product
             .lock()
             .map_err(|_| refuse("retained policy observer is unavailable".into()))?;
-        let root = GovernanceRootVerifier::new(self.issuer.clone(), self.key.public_key());
-        let Some(source) = original_policy(&self.target, &product, cut, &root)? else {
+        if self.current.project_id != self.roots.project() {
+            return Err(refuse(
+                "historical roots belong to another admitted project".into(),
+            ));
+        }
+        let Some(source) = original_policy(&self.target, &product, cut, &self.roots)? else {
             return Ok(());
         };
         authorize_source(&self.current, &source, &self.issuer, &self.key).map_err(refuse)
@@ -142,121 +162,290 @@ mod tests {
 
     #[test]
     fn recorded_version_resolves_its_original_signed_restrictions() {
-        use whipplescript_store::files::{FileStore, FileWriteContext};
-        use whipplescript_store::vcs_file_save::{
-            save_cut_id, VersionedSaveBinding, SAVE_OUTPUT_PATH,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let (wb, command, inputs, token) = admitted_fixture(dir.path());
-        let mut wb = wb.lock_unpoisoned();
-        let context = wb.authenticate_action_context(&token).unwrap();
-        let prepared = wb
-            .prepare_native_editor_action(&context, &inputs, &command, &command.policy)
-            .unwrap();
-        let target = wb
-            .bind_native_editor_target(&prepared.chat_id, &command)
-            .unwrap();
-        let mut source_policy = prepared.authority.policy.clone();
-        source_policy
-            .resources
-            .get_mut("file:/action/output")
-            .unwrap()
-            .reader
-            .insert("historical:restricted".into());
-        let original = prepare_action_policy(
-            wb.store_mut(),
-            &ActionPolicyIdentity {
-                issuer: command.issuer.clone(),
-                scope: command.scope.clone(),
-                request_id: "recorded-source".into(),
-            },
-            &source_policy,
-            &prepared.key,
-        )
-        .unwrap();
-        let binding = VersionedSaveBinding {
-            branch_id: target.branch().into(),
-            path: target.path().into(),
-            base_cut_id: target.base().into(),
-            draft: "retained source".into(),
-            draft_hash: whipplescript_store::stable_hash_hex("retained source"),
-            input_label: command.inputs["content"].label_ref.clone(),
-            executing_principal: context.actor().as_str().into(),
-            evidence_label: format!(
-                "policy:{}:admitted_target",
-                original.policy_ref().envelope_hash
-            ),
-            recorded_at: "fixture".into(),
-        };
-        // Construct owner evidence directly to test its provenance consumer.
-        // This fixture is not product dispatch or a claimed Home Saved result.
-        let files = target
-            .open_scoped_versioned_save(
-                binding.clone(),
-                prepared.resolution_scope,
-                std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
-            )
-            .unwrap();
-        files
-            .write_text_with_context(
-                std::path::Path::new(SAVE_OUTPUT_PATH),
-                &binding.draft,
-                FileWriteContext {
-                    instance_id: "source-fixture",
-                    effect_id: "save",
-                    run_id: "attempt",
-                    started_event_id: "started",
-                },
-            )
-            .unwrap();
-        drop(files);
-        let cut = save_cut_id("source-fixture", "save");
-        let mut current = prepared.authority;
-        current
-            .read_clearances
-            .insert("historical:restricted".into());
-        for sink in ["file:/action/output", "result", "error"] {
-            current
-                .policy
+        for (project_signer, foreign_scope) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            use whipplescript_store::files::{FileStore, FileWriteContext};
+            use whipplescript_store::vcs_file_save::{
+                save_cut_id, VersionedSaveBinding, SAVE_OUTPUT_PATH,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let (wb, command, inputs, token) = admitted_fixture(dir.path());
+            let mut wb = wb.lock_unpoisoned();
+            let context = wb.authenticate_action_context(&token).unwrap();
+            let prepared = wb
+                .prepare_native_editor_action(&context, &inputs, &command, &command.policy)
+                .unwrap();
+            let target = wb
+                .bind_native_editor_target(&prepared.chat_id, &command)
+                .unwrap();
+            let mut source_policy = prepared.authority.policy.clone();
+            source_policy
                 .resources
-                .get_mut(sink)
+                .get_mut("file:/action/output")
                 .unwrap()
                 .reader
                 .insert("historical:restricted".into());
-        }
-        let mut guard = NativeSaveVersionAuthority::new(
-            target.clone(),
-            wb.store_ref().read_only_sibling().unwrap(),
-            current,
-            wb.authority().clone(),
-            prepared.key,
-        );
-        guard
-            .authorize_read(target.branch(), target.path(), &cut)
+            let source_key = if project_signer {
+                wb.initialize_project_authority(&prepared.authority.project_id)
+                    .unwrap();
+                wb.project_signing_key(&prepared.authority.project_id)
+                    .unwrap()
+            } else {
+                prepared.key.clone()
+            };
+            let source_issuer = if project_signer {
+                wb.project_authority_identity(&prepared.authority.project_id)
+                    .unwrap()
+                    .0
+            } else {
+                wb.authority().clone()
+            };
+            let original = prepare_action_policy(
+                wb.store_mut(),
+                &ActionPolicyIdentity {
+                    issuer: source_issuer.as_str().into(),
+                    scope: if foreign_scope {
+                        serde_json::to_string(&(
+                            "gaugedesk.editor-file.v1",
+                            "other-project",
+                            "chat",
+                        ))
+                        .unwrap()
+                    } else {
+                        command.scope.clone()
+                    },
+                    request_id: "recorded-source".into(),
+                },
+                &source_policy,
+                &source_key,
+            )
             .unwrap();
-        guard
-            .current
-            .policy
-            .resources
-            .get_mut("file:/action/output")
-            .unwrap()
-            .reader
-            .remove("historical:restricted");
-        assert!(guard
-            .authorize_read(target.branch(), target.path(), &cut)
-            .is_err());
-        guard
-            .current
-            .policy
-            .resources
-            .get_mut("file:/action/output")
-            .unwrap()
-            .reader
-            .insert("historical:restricted".into());
-        guard.key = SigningKey::from_seed(&[97; 32]).unwrap();
-        assert!(guard
-            .authorize_read(target.branch(), target.path(), &cut)
-            .is_err());
+            let binding = VersionedSaveBinding {
+                branch_id: target.branch().into(),
+                path: target.path().into(),
+                base_cut_id: target.base().into(),
+                draft: "retained source".into(),
+                draft_hash: whipplescript_store::stable_hash_hex("retained source"),
+                input_label: command.inputs["content"].label_ref.clone(),
+                executing_principal: context.actor().as_str().into(),
+                evidence_label: format!(
+                    "policy:{}:admitted_target",
+                    original.policy_ref().envelope_hash
+                ),
+                recorded_at: "fixture".into(),
+            };
+            // Construct owner evidence directly to test its provenance consumer.
+            // This fixture is not product dispatch or a claimed Home Saved result.
+            let files = target
+                .open_scoped_versioned_save(
+                    binding.clone(),
+                    prepared.resolution_scope,
+                    std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+                )
+                .unwrap();
+            files
+                .write_text_with_context(
+                    std::path::Path::new(SAVE_OUTPUT_PATH),
+                    &binding.draft,
+                    FileWriteContext {
+                        instance_id: "source-fixture",
+                        effect_id: "save",
+                        run_id: "attempt",
+                        started_event_id: "started",
+                    },
+                )
+                .unwrap();
+            drop(files);
+            let cut = save_cut_id("source-fixture", "save");
+            let mut current = prepared.authority;
+            current
+                .read_clearances
+                .insert("historical:restricted".into());
+            for sink in ["file:/action/output", "result", "error"] {
+                current
+                    .policy
+                    .resources
+                    .get_mut(sink)
+                    .unwrap()
+                    .reader
+                    .insert("historical:restricted".into());
+            }
+            if project_signer {
+                let custody = dir.path().join("content-keys/projects").join(format!(
+                    "{}.key",
+                    crate::org::sha256_hex(&current.project_id)
+                ));
+                std::fs::remove_file(&custody).unwrap();
+                assert!(wb.project_signing_key(&current.project_id).is_err());
+            }
+            let roots = wb.local_project_policy_roots(&current.project_id).unwrap();
+            let mut guard = NativeSaveVersionAuthority::new(
+                target.clone(),
+                wb.store_ref().read_only_sibling().unwrap(),
+                current,
+                wb.authority().clone(),
+                prepared.key,
+                roots,
+            );
+            if foreign_scope {
+                assert!(guard
+                    .authorize_read(target.branch(), target.path(), &cut)
+                    .is_err());
+                continue;
+            }
+            guard
+                .authorize_read(target.branch(), target.path(), &cut)
+                .unwrap();
+            guard
+                .current
+                .policy
+                .resources
+                .get_mut("file:/action/output")
+                .unwrap()
+                .reader
+                .remove("historical:restricted");
+            assert!(guard
+                .authorize_read(target.branch(), target.path(), &cut)
+                .is_err());
+            guard
+                .current
+                .policy
+                .resources
+                .get_mut("file:/action/output")
+                .unwrap()
+                .reader
+                .insert("historical:restricted".into());
+            guard.key = SigningKey::from_seed(&[97; 32]).unwrap();
+            // Changing the current observation signer cannot redefine history.
+            guard
+                .authorize_read(target.branch(), target.path(), &cut)
+                .unwrap();
+            guard.roots = crate::project_policy_authority::LocalProjectPolicyRoots::fixture(
+                &guard.current.project_id,
+                vec![GovernanceRootVerifier::new(
+                    guard.issuer.clone(),
+                    guard.key.public_key(),
+                )],
+            );
+            assert!(guard
+                .authorize_read(target.branch(), target.path(), &cut)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn public_file_observation_reopens_project_signed_history_without_signing_custody() {
+        use whipplescript_store::files::{FileStore, FileWriteContext};
+        use whipplescript_store::vcs_file_save::{VersionedSaveBinding, SAVE_OUTPUT_PATH};
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, command, inputs, token) = admitted_fixture(dir.path());
+        let (project, chat, path, cut) = {
+            let mut wb = shared.lock_unpoisoned();
+            let context = wb.authenticate_action_context(&token).unwrap();
+            let prepared = wb
+                .prepare_native_editor_action(&context, &inputs, &command, &command.policy)
+                .unwrap();
+            let target = wb
+                .bind_native_editor_target(&prepared.chat_id, &command)
+                .unwrap();
+            let project = prepared.authority.project_id.clone();
+            wb.initialize_project_authority(&project).unwrap();
+            let key = wb.project_signing_key(&project).unwrap();
+            let issuer = wb.project_authority_identity(&project).unwrap().0;
+            let mut policy = prepared.authority.policy;
+            // Distinct meaning ensures lookup cannot consume an earlier host
+            // policy with an equal hash instead of this project signature.
+            policy.resources.insert(
+                "file:/action/history-fixture".into(),
+                policy.resources["file:/action/output"].clone(),
+            );
+            let retained = prepare_action_policy(
+                wb.store_mut(),
+                &ActionPolicyIdentity {
+                    issuer: issuer.as_str().into(),
+                    scope: command.scope.clone(),
+                    request_id: "project-history-fixture".into(),
+                },
+                &policy,
+                &key,
+            )
+            .unwrap();
+            let body = "project-signed recorded version";
+            let binding = VersionedSaveBinding {
+                branch_id: target.branch().into(),
+                path: target.path().into(),
+                base_cut_id: target.base().into(),
+                draft: body.into(),
+                draft_hash: whipplescript_store::stable_hash_hex(body),
+                input_label: command.inputs["content"].label_ref.clone(),
+                executing_principal: context.actor().as_str().into(),
+                evidence_label: format!(
+                    "policy:{}:admitted_target",
+                    retained.policy_ref().envelope_hash
+                ),
+                recorded_at: "fixture".into(),
+            };
+            // Owner evidence exercises the provenance consumer, not Home Saved
+            // admission or product dispatch for this explicitly created source.
+            let files = target
+                .open_scoped_versioned_save(
+                    binding,
+                    prepared.resolution_scope,
+                    std::sync::Arc::new(|_: &str, _: &str, _: &str| Ok(())),
+                )
+                .unwrap();
+            files
+                .write_text_with_context(
+                    std::path::Path::new(SAVE_OUTPUT_PATH),
+                    body,
+                    FileWriteContext {
+                        instance_id: "project-history-fixture",
+                        effect_id: "save",
+                        run_id: "attempt",
+                        started_event_id: "started",
+                    },
+                )
+                .unwrap();
+            (
+                project,
+                prepared.chat_id,
+                target.path().to_owned(),
+                whipplescript_store::vcs_file_save::save_cut_id("project-history-fixture", "save"),
+            )
+        };
+        drop(shared);
+        let reopened = crate::workbench_state::open_lean_workbench(dir.path()).unwrap();
+        let mut wb = reopened.lock_unpoisoned();
+        let context = wb.authenticate_action_context(&token).unwrap();
+        let observed = wb
+            .observe_native_file_content(&context, &chat, &path)
+            .unwrap();
+        assert_eq!(observed.cut, cut);
+        assert_eq!(
+            observed.content.as_deref(),
+            Some("project-signed recorded version")
+        );
+        let custody = dir
+            .path()
+            .join("content-keys/projects")
+            .join(format!("{}.key", crate::org::sha256_hex(&project)));
+        std::fs::remove_file(&custody).unwrap();
+        assert!(wb.project_signing_key(&project).is_err());
+        let before = wb.store_ref().scope_high_water_marks().unwrap();
+        let observed = wb
+            .observe_native_file_content(&context, &chat, &path)
+            .unwrap();
+        assert_eq!(observed.cut, cut);
+        assert_eq!(
+            observed.content.as_deref(),
+            Some("project-signed recorded version")
+        );
+        assert_eq!(wb.store_ref().scope_high_water_marks().unwrap(), before);
+        assert!(
+            !custody.exists(),
+            "historical verification must not recreate custody"
+        );
     }
 
     #[test]
@@ -339,12 +528,16 @@ mod tests {
             .unwrap()
             .unwrap()
             .0;
+        let roots = wb
+            .local_project_policy_roots(&prepared.authority.project_id)
+            .unwrap();
         let guard = NativeSaveVersionAuthority::new(
             target.clone(),
             wb.store_ref().read_only_sibling().unwrap(),
             prepared.authority,
             wb.authority().clone(),
             prepared.key,
+            roots,
         );
         let error = guard
             .authorize_read(target.branch(), target.path(), &opaque)

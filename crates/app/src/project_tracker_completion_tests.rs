@@ -4,6 +4,37 @@ use crate::project_tracker::{
 };
 use gaugedesk_whip_runtime::host_actions::action_result::ActionInstanceStatus;
 
+pub(super) fn assert_project_policy(wb: &Workbench, project: &str, command: &HostActionCommand) {
+    let (authority, public_key) = wb.project_authority_identity(project).unwrap();
+    assert_eq!(command.issuer, authority.as_str());
+    assert_ne!(public_key, wb.governance_public_key());
+    let identity = crate::action_policy::ActionPolicyIdentity {
+        issuer: command.issuer.clone(),
+        scope: command.scope.clone(),
+        request_id: command.request_id.clone(),
+    };
+    let project_root =
+        gaugedesk_whip_runtime::GovernanceRootVerifier::new(authority.clone(), public_key);
+    assert!(crate::action_policy::load_project_action_policy(
+        wb.store_ref(),
+        project,
+        &identity,
+        &command.policy,
+        &project_root
+    )
+    .is_ok());
+    let host_root =
+        gaugedesk_whip_runtime::GovernanceRootVerifier::new(authority, wb.governance_public_key());
+    assert!(crate::action_policy::load_project_action_policy(
+        wb.store_ref(),
+        project,
+        &identity,
+        &command.policy,
+        &host_root
+    )
+    .is_err());
+}
+
 pub(super) fn setup() -> (
     tempfile::TempDir,
     crate::SharedWorkbench,
@@ -61,6 +92,7 @@ fn completion_replays_across_restart_and_preserves_human_native_lineage() {
         ActionInstanceStatus::Completed
     );
     let wb = shared.lock_unpoisoned();
+    assert_project_policy(&wb, &request.project, &completed.snapshot.command);
     let native = stores(&wb, &invocation);
     let events = native.runtime.items.export_events().unwrap();
     let closed: Vec<_> = events

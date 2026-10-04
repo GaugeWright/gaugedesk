@@ -2372,6 +2372,7 @@ pub async fn post_handoff_abort(
         None,
         None,
         None,
+        None,
     )
     .await
     {
@@ -2487,6 +2488,9 @@ struct HandoffContentBundle {
 #[path = "federation_workflow_keys.rs"]
 mod workflow_keys;
 
+#[path = "federation_project_authority.rs"]
+mod project_authority;
+
 /// What a handoff message asks the receiver to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum HandoffMsgKind {
@@ -2498,6 +2502,8 @@ enum HandoffMsgKind {
     /// Complete native protected workflow carriage. Older receivers must refuse
     /// this kind rather than silently drop a key they do not understand.
     OfferWithWorkflowKeys,
+    /// Complete project signing custody; older receivers cannot omit it.
+    OfferWithProjectAuthority,
     /// target → origin: the target consented and committed (is now home); the origin
     /// commits its side (becomes operator).
     Committed,
@@ -2540,6 +2546,8 @@ struct HandoffWire {
     /// the target re-wraps the opened key inside its Home boundary.
     #[serde(default)]
     credential_key: Option<SealedKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_authority: Option<project_authority::Capsule>,
     #[serde(default)]
     shared_route: Option<crate::home::OpaqueHomeRoute>,
     signed_bytes: Vec<u8>,
@@ -3052,9 +3060,10 @@ async fn send_handoff(
     credential_key: Option<SealedKey>,
     shared_route: Option<crate::home::OpaqueHomeRoute>,
     project_commands: Option<CommandScopeArchive>,
+    project_authority: Option<project_authority::Capsule>,
 ) -> std::io::Result<serde_json::Value> {
     let signed_bytes = handoff_bytes(project, source_home);
-    let wire = HandoffWire {
+    let mut wire = HandoffWire {
         kind,
         project: project.to_string(),
         source: me.as_str().to_string(),
@@ -3064,12 +3073,15 @@ async fn send_handoff(
         project_commands,
         content,
         credential_key,
+        project_authority,
         shared_route,
         signature: subkey.sign(&signed_bytes),
         source_pubkey: subkey.public_key().as_str().to_string(),
         signed_bytes,
         delegation: Some(delegation.clone()),
     };
+    wire.signed_bytes = project_authority::signed_bytes(&wire)?;
+    wire.signature = subkey.sign(&wire.signed_bytes);
     let token = handoff_inbox_token(me.as_str(), peer.as_str());
     let tcp = join_relay(broker, &token).await?;
     let mut tls = tls_connect(tcp, peer, pins).await?;
@@ -3490,6 +3502,7 @@ async fn resolve_handoffs_in_doubt(wb: &SharedWorkbench, peer: &AuthorityId) {
             None,
             None,
             None,
+            None,
         )
         .await;
         let Ok(verdict) = asked else {
@@ -3605,7 +3618,9 @@ fn pending_handoff_wire(offer: &serde_json::Value) -> Result<HandoffWire, &'stat
         || offer["source"].as_str() != Some(wire.source.as_str())
         || !matches!(
             wire.kind,
-            HandoffMsgKind::OfferWithCommands | HandoffMsgKind::OfferWithWorkflowKeys
+            HandoffMsgKind::OfferWithCommands
+                | HandoffMsgKind::OfferWithWorkflowKeys
+                | HandoffMsgKind::OfferWithProjectAuthority
         )
     {
         return Err("incoming offer identity does not match its original evidence");
@@ -3734,18 +3749,23 @@ fn verify_handoff(guard: &Workbench, wire: &HandoffWire) -> Result<BridgeGrant, 
     else {
         return Err("bad source key");
     };
+    let expected =
+        project_authority::signed_bytes(wire).map_err(|_| "handoff signed state is unavailable")?;
     if !grant.is_valid(now_secs())
-        || wire.signed_bytes != handoff_bytes(&wire.project, &wire.source_home)
+        || wire.signed_bytes != expected
         || verify_signature(&wire.signed_bytes, &wire.signature, &verify_key) != Ok(true)
     {
         return Err("verification failed");
     }
+    project_authority::validate(wire)?;
     if wire.kind != HandoffMsgKind::Route && wire.shared_route.is_some() {
         return Err("unexpected shared route");
     }
     if matches!(
         wire.kind,
-        HandoffMsgKind::OfferWithCommands | HandoffMsgKind::OfferWithWorkflowKeys
+        HandoffMsgKind::OfferWithCommands
+            | HandoffMsgKind::OfferWithWorkflowKeys
+            | HandoffMsgKind::OfferWithProjectAuthority
     ) {
         workflow_keys::validate(wire)?;
         // Every offer carries the project's original command evidence (DR-0201).
@@ -3795,7 +3815,9 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
     };
     // `registered` = the target imported a relocated project (its library changed).
     let (verdict, registered) = match wire.kind {
-        HandoffMsgKind::OfferWithCommands | HandoffMsgKind::OfferWithWorkflowKeys => {
+        HandoffMsgKind::OfferWithCommands
+        | HandoffMsgKind::OfferWithWorkflowKeys
+        | HandoffMsgKind::OfferWithProjectAuthority => {
             // Three admission paths (INV-13), all the target's: a standing per-peer
             // pre-auth, or a one-shot from an accepted invite (consumed with the
             // receiving commit, ADR 0047), else explicit consent. An existing
@@ -4175,7 +4197,7 @@ async fn drive_relocate(
     // Mark before publishing outgoing state, so reconciliation cannot inspect
     // an offer between its durable preparation and its first send.
     let _in_flight = OfferInFlight::mark(peer.as_str(), project);
-    let (log, content, credential_key, project_commands) = {
+    let (log, content, credential_key, project_commands, project_authority) = {
         let mut guard = wb.lock_unpoisoned();
         // An editor save stays on the Home that admitted it, so a project with
         // one still being written does not start moving (DR-0202). Checked under the same
@@ -4239,6 +4261,8 @@ async fn drive_relocate(
                     })
                     .transpose()?;
                 workflow_keys::check_recipient(&guard, peer.as_str(), &peer_key)?;
+                let project_authority =
+                    project_authority::prepare(&guard, project, peer.as_str(), &peer_key)?;
                 Ok((
                     collect_project_log(guard.store_ref(), project),
                     content,
@@ -4251,6 +4275,7 @@ async fn drive_relocate(
                                 "project command capture failed: {error:?}"
                             ))
                         })?,
+                    project_authority,
                 ))
             },
         ) {
@@ -4277,7 +4302,9 @@ async fn drive_relocate(
             }
         }
     };
-    let kind = if content.iter().any(|bundle| bundle.workflow_key.is_some()) {
+    let kind = if project_authority.is_some() {
+        HandoffMsgKind::OfferWithProjectAuthority
+    } else if content.iter().any(|bundle| bundle.workflow_key.is_some()) {
         HandoffMsgKind::OfferWithWorkflowKeys
     } else {
         HandoffMsgKind::OfferWithCommands
@@ -4297,6 +4324,7 @@ async fn drive_relocate(
         credential_key,
         None,
         Some(project_commands),
+        project_authority,
     )
     .await
     {
@@ -6306,6 +6334,7 @@ async fn notify_origin(n: HandoffNotify, kind: HandoffMsgKind, project: &str) {
         None,
         None,
         None,
+        None,
     )
     .await;
 }
@@ -6451,6 +6480,7 @@ fn distribute_home_routes(
                 Vec::new(),
                 None,
                 Some(route),
+                None,
                 None,
             )
             .await
@@ -6919,6 +6949,7 @@ mod handoff_routes_tests {
             log: Vec::new(),
             content: Vec::new(),
             credential_key: None,
+            project_authority: None,
             project_commands: None,
             shared_route: Some(route.clone()),
             signature: subkey.sign(&signed_bytes),

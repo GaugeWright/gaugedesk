@@ -19,6 +19,14 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Reading recorded file history now checks that its original policy belongs to
+  the admitted project and has a matching preparation receipt.
+
+- Project workflows now use a retained project signing key. Moving a project
+  carries that identity securely so its workflows can resume after the move.
+  Upgrade the receiving host before moving a project with new workflows;
+  older hosts refuse the new handoff format.
+
 - Registered project gates now require a matching product acknowledgment before
   using an imported program. Missing or mismatched Home journals stop that work
   instead of falling back to the install-wide prototype.

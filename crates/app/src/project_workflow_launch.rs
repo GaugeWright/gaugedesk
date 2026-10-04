@@ -143,87 +143,6 @@ impl Workbench {
             .map(Arc::new)
             .map_err(debug_error)
     }
-    /// The root a run's signed policy is checked against. This Home's own key
-    /// for its own runs; for a run that arrived with a relocated project, the key
-    /// pinned when that move was admitted (DR-0201), which outlives the pairing;
-    /// otherwise the issuer's current, unexpired pairing.
-    pub(super) fn workflow_policy_root(
-        &self,
-        project: &str,
-        issuer: &str,
-    ) -> Result<
-        (
-            GovernanceRootVerifier,
-            gaugedesk_store::command_dispatch::DispatchReadBasis,
-        ),
-        String,
-    > {
-        use crate::federation::{BridgeRecord, BRIDGE_SCOPE};
-        let pins = crate::federation::workflow_signers_scope(project);
-        let ((key, expiry), basis) = self
-            .store_ref()
-            .read_for_dispatch(&[BRIDGE_SCOPE, &pins], |store| {
-                if issuer == self.authority().as_str() {
-                    let key = SigningKey::from_seed(&self.governance_seed()).map_err(|_| {
-                        gaugedesk_store::AdmitError::Rejected(gaugedesk_core::Rejection {
-                            reason: "local workflow signing root is unavailable",
-                        })
-                    })?;
-                    return Ok((key.public_key(), None));
-                }
-                store.retained_events(&pins)?;
-                let mut pinned = None;
-                for row in store.records(&pins, crate::federation::WORKFLOW_SIGNER_PIN_KIND)? {
-                    let pin: crate::federation::WorkflowSignerPin = serde_json::from_str(&row)?;
-                    if pin.issuer == issuer {
-                        pinned = Some(pin.governance_pubkey);
-                    }
-                }
-                if let Some(key) = pinned {
-                    return Ok((gaugedesk_core::ids::PublicKey::new(key), None));
-                }
-                // Read the authoritative roster, including tombstones and revokes.
-                // A cached pairing or a key carried by the offer is not this evidence.
-                store.retained_events(BRIDGE_SCOPE)?;
-                let mut current = None;
-                for row in store.records(BRIDGE_SCOPE, "bridge")? {
-                    let record: BridgeRecord = serde_json::from_str(&row)?;
-                    if record.id == issuer {
-                        current = Some(record);
-                    }
-                }
-                let record = current
-                    .filter(|record| {
-                        record.op == crate::library::RecordOp::Upsert
-                            && record.active
-                            && record.ticket.authority == issuer
-                            && record.ticket.expiry > crate::account::session_now_ms() / 1000
-                    })
-                    .ok_or(gaugedesk_store::AdmitError::Rejected(
-                        gaugedesk_core::Rejection {
-                            reason: "original workflow signing authority is not currently trusted",
-                        },
-                    ))?;
-                Ok((
-                    gaugedesk_core::ids::PublicKey::new(record.ticket.governance_pubkey),
-                    Some(record.ticket.expiry),
-                ))
-            })
-            .map_err(debug_error)?;
-        let basis = match expiry {
-            Some(expiry) => basis.with_deadline(
-                std::time::UNIX_EPOCH
-                    .checked_add(std::time::Duration::from_secs(expiry))
-                    .ok_or("workflow signing trust deadline is invalid")?,
-            ),
-            None => basis,
-        };
-        Ok((
-            GovernanceRootVerifier::new(gaugedesk_core::ids::AuthorityId::new(issuer), key),
-            basis,
-        ))
-    }
-
     pub fn launch_project_workflow(
         &mut self,
         context: &AuthenticatedActionContext,
@@ -326,8 +245,13 @@ impl Workbench {
         let protection =
             WorkflowProtection::new(&authority.workspace, key.clone()).map_err(debug_error)?;
         let storage = self.workflow_storage(&authority.workspace)?;
+        self.initialize_project_authority(&request.project)
+            .map_err(debug_error)?;
+        let (project_authority, _) = self
+            .project_authority_identity(&request.project)
+            .map_err(debug_error)?;
         let identity = ActionPolicyIdentity {
-            issuer: self.authority().as_str().into(),
+            issuer: project_authority.as_str().into(),
             scope: format!(
                 "project::{}::workflow::{}",
                 request.project,
@@ -335,7 +259,9 @@ impl Workbench {
             ),
             request_id: request.request_id.clone(),
         };
-        let signing_key = SigningKey::from_seed(&self.governance_seed()).map_err(debug_error)?;
+        let signing_key = self
+            .project_signing_key(&request.project)
+            .map_err(debug_error)?;
         let policy = prepare_project_action_policy(
             self.store_mut(),
             &request.project,
@@ -343,7 +269,7 @@ impl Workbench {
             &authority.policy,
             &signing_key,
         )?;
-        let (root, _) = self.workflow_policy_root(&request.project, &identity.issuer)?;
+        let (root, _) = self.project_policy_root(&request.project, &identity.issuer)?;
         let envelope =
             ifc::VerifiedEnvelope::verify_signed_text_with(policy.signed_envelope(), &root)?;
         if !ifc::check_with_envelope(action.program(), &envelope).is_empty() {

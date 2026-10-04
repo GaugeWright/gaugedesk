@@ -367,7 +367,7 @@ impl Workbench {
                 .map_err(debug_error)?;
             recipients.insert(queue.clone(), readers);
         }
-        let signing_key = SigningKey::from_seed(&self.governance_seed()).map_err(debug_error)?;
+        let signing_key = self.project_signing_key(project).map_err(debug_error)?;
         let mut writer = self.store_ref().sibling().map_err(debug_error)?;
         writer
             .with_dispatch_basis(&prepared.authority.basis, || {

@@ -281,11 +281,13 @@ fn load_at(
 
 /// Resolve a retained content label through its original signed policy. This
 /// returns restrictions, never authority to read content or execute an action.
-/// The caller must independently authorize the selected target and reader.
+/// The caller selects eligible original identities and trusted public roots,
+/// and independently authorizes the selected target and reader. `None` skips
+/// evidence outside that profile; an eligible but untrusted candidate refuses.
 pub(crate) fn load_action_label(
     product: &Store,
     label: &str,
-    root: &GovernanceRootVerifier,
+    resolve_root: impl Fn(&ActionPolicyIdentity) -> Result<Option<GovernanceRootVerifier>, String>,
 ) -> Result<gaugedesk_whip_runtime::ResourcePolicy, String> {
     let (hash, binding) = label
         .strip_prefix("policy:")
@@ -310,10 +312,34 @@ pub(crate) fn load_action_label(
             if retained.policy_ref.envelope_hash != hash {
                 continue;
             }
+            let Some(root) = resolve_root(&retained.identity)? else {
+                // Equal policy meaning can share an envelope hash across
+                // projects. Foreign records never supply this project's
+                // evidence, nor hide a later matching local preparation.
+                continue;
+            };
             if retained.identity.storage_scope()? != *scope {
                 return Err("retained content policy has a substituted storage identity".into());
             }
-            verify_record(&retained, &retained.identity, root)?;
+            verify_record(&retained, &retained.identity, &root)?;
+            // The signature binds policy meaning and issuer. The immutable
+            // preparation receipt binds those bytes to their project/request
+            // coordinates; a copied signed envelope is not that receipt.
+            let expected_preparation = serde_json::to_string(&(
+                &retained.identity,
+                &retained.canonical_policy,
+                root.expected_key().as_str(),
+                ACTION_EPOCH,
+            ))
+            .map_err(|error| error.to_string())?;
+            if product
+                .committed_record_snapshot(scope, PREPARATION_KEY)
+                .map_err(|_| "retained content policy preparation is unavailable")?
+                .as_deref()
+                != Some(expected_preparation.as_str())
+            {
+                return Err("retained content policy has no matching preparation receipt".into());
+            }
             let policy: HostGovernancePolicy = serde_json::from_str(&retained.signed_envelope)
                 .map_err(|_| "retained content policy cannot be decoded")?;
             if canonicalize(&policy.to_json()?)? != retained.canonical_policy {
@@ -339,6 +365,23 @@ mod tests {
     use gaugedesk_whip_runtime::host_actions::NativeStores;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Barrier};
+
+    // A test consumer selects one exact original command scope. Native file
+    // profile interpretation is qualified through the real file-history door.
+    fn test_label(
+        product: &Store,
+        label: &str,
+        roots: &crate::project_policy_authority::LocalProjectPolicyRoots,
+    ) -> Result<gaugedesk_whip_runtime::ResourcePolicy, String> {
+        let scope =
+            serde_json::to_string(&("gaugedesk.editor-file.v1", roots.project(), "chat")).unwrap();
+        load_action_label(product, label, |identity| {
+            if identity.scope != scope {
+                return Ok(None);
+            }
+            roots.root(&identity.issuer).cloned().map(Some)
+        })
+    }
 
     fn identity() -> ActionPolicyIdentity {
         ActionPolicyIdentity {
@@ -772,7 +815,10 @@ mod tests {
         let path = dir.path().join("product.sqlite");
         let mut product = Store::open(path.to_str().unwrap()).unwrap();
         let key = SigningKey::from_seed(&[41; 32]).unwrap();
-        let mut id = identity();
+        let mut id = ActionPolicyIdentity {
+            scope: serde_json::to_string(&("gaugedesk.editor-file.v1", "one", "chat")).unwrap(),
+            ..identity()
+        };
         let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
         let original = policy();
         let prepared = prepare_action_policy(&mut product, &id, &original, &key).unwrap();
@@ -796,7 +842,15 @@ mod tests {
             .scope_ids_with_kind(POLICY_KIND, None, std::num::NonZeroUsize::new(64).unwrap())
             .unwrap();
         assert_eq!(
-            load_action_label(&product, &label, &root).unwrap(),
+            test_label(
+                &product,
+                &label,
+                &crate::project_policy_authority::LocalProjectPolicyRoots::fixture(
+                    "one",
+                    vec![root.clone()]
+                )
+            )
+            .unwrap(),
             original.resources["file:/action/input"]
         );
         for invalid in [
@@ -806,14 +860,30 @@ mod tests {
             &label.replace("admitted_input", "missing"),
         ] {
             assert!(
-                load_action_label(&product, invalid, &root).is_err(),
+                test_label(
+                    &product,
+                    invalid,
+                    &crate::project_policy_authority::LocalProjectPolicyRoots::fixture(
+                        "one",
+                        vec![root.clone()]
+                    )
+                )
+                .is_err(),
                 "{invalid}"
             );
         }
         let other = SigningKey::from_seed(&[42; 32]).unwrap();
         let wrong_root =
             GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), other.public_key());
-        assert!(load_action_label(&product, &label, &wrong_root).is_err());
+        assert!(test_label(
+            &product,
+            &label,
+            &crate::project_policy_authority::LocalProjectPolicyRoots::fixture(
+                "one",
+                vec![wrong_root]
+            )
+        )
+        .is_err());
         assert_eq!(
             product
                 .scope_ids_with_kind(POLICY_KIND, None, std::num::NonZeroUsize::new(64).unwrap())
@@ -822,12 +892,93 @@ mod tests {
         );
     }
     #[test]
+    fn retained_file_labels_refuse_foreign_projects_profiles_and_unreceipted_aliases() {
+        let key = SigningKey::from_seed(&[41; 32]).unwrap();
+        let issuer = identity().issuer;
+        let root = GovernanceRootVerifier::new(AuthorityId::new(&issuer), key.public_key());
+        let roots =
+            crate::project_policy_authority::LocalProjectPolicyRoots::fixture("one", vec![root]);
+        for (format, project, request) in [
+            ("gaugedesk.editor-file.v1", "other", "foreign"),
+            ("gaugedesk.editor-corrections.v1", "one", "wrong-profile"),
+            ("gaugedesk.editor-file.v1", "one", "own"),
+        ] {
+            let mut product = Store::open_in_memory().unwrap();
+            let id = ActionPolicyIdentity {
+                issuer: issuer.clone(),
+                scope: serde_json::to_string(&(format, project, "chat")).unwrap(),
+                request_id: request.into(),
+            };
+            let prepared = prepare_action_policy(&mut product, &id, &policy(), &key).unwrap();
+            let label = format!(
+                "policy:{}:admitted_input",
+                prepared.policy_ref().envelope_hash
+            );
+            let before = product.scope_high_water_marks().unwrap();
+            let result = test_label(&product, &label, &roots);
+            if request == "own" {
+                assert_eq!(result.unwrap(), policy().resources["file:/action/input"]);
+            } else {
+                assert!(result.is_err(), "{request}");
+            }
+            assert_eq!(product.scope_high_water_marks().unwrap(), before);
+            if request == "foreign" {
+                // Copy a correctly signed envelope under counterfeit local
+                // coordinates. There is no preparation receipt for this alias.
+                let mut alias = record(&product, &id.storage_scope().unwrap())
+                    .unwrap()
+                    .unwrap();
+                alias.identity.scope =
+                    serde_json::to_string(&("gaugedesk.editor-file.v1", "one", "chat")).unwrap();
+                let alias_scope = alias.identity.storage_scope().unwrap();
+                product
+                    .append_record(
+                        &alias_scope,
+                        POLICY_KIND,
+                        &serde_json::to_string(&alias).unwrap(),
+                    )
+                    .unwrap();
+                assert!(test_label(&product, &label, &roots)
+                    .unwrap_err()
+                    .contains("matching preparation receipt"));
+            }
+        }
+    }
+
+    #[test]
+    fn equal_policy_hashes_in_other_projects_do_not_hide_local_preparation() {
+        let mut product = Store::open_in_memory().unwrap();
+        let key = SigningKey::from_seed(&[41; 32]).unwrap();
+        let mut id = identity();
+        let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
+        let roots =
+            crate::project_policy_authority::LocalProjectPolicyRoots::fixture("one", vec![root]);
+        id.scope =
+            serde_json::to_string(&("gaugedesk.editor-file.v1", "aaa-other", "chat")).unwrap();
+        let foreign = prepare_action_policy(&mut product, &id, &policy(), &key).unwrap();
+        id.scope = serde_json::to_string(&("gaugedesk.editor-file.v1", "one", "chat")).unwrap();
+        let own = prepare_action_policy(&mut product, &id, &policy(), &key).unwrap();
+        assert_eq!(
+            foreign.policy_ref().envelope_hash,
+            own.policy_ref().envelope_hash
+        );
+        let label = format!("policy:{}:admitted_input", own.policy_ref().envelope_hash);
+        assert_eq!(
+            test_label(&product, &label, &roots).unwrap(),
+            policy().resources["file:/action/input"]
+        );
+    }
+
+    #[test]
     fn retained_label_lookup_reaches_policies_after_the_first_discovery_page() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("product.sqlite");
         let mut product = Store::open(path.to_str().unwrap()).unwrap();
         let key = SigningKey::from_seed(&[41; 32]).unwrap();
-        let mut id = identity();
+        let mut id = ActionPolicyIdentity {
+            scope: serde_json::to_string(&("gaugedesk.editor-file.v1", "one", "chat")).unwrap(),
+            ..identity()
+        };
         let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
         for index in (0..65).rev() {
             id.request_id = format!("aa-{index:03}");
@@ -856,7 +1007,15 @@ mod tests {
             "fixture must require another page"
         );
         assert_eq!(
-            load_action_label(&product, &label, &root).unwrap(),
+            test_label(
+                &product,
+                &label,
+                &crate::project_policy_authority::LocalProjectPolicyRoots::fixture(
+                    "one",
+                    vec![root.clone()]
+                )
+            )
+            .unwrap(),
             original.resources["file:/action/input"]
         );
     }

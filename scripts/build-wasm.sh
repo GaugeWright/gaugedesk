@@ -190,8 +190,10 @@ fi
 flags=()
 [ "$profile" = "release" ] && flags+=(--release)
 
-rm -rf "$out"
 mkdir -p "$out"
+# The sandbox binds this generated directory as a writable mountpoint. Clear
+# its contents, including hidden stale artifacts, without removing the mount.
+find "$out" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
 # One module per crate. Kept separate rather than merged because they load on
 # different occasions: the verifier is needed on any signed-in load, the tunnel

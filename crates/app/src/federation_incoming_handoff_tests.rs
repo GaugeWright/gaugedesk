@@ -475,3 +475,389 @@ fn protected_carriage_requires_the_explicit_offer_kind_and_one_matching_bundle()
         assert!(workflow_keys::validate(&wire).is_err(), "{failure}");
     }
 }
+
+fn authority_fixture() -> (
+    SharedWorkbench,
+    HandoffWire,
+    Workbench,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    use crate::{
+        at_rest::LoopbackKeyWrap,
+        content_vault::{ContentVault, LocalFileErasureLedger},
+    };
+    let (wb, mut wire, source_dir, target_dir) = fixture_with_protection(true);
+    let recipient = federation_root_signing_key(&wb.lock_unpoisoned()).public_key();
+    let target_ticket = wb.lock_unpoisoned().federation_ref().unwrap().mint_ticket(
+        recipient.clone(),
+        "bridge:invoke".into(),
+        Some(3600),
+    );
+    let mut federation = Federation::open(
+        AuthorityId::new("alice"),
+        source_dir.path(),
+        "wss://127.0.0.1:1".into(),
+    )
+    .unwrap();
+    federation.accept_ticket(&target_ticket, "target".into());
+    let dir = source_dir.path().join("content-keys");
+    let vault = Arc::new(
+        ContentVault::new(&dir, Box::new(LoopbackKeyWrap::new([7; 32]))).with_ledger(Box::new(
+            LocalFileErasureLedger::new(dir.join("erased.ledger")),
+        )),
+    );
+    let mut store =
+        Store::open(source_dir.path().join("product.sqlite").to_str().unwrap()).unwrap();
+    for record in &wire.log {
+        store
+            .append_record(&record.scope, &record.kind, &record.payload)
+            .unwrap();
+    }
+    let mut source = Workbench::new(store)
+        .with_authority(AuthorityId::new("alice"))
+        .with_root(source_dir.path())
+        .with_content_vault(vault)
+        .with_federation(federation);
+    source.rebuild_library();
+    source.initialize_project_authority("p1").unwrap();
+    wire.project_authority = project_authority::prepare(&source, "p1", "bob", &recipient).unwrap();
+    wire.kind = HandoffMsgKind::OfferWithProjectAuthority;
+    resign_authority_offer(&mut wire, source_dir.path());
+    assert_eq!(admit_handoff(&wb, &wire)["pending"], true);
+    (wb, wire, source, source_dir, target_dir)
+}
+
+fn resign_authority_offer(wire: &mut HandoffWire, source: &std::path::Path) {
+    let id = AuthorityId::new("alice");
+    let root = FileKeyStore::new(source.join("keys")).signing_key(&id);
+    let (key, _) = device_identity(source, &id, &root);
+    wire.signed_bytes = project_authority::signed_bytes(wire).unwrap();
+    wire.signature = key.sign(&wire.signed_bytes);
+}
+
+#[test]
+fn staged_authority_survives_failed_receiving_commit_without_granting_use() {
+    let (wb, wire, source, _source_dir, _target_dir) = authority_fixture();
+    let public = source.project_authority_identity("p1").unwrap().1;
+    let mut guard = wb.lock_unpoisoned();
+    let conn = rusqlite::Connection::open(guard.store_ref().path()).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_authority_receive BEFORE INSERT ON command_receipts WHEN NEW.scope_id = 'handoff::p1' AND NEW.command_key = 'receive' BEGIN SELECT RAISE(ABORT, 'receipt fault'); END;").unwrap();
+    assert!(commit(&mut guard, &wire, Consent::Pending).is_err());
+    assert!(guard
+        .store_ref()
+        .project_authority_key("p1")
+        .unwrap()
+        .is_some());
+    assert!(guard.project_signing_key("p1").is_err());
+    assert!(guard.project_home_id("p1").is_none());
+    // Even a local creation reusing this id cannot activate staged signing
+    // custody without the receiving admission which retains the transfer.
+    let record: crate::library::ProjectRecord = serde_json::from_str(
+        &wire
+            .log
+            .iter()
+            .find(|r| r.kind == "project")
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    let mut local = record;
+    local.home_id = guard.home_id().clone();
+    guard.library.projects.insert("p1".into(), local);
+    assert!(guard.initialize_project_authority("p1").is_err());
+    assert!(guard.project_authority_identity("p1").is_err());
+    guard.rebuild_library();
+    conn.execute_batch("DROP TRIGGER fail_authority_receive")
+        .unwrap();
+    commit(&mut guard, &wire, Consent::Pending).unwrap();
+    assert_eq!(
+        guard.project_signing_key("p1").unwrap().public_key(),
+        public
+    );
+    let retained = guard
+        .store_ref()
+        .project_authority_key("p1")
+        .unwrap()
+        .unwrap();
+    commit(&mut guard, &wire, Consent::Pending).unwrap();
+    assert!(
+        guard
+            .store_ref()
+            .project_authority_key("p1")
+            .unwrap()
+            .unwrap()
+            == retained
+    );
+}
+
+#[test]
+fn authority_offer_binds_complete_state_and_refuses_partial_or_foreign_custody() {
+    for failure in [
+        "missing",
+        "legacy",
+        "tampered-log",
+        "recipient",
+        "project",
+        "public-key",
+        "ciphertext",
+        "payload-context",
+        "missing-vault",
+    ] {
+        let (wb, mut wire, _source, source_dir, _target_dir) = authority_fixture();
+        let mut capsule = serde_json::to_value(&wire.project_authority).unwrap();
+        match failure {
+            "missing" => wire.project_authority = None,
+            "legacy" => wire.kind = HandoffMsgKind::OfferWithWorkflowKeys,
+            "tampered-log" => wire.log[0].payload.push(' '),
+            "recipient" => {
+                capsule["recipient"] =
+                    serde_json::to_value(SigningKey::from_seed(&[99; 32]).unwrap().public_key())
+                        .unwrap()
+            }
+            "project" => capsule["project"] = serde_json::json!("another-project"),
+            "public-key" => {
+                let public = SigningKey::from_seed(&[99; 32]).unwrap().public_key();
+                capsule["authority"] =
+                    serde_json::to_value(crate::project_authority::authority(&public)).unwrap();
+                capsule["public_key"] = serde_json::to_value(public).unwrap();
+            }
+            "ciphertext" => capsule["sealed"]["ciphertext"] = serde_json::json!("00"),
+            "payload-context" => {
+                let recipient = federation_root_signing_key(&wb.lock_unpoisoned()).public_key();
+                capsule["sealed"] =
+                    serde_json::to_value(seal_to_subkey(&recipient, &[3; 64]).unwrap()).unwrap();
+            }
+            "missing-vault" => wb.lock_unpoisoned().content_vault = None,
+            _ => unreachable!(),
+        }
+        if !matches!(
+            failure,
+            "missing" | "legacy" | "tampered-log" | "missing-vault"
+        ) {
+            wire.project_authority = Some(serde_json::from_value(capsule).unwrap());
+            // Current source transport legitimately signs malformed custody:
+            // the receiving cryptographic checks must still refuse it.
+            resign_authority_offer(&mut wire, source_dir.path());
+        }
+        let admitted = admit_handoff(&wb, &wire);
+        if admitted["pending"] == true {
+            assert!(
+                commit(&mut wb.lock_unpoisoned(), &wire, Consent::Pending).is_err(),
+                "{failure}"
+            );
+        } else {
+            assert_eq!(admitted["ok"], false, "{failure}");
+        }
+        let guard = wb.lock_unpoisoned();
+        assert!(guard.project_home_id("p1").is_none(), "{failure}");
+        assert!(
+            guard
+                .store_ref()
+                .project_authority_key("p1")
+                .unwrap()
+                .is_none(),
+            "{failure}"
+        );
+    }
+}
+
+#[test]
+fn committed_authority_recovery_refuses_missing_custody_without_repairing_it() {
+    let (wb, wire, _source, _source_dir, target_dir) = authority_fixture();
+    let mut guard = wb.lock_unpoisoned();
+    commit(&mut guard, &wire, Consent::Pending).unwrap();
+    let file = target_dir
+        .path()
+        .join("content-keys/projects")
+        .join(format!("{}.key", crate::org::sha256_hex("p1")));
+    std::fs::remove_file(&file).unwrap();
+    assert!(commit(&mut guard, &wire, Consent::Pending).is_err());
+    assert!(guard.project_signing_key("p1").is_err());
+    assert!(!file.exists());
+}
+
+fn workflow_member(wb: &mut Workbench) -> crate::identity::AuthenticatedActionContext {
+    let member = crate::org::MembershipRecord {
+        id: "member".into(),
+        op: crate::org::RecordOp::Upsert,
+        org_id: crate::org::ORG_ID.into(),
+        authority: "member".into(),
+        email: String::new(),
+        role: "owner".into(),
+        status: crate::org::MembershipStatus::Active,
+        managed_by_scim: false,
+        team: None,
+    };
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&member).unwrap(),
+        )
+        .unwrap();
+    let token = wb.mint_account_session("member", "passkey", 3600).unwrap();
+    wb.authenticate_action_context(&token).unwrap()
+}
+
+#[test]
+fn actual_project_signed_workflow_moves_and_resumes_under_same_authority_after_restart() {
+    use crate::project_workflow::{ProjectWorkflowLaunch, ProjectWorkflowLimits};
+    use crate::{
+        at_rest::LoopbackKeyWrap,
+        content_vault::{ContentVault, LocalFileErasureLedger},
+    };
+    let (wb, mut wire, mut source, source_dir, target_dir) = authority_fixture();
+    crate::library_routes::create_named_project(&mut source, "p1", "Incoming project").unwrap();
+    let context = workflow_member(&mut source);
+    let target = crate::library_state::managed_project_target_id("p1");
+    let mut record = source.library.work_targets[&target].clone();
+    record.authority = "member".into();
+    record.parties = vec!["member".into()];
+    source
+        .store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "work_target",
+            &serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    source.rebuild_library();
+    let workspace = source.targets.get(&target).unwrap();
+    workspace.seed_main(&[("hello.whip", "workflow Greeting(learner: Learner) -> string\nclass Learner { authority string }\nrule greet\n  when Learner as learner\n=> { complete result learner.authority }\n")]).unwrap();
+    let cut = workspace.current_main_cut().unwrap().unwrap();
+    let limits = ProjectWorkflowLimits {
+        source_bytes: 256 * 1024,
+        input_bytes: 64 * 1024,
+    };
+    let request = ProjectWorkflowLaunch {
+        project: "p1".into(),
+        target,
+        path: "hello.whip".into(),
+        cut,
+        request_id: "move-workflow".into(),
+        inputs: BTreeMap::from([("learner".into(), serde_json::json!({"authority":"member"}))]),
+    };
+    let original = source
+        .launch_project_workflow(&context, &request, limits)
+        .unwrap();
+    let identity = source.project_authority_identity("p1").unwrap();
+    assert_eq!(original.command.issuer, identity.0.as_str());
+    let recipient = federation_root_signing_key(&wb.lock_unpoisoned()).public_key();
+    let (workspace, transfer) = workflow_keys::prepare(&source, "p1", "bob", &recipient)
+        .unwrap()
+        .unwrap();
+    let (log, content, commands, capsule) = capture_handoff_offer(
+        source.store_ref(),
+        "p1",
+        "bob",
+        Some(&transfer),
+        |custody| {
+            let (key, key_capsule) = custody.unwrap();
+            let protection =
+                gaugedesk_workspace::WorkflowProtection::new(&workspace, key.clone()).unwrap();
+            Ok((
+                collect_project_log(source.store_ref(), "p1"),
+                collect_project_content_with_custody(
+                    &source,
+                    "p1",
+                    Some(&protection),
+                    Some(key_capsule),
+                )?,
+                source
+                    .store_ref()
+                    .export_command_scopes(|scope| is_project_scope(scope, "p1"))
+                    .unwrap(),
+                project_authority::prepare(&source, "p1", "bob", &recipient)?,
+            ))
+        },
+    )
+    .unwrap();
+    wire.log = log;
+    wire.content = content;
+    wire.project_commands = Some(commands);
+    wire.project_authority = capsule;
+    resign_authority_offer(&mut wire, source_dir.path());
+    let mut partial = wire.clone();
+    partial.project_authority = None;
+    partial.kind = HandoffMsgKind::OfferWithWorkflowKeys;
+    resign_authority_offer(&mut partial, source_dir.path());
+    assert_eq!(admit_handoff(&wb, &partial)["ok"], false);
+    assert_eq!(admit_handoff(&wb, &wire)["pending"], true);
+    {
+        let mut guard = wb.lock_unpoisoned();
+        commit(&mut guard, &wire, Consent::Pending).unwrap();
+        let target_context = workflow_member(&mut guard);
+        assert_eq!(guard.project_authority_identity("p1").unwrap(), identity);
+        let resumed = guard
+            .resume_project_workflow(&target_context, "p1", "move-workflow", limits)
+            .unwrap();
+        assert_eq!(resumed.command, original.command);
+        assert_eq!(resumed.admission, original.admission);
+        guard
+            .step_project_workflow(&target_context, "p1", "move-workflow", limits)
+            .unwrap();
+    }
+    // Reopen product/workspace/custody state with a fresh key cache.
+    drop(wb);
+    let dir = target_dir.path().join("content-keys");
+    let vault = Arc::new(
+        ContentVault::new(&dir, Box::new(LoopbackKeyWrap::new([8; 32]))).with_ledger(Box::new(
+            LocalFileErasureLedger::new(dir.join("erased.ledger")),
+        )),
+    );
+    let mut reopened = Workbench::new(
+        Store::open(target_dir.path().join("events.sqlite").to_str().unwrap()).unwrap(),
+    )
+    .with_authority(AuthorityId::new("bob"))
+    .with_root(target_dir.path())
+    .with_content_vault(vault);
+    reopened.rebuild_library();
+    reopened
+        .ensure_project_collaboration_workspace("p1")
+        .unwrap();
+    let context = workflow_member(&mut reopened);
+    assert_eq!(reopened.project_authority_identity("p1").unwrap(), identity);
+    let resumed = reopened
+        .resume_project_workflow(&context, "p1", "move-workflow", limits)
+        .unwrap();
+    assert_eq!(resumed.command, original.command);
+    assert_eq!(resumed.admission, original.admission);
+}
+
+#[test]
+fn retained_authority_offer_signature_refuses_changed_carriage() {
+    let (wb, mut wire, _source, _source_dir, _target_dir) = authority_fixture();
+    assert!(verify_handoff(&wb.lock_unpoisoned(), &wire).is_ok());
+    let mut capsule = serde_json::to_value(&wire.project_authority).unwrap();
+    capsule["sealed"]["ciphertext"] = serde_json::json!("00");
+    wire.project_authority = Some(serde_json::from_value(capsule).unwrap());
+    assert!(verify_handoff(&wb.lock_unpoisoned(), &wire).is_err());
+}
+
+#[test]
+fn receiving_authority_refuses_conflicting_retention_and_missing_committed_registry() {
+    for fault in ["different-authority", "missing-registry"] {
+        let (wb, wire, _source, _source_dir, _target_dir) = authority_fixture();
+        let mut guard = wb.lock_unpoisoned();
+        if fault == "different-authority" {
+            guard
+                .stage_project_authority("p1", &SigningKey::from_seed(&[99; 32]).unwrap(), false)
+                .unwrap();
+        } else {
+            commit(&mut guard, &wire, Consent::Pending).unwrap();
+            let conn = rusqlite::Connection::open(guard.store_ref().path()).unwrap();
+            conn.execute_batch("DROP TRIGGER project_authority_no_delete; DELETE FROM project_authority_keys WHERE project_id = 'p1'").unwrap();
+        }
+        let retained = guard.store_ref().project_authority_key("p1").unwrap();
+        assert!(
+            commit(&mut guard, &wire, Consent::Pending).is_err(),
+            "{fault}"
+        );
+        assert!(
+            guard.store_ref().project_authority_key("p1").unwrap() == retained,
+            "{fault}"
+        );
+        assert!(guard.project_signing_key("p1").is_err(), "{fault}");
+    }
+}

@@ -188,7 +188,9 @@ impl Workbench {
         // Acknowledgment commits release the product writer. Re-capture current
         // authority before any effect, retaining the original command and inputs.
         let prepared = self.prepare_tracker_completion(context, request, limits, &scope)?;
-        let signing_key = SigningKey::from_seed(&self.governance_seed()).map_err(debug_error)?;
+        let signing_key = self
+            .project_signing_key(&request.project)
+            .map_err(debug_error)?;
         let mut writer = self.store_ref().sibling().map_err(debug_error)?;
         writer
             .with_dispatch_basis(&prepared.basis, || {
@@ -275,10 +277,18 @@ impl Workbench {
             return Err("completion input exceeds budget".into());
         }
         let current_policy = completion_policy(&tracker, context.actor().as_str())?;
-        let signing_key = SigningKey::from_seed(&self.governance_seed()).map_err(debug_error)?;
+        self.initialize_project_authority(&request.project)
+            .map_err(debug_error)?;
+        let signing_key = self
+            .project_signing_key(&request.project)
+            .map_err(debug_error)?;
+        let project_authority = self
+            .project_authority_identity(&request.project)
+            .map_err(debug_error)?
+            .0;
         let identity = ActionPolicyIdentity {
             issuer: original.as_ref().map_or_else(
-                || self.authority().as_str().into(),
+                || project_authority.as_str().into(),
                 |command| command.issuer.clone(),
             ),
             scope: format!(
@@ -288,7 +298,7 @@ impl Workbench {
             ),
             request_id: request.request_id.clone(),
         };
-        let (root, trust_basis) = self.workflow_policy_root(&request.project, &identity.issuer)?;
+        let (root, trust_basis) = self.project_policy_root(&request.project, &identity.issuer)?;
         basis = basis.combine(trust_basis).map_err(debug_error)?;
         let policy = if let Some(command) = &original {
             load_project_action_policy(
@@ -483,7 +493,7 @@ impl Workbench {
                 },
             )
             .map_err(debug_error)?;
-        let (root, trust_basis) = self.workflow_policy_root(&request.project, &identity.issuer)?;
+        let (root, trust_basis) = self.project_policy_root(&request.project, &identity.issuer)?;
         // The command commit changed the product head. Re-verify the retained
         // signature against this fresh trust observation rather than carrying a
         // verifier derived from an earlier pairing into its new basis.
@@ -542,7 +552,9 @@ impl Workbench {
         limits: ProjectWorkflowLimits,
         scope: &str,
     ) -> Result<ProjectWorkflowInvocation, String> {
-        let signing_key = SigningKey::from_seed(&self.governance_seed()).map_err(debug_error)?;
+        let signing_key = self
+            .project_signing_key(&request.project)
+            .map_err(debug_error)?;
         let command = &prepared.command;
         let proof = signing_key.sign(&command.signing_bytes().map_err(debug_error)?);
         let mut writer = self.store_ref().sibling().map_err(debug_error)?;

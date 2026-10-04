@@ -16,11 +16,31 @@ const CALLBACK = "https://desk.example.test/auth/saml/acs";
 const REQUEST_ID = "_browser-request-1";
 const IDP_ISSUER = "https://idp.example.com/metadata";
 
-function pem(attrs) {
-    const r = selfsigned.generate(attrs || [{ name: "commonName", value: "idp.example.com" }], {
+async function pem(attrs) {
+    const notBeforeDate = new Date();
+    const notAfterDate = new Date(notBeforeDate);
+    notAfterDate.setDate(notAfterDate.getDate() + 365);
+    const r = await selfsigned.generate(attrs || [{ name: "commonName", value: "idp.example.com" }], {
         keySize: 2048,
         algorithm: "sha256",
-        days: 365,
+        notBeforeDate,
+        notAfterDate,
+        // Preserve the fixture certificate's selfsigned 2.x extensions.
+        extensions: [
+            { name: "basicConstraints", cA: true },
+            {
+                name: "keyUsage",
+                keyCertSign: true,
+                digitalSignature: true,
+                nonRepudiation: true,
+                keyEncipherment: true,
+                dataEncipherment: true,
+            },
+            {
+                name: "subjectAltName",
+                altNames: [{ type: 6, value: "http://example.org/webid#me" }],
+            },
+        ],
     });
     return { cert: r.cert, key: r.private };
 }
@@ -44,7 +64,7 @@ function runVerify(request) {
 }
 
 test("accepts a valid signed assertion and maps subject + attributes", async () => {
-    const { cert, key } = pem();
+    const { cert, key } = await pem();
     const saml_response = makeSignedResponse({
         subject: "alice@acme.com",
         audience: AUDIENCE,
@@ -63,7 +83,7 @@ test("accepts a valid signed assertion and maps subject + attributes", async () 
 });
 
 test("binds a browser response to the exact request, ACS, and IdP issuer", async () => {
-    const { cert, key } = pem();
+    const { cert, key } = await pem();
     const response = (overrides = {}) => makeSignedResponse({
         subject: "alice@acme.com", audience: AUDIENCE, attributes: {}, certPem: cert, keyPem: key,
         requestId: REQUEST_ID, recipient: CALLBACK, issuer: IDP_ISSUER, ...overrides,
@@ -80,7 +100,7 @@ test("binds a browser response to the exact request, ACS, and IdP issuer", async
 });
 
 test("rejects a tampered assertion (signature no longer matches)", async () => {
-    const { cert, key } = pem();
+    const { cert, key } = await pem();
     const good = makeSignedResponse({
         subject: "alice@acme.com",
         audience: AUDIENCE,
@@ -96,8 +116,8 @@ test("rejects a tampered assertion (signature no longer matches)", async () => {
 });
 
 test("rejects a response signed by a different (untrusted) cert", async () => {
-    const signer = pem();
-    const other = pem([{ name: "commonName", value: "attacker" }]);
+    const signer = await pem();
+    const other = await pem([{ name: "commonName", value: "attacker" }]);
     const saml_response = makeSignedResponse({
         subject: "alice@acme.com",
         audience: AUDIENCE,
@@ -111,7 +131,7 @@ test("rejects a response signed by a different (untrusted) cert", async () => {
 });
 
 test("rejects an unsigned response", async () => {
-    const { cert } = pem();
+    const { cert } = await pem();
     const unsigned = Buffer.from(
         `<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>x</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>`,
         "utf8",

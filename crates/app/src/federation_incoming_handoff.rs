@@ -527,6 +527,8 @@ pub(super) fn commit(
             Ok((false, oneshot, reused))
         },
     )?;
+    project_authority::receive(guard, wire, replayed)
+        .map_err(|error| AdmitError::Codec(error.to_string()))?;
     if replayed {
         // Later workflow writes legitimately change the installation receipt.
         // Recover this product admission before considering another import.

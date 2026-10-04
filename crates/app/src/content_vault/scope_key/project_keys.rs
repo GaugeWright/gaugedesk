@@ -154,6 +154,39 @@ fn project_key_id(project: &str) -> String {
 }
 
 impl ContentVault {
+    /// Explicit authority-key creation uses the project's existing custody
+    /// seam, never the install wrapper directly. No raw seed is persisted.
+    pub(crate) fn seal_project_authority_seed(
+        &self,
+        project: &str,
+        seed: &[u8; 32],
+    ) -> std::io::Result<Vec<u8>> {
+        self.wrap_dek_for_project(project, seed)
+    }
+
+    /// Reopen exact custody without cache-based availability or initialization.
+    /// The expected project comes from the owner, not a ciphertext header.
+    pub(crate) fn open_project_authority_seed(
+        &self,
+        project: &str,
+        sealed: &[u8],
+    ) -> std::io::Result<[u8; 32]> {
+        let (custody, wrapped) = decode_dek(sealed)?;
+        let id = project_key_id(project);
+        if custody != DekCustody::Project(id.clone()) {
+            return Err(std::io::Error::other(
+                "authority key has different project custody",
+            ));
+        }
+        // Ordinary content may cache a key; signing must also prove its
+        // retained custody still exists, including within that same process.
+        let retained = std::fs::read(self.project_keys_dir().join(format!("{id}.key")))?;
+        let key = self.open_project_key(&retained)?;
+        LoopbackKeyWrap::new(key)
+            .unwrap(wrapped)
+            .map_err(custody_error)
+    }
+
     /// The project each scope belongs to, for the library to keep current.
     pub fn scope_index(&self) -> Arc<ScopeProjectIndex> {
         self.scope_projects.clone()
