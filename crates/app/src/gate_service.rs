@@ -16,6 +16,10 @@
 //! Each arrival still stages into its **own** root directory, so two concurrent
 //! screenings on one project cannot overwrite each other's item (GATE-3i).
 
+#[path = "gate_reference_journal.rs"]
+mod reference_journal;
+use reference_journal::GateHomeJournal;
+
 use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,6 +28,7 @@ use gaugedesk_store::home_reference_journal::{
     ReferenceCompletion, ReferenceEvidence, ReferenceOperation, ReferenceUseEvidence,
     RevalidatedReferenceEvidence,
 };
+#[cfg(test)]
 use gaugedesk_store::Store;
 use gaugedesk_whip_runtime::gate_runner::{
     deliver_verdict_with_use_check, run_gate, run_gate_with_home_admission,
@@ -178,7 +183,7 @@ fn gate_evidence(
 
 #[allow(clippy::too_many_arguments)] // Home, project, target and selected item are separate authority keys.
 fn home_gate_use(
-    store: &mut Store,
+    store: &mut GateHomeJournal<'_>,
     home_id: &str,
     project_id: &str,
     item_id: &str,
@@ -314,7 +319,7 @@ fn home_gate_use(
 
 #[allow(clippy::too_many_arguments)]
 fn screen_item_with_home<T: GateTransport>(
-    store: &mut Store,
+    store: &mut GateHomeJournal<'_>,
     home_id: &str,
     ir: &GateProgram,
     coerce: &GateCoercionConfig,
@@ -426,6 +431,31 @@ pub fn project_gate(
 }
 
 impl crate::Workbench {
+    fn project_gate_journal(
+        &mut self,
+        state_root: &Path,
+        project_id: &str,
+        home_id: &str,
+    ) -> io::Result<GateHomeJournal<'_>> {
+        if self
+            .store_ref()
+            .home_journal_registration(project_id)
+            .map_err(io::Error::other)?
+            .is_some()
+        {
+            let journal = self
+                .store_ref()
+                .open_home_journal(state_root, project_id, home_id)
+                .map_err(io::Error::other)?;
+            return Ok(GateHomeJournal::Project {
+                journal: Box::new(journal),
+                product: self.store_mut(),
+            });
+        }
+        // Existing prototype rows remain migration evidence. Absence is never
+        // promoted to a complete population or adopted from the runtime store.
+        Ok(GateHomeJournal::LegacyPrototype(self.store_mut()))
+    }
     /// The coercion config a gate pass on `project_id` may use when `actor`
     /// runs it.
     ///
@@ -531,19 +561,22 @@ impl crate::Workbench {
         let state_root = self.root_path();
         let targets_dir = self.targets_dir();
         let home_id = self.home_id().as_str().to_owned();
-        let Some(disposition) = screen_item_with_home(
-            self.store_mut(),
-            &home_id,
-            &ir,
-            coerce,
-            &state_root,
-            &targets_dir,
-            project_id,
-            item_id,
-            &payload,
-            transport,
-        )?
-        else {
+        let disposition = {
+            let mut journal = self.project_gate_journal(&state_root, project_id, &home_id)?;
+            screen_item_with_home(
+                &mut journal,
+                &home_id,
+                &ir,
+                coerce,
+                &state_root,
+                &targets_dir,
+                project_id,
+                item_id,
+                &payload,
+                transport,
+            )?
+        };
+        let Some(disposition) = disposition else {
             return Ok(None);
         };
         let verdict = match disposition {
@@ -589,28 +622,31 @@ impl crate::Workbench {
             crate::gate::Verdict::Keep => Disposition::Keep,
             crate::gate::Verdict::Flag => Disposition::Flag,
         };
-        let ruled = deliver_verdict_with_use_check(
-            &ir,
-            coerce,
-            item_id,
-            disposition,
-            &root,
-            &state,
-            transport,
-            |selected| {
-                home_gate_use(
-                    self.store_mut(),
-                    &home_id,
-                    project_id,
-                    item_id,
-                    &ir,
-                    &targets_dir,
-                    &state,
-                    selected,
-                )
-            },
-        )
-        .map_err(io::Error::other)?;
+        let ruled = {
+            let mut journal = self.project_gate_journal(&state_root, project_id, &home_id)?;
+            deliver_verdict_with_use_check(
+                &ir,
+                coerce,
+                item_id,
+                disposition,
+                &root,
+                &state,
+                transport,
+                |selected| {
+                    home_gate_use(
+                        &mut journal,
+                        &home_id,
+                        project_id,
+                        item_id,
+                        &ir,
+                        &targets_dir,
+                        &state,
+                        selected,
+                    )
+                },
+            )
+            .map_err(io::Error::other)?
+        };
         // An answer needs a question. `deliver_verdict` finds none when nothing
         // has screened this project yet — no instance, so no parked request the
         // verdict could correlate against — and returns `None`, which the caller
@@ -627,8 +663,9 @@ impl crate::Workbench {
             Some(ruled) => Some(ruled),
             None => {
                 let payload = self.read_quarantined_item(project_id, item_id)?;
+                let mut journal = self.project_gate_journal(&state_root, project_id, &home_id)?;
                 match screen_item_with_home(
-                    self.store_mut(),
+                    &mut journal,
                     &home_id,
                     &ir,
                     coerce,
@@ -650,7 +687,7 @@ impl crate::Workbench {
                         transport,
                         |selected| {
                             home_gate_use(
-                                self.store_mut(),
+                                &mut journal,
                                 &home_id,
                                 project_id,
                                 item_id,
@@ -708,6 +745,54 @@ mod tests {
     }
 
     #[test]
+    fn registered_project_gate_never_falls_back_on_missing_or_unready_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let mut wb = crate::Workbench::new(Store::open_in_memory().unwrap());
+        let home = wb.home_id().as_str().to_owned();
+        assert!(matches!(
+            wb.project_gate_journal(root.path(), "legacy", &home)
+                .unwrap(),
+            GateHomeJournal::LegacyPrototype(_)
+        ));
+        wb.store_mut()
+            .register_home_journal("project", &home)
+            .unwrap();
+        assert!(wb
+            .project_gate_journal(root.path(), "project", &home)
+            .is_err());
+        assert!(
+            !gaugedesk_store::home_reference_journal::home_reference_journal_path(
+                root.path(),
+                "project"
+            )
+            .exists()
+        );
+        drop(
+            wb.store_mut()
+                .initialize_home_journal(root.path(), "project", &home)
+                .unwrap(),
+        );
+        assert!(matches!(
+            wb.project_gate_journal(root.path(), "project", &home)
+                .unwrap(),
+            GateHomeJournal::Project { .. }
+        ));
+        assert!(wb
+            .project_gate_journal(root.path(), "project", "other-home")
+            .is_err());
+        let path = gaugedesk_store::home_reference_journal::home_reference_journal_path(
+            root.path(),
+            "project",
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(wb
+            .project_gate_journal(root.path(), "project", &home)
+            .is_err());
+        assert!(!path.exists());
+        assert!(!gate_state_dir(root.path(), "project").exists());
+    }
+
+    #[test]
     fn a_seal_between_registration_and_target_write_revalidates_before_use() {
         struct NoTransport;
         impl GateTransport for NoTransport {
@@ -758,7 +843,7 @@ mod tests {
             },
             |selected| {
                 home_gate_use(
-                    &mut store.borrow_mut(),
+                    &mut GateHomeJournal::LegacyPrototype(&mut store.borrow_mut()),
                     home,
                     project,
                     item,

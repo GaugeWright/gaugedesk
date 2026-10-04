@@ -11,9 +11,15 @@ use sha2::{Digest, Sha256};
 
 use crate::Store;
 
+pub use crate::home_reference_catalog::{
+    home_reference_journal_path, HomeJournalRegistration, HomeReferenceUseAcknowledgment,
+};
+pub use crate::home_reference_storage::{HomeJournalBinding, HomeReferenceJournal};
+
 #[derive(Debug)]
 pub enum JournalError {
     Database(rusqlite::Error),
+    Storage(std::io::Error),
     Conflict(&'static str),
     Verification(String),
 }
@@ -22,6 +28,7 @@ impl std::fmt::Display for JournalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Database(error) => error.fmt(f),
+            Self::Storage(error) => error.fmt(f),
             Self::Conflict(message) => f.write_str(message),
             Self::Verification(message) => write!(f, "reference evidence refused: {message}"),
         }

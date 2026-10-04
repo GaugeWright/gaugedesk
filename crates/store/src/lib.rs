@@ -24,7 +24,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 pub mod command_dispatch;
 pub mod command_scope_archive;
+mod home_reference_catalog;
 pub mod home_reference_journal;
+mod home_reference_storage;
 mod record_admission;
 #[cfg(test)]
 mod record_claim_tests;
@@ -240,7 +242,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 8;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 9;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -522,6 +524,86 @@ const MIGRATIONS: &[Migration] = &[
                   )
                   BEGIN SELECT RAISE(ABORT, 'pending reference identity is immutable'); END;",
     },
+    Migration {
+        version: 9,
+        name: "project-home-journal-catalog",
+        // Independently retain the exact journal identity before creating its
+        // file. A ready receipt never permits missing-file reinitialization.
+        sql: "CREATE TABLE IF NOT EXISTS home_reference_journal_bindings (
+                  project_id TEXT PRIMARY KEY CHECK (length(project_id) > 0),
+                  home_id TEXT NOT NULL UNIQUE CHECK (length(home_id) > 0),
+                  incarnation TEXT NOT NULL UNIQUE CHECK (length(incarnation) = 32
+                      AND incarnation NOT GLOB '*[^0-9a-f]*'),
+                  UNIQUE (project_id, home_id, incarnation)
+              );
+              CREATE TABLE IF NOT EXISTS home_reference_journal_ready (
+                  project_id TEXT PRIMARY KEY,
+                  home_id TEXT NOT NULL UNIQUE,
+                  incarnation TEXT NOT NULL UNIQUE,
+                  FOREIGN KEY (project_id, home_id, incarnation)
+                      REFERENCES home_reference_journal_bindings(project_id, home_id, incarnation)
+              );
+              CREATE TABLE IF NOT EXISTS home_reference_use_acknowledgments (
+                  project_id TEXT NOT NULL,
+                  home_id TEXT NOT NULL,
+                  journal_incarnation TEXT NOT NULL,
+                  target_store TEXT NOT NULL,
+                  target_store_incarnation TEXT NOT NULL,
+                  use_key TEXT NOT NULL,
+                  version_id TEXT NOT NULL,
+                  operation_id TEXT NOT NULL,
+                  bound_epoch INTEGER NOT NULL,
+                  evidence_ref TEXT NOT NULL,
+                  witness_digest TEXT NOT NULL,
+                  PRIMARY KEY (project_id, target_store, use_key)
+              );
+              CREATE TRIGGER IF NOT EXISTS home_reference_ack_requires_ready
+                  BEFORE INSERT ON home_reference_use_acknowledgments
+                  WHEN NOT EXISTS (SELECT 1 FROM home_reference_journal_ready
+                      WHERE project_id = NEW.project_id AND home_id = NEW.home_id
+                        AND incarnation = NEW.journal_incarnation)
+                  BEGIN SELECT RAISE(ABORT, 'Home use acknowledgment requires ready storage'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_ack_no_update
+                  BEFORE UPDATE ON home_reference_use_acknowledgments
+                  BEGIN SELECT RAISE(ABORT, 'Home use acknowledgment is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_ack_no_delete
+                  BEFORE DELETE ON home_reference_use_acknowledgments
+                  BEGIN SELECT RAISE(ABORT, 'Home use acknowledgment is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_ack_no_replace
+                  BEFORE INSERT ON home_reference_use_acknowledgments
+                  WHEN EXISTS (SELECT 1 FROM home_reference_use_acknowledgments
+                      WHERE project_id = NEW.project_id AND target_store = NEW.target_store
+                        AND use_key = NEW.use_key)
+                  BEGIN SELECT RAISE(ABORT, 'Home use acknowledgment is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_binding_no_update
+                  BEFORE UPDATE ON home_reference_journal_bindings
+                  BEGIN SELECT RAISE(ABORT, 'Home journal registration is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_binding_no_delete
+                  BEFORE DELETE ON home_reference_journal_bindings
+                  BEGIN SELECT RAISE(ABORT, 'Home journal registration is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_binding_no_replace
+                  BEFORE INSERT ON home_reference_journal_bindings
+                  WHEN EXISTS (SELECT 1 FROM home_reference_journal_bindings
+                      WHERE project_id = NEW.project_id OR home_id = NEW.home_id OR incarnation = NEW.incarnation)
+                  BEGIN SELECT RAISE(ABORT, 'Home journal registration is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_ready_requires_binding
+                  BEFORE INSERT ON home_reference_journal_ready
+                  WHEN NOT EXISTS (SELECT 1 FROM home_reference_journal_bindings
+                      WHERE project_id = NEW.project_id AND home_id = NEW.home_id AND incarnation = NEW.incarnation)
+                  BEGIN SELECT RAISE(ABORT, 'Home journal readiness requires its exact registration'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_ready_no_update
+                  BEFORE UPDATE ON home_reference_journal_ready
+                  BEGIN SELECT RAISE(ABORT, 'Home journal readiness is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_ready_no_delete
+                  BEFORE DELETE ON home_reference_journal_ready
+                  BEGIN SELECT RAISE(ABORT, 'Home journal readiness is immutable'); END;
+              CREATE TRIGGER IF NOT EXISTS home_reference_ready_no_replace
+                  BEFORE INSERT ON home_reference_journal_ready
+                  WHEN EXISTS (SELECT 1 FROM home_reference_journal_ready
+                      WHERE project_id = NEW.project_id OR home_id = NEW.home_id OR incarnation = NEW.incarnation)
+                  BEGIN SELECT RAISE(ABORT, 'Home journal readiness is immutable'); END;",
+    },
+
 ];
 
 /// The fail-closed downgrade-guard error (DR-0054 Phase B): diagnosable — it

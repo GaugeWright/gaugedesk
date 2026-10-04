@@ -19,6 +19,14 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Registered project gates now require a matching product acknowledgment before
+  using an imported program. Missing or mismatched Home journals stop that work
+  instead of falling back to the install-wide prototype.
+
+- Added durable, project-bound operation journal storage for Homes. Missing or
+  replaced journal files refuse reopening; production path integration remains
+  in progress.
+
 ## [0.6.1] — 2026-10-02
 
 - WhippleScript programs now run on Wasmtime 48.0.5, which fixes seven

@@ -912,6 +912,17 @@ async fn a_projects_own_gate_screens_a_drained_item_into_the_workspace() {
         max_tokens: 64,
     };
 
+    // The admitted project Home explicitly creates its journal before intake;
+    // the runtime path only reopens this independently retained binding.
+    {
+        let mut guard = workbench.lock_unpoisoned();
+        let home = guard.home_id().as_str().to_owned();
+        guard
+            .store_mut()
+            .initialize_home_journal(dir.path(), PROJECT, &home)
+            .unwrap();
+    }
+
     let landed = workbench
         .lock_unpoisoned()
         .run_project_gate(PROJECT, ARTIFACT, &chat, &coerce, &Screener("keep"))
@@ -923,20 +934,42 @@ async fn a_projects_own_gate_screens_a_drained_item_into_the_workspace() {
     let guard = workbench.lock_unpoisoned();
     let home = guard.home_id().as_str();
     let target = format!("project-gate:{PROJECT}");
-    let pin = guard
+    let journal = guard
         .store_ref()
+        .open_home_journal(dir.path(), PROJECT, home)
+        .unwrap();
+    let pin = journal
         .reference_use_pin(home, &target, ARTIFACT)
         .unwrap()
         .expect("the item has an exact Home use pin");
     let operation_id = pin.operation_id.as_deref().expect("an exact operation");
-    let operation = guard
-        .store_ref()
+    let operation = journal
         .reference_operation(operation_id)
         .unwrap()
         .expect("the Home remembers the operation");
     assert_eq!(operation.completed_epoch, Some(0));
     assert_eq!(operation.evidence_ref.as_deref(), Some(operation_id));
     assert!(operation.witness_digest.is_some());
+    let acknowledgment = guard
+        .store_ref()
+        .home_reference_use_acknowledgment(PROJECT, &target, ARTIFACT)
+        .unwrap()
+        .expect("use has a committed product acknowledgment");
+    assert_eq!(acknowledgment.binding, *journal.binding());
+    assert_eq!(acknowledgment.pin, pin);
+    assert_eq!(
+        acknowledgment.witness_digest,
+        operation.witness_digest.clone().unwrap()
+    );
+    assert!(
+        guard
+            .store_ref()
+            .reference_operation(operation_id)
+            .unwrap()
+            .is_none(),
+        "the accepting path wrote the dedicated journal, not the install-wide prototype"
+    );
+    drop(journal);
     drop(guard);
 
     // The bytes are in the project-owned target, and the record says so.

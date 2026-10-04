@@ -159,6 +159,10 @@ run_contracts() {
     echo "== agent guide, as an edge =="
     gate_section carries-agent-guide
     gate_section carries-agent-guide-checker
+
+    echo "== shared checks, as edges =="
+    gate_section carries-build-coverage
+    gate_section carries-buckify-crates
     gate_section carries-docs-theme-stylesheet
     gate_section carries-docs-theme-logo
     gate_section carries-docs-theme-fonts
