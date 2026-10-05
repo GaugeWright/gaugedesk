@@ -19,6 +19,8 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-05
+
 - Native file saves and corrections use project signing authority for new acts.
   Older commands and signed evidence keep their original identities on retry;
   current membership and project authority still govern each use.
