@@ -19,6 +19,12 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Multi-target settlement signs new effect and recovery receipts with project
+  authority. Existing host-signed receipts retain their original identity.
+  Missing project signing custody stops new work before target effects start;
+  historical verification uses public roots. Upgrade hosts before using the
+  new project receipt frames in forward compensation.
+
 ## [0.7.1] — 2026-10-05
 
 - Native chat test evidence matches file writes through the folder binding

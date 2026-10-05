@@ -112,24 +112,94 @@ fn target_receipt_payload(receipt: &AuthenticatedTargetReceipt) -> Result<Vec<u8
     .map_err(|error| error.to_string())
 }
 
-fn verify_target_receipt_authentication(
+const PROJECT_RECEIPT_FRAME: &str = "gaugedesk.target-receipt.project.v1";
+const PROJECT_RECEIPT_PREFIX: &str = "project-p256-v1:";
+
+// Process-local custody for one bounded effect/query; never an actor grant.
+struct SettlementSigner {
+    project: String,
+    key: SigningKey,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectReceiptAuthentication {
+    project: String,
+    authority: String,
+    signature: String,
+}
+
+fn project_receipt_payload(
     receipt: &AuthenticatedTargetReceipt,
-    expected_signer: &PublicKey,
+    project: &str,
+    authority: &str,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&(
+        PROJECT_RECEIPT_FRAME,
+        project,
+        authority,
+        target_receipt_payload(receipt)?,
+    ))
+    .map_err(|error| error.to_string())
+}
+
+fn verify_target_receipt_authentication(
+    store: &gaugedesk_store::Store,
+    receipt: &AuthenticatedTargetReceipt,
+    project: &str,
+    legacy_signer: Option<&PublicKey>,
 ) -> Result<(), String> {
-    let encoded = receipt
+    let (public_key, signature, payload) = if let Some(encoded) = receipt
         .authentication_ref
-        .strip_prefix("p256:")
-        .ok_or_else(|| "compensation receipt has no P-256 authentication".to_owned())?;
-    let (public_key, signature) = encoded
-        .split_once(':')
-        .ok_or_else(|| "compensation receipt authentication is malformed".to_owned())?;
+        .strip_prefix(PROJECT_RECEIPT_PREFIX)
+    {
+        let frame: ProjectReceiptAuthentication =
+            serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+        let retained = store
+            .project_authority_key(project)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "receipt project authority is unavailable".to_owned())?;
+        let key = PublicKey::new(retained.public_key);
+        if frame.project != project
+            || frame.authority != retained.authority_id
+            || crate::project_authority::authority(&key).as_str() != frame.authority
+            || (retained.custody == "incoming-project-v1"
+                && store
+                    .committed_record_snapshot(
+                        &crate::federation::handoff_scope(project),
+                        "receive",
+                    )
+                    .map_err(|error| format!("{error:?}"))?
+                    .is_none())
+        {
+            return Err("receipt has an untrusted project authority".to_owned());
+        }
+        let payload = project_receipt_payload(receipt, project, &frame.authority)?;
+        (key, frame.signature, payload)
+    } else {
+        let encoded = receipt
+            .authentication_ref
+            .strip_prefix("p256:")
+            .ok_or_else(|| "compensation receipt has no supported authentication".to_owned())?;
+        let (public_key, signature) = encoded
+            .split_once(':')
+            .ok_or_else(|| "compensation receipt authentication is malformed".to_owned())?;
+        let legacy_signer = legacy_signer
+            .ok_or_else(|| "original legacy receipt root is unavailable".to_owned())?;
+        if public_key != legacy_signer.as_str() {
+            return Err("legacy receipt has an untrusted signer".to_owned());
+        }
+        (
+            legacy_signer.clone(),
+            signature.to_owned(),
+            target_receipt_payload(receipt)?,
+        )
+    };
     let signature = hex::decode(signature)
         .map(Signature::new)
         .map_err(|_| "compensation receipt signature is not hex".to_owned())?;
-    let payload = target_receipt_payload(receipt)?;
-    if public_key != expected_signer.as_str()
-        || receipt.receipt_ref != format!("target-receipt:{}", digest(&payload))
-        || verify_signature(&payload, &signature, &PublicKey::new(public_key)) != Ok(true)
+    if receipt.receipt_ref != format!("target-receipt:{}", digest(&payload))
+        || verify_signature(&payload, &signature, &public_key) != Ok(true)
     {
         return Err("compensation receipt authentication is invalid".to_owned());
     }
@@ -327,20 +397,115 @@ impl Workbench {
         }
     }
 
+    fn verify_recorded_target_receipt(
+        &self,
+        project: &str,
+        receipt: &AuthenticatedTargetReceipt,
+    ) -> Result<(), String> {
+        let legacy_signer = if receipt
+            .authentication_ref
+            .starts_with(PROJECT_RECEIPT_PREFIX)
+        {
+            None
+        } else {
+            Some(
+                SigningKey::from_seed(&self.governance_seed())
+                    .map_err(|error| error.reason.to_owned())?
+                    .public_key(),
+            )
+        };
+        verify_target_receipt_authentication(
+            self.store_ref(),
+            receipt,
+            project,
+            legacy_signer.as_ref(),
+        )
+    }
+
+    fn known_settlement_outcome(
+        &self,
+        state: &TargetSettlementState,
+        declaration: &TargetSettlementDeclaration,
+        member_id: &str,
+    ) -> Result<bool, String> {
+        let member = state
+            .members
+            .get(member_id)
+            .ok_or_else(|| "settlement member is not declared".to_owned())?;
+        if !matches!(
+            member.phase,
+            SettlementMemberPhase::Succeeded | SettlementMemberPhase::Failed
+        ) {
+            return Ok(false);
+        }
+        self.require_owned_project(&declaration.project_id)
+            .map_err(|error| error.to_string())?;
+        let receipt = member
+            .receipt
+            .as_ref()
+            .ok_or_else(|| "known settlement outcome has no receipt".to_owned())?;
+        self.verify_recorded_target_receipt(&declaration.project_id, receipt)?;
+        Ok(true)
+    }
+
+    /// Explicitly establish custody while project placement and handoff are
+    /// current, before a target effect can start. This creates no actor standing.
+    fn initialize_settlement_authority(
+        &mut self,
+        declaration: &TargetSettlementDeclaration,
+    ) -> Result<SettlementSigner, String> {
+        let project = &declaration.project_id;
+        let handoff = crate::federation::handoff_scope(project);
+        let (_, basis) = self.store_ref().read_for_dispatch(
+            &[crate::library::LIBRARY_SCOPE, &handoff],
+            |store| {
+                crate::federation::require_project_writes_available(store, project)?;
+                let library = crate::library::Library::rebuild(store)?;
+                if declaration.members.iter().any(|member| {
+                    library.work_targets.get(&member.target_id).is_none_or(|target| {
+                        !matches!(&target.owner, crate::library::WorkTargetOwner::Project { project_id } if project_id == project)
+                    })
+                }) {
+                    return Err(gaugedesk_store::AdmitError::Rejected(gaugedesk_core::Rejection {
+                        reason: "settlement target belongs to another authority",
+                    }));
+                }
+                Ok(())
+            },
+        ).map_err(|error| format!("{error:?}"))?;
+        self.initialize_project_authority_against(project, &basis)
+            .map_err(|error| error.to_string())?;
+        Ok(SettlementSigner {
+            project: project.clone(),
+            key: self
+                .project_signing_key(project)
+                .map_err(|error| error.to_string())?,
+        })
+    }
+
     fn sign_target_receipt(
         &self,
+        signer: &SettlementSigner,
         member: &SettlementMemberDeclaration,
         outcome: ReceiptOutcome,
         resulting_basis: Option<String>,
         resulting_digest: Option<String>,
         failure_reason: Option<String>,
     ) -> Result<AuthenticatedTargetReceipt, String> {
-        let authority_ref = self
-            .library
+        let project = signer.project.as_str();
+        self.require_owned_project(project)
+            .map_err(|error| error.to_string())?;
+        let library = crate::library::Library::rebuild(self.store_ref())
+            .map_err(|error| format!("{error:?}"))?;
+        let target = library
             .work_targets
             .get(&member.target_id)
-            .map(|target| target.authority.clone())
             .ok_or_else(|| "settlement target is unavailable".to_owned())?;
+        if !matches!(&target.owner, crate::library::WorkTargetOwner::Project { project_id } if project_id == project)
+        {
+            return Err("settlement target belongs to another authority".to_owned());
+        }
+        let authority_ref = target.authority.clone();
         let mut receipt = AuthenticatedTargetReceipt {
             receipt_ref: String::new(),
             member_id: member.member_id.clone(),
@@ -354,14 +519,18 @@ impl Workbench {
             authentication_ref: String::new(),
             failure_reason,
         };
-        let payload = target_receipt_payload(&receipt)?;
-        let signing_key = SigningKey::from_seed(&self.governance_seed())
-            .map_err(|error| error.reason.to_owned())?;
+        let signing_key = &signer.key;
+        let authority = crate::project_authority::authority(&signing_key.public_key());
+        let payload = project_receipt_payload(&receipt, project, authority.as_str())?;
         let signature = signing_key.sign(&payload);
+        let frame = ProjectReceiptAuthentication {
+            project: project.to_owned(),
+            authority: authority.as_str().to_owned(),
+            signature: hex::encode(signature.as_bytes()),
+        };
         receipt.authentication_ref = format!(
-            "p256:{}:{}",
-            signing_key.public_key().as_str(),
-            hex::encode(signature.as_bytes())
+            "{PROJECT_RECEIPT_PREFIX}{}",
+            serde_json::to_string(&frame).map_err(|error| error.to_string())?
         );
         receipt.receipt_ref = format!("target-receipt:{}", digest(&payload));
         Ok(receipt)
@@ -508,6 +677,7 @@ impl Workbench {
         member: &SettlementMemberDeclaration,
         candidate: TargetCandidateSnapshot,
         files: &[(String, Option<Vec<u8>>)],
+        signer: &SettlementSigner,
     ) -> Result<TargetSettlementState, String> {
         let member_id = member.member_id.as_str();
         match self.execute_prepared_target_effect(member, files) {
@@ -540,6 +710,7 @@ impl Workbench {
                     self.write_work_target_record(target);
                 }
                 let receipt = self.sign_target_receipt(
+                    signer,
                     member,
                     ReceiptOutcome::Succeeded,
                     Some(resulting_basis),
@@ -567,6 +738,7 @@ impl Workbench {
                     Some(reason.clone()),
                 )?;
                 let receipt = self.sign_target_receipt(
+                    signer,
                     member,
                     ReceiptOutcome::Failed,
                     None,
@@ -604,7 +776,11 @@ impl Workbench {
             .find(|member| member.member_id == member_id)
             .cloned()
             .ok_or_else(|| "settlement member is not declared".to_owned())?;
+        if self.known_settlement_outcome(&state, &declaration, member_id)? {
+            return Ok(state);
+        }
         let (candidate, files) = self.exact_candidate_files(&declaration, &member)?;
+        let signer = self.initialize_settlement_authority(&declaration)?;
         self.start_settlement_member(declaration_id, member_id)?;
         self.finish_started_settlement_member(
             declaration_id,
@@ -612,6 +788,7 @@ impl Workbench {
             &member,
             candidate,
             &files,
+            &signer,
         )
     }
 
@@ -637,7 +814,13 @@ impl Workbench {
             .find(|member| member.member_id == member_id)
             .cloned()
             .ok_or_else(|| "settlement member is not declared".to_owned())?;
+        if state.members[member_id].phase == SettlementMemberPhase::Succeeded
+            && self.known_settlement_outcome(&state, &declaration, member_id)?
+        {
+            return Ok(state);
+        }
         let (candidate, files) = self.exact_candidate_files(&declaration, &member)?;
+        let signer = self.initialize_settlement_authority(&declaration)?;
         self.retry_failed_settlement_member(declaration_id, member_id)?;
         self.finish_started_settlement_member(
             declaration_id,
@@ -645,6 +828,7 @@ impl Workbench {
             &member,
             candidate,
             &files,
+            &signer,
         )
     }
 
@@ -668,6 +852,9 @@ impl Workbench {
             .find(|member| member.member_id == member_id)
             .cloned()
             .ok_or_else(|| "settlement member is not declared".to_owned())?;
+        if self.known_settlement_outcome(&state, &declaration, member_id)? {
+            return Ok(Some(state));
+        }
         let query_ref = format!(
             "target-query:{}",
             digest(format!(
@@ -676,6 +863,7 @@ impl Workbench {
             ))
         );
         let source = self.settlement_source(&declaration)?;
+        let signer = self.initialize_settlement_authority(&declaration)?;
         self.request_settlement_query(declaration_id, member_id, &query_ref)?;
         let candidate = source
             .candidate_snapshots
@@ -686,6 +874,7 @@ impl Workbench {
         let observed_digest = snapshot_digest(&observed_files);
         let receipt = if observed_digest == member.expected_result_digest {
             Some(self.sign_target_receipt(
+                &signer,
                 &member,
                 ReceiptOutcome::Succeeded,
                 Some(observed_basis),
@@ -694,6 +883,7 @@ impl Workbench {
             )?)
         } else if observed_basis == member.expected_basis {
             Some(self.sign_target_receipt(
+                &signer,
                 &member,
                 ReceiptOutcome::Failed,
                 Some(observed_basis),
@@ -811,6 +1001,7 @@ impl Workbench {
             promotion_manifest_ref,
             members,
         };
+        self.initialize_settlement_authority(&declaration)?;
         let state = self
             .store_mut()
             .admit_materialized::<TargetSettlementState>(
@@ -1334,10 +1525,6 @@ impl Workbench {
                 })
             })
             .collect::<BTreeMap<_, _>>();
-        let receipt_signer = SigningKey::from_seed(&self.governance_seed())
-            .map_err(|error| error.reason.to_owned())?
-            .public_key();
-
         for link in &receipt_links {
             let (original, original_lane_sequence) =
                 successful.get(&link.original_receipt_ref).ok_or_else(|| {
@@ -1399,7 +1586,7 @@ impl Workbench {
             if later_receipt.authority_ref != expected_authority {
                 return Err("compensation receipt names the wrong target authority".to_owned());
             }
-            verify_target_receipt_authentication(later_receipt, &receipt_signer)?;
+            self.verify_recorded_target_receipt(&original_declaration.project_id, later_receipt)?;
         }
 
         self.store_mut()
@@ -2304,6 +2491,450 @@ mod tests {
             .expect("remove probe");
     }
 
+    fn ready_settlement(workbench: &mut Workbench, suffix: &str) -> TargetSettlementDeclaration {
+        let chat = workbench
+            .create_chat_in_instance(DEFAULT_PLACEMENT, suffix)
+            .expect("chat");
+        let chat_id = chat["id"].as_str().expect("chat id");
+        let (source, target_id) = seed_change_set(workbench, chat_id, suffix);
+        let declared = workbench
+            .create_target_settlement(
+                chat_id,
+                &source.id,
+                None,
+                vec![RequestedSettlementMember {
+                    target_id,
+                    act: TargetActKind::Apply,
+                }],
+            )
+            .expect("declare");
+        let declaration = declared.declaration.expect("declaration");
+        workbench
+            .preflight_target_settlement(&declaration.declaration_id)
+            .expect("preflight");
+        declaration
+    }
+
+    #[test]
+    fn actual_settlement_receipt_binds_project_and_reopens_without_private_custody() {
+        let root = tempfile::tempdir().expect("root");
+        let wb = open_workbench(root.path()).expect("workbench");
+        let (project, receipt, public) = {
+            let mut wb = wb.lock_unpoisoned();
+            let declaration = ready_settlement(&mut wb, "project-receipt");
+            let member = &declaration.members[0];
+            let state = wb
+                .execute_settlement_member(&declaration.declaration_id, &member.member_id)
+                .expect("effect");
+            let receipt = state.members[&member.member_id]
+                .receipt
+                .clone()
+                .expect("actual receipt");
+            let project = declaration.project_id;
+            let public = wb.project_signing_key(&project).unwrap().public_key();
+            assert_ne!(public, wb.governance_public_key());
+            assert!(receipt
+                .authentication_ref
+                .starts_with(PROJECT_RECEIPT_PREFIX));
+            let host = wb.governance_public_key();
+            verify_target_receipt_authentication(wb.store_ref(), &receipt, &project, Some(&host))
+                .unwrap();
+            assert!(verify_target_receipt_authentication(
+                wb.store_ref(),
+                &receipt,
+                "foreign-project",
+                Some(&host)
+            )
+            .is_err());
+
+            let frame: ProjectReceiptAuthentication = serde_json::from_str(
+                receipt
+                    .authentication_ref
+                    .strip_prefix(PROJECT_RECEIPT_PREFIX)
+                    .unwrap(),
+            )
+            .unwrap();
+            let payload = project_receipt_payload(&receipt, &project, &frame.authority).unwrap();
+            let signature = Signature::new(hex::decode(&frame.signature).unwrap());
+            assert_eq!(verify_signature(&payload, &signature, &public), Ok(true));
+            assert_ne!(verify_signature(&payload, &signature, &host), Ok(true));
+
+            for field in ["project", "authority", "signature", "extra"] {
+                let mut encoded = serde_json::to_value(&frame).unwrap();
+                encoded[field] = "foreign".into();
+                let mut changed = receipt.clone();
+                changed.authentication_ref = format!("{PROJECT_RECEIPT_PREFIX}{encoded}");
+                assert!(
+                    verify_target_receipt_authentication(
+                        wb.store_ref(),
+                        &changed,
+                        &project,
+                        Some(&host)
+                    )
+                    .is_err(),
+                    "{field}"
+                );
+            }
+            let mut changed = receipt.clone();
+            changed.resulting_digest = Some("sha256:other-body".into());
+            assert!(verify_target_receipt_authentication(
+                wb.store_ref(),
+                &changed,
+                &project,
+                Some(&host)
+            )
+            .is_err());
+            let mut changed = receipt.clone();
+            changed.receipt_ref = "target-receipt:invented".into();
+            assert!(verify_target_receipt_authentication(
+                wb.store_ref(),
+                &changed,
+                &project,
+                Some(&host)
+            )
+            .is_err());
+
+            // A host-signed body under a project-shaped envelope is not a project act.
+            let mut changed = receipt.clone();
+            let mut frame = frame;
+            let host_key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+            frame.signature = hex::encode(host_key.sign(&payload).as_bytes());
+            changed.authentication_ref = format!(
+                "{PROJECT_RECEIPT_PREFIX}{}",
+                serde_json::to_string(&frame).unwrap()
+            );
+            assert!(verify_target_receipt_authentication(
+                wb.store_ref(),
+                &changed,
+                &project,
+                Some(&host)
+            )
+            .is_err());
+            (project, receipt, public)
+        };
+        drop(wb);
+        let reopened = open_workbench(root.path()).expect("reopen before custody loss");
+        {
+            let wb = reopened.lock_unpoisoned();
+            let host = wb.governance_public_key();
+            verify_target_receipt_authentication(wb.store_ref(), &receipt, &project, Some(&host))
+                .unwrap();
+            assert_eq!(
+                wb.project_signing_key(&project).unwrap().public_key(),
+                public
+            );
+        }
+        drop(reopened);
+        let custody = root
+            .path()
+            .join("content-keys/projects")
+            .join(format!("{}.key", crate::org::sha256_hex(&project)));
+        std::fs::remove_file(&custody).expect("remove project private custody");
+        // The public reader needs only retained registration, even with a different host key.
+        let store =
+            gaugedesk_store::Store::open(root.path().join("gaugewright.db").to_str().unwrap())
+                .expect("public registry reader");
+        let foreign_host = SigningKey::from_seed(&[73; 32]).unwrap().public_key();
+        verify_target_receipt_authentication(&store, &receipt, &project, None).unwrap();
+        let before = serde_json::to_string(&receipt).unwrap();
+        verify_target_receipt_authentication(&store, &receipt, &project, Some(&foreign_host))
+            .unwrap();
+        assert_eq!(serde_json::to_string(&receipt).unwrap(), before);
+        assert!(!custody.exists());
+        let mut incoming = store.project_authority_key(&project).unwrap().unwrap();
+        incoming.custody = "incoming-project-v1".into();
+        let mut staged = gaugedesk_store::Store::open_in_memory().unwrap();
+        staged.retain_project_authority_key(&incoming).unwrap();
+        assert!(
+            verify_target_receipt_authentication(&staged, &receipt, &project, Some(&foreign_host))
+                .is_err(),
+            "staging is not receiving admission"
+        );
+    }
+
+    #[test]
+    fn legacy_receipt_keeps_original_identity_and_never_trusts_its_supplied_root() {
+        let root = tempfile::tempdir().expect("root");
+        let wb = open_workbench(root.path()).expect("workbench");
+        let mut wb = wb.lock_unpoisoned();
+        let declaration = ready_settlement(&mut wb, "legacy-receipt");
+        let member = &declaration.members[0];
+        let mut legacy = receipt(member, "legacy");
+        legacy.authority_ref = wb.library.work_targets[&member.target_id].authority.clone();
+        let payload = target_receipt_payload(&legacy).unwrap();
+        let old = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+        legacy.receipt_ref = format!("target-receipt:{}", digest(&payload));
+        legacy.authentication_ref = format!(
+            "p256:{}:{}",
+            old.public_key().as_str(),
+            hex::encode(old.sign(&payload).as_bytes())
+        );
+        let original = serde_json::to_string(&legacy).unwrap();
+        let before = wb
+            .store_ref()
+            .events(&settlement_scope(&declaration.declaration_id))
+            .unwrap();
+        verify_target_receipt_authentication(
+            wb.store_ref(),
+            &legacy,
+            &declaration.project_id,
+            Some(&old.public_key()),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), original);
+        assert_eq!(
+            wb.store_ref()
+                .events(&settlement_scope(&declaration.declaration_id))
+                .unwrap(),
+            before
+        );
+        let project_key = wb
+            .project_signing_key(&declaration.project_id)
+            .unwrap()
+            .public_key();
+        assert!(verify_target_receipt_authentication(
+            wb.store_ref(),
+            &legacy,
+            &declaration.project_id,
+            Some(&project_key)
+        )
+        .is_err());
+        let foreign = SigningKey::from_seed(&[81; 32]).unwrap();
+        let mut forged = legacy.clone();
+        forged.authentication_ref = format!(
+            "p256:{}:{}",
+            foreign.public_key().as_str(),
+            hex::encode(foreign.sign(&payload).as_bytes())
+        );
+        assert!(verify_target_receipt_authentication(
+            wb.store_ref(),
+            &forged,
+            &declaration.project_id,
+            Some(&old.public_key())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn actual_legacy_effect_and_query_receipt_replay_without_reminting() {
+        let root = tempfile::tempdir().expect("root");
+        let wb = open_workbench(root.path()).expect("workbench");
+        let mut wb = wb.lock_unpoisoned();
+        let declaration = ready_settlement(&mut wb, "legacy-query-replay");
+        let member = &declaration.members[0];
+        let id = &declaration.declaration_id;
+        let (_, files) = wb.exact_candidate_files(&declaration, member).unwrap();
+        wb.start_settlement_member(id, &member.member_id).unwrap();
+        let TargetEffectOutcome::Succeeded { resulting_basis } =
+            wb.execute_prepared_target_effect(member, &files)
+        else {
+            panic!("actual effect");
+        };
+        wb.record_settlement_unknown(id, &member.member_id, "original:lost-receipt")
+            .unwrap();
+        wb.request_settlement_query(id, &member.member_id, "original:query")
+            .unwrap();
+        // Original producer encoding, applied to the actual recovered target effect.
+        let mut legacy = receipt(member, "legacy-query");
+        legacy.resulting_basis = Some(resulting_basis);
+        legacy.authority_ref = wb.library.work_targets[&member.target_id].authority.clone();
+        let payload = target_receipt_payload(&legacy).unwrap();
+        let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+        legacy.receipt_ref = format!("target-receipt:{}", digest(&payload));
+        legacy.authentication_ref = format!(
+            "p256:{}:{}",
+            key.public_key().as_str(),
+            hex::encode(key.sign(&payload).as_bytes())
+        );
+        let original = wb
+            .record_settlement_query_receipt(id, legacy.clone())
+            .unwrap();
+        assert_eq!(original.phase, SettlementPhase::Completed);
+        let coordinator = wb.store_ref().events(&settlement_scope(id)).unwrap();
+        let lane = wb
+            .store_ref()
+            .events(&lane_scope(&member.target_id))
+            .unwrap();
+        let target = wb.targets[&member.target_id].current_main_cut().unwrap();
+        let custody = root.path().join("content-keys/projects").join(format!(
+            "{}.key",
+            crate::org::sha256_hex(&declaration.project_id)
+        ));
+        std::fs::remove_file(&custody).unwrap();
+        let query = wb
+            .query_settlement_member(id, &member.member_id)
+            .unwrap()
+            .unwrap();
+        let execute = wb.execute_settlement_member(id, &member.member_id).unwrap();
+        let retry = wb
+            .retry_settlement_member_effect(id, &member.member_id)
+            .unwrap();
+        for replay in [query, execute, retry] {
+            assert_eq!(
+                serde_json::to_value(replay).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+        assert_eq!(
+            wb.store_ref().events(&settlement_scope(id)).unwrap(),
+            coordinator
+        );
+        assert_eq!(
+            wb.store_ref()
+                .events(&lane_scope(&member.target_id))
+                .unwrap(),
+            lane
+        );
+        assert_eq!(
+            wb.targets[&member.target_id].current_main_cut().unwrap(),
+            target
+        );
+        assert!(!custody.exists());
+        // The replay path verifies the original receipt rather than trusting labels.
+        let mut forged = original.clone();
+        forged
+            .members
+            .get_mut(&member.member_id)
+            .unwrap()
+            .receipt
+            .as_mut()
+            .unwrap()
+            .authentication_ref = "p256:invented:00".into();
+        assert!(wb
+            .known_settlement_outcome(&forged, &declaration, &member.member_id)
+            .is_err());
+    }
+
+    #[test]
+    fn started_effect_uses_its_held_signer_when_private_custody_disappears() {
+        let root = tempfile::tempdir().expect("root");
+        let wb = open_workbench(root.path()).expect("workbench");
+        let mut wb = wb.lock_unpoisoned();
+        let declaration = ready_settlement(&mut wb, "held-signer");
+        let member = &declaration.members[0];
+        let (candidate, files) = wb.exact_candidate_files(&declaration, member).unwrap();
+        let signer = wb.initialize_settlement_authority(&declaration).unwrap();
+        wb.start_settlement_member(&declaration.declaration_id, &member.member_id)
+            .unwrap();
+        let custody = root.path().join("content-keys/projects").join(format!(
+            "{}.key",
+            crate::org::sha256_hex(&declaration.project_id)
+        ));
+        std::fs::remove_file(&custody).unwrap();
+        assert!(wb.project_signing_key(&declaration.project_id).is_err());
+        let completed = wb
+            .finish_started_settlement_member(
+                &declaration.declaration_id,
+                &declaration,
+                member,
+                candidate,
+                &files,
+                &signer,
+            )
+            .expect("finish already admitted effect");
+        assert_eq!(completed.phase, SettlementPhase::Completed);
+        let receipt = completed.members[&member.member_id]
+            .receipt
+            .as_ref()
+            .unwrap();
+        verify_target_receipt_authentication(
+            wb.store_ref(),
+            receipt,
+            &declaration.project_id,
+            None,
+        )
+        .unwrap();
+        assert!(!custody.exists());
+    }
+
+    #[test]
+    fn missing_project_custody_refuses_execute_retry_and_query_before_any_change() {
+        for door in ["execute", "retry", "query"] {
+            let root = tempfile::tempdir().expect("root");
+            let wb = open_workbench(root.path()).expect("workbench");
+            let mut wb = wb.lock_unpoisoned();
+            let declaration = ready_settlement(&mut wb, door);
+            let member = &declaration.members[0];
+            let id = &declaration.declaration_id;
+            if door != "execute" {
+                wb.start_settlement_member(id, &member.member_id)
+                    .expect("start");
+                if door == "retry" {
+                    let signer = wb.initialize_settlement_authority(&declaration).unwrap();
+                    let failed = wb
+                        .sign_target_receipt(
+                            &signer,
+                            member,
+                            ReceiptOutcome::Failed,
+                            None,
+                            None,
+                            Some("known no effect".into()),
+                        )
+                        .unwrap();
+                    wb.record_settlement_receipt(id, failed)
+                        .expect("failed effect");
+                } else {
+                    wb.record_settlement_unknown(id, &member.member_id, "lost-receipt")
+                        .expect("unknown");
+                }
+            }
+            let coordinator = wb.store_ref().events(&settlement_scope(id)).unwrap();
+            let lane = wb
+                .store_ref()
+                .events(&lane_scope(&member.target_id))
+                .unwrap();
+            let target = wb.targets[&member.target_id].current_main_cut().unwrap();
+            let public = wb
+                .project_signing_key(&declaration.project_id)
+                .unwrap()
+                .public_key();
+            let custody = root.path().join("content-keys/projects").join(format!(
+                "{}.key",
+                crate::org::sha256_hex(&declaration.project_id)
+            ));
+            std::fs::remove_file(&custody).expect("remove custody");
+            let error = match door {
+                "execute" => wb
+                    .execute_settlement_member(id, &member.member_id)
+                    .unwrap_err(),
+                "retry" => wb
+                    .retry_settlement_member_effect(id, &member.member_id)
+                    .unwrap_err(),
+                "query" => wb
+                    .query_settlement_member(id, &member.member_id)
+                    .unwrap_err(),
+                _ => unreachable!(),
+            };
+            assert!(!error.is_empty());
+            assert_eq!(
+                wb.store_ref().events(&settlement_scope(id)).unwrap(),
+                coordinator,
+                "{door}"
+            );
+            assert_eq!(
+                wb.store_ref()
+                    .events(&lane_scope(&member.target_id))
+                    .unwrap(),
+                lane,
+                "{door}"
+            );
+            assert_eq!(
+                wb.targets[&member.target_id].current_main_cut().unwrap(),
+                target,
+                "{door}"
+            );
+            assert_eq!(
+                wb.store_ref()
+                    .project_authority_key(&declaration.project_id)
+                    .unwrap()
+                    .unwrap()
+                    .public_key,
+                public.as_str()
+            );
+            assert!(!custody.exists(), "{door} must not remint");
+        }
+    }
+
     #[test]
     fn ambiguous_post_effect_outcome_is_settled_only_by_the_target_query() {
         let root = tempfile::tempdir().expect("root");
@@ -2350,6 +2981,20 @@ mod tests {
             .expect("query")
             .expect("decisive query");
         assert_eq!(completed.phase, SettlementPhase::Completed);
+        let receipt = completed.members[&member.member_id]
+            .receipt
+            .as_ref()
+            .expect("query receipt");
+        verify_target_receipt_authentication(
+            workbench.store_ref(),
+            receipt,
+            &declaration.project_id,
+            Some(&workbench.governance_public_key()),
+        )
+        .expect("project query signature");
+        assert!(receipt
+            .authentication_ref
+            .starts_with(PROJECT_RECEIPT_PREFIX));
     }
 
     #[test]
@@ -2412,6 +3057,13 @@ mod tests {
         let chat_id = chat["id"].as_str().expect("chat id");
         let (source, target_id) = seed_change_set(&mut workbench, chat_id, "compensation");
         let project_id = source.project_id;
+        workbench
+            .initialize_project_authority(&project_id)
+            .expect("project authority");
+        let signer = SettlementSigner {
+            project: project_id.clone(),
+            key: workbench.project_signing_key(&project_id).unwrap(),
+        };
         let original_id = "settlement:original";
         let original_member = test_member("original", &target_id, "basis:before");
         let skipped_member = test_member("skipped", &target_id, "basis:before");
@@ -2457,6 +3109,7 @@ mod tests {
         );
         let original_receipt = workbench
             .sign_target_receipt(
+                &signer,
                 &original_member,
                 ReceiptOutcome::Succeeded,
                 Some("basis:after-original".into()),
@@ -2518,6 +3171,7 @@ mod tests {
         );
         let early_repair_receipt = workbench
             .sign_target_receipt(
+                &signer,
                 &early_repair_member,
                 ReceiptOutcome::Succeeded,
                 Some("basis:early-repair".into()),
@@ -2581,6 +3235,7 @@ mod tests {
         );
         let mut forged_repair_receipt = workbench
             .sign_target_receipt(
+                &signer,
                 &forged_repair_member,
                 ReceiptOutcome::Succeeded,
                 Some("basis:forged-repair".into()),
@@ -2615,7 +3270,7 @@ mod tests {
             "declare",
             TargetSettlementCommand::Declare(TargetSettlementDeclaration {
                 declaration_id: repair_id.into(),
-                project_id,
+                project_id: project_id.clone(),
                 chat_id: chat_id.into(),
                 source_change_set_ref: "change-set:repair".into(),
                 promotion_manifest_ref: Some("promotion:repair".into()),
@@ -2645,6 +3300,7 @@ mod tests {
         );
         let repair_receipt = workbench
             .sign_target_receipt(
+                &signer,
                 &repair_member,
                 ReceiptOutcome::Succeeded,
                 Some("basis:repaired".into()),
