@@ -210,8 +210,15 @@ pub(crate) fn open_startup_store(
     root: &Path,
     content_keywrap: impl Fn(&Path) -> std::io::Result<Box<dyn KeyWrap>>,
 ) -> std::io::Result<(Store, Option<Arc<ContentVault>>)> {
+    // A store a newer build wrote stays typed, so the desktop can tell the
+    // person to update rather than show them SQLite's text.
     let mut store =
-        Store::open(root.join("gaugewright.db").to_str().expect("utf8 path")).map_err(crate::io)?;
+        Store::open(root.join("gaugewright.db").to_str().expect("utf8 path")).map_err(|error| {
+            match gaugedesk_store::SchemaAhead::of(&error) {
+                Some(ahead) => std::io::Error::other(ahead.clone()),
+                None => crate::io(error),
+            }
+        })?;
     let content_vault = configured_content_vault(root, content_keywrap)?;
     if let Some(vault) = &content_vault {
         // Re-erase-on-open sweep (SOC 2 finding 4.7 / DR-0086): this runs on every

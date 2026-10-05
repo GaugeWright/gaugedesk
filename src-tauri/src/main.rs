@@ -16,6 +16,7 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 mod chat_notification;
+mod logging;
 
 const BACKGROUND_ARG: &str = "--background";
 
@@ -108,6 +109,21 @@ fn operator_secret() -> Option<String> {
     OPERATOR.get().map(|secret| secret.expose().to_owned())
 }
 
+/// Why the co-resident control plane stopped serving, once it has. A
+/// Finder-launched app discards stderr, and the webview reaches its control
+/// plane over HTTP, so without this the person sees only that a request did
+/// not connect ("Load failed").
+static CONTROL_PLANE_FAILURE: std::sync::OnceLock<gaugedesk_app::open_api::ControlPlaneFailure> =
+    std::sync::OnceLock::new();
+
+/// The reason the co-resident control plane is not serving, or `None` while it
+/// is (or in enterprise mode, where there is none). The webview asks when a
+/// request to its control plane fails to connect, and shows the answer.
+#[tauri::command]
+fn control_plane_failure() -> Option<gaugedesk_app::open_api::ControlPlaneFailure> {
+    CONTROL_PLANE_FAILURE.get().cloned()
+}
+
 /// A fresh secret for each launch. A debug build alone may take a fixed one
 /// from `GAUGEDESK_OPERATOR_SECRET`, so a developer can call a source build's
 /// control plane by hand; a release build never reads it.
@@ -116,7 +132,7 @@ fn launch_operator_secret() -> gaugedesk_app::open_api::LocalOperatorSecret {
     match gaugedesk_app::open_api::LocalOperatorSecret::from_env() {
         Ok(Some(secret)) => return secret,
         Ok(None) => {}
-        Err(message) => eprintln!("[gaugewright] ignoring the configured secret: {message}"),
+        Err(message) => tracing::warn!("ignoring the configured secret: {message}"),
     }
     gaugedesk_app::open_api::LocalOperatorSecret::generate()
 }
@@ -174,7 +190,8 @@ fn main() {
             open_external,
             notify_chat,
             home_session,
-            operator_secret
+            operator_secret,
+            control_plane_failure
         ])
         .menu(|app| {
             let menu = Menu::default(app)?;
@@ -243,6 +260,11 @@ fn main() {
             }
         })
         .setup(|app| {
+            // First, so the control plane's start below is recorded either way.
+            match app.path().app_log_dir() {
+                Ok(dir) => logging::init(&dir),
+                Err(e) => eprintln!("[gaugewright] no log directory: {e}"),
+            }
             let open_item = MenuItem::with_id(app, "open", "Open GaugeDesk", true, None::<&str>)?;
             let startup = CheckMenuItem::with_id(
                 app,
@@ -269,7 +291,7 @@ fn main() {
                             manager.disable()
                         };
                         if let Err(error) = result {
-                            eprintln!("could not change Start at login: {error}");
+                            tracing::warn!("could not change Start at login: {error}");
                             if let Ok(enabled) = manager.is_enabled() {
                                 let _ = startup.set_checked(enabled);
                             }
@@ -297,7 +319,7 @@ fn main() {
             let require_org_cp = gaugedesk_app::var("REQUIRE_ORG_CP").as_deref() == Some("1");
             let decision =
                 cp_launch_decision(org_cp.as_deref(), require_org_cp).unwrap_or_else(|msg| {
-                    eprintln!("[gaugewright] FATAL: {msg}");
+                    tracing::error!("FATAL: {msg}");
                     std::process::exit(1);
                 });
             match decision {
@@ -329,7 +351,9 @@ fn main() {
                                 Err(e) => Err(e),
                             };
                             if let Err(e) = served {
-                                eprintln!("control plane exited: {e}");
+                                tracing::error!("control plane exited: {e}");
+                                let _ = CONTROL_PLANE_FAILURE
+                                    .set(gaugedesk_app::open_api::control_plane_failure(&e));
                             }
                         });
                     });
@@ -338,7 +362,7 @@ fn main() {
                     // Enterprise: no co-resident control plane; the webview talks to the
                     // enrolled org control plane. Its endpoint is injected below as a
                     // document-start script before the first page parses (DEPLOY-5).
-                    eprintln!("enterprise mode: connecting to the enrolled org control plane");
+                    tracing::info!("enterprise mode: connecting to the enrolled org control plane");
                 }
             }
 

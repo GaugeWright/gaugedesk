@@ -19,6 +19,7 @@
 import "./wasm-modules";
 // Before anything can reach the control plane (DR-0269).
 import "./desktop-operator-credential";
+import "./desktop-control-plane-failure";
 import { accountSelectionSync } from "./account-selection-sync";
 import { accountMenuIdentity } from "./account-menu-identity";
 import { followDesktopHomeSession } from "./desktop-home-session";

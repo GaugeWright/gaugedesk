@@ -3,6 +3,21 @@
 Start with the message shown in GaugeDesk. A denied action often means that a
 security check worked as designed.
 
+## GaugeDesk's log
+
+The desktop app writes a daily log, and keeps the last seven days:
+
+- macOS: `~/Library/Logs/com.gaugewright.gaugedesk/`
+- Linux: `~/.local/share/com.gaugewright.gaugedesk/logs/`
+- Windows: `%LOCALAPPDATA%\com.gaugewright.gaugedesk\logs\`
+
+When GaugeDesk's local service cannot start, the window says why where an
+action fails — for example, that a newer GaugeDesk has already used your data
+and this one must be updated. If every action still fails with a generic
+message such as "Load failed", look at the newest file first: GaugeDesk records
+there why its local service did not start. The log holds operational details,
+not your work.
+
 ## A run is denied
 
 Check:

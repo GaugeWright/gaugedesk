@@ -87,6 +87,51 @@ pub fn open_prepare(root: &std::path::Path) -> std::io::Result<crate::SharedWork
     Ok(wb)
 }
 
+/// Why the co-resident control plane stopped serving, in the words the person
+/// at the desktop is shown. The webview reaches its control plane over HTTP, so
+/// without this all it can say is that a request did not connect.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ControlPlaneFailure {
+    /// `store_too_new`, `port_in_use`, or `failed`.
+    pub kind: &'static str,
+    pub message: String,
+}
+
+/// Describe the error [`open_prepare`] or [`open_serve_workbench_with`]
+/// returned. `io::Error::source` skips the error it wraps, so the store's
+/// refusal is looked for from `get_ref`.
+pub fn control_plane_failure(error: &std::io::Error) -> ControlPlaneFailure {
+    let wrapped = error
+        .get_ref()
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    if let Some(ahead) = wrapped.and_then(gaugedesk_store::SchemaAhead::of) {
+        return ControlPlaneFailure {
+            kind: "store_too_new",
+            message: format!(
+                "A newer version of GaugeDesk has already used the data on this computer, \
+                 and this version cannot open it (data version {}; this version reads up to {}). \
+                 Update GaugeDesk to continue. Nothing was changed.",
+                ahead.found, ahead.supported
+            ),
+        };
+    }
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        return ControlPlaneFailure {
+            kind: "port_in_use",
+            message: format!(
+                "GaugeDesk could not start its local service because another program is using \
+                 its address ({error}). Quit any other copy of GaugeDesk, then open it again."
+            ),
+        };
+    }
+    ControlPlaneFailure {
+        kind: "failed",
+        message: format!(
+            "GaugeDesk's local service could not start: {error}. Quit GaugeDesk and open it again."
+        ),
+    }
+}
+
 /// Serve a workbench from [`open_prepare`] on `addr`, requiring the local
 /// operator secret `GAUGEDESK_OPERATOR_SECRET` names, if it names one. The
 /// desktop shell uses [`open_serve_workbench_with`] and its own secret.
@@ -864,5 +909,73 @@ mod reachability_tests {
         assert_eq!(status, 403, "{body}");
         assert!(body.contains("belongs to another account"), "{body}");
         tasks.iter().for_each(|task| task.abort());
+    }
+}
+
+#[cfg(test)]
+mod control_plane_failure_tests {
+    use super::*;
+
+    /// The 2026-10-05 failure: an installed build met a store a newer build had
+    /// migrated. The person is told to update, in words, not SQLite's text.
+    #[test]
+    fn a_store_a_newer_build_wrote_tells_the_person_to_update() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("gaugewright.db");
+        drop(gaugedesk_store::Store::open(db.to_str().unwrap()).unwrap());
+        let ahead = gaugedesk_store::SUPPORTED_SCHEMA_VERSION + 2;
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [ahead],
+            )
+            .unwrap();
+
+        let error = match open_prepare(root.path()) {
+            Ok(_) => panic!("a store a newer build wrote must refuse to open"),
+            Err(error) => error,
+        };
+        let failure = control_plane_failure(&error);
+        assert_eq!(failure.kind, "store_too_new", "{failure:?}");
+        assert!(
+            failure.message.contains("Update GaugeDesk"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains(&ahead.to_string())
+                && failure
+                    .message
+                    .contains(&gaugedesk_store::SUPPORTED_SCHEMA_VERSION.to_string()),
+            "names both versions: {}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("SqliteFailure"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn a_taken_address_and_any_other_failure_say_what_happened() {
+        let taken = std::io::Error::new(std::io::ErrorKind::AddrInUse, "Address already in use");
+        let failure = control_plane_failure(&taken);
+        assert_eq!(failure.kind, "port_in_use");
+        assert!(
+            failure.message.contains("Address already in use"),
+            "{}",
+            failure.message
+        );
+
+        let other = std::io::Error::other("disk I/O error");
+        let failure = control_plane_failure(&other);
+        assert_eq!(failure.kind, "failed");
+        assert!(
+            failure.message.contains("disk I/O error"),
+            "{}",
+            failure.message
+        );
     }
 }

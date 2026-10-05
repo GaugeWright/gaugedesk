@@ -1,3 +1,4 @@
+import { fetchLocalControlPlane } from "./local-control-plane-failure";
 import { LOCAL_OPERATOR_HEADER, localOperatorCredentialFor } from "./local-operator-credential";
 import { Rejected, TurnStopped, TURN_STOPPED_STATUS } from "./control-plane-domain";
 import { newIdempotencyKey, type RouteJson } from "./control-plane-transport";
@@ -200,7 +201,7 @@ export function browserRouteRequest(
         }
         const operator = await localOperatorCredentialFor(normalizedBase + path);
         if (operator) headers.set(LOCAL_OPERATOR_HEADER, operator);
-        return fetch(normalizedBase + path, {
+        return fetchLocalControlPlane(normalizedBase + path, {
             ...init,
             method,
             headers,

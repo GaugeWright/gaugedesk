@@ -633,19 +633,62 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-/// The fail-closed downgrade-guard error (DR-0054 Phase B): diagnosable — it
+/// The fail-closed downgrade-guard refusal (DR-0054 Phase B): diagnosable — it
 /// names the database, both versions, and the remediation (run the newer
-/// build), never "reset the state root".
-fn schema_ahead_error(path: &str, found: i64) -> rusqlite::Error {
-    rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-        Some(format!(
+/// build), never "reset the state root". Typed, so a caller that has to tell a
+/// person what happened can recognise it rather than show them SQLite's text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaAhead {
+    pub path: String,
+    /// The version the database records.
+    pub found: i64,
+    /// The newest version this build reads: [`SUPPORTED_SCHEMA_VERSION`].
+    pub supported: i64,
+}
+
+impl SchemaAhead {
+    /// The refusal behind `error`, if `error` is one, at any depth of its
+    /// source chain.
+    pub fn of<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a SchemaAhead> {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if let Some(ahead) = error.downcast_ref::<SchemaAhead>() {
+                return Some(ahead);
+            }
+            current = error.source();
+        }
+        None
+    }
+}
+
+impl std::fmt::Display for SchemaAhead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            path,
+            found,
+            supported,
+        } = self;
+        write!(
+            f,
             "store {path} records schema version {found}, but this build supports at most \
-             {SUPPORTED_SCHEMA_VERSION}: a newer GaugeDesk wrote it. Refusing to open so no \
+             {supported}: a newer GaugeDesk wrote it. Refusing to open so no \
              data is misread or dropped — run a build at schema version {found} or newer \
              against this state root (do not reset it)."
-        )),
-    )
+        )
+    }
+}
+
+impl std::error::Error for SchemaAhead {}
+
+/// rusqlite has no variant for an error of the caller's own. This one boxes
+/// any error, displays it unchanged and returns it as its `source()`, so the
+/// message is what it always was and [`SchemaAhead::of`] can recover it.
+fn schema_ahead_error(path: &str, found: i64) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(SchemaAhead {
+        path: path.to_owned(),
+        found,
+        supported: SUPPORTED_SCHEMA_VERSION,
+    }))
 }
 
 /// Read the decoded payload of a scope's last row of `kind`, inside an open
@@ -2457,6 +2500,15 @@ mod tests {
         assert!(
             message.contains("Refusing to open") && message.contains("do not reset"),
             "the remediation is the newer build, never a reset: {message}"
+        );
+        assert_eq!(
+            SchemaAhead::of(&error),
+            Some(&SchemaAhead {
+                path: path.clone(),
+                found: 999,
+                supported: SUPPORTED_SCHEMA_VERSION
+            }),
+            "the refusal is recognisable without reading its text"
         );
         // Failing closed changed nothing: the newer build's database still opens there.
         let conn = Connection::open(&path).unwrap();

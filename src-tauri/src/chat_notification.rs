@@ -111,7 +111,7 @@ mod macos {
         if mac_usernotifications::check_bundle().is_err() {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
-                eprintln!("chat notifications need the bundled app; this build shows none")
+                tracing::warn!("chat notifications need the bundled app; this build shows none")
             });
             return;
         }
@@ -123,7 +123,7 @@ mod macos {
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(error) => {
-                    eprintln!("could not ask to show notifications: {error}");
+                    tracing::warn!("could not ask to show notifications: {error}");
                     return;
                 }
             }
@@ -152,7 +152,7 @@ mod macos {
             let handle = match sent {
                 Ok(handle) => handle,
                 Err(error) => {
-                    eprintln!("could not show a notification: {error}");
+                    tracing::warn!("could not show a notification: {error}");
                     return;
                 }
             };
@@ -194,7 +194,7 @@ mod freedesktop_or_windows {
             let handle = match notification.show() {
                 Ok(handle) => handle,
                 Err(error) => {
-                    eprintln!("could not show a notification: {error}");
+                    tracing::warn!("could not show a notification: {error}");
                     return;
                 }
             };

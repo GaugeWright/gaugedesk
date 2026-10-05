@@ -1406,27 +1406,30 @@ pub fn editor_package_capabilities() -> io::Result<BTreeSet<String>> {
 }
 
 /// Transitional implementation of GaugeDesk's neutral harness seam over the
-/// permanent WhippleScript host protocol. GaugeDesk supplies its governance
-/// root and state directory; package admission, IFC, transcript continuity,
+/// permanent WhippleScript host protocol. GaugeDesk supplies a trusted public
+/// policy root, a separate actor identity and a state directory. The factory
+/// holds no private governance key. Package admission, IFC, transcript continuity,
 /// tool execution, and the labeled output projection remain WhippleScript-owned.
 #[derive(Clone)]
 pub struct WhipHarnessFactory {
     pub(crate) authority: AuthorityId,
-    signing_key: SigningKey,
+    policy_root: GovernanceRootVerifier,
     runtime_root: PathBuf,
     hosted: Option<DoHostConfig>,
     organization_model_broker: Option<OrganizationModelBrokerConfig>,
 }
 
 impl WhipHarnessFactory {
+    /// The product composition selects this root independently of the incoming
+    /// policy. Possessing its public key grants no signing or product standing.
     pub fn new(
         authority: AuthorityId,
-        signing_key: SigningKey,
+        policy_root: GovernanceRootVerifier,
         runtime_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             authority,
-            signing_key,
+            policy_root,
             runtime_root: runtime_root.into(),
             hosted: None,
             organization_model_broker: None,
@@ -1463,14 +1466,20 @@ impl WhipHarnessFactory {
         epoch: u64,
         signed_policy: &str,
     ) -> io::Result<GovernedHostRuntime> {
-        let verifier =
-            GovernanceRootVerifier::new(self.authority.clone(), self.signing_key.public_key());
+        // The original policy issuer is independent of the actor/transport
+        // identity. Verify the complete pinned root before touching its store.
+        AdmittedPolicyEpoch::verify_with(
+            PolicyEpoch::new(epoch).map_err(invalid_data)?,
+            signed_policy,
+            &self.policy_root,
+        )
+        .map_err(invalid_data)?;
         std::fs::create_dir_all(&self.runtime_root)?;
         GovernedHostRuntime::open_with_verifier(
             chat_runtime_database(&self.runtime_root, chat_id),
             epoch,
             signed_policy,
-            &verifier,
+            &self.policy_root,
         )
         .map_err(invalid_data)
     }
@@ -3903,6 +3912,11 @@ impl AdmittedPolicyEpoch {
             .map_err(PolicyAdmissionError::EnvelopeRejected)?;
         let policy_ref = PolicyEpochRef::from_verified(epoch.get(), &envelope)
             .map_err(PolicyAdmissionError::Protocol)?;
+        if policy_ref.signer != verifier.expected_signer().as_str() {
+            return Err(PolicyAdmissionError::EnvelopeRejected(
+                "governance signer does not match the pinned root".to_owned(),
+            ));
+        }
         Ok(Self {
             epoch,
             policy_ref,
@@ -3985,7 +3999,7 @@ mod tests {
         std::fs::create_dir_all(&runtime_root).unwrap();
         let factory = WhipHarnessFactory::new(
             AuthorityId::new("authority:owner"),
-            SigningKey::from_seed(&[7u8; 32]).unwrap(),
+            harness_policy_root(),
             &runtime_root,
         );
         factory
@@ -4089,7 +4103,7 @@ mod tests {
         std::fs::create_dir_all(&runtime_root).unwrap();
         let factory = WhipHarnessFactory::new(
             AuthorityId::new("authority:owner"),
-            SigningKey::from_seed(&[7u8; 32]).unwrap(),
+            harness_policy_root(),
             &runtime_root,
         );
         factory
@@ -5321,7 +5335,21 @@ mod tests {
         signed_harness_policy_at("https://api.openai.com")
     }
 
+    fn harness_policy_root() -> GovernanceRootVerifier {
+        GovernanceRootVerifier::new(
+            AuthorityId::new("authority:owner"),
+            SigningKey::from_seed(&[7u8; 32]).expect("key").public_key(),
+        )
+    }
+
     fn signed_harness_policy_at(base_url: &str) -> String {
+        let authority = AuthorityId::new("authority:owner");
+        let key = SigningKey::from_seed(&[7u8; 32]).expect("key");
+        sign_policy_envelope(&harness_policy_at(base_url), &authority, &key)
+            .expect("signed harness policy")
+    }
+
+    fn harness_policy_at(base_url: &str) -> String {
         let principal = ResourcePolicy {
             principal: true,
             ..ResourcePolicy::default()
@@ -5383,10 +5411,7 @@ mod tests {
             )]),
             ..HostGovernancePolicy::default()
         };
-        let authority = AuthorityId::new("authority:owner");
-        let key = SigningKey::from_seed(&[7u8; 32]).expect("key");
-        sign_policy_envelope(&policy.to_json().expect("policy"), &authority, &key)
-            .expect("signed harness policy")
+        policy.to_json().expect("policy")
     }
 
     #[test]
@@ -5623,6 +5648,125 @@ mod tests {
     }
 
     #[test]
+    fn policy_admission_refuses_a_different_signer_under_the_same_key() {
+        let key = SigningKey::from_seed(&[7u8; 32]).expect("root key");
+        let signed = sign_policy_envelope(
+            &harness_policy_at("https://api.openai.com"),
+            &AuthorityId::new("project:foreign"),
+            &key,
+        )
+        .unwrap();
+        let error = AdmittedPolicyEpoch::verify_with(
+            PolicyEpoch::new(1).unwrap(),
+            &signed,
+            &harness_policy_root(),
+        )
+        .err()
+        .expect("a signature is not issuer standing");
+        assert!(error.to_string().contains("signer does not match"));
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime_root = root.path().join("runtime");
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("transport:host"),
+            harness_policy_root(),
+            &runtime_root,
+        );
+        assert!(factory.runtime_for_chat("chat", 1, &signed).is_err());
+        assert!(
+            !runtime_root.exists(),
+            "refusal must precede runtime writes"
+        );
+    }
+
+    #[test]
+    fn project_policy_reopens_and_forks_with_only_its_original_public_root() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let actor = AuthorityId::new("transport:project-host");
+        let issuer = AuthorityId::new("project:original");
+        // Only the signed policy and public root leave the signing scope.
+        let (signed, policy_root) = {
+            let key = SigningKey::from_seed(&[8u8; 32]).unwrap();
+            (
+                sign_hosted_policy_envelope(
+                    &harness_policy_at("https://api.openai.com"),
+                    &issuer,
+                    &key,
+                    1,
+                )
+                .unwrap(),
+                GovernanceRootVerifier::new(issuer.clone(), key.public_key()),
+            )
+        };
+        let factory = WhipHarnessFactory::new(actor.clone(), policy_root.clone(), root.path());
+        let mut spec = continuity_spec(
+            worktree.path(),
+            "https://api.openai.com",
+            gaugedesk_harness::ChatMode::Edit,
+            None,
+            Some("Inspect the project."),
+        );
+        spec.signed_policy_envelope = Some(signed.clone());
+        let first = factory.create_harness(&spec).unwrap();
+        assert_eq!(first.respondent_ref, actor.as_str());
+        assert_eq!(first.runtime.policy_ref().signer, issuer.as_str());
+        let policy = first.runtime.policy_ref().clone();
+        let position = first.runtime.current_position(&first.instance_ref).unwrap();
+        let source_instance = first.instance_ref.clone();
+        drop(first);
+        let source = HarnessContinuitySpec {
+            chat_id: spec.chat_id.clone(),
+            runtime_placement_id: spec.runtime_placement_id.clone(),
+            worktree: spec.worktree.clone(),
+            mode: spec.mode,
+            package_root: None,
+            package_version_ref: None,
+            system_prompt: spec.system_prompt.clone(),
+            policy_epoch: spec.policy_epoch,
+            signed_policy_envelope: spec.signed_policy_envelope.clone(),
+            source_position: Some(RuntimePosition {
+                instance_ref: position.instance_ref,
+                sequence: position.sequence,
+            }),
+        };
+        let target = HarnessContinuitySpec {
+            chat_id: "forked-project-chat".into(),
+            source_position: None,
+            ..source.clone()
+        };
+        drop(factory);
+        // Reconstruct from public evidence alone, as after custody has gone.
+        let reopened = WhipHarnessFactory::new(actor, policy_root, root.path());
+        let original = reopened.create_harness(&spec).unwrap();
+        assert_eq!(original.instance_ref, source_instance);
+        assert_eq!(original.runtime.policy_ref(), &policy);
+        drop(original);
+        reopened.clone_continuity(&source, &target).unwrap();
+        reopened.clone_continuity(&source, &target).unwrap();
+        let fork = reopened
+            .create_harness(&HarnessSpec {
+                chat_id: target.chat_id.clone(),
+                ..spec
+            })
+            .unwrap();
+        assert_ne!(fork.instance_ref, source_instance);
+        assert_eq!(fork.runtime.policy_ref(), &policy);
+        assert_eq!(
+            source.signed_policy_envelope.as_deref(),
+            Some(signed.as_str())
+        );
+
+        let wrong = WhipHarnessFactory::new(
+            AuthorityId::new("transport:project-host"),
+            harness_policy_root(),
+            root.path().join("foreign"),
+        );
+        assert!(wrong.clone_continuity(&source, &target).is_err());
+        assert!(!root.path().join("foreign").exists());
+    }
+
+    #[test]
     fn first_chat_creates_file_continues_and_reopens_through_real_runtime() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5710,7 +5854,7 @@ workflow Method {
         };
         let factory = WhipHarnessFactory::new(
             AuthorityId::new("authority:owner"),
-            SigningKey::from_seed(&[7u8; 32]).expect("key"),
+            harness_policy_root(),
             root.path(),
         );
         let mut first = factory.create_harness(&spec).expect("first harness");
@@ -6022,7 +6166,7 @@ workflow Method {
         let (origin, calls, server) = recording_provider(3);
         let factory = WhipHarnessFactory::new(
             AuthorityId::new("authority:owner"),
-            SigningKey::from_seed(&[7u8; 32]).expect("key"),
+            harness_policy_root(),
             root.path(),
         );
         let edit = gaugedesk_harness::ChatMode::Edit;
@@ -6054,7 +6198,7 @@ workflow Method {
         let (origin, calls, server) = recording_provider(2);
         let factory = WhipHarnessFactory::new(
             AuthorityId::new("authority:owner"),
-            SigningKey::from_seed(&[7u8; 32]).expect("key"),
+            harness_policy_root(),
             root.path(),
         );
         let version = |number: u32, persona: &str| {
@@ -6200,7 +6344,7 @@ workflow Method {
         };
         let factory = WhipHarnessFactory::new(
             AuthorityId::new("authority:owner"),
-            SigningKey::from_seed(&[7u8; 32]).expect("key"),
+            harness_policy_root(),
             root.path(),
         );
         let mut first = factory.create_harness(&spec).expect("first harness");
@@ -6424,7 +6568,7 @@ workflow Method {
     fn whip_factory_requires_gaugedesk_owned_codex_material() {
         let factory = WhipHarnessFactory::new(
             AuthorityId::new("authority:owner"),
-            SigningKey::from_seed(&[7u8; 32]).expect("key"),
+            harness_policy_root(),
             ".",
         );
         assert!(matches!(

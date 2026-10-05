@@ -7,8 +7,8 @@
 pub use crate::local_operator::LocalOperatorSecret;
 pub use crate::open_route_stack::{open_control_plane, open_control_plane_with_native_saves};
 pub use crate::open_runtime::{
-    open_control_plane_root, open_prepare, open_serve, open_serve_workbench,
-    open_serve_workbench_with,
+    control_plane_failure, open_control_plane_root, open_prepare, open_serve, open_serve_workbench,
+    open_serve_workbench_with, ControlPlaneFailure,
 };
 
 /// Hash a small synthetic chat observation inside the native app. The desktop

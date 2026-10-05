@@ -55,6 +55,11 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # `tauri::generate_context!()` expands to code that parses the bundled config via
 # serde_json, so it must be a direct dependency (else E0433: serde_json not in crate root).
 serde_json = "1"
+# The persistent log (src/logging.rs): the co-resident control plane's events
+# have no subscriber unless the shell installs one.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
 
 [features]
 # Production builds embed custom-protocol assets; dev uses the Vite server.

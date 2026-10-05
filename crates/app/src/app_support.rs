@@ -246,11 +246,13 @@ impl Workbench {
     pub fn whip_harness_factory(
         &self,
     ) -> std::io::Result<gaugedesk_whip_runtime::WhipHarnessFactory> {
-        let signing_key = gaugedesk_core::signature::SigningKey::from_seed(&self.governance_seed())
-            .map_err(|error| std::io::Error::other(error.reason))?;
+        let policy_root = gaugedesk_whip_runtime::GovernanceRootVerifier::new(
+            self.authority().clone(),
+            self.governance_public_key(),
+        );
         let factory = gaugedesk_whip_runtime::WhipHarnessFactory::new(
             self.authority().clone(),
-            signing_key,
+            policy_root,
             self.root_path().join("whip-runtimes"),
         );
         match gaugedesk_env::var("DO_HOST_URL") {

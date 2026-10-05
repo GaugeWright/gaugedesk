@@ -19,6 +19,10 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Native chat runtimes verify the policy's original signer and public key
+  independently of the runtime actor. A harness factory carries public
+  verification evidence without retaining a private governance signing key.
+
 - Multi-target settlement signs new effect and recovery receipts with project
   authority. Existing host-signed receipts retain their original identity.
   Missing project signing custody stops new work before target effects start;
