@@ -81,7 +81,15 @@ impl Workbench {
     /// never supplies the frozen source provenance used by installed-method
     /// grants.
     pub(crate) fn agent_authoring_owner(&self, id: &str) -> Option<String> {
-        let agent = self.library.agents.get(id)?;
+        self.agent_authoring_owner_in(&self.library, id)
+    }
+
+    pub(crate) fn agent_authoring_owner_in(
+        &self,
+        library: &crate::library::Library,
+        id: &str,
+    ) -> Option<String> {
+        let agent = library.agents.get(id)?;
         agent
             .authoring_owner
             .clone()

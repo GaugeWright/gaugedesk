@@ -547,7 +547,7 @@ mod tests {
             let mut guard = inspect.lock_unpoisoned();
             guard.write_project_record(ProjectRecord {
                 schema: crate::library::LIBRARY_RECORD_SCHEMA,
-                extra: Default::default(),
+                extra: [("owner".into(), serde_json::json!("alice"))].into(),
                 id: "foreign".into(),
                 op: RecordOp::Upsert,
                 name: "Foreign".into(),

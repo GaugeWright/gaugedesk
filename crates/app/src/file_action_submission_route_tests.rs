@@ -154,6 +154,7 @@ async fn submission_http_refuses_a_changed_authenticated_actor_before_custody() 
     let bob = {
         let mut guard = wb.lock_unpoisoned();
         membership(&mut guard, "bob", "owner");
+        project_grant(&mut guard, "bob", crate::org::RecordOp::Upsert);
         let token = guard.mint_account_session("bob", "passkey", 3600).unwrap();
         let context = guard.authenticate_action_context(&token).unwrap();
         // Both accounts independently have target authority; a permission

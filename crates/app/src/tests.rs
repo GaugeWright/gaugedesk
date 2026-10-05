@@ -5637,6 +5637,100 @@ fn append_turn(wb: &mut Workbench, chat: &str, user: &str, assistant: &str) -> (
 }
 
 #[test]
+fn transcript_write_targets_use_the_authoring_turns_binding() {
+    let mut wb = Workbench::new(Store::open_in_memory().unwrap());
+    let chat = "named-write";
+    wb.write_chat_record(lineage_chat(chat, None, None));
+    let user = wb
+        .store_mut()
+        .append_record(chat, "transcript", r#"{"type":"user","text":"write"}"#)
+        .unwrap();
+    let declaration = serde_json::json!({
+        "schema": "gaugedesk.turn-process.v1", "id": "process-test", "run_ref": format!("{chat}:{user}"),
+        "chat_id": chat, "project_id": "project", "placement_id": "placement", "package_version_ref": "package",
+        "target_set_revision": 0, "executable": "whip", "read_targets": ["target"], "write_targets": ["target"],
+        "output_targets": ["target"], "governance_epoch": 1, "governance_envelope_digest": "digest",
+        "bindings": [{"target_id": "target", "resource_handle": "target:t-personal", "root": "targets/t-personal",
+            "name": "Personal files", "native_basis": "cut", "adapter_family": "whipplescript-v1",
+            "path_scope": ["."], "capabilities": {"read": true, "propose": true, "apply": true, "publish": false, "release": false},
+            "participation": "writable", "authorities": ["home"], "readable": true, "writable": true, "output": true}]
+    });
+    wb.store_mut()
+        .append_record(
+            chat,
+            crate::target_change_set::TURN_PROCESS_DECLARATION_KIND,
+            &declaration.to_string(),
+        )
+        .unwrap();
+    for target in [
+        "Personal files/test.txt",
+        "targets/t-personal/test.txt",
+        "Personal files/../other/test.txt",
+        "Personal files-extra/test.txt",
+    ] {
+        wb.store_mut()
+            .append_record(
+                chat,
+                "transcript",
+                &serde_json::json!({
+                    "type": "toolresult", "tool": "write", "target": target, "ok": true,
+                    "canonical_target": "model-supplied-forgery"
+                })
+                .to_string(),
+            )
+            .unwrap();
+    }
+    let rows: serde_json::Value =
+        serde_json::from_str(&wb.engagement_transcript_json(chat).unwrap()).unwrap();
+    assert_eq!(rows[1]["canonical_target"], "targets/t-personal/test.txt");
+    assert_eq!(rows[2]["canonical_target"], "targets/t-personal/test.txt");
+    assert!(rows[3]["canonical_target"].is_null());
+    assert!(rows[4]["canonical_target"].is_null());
+    // A new prompt cannot borrow the earlier declaration, even if the name matches.
+    wb.store_mut()
+        .append_record(chat, "transcript", r#"{"type":"user","text":"later"}"#)
+        .unwrap();
+    wb.store_mut()
+        .append_record(
+            chat,
+            "transcript",
+            r#"{"type":"toolresult","tool":"edit","target":"Personal files/test.txt","ok":true}"#,
+        )
+        .unwrap();
+    let rows: serde_json::Value =
+        serde_json::from_str(&wb.engagement_transcript_json(chat).unwrap()).unwrap();
+    assert!(rows[6]["canonical_target"].is_null());
+    // A declaration scoped to the wrong prompt cannot lend its mapping either.
+    wb.store_mut()
+        .append_record(
+            chat,
+            crate::target_change_set::TURN_PROCESS_DECLARATION_KIND,
+            &declaration.to_string(),
+        )
+        .unwrap();
+    wb.store_mut()
+        .append_record(
+            chat,
+            "transcript",
+            r#"{"type":"toolresult","tool":"edit","target":"Personal files/test.txt","ok":true}"#,
+        )
+        .unwrap();
+    let rows: serde_json::Value =
+        serde_json::from_str(&wb.engagement_transcript_json(chat).unwrap()).unwrap();
+    assert!(rows[7]["canonical_target"].is_null());
+    // Duplicate presented names are ambiguous, not a choice made by the exporter.
+    let mut duplicate = declaration.clone();
+    let mut binding = duplicate["bindings"][0].clone();
+    binding["root"] = "targets/t-other".into();
+    duplicate["bindings"].as_array_mut().unwrap().push(binding);
+    let process: crate::target_change_set::TurnProcessDeclaration =
+        serde_json::from_value(duplicate).unwrap();
+    assert!(process
+        .canonical_tool_target("Personal files/test.txt")
+        .is_none());
+}
+
+#[test]
 fn transcript_workspace_receipts_are_scoped_to_the_settle_and_fork_cut() {
     let mut wb = Workbench::new(Store::open_in_memory().unwrap());
     wb.write_chat_record(lineage_chat("receipt-parent", None, None));

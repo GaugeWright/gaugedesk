@@ -227,7 +227,11 @@ async fn correction_admission_uses_committed_membership_and_target_permission() 
     let intent = corrections(&file);
     let app = recording_router(wb.clone(), dir.path().join("inputs.sqlite"), 4096);
     let admission = home_admission(&app, &token).await;
-    membership(&mut wb.lock_unpoisoned(), "alice", "consultant");
+    {
+        let mut guard = wb.lock_unpoisoned();
+        membership(&mut guard, "alice", "consultant");
+        project_grant(&mut guard, "alice", crate::org::RecordOp::Tombstone);
+    }
     let (status, reason) = submit(&app, &token, &admission, &intent).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{reason}");
     // Refused at the Home boundary, which resolves the chat's project, before
@@ -239,6 +243,7 @@ async fn correction_admission_uses_committed_membership_and_target_permission() 
     {
         let mut wb = wb.lock_unpoisoned();
         membership(&mut wb, "alice", "owner");
+        project_grant(&mut wb, "alice", crate::org::RecordOp::Upsert);
         let id = wb
             .library
             .current_target_set(&file.chat_id)

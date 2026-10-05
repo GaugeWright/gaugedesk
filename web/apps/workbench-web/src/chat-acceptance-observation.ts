@@ -37,7 +37,7 @@ export function admittedChatObservation(input: ChatAcceptanceInput) {
         } else if (entry.type === "toolresult" && entry.ok === true) {
             tools++;
             if (user !== undefined && (entry.tool === "write" || entry.tool === "edit")
-                && entry.target === input.file && entryId(entry.entry_id)) write = entry.entry_id;
+                && (entry.canonical_target ?? entry.target) === input.file && entryId(entry.entry_id)) write = entry.entry_id;
         } else if (entry.type === "admitted" && entry.kind === "run" && entry.text === "run → Completed") {
             const receipt = record(entry.workspace_change);
             if (user === undefined || !entryId(entry.entry_id) || !entryId(write) || write <= user || write >= entry.entry_id

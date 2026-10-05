@@ -109,6 +109,23 @@ pub(super) fn membership(wb: &mut Workbench, actor: &str, role: &str) {
         .unwrap();
 }
 
+/// The fixture's project grant is separate from organization administration.
+pub(super) fn project_grant(wb: &mut Workbench, actor: &str, op: crate::org::RecordOp) {
+    let grant = crate::org::MemberGrantRecord {
+        id: crate::org::MemberGrantRecord::make_id(actor, crate::DEFAULT_PROJECT),
+        authority: actor.into(),
+        project_id: crate::DEFAULT_PROJECT.into(),
+        op,
+    };
+    wb.store_mut()
+        .append_record(
+            ORG_SCOPE,
+            "member_grant",
+            &serde_json::to_string(&grant).unwrap(),
+        )
+        .unwrap();
+}
+
 fn setup(root: &std::path::Path) -> (SharedWorkbench, Intent, String) {
     setup_content(root, "recorded base", "private editor draft")
 }
@@ -128,6 +145,7 @@ fn setup_content(
             crate::identity::LoopbackIdentityProvider::new(),
         )));
         membership(&mut wb, "alice", "owner");
+        project_grant(&mut wb, "alice", crate::org::RecordOp::Upsert);
         let token = wb.mint_account_session("alice", "passkey", 3600).unwrap();
         let chat = wb
             .create_chat_in_instance(DEFAULT_PLACEMENT, "File action")
@@ -439,6 +457,7 @@ async fn factory_requires_current_project_grants_and_committed_target_permission
     {
         let mut wb = wb.lock_unpoisoned();
         membership(&mut wb, "alice", "consultant");
+        project_grant(&mut wb, "alice", crate::org::RecordOp::Tombstone);
     }
     let (status, refusal) = send(
         &app,
@@ -459,6 +478,7 @@ async fn factory_requires_current_project_grants_and_committed_target_permission
     {
         let mut wb = wb.lock_unpoisoned();
         membership(&mut wb, "alice", "owner");
+        project_grant(&mut wb, "alice", crate::org::RecordOp::Upsert);
         let id = wb
             .library
             .current_target_set(&intent.chat_id)
@@ -938,10 +958,12 @@ fn native_delivery_refuses_revocation_changed_authority_and_unadmitted_commands(
         .deliver_editor_file_save(&context, &inputs, &changed, &mut runtime)
         .is_err());
     membership(&mut wb, "alice", "consultant");
+    project_grant(&mut wb, "alice", crate::org::RecordOp::Tombstone);
     assert!(wb
         .deliver_editor_file_save(&context, &inputs, &command, &mut runtime)
         .is_err());
     membership(&mut wb, "alice", "owner");
+    project_grant(&mut wb, "alice", crate::org::RecordOp::Upsert);
     let (id, _, _): (String, String, String) = serde_json::from_str(
         command.resources["target"]
             .resource

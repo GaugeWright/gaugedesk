@@ -62,6 +62,23 @@ fn seed_members(store: &mut Store, members: &[(&str, &str, Option<&str>)]) {
     }
 }
 
+/// Administrative fixtures must record project ownership separately from roles.
+fn record_test_project_owner(wb: &mut Workbench) {
+    let mut project = gaugedesk_app::library::Library::rebuild(wb.store_ref())
+        .unwrap()
+        .projects["test-project"]
+        .clone();
+    gaugedesk_app::project_owner::record_owner(&mut project.extra, "owner-auth");
+    wb.store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    wb.rebuild_library();
+}
+
 fn workbench_with_idp() -> (tempfile::TempDir, Router) {
     let (dir, app, _workbench) = workbench_with_idp_shared();
     (dir, app)
@@ -122,8 +139,9 @@ fn workbench_with_idp_shared() -> (tempfile::TempDir, Router, Arc<Mutex<Workbenc
             AuthorityId::new("outsider-auth"),
             AuthorityAttributes::default(),
         );
-    let wb =
+    let mut wb =
         Workbench::with_target("inst-test", instance, store).with_identity_provider(Arc::new(idp));
+    record_test_project_owner(&mut wb);
     let shared = Arc::new(Mutex::new(wb));
     (dir, enterprise_control_plane(Arc::clone(&shared)), shared)
 }
@@ -153,7 +171,7 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
     // Seed the library: a project, a using-instance bound into it, and a chat on that instance.
     let project = ProjectRecord {
         schema: gaugedesk_app::library::LIBRARY_RECORD_SCHEMA,
-        extra: Default::default(),
+        extra: [("owner".into(), serde_json::json!("owner-auth"))].into(),
         id: "proj-acme".into(),
         op: RecordOp::Upsert,
         name: "Acme".into(),
@@ -261,6 +279,7 @@ fn workbench_with_scoped_project_cfg(audit_reads: bool) -> (tempfile::TempDir, R
         .with_identity_provider(Arc::new(idp))
         .with_audit_reads(audit_reads);
     wb.rebuild_library(); // fold the seeded library records into the projection
+    record_test_project_owner(&mut wb);
     (dir, enterprise_control_plane(Arc::new(Mutex::new(wb))))
 }
 
@@ -764,6 +783,22 @@ async fn export_is_gated_by_role_policy() {
             |_| Authority::from("owner-auth"),
         );
         resource_store::put(workbench.store_mut(), "eng-1", &output).unwrap();
+        // The viewer is a project member, so the rejection below establishes
+        // the export policy rather than failing earlier at project admission.
+        let grant = gaugedesk_app::org::MemberGrantRecord {
+            id: gaugedesk_app::org::MemberGrantRecord::make_id("viewer-auth", "test-project"),
+            op: RecordOp::Upsert,
+            authority: "viewer-auth".into(),
+            project_id: "test-project".into(),
+        };
+        workbench
+            .store_mut()
+            .append_record(
+                ORG_SCOPE,
+                "member_grant",
+                &serde_json::to_string(&grant).unwrap(),
+            )
+            .unwrap();
     }
 
     // A viewer is denied export by the policy → 403 (the gate fires before admit).
@@ -843,8 +878,8 @@ async fn enterprise_mode_gates_data_routes_for_active_members() {
 
 #[tokio::test]
 async fn entsec2_scopes_data_routes_to_granted_projects() {
-    // ENTSEC-2 (ADR 0065): a plain member sees only the projects granted to them; owner/admin
-    // bypass; a non-granted member is forbidden the project's data routes, fail-closed.
+    // DR-0268: every account needs project ownership or an explicit grant;
+    // organization administration supplies no data standing.
     let (_dir, app) = workbench_with_scoped_project();
 
     // Grant consultant-a access to proj-acme (owner administers grants).
@@ -915,7 +950,7 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
         "granted member passes the scope gate for the chat"
     );
 
-    // The owner bypasses scoping — sees the project with no grant of its own.
+    // The account owns this project explicitly, independently of its org role.
     let (s, _) = send(
         &app,
         "GET",
@@ -924,7 +959,7 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
         Some("owner-token"),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "owner bypasses project scoping");
+    assert_eq!(s, StatusCode::OK, "the recorded project owner is admitted");
 
     // The workspace nav is membership-gated (200 for any active member), but its *content*
     // is now visibility-scoped (ENTSEC-2, see `entsec2_scopes_the_workspace_nav_content`).
@@ -954,6 +989,76 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "a revoked grant withdraws access");
+}
+
+#[tokio::test]
+async fn organization_administrators_need_project_standing_at_the_enterprise_boundary() {
+    let (_dir, app, shared) = workbench_with_idp_shared();
+    {
+        let mut wb = shared.lock().unwrap();
+        let mut project = gaugedesk_app::library::Library::rebuild(wb.store_ref())
+            .unwrap()
+            .projects["test-project"]
+            .clone();
+        project.id = "ungranted".into();
+        project.name = "Other account's project".into();
+        project.is_default = false;
+        gaugedesk_app::project_owner::record_owner(&mut project.extra, "another-account");
+        wb.store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "project",
+                &serde_json::to_string(&project).unwrap(),
+            )
+            .unwrap();
+        wb.rebuild_library();
+    }
+    for (account, token) in [("owner-auth", "owner-token"), ("admin-a", "admin-a-token")] {
+        let (status, _) = send(&app, "GET", "/projects/ungranted/home", None, Some(token)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{account} has only an org role"
+        );
+        let (status, workspace) = send(&app, "GET", "/workspace", None, Some(token)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!workspace["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|project| project["id"] == "ungranted"));
+
+        let (status, result) = admin(
+            &app,
+            Some("owner-token"),
+            "people",
+            "project-access.grant",
+            serde_json::json!({"authority": account, "project_id": "ungranted"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(
+            send(&app, "GET", "/projects/ungranted/home", None, Some(token))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (status, _) = admin(
+            &app,
+            Some("owner-token"),
+            "people",
+            "project-access.revoke",
+            serde_json::json!({"authority": account, "project_id": "ungranted"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            send(&app, "GET", "/projects/ungranted/home", None, Some(token))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+    }
 }
 
 /// The ids in a fork-forest response, depth first.
@@ -1025,7 +1130,7 @@ async fn ws580_routes_naming_no_project_are_closed_to_a_member_limited_to_projec
     assert_ne!(s, StatusCode::FORBIDDEN, "{body}");
 
     // A route naming no project is closed to a scoped member and open to the
-    // owner, who sees every project.
+    // account owner, who can administer the host and owns the named target.
     for (method, path, body) in [
         ("GET", "/archetypes/agent-default", None),
         ("POST", "/chats", Some("{}")),
@@ -1249,7 +1354,7 @@ async fn entsec2_scopes_the_workspace_nav_content() {
             .any(|c| c["id"] == id)
     };
 
-    // Owner: bypasses scoping — sees the project and its chat.
+    // Recorded project owner: sees this project and its chat without a grant.
     let owner = nav(&app, "owner-token").await;
     assert!(has_project(&owner, "proj-acme"), "owner sees the project");
     assert!(has_recent_chat(&owner, "chat-acme"), "owner sees the chat");

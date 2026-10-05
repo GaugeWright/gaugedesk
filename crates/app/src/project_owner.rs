@@ -8,7 +8,7 @@
 //! whose claim was the explicit act that gave it the computer's projects, or
 //! the computer's local account where nobody claimed it.
 //!
-//! On a desktop this is what admits a signed-in account to a project, beside
+//! This is what admits a signed-in account to a project, beside
 //! an explicit grant; an organization role no longer reaches every project.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,13 +59,40 @@ impl Workbench {
     /// The owner of a project with no recorded one: the account that claimed
     /// this computer, else the computer's local account.
     pub(crate) fn legacy_project_owner(&self) -> String {
-        self.home_owner_account()
-            .unwrap_or_else(|| self.authority().as_str().to_owned())
+        // DR-0309 names the earlier explicit claim, never an organization
+        // role. home_owner_account also recognizes a sole directory owner,
+        // which is host-era compatibility and cannot establish project data
+        // ownership. Unreadable or ambiguous claim evidence supplies no owner.
+        let Ok(claims) = self
+            .store_ref()
+            .records(crate::org::ORG_SCOPE, crate::home_owner::CLAIM_KIND)
+        else {
+            return String::new();
+        };
+        match claims.as_slice() {
+            [] => self.authority().as_str().to_owned(),
+            [claim] => match serde_json::from_str::<crate::home_owner::HomeOwnerClaim>(claim) {
+                Ok(claim) => claim
+                    .account
+                    .unwrap_or_else(|| self.authority().as_str().to_owned()),
+                Err(_) => String::new(),
+            },
+            _ => String::new(),
+        }
     }
 
     /// The owner of `project`. `legacy` is [`Self::legacy_project_owner`],
     /// passed in so a caller folding every project reads it once.
     pub(crate) fn project_owner_with(&self, project: &ProjectRecord, legacy: &str) -> ProjectOwner {
+        self.project_owner_in(&self.library, project, legacy)
+    }
+
+    fn project_owner_in(
+        &self,
+        library: &crate::library::Library,
+        project: &ProjectRecord,
+        legacy: &str,
+    ) -> ProjectOwner {
         if let Some(owner) = recorded_owner(project) {
             return ProjectOwner::Account(owner.to_owned());
         }
@@ -92,13 +119,13 @@ impl Workbench {
             let previewed = marker
                 .placement_id
                 .as_deref()
-                .and_then(|placement| self.library.project_of_instance(placement))
-                .and_then(|id| self.library.projects.get(id))
+                .and_then(|placement| library.project_of_instance(placement))
+                .and_then(|id| library.projects.get(id))
                 .filter(|previewed| !crate::panel_preview::is_panel_preview_project(previewed));
             if let Some(previewed) = previewed {
-                return self.project_owner_with(previewed, legacy);
+                return self.project_owner_in(library, previewed, legacy);
             }
-            if let Some(author) = self.agent_authoring_owner(&marker.agent_id) {
+            if let Some(author) = self.agent_authoring_owner_in(library, &marker.agent_id) {
                 return ProjectOwner::Account(author);
             }
         }
@@ -183,13 +210,18 @@ impl Workbench {
     /// The projects `account` reaches as itself: those it owns and those it
     /// holds a grant to in `org`.
     pub(crate) fn account_project_ids(&self, account: &str, org: &Org) -> BTreeSet<String> {
+        // Admission consumes durable ownership, including a preview's source,
+        // rather than a Workbench projection that another writer may have left
+        // stale. Unreadable ownership evidence grants no project visibility.
+        let Ok(library) = crate::library::Library::rebuild(self.store_ref()) else {
+            return BTreeSet::new();
+        };
         let legacy = self.legacy_project_owner();
-        let mut ids: BTreeSet<String> = self
-            .library
+        let mut ids: BTreeSet<String> = library
             .projects
             .values()
             .filter(|project| {
-                self.project_owner_with(project, &legacy)
+                self.project_owner_in(&library, project, &legacy)
                     == ProjectOwner::Account(account.to_owned())
             })
             .map(|project| project.id.clone())

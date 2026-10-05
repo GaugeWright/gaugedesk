@@ -19,6 +19,17 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-05
+
+- Native chat test evidence matches file writes through the folder binding
+  recorded for that turn, so admitted folder names and the file viewer's stable
+  paths identify the same synthetic file.
+
+- Hosted project requests and listings now require account ownership or an
+  explicit project grant. Organization owner and admin roles do not provide
+  project data access. Legacy ownership follows the original computer claim,
+  rather than the directory's current owner role.
+
 ## [0.7.0] — 2026-10-05
 
 - Native file saves and corrections use project signing authority for new acts.

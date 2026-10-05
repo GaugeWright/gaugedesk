@@ -792,6 +792,22 @@ mod tests {
                     )
                     .unwrap();
             }
+            let project = wb.library.project_of_chat(&chat.id).unwrap().to_owned();
+            for person in ["alice", "bob"] {
+                let grant = crate::org::MemberGrantRecord {
+                    id: crate::org::MemberGrantRecord::make_id(person, &project),
+                    op: crate::org::RecordOp::Upsert,
+                    authority: person.into(),
+                    project_id: project.clone(),
+                };
+                wb.store_mut()
+                    .append_record(
+                        crate::org::ORG_SCOPE,
+                        "member_grant",
+                        &serde_json::to_string(&grant).unwrap(),
+                    )
+                    .unwrap();
+            }
             wb.set_identity_provider(Some(Arc::new(
                 crate::identity::LoopbackIdentityProvider::new()
                     .enroll(

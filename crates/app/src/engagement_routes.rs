@@ -495,16 +495,50 @@ impl Workbench {
                     }
                 }
             }
-            for (position, _, payload) in events
-                .into_iter()
-                .filter(|(position, kind, _)| *position <= bound && kind == "transcript")
-            {
+            let mut user_entry = None;
+            let mut process = None;
+            for (position, kind, payload) in events.into_iter().filter(|(p, _, _)| *p <= bound) {
+                if kind == crate::target_change_set::TURN_PROCESS_DECLARATION_KIND {
+                    process = serde_json::from_str::<
+                        crate::target_change_set::TurnProcessDeclaration,
+                    >(&payload)
+                    .ok()
+                    .filter(|declaration| {
+                        Some(declaration.run_ref.as_str()) == user_entry.as_deref()
+                    });
+                    continue;
+                }
+                if kind != "transcript" {
+                    continue;
+                }
                 let Ok(mut event) = serde_json::from_str::<serde_json::Value>(&payload) else {
                     continue;
                 };
                 let Some(object) = event.as_object_mut() else {
                     continue;
                 };
+                if object.get("type").and_then(|v| v.as_str()) == Some("user") {
+                    user_entry = Some(format!("{scope}:{position}"));
+                    process = None;
+                }
+                // The agent sees a presented folder name; the file viewer uses
+                // its stable root. Resolve only against this turn's immutable
+                // declaration, never today's names or model-supplied metadata.
+                object.remove("canonical_target");
+                if object.get("type").and_then(|v| v.as_str()) == Some("toolresult")
+                    && matches!(
+                        object.get("tool").and_then(|v| v.as_str()),
+                        Some("write" | "edit")
+                    )
+                {
+                    if let Some(target) = object
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .and_then(|target| process.as_ref()?.canonical_tool_target(target))
+                    {
+                        object.insert("canonical_target".into(), target.into());
+                    }
+                }
                 object.insert("entry_id".into(), position.into());
                 if let Some(receipt) = receipts.remove(&position) {
                     object.insert("workspace_change".into(), receipt);

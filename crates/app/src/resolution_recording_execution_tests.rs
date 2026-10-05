@@ -353,7 +353,10 @@ fn correction_execution_rechecks_current_authority_and_retained_input_before_dis
             0 => {
                 wb.revoke_account_session(&token);
             }
-            1 => membership(&mut wb, "alice", "consultant"),
+            1 => {
+                membership(&mut wb, "alice", "consultant");
+                project_grant(&mut wb, "alice", crate::org::RecordOp::Tombstone);
+            }
             2 => {
                 let (chat, _) = coordinates(&command);
                 let target_id = wb.library.current_target_set(&chat).unwrap().members[0]

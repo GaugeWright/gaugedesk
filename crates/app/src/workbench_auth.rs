@@ -35,13 +35,13 @@ fn web_account_uses_account_admission(
 /// *appearing* in the nav for a scoped member (no information leak of project/chat existence).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectVisibility {
-    /// See everything — solo/loopback (no IdP), bootstrap (unprovisioned directory), or an
-    /// `owner`/`admin` who bypasses scoping. The default, so the single-user shape is untouched.
+    /// Legacy solo/loopback or an unprovisioned bootstrap. Authenticated
+    /// organization roles never select this all-project view (DR-0268).
     All,
-    /// A scoped member sees **only** these explicitly-granted project ids (fail-closed: an
+    /// A scoped member sees **only** these owned or explicitly granted project ids (fail-closed: an
     /// empty set means no client projects are visible).
     Only(BTreeSet<String>),
-    /// A desktop's owner or admin sees the projects it owns or holds a grant
+    /// An account sees the projects it owns or holds a grant
     /// to (DR-0268, DR-0309). Listings and project routes are limited to these
     /// exactly as for [`Only`](Self::Only), but the caller is a whole account
     /// rather than a member limited to specific projects, so routes naming no
@@ -90,7 +90,8 @@ pub(crate) fn scoped_member_may_reach(method: &axum::http::Method, path: &str) -
         || path.starts_with("/tutorials/")
         || exact(&["/health", "/whoami"])
         // The hosted composition's machine policy: Home-wide, readable by any
-        // member, settable only by the owner, who sees every project anyway.
+        // member, settable only by the organization owner. That administrative
+        // capability supplies no project data standing.
         || (get && path == "/machine/execution-policy")
         // Listings that filter to the caller's visible projects or to what
         // is addressed to the caller.
@@ -752,9 +753,9 @@ impl Workbench {
     /// actor is already an active member here; this narrows to the projects they may touch:
     ///
     /// - **No IdP** / **not provisioned** ⇒ `Ok` (solo / bootstrap, unchanged).
-    /// - **owner / admin** ⇒ `Ok` — the client org's own people see every project (role bypass).
-    /// - **any other member** ⇒ `Ok` only if explicitly **granted** `project_id`
-    ///   ([`Org::can_access_project`](org::Org::can_access_project)); else `403`, fail-closed
+    /// - **active member** ⇒ `Ok` only for an account-owned project or an
+    ///   explicit project grant; an organization role supplies no data standing
+    ///   (DR-0268, DR-0309). Otherwise `403`, fail-closed
     ///   (`INV-20`). A token that no longer authenticates is `401`.
     pub fn authorize_scope(
         &self,
@@ -773,8 +774,8 @@ impl Workbench {
     /// Folding the directory twice (membership, then scope) opened a TOCTOU window: a
     /// concurrent deprovision / grant-revoke between the two reads could admit on the first
     /// and mis-decide on the second. One fold closes it. Solo (no IdP) ⇒ the local authority;
-    /// bootstrap (not provisioned) ⇒ the best-effort actor; otherwise an active member, with
-    /// `owner`/`admin` seeing every project and any other member needing an explicit grant
+    /// bootstrap (not provisioned) ⇒ the best-effort actor; otherwise an active
+    /// member reaching only account-owned or explicitly granted projects
     /// (`INV-20`, fail-closed). `pub` so the extracted enterprise band's ENTSEC-1
     /// data-route middleware (`gaugedesk-ee`) admits through the same fold-once seam.
     pub fn admit_data_request(
@@ -923,14 +924,11 @@ impl Workbench {
             ));
         }
         if let Some(project) = project {
-            // On a desktop an account reaches a project it owns or was
-            // granted; an organization role does not reach every project.
-            let admitted = if self.desktop_account_mode() {
-                self.account_project_ids(authority.as_str(), &org)
-                    .contains(project)
-            } else {
-                org.can_access_project(authority.as_str(), project)
-            };
+            // Every composition uses the same project standing. Hosting and
+            // organization administration cannot widen it (DR-0268).
+            let admitted = self
+                .account_project_ids(authority.as_str(), &org)
+                .contains(project);
             if !admitted {
                 return Err((StatusCode::FORBIDDEN, "not in scope for this project"));
             }
@@ -1020,11 +1018,11 @@ impl Workbench {
             ))
     }
 
-    /// **ENTSEC-2** ([ADR 0065]): the set of projects a request's caller may **see** in the
+    /// **ENTSEC-2** ([DR 0065]): the set of projects a request's caller may **see** in the
     /// nav / list projections — the visibility complement to [`authorize_scope`](Self::authorize_scope).
-    /// Mirrors [`admit_data_request`](Self::admit_data_request)'s membership logic: solo (no IdP),
-    /// bootstrap (unprovisioned), and `owner`/`admin` are unrestricted ([`ProjectVisibility::All`]);
-    /// any other active member is restricted to their explicitly-granted projects. An
+    /// Mirrors [`admit_data_request`](Self::admit_data_request)'s membership
+    /// logic: legacy solo/bootstrap uses [`ProjectVisibility::All`]; every
+    /// authenticated account is restricted to its owned or granted projects. An
     /// unauthenticated / non-member caller in enterprise mode (which the ENTSEC-1 data-route gate
     /// would already have refused with `401`/`403`) resolves fail-closed to an empty set, so a
     /// projection can never leak project existence to someone the gate would reject.
@@ -1092,9 +1090,9 @@ impl Workbench {
                 if role == gaugedesk_core::abac::Role::owner()
                     || role == gaugedesk_core::abac::Role::admin() =>
             {
-                ProjectVisibility::All // the client org's own people see every project
+                ProjectVisibility::Account(self.account_project_ids(authority.as_str(), &org))
             }
-            Some(_) => ProjectVisibility::Only(org.granted_project_ids(authority.as_str())),
+            Some(_) => ProjectVisibility::Only(self.account_project_ids(authority.as_str(), &org)),
             None => ProjectVisibility::Only(BTreeSet::new()), // not a member: leak nothing
         }
     }
@@ -1175,8 +1173,9 @@ impl Workbench {
     /// chat's events, a project-less edit chat was open to every member, and
     /// `POST /chats` wrote into the Home's Personal project. This makes the
     /// unmapped case fail closed for exactly the principals scoping exists for.
-    /// Solo, bootstrap and owner/admin callers see every project, so it never
-    /// refuses them; `project` is the path's resolved project, if any.
+    /// Legacy solo/bootstrap and whole-account callers proceed to the ordinary
+    /// gates; account status does not widen their project visibility. `project`
+    /// is the path's resolved project, if any.
     pub fn scoped_member_route_refusal(
         &self,
         bearer: Option<&str>,

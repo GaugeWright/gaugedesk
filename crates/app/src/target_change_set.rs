@@ -58,6 +58,38 @@ pub(crate) struct TurnProcessDeclaration {
 }
 
 impl TurnProcessDeclaration {
+    pub(crate) fn canonical_tool_target(&self, path: &str) -> Option<String> {
+        // Do not turn traversal, absolute paths or an ambiguous presented name
+        // into qualifying evidence. The spelling is otherwise preserved.
+        let relative = |path: &str| {
+            !path.is_empty()
+                && !path.contains('\\')
+                && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+        };
+        if !relative(path) {
+            return None;
+        }
+        let mut candidates = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.writable)
+            .filter_map(|binding| {
+                if !relative(&binding.root) {
+                    return None;
+                }
+                let suffix = path
+                    .strip_prefix(&format!("{}/", binding.root))
+                    .or_else(|| {
+                        (!binding.name.is_empty())
+                            .then(|| path.strip_prefix(&format!("{}/", binding.name)))
+                            .flatten()
+                    })?;
+                Some(format!("{}/{suffix}", binding.root))
+            });
+        let candidate = candidates.next()?;
+        candidates.next().is_none().then_some(candidate)
+    }
+
     pub(crate) fn bind_governance(&mut self, epoch: u64, envelope: &str) {
         self.governance_epoch = epoch;
         self.governance_envelope_digest = digest(envelope.as_bytes());

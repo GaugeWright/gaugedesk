@@ -760,8 +760,9 @@ pub async fn enterprise_auth(
     {
         let mut guard = wb.lock_unpoisoned();
         // ENTSEC-1 + ENTSEC-2 + SECAUD-7: one fold-once admission — authenticate the bearer,
-        // confirm active membership, and (if the path is project-scoped) enforce the grant
-        // (owner/admin bypass), all against a single consistent directory read. Returns the
+        // confirm active membership, and (if the path is project-scoped) require account
+        // ownership or an explicit grant. Organization roles do not widen project standing.
+        // The directory is folded once. Returns the
         // resolved actor so the audit record below reuses it (no re-authenticate). Folding the
         // org twice opened a TOCTOU window between membership and scope (CC6.1).
         let project = guard.scope_project_of_path(&path);

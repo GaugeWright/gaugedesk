@@ -25,9 +25,18 @@ fn append(wb: &SharedWorkbench, kind: &str, record: &impl serde::Serialize) {
         .unwrap();
 }
 
-/// The claim writes its account as the computer's one active owner, which is
-/// what the legacy rule reads.
+/// Retain the explicit claim as well as its directory membership. The role
+/// alone is not project ownership evidence (DR-0309).
 fn claim(wb: &SharedWorkbench, account: &str) {
+    append(
+        wb,
+        crate::home_owner::CLAIM_KIND,
+        &crate::home_owner::HomeOwnerClaim {
+            account: Some(account.into()),
+            session: Some("original-claim-session".into()),
+            claimed_at_ms: 1,
+        },
+    );
     append(
         wb,
         "membership",
@@ -43,6 +52,68 @@ fn claim(wb: &SharedWorkbench, account: &str) {
             team: None,
         },
     );
+}
+
+#[test]
+fn a_sole_directory_owner_does_not_own_unclaimed_legacy_projects() {
+    let (_root, wb) = open();
+    project(&wb, "legacy", serde_json::json!({}));
+    let local = wb.lock_unpoisoned().authority().as_str().to_owned();
+    append(
+        &wb,
+        "membership",
+        &MembershipRecord {
+            id: OTHER.into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: OTHER.into(),
+            email: String::new(),
+            role: "owner".into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        },
+    );
+    assert_eq!(owner(&wb, "legacy"), ProjectOwner::Account(local));
+    let guard = wb.lock_unpoisoned();
+    assert!(guard
+        .account_project_ids(OTHER, &Org::rebuild(guard.store_ref()).unwrap())
+        .is_empty());
+}
+
+#[test]
+fn ambiguous_or_malformed_legacy_claims_supply_no_inferred_owner() {
+    for evidence in [
+        vec!["not a claim".to_owned()],
+        vec![
+            serde_json::to_string(&crate::home_owner::HomeOwnerClaim {
+                account: Some(CLAIMANT.into()),
+                session: None,
+                claimed_at_ms: 1,
+            })
+            .unwrap();
+            2
+        ],
+    ] {
+        let (_root, wb) = open();
+        project(&wb, "legacy", serde_json::json!({}));
+        project(&wb, "explicit", serde_json::json!({ "owner": OTHER }));
+        for raw in evidence {
+            wb.lock_unpoisoned()
+                .store_mut()
+                .append_record(ORG_SCOPE, crate::home_owner::CLAIM_KIND, &raw)
+                .unwrap();
+        }
+        let guard = wb.lock_unpoisoned();
+        assert!(guard.legacy_project_owner().is_empty());
+        assert_eq!(
+            guard.project_owner_with(&guard.library.projects["explicit"], ""),
+            ProjectOwner::Account(OTHER.into())
+        );
+        assert!(!guard
+            .account_project_ids(CLAIMANT, &Org::rebuild(guard.store_ref()).unwrap())
+            .contains("legacy"));
+    }
 }
 
 fn grant(wb: &SharedWorkbench, account: &str, project: &str) {
@@ -89,6 +160,145 @@ fn session(wb: &SharedWorkbench, account: &str) -> String {
 
 fn visibility(wb: &SharedWorkbench, bearer: Option<&str>) -> ProjectVisibility {
     wb.lock_unpoisoned().project_visibility(bearer)
+}
+
+#[test]
+fn project_admission_reads_durable_ownership_instead_of_the_cached_owner() {
+    let (_root, wb) = open();
+    wb.lock_unpoisoned().enable_hosted_home_mode();
+    claim(&wb, CLAIMANT);
+    project(&wb, "changed", serde_json::json!({ "owner": CLAIMANT }));
+    let token = session(&wb, CLAIMANT);
+    let mut guard = wb.lock_unpoisoned();
+    assert!(guard
+        .admit_data_request(Some(&token), Some("changed"))
+        .is_ok());
+    let mut record = guard.library.projects["changed"].clone();
+    record_owner(&mut record.extra, OTHER);
+    guard
+        .store_mut()
+        .append_record(
+            crate::library::LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        recorded_owner(&guard.library.projects["changed"]),
+        Some(CLAIMANT)
+    );
+    assert_eq!(
+        guard.admit_data_request(Some(&token), Some("changed")),
+        Err((StatusCode::FORBIDDEN, "not in scope for this project"))
+    );
+    assert!(!guard.project_visibility(Some(&token)).allows("changed"));
+    assert!(guard
+        .account_project_ids(OTHER, &Org::rebuild(guard.store_ref()).unwrap())
+        .contains("changed"));
+
+    // Even an explicit grant cannot rescue unreadable ownership evidence.
+    guard
+        .store_mut()
+        .append_record(crate::library::LIBRARY_SCOPE, "project", "not a project")
+        .unwrap();
+    drop(guard);
+    grant(&wb, CLAIMANT, "changed");
+    let guard = wb.lock_unpoisoned();
+    assert!(guard
+        .admit_data_request(Some(&token), Some("changed"))
+        .is_err());
+    assert!(!guard.project_visibility(Some(&token)).allows("changed"));
+}
+
+#[test]
+fn hosted_organization_owner_and_admin_reach_only_owned_or_granted_projects() {
+    for role in ["owner", "admin"] {
+        let (_root, wb) = open();
+        wb.lock_unpoisoned().enable_hosted_home_mode();
+        append(
+            &wb,
+            "membership",
+            &MembershipRecord {
+                id: CLAIMANT.into(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.into(),
+                authority: CLAIMANT.into(),
+                email: String::new(),
+                role: role.into(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            },
+        );
+        project(&wb, "owned", serde_json::json!({ "owner": CLAIMANT }));
+        project(&wb, "other", serde_json::json!({ "owner": OTHER }));
+        project(&wb, "legacy", serde_json::json!({}));
+        project(
+            &wb,
+            "organization-project",
+            serde_json::json!({ "organization": "organization:abc" }),
+        );
+        let token = session(&wb, CLAIMANT);
+        {
+            let guard = wb.lock_unpoisoned();
+            assert!(guard
+                .admit_data_request(Some(&token), Some("owned"))
+                .is_ok());
+            for id in ["other", "legacy", "organization-project", DEFAULT_PROJECT] {
+                assert_eq!(
+                    guard.admit_data_request(Some(&token), Some(id)),
+                    Err((StatusCode::FORBIDDEN, "not in scope for this project")),
+                    "{role} is not project standing for {id}"
+                );
+            }
+            assert_eq!(
+                guard.project_visibility(Some(&token)),
+                ProjectVisibility::Account(["owned".to_owned()].into())
+            );
+            // Administrative admission survives without project payload access.
+            assert!(guard.admit_data_request(Some(&token), None).is_ok());
+            assert!(guard
+                .scoped_member_route_refusal(
+                    Some(&token),
+                    ORG_SCOPE,
+                    &axum::http::Method::GET,
+                    "/admin/members",
+                    None,
+                )
+                .is_none());
+        }
+        grant(&wb, CLAIMANT, "organization-project");
+        {
+            let guard = wb.lock_unpoisoned();
+            assert!(guard
+                .admit_data_request(Some(&token), Some("organization-project"))
+                .is_ok());
+            assert_eq!(
+                guard.project_visibility(Some(&token)),
+                ProjectVisibility::Account(
+                    ["owned".to_owned(), "organization-project".to_owned()].into()
+                )
+            );
+        }
+        append(
+            &wb,
+            "member_grant",
+            &MemberGrantRecord {
+                id: MemberGrantRecord::make_id(CLAIMANT, "organization-project"),
+                op: RecordOp::Tombstone,
+                authority: CLAIMANT.into(),
+                project_id: "organization-project".into(),
+            },
+        );
+        let guard = wb.lock_unpoisoned();
+        assert!(guard
+            .admit_data_request(Some(&token), Some("organization-project"))
+            .is_err());
+        assert_eq!(
+            guard.project_visibility(Some(&token)),
+            ProjectVisibility::Account(["owned".to_owned()].into())
+        );
+    }
 }
 
 #[test]
@@ -191,12 +401,26 @@ async fn send(
     bearer: Option<&str>,
     body: Option<serde_json::Value>,
 ) -> (StatusCode, serde_json::Value) {
+    send_with_admission(app, method, uri, bearer, body, None).await
+}
+
+async fn send_with_admission(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    bearer: Option<&str>,
+    body: Option<serde_json::Value>,
+    admission: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
     let mut request = Request::builder().method(method).uri(uri).header(
         "idempotency-key",
         format!("probe-{method}-{uri}-{bearer:?}"),
     );
     if let Some(bearer) = bearer {
         request = request.header("authorization", format!("Bearer {bearer}"));
+    }
+    if let Some(admission) = admission {
+        request = request.header(crate::home_admission::HOME_ADMISSION_HEADER, admission);
     }
     let request = match body {
         Some(body) => request
@@ -219,6 +443,67 @@ fn gated(wb: &SharedWorkbench) -> axum::Router {
         wb.clone(),
         account_project_gate,
     ))
+}
+
+#[tokio::test]
+async fn hosted_home_routes_and_listings_recheck_current_project_standing() {
+    let (_root, wb) = open();
+    wb.lock_unpoisoned().enable_hosted_home_mode();
+    claim(&wb, CLAIMANT);
+    project(&wb, "own-project", serde_json::json!({ "owner": CLAIMANT }));
+    project(&wb, "other-project", serde_json::json!({ "owner": OTHER }));
+    let token = session(&wb, CLAIMANT);
+    let app = crate::open_control_plane(wb.clone()).layer(axum::middleware::from_fn_with_state(
+        wb.clone(),
+        crate::home_routes::require_home_admission,
+    ));
+    let (status, admitted) = send(&app, "POST", "/home/admissions", Some(&token), None).await;
+    assert_eq!(status, StatusCode::CREATED, "{admitted}");
+    let admission = admitted["admission"].as_str().unwrap();
+    let read = |path: &str| {
+        let path = path.to_owned();
+        let app = app.clone();
+        let token = token.clone();
+        let admission = admission.to_owned();
+        async move {
+            send_with_admission(&app, "GET", &path, Some(&token), None, Some(&admission)).await
+        }
+    };
+    assert_eq!(read("/projects/own-project/home").await.0, StatusCode::OK);
+    assert_eq!(
+        read("/projects/other-project/home").await.0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, workspace) = read("/workspace").await;
+    assert_eq!(status, StatusCode::OK, "{workspace}");
+    let listed = |workspace: &serde_json::Value| {
+        workspace["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|project| project["id"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    assert!(!listed(&workspace).contains("other-project"));
+    grant(&wb, CLAIMANT, "other-project");
+    assert_eq!(read("/projects/other-project/home").await.0, StatusCode::OK);
+    assert!(listed(&read("/workspace").await.1).contains("other-project"));
+    append(
+        &wb,
+        "member_grant",
+        &MemberGrantRecord {
+            id: MemberGrantRecord::make_id(CLAIMANT, "other-project"),
+            op: RecordOp::Tombstone,
+            authority: CLAIMANT.into(),
+            project_id: "other-project".into(),
+        },
+    );
+    // The earlier Home admission token cannot preserve a revoked grant.
+    assert_eq!(
+        read("/projects/other-project/home").await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(!listed(&read("/workspace").await.1).contains("other-project"));
 }
 
 #[tokio::test]

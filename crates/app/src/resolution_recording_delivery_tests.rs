@@ -160,10 +160,12 @@ fn correction_delivery_refuses_changed_commands_revocation_and_stale_target_auth
     let token = wb.mint_account_session("alice", "passkey", 3600).unwrap();
     let context = wb.authenticate_action_context(&token).unwrap();
     membership(&mut wb, "alice", "consultant");
+    project_grant(&mut wb, "alice", crate::org::RecordOp::Tombstone);
     assert!(wb
         .deliver_editor_corrections(&context, &inputs, &command, &mut runtime)
         .is_err());
     membership(&mut wb, "alice", "owner");
+    project_grant(&mut wb, "alice", crate::org::RecordOp::Upsert);
     let (_, _, chat, _): (String, String, String, String) =
         serde_json::from_str(&command.scope).unwrap();
     let target_id = wb.library.current_target_set(&chat).unwrap().members[0]
