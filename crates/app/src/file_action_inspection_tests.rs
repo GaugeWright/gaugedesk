@@ -494,8 +494,10 @@ fn subsequent_save_preserves_the_retained_base_reader_floor() {
         }
         if let Ok(admitted) = admitted {
             let command = admitted.command;
-            let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
-            let root = GovernanceRootVerifier::new(wb.authority().clone(), key.public_key());
+            let root = project_signature::NativeHistoryRoots::open(&wb)
+                .unwrap()
+                .original_root(wb.store_ref(), &command)
+                .unwrap();
             let retained = load_action_policy(
                 wb.store_ref(),
                 &ActionPolicyIdentity {

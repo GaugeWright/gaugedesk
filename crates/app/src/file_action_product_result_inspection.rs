@@ -107,7 +107,7 @@ impl Workbench {
         let result_scope = format!("host-action-native-save-result:{scope}");
         let prepared =
             self.prepare_editor_file_save_inspection(context, command, &[&result_scope], None)?;
-        let history = dispatch_grant::NativeDispatchHistory::open(self, prepared.key.public_key())?;
+        let history = dispatch_grant::NativeDispatchHistory::open(self)?;
         self.store_mut()
             .with_dispatch_basis(&prepared.basis, || {
                 let snapshots = history

@@ -176,7 +176,7 @@ impl Workbench {
             .map_err(|error| format!("{error:?}"))?;
         let scope = request_scope(original, &command.request_id)?;
         let identity = ActionPolicyIdentity {
-            issuer: original.issuer.clone(),
+            issuer: command.policy.signer.clone(),
             scope: scope.clone(),
             request_id: command.request_id.clone(),
         };
@@ -194,7 +194,7 @@ impl Workbench {
                 != command
                     .fingerprint()
                     .map_err(|error| format!("{error:?}"))?
-            || command.issuer != original.issuer
+            || command.issuer != command.policy.signer
             || command.scope != original.scope
             || command.provenance != reconciliation_provenance(context, original, admission)?
             || command.evidence.frame.instance_id != admission.instance_ref
@@ -207,8 +207,12 @@ impl Workbench {
                 "correction reconciliation differs from its admitted current authority".into(),
             );
         }
-        let root =
-            GovernanceRootVerifier::new(self.authority().clone(), inspection.key.public_key());
+        let project = project_signature::command_project(original)?;
+        let root = project_signature::NativeHistoryRoots::open(self)?.policy_root(
+            self.store_ref(),
+            &project,
+            &identity.issuer,
+        )?;
         let policy = load_action_policy(self.store_ref(), &identity, &command.policy, &root)?;
         if canonicalize(policy.signed_envelope())?
             != canonicalize(&inspection.read_policy.to_json()?)?
@@ -235,7 +239,12 @@ impl Workbench {
         let prepared =
             self.prepare_correction_reconciliation_delivery(context, original, admission, command)?;
         let source = self.native_action_reconciliation_source()?;
-        let issuer = self.authority().clone();
+        let issuer = crate::project_authority::authority(&prepared.inspection.key.public_key());
+        let original_root = project_signature::NativeHistoryRoots::open(self)?.policy_root(
+            self.store_ref(),
+            &project_signature::command_project(original)?,
+            &command.policy.signer,
+        )?;
         self.store_mut()
             .with_dispatch_basis(&prepared.inspection.basis, || -> StoreResult<_> {
                 // Missing original history refuses before opening a metadata writer.
@@ -247,8 +256,7 @@ impl Workbench {
                     admission,
                     &prepared.inspection.key,
                 )?;
-                let root =
-                    GovernanceRootVerifier::new(issuer, prepared.inspection.key.public_key());
+                let root = original_root;
                 let (home_root, store) = source.open()?;
                 let mut runtime = gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
                     store,

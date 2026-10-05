@@ -34,6 +34,197 @@ fn target_databases(root: &std::path::Path, paths: &mut Vec<std::path::PathBuf>)
 }
 
 #[test]
+fn pending_handoff_allows_history_but_refuses_new_saved_source_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = saved(dir.path());
+    let mut wb = fixture.shared.lock_unpoisoned();
+    let (context, _) = reader(&mut wb);
+    let storage = storage(&wb);
+    let project =
+        crate::file_action_factory::project_signature::command_project(&fixture.command).unwrap();
+    wb.store_mut()
+        .append_record(
+            &crate::federation::handoff_scope(&project),
+            "event",
+            &serde_json::to_string(&gaugedesk_core::handoff::HandoffEvent::HandoffOffered).unwrap(),
+        )
+        .unwrap();
+    let observed = wb
+        .observe_editor_file_save(
+            &context,
+            &fixture.command,
+            &fixture.admission,
+            fixture.attempt(),
+        )
+        .unwrap();
+    assert!(wb
+        .retain_editor_file_save_source(
+            &context,
+            &storage,
+            "handoff-source",
+            &observed,
+            fixture.attempt()
+        )
+        .is_err());
+    let scope = source_scope(
+        wb.home_id().as_str(),
+        context.actor().as_str(),
+        "handoff-source",
+    )
+    .unwrap();
+    assert!(wb.store_ref().records(&scope, KIND).unwrap().is_empty());
+    assert!(wb
+        .store_ref()
+        .committed_record_snapshot(&scope, KEY)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn legacy_saved_source_replays_its_original_signature_and_cause_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = NativeActionStorageConfig {
+        input_byte_limit: 4096,
+        file_lease: FileLeasePolicy::new(17).unwrap(),
+    };
+    let (shared, command, storage, token) =
+        crate::file_action_factory::tests::legacy_home_storage_fixture(dir.path(), config);
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let grant = wb
+        .authorize_editor_file_save_dispatch(&context, storage.inputs(), &command, "legacy-save")
+        .unwrap();
+    let mut driver = wb
+        .start_editor_file_save_driver(&storage, &command, &grant.grant_ref)
+        .unwrap();
+    let mut completed = false;
+    for _ in 0..4 {
+        match wb
+            .step_editor_file_save_driver(&storage, &mut driver)
+            .unwrap()
+        {
+            NativeEditorSaveProgress::Advanced => {}
+            NativeEditorSaveProgress::Saved(_) => {
+                completed = true;
+                break;
+            }
+            NativeEditorSaveProgress::Unresolved(evidence) => {
+                panic!("unexpected unresolved save: {evidence:?}")
+            }
+        }
+    }
+    assert!(completed);
+    let execution = wb
+        .observe_editor_file_save_execution(&context, &command)
+        .unwrap();
+    let evidence = execution.runtime().unwrap();
+    let effect = evidence
+        .effects
+        .iter()
+        .find(|effect| {
+            effect.attempts.iter().any(|attempt| {
+                attempt
+                    .dispatch
+                    .as_ref()
+                    .is_some_and(|marker| marker.frame.kind == "file.write")
+            })
+        })
+        .unwrap();
+    let effect_id = effect.effect_id.clone();
+    let run_id = effect.attempts[0].run_id.clone();
+    let admission = evidence.admission.clone();
+    let attempt = EditorFileSaveAttempt {
+        effect_id: &effect_id,
+        run_id: &run_id,
+    };
+    let observed = wb
+        .observe_editor_file_save(&context, &command, &admission, attempt)
+        .unwrap();
+    let input = storage
+        .inputs()
+        .prepare_unerased(
+            "saved_source",
+            &label(observed.restrictions()).unwrap(),
+            &observed.saved().unwrap().accepted_content,
+        )
+        .unwrap();
+    let expected = statement(
+        wb.home_id().as_str(),
+        "legacy-source",
+        input.clone(),
+        &observed,
+        attempt,
+    )
+    .unwrap();
+    let host = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+    let original = SignedSource {
+        signature: host
+            .sign(&expected.signing_bytes().unwrap())
+            .as_bytes()
+            .to_vec(),
+        statement: expected.clone(),
+        project_signature: None,
+    };
+    let payload = serde_json::to_string(&original).unwrap();
+    let snapshot = expected.snapshot().unwrap();
+    let scope = source_scope(
+        wb.home_id().as_str(),
+        context.actor().as_str(),
+        "legacy-source",
+    )
+    .unwrap();
+    storage
+        .inputs()
+        .publish(std::slice::from_ref(&input), || {
+            wb.store_mut()
+                .with_record_admission(|writer| {
+                    writer.commit(
+                        &scope,
+                        KEY,
+                        &snapshot,
+                        &[CommandRecordFact {
+                            scope_id: scope.clone(),
+                            kind: KIND.into(),
+                            payload: payload.clone(),
+                        }],
+                    )
+                })
+                .unwrap()
+                .map(|_| ())
+                .map_err(|error| StoreError::Conflict(format!("{error:?}")))
+        })
+        .unwrap();
+    drop(driver);
+    drop(wb);
+    drop(shared);
+    let restarted = crate::open_workbench(dir.path()).unwrap();
+    let mut wb = restarted.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let retry = wb
+        .retain_editor_file_save_source(&context, &storage, "legacy-source", &observed, attempt)
+        .unwrap();
+    assert!(retry.replayed());
+    assert_eq!(retry.cause().authority, command.issuer);
+    assert_eq!(retry.cause().digest, digest(snapshot.as_bytes()));
+    assert_eq!(wb.store_ref().records(&scope, KIND).unwrap(), [payload]);
+    let roots = NativeHistoryRoots::open(&wb).unwrap();
+    let retained = load_source(wb.store_ref(), &scope, &roots)
+        .unwrap()
+        .unwrap();
+    assert!(retained.project_signature.is_none());
+    assert_eq!(retained.signature, original.signature);
+    let current = wb
+        .retain_editor_file_save_source(&context, &storage, "current-source", &observed, attempt)
+        .unwrap();
+    let project = crate::file_action_factory::project_signature::command_project(&command).unwrap();
+    assert_eq!(
+        current.cause().authority,
+        wb.project_authority_identity(&project).unwrap().0.as_str()
+    );
+    assert_ne!(current.cause().authority, retry.cause().authority);
+}
+
+#[test]
 fn saved_source_retains_exact_bytes_labels_original_author_and_idempotent_cause() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = saved(dir.path());
@@ -78,12 +269,14 @@ fn saved_source_retains_exact_bytes_labels_original_author_and_idempotent_cause(
         source.statement.receipt_digest,
         digest(observation.saved().unwrap().receipt_json.as_bytes())
     );
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
-    assert!(
-        original_source(wb.store_ref(), &scope, &source.statement, &key.public_key())
-            .unwrap()
-            .is_some()
-    );
+    assert!(original_source(
+        wb.store_ref(),
+        &scope,
+        &source.statement,
+        &NativeHistoryRoots::open(&wb).unwrap()
+    )
+    .unwrap()
+    .is_some());
     assert_eq!(std::fs::read(&runtime_path).unwrap(), before);
     drop(wb);
     let reopened = crate::open_workbench(dir.path()).unwrap();
@@ -267,7 +460,6 @@ fn saved_source_retains_unknown_disposition_and_rejects_changed_preparation_mean
         source.statement.attempt.disposition,
         whipplescript_store::effect_recovery::ExternalDisposition::Unknown
     );
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
     for field in ["input", "label", "author", "pin"] {
         let mut changed = source.statement.clone();
         match field {
@@ -277,7 +469,13 @@ fn saved_source_retains_unknown_disposition_and_rejects_changed_preparation_mean
             "pin" => changed.observed_at.head_digest = "other".into(),
             _ => unreachable!(),
         }
-        assert!(original_source(wb.store_ref(), &scope, &changed, &key.public_key()).is_err());
+        assert!(original_source(
+            wb.store_ref(),
+            &scope,
+            &changed,
+            &NativeHistoryRoots::open(&wb).unwrap()
+        )
+        .is_err());
     }
     assert_eq!(
         retained.cause().digest,
@@ -554,10 +752,13 @@ fn saved_source_history_reopens_without_its_erased_body_or_checkout() {
     assert!(!checkout.exists());
     assert_eq!(branch_rows(), branches_before);
     let (scope, _): (String, String) = serde_json::from_str(&source.cause().record_ref).unwrap();
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
-    let retained = load_source(wb.store_ref(), &scope, &key.public_key())
-        .unwrap()
-        .unwrap();
+    let retained = load_source(
+        wb.store_ref(),
+        &scope,
+        &NativeHistoryRoots::open(&wb).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(retained.statement.input, *source.input());
     assert_eq!(
         retained.statement.attempt.disposition,

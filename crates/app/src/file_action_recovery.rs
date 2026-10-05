@@ -15,6 +15,7 @@ use gaugedesk_whip_runtime::host_actions::{
 use gaugedesk_whip_runtime::{
     host_actions::recovery::{
         ReconcileEffectCommand, ReconciliationReceipt, EFFECT_RECONCILIATION_PROTOCOL,
+        EFFECT_RECONCILIATION_PROTOCOL_V2,
     },
     ProtocolError,
 };
@@ -241,7 +242,7 @@ impl Workbench {
         if target.branch() != branch || target.path() != path || target.base() != base {
             return Err("editor target differs from its actual native binding".into());
         }
-        let history = dispatch_grant::NativeDispatchHistory::open(self, prepared.key.public_key())?;
+        let history = dispatch_grant::NativeDispatchHistory::open(self)?;
         self.store_mut()
             .with_dispatch_basis(&prepared.basis, || {
                 let snapshot =
@@ -291,6 +292,85 @@ fn reconciliation_provenance(
     })
 }
 
+fn reconciliation_policy_scope(
+    original: &HostActionCommand,
+    request_id: &str,
+) -> Result<String, String> {
+    serde_json::to_string(&(
+        "gaugedesk.editor-save.reconcile.v1",
+        original
+            .instance_ref()
+            .map_err(|error| format!("{error:?}"))?,
+        &original.issuer,
+        &original.scope,
+        request_id,
+    ))
+    .map_err(|error| error.to_string())
+}
+
+/// Verify historical metadata policy with retained public roots. This runs
+/// through the product sibling while its current authority writer is fenced;
+/// a valid signature is neither current standing nor permission to execute.
+fn verify_reconciliation_policy(
+    original: &HostActionCommand,
+    command: &ReconcileEffectCommand,
+    history: &dispatch_grant::NativeDispatchHistory,
+) -> StoreResult<()> {
+    command.validate().map_err(|_| refused())?;
+    if command.protocol == EFFECT_RECONCILIATION_PROTOCOL {
+        if command.issuer != original.issuer || command.policy != original.policy {
+            return Err(refused());
+        }
+        return Ok(());
+    }
+    let project = project_signature::command_project(original).map_err(|_| refused())?;
+    let registration = history
+        .store
+        .project_authority_key(&project)
+        .map_err(|_| refused())?
+        .ok_or_else(refused)?;
+    if command.original_issuer.as_deref() != Some(original.issuer.as_str())
+        || command.issuer != registration.authority_id
+        || command.policy.signer != command.issuer
+    {
+        return Err(refused());
+    }
+    let root = history
+        .roots
+        .policy_root(&history.store, &project, &command.issuer)
+        .map_err(|_| refused())?;
+    let identity = ActionPolicyIdentity {
+        issuer: command.issuer.clone(),
+        scope: reconciliation_policy_scope(original, &command.request_id).map_err(|_| refused())?,
+        request_id: command.request_id.clone(),
+    };
+    let policy =
+        crate::action_policy::load_action_policy(&history.store, &identity, &command.policy, &root)
+            .map_err(|_| refused())?;
+    let original_root = history
+        .roots
+        .original_root(&history.store, original)
+        .map_err(|_| refused())?;
+    let original_policy = crate::action_policy::load_action_policy(
+        &history.store,
+        &ActionPolicyIdentity {
+            issuer: original.issuer.clone(),
+            scope: original.scope.clone(),
+            request_id: original.request_id.clone(),
+        },
+        &original.policy,
+        &original_root,
+    )
+    .map_err(|_| refused())?;
+    if whipplescript_kernel::gov::canonicalize(policy.signed_envelope()).map_err(|_| refused())?
+        != whipplescript_kernel::gov::canonicalize(original_policy.signed_envelope())
+            .map_err(|_| refused())?
+    {
+        return Err(refused());
+    }
+    Ok(())
+}
+
 /// Renewed current authority may redeliver the same admitted reconciliation,
 /// but cannot change its original grant or any evidence coordinate.
 fn retained_reconciliation(
@@ -318,6 +398,7 @@ fn retained_reconciliation(
         {
             continue;
         }
+        verify_reconciliation_policy(&snapshot.command, &command, history)?;
         history
             .verify(
                 &snapshot.command,
@@ -419,7 +500,7 @@ impl Workbench {
         if request.request_id.trim().is_empty() {
             return Err("native save reconciliation requires a stable request identity".into());
         }
-        let prepared = self.prepare_native_editor_action(
+        let mut prepared = self.prepare_native_editor_action(
             context,
             inputs,
             command,
@@ -449,7 +530,91 @@ impl Workbench {
         if target.branch() != branch || target.path() != path || target.base() != base {
             return Err("editor target differs from its actual native binding".into());
         }
-        let history = dispatch_grant::NativeDispatchHistory::open(self, prepared.key.public_key())?;
+        let history = dispatch_grant::NativeDispatchHistory::open(self)?;
+        // V1 save reconciliations predate separate metadata policies. Discover
+        // an exact old request under current standing before creating anything:
+        // a retry must reuse its original policy, issuer and signing bytes.
+        let legacy_retry = self
+            .store_mut()
+            .with_dispatch_basis(&prepared.basis, || -> StoreResult<_> {
+                use gaugedesk_whip_runtime::host_actions::recovery::RecordedReconciliation;
+                owner.require_current(admission)?;
+                super::execution::read_evidence(&owner.runtime, command, admission, &prepared.key)?;
+                let mut previous = None;
+                for event in owner
+                    .runtime
+                    .kernel()
+                    .store()
+                    .chain_prefix(&admission.instance_ref)?
+                {
+                    if event.source.as_deref() != Some("kernel")
+                        || event.event_type != "effect.disposition.reconciled"
+                    {
+                        continue;
+                    }
+                    let recorded: RecordedReconciliation =
+                        serde_json::from_str(&event.payload_json).map_err(|_| refused())?;
+                    let retained = recorded.command;
+                    if retained.scope != command.scope || retained.request_id != request.request_id
+                    {
+                        continue;
+                    }
+                    if previous.is_some() {
+                        return Err(refused());
+                    }
+                    previous = Some(retained);
+                }
+                match previous {
+                    Some(retained)
+                        if retained.protocol == EFFECT_RECONCILIATION_PROTOCOL
+                            && retained.original_issuer.is_none()
+                            && retained.issuer == command.issuer
+                            && retained.policy == command.policy =>
+                    {
+                        Ok(true)
+                    }
+                    Some(retained) if retained.protocol != EFFECT_RECONCILIATION_PROTOCOL_V2 => {
+                        Err(refused())
+                    }
+                    _ => Ok(false),
+                }
+            })
+            .map_err(|error| format!("{error:?}"))?
+            .map_err(|error| format!("{error:?}"))?;
+        let roots = project_signature::NativeHistoryRoots::open(self)?;
+        let (issuer, policy, root) = if legacy_retry {
+            let root = roots.original_root(self.store_ref(), command)?;
+            let identity = ActionPolicyIdentity {
+                issuer: command.issuer.clone(),
+                scope: command.scope.clone(),
+                request_id: command.request_id.clone(),
+            };
+            let policy = crate::action_policy::load_action_policy(
+                self.store_ref(),
+                &identity,
+                &command.policy,
+                &root,
+            )?;
+            (identity.issuer, policy, root)
+        } else {
+            let scope = reconciliation_policy_scope(command, request.request_id)?;
+            let (identity, policy, basis) = self.prepare_native_metadata_policy(
+                command,
+                &scope,
+                request.request_id,
+                &prepared.authority.policy,
+                &prepared.key,
+                prepared.basis,
+            )?;
+            prepared.basis = basis;
+            let root = roots.policy_root(
+                self.store_ref(),
+                &prepared.authority.project_id,
+                &identity.issuer,
+            )?;
+            (identity.issuer, policy, root)
+        };
+        let writer_source = self.native_action_reconciliation_source()?;
         self.store_mut()
             .with_dispatch_basis(&prepared.basis, || {
                 owner.require_current(admission)?;
@@ -479,12 +644,19 @@ impl Workbench {
                     &original.attempt,
                     |workspace, result| {
                         owner.require_current(admission)?;
+                        let separate_authority = issuer != command.issuer;
                         let reconciliation = ReconcileEffectCommand {
-                            protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
-                            issuer: command.issuer.clone(),
+                            protocol: if separate_authority {
+                                EFFECT_RECONCILIATION_PROTOCOL_V2
+                            } else {
+                                EFFECT_RECONCILIATION_PROTOCOL
+                            }
+                            .into(),
+                            issuer: issuer.clone(),
+                            original_issuer: separate_authority.then(|| command.issuer.clone()),
                             scope: command.scope.clone(),
                             request_id: request.request_id.into(),
-                            policy: command.policy.clone(),
+                            policy: policy.policy_ref().clone(),
                             provenance: dispatch_grant::with_grant_cause(
                                 reconciliation_provenance(command, admission)?,
                                 prepared.grant_cause.as_ref(),
@@ -522,8 +694,21 @@ impl Workbench {
                             key: prepared.key.public_key(),
                         };
                         let bytes = reconciliation.signing_bytes().map_err(|_| refused())?;
-                        owner
-                            .runtime
+                        let (_, store) = writer_source.open()?;
+                        if store.chain_prefix(&admission.instance_ref)? != prefix
+                            || store.instance_owner_epoch(&admission.instance_ref)? != owner.epoch
+                        {
+                            return Err(refused());
+                        }
+                        let mut runtime =
+                            gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
+                                store,
+                                reconciliation.policy.epoch,
+                                policy.signed_envelope(),
+                                &root,
+                            )
+                            .map_err(|_| refused())?;
+                        runtime
                             .reconcile_scoped_versioned_save(
                                 reconciliation.clone(),
                                 owner.epoch,
@@ -603,7 +788,8 @@ pub(super) mod tests {
         let writes = wb
             .advance_editor_file_save(&context, &inputs, &command, &admission, &mut runtime)
             .unwrap();
-        let fault = rusqlite::Connection::open(dir.path().join("runtime.sqlite")).unwrap();
+        let fault =
+            rusqlite::Connection::open(dir.path().join("actions/native/runtime.sqlite")).unwrap();
         if lose_settlement {
             fault.execute_batch("CREATE TRIGGER lose_inspection_terminal BEFORE INSERT ON events WHEN NEW.event_type = 'effect.terminal' BEGIN SELECT RAISE(ABORT, 'lost settlement'); END;").unwrap();
         }
@@ -895,7 +1081,7 @@ pub(super) mod tests {
             store.chain_prefix(&owner.admission.instance_ref).unwrap(),
             effect,
             &request.evidence.frame.run_id,
-            &dispatch_grant::NativeDispatchHistory::open(wb, key.public_key()).unwrap(),
+            &dispatch_grant::NativeDispatchHistory::open(wb).unwrap(),
         )
         .unwrap();
         let verifier = NativeSaveReconciliationAuthority {
@@ -963,6 +1149,274 @@ pub(super) mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_v1_save_reconciliation_replays_unchanged_with_current_project_custody() {
+        use super::super::tests::legacy_home_storage_fixture;
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, command, storage, token) = legacy_home_storage_fixture(
+            dir.path(),
+            NativeActionStorageConfig {
+                input_byte_limit: 4096,
+                file_lease: whipplescript_kernel::file_lease::FileLeasePolicy::new(17).unwrap(),
+            },
+        );
+        let mut wb = shared.lock_unpoisoned();
+        let context = wb.authenticate_action_context(&token).unwrap();
+        let grant = wb
+            .authorize_editor_file_save_dispatch(
+                &context,
+                storage.inputs(),
+                &command,
+                "legacy-reconciliation-driver",
+            )
+            .unwrap();
+        let mut driver = wb
+            .start_editor_file_save_driver(&storage, &command, &grant.grant_ref)
+            .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                wb.step_editor_file_save_driver(&storage, &mut driver)
+                    .unwrap(),
+                NativeEditorSaveProgress::Advanced
+            ));
+        }
+        let NativeEditorSaveProgress::Saved(saved) = wb
+            .step_editor_file_save_driver(&storage, &mut driver)
+            .unwrap()
+        else {
+            panic!("saved");
+        };
+        let admission = saved.result.admission.clone();
+        drop(driver);
+        let runtime = wb
+            .open_editor_file_save_runtime(&context, &storage, &command)
+            .unwrap();
+        let mut owner = wb
+            .claim_editor_file_save_runtime(
+                &context,
+                storage.inputs(),
+                &command,
+                &admission,
+                runtime,
+            )
+            .unwrap();
+        let prepared = wb
+            .prepare_native_editor_action(
+                &context,
+                storage.inputs(),
+                &command,
+                owner.runtime.policy_ref(),
+            )
+            .unwrap();
+        let snapshot = super::super::execution::read_evidence(
+            &owner.runtime,
+            &command,
+            &admission,
+            &prepared.key,
+        )
+        .unwrap();
+        let prefix = owner
+            .runtime
+            .kernel()
+            .store()
+            .chain_prefix(&admission.instance_ref)
+            .unwrap();
+        let recorded: gaugedesk_whip_runtime::host_actions::recovery::RecordedReconciliation =
+            serde_json::from_str(
+                &prefix
+                    .iter()
+                    .find(|event| event.event_type == "effect.disposition.reconciled")
+                    .unwrap()
+                    .payload_json,
+            )
+            .unwrap();
+        let history = dispatch_grant::NativeDispatchHistory::open(&wb).unwrap();
+        verify_reconciliation_policy(&command, &recorded.command, &history).unwrap();
+        for field in ["original", "current", "policy"] {
+            let mut substituted = recorded.command.clone();
+            match field {
+                "original" => substituted.original_issuer = Some("foreign-original".into()),
+                "current" => substituted.issuer = command.issuer.clone(),
+                _ => substituted.policy.envelope_hash = "1".repeat(64),
+            }
+            assert!(
+                verify_reconciliation_policy(&command, &substituted, &history).is_err(),
+                "{field}"
+            );
+        }
+        let observed = snapshot
+            .effects
+            .iter()
+            .find(|effect| {
+                effect.attempts.iter().any(|attempt| {
+                    attempt
+                        .dispatch
+                        .as_ref()
+                        .is_some_and(|marker| marker.frame.kind == "file.write")
+                })
+            })
+            .unwrap();
+        let effect_id = observed.effect_id.clone();
+        let run_id = observed.attempts[0].run_id.clone();
+        let effect = owner
+            .runtime
+            .kernel()
+            .store()
+            .list_effects(&admission.instance_ref)
+            .unwrap()
+            .into_iter()
+            .find(|effect| effect.effect_id == effect_id)
+            .unwrap();
+        let original = original_save(
+            &snapshot,
+            owner
+                .runtime
+                .kernel()
+                .store()
+                .chain_prefix(&admission.instance_ref)
+                .unwrap(),
+            effect,
+            &run_id,
+            &dispatch_grant::NativeDispatchHistory::open(&wb).unwrap(),
+        )
+        .unwrap();
+        let resource = &command.resources["target"];
+        let (_, _, path): (String, String, String) =
+            serde_json::from_str(resource.resource.selector.as_deref().unwrap()).unwrap();
+        let ActionBasis::Version { version_ref: base } = &resource.basis else {
+            panic!("base");
+        };
+        let target = wb.engagements[&prepared.chat_id]
+            .native_file_action_evidence_target(&path, base)
+            .unwrap();
+        // Exercise the actual old protocol producer and target proof. This
+        // fixture alone holds legacy signing custody; product retry uses the
+        // current project key and must preserve this original command.
+        let legacy_key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+        assert_ne!(legacy_key.public_key(), prepared.key.public_key());
+        let receipt = target
+            .publish_committed_scoped_result(
+                &original.binding,
+                &original.resolution_scope,
+                &original.attempt,
+                |workspace, result| {
+                    let request = ReconcileEffectCommand {
+                        protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
+                        issuer: command.issuer.clone(),
+                        original_issuer: None,
+                        scope: command.scope.clone(),
+                        request_id: "legacy-v1-reconciliation".into(),
+                        policy: command.policy.clone(),
+                        provenance: reconciliation_provenance(&command, &admission)?,
+                        evidence: DispositionEvidence {
+                            frame: original.dispatch.frame.clone(),
+                            disposition: EvidenceDisposition::Applied,
+                            evidence_ref: resource.resource.handle.clone(),
+                            evidence_digest: hex::encode(Sha256::digest(
+                                result.receipt_json.as_bytes(),
+                            )),
+                            authority_ref: command.issuer.clone(),
+                        },
+                        evidence_label_ref: original.binding.evidence_label.clone(),
+                    };
+                    let source = ScopedVersionedSaveEvidenceSource {
+                        save: VersionedSaveEvidenceSource {
+                            admission: &admission,
+                            workspace,
+                            binding: &original.binding,
+                            input_name: "content",
+                            resource_name: "target",
+                            authority_ref: &command.issuer,
+                        },
+                        resolution_scope: &original.resolution_scope,
+                    };
+                    let verifier = NativeSaveReconciliationAuthority {
+                        request: &request,
+                        original: &command,
+                        save: &original,
+                        key: legacy_key.public_key(),
+                    };
+                    let bytes = request.signing_bytes().map_err(|_| refused())?;
+                    owner
+                        .runtime
+                        .reconcile_scoped_versioned_save(
+                            request.clone(),
+                            owner.epoch,
+                            &source,
+                            &verifier,
+                            legacy_key.sign(&bytes).as_bytes(),
+                        )
+                        .map_err(|error| StoreError::Conflict(format!("{error:?}")))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let before = owner
+            .runtime
+            .kernel()
+            .store()
+            .list_events(&admission.instance_ref)
+            .unwrap();
+        drop(legacy_key);
+        let policies = wb
+            .store_ref()
+            .records_across_scopes("host_action_policy_v1")
+            .unwrap();
+        drop(owner);
+        drop(wb);
+        drop(shared);
+        let shared = crate::open_workbench(dir.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        let token = wb.mint_account_session("alice", "passkey", 3600).unwrap();
+        let context = wb.authenticate_action_context(&token).unwrap();
+        let runtime = wb
+            .open_editor_file_save_runtime(&context, &storage, &command)
+            .unwrap();
+        let mut owner = wb
+            .claim_editor_file_save_runtime(
+                &context,
+                storage.inputs(),
+                &command,
+                &admission,
+                runtime,
+            )
+            .unwrap();
+        assert_eq!(
+            wb.reconcile_editor_file_save_attempt(
+                &context,
+                storage.inputs(),
+                &command,
+                &admission,
+                EditorFileSaveReconciliation {
+                    request_id: "legacy-v1-reconciliation",
+                    attempt: EditorFileSaveAttempt {
+                        effect_id: &effect_id,
+                        run_id: &run_id
+                    },
+                },
+                &mut owner,
+            )
+            .unwrap(),
+            Some(receipt)
+        );
+        assert_eq!(
+            owner
+                .runtime
+                .kernel()
+                .store()
+                .list_events(&admission.instance_ref)
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            wb.store_ref()
+                .records_across_scopes("host_action_policy_v1")
+                .unwrap(),
+            policies,
+            "V1 retry must not create a new metadata policy"
+        );
     }
 
     #[test]
@@ -1202,8 +1656,7 @@ pub(super) mod tests {
             .into_iter()
             .find(|effect| effect.effect_id == fixture.effect_id)
             .unwrap();
-        let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
-        let history = dispatch_grant::NativeDispatchHistory::open(&wb, key.public_key()).unwrap();
+        let history = dispatch_grant::NativeDispatchHistory::open(&wb).unwrap();
         assert!(original_save(
             &snapshot,
             prefix.clone(),

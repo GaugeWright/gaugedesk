@@ -443,7 +443,7 @@ impl Workbench {
             .command;
         let action = control_action(&request.queue, &request.control)?;
         let current_policy = control_policy(&tracker, context.actor().as_str(), &request.control)?;
-        self.initialize_project_authority(&request.project)
+        self.initialize_project_authority_against(&request.project, &basis)
             .map_err(debug_error)?;
         let signing_key = self
             .project_signing_key(&request.project)

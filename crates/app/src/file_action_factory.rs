@@ -2,9 +2,12 @@
 //! This factory admits work; runtime delivery, execution and result retrieval
 //! remain separate. No production route is switched by this module.
 
+#[cfg(test)]
+use crate::action_policy::prepare_action_policy;
+
 use crate::{
     action_inputs::NativeActionInputCustody,
-    action_policy::{prepare_action_policy, ActionPolicyIdentity},
+    action_policy::ActionPolicyIdentity,
     file_action_policy::{compile_file_save_policy, FileSavePolicyInput},
     identity::{ActorAuthentication, AuthenticatedActionContext},
     library::{
@@ -432,7 +435,7 @@ impl Workbench {
             .map_err(|error| format!("file action authorization refused: {error:?}"))?;
         let expected = request_preparation::identity(
             home.as_str(),
-            self.authority().as_str(),
+            &original.issuer,
             &authority.project_id,
             request.chat_id,
             request.request_id,
@@ -452,20 +455,23 @@ impl Workbench {
             scope: original.scope.clone(),
             request_id: original.request_id.clone(),
         };
-        let signing_key =
-            SigningKey::from_seed(&self.governance_seed()).map_err(|error| error.reason)?;
-        let root = GovernanceRootVerifier::new(self.authority().clone(), signing_key.public_key());
-        // Refuse an incompatible original source before retaining the draft
-        // under this policy. The final publication fence repeats authorization;
-        // this check cannot become a grant that survives preparation.
         let preparation_basis = authority
             .bind_deadline(preparation_basis)
             .map_err(|error| format!("file preparation deadline refused: {error:?}"))?;
+        let (signing_key, preparation_basis) =
+            self.native_project_signer(&authority.project_id, preparation_basis)?;
+        let signer = crate::project_authority::authority(&signing_key.public_key());
+        let root = project_signature::NativeHistoryRoots::open(self)?
+            .policy_root(self.store_ref(), &authority.project_id, &identity.issuer)
+            .map_err(|e| format!("original file request authority refused: {e}"))?;
+        // Refuse an incompatible original source before retaining the draft
+        // under this policy. The final publication fence repeats authorization;
+        // this check cannot become a grant that survives preparation.
         let observer = self
             .store_ref()
             .read_only_sibling()
             .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
-        let issuer = self.authority().clone();
+        let issuer = signer.clone();
         let roots = self.local_project_policy_roots(&authority.project_id)?;
         self.store_mut()
             .with_dispatch_basis(&preparation_basis, || {
@@ -481,8 +487,28 @@ impl Workbench {
             })
             .map_err(|error| format!("file preparation authority refused: {error:?}"))?
             .map_err(|error| format!("{error:?}"))?;
-        let policy =
-            prepare_action_policy(self.store_mut(), &identity, &authority.policy, &signing_key)?;
+        let policy = match crate::action_policy::prepared_action_policy(
+            self.store_ref(),
+            &identity,
+            &authority.policy,
+            &root,
+        )? {
+            Some(previous) => previous,
+            None if identity.issuer == signer.as_str() => {
+                crate::action_policy::prepare_action_policy_against(
+                    self.store_mut(),
+                    &identity,
+                    &authority.policy,
+                    &signing_key,
+                    &preparation_basis,
+                )?
+            }
+            None => {
+                return Err(
+                    "unsubmitted legacy file request needs a fresh project request identity".into(),
+                )
+            }
+        };
         let envelope =
             ifc::VerifiedEnvelope::verify_signed_text_with(policy.signed_envelope(), &root)?;
         let diagnostics = ifc::check_with_envelope(action.program(), &envelope);
@@ -580,7 +606,7 @@ impl Workbench {
             .store_ref()
             .read_only_sibling()
             .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
-        let issuer = self.authority().clone();
+        let issuer = signer.clone();
         let roots = self.local_project_policy_roots(&current.project_id)?;
         let admitted = self
             .store_mut()
@@ -627,6 +653,9 @@ mod tests;
 
 #[path = "file_action_delivery.rs"]
 mod delivery;
+
+#[path = "native_project_signature.rs"]
+mod project_signature;
 
 #[path = "file_action_request_preparation.rs"]
 mod request_preparation;

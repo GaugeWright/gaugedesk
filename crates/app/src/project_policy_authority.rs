@@ -42,9 +42,8 @@ impl Workbench {
         &self,
         project: &str,
     ) -> Result<LocalProjectPolicyRoots, String> {
-        if project.trim().is_empty() || !self.owns_project(project) {
-            return Err("local project policy authority is unavailable".into());
-        }
+        self.require_owned_project(project)
+            .map_err(|e| e.to_string())?;
         let legacy = SigningKey::from_seed(&self.governance_seed()).map_err(|e| e.reason)?;
         let mut roots = vec![GovernanceRootVerifier::new(
             self.authority().clone(),

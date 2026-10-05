@@ -39,9 +39,10 @@ pub(super) fn identity(
 }
 
 impl Workbench {
-    /// Read the original coordinates before submission. No intent, policy or
-    /// input is retained. A lost response here permits another read, but once
-    /// intent may have been submitted its retained identity must be investigated.
+    /// Prepare original coordinates before submission. This may initialize
+    /// project signing custody under current authority, but retains no intent,
+    /// policy or input. A lost response permits another preparation; once intent
+    /// may have been submitted its retained identity must be investigated.
     pub fn prepare_editor_file_save_request(
         &mut self,
         context: &AuthenticatedActionContext,
@@ -77,16 +78,23 @@ impl Workbench {
                 },
             )
             .map_err(|error| format!("file request authority refused: {error:?}"))?;
+        crate::federation::require_project_writes_available(
+            self.store_ref(),
+            &authority.project_id,
+        )
+        .map_err(|e| format!("file request preparation paused: {e:?}"))?;
+        let basis = authority
+            .bind_deadline(basis)
+            .map_err(|error| format!("file request deadline refused: {error:?}"))?;
+        let (key, basis) = self.native_project_signer(&authority.project_id, basis)?;
+        let issuer = crate::project_authority::authority(&key.public_key());
         let original = identity(
             home.as_str(),
-            self.authority().as_str(),
+            issuer.as_str(),
             &authority.project_id,
             chat_id,
             request_id,
         )?;
-        let basis = authority
-            .bind_deadline(basis)
-            .map_err(|error| format!("file request deadline refused: {error:?}"))?;
         self.store_mut()
             .with_dispatch_basis(&basis, || original)
             .map_err(|error| format!("file request authority changed: {error:?}"))

@@ -57,8 +57,8 @@ impl NativeActionObservationSource {
     }
 }
 
-/// Metadata-writing locator for an already admitted reconciliation. This is
-/// distinct from the read-only observation source and conveys no authorization.
+/// Metadata-writing locator for a separately authorized reconciliation. This
+/// conveys no authorization, original-history proof or runtime ownership.
 pub(in crate::file_action_factory) struct NativeActionReconciliationSource {
     home_root: PathBuf,
 }
@@ -70,7 +70,7 @@ impl NativeActionReconciliationSource {
         let path = root.join("actions/native/runtime.sqlite");
         if !path.is_file() {
             return Err(StoreError::Conflict(
-                "original correction runtime is unavailable".into(),
+                "original native action runtime is unavailable".into(),
             ));
         }
         Ok((root, whipplescript_store::SqliteStore::open(path)?))
@@ -139,7 +139,6 @@ impl Workbench {
         self.open_native_command_runtime(
             storage,
             command,
-            prepared.key,
             prepared.basis,
             NativeActionKind::FileSave,
         )
@@ -159,7 +158,6 @@ impl Workbench {
         self.open_native_command_runtime(
             storage,
             command,
-            prepared.key,
             prepared.basis,
             NativeActionKind::RecordCorrections,
         )
@@ -171,7 +169,6 @@ impl Workbench {
         &mut self,
         storage: &NativeActionStorage,
         command: &HostActionCommand,
-        key: SigningKey,
         basis: gaugedesk_store::command_dispatch::DispatchReadBasis,
         kind: NativeActionKind,
     ) -> Result<GovernedHostFacade<NativeStores>, String> {
@@ -182,7 +179,8 @@ impl Workbench {
                 return Err("inspection cannot initialize a writable runtime".into())
             }
         };
-        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        let root = project_signature::NativeHistoryRoots::open(self)?
+            .original_root(self.store_ref(), command)?;
         let policy = crate::action_policy::load_action_policy(
             self.store_ref(),
             &ActionPolicyIdentity {

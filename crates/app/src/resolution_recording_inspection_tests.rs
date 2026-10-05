@@ -86,6 +86,30 @@ fn recorded_input_with_call_shape(
     public: bool,
     legacy_call: bool,
 ) -> Recorded {
+    recorded_input_with_authority(
+        root,
+        ceiling,
+        interrupted,
+        corrections,
+        public,
+        legacy_call,
+        false,
+    )
+}
+
+fn legacy_recorded(root: &std::path::Path) -> Recorded {
+    recorded_input_with_authority(root, &[""], true, &input(""), false, false, true)
+}
+
+fn recorded_input_with_authority(
+    root: &std::path::Path,
+    ceiling: &[&str],
+    interrupted: bool,
+    corrections: &ResolutionRecordingInput,
+    public: bool,
+    legacy_call: bool,
+    legacy_issuer: bool,
+) -> Recorded {
     let (shared, file, token) = setup(root);
     let mut wb = shared.lock_unpoisoned();
     path_ceiling(&mut wb, &file.chat_id, ceiling);
@@ -98,6 +122,63 @@ fn recorded_input_with_call_shape(
     }
     let context = wb.authenticate_action_context(&token).unwrap();
     let storage = wb.open_native_action_storage(config()).unwrap();
+    if legacy_issuer {
+        // Retain the actual pre-migration preparation under its original local
+        // host root. The migrated factory must recover it without rewriting it.
+        let authority = current_target_authority(
+            wb.store_ref(),
+            wb.home_id(),
+            &context,
+            &NativeTargetIntent {
+                chat_id: &file.chat_id,
+                request_id: "inspect-original",
+                path: "notes/correction.txt",
+            },
+            NativeActionKind::RecordCorrections,
+        )
+        .unwrap();
+        let target = wb.engagements[&file.chat_id]
+            .native_resolution_recording_target(
+                &authority.workspace_path,
+                authority.resolution_scope.clone(),
+            )
+            .unwrap();
+        let identity = ActionPolicyIdentity {
+            issuer: wb.authority().as_str().into(),
+            scope: serde_json::to_string(&(
+                "gaugedesk.editor-corrections.v1",
+                &authority.project_id,
+                &file.chat_id,
+                target.path(),
+            ))
+            .unwrap(),
+            request_id: "inspect-original".into(),
+        };
+        let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+        let retained =
+            prepare_action_policy(wb.store_mut(), &identity, &authority.policy, &key).unwrap();
+        let original_input = storage
+            .inputs()
+            .prepare(
+                "admitted_corrections",
+                &format!(
+                    "policy:{}:admitted_corrections",
+                    retained.policy_ref().envelope_hash
+                ),
+                &serde_json::to_string(corrections).unwrap(),
+            )
+            .unwrap();
+        let home = wb.home_id().as_str().to_owned();
+        crate::action_input_binding::retain_input_binding(
+            wb.store_mut(),
+            storage.inputs(),
+            &identity.issuer,
+            &home,
+            &original_input,
+            &key,
+        )
+        .unwrap();
+    }
     let command = wb
         .admit_editor_corrections(
             &context,

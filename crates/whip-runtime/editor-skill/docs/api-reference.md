@@ -1713,6 +1713,11 @@ values are in USD for each million tokens, for each provider and model, with the
 input side and the output side separate. The rates are in the configuration
 only. The system ships no default rate. Usage with no matching rate records
 honestly as `unpriced` with a cost of 0, and such usage cannot bind the cap.
+Completed and failed scenario evaluations both enter the campaign spend ledger.
+If a failed evaluation has a provider run whose cost cannot be established,
+an invocation with `--spend-cap` stops instead of continuing under an
+incomplete total. Its `campaign.spend` event names the failed evaluation and
+the unaccounted runs.
 
 A campaign that crosses its cap **parks**. The record then has a
 `campaign.parked` event, and the report has `"parked": true`. The
@@ -1738,6 +1743,11 @@ baseline. A configured global context directory or
 which instructions the evaluated agent sees. With no `--context-root`, improve
 retains its source-only behavior.
 
+If the workflow uses content-pinned `std.script` capabilities, set
+`WHIPPLESCRIPT_SCRIPT_MANIFEST` for `whip improve` as for `whip run`. Baseline
+and candidate regenerations load that manifest into their disposable stores;
+the manifest and its scripts stay outside the editable context tree.
+
 An inline target such as `extract_quality>=0.9` becomes a reach bound. The
 `then` keyword separates the lexicographic stages, and the stages have ratchet
 semantics. A stage whose reach targets the baseline already meets advances at
@@ -1756,6 +1766,23 @@ runs with the `unheld-out` tag. The command then evaluates the baseline. The
 command then repeats these steps: propose a candidate, apply the static gate,
 evaluate the candidate, give a verdict on the dominance, and apply the sealed
 gate for a promotion.
+
+A draft that passes source checking but fails when one of its rules is lowered
+against an open scenario is recorded as a rejected candidate, and the campaign
+continues its search. The open-case compiler or lowering diagnostic appears
+in the next proposer turn's search history. Provider and evaluation
+infrastructure failures still fail the campaign. A rejected draft is never
+eligible for adoption.
+
+An exec judge receives `whipplescript.judge_input.v0` with the scenario,
+instance status and input, all produced facts including consumed facts, and
+`terminal`: the final workflow completion or failure payload, or `null` if no
+terminal event exists. This is the same record shape for baseline and candidate
+evaluations.
+
+If any declared gauge is unscored on a baseline scenario, the campaign fails
+with the judge's reason. It cannot select a candidate against an unknown
+baseline or claim that a protected gauge held when its judge did not run.
 
 The command proposes a candidate only when the candidate improves a gauge in the
 ascend set, causes no regression in a guarded gauge, and meets each bar. The

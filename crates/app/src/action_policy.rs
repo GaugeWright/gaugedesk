@@ -127,6 +127,26 @@ pub fn prepare_action_policy(
     prepare_at(product, &storage_scope, identity, policy, signing_key, None)
 }
 
+/// Publish native policy preparation against the caller's current authority
+/// snapshot. An earlier access check cannot survive a changed Home or handoff.
+pub(crate) fn prepare_action_policy_against(
+    product: &mut Store,
+    identity: &ActionPolicyIdentity,
+    policy: &HostGovernancePolicy,
+    signing_key: &SigningKey,
+    basis: &DispatchReadBasis,
+) -> Result<RetainedActionPolicy, String> {
+    let storage_scope = identity.storage_scope()?;
+    prepare_at(
+        product,
+        &storage_scope,
+        identity,
+        policy,
+        signing_key,
+        Some(basis),
+    )
+}
+
 /// Retain a project workflow's policy in the project's relocatable record
 /// scopes. `project` and the command identity come from current host admission;
 /// this storage helper grants neither project access nor permission to execute.
@@ -270,6 +290,7 @@ fn load_at(
     let retained =
         record(product, storage_scope)?.ok_or("retained action policy is unavailable")?;
     verify_record(&retained, identity, root)?;
+    verify_preparation(product, storage_scope, &retained, root)?;
     if &retained.policy_ref != expected {
         return Err("retained action policy differs from the admitted reference".into());
     }
@@ -277,6 +298,60 @@ fn load_at(
         signed_envelope: retained.signed_envelope,
         policy_ref: retained.policy_ref,
     })
+}
+
+fn verify_preparation(
+    product: &Store,
+    scope: &str,
+    retained: &PolicyRecord,
+    root: &GovernanceRootVerifier,
+) -> Result<(), String> {
+    let expected = serde_json::to_string(&(
+        &retained.identity,
+        &retained.canonical_policy,
+        root.expected_key().as_str(),
+        ACTION_EPOCH,
+    ))
+    .map_err(|e| e.to_string())?;
+    if product
+        .committed_record_snapshot(scope, PREPARATION_KEY)
+        .map_err(|e| format!("{e:?}"))?
+        .as_deref()
+        != Some(expected.as_str())
+    {
+        return Err("action policy has no matching original preparation receipt".into());
+    }
+    Ok(())
+}
+
+/// Recover an exact preparation under its original public root without signing
+/// or repairing it. A changed signer cannot reinterpret an earlier request.
+pub(crate) fn prepared_action_policy(
+    product: &Store,
+    identity: &ActionPolicyIdentity,
+    policy: &HostGovernancePolicy,
+    root: &GovernanceRootVerifier,
+) -> Result<Option<RetainedActionPolicy>, String> {
+    let scope = identity.storage_scope()?;
+    let Some(retained) = record(product, &scope)? else {
+        if product
+            .committed_record_snapshot(&scope, PREPARATION_KEY)
+            .map_err(|e| format!("{e:?}"))?
+            .is_some()
+        {
+            return Err("action policy preparation is missing its original fact".into());
+        }
+        return Ok(None);
+    };
+    verify_record(&retained, identity, root)?;
+    verify_preparation(product, &scope, &retained, root)?;
+    if retained.canonical_policy != canonicalize(&policy.to_json()?)? {
+        return Err("action policy request reused with different meaning".into());
+    }
+    Ok(Some(RetainedActionPolicy {
+        signed_envelope: retained.signed_envelope,
+        policy_ref: retained.policy_ref,
+    }))
 }
 
 /// Resolve a retained content label through its original signed policy. This
@@ -406,6 +481,54 @@ mod tests {
             capabilities: BTreeSet::from(["file.read".into()]),
             ..HostGovernancePolicy::default()
         }
+    }
+
+    #[test]
+    fn native_policy_preparation_checks_current_authority_inside_the_writer() {
+        let key = SigningKey::from_seed(&[41; 32]).unwrap();
+        let id = identity();
+        let scope = id.storage_scope().unwrap();
+        let mut product = Store::open_in_memory().unwrap();
+        let (_, stale) = product
+            .read_for_dispatch(&["current-home"], |_| Ok(()))
+            .unwrap();
+        product
+            .append_record("current-home", "member-grant", "revoked")
+            .unwrap();
+        assert!(prepare_action_policy_against(&mut product, &id, &policy(), &key, &stale).is_err());
+        assert!(product.records(&scope, POLICY_KIND).unwrap().is_empty());
+        assert!(product
+            .committed_record_snapshot(&scope, PREPARATION_KEY)
+            .unwrap()
+            .is_none());
+        let (_, current) = product
+            .read_for_dispatch(&["current-home"], |_| Ok(()))
+            .unwrap();
+        let prepared =
+            prepare_action_policy_against(&mut product, &id, &policy(), &key, &current).unwrap();
+        let receipt = product
+            .committed_record_snapshot(&scope, PREPARATION_KEY)
+            .unwrap();
+        let (_, expired) = product
+            .read_for_dispatch(&["current-home"], |_| Ok(()))
+            .unwrap();
+        let expired = expired.with_deadline(std::time::UNIX_EPOCH);
+        assert!(
+            prepare_action_policy_against(&mut product, &id, &policy(), &key, &expired).is_err()
+        );
+        assert_eq!(
+            product
+                .committed_record_snapshot(&scope, PREPARATION_KEY)
+                .unwrap(),
+            receipt
+        );
+        let root = GovernanceRootVerifier::new(AuthorityId::new(&id.issuer), key.public_key());
+        assert_eq!(
+            load_action_policy(&product, &id, prepared.policy_ref(), &root)
+                .unwrap()
+                .signed_envelope(),
+            prepared.signed_envelope()
+        );
     }
 
     #[test]

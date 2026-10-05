@@ -382,3 +382,169 @@ fn native_driver_refuses_missing_acknowledgment_receipt_without_redelivery() {
         .require_current(&driver.owner.admission)
         .unwrap();
 }
+
+#[test]
+fn legacy_preparation_keeps_original_policy_while_current_save_and_source_use_project_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, command, storage, token) =
+        super::super::tests::legacy_home_storage_fixture(dir.path(), config());
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let project = project_signature::command_project(&command).unwrap();
+    let (project_issuer, project_public) = wb.project_authority_identity(&project).unwrap();
+    assert_eq!(command.issuer, wb.authority().as_str());
+    assert_eq!(command.policy.signer, command.issuer);
+    assert_ne!(command.issuer, project_issuer.as_str());
+    let identity = ActionPolicyIdentity {
+        issuer: command.issuer.clone(),
+        scope: command.scope.clone(),
+        request_id: command.request_id.clone(),
+    };
+    let original_receipt = wb
+        .store_ref()
+        .committed_record_snapshot(&identity.storage_scope().unwrap(), "prepare")
+        .unwrap();
+    let prepared = wb
+        .prepare_native_editor_action(&context, storage.inputs(), &command, &command.policy)
+        .unwrap();
+    assert_eq!(prepared.key.public_key(), project_public);
+    let (_, mut driver) = start(&mut wb, &storage, &command, &token);
+    step(&mut wb, &storage, &mut driver);
+    step(&mut wb, &storage, &mut driver);
+    let result = saved(&mut wb, &storage, &mut driver);
+    assert_eq!(result.result.issuer, command.issuer);
+    let evidence = snapshot(&mut wb, &storage, &driver);
+    let write = evidence
+        .effects
+        .iter()
+        .find(|effect| {
+            effect.attempts.iter().any(|attempt| {
+                attempt
+                    .dispatch
+                    .as_ref()
+                    .is_some_and(|marker| marker.frame.kind == "file.write")
+            })
+        })
+        .unwrap();
+    let attempt = EditorFileSaveAttempt {
+        effect_id: &write.effect_id,
+        run_id: &write.attempts[0].run_id,
+    };
+    let reconciliation = EditorFileSaveReconciliation {
+        request_id: "legacy-command-current-reconciliation",
+        attempt,
+    };
+    let admission = driver.owner.admission.clone();
+    let reconciled = wb
+        .reconcile_editor_file_save_attempt(
+            &context,
+            storage.inputs(),
+            &command,
+            &admission,
+            reconciliation,
+            &mut driver.owner,
+        )
+        .unwrap()
+        .unwrap();
+    let events = driver
+        .owner
+        .runtime()
+        .kernel()
+        .store()
+        .list_events(&driver.owner.admission.instance_ref)
+        .unwrap();
+    let recorded: gaugedesk_whip_runtime::host_actions::recovery::RecordedReconciliation =
+        serde_json::from_str(&events.last().unwrap().payload_json).unwrap();
+    assert_eq!(recorded.command.issuer, project_issuer.as_str());
+    assert_eq!(recorded.command.policy.signer, project_issuer.as_str());
+    assert_eq!(
+        recorded.command.protocol,
+        gaugedesk_whip_runtime::host_actions::recovery::EFFECT_RECONCILIATION_PROTOCOL_V2
+    );
+    assert_eq!(
+        recorded.command.original_issuer.as_deref(),
+        Some(command.issuer.as_str())
+    );
+    assert_eq!(
+        wb.reconcile_editor_file_save_attempt(
+            &context,
+            storage.inputs(),
+            &command,
+            &admission,
+            EditorFileSaveReconciliation {
+                request_id: "legacy-command-current-reconciliation",
+                attempt
+            },
+            &mut driver.owner,
+        )
+        .unwrap(),
+        Some(reconciled)
+    );
+    assert_eq!(
+        driver
+            .owner
+            .runtime()
+            .kernel()
+            .store()
+            .list_events(&admission.instance_ref)
+            .unwrap(),
+        events
+    );
+    let observed = wb
+        .observe_editor_file_save(&context, &command, &driver.owner.admission, attempt)
+        .unwrap();
+    let source = wb
+        .retain_editor_file_save_source(
+            &context,
+            &storage,
+            "legacy-command-source",
+            &observed,
+            attempt,
+        )
+        .unwrap();
+    assert_eq!(source.cause().authority, project_issuer.as_str());
+    let (scope, _): (String, String) = serde_json::from_str(&source.cause().record_ref).unwrap();
+    let record: serde_json::Value = serde_json::from_str(
+        &wb.store_ref()
+            .records(&scope, "native_saved_action_source_v1")
+            .unwrap()[0],
+    )
+    .unwrap();
+    assert_eq!(record["statement"]["issuer"], command.issuer);
+    assert_eq!(
+        record["project_signature"]["authority"],
+        project_issuer.as_str()
+    );
+    assert_eq!(
+        wb.store_ref()
+            .committed_record_snapshot(&identity.storage_scope().unwrap(), "prepare")
+            .unwrap(),
+        original_receipt
+    );
+    drop(driver);
+    drop(wb);
+    drop(shared);
+    let restarted = crate::open_workbench(dir.path()).unwrap();
+    let mut wb = restarted.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    assert_eq!(
+        wb.observe_editor_file_save_request(
+            &context,
+            EditorFileSaveRequest {
+                issuer: &command.issuer,
+                scope: &command.scope,
+                request_id: &command.request_id
+            }
+        )
+        .unwrap()
+        .command(),
+        &command
+    );
+    assert_eq!(
+        wb.observe_editor_file_saved_results(&context, &command)
+            .unwrap()
+            .results()
+            .len(),
+        1
+    );
+}

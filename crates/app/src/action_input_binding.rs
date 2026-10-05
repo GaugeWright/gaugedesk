@@ -1,4 +1,5 @@
-//! Home-signed, body-free input mappings retained independently of erasure.
+//! Project-signed, body-free input mappings retained independently of erasure.
+//! Legacy mappings keep their original host signature and preparation receipt.
 //! A verified mapping is evidence about bytes previously resolved from custody;
 //! it grants neither payload access, command admission nor effect execution.
 use crate::action_inputs::NativeActionInputCustody;
@@ -128,6 +129,7 @@ pub(crate) fn load_input_binding(
 /// Prepare from actual custody under its erasure exclusion. Signature randomness
 /// is not command meaning: races and replay use the original receipted statement.
 /// This is internal preparation, independently checked before action admission.
+#[cfg(test)]
 pub(crate) fn retain_input_binding(
     product: &mut Store,
     inputs: &NativeActionInputCustody,
@@ -136,55 +138,102 @@ pub(crate) fn retain_input_binding(
     input: &ActionInput,
     key: &SigningKey,
 ) -> StoreResult<NativeInputBinding> {
+    retain_input_binding_at(
+        product,
+        inputs,
+        issuer,
+        home,
+        input,
+        (key, &key.public_key()),
+        None,
+    )
+}
+
+pub(crate) fn retain_original_input_binding(
+    product: &mut Store,
+    inputs: &NativeActionInputCustody,
+    issuer: &str,
+    home: &str,
+    input: &ActionInput,
+    current_and_original: (&SigningKey, &PublicKey),
+    basis: &gaugedesk_store::command_dispatch::DispatchReadBasis,
+) -> StoreResult<NativeInputBinding> {
+    retain_input_binding_at(
+        product,
+        inputs,
+        issuer,
+        home,
+        input,
+        current_and_original,
+        Some(basis),
+    )
+}
+
+fn retain_input_binding_at(
+    product: &mut Store,
+    inputs: &NativeActionInputCustody,
+    issuer: &str,
+    home: &str,
+    input: &ActionInput,
+    current_and_original: (&SigningKey, &PublicKey),
+    basis: Option<&gaugedesk_store::command_dispatch::DispatchReadBasis>,
+) -> StoreResult<NativeInputBinding> {
+    let (key, original_key) = current_and_original;
     if inputs.authority_scope() != home || home.trim().is_empty() {
         return Err(refused("input custody belongs to another Home"));
     }
     let reader = product.sibling().map_err(refused)?;
-    product
-        .with_record_admission(|admission| {
-            inputs.with_resolved(input, |resolved| {
-                let statement = Statement {
-                    protocol: PROTOCOL.into(),
-                    issuer: issuer.into(),
-                    home: home.into(),
-                    input: input.clone(),
-                    content_hash: resolved.content_hash.clone(),
-                };
-                let public = key.public_key();
-                if let Some(previous) =
-                    read_retained_snapshot(&reader, issuer, home, input, &public)?
-                {
-                    if previous.statement != statement {
-                        return Err(refused("input mapping changed meaning"));
-                    }
-                    return Ok(previous);
+    let publish = |admission: gaugedesk_store::command_dispatch::DispatchRecordAdmission<'_>| {
+        inputs.with_resolved(input, |resolved| {
+            let statement = Statement {
+                protocol: PROTOCOL.into(),
+                issuer: issuer.into(),
+                home: home.into(),
+                input: input.clone(),
+                content_hash: resolved.content_hash.clone(),
+            };
+            let public = original_key.clone();
+            if let Some(previous) = read_retained_snapshot(&reader, issuer, home, input, &public)? {
+                if previous.statement != statement {
+                    return Err(refused("input mapping changed meaning"));
                 }
-                let signed = SignedBinding {
-                    signature: key.sign(&statement.signing_bytes()?).as_bytes().to_vec(),
-                    statement,
-                };
-                let scope = input_binding_scope(issuer, input)?;
-                admission
-                    .commit(
-                        &scope,
-                        KEY,
-                        &signed.statement.snapshot(&public)?,
-                        &[CommandRecordFact {
-                            scope_id: scope.clone(),
-                            kind: KIND.into(),
-                            payload: serde_json::to_string(&signed)?,
-                        }],
-                    )
-                    .map_err(refused)?;
-                let retained = read_retained_snapshot(&reader, issuer, home, input, &public)?
-                    .ok_or_else(|| refused("input mapping was not retained"))?;
-                if retained.statement != signed.statement {
-                    return Err(refused("input mapping winner changed meaning"));
-                }
-                Ok(retained)
-            })
+                return Ok(previous);
+            }
+            if &key.public_key() != original_key {
+                return Err(refused(
+                    "missing historical input mapping requires a fresh request",
+                ));
+            }
+            let signed = SignedBinding {
+                signature: key.sign(&statement.signing_bytes()?).as_bytes().to_vec(),
+                statement,
+            };
+            let scope = input_binding_scope(issuer, input)?;
+            admission
+                .commit(
+                    &scope,
+                    KEY,
+                    &signed.statement.snapshot(&public)?,
+                    &[CommandRecordFact {
+                        scope_id: scope.clone(),
+                        kind: KIND.into(),
+                        payload: serde_json::to_string(&signed)?,
+                    }],
+                )
+                .map_err(refused)?;
+            let retained = read_retained_snapshot(&reader, issuer, home, input, &public)?
+                .ok_or_else(|| refused("input mapping was not retained"))?;
+            if retained.statement != signed.statement {
+                return Err(refused("input mapping winner changed meaning"));
+            }
+            Ok(retained)
         })
-        .map_err(refused)?
+    };
+    match basis {
+        Some(basis) => product.with_dispatch_record_admission(basis, publish),
+        None => product.with_record_admission(publish),
+    }
+    .map_err(refused)?
 }
 
 // Preparation can race another preparer. Observe the fact and receipt from one

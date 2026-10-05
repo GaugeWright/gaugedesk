@@ -61,6 +61,7 @@ pub(super) fn read_evidence(
     let request = ReadActionResult {
         protocol: ACTION_RESULT_PROTOCOL.into(),
         issuer: command.issuer.clone(),
+        read_authority: None,
         scope: command.scope.clone(),
         policy: command.policy.clone(),
         provenance: command.provenance.clone(),
@@ -328,7 +329,7 @@ impl Workbench {
             .store_ref()
             .read_only_sibling()
             .map_err(|error| format!("retained policy observer unavailable: {error:?}"))?;
-        let issuer = self.authority().clone();
+        let issuer = crate::project_authority::authority(&key.public_key());
         let roots = self.local_project_policy_roots(&authority.project_id)?;
         self.store_mut()
             .with_dispatch_basis(&basis, || {

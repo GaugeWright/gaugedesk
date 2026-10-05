@@ -717,11 +717,60 @@ pub(super) fn home_storage_fixture(
     NativeActionStorage,
     String,
 ) {
-    let (wb, intent, token) = setup(root);
+    home_storage_fixture_with_original(root, config, false)
+}
+
+pub(super) fn legacy_home_storage_fixture(
+    root: &std::path::Path,
+    config: NativeActionStorageConfig,
+) -> (
+    SharedWorkbench,
+    HostActionCommand,
+    NativeActionStorage,
+    String,
+) {
+    home_storage_fixture_with_original(root, config, true)
+}
+
+fn home_storage_fixture_with_original(
+    root: &std::path::Path,
+    config: NativeActionStorageConfig,
+    legacy: bool,
+) -> (
+    SharedWorkbench,
+    HostActionCommand,
+    NativeActionStorage,
+    String,
+) {
+    let (wb, mut intent, token) = setup(root);
     let (command, storage) = {
         let mut wb = wb.lock_unpoisoned();
         let context = wb.authenticate_action_context(&token).unwrap();
         let storage = wb.open_native_action_storage(config).unwrap();
+        if legacy {
+            intent.identity.issuer = wb.authority().as_str().into();
+            let request = EditorFileSave {
+                chat_id: &intent.chat_id,
+                request_id: &intent.request_id,
+                path: &intent.path,
+                base_cut: &intent.base_cut,
+                content: &intent.content,
+            };
+            let authority =
+                current_authority(wb.store_ref(), wb.home_id(), &context, &request).unwrap();
+            let original_key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+            prepare_action_policy(
+                wb.store_mut(),
+                &ActionPolicyIdentity {
+                    issuer: intent.identity.issuer.clone(),
+                    scope: intent.identity.scope.clone(),
+                    request_id: intent.identity.request_id.clone(),
+                },
+                &authority.policy,
+                &original_key,
+            )
+            .unwrap();
+        }
         let command = wb
             .admit_editor_file_save(
                 &context,
@@ -750,8 +799,11 @@ pub(super) fn editor_runtime(
     gaugedesk_whip_runtime::host_actions::NativeStores,
 > {
     use gaugedesk_whip_runtime::host_actions::NativeStores;
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
-    let root = GovernanceRootVerifier::new(wb.authority().clone(), key.public_key());
+    std::fs::create_dir_all(root_path.join("actions/native")).unwrap();
+    let root = project_signature::NativeHistoryRoots::open(wb)
+        .unwrap()
+        .original_root(wb.store_ref(), command)
+        .unwrap();
     let policy = crate::action_policy::load_action_policy(
         wb.store_ref(),
         &ActionPolicyIdentity {
@@ -765,9 +817,9 @@ pub(super) fn editor_runtime(
     .unwrap();
     gaugedesk_whip_runtime::host_actions::open_governed_host_facade(
         NativeStores::open(
-            root_path.join("runtime.sqlite"),
-            root_path.join("coord.sqlite"),
-            root_path.join("items.sqlite"),
+            root_path.join("actions/native/runtime.sqlite"),
+            root_path.join("actions/native/coord.sqlite"),
+            root_path.join("actions/native/items.sqlite"),
         )
         .unwrap(),
         command.policy.epoch,
@@ -1514,7 +1566,8 @@ fn native_editor_lost_runtime_settlement_preserves_unknown_outcome_and_target_ev
         let writes = wb
             .advance_editor_file_save(&context, &inputs, &command, &admission, &mut runtime)
             .unwrap();
-        let fault = rusqlite::Connection::open(dir.path().join("runtime.sqlite")).unwrap();
+        let fault =
+            rusqlite::Connection::open(dir.path().join("actions/native/runtime.sqlite")).unwrap();
         fault
             .execute_batch(
                 "CREATE TRIGGER lose_editor_terminal BEFORE INSERT ON events

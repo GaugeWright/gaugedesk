@@ -305,8 +305,7 @@ fn historical_grant_causes_require_exact_signed_receipted_history_without_live_a
     let (fixture, grant_ref) = saved();
     let mut wb = fixture.wb.lock_unpoisoned();
     let context = wb.authenticate_action_context(&fixture.token).unwrap();
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
-    let history = dispatch_grant::NativeDispatchHistory::open(&wb, key.public_key()).unwrap();
+    let history = dispatch_grant::NativeDispatchHistory::open(&wb).unwrap();
     let snapshot = wb
         .read_editor_file_save_result(
             &context,

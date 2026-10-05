@@ -88,8 +88,7 @@ impl Workbench {
         access: NativeActionAccess,
     ) -> Result<NativeCorrectionPreparation, String> {
         let refused = || "native correction delivery binding is invalid".to_owned();
-        if command.issuer != self.authority().as_str()
-            || inputs.authority_scope() != self.home_id().as_str()
+        if inputs.authority_scope() != self.home_id().as_str()
             || command.provenance.initiator != context.actor().as_str()
             || command.provenance.executor != context.actor().as_str()
             || !command.provenance.delegation.is_empty()
@@ -124,12 +123,12 @@ impl Workbench {
             request_id: command.request_id.clone(),
         };
         let policy_scope = identity.storage_scope()?;
-        let key = SigningKey::from_seed(&self.governance_seed()).map_err(|error| error.reason)?;
+        let roots = project_signature::NativeHistoryRoots::open(self)?;
         let mapping_scope =
             crate::action_input_binding::input_binding_scope(&command.issuer, input)
                 .map_err(|error| format!("correction input mapping refused: {error:?}"))?;
         let handoff_scope = crate::federation::handoff_scope(&project);
-        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        let root = roots.original_root(self.store_ref(), command)?;
         let mut scopes = vec![
             LIBRARY_SCOPE,
             ORG_SCOPE,
@@ -151,7 +150,7 @@ impl Workbench {
                 let source_policy = Self::correction_source_policy(
                     store,
                     home.as_str(),
-                    &key.public_key(),
+                    &roots,
                     command,
                     &original_policy,
                 )
@@ -175,11 +174,16 @@ impl Workbench {
                     &command.issuer,
                     home.as_str(),
                     input,
-                    &key.public_key(),
+                    root.expected_key(),
                 );
                 Ok((authority, mapping, policy))
             })
             .map_err(|error| format!("current correction authority refused: {error:?}"))?;
+        let basis = authority
+            .bind_deadline(basis)
+            .map_err(|error| format!("correction authority deadline refused: {error:?}"))?;
+        let (key, basis) =
+            self.native_project_signer_access(&authority.project_id, basis, access)?;
         let input_binding = input_binding
             .map_err(|error| format!("correction input mapping refused: {error:?}"))?;
         if authority.project_id != project
@@ -218,9 +222,6 @@ impl Workbench {
         let envelope =
             ifc::VerifiedEnvelope::verify_signed_text_with(policy.signed_envelope(), &root)?;
         crate::resolution_recording_policy::validate_resolution_recording_flows(&envelope)?;
-        let basis = authority
-            .bind_deadline(basis)
-            .map_err(|error| format!("correction authority deadline refused: {error:?}"))?;
         Ok(NativeCorrectionPreparation {
             scope,
             key,

@@ -277,7 +277,7 @@ impl Workbench {
             return Err("completion input exceeds budget".into());
         }
         let current_policy = completion_policy(&tracker, context.actor().as_str())?;
-        self.initialize_project_authority(&request.project)
+        self.initialize_project_authority_against(&request.project, &basis)
             .map_err(debug_error)?;
         let signing_key = self
             .project_signing_key(&request.project)

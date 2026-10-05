@@ -53,7 +53,7 @@ impl Workbench {
         let command = delivery.command.clone();
         let basis = authority.basis;
         let mut writer = self.store_ref().sibling().map_err(debug_error)?;
-        self.initialize_project_authority(&project)
+        self.initialize_project_authority_against(&project, &basis)
             .map_err(debug_error)?;
         let signing_key = self.project_signing_key(&project).map_err(debug_error)?;
         let proof = signing_key

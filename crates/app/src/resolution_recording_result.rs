@@ -81,7 +81,7 @@ fn verify_reconciliation_identity(
         .resources
         .get("resolutions")
         .ok_or_else(|| refused("missing original resource"))?;
-    if command.issuer != original.issuer
+    if command.issuer != command.policy.signer
         || command.scope != original.scope
         || command.evidence.frame.instance_id != admission.instance_ref
         || command.evidence.disposition != EvidenceDisposition::Applied
@@ -218,21 +218,44 @@ impl Workbench {
         admission
             .validate_for(original)
             .map_err(|error| format!("{error:?}"))?;
-        let identity = result_policy_identity(original, request_id)?;
-        let scope = &identity.scope;
+        let mut identity = result_policy_identity(original, request_id)?;
+        let scope = identity.scope.clone();
+        let (result, result_basis) = self
+            .store_ref()
+            .read_for_dispatch(&[&scope], |store| {
+                Ok(retained_fact::<NativeEditorCorrectionResult>(
+                    store,
+                    &scope,
+                    request_id,
+                    &scope,
+                    RESULT_KIND,
+                ))
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        let result = result?;
+        if let Some(result) = &result {
+            identity.issuer = result.policy.signer.clone();
+        }
         let policy_scope = identity.storage_scope()?;
         let mut prepared =
-            self.prepare_correction_inspection_scoped(context, original, &[scope, &policy_scope])?;
-        let result: Option<NativeEditorCorrectionResult> =
-            retained_fact(self.store_ref(), scope, request_id, scope, RESULT_KIND)?;
+            self.prepare_correction_inspection_scoped(context, original, &[&scope, &policy_scope])?;
+        prepared.basis = prepared
+            .basis
+            .combine(result_basis)
+            .map_err(|e| format!("{e:?}"))?;
         let Some(result) = result else {
             return Ok(None);
         };
         verify_result_identity(original, admission, request_id, &result)
             .map_err(|error| format!("{error:?}"))?;
-        let root = GovernanceRootVerifier::new(self.authority().clone(), prepared.key.public_key());
+        let root = project_signature::NativeHistoryRoots::open(self)?.policy_root(
+            self.store_ref(),
+            &project_signature::command_project(original)?,
+            &identity.issuer,
+        )?;
         let retained = load_action_policy(self.store_ref(), &identity, &result.policy, &root)?;
-        retain_restrictions(&mut prepared, &retained, self.authority())?;
+        let current_issuer = crate::project_authority::authority(&prepared.key.public_key());
+        retain_restrictions(&mut prepared, &retained, &current_issuer)?;
         self.store_mut()
             .with_dispatch_basis(&prepared.basis, || Some(result))
             .map_err(|error| format!("{error:?}"))
@@ -261,15 +284,13 @@ impl Workbench {
             });
         }
         let identity = result_policy_identity(original, request.request_id)?;
-        let scope = &identity.scope;
         let reconciliation_scope = request_scope(original, request.reconciliation_request_id)?;
-        let reconciliation_identity = ActionPolicyIdentity {
+        let mut reconciliation_identity = ActionPolicyIdentity {
             issuer: original.issuer.clone(),
             scope: reconciliation_scope.clone(),
             request_id: request.reconciliation_request_id.into(),
         };
         let reconciliation_policy_scope = reconciliation_identity.storage_scope()?;
-        let policy_scope = identity.storage_scope()?;
         let mut initial = self.prepare_correction_inspection_scoped(
             context,
             original,
@@ -285,20 +306,31 @@ impl Workbench {
             .ok_or("correction result requires the original reconciliation outbox")?;
         verify_reconciliation_identity(original, admission, &first.command)
             .map_err(|error| format!("{error:?}"))?;
-        let root = GovernanceRootVerifier::new(self.authority().clone(), initial.key.public_key());
+        reconciliation_identity.issuer = first.command.policy.signer.clone();
+        let root = project_signature::NativeHistoryRoots::open(self)?.policy_root(
+            self.store_ref(),
+            &project_signature::command_project(original)?,
+            &reconciliation_identity.issuer,
+        )?;
         let reconciliation_policy = load_action_policy(
             self.store_ref(),
             &reconciliation_identity,
             &first.command.policy,
             &root,
         )?;
-        retain_restrictions(&mut initial, &reconciliation_policy, self.authority())?;
-        let retained = crate::action_policy::prepare_action_policy(
-            self.store_mut(),
-            &identity,
+        let current_issuer = crate::project_authority::authority(&initial.key.public_key());
+        retain_restrictions(&mut initial, &reconciliation_policy, &current_issuer)?;
+        let (identity, retained, basis) = self.prepare_native_metadata_policy(
+            original,
+            &identity.scope,
+            request.request_id,
             &initial.read_policy,
             &initial.key,
+            initial.basis,
         )?;
+        let scope = &identity.scope;
+        let policy_scope = identity.storage_scope()?;
+        let reconciliation_policy_scope = reconciliation_identity.storage_scope()?;
         // No target or runtime evidence was read before this final authority
         // snapshot. Include the policy preparation that just became durable.
         let mut prepared = self.prepare_correction_inspection_scoped(
@@ -311,7 +343,11 @@ impl Workbench {
                 &reconciliation_policy_scope,
             ],
         )?;
-        retain_restrictions(&mut prepared, &reconciliation_policy, self.authority())?;
+        prepared.basis = prepared.basis.combine(basis).map_err(|e| {
+            format!("correction result authority changed during preparation: {e:?}")
+        })?;
+        let current_issuer = crate::project_authority::authority(&prepared.key.public_key());
+        retain_restrictions(&mut prepared, &reconciliation_policy, &current_issuer)?;
         if canonicalize(retained.signed_envelope())?
             != canonicalize(&prepared.read_policy.to_json()?)?
         {
@@ -349,8 +385,12 @@ impl Workbench {
         {
             return Err("correction reconciliation acknowledgment differs from its outbox".into());
         }
-        let issuer = self.authority().clone();
-        let root = GovernanceRootVerifier::new(issuer.clone(), prepared.key.public_key());
+        let issuer = crate::project_authority::authority(&prepared.key.public_key());
+        let root = project_signature::NativeHistoryRoots::open(self)?.policy_root(
+            self.store_ref(),
+            &project_signature::command_project(original)?,
+            &reconciliation_identity.issuer,
+        )?;
         load_action_policy(
             self.store_ref(),
             &reconciliation_identity,

@@ -57,6 +57,7 @@ pub(super) fn read_result(
     let request = ReadActionResult {
         protocol: ACTION_RESULT_PROTOCOL.into(),
         issuer: command.issuer.clone(),
+        read_authority: None,
         scope: command.scope.clone(),
         policy: command.policy.clone(),
         provenance: command.provenance.clone(),

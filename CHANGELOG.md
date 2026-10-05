@@ -19,6 +19,11 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Native file saves and corrections use project signing authority for new acts.
+  Older commands and signed evidence keep their original identities on retry;
+  current membership and project authority still govern each use.
+  Upgrade older hosts before reading the new native signature frames.
+
 - Reading recorded file history now checks that its original policy belongs to
   the admitted project and has a matching preparation receipt.
 

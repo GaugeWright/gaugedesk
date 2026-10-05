@@ -192,7 +192,7 @@ mod tests {
                 wb.project_signing_key(&prepared.authority.project_id)
                     .unwrap()
             } else {
-                prepared.key.clone()
+                SigningKey::from_seed(&wb.governance_seed()).unwrap()
             };
             let source_issuer = if project_signer {
                 wb.project_authority_identity(&prepared.authority.project_id)
@@ -284,7 +284,7 @@ mod tests {
                 target.clone(),
                 wb.store_ref().read_only_sibling().unwrap(),
                 current,
-                wb.authority().clone(),
+                crate::project_authority::authority(&prepared.key.public_key()),
                 prepared.key,
                 roots,
             );

@@ -302,8 +302,11 @@ fn derived_correction_rejects_stricter_retained_labels_after_current_policy_rela
         .unwrap();
     let scope = source_scope(wb.home_id().as_str(), "bob", &statement.request_id).unwrap();
     let snapshot = statement.snapshot().unwrap();
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+    let key = wb
+        .project_signing_key(&project_signature::command_project(&fixture.command).unwrap())
+        .unwrap();
     let signed = SignedSource {
+        project_signature: None,
         signature: key
             .sign(&statement.signing_bytes().unwrap())
             .as_bytes()
@@ -323,7 +326,7 @@ fn derived_correction_rejects_stricter_retained_labels_after_current_policy_rela
         )
         .unwrap();
     let cause = ActionCause {
-        authority: wb.authority().as_str().into(),
+        authority: fixture.command.issuer.clone(),
         record_ref: serde_json::to_string(&(&scope, KEY)).unwrap(),
         digest: digest(snapshot.as_bytes()),
     };

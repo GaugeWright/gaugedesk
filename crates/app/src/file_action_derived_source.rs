@@ -30,19 +30,19 @@ fn cause_scope(cause: &ActionCause) -> StoreResult<String> {
 fn source_for_cause(
     product: &Store,
     home: &str,
-    issuer: &str,
-    key: &PublicKey,
+    roots: &NativeHistoryRoots,
     cause: &ActionCause,
 ) -> StoreResult<SignedSource> {
-    if cause.authority != issuer {
-        return Err(refused());
-    }
     let scope = cause_scope(cause)?;
-    let source = load_source(product, &scope, key)?.ok_or_else(refused)?;
+    let source = load_source(product, &scope, roots)?.ok_or_else(refused)?;
     let s = &source.statement;
     if s.protocol != PROTOCOL
         || s.home != home
-        || s.issuer != issuer
+        || cause.authority
+            != source
+                .project_signature
+                .as_ref()
+                .map_or(s.issuer.as_str(), |frame| frame.authority())
         || s.observer.trim().is_empty()
         || source_scope(home, &s.observer, &s.request_id)? != scope
         || s.input.handle != "saved_source"
@@ -106,7 +106,7 @@ impl Workbench {
     pub(in crate::file_action_factory) fn correction_source_policy(
         store: &Store,
         home: &str,
-        key: &PublicKey,
+        roots: &NativeHistoryRoots,
         command: &HostActionCommand,
         policy: &HostGovernancePolicy,
     ) -> StoreResult<Option<ResourcePolicy>> {
@@ -116,13 +116,7 @@ impl Workbench {
         {
             return Ok(None);
         }
-        let source = source_for_cause(
-            store,
-            home,
-            &command.issuer,
-            key,
-            &command.provenance.causes[0],
-        )?;
+        let source = source_for_cause(store, home, roots, &command.provenance.causes[0])?;
         for address in ["memory:/action/corrections", "result", "error"] {
             let retained = policy.resources.get(address).ok_or_else(refused)?;
             if retained.principal
@@ -147,15 +141,9 @@ impl Workbench {
         cause: &ActionCause,
     ) -> Result<PreparedSavedSource, String> {
         storage.require_home(self)?;
-        let key = SigningKey::from_seed(&self.governance_seed()).map_err(|e| e.reason)?;
-        let source = source_for_cause(
-            self.store_ref(),
-            self.home_id().as_str(),
-            self.authority().as_str(),
-            &key.public_key(),
-            cause,
-        )
-        .map_err(|e| format!("saved source cause refused: {e:?}"))?;
+        let roots = NativeHistoryRoots::open(self)?;
+        let source = source_for_cause(self.store_ref(), self.home_id().as_str(), &roots, cause)
+            .map_err(|e| format!("saved source cause refused: {e:?}"))?;
         let command = self
             .store_ref()
             .fold::<ProductActionAdmission>(&source.statement.admission.instance_ref)
@@ -178,6 +166,7 @@ impl Workbench {
             SavedObservationOptions {
                 through: Some(source.statement.observed_at.clone()),
                 retained: Some(&source.statement.restrictions),
+                publish_metadata: false,
             },
             |observed, _, _, _| Ok(observed),
         )?;
@@ -213,10 +202,8 @@ impl Workbench {
             gaugedesk_store::command_dispatch::DispatchRecordAdmission<'tx>,
         ) -> StoreResult<T>,
     ) -> Result<T, String> {
-        let key = SigningKey::from_seed(&self.governance_seed()).map_err(|e| e.reason)?;
-        let history = dispatch_grant::NativeDispatchHistory::open(self, key.public_key())?;
+        let history = dispatch_grant::NativeDispatchHistory::open(self)?;
         let home = self.home_id().as_str().to_owned();
-        let issuer = self.authority().as_str().to_owned();
         let expected = &prepared.source.statement;
         self.with_editor_file_save_observation(
             context,
@@ -229,15 +216,11 @@ impl Workbench {
             SavedObservationOptions {
                 through: Some(expected.observed_at.clone()),
                 retained: Some(&expected.restrictions),
+                publish_metadata: false,
             },
             |observed, original, target, writer| {
-                let source = source_for_cause(
-                    &history.store,
-                    &home,
-                    &issuer,
-                    &key.public_key(),
-                    &prepared.cause,
-                )?;
+                let source =
+                    source_for_cause(&history.store, &home, &history.roots, &prepared.cause)?;
                 if source.statement != *expected || observed.restrictions != prepared.restrictions {
                     return Err(refused());
                 }

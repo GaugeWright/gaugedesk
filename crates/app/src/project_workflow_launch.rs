@@ -245,7 +245,7 @@ impl Workbench {
         let protection =
             WorkflowProtection::new(&authority.workspace, key.clone()).map_err(debug_error)?;
         let storage = self.workflow_storage(&authority.workspace)?;
-        self.initialize_project_authority(&request.project)
+        self.initialize_project_authority_against(&request.project, &authority.basis)
             .map_err(debug_error)?;
         let (project_authority, _) = self
             .project_authority_identity(&request.project)

@@ -4,7 +4,7 @@ use super::*;
 use gaugedesk_core::host_action_admission::HostActionAdmission;
 use gaugedesk_store::command_dispatch::CommandDispatch;
 use gaugedesk_whip_runtime::host_actions::recovery::{
-    ReconcileEffectCommand, EFFECT_RECONCILIATION_PROTOCOL,
+    ReconcileEffectCommand, EFFECT_RECONCILIATION_PROTOCOL, EFFECT_RECONCILIATION_PROTOCOL_V2,
 };
 use sha2::{Digest, Sha256};
 use whipplescript_store::effect_recovery::{DispositionEvidence, EvidenceDisposition};
@@ -112,20 +112,24 @@ impl Workbench {
             .resources
             .get("resolutions")
             .ok_or("original correction resource is unavailable")?;
-        let identity = ActionPolicyIdentity {
-            issuer: original.issuer.clone(),
-            scope: scope.clone(),
-            request_id: request.request_id.into(),
-        };
-        let policy = crate::action_policy::prepare_action_policy(
-            self.store_mut(),
-            &identity,
+        let (identity, policy, basis) = self.prepare_native_metadata_policy(
+            original,
+            &scope,
+            request.request_id,
             &prepared.read_policy,
             &prepared.key,
+            prepared.basis,
         )?;
+        let separate_authority = identity.issuer != original.issuer;
         let command = ReconcileEffectCommand {
-            protocol: EFFECT_RECONCILIATION_PROTOCOL.into(),
-            issuer: original.issuer.clone(),
+            protocol: if separate_authority {
+                EFFECT_RECONCILIATION_PROTOCOL_V2
+            } else {
+                EFFECT_RECONCILIATION_PROTOCOL
+            }
+            .into(),
+            issuer: identity.issuer,
+            original_issuer: separate_authority.then(|| original.issuer.clone()),
             scope: original.scope.clone(),
             request_id: request.request_id.into(),
             policy: policy.policy_ref().clone(),
@@ -152,7 +156,7 @@ impl Workbench {
                 request.request_id,
                 command.clone(),
                 &dispatch,
-                &prepared.basis,
+                &basis,
             )
             .map_err(|error| format!("correction reconciliation admission refused: {error:?}"))?;
         Ok(AdmittedEditorCorrectionReconciliation {

@@ -73,8 +73,12 @@ class PinTests(unittest.TestCase):
             ("contract_digest", "0" * 64),
             ("contract_path", "spec/host-action-contract-v1.json"),
             ("contract_path", "spec/host-action-contract-v2.json"),
+            ("contract_path", "spec/host-action-contract-v4.json"),
+            ("contract_path", "spec/host-action-contract-v5.json"),
             ("contract_revision", "whipplescript-host-action/v1.0.0"),
             ("contract_revision", "whipplescript-host-action/v2.0.0"),
+            ("contract_revision", "whipplescript-host-action/v4.0.0"),
+            ("contract_revision", "whipplescript-host-action/v5.0.0"),
         ):
             with self.subTest(field=field):
                 changed = dict(original)

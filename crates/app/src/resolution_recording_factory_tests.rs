@@ -137,7 +137,9 @@ async fn correction_home_admission_retains_exact_input_and_outbox_without_a_file
                 .unwrap(),
             "recorded base"
         );
-        let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+        let key = wb
+            .project_signing_key(&project_signature::command_project(&command).unwrap())
+            .unwrap();
         let retained = crate::action_policy::load_action_policy(
             wb.store_ref(),
             &ActionPolicyIdentity {
@@ -146,7 +148,10 @@ async fn correction_home_admission_retains_exact_input_and_outbox_without_a_file
                 request_id: command.request_id.clone(),
             },
             &command.policy,
-            &GovernanceRootVerifier::new(wb.authority().clone(), key.public_key()),
+            &GovernanceRootVerifier::new(
+                gaugedesk_core::ids::AuthorityId::new(&command.issuer),
+                key.public_key(),
+            ),
         )
         .unwrap();
         let signed: serde_json::Value = serde_json::from_str(retained.signed_envelope()).unwrap();
@@ -357,7 +362,9 @@ async fn correction_home_refuses_command_publication_when_input_attestation_is_n
     let response: serde_json::Value = serde_json::from_str(&response).unwrap();
     let command: HostActionCommand = serde_json::from_value(response["command"].clone()).unwrap();
     let wb = wb.lock_unpoisoned();
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+    let key = wb
+        .project_signing_key(&project_signature::command_project(&command).unwrap())
+        .unwrap();
     let retained = crate::action_input_binding::load_input_binding(
         wb.store_ref(),
         &command.issuer,

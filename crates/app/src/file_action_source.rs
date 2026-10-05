@@ -1,6 +1,7 @@
 //! Exact saved-source preparation for subsequent derived admission (ACTION-4).
 //! A signed source is evidence of retained input, never a grant or endorsement.
 use super::*;
+use crate::file_action_factory::project_signature::{NativeHistoryRoots, ProjectSignature};
 use gaugedesk_store::CommandRecordFact;
 use serde::{Deserialize, Serialize};
 use whipplescript_store::{
@@ -49,6 +50,8 @@ impl SourceStatement {
 struct SignedSource {
     statement: SourceStatement,
     signature: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_signature: Option<ProjectSignature>,
 }
 
 /// Durable body-free source coordinates. Each later use must verify its Home
@@ -140,9 +143,9 @@ fn original_source(
     store: &Store,
     scope: &str,
     expected: &SourceStatement,
-    key: &PublicKey,
+    roots: &NativeHistoryRoots,
 ) -> StoreResult<Option<SignedSource>> {
-    let source = load_source(store, scope, key)?;
+    let source = load_source(store, scope, roots)?;
     if source
         .as_ref()
         .is_some_and(|source| source.statement != *expected)
@@ -152,7 +155,11 @@ fn original_source(
     Ok(source)
 }
 
-fn load_source(store: &Store, scope: &str, key: &PublicKey) -> StoreResult<Option<SignedSource>> {
+fn load_source(
+    store: &Store,
+    scope: &str,
+    roots: &NativeHistoryRoots,
+) -> StoreResult<Option<SignedSource>> {
     let records = store.records(scope, KIND).map_err(|_| refused())?;
     let snapshot = store
         .committed_record_snapshot(scope, KEY)
@@ -161,11 +168,34 @@ fn load_source(store: &Store, scope: &str, key: &PublicKey) -> StoreResult<Optio
         ([], None) => Ok(None),
         ([record], Some(snapshot)) => {
             let source: SignedSource = serde_json::from_str(record)?;
+            let command = store
+                .fold::<ProductActionAdmission>(&source.statement.admission.instance_ref)
+                .map_err(|_| refused())?
+                .command
+                .ok_or_else(refused)?;
+            if command.issuer != source.statement.issuer
+                || command.fingerprint().map_err(|_| refused())?
+                    != source.statement.command_fingerprint
+                || command.instance_ref().map_err(|_| refused())?
+                    != source.statement.admission.instance_ref
+            {
+                return Err(refused());
+            }
+            let root = match &source.project_signature {
+                Some(frame) => frame.root(roots, store, &command),
+                None => roots.original_root(store, &command),
+            }
+            .map_err(|_| refused())?;
+            let bytes = source.statement.signing_bytes()?;
+            let bytes = match &source.project_signature {
+                Some(frame) => frame.signing_bytes(&bytes).map_err(|_| refused())?,
+                None => bytes,
+            };
             if source.statement.snapshot()? != snapshot
                 || !verify_signature(
-                    &source.statement.signing_bytes()?,
+                    &bytes,
                     &Signature::new(source.signature.as_slice()),
-                    key,
+                    root.expected_key(),
                 )
                 .unwrap_or(false)
             {
@@ -206,6 +236,7 @@ impl Workbench {
             SavedObservationOptions {
                 through: Some(observed.evidence.observed_at.clone()),
                 retained: None,
+                publish_metadata: true,
             },
             |current, _, _, _| Ok(current),
         )?;
@@ -215,12 +246,14 @@ impl Workbench {
             .saved
             .as_ref()
             .ok_or("saved source bytes are unavailable")?;
-        let key = SigningKey::from_seed(&self.governance_seed()).map_err(|e| e.reason)?;
+        let project = crate::file_action_factory::project_signature::command_project(command)?;
+        let key = self
+            .project_signing_key(&project)
+            .map_err(|e| e.to_string())?;
+        let roots = NativeHistoryRoots::open(self)?;
         let previous = self
             .store_ref()
-            .read_for_dispatch(&[&scope], |store| {
-                Ok(load_source(store, &scope, &key.public_key()))
-            })
+            .read_for_dispatch(&[&scope], |store| Ok(load_source(store, &scope, &roots)))
             .map_err(|e| format!("{e:?}"))?
             .0
             .map_err(|e| format!("{e:?}"))?;
@@ -254,7 +287,7 @@ impl Workbench {
         {
             return Err("saved source preparation identity changed meaning".into());
         }
-        let history = dispatch_grant::NativeDispatchHistory::open(self, key.public_key())?;
+        let history = dispatch_grant::NativeDispatchHistory::open(self)?;
         inputs
             .publish(std::slice::from_ref(&input), || {
                 self.with_editor_file_save_observation(
@@ -265,6 +298,7 @@ impl Workbench {
                     SavedObservationOptions {
                         through: Some(current.evidence.observed_at.clone()),
                         retained: None,
+                        publish_metadata: true,
                     },
                     |fresh, original, target, writer| {
                         let actual = statement(
@@ -299,16 +333,20 @@ impl Workbench {
                                         &history.store,
                                         &scope,
                                         &expected,
-                                        &key.public_key(),
+                                        &history.roots,
                                     )? {
                                         Some(source) => source,
-                                        None => SignedSource {
-                                            signature: key
-                                                .sign(&expected.signing_bytes()?)
-                                                .as_bytes()
-                                                .to_vec(),
-                                            statement: expected.clone(),
-                                        },
+                                        None => {
+                                            let frame = ProjectSignature::new(&project, &key);
+                                            let bytes = frame
+                                                .signing_bytes(&expected.signing_bytes()?)
+                                                .map_err(|_| refused())?;
+                                            SignedSource {
+                                                signature: key.sign(&bytes).as_bytes().to_vec(),
+                                                statement: expected.clone(),
+                                                project_signature: Some(frame),
+                                            }
+                                        }
                                     };
                                     let snapshot = source.statement.snapshot()?;
                                     let receipt = writer
@@ -326,7 +364,13 @@ impl Workbench {
                                     Ok(RetainedEditorFileSaveSource {
                                         input: input.clone(),
                                         cause: ActionCause {
-                                            authority: expected.issuer.clone(),
+                                            authority: source
+                                                .project_signature
+                                                .as_ref()
+                                                .map_or_else(
+                                                    || expected.issuer.clone(),
+                                                    |frame| frame.authority().into(),
+                                                ),
                                             record_ref: serde_json::to_string(&(&scope, KEY))?,
                                             digest: digest(snapshot.as_bytes()),
                                         },

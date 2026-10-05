@@ -442,3 +442,79 @@ fn correction_result_refuses_a_later_dispute_of_the_acknowledged_attempt() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn legacy_correction_history_reconciles_and_publishes_under_current_project_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = legacy_recorded(dir.path());
+    let mut wb = fixture.shared.lock_unpoisoned();
+    let project = project_signature::command_project(&fixture.command).unwrap();
+    let project_issuer = wb.project_authority_identity(&project).unwrap().0;
+    assert_eq!(fixture.command.issuer, wb.authority().as_str());
+    assert_ne!(fixture.command.issuer, project_issuer.as_str());
+    let identity = ActionPolicyIdentity {
+        issuer: fixture.command.issuer.clone(),
+        scope: fixture.command.scope.clone(),
+        request_id: fixture.command.request_id.clone(),
+    };
+    let receipt = wb
+        .store_ref()
+        .committed_record_snapshot(&identity.storage_scope().unwrap(), "prepare")
+        .unwrap();
+    let (context, token) = reader(&mut wb);
+    reconcile(&mut wb, &context, &fixture);
+    let result = admit_result(&mut wb, &context, &fixture);
+    assert_eq!(result.issuer, fixture.command.issuer);
+    assert_eq!(result.admission, fixture.admission);
+    assert_eq!(
+        wb.store_ref()
+            .fold::<ProductActionAdmission>(&fixture.admission.instance_ref)
+            .unwrap()
+            .command
+            .as_ref(),
+        Some(&fixture.command)
+    );
+    assert_eq!(result.reconciliation.issuer, project_issuer.as_str());
+    assert_eq!(
+        result.reconciliation.protocol,
+        gaugedesk_whip_runtime::host_actions::recovery::EFFECT_RECONCILIATION_PROTOCOL_V2
+    );
+    assert_eq!(
+        result.reconciliation.original_issuer.as_deref(),
+        Some(fixture.command.issuer.as_str())
+    );
+    assert_eq!(result.reconciliation.policy.signer, project_issuer.as_str());
+    assert_eq!(result.policy.signer, project_issuer.as_str());
+    assert_eq!(
+        result.reconciliation.evidence.authority_ref,
+        fixture.command.issuer
+    );
+    assert_eq!(
+        wb.store_ref()
+            .committed_record_snapshot(&identity.storage_scope().unwrap(), "prepare")
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(read_result(&mut wb, &context, &fixture), result);
+    drop(wb);
+    let reopened = crate::open_workbench(dir.path()).unwrap();
+    let mut wb = reopened.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    assert_eq!(read_result(&mut wb, &context, &fixture), result);
+    assert!(
+        wb.admit_editor_correction_result(
+            &context,
+            &fixture.command,
+            &fixture.admission,
+            &result_request()
+        )
+        .unwrap()
+        .replayed
+    );
+    assert_eq!(
+        wb.store_ref()
+            .committed_record_snapshot(&identity.storage_scope().unwrap(), "prepare")
+            .unwrap(),
+        receipt
+    );
+}

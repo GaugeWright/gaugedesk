@@ -390,7 +390,8 @@ fn native_saved_result_admission_refuses_changed_proof_and_disputed_runtime_evid
     )
     .unwrap()
     .unwrap();
-    let fault = rusqlite::Connection::open(dir.path().join("runtime.sqlite")).unwrap();
+    let fault =
+        rusqlite::Connection::open(dir.path().join("actions/native/runtime.sqlite")).unwrap();
     let (id, original): (String, String) = fault.query_row("SELECT event_id, payload_json FROM events WHERE event_type = 'effect.disposition.reconciled'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     for (field, value) in [
         (

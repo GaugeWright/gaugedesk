@@ -311,8 +311,18 @@ fn dispatch_grant_retains_original_session_expiration_and_refuses_uncommitted_ad
         .unwrap();
     let mut body: Signed<Grant> = serde_json::from_str(&original).unwrap();
     body.body.expires_at_ms = Some(1);
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
-    let expired = serde_json::to_string(&sign(body.body, &key).unwrap()).unwrap();
+    let key = wb
+        .project_signing_key(&project_signature::command_project(&command).unwrap())
+        .unwrap();
+    let expired = serde_json::to_string(
+        &sign(
+            body.body,
+            &key,
+            &project_signature::command_project(&command).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let sql = rusqlite::Connection::open(wb.store_ref().path()).unwrap();
     sql.execute(
         "UPDATE commands SET snapshot_json = ?1 WHERE scope_id = ?2",
@@ -840,4 +850,250 @@ fn retained_dispatch_keeps_its_original_idle_ceiling_after_provider_refresh() {
         .unwrap();
     assert!(retry.replayed);
     assert_eq!(retry.grant_ref, grant.grant_ref);
+}
+
+#[test]
+fn project_fact_frame_binds_the_original_project_authority_and_complete_body() {
+    for fault in ["project", "authority", "protocol", "body", "removed"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, command, inputs, token) = admitted_fixture(dir.path());
+        let mut wb = shared.lock_unpoisoned();
+        let context = wb.authenticate_action_context(&token).unwrap();
+        let admitted = wb
+            .authorize_editor_file_save_dispatch(&context, &inputs, &command, "frame-check")
+            .unwrap();
+        let original = wb
+            .store_ref()
+            .committed_record_snapshot(&admitted.grant_ref, "authorize")
+            .unwrap()
+            .unwrap();
+        let signed: Signed<Grant> = serde_json::from_str(&original).unwrap();
+        let project = project_signature::command_project(&command).unwrap();
+        let root = wb.project_authority_identity(&project).unwrap();
+        assert_eq!(
+            signed.project_signature.as_ref().unwrap().authority(),
+            root.0.as_str()
+        );
+        verify(&signed, &root.1).unwrap();
+        let host = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+        assert!(verify(&signed, &host.public_key()).is_err());
+        let mut changed: serde_json::Value = serde_json::from_str(&original).unwrap();
+        match fault {
+            "body" => changed["body"]["source"]["session_ref"] = "foreign-session".into(),
+            "removed" => {
+                changed.as_object_mut().unwrap().remove("project_signature");
+            }
+            field => changed["project_signature"][field] = "foreign".into(),
+        }
+        if matches!(fault, "project" | "authority" | "protocol") {
+            // Keep the cryptographic proof valid so this control exercises
+            // the frame's independent project/authority/version check.
+            let mut changed_signed: Signed<Grant> = serde_json::from_value(changed).unwrap();
+            let frame = changed_signed.project_signature.as_ref().unwrap();
+            let bytes = frame
+                .signing_bytes(&signing_bytes(&changed_signed.body).unwrap())
+                .unwrap();
+            changed_signed.signature = wb.project_signing_key(&project).unwrap().sign(&bytes);
+            verify(&changed_signed, &root.1).unwrap();
+            changed = serde_json::to_value(changed_signed).unwrap();
+        }
+        let changed = serde_json::to_string(&changed).unwrap();
+        let sql = rusqlite::Connection::open(wb.store_ref().path()).unwrap();
+        sql.execute(
+            "UPDATE commands SET snapshot_json=?1 WHERE scope_id=?2",
+            rusqlite::params![changed, admitted.grant_ref],
+        )
+        .unwrap();
+        sql.execute(
+            "UPDATE events SET payload=?1 WHERE scope_id=?2",
+            rusqlite::params![changed, admitted.grant_ref],
+        )
+        .unwrap();
+        assert!(
+            wb.load_editor_file_save_dispatch_authority(&inputs, &command, &admitted.grant_ref)
+                .is_err(),
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn legacy_host_grant_replays_unchanged_and_project_authority_revokes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, command, storage, token) = super::super::tests::legacy_home_storage_fixture(
+        dir.path(),
+        NativeActionStorageConfig {
+            input_byte_limit: 4096,
+            file_lease: whipplescript_kernel::file_lease::FileLeasePolicy::new(17).unwrap(),
+        },
+    );
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let scope = grant_scope(wb.home_id(), &command, "legacy-background").unwrap();
+    let prepared = wb
+        .prepare_native_editor_action_scoped(
+            &context,
+            storage.inputs(),
+            &command,
+            &command.policy,
+            &[&scope],
+            NativeActionAccess::Mutate,
+        )
+        .unwrap();
+    // Retain the actual pre-migration wire format under its original host key.
+    // No project frame or new signature replaces this historical fact.
+    let host = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+    let body = Grant {
+        protocol: PROTOCOL.into(),
+        issuer: command.issuer.clone(),
+        home_id: wb.home_id().as_str().into(),
+        request_id: "legacy-background".into(),
+        actor: context.actor().as_str().into(),
+        origin: "editor.save.dispatch.authorize".into(),
+        policy: command.policy.clone(),
+        original_admission: ProductAdmissionCause {
+            scope: prepared.scope.clone(),
+            command_id: prepared.delivery.command_id.clone(),
+            fingerprint: command.fingerprint().unwrap(),
+        },
+        source: Source::from_request(&context).unwrap(),
+        expires_at_ms: prepared.basis.deadline().map(|deadline| {
+            u64::try_from(
+                deadline
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+        }),
+    };
+    let original = Signed {
+        signature: host.sign(&signing_bytes(&body).unwrap()),
+        body,
+        project_signature: None,
+    };
+    let payload = serde_json::to_string(&original).unwrap();
+    wb.store_mut()
+        .with_dispatch_record_admission(&prepared.basis, |writer| {
+            writer.commit(
+                &scope,
+                "authorize",
+                &payload,
+                &[CommandRecordFact {
+                    scope_id: scope.clone(),
+                    kind: GRANT_KIND.into(),
+                    payload: payload.clone(),
+                }],
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let before = wb.store_ref().retained_events(&scope).unwrap();
+    let retry = wb
+        .authorize_editor_file_save_dispatch(
+            &context,
+            storage.inputs(),
+            &command,
+            "legacy-background",
+        )
+        .unwrap();
+    assert!(retry.replayed);
+    assert_eq!(wb.store_ref().retained_events(&scope).unwrap(), before);
+    assert_eq!(
+        wb.store_ref()
+            .committed_record_snapshot(&scope, "authorize")
+            .unwrap()
+            .unwrap(),
+        payload
+    );
+    wb.load_editor_file_save_dispatch_authority(storage.inputs(), &command, &scope)
+        .unwrap();
+    wb.revoke_editor_file_save_dispatch(&context, storage.inputs(), &command, &scope)
+        .unwrap();
+    let revoked: Signed<Revocation> = serde_json::from_str(
+        &wb.store_ref()
+            .committed_record_snapshot(&scope, "revoke")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let project = project_signature::command_project(&command).unwrap();
+    let (authority, public) = wb.project_authority_identity(&project).unwrap();
+    assert_eq!(
+        revoked.project_signature.as_ref().unwrap().authority(),
+        authority.as_str()
+    );
+    assert_eq!(revoked.body.grant_signature, original.signature);
+    verify(&revoked, &public).unwrap();
+    assert!(verify(&revoked, &host.public_key()).is_err());
+    assert_eq!(
+        wb.store_ref()
+            .committed_record_snapshot(&scope, "authorize")
+            .unwrap()
+            .unwrap(),
+        payload
+    );
+    assert!(wb
+        .load_editor_file_save_dispatch_authority(storage.inputs(), &command, &scope)
+        .is_err());
+    let roots = NativeHistoryRoots::open(&wb).unwrap();
+    assert!(
+        load_grant(wb.store_ref(), wb.home_id(), &command, &scope, &roots)
+            .unwrap()
+            .unwrap()
+            .1
+    );
+    drop(wb);
+    drop(shared);
+    let restarted = crate::open_workbench(dir.path()).unwrap();
+    let wb = restarted.lock_unpoisoned();
+    let roots = NativeHistoryRoots::open(&wb).unwrap();
+    assert!(
+        load_grant(wb.store_ref(), wb.home_id(), &command, &scope, &roots)
+            .unwrap()
+            .unwrap()
+            .1
+    );
+}
+
+#[test]
+fn historical_project_grant_verification_survives_lost_private_custody_but_current_dispatch_refuses(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, command, inputs, token) = admitted_fixture(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let context = wb.authenticate_action_context(&token).unwrap();
+    let grant = wb
+        .authorize_editor_file_save_dispatch(&context, &inputs, &command, "custody-check")
+        .unwrap();
+    let authority = wb
+        .load_editor_file_save_dispatch_authority(&inputs, &command, &grant.grant_ref)
+        .unwrap();
+    let prepared = wb
+        .prepare_native_editor_action(&authority.context, &inputs, &command, &command.policy)
+        .unwrap();
+    let cause = prepared.grant_cause.unwrap();
+    let provenance = with_grant_cause(command.provenance.clone(), Some(&cause));
+    let history = NativeDispatchHistory::open(&wb).unwrap();
+    let project = project_signature::command_project(&command).unwrap();
+    let custody = dir
+        .path()
+        .join("content-keys/projects")
+        .join(format!("{}.key", crate::org::sha256_hex(&project)));
+    std::fs::remove_file(&custody).unwrap();
+    history
+        .verify(&command, &provenance, &command.provenance)
+        .unwrap();
+    let before = wb.store_ref().retained_events(&grant.grant_ref).unwrap();
+    assert!(wb
+        .load_editor_file_save_dispatch_authority(&inputs, &command, &grant.grant_ref)
+        .is_err());
+    assert!(wb
+        .authorize_editor_file_save_dispatch(&context, &inputs, &command, "no-remint")
+        .is_err());
+    assert_eq!(
+        wb.store_ref().retained_events(&grant.grant_ref).unwrap(),
+        before
+    );
+    assert!(!custody.exists());
 }

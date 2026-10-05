@@ -12,7 +12,7 @@ use gaugedesk_store::command_dispatch::DispatchReadBasis;
 use gaugedesk_whip_runtime::{
     host_actions::{
         action_result::{
-            ActionResultSnapshot, ActionResultVerifier, ReadActionResult, ACTION_RESULT_PROTOCOL,
+            ActionResultSnapshot, ActionResultVerifier, ReadActionResult, ACTION_RESULT_PROTOCOL_V2,
         },
         facade::GovernedHostFacade,
         LogAppend,
@@ -86,8 +86,13 @@ fn read_evidence(
 ) -> StoreResult<ActionResultSnapshot> {
     admission.validate_for(command).map_err(refused)?;
     let request = ReadActionResult {
-        protocol: ACTION_RESULT_PROTOCOL.into(),
+        protocol: ACTION_RESULT_PROTOCOL_V2.into(),
         issuer: command.issuer.clone(),
+        read_authority: Some(
+            crate::project_authority::authority(&key.public_key())
+                .as_str()
+                .into(),
+        ),
         scope: command.scope.clone(),
         policy: runtime.policy_ref().clone(),
         provenance: ActionProvenance {
@@ -149,8 +154,7 @@ impl Workbench {
         command: &HostActionCommand,
         extra_scopes: &[&str],
     ) -> Result<CorrectionInspectionPreparation, String> {
-        if command.issuer != self.authority().as_str()
-            || command.provenance.initiator != command.provenance.executor
+        if command.provenance.initiator != command.provenance.executor
             || !command.provenance.delegation.is_empty()
             || command.inputs.len() != 1
             || command.resources.len() != 1
@@ -197,8 +201,8 @@ impl Workbench {
         let policy_scope = identity.storage_scope()?;
         let mapping_scope =
             input_binding_scope(&command.issuer, input).map_err(|error| format!("{error:?}"))?;
-        let key = SigningKey::from_seed(&self.governance_seed()).map_err(|error| error.reason)?;
-        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        let roots = project_signature::NativeHistoryRoots::open(self)?;
+        let root = roots.original_root(self.store_ref(), command)?;
         let mut scopes = vec![
             LIBRARY_SCOPE,
             ORG_SCOPE,
@@ -229,20 +233,14 @@ impl Workbench {
                     .map_err(|_| invalid("original correction policy is unavailable"))?;
                 let original = delivery::original_policy(retained.signed_envelope())
                     .map_err(|_| invalid("original correction policy is unrepresentable"))?;
-                Self::correction_source_policy(
-                    store,
-                    home.as_str(),
-                    &key.public_key(),
-                    command,
-                    &original,
-                )
-                .map_err(|_| invalid("original correction source evidence is unavailable"))?;
+                Self::correction_source_policy(store, home.as_str(), &roots, command, &original)
+                    .map_err(|_| invalid("original correction source evidence is unavailable"))?;
                 let mapping = load_input_binding(
                     store,
                     &command.issuer,
                     home.as_str(),
                     input,
-                    &key.public_key(),
+                    root.expected_key(),
                 );
                 Ok((current, admitted, original, mapping))
             })
@@ -270,8 +268,16 @@ impl Workbench {
             return Err("correction inspection has no original Home outbox binding".into());
         }
         let read_policy = policy::compile(&current, &original_scope, &original)?;
-        let signed_policy =
-            sign_hosted_policy_envelope(&read_policy.to_json()?, self.authority(), &key, 1)?;
+        let basis = current
+            .bind_deadline(basis)
+            .map_err(|error| format!("{error:?}"))?;
+        let (key, basis) = self.native_project_signer_access(
+            &current.project_id,
+            basis,
+            NativeActionAccess::Inspect,
+        )?;
+        let issuer = crate::project_authority::authority(&key.public_key());
+        let signed_policy = sign_hosted_policy_envelope(&read_policy.to_json()?, &issuer, &key, 1)?;
         let target = self
             .engagements
             .get(&chat)
@@ -279,9 +285,6 @@ impl Workbench {
             .native_resolution_recording_evidence_target(&path, original_scope)
             .map_err(|error| format!("{error:?}"))?;
         let source = self.native_action_observation_source()?;
-        let basis = current
-            .bind_deadline(basis)
-            .map_err(|error| format!("{error:?}"))?;
         Ok(CorrectionInspectionPreparation {
             key,
             basis,
@@ -303,7 +306,7 @@ impl Workbench {
         admission: &ActionAdmissionReceipt,
     ) -> Result<ActionResultSnapshot, String> {
         let prepared = self.prepare_correction_inspection(context, command)?;
-        let issuer = self.authority().clone();
+        let issuer = crate::project_authority::authority(&prepared.key.public_key());
         self.store_mut()
             .with_dispatch_basis(&prepared.basis, || {
                 let runtime = prepared.runtime(&issuer)?;
@@ -324,7 +327,7 @@ impl Workbench {
         run_id: &str,
     ) -> Result<EditorCorrectionObservation, String> {
         let prepared = self.prepare_correction_inspection(context, command)?;
-        let issuer = self.authority().clone();
+        let issuer = crate::project_authority::authority(&prepared.key.public_key());
         self.store_mut()
             .with_dispatch_basis(&prepared.basis, || -> StoreResult<_> {
                 let runtime = prepared.runtime(&issuer)?;

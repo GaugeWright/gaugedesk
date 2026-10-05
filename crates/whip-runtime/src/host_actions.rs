@@ -5,8 +5,8 @@
 //! The product shell must authenticate principals, admit intent and retain exact
 //! references before invoking the governed facade.
 
-pub const REVISION: &str = "whipplescript-host-action/v4.0.0";
-pub const DIGEST: &str = "b468641c9ccb6d41482c2f9c5a2c5f49258611a90fd9776dec87c39546d06370";
+pub const REVISION: &str = "whipplescript-host-action/v6.0.0";
+pub const DIGEST: &str = "12081b319a28cf05d432708f2f1336732e7cde6e8c6e043726d37c0dfc1af6f0";
 
 pub use whipplescript_kernel::host_action::CompiledHostAction;
 pub use whipplescript_kernel::host_facade as facade;

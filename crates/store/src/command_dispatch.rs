@@ -179,7 +179,7 @@ struct DispatchSnapshot<Command> {
     dispatch: CommandDispatch,
 }
 
-fn check_dispatch_basis(
+pub(crate) fn check_dispatch_basis(
     tx: &rusqlite::Transaction<'_>,
     store_path: &str,
     basis: &DispatchReadBasis,

@@ -141,7 +141,7 @@ impl Workbench {
             crate::account_auth::ACCOUNT_AUTH_SCOPE,
             crate::mobile_machine_session::SCOPE,
         ];
-        let (authority, _) = self
+        let (authority, preparation_basis) = self
             .store_ref()
             .read_for_dispatch(&authority_scopes, read)
             .map_err(|error| format!("correction authorization refused: {error:?}"))?;
@@ -156,7 +156,7 @@ impl Workbench {
             .map_err(|error| format!("{error:?}"))?;
         let recording = ResolutionRecordingAction::compile()?;
         let action = recording.action();
-        let identity = ActionPolicyIdentity {
+        let mut identity = ActionPolicyIdentity {
             issuer: self.authority().as_str().into(),
             // Retain the exact target path used for admission without claiming a
             // file version or exposing a caller-chosen physical store locator.
@@ -169,11 +169,36 @@ impl Workbench {
             .map_err(|error| error.to_string())?,
             request_id: request.request_id.into(),
         };
-        let signing_key =
-            SigningKey::from_seed(&self.governance_seed()).map_err(|error| error.reason)?;
-        let root = GovernanceRootVerifier::new(self.authority().clone(), signing_key.public_key());
-        let policy =
-            prepare_action_policy(self.store_mut(), &identity, &authority.policy, &signing_key)?;
+        let roots = project_signature::NativeHistoryRoots::open(self)?;
+        let legacy_root =
+            roots.policy_root(self.store_ref(), &authority.project_id, &identity.issuer)?;
+        let previous = crate::action_policy::prepared_action_policy(
+            self.store_ref(),
+            &identity,
+            &authority.policy,
+            &legacy_root,
+        )?;
+        let preparation_basis = authority
+            .bind_deadline(preparation_basis)
+            .map_err(|e| format!("{e:?}"))?;
+        let (signing_key, preparation_basis) =
+            self.native_project_signer(&authority.project_id, preparation_basis)?;
+        if previous.is_none() {
+            identity.issuer = crate::project_authority::authority(&signing_key.public_key())
+                .as_str()
+                .into();
+        }
+        let root = roots.policy_root(self.store_ref(), &authority.project_id, &identity.issuer)?;
+        let policy = match previous {
+            Some(previous) => previous,
+            None => crate::action_policy::prepare_action_policy_against(
+                self.store_mut(),
+                &identity,
+                &authority.policy,
+                &signing_key,
+                &preparation_basis,
+            )?,
+        };
         let envelope =
             ifc::VerifiedEnvelope::verify_signed_text_with(policy.signed_envelope(), &root)?;
         crate::resolution_recording_policy::validate_resolution_recording_flows(&envelope)?;
@@ -196,13 +221,14 @@ impl Workbench {
             &body,
         )
         .map_err(|error| format!("{error:?}"))?;
-        crate::action_input_binding::retain_input_binding(
+        crate::action_input_binding::retain_original_input_binding(
             self.store_mut(),
             inputs,
             &identity.issuer,
             home.as_str(),
             &input,
-            &signing_key,
+            (&signing_key, root.expected_key()),
+            &preparation_basis,
         )
         .map_err(|error| format!("correction input mapping refused: {error:?}"))?;
         let mapping_scope =

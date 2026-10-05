@@ -79,6 +79,7 @@ fn applied_reconciliation(
             continue;
         }
         command.validate().map_err(|_| refused())?;
+        verify_reconciliation_policy(&snapshot.command, command, history)?;
         history
             .verify(
                 &snapshot.command,
@@ -88,9 +89,7 @@ fn applied_reconciliation(
             .map_err(|_| refused())?;
         if recorded.diagnostic.is_some()
             || command.evidence.disposition != EvidenceDisposition::Applied
-            || command.issuer != snapshot.command.issuer
             || command.scope != snapshot.command.scope
-            || command.policy != snapshot.command.policy
             || command.evidence_label_ref != original.binding.evidence_label
             || command.evidence.authority_ref != snapshot.command.issuer
             || command.evidence.evidence_ref != snapshot.command.resources["target"].resource.handle
@@ -168,7 +167,7 @@ impl Workbench {
         if target.branch() != branch || target.path() != path || target.base() != base {
             return Err("editor target differs from its actual native binding".into());
         }
-        let history = dispatch_grant::NativeDispatchHistory::open(self, prepared.key.public_key())?;
+        let history = dispatch_grant::NativeDispatchHistory::open(self)?;
         self.store_mut()
             .with_dispatch_record_admission(&prepared.basis, |writer| {
                 ownership::require_epoch(runtime, admission, epoch)?;

@@ -19,8 +19,15 @@ pub(crate) fn authority(public_key: &PublicKey) -> AuthorityId {
 }
 
 impl Workbench {
-    fn require_owned_project(&self, project: &str) -> io::Result<()> {
-        if project.trim().is_empty() || !self.owns_project(project) {
+    pub(crate) fn require_owned_project(&self, project: &str) -> io::Result<()> {
+        let library = crate::library::Library::rebuild(self.store_ref())
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
+        if project.trim().is_empty()
+            || library
+                .projects
+                .get(project)
+                .is_none_or(|record| record.home_id != *self.home_id())
+        {
             return Err(io::Error::other("project signing authority is not local"));
         }
         Ok(())
@@ -36,6 +43,33 @@ impl Workbench {
     /// must admit the project creation/recovery first; this storage operation
     /// grants no membership or permission to publish a signed fact.
     pub fn initialize_project_authority(&mut self, project: &str) -> io::Result<()> {
+        let handoff = crate::federation::handoff_scope(project);
+        let (_, basis) = self
+            .store_ref()
+            .read_for_dispatch(&[crate::library::LIBRARY_SCOPE, &handoff], |store| {
+                crate::federation::require_project_writes_available(store, project)
+            })
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "project initialization authority refused: {error:?}"
+                ))
+            })?;
+        self.initialize_project_authority_at(project, &basis)
+    }
+
+    pub(crate) fn initialize_project_authority_against(
+        &mut self,
+        project: &str,
+        basis: &gaugedesk_store::command_dispatch::DispatchReadBasis,
+    ) -> io::Result<()> {
+        self.initialize_project_authority_at(project, basis)
+    }
+
+    fn initialize_project_authority_at(
+        &mut self,
+        project: &str,
+        basis: &gaugedesk_store::command_dispatch::DispatchReadBasis,
+    ) -> io::Result<()> {
         self.require_owned_project(project)?;
         if self
             .store_ref()
@@ -78,7 +112,10 @@ impl Workbench {
             custody: custody.into(),
             wrapped_seed,
         };
-        if let Err(error) = self.store_mut().retain_project_authority_key(&retained) {
+        let retention = self
+            .store_mut()
+            .retain_project_authority_key_against(&retained, basis);
+        if let Err(error) = retention {
             // A crash/retry or concurrent initializer may have committed first.
             // Recover only an actually retained key through the strict reader.
             if self
@@ -250,6 +287,13 @@ mod tests {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
         };
+        wb.store_mut()
+            .append_record(
+                crate::library::LIBRARY_SCOPE,
+                "project",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
         wb.library.projects.insert(id.into(), record);
     }
 
@@ -265,6 +309,36 @@ mod tests {
         project(&mut wb, "a");
         project(&mut wb, "b");
         wb
+    }
+
+    #[test]
+    fn cached_project_without_current_ownership_cannot_initialize_signing_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let mut wb = workbench(root.path());
+        let mut deleted = wb.library.projects["a"].clone();
+        deleted.op = crate::library::RecordOp::Tombstone;
+        wb.store_mut()
+            .append_record(
+                crate::library::LIBRARY_SCOPE,
+                "project",
+                &serde_json::to_string(&deleted).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            wb.library.projects.contains_key("a"),
+            "stale cache still claims the project"
+        );
+        assert!(wb
+            .initialize_project_authority("a")
+            .unwrap_err()
+            .to_string()
+            .contains("not local"));
+        assert!(wb.store_ref().project_authority_key("a").unwrap().is_none());
+        assert!(!root
+            .path()
+            .join("content-keys/projects")
+            .join(format!("{}.key", crate::org::sha256_hex("a")))
+            .exists());
     }
 
     #[test]
@@ -345,12 +419,14 @@ mod tests {
     #[test]
     fn persistent_database_without_root_never_uses_loopback_custody() {
         let root = tempfile::tempdir().unwrap();
-        let mut template = workbench(root.path());
-        let record = template.library.projects.remove("a").unwrap();
         let store = Store::open(root.path().join("persistent.sqlite").to_str().unwrap()).unwrap();
         let mut wb = Workbench::new(store);
-        wb.library.projects.insert("a".into(), record);
-        assert!(wb.initialize_project_authority("a").is_err());
+        project(&mut wb, "a");
+        assert!(wb
+            .initialize_project_authority("a")
+            .unwrap_err()
+            .to_string()
+            .contains("custody is unavailable"));
         assert!(wb.store_ref().project_authority_key("a").unwrap().is_none());
         // A real scratch store may use the explicitly marked development double.
         let mut bare = Workbench::new(Store::open_in_memory().unwrap());

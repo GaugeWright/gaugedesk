@@ -73,15 +73,43 @@ impl Store {
         &mut self,
         key: &ProjectAuthorityKey,
     ) -> Result<ProjectAuthorityKey, AuthorityKeyError> {
+        self.retain_project_authority_key_at(key, None)
+    }
+
+    /// Admit durable key identity under the same current-authority snapshot as
+    /// its first signed fact. The basis is checked inside this durable writer.
+    pub fn retain_project_authority_key_against(
+        &mut self,
+        key: &ProjectAuthorityKey,
+        basis: &crate::command_dispatch::DispatchReadBasis,
+    ) -> Result<ProjectAuthorityKey, AuthorityKeyError> {
+        self.retain_project_authority_key_at(key, Some(basis))
+    }
+
+    fn retain_project_authority_key_at(
+        &mut self,
+        key: &ProjectAuthorityKey,
+        basis: Option<&crate::command_dispatch::DispatchReadBasis>,
+    ) -> Result<ProjectAuthorityKey, AuthorityKeyError> {
         if key.project_id.trim().is_empty() || key.authority_id.trim().is_empty() {
             return Err(AuthorityKeyError::Conflict(
                 "project authority identity is empty",
             ));
         }
+        let store_path = self.path.clone();
         crate::durable_registry::write(
             &mut self.conn,
             AuthorityKeyError::Conflict("project key creation must precede the product writer"),
             |tx| {
+                if let Some(basis) = basis {
+                    crate::command_dispatch::check_dispatch_basis(tx, &store_path, basis).map_err(
+                        |_| {
+                            AuthorityKeyError::Conflict(
+                                "project key authority changed during preparation",
+                            )
+                        },
+                    )?;
+                }
                 if let Some(found) = read(tx, &key.project_id)? {
                     if found != *key {
                         return Err(AuthorityKeyError::Conflict(
@@ -172,5 +200,45 @@ mod tests {
         assert!(store
             .retain_project_authority_key(&candidate("project", 'a'))
             .is_ok());
+    }
+
+    #[test]
+    fn key_registration_checks_current_basis_inside_its_durable_writer() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (_, stale) = store
+            .read_for_dispatch(&["project-authority"], |_| Ok(()))
+            .unwrap();
+        store
+            .append_record("project-authority", "handoff", "offered")
+            .unwrap();
+        let key = candidate("project", 'a');
+        assert!(store
+            .retain_project_authority_key_against(&key, &stale)
+            .is_err());
+        assert!(store.project_authority_key("project").unwrap().is_none());
+        let (_, current) = store
+            .read_for_dispatch(&["project-authority"], |_| Ok(()))
+            .unwrap();
+        assert!(
+            store
+                .retain_project_authority_key_against(&key, &current)
+                .unwrap()
+                == key
+        );
+        let (_, foreign) = Store::open_in_memory()
+            .unwrap()
+            .read_for_dispatch(&["project-authority"], |_| Ok(()))
+            .unwrap();
+        assert!(store
+            .retain_project_authority_key_against(&candidate("other", 'b'), &foreign)
+            .is_err());
+        let (_, expired) = store
+            .read_for_dispatch(&["project-authority"], |_| Ok(()))
+            .unwrap();
+        let expired = expired.with_deadline(std::time::UNIX_EPOCH);
+        assert!(store
+            .retain_project_authority_key_against(&candidate("other", 'b'), &expired)
+            .is_err());
+        assert!(store.project_authority_key("other").unwrap().is_none());
     }
 }

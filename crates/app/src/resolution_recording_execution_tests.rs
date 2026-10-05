@@ -509,7 +509,9 @@ fn interrupted_correction_settlement_remains_unknown_after_restart_and_input_era
     );
     assert!(result.terminal.is_none());
     assert_eq!(receipt(&wb, &command, &original), recorded);
-    let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+    let key = wb
+        .project_signing_key(&project_signature::command_project(&command).unwrap())
+        .unwrap();
     let mapping = crate::action_input_binding::load_input_binding(
         wb.store_ref(),
         &command.issuer,
@@ -614,7 +616,9 @@ fn correction_execution_requires_the_original_home_mapping_before_dispatch() {
             }
             2 | 3 => {
                 signed["statement"]["content_hash"] = "0".repeat(32).into();
-                let key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
+                let key = wb
+                    .project_signing_key(&project_signature::command_project(&command).unwrap())
+                    .unwrap();
                 if case == 3 {
                     // Even a correctly signed statement must match the bytes
                     // resolved for this attempt. Signing cannot replace that check.

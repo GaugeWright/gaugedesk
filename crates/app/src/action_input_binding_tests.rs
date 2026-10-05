@@ -284,3 +284,61 @@ fn input_binding_takes_product_exclusion_before_waiting_for_retention() {
         "input binding waited for content before fencing the product"
     );
 }
+
+#[test]
+fn native_mapping_publication_fences_current_home_authority_even_on_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut product, inputs, input, key) = setup(dir.path());
+    let public = key.public_key();
+    let scope = input_binding_scope(ISSUER, &input).unwrap();
+    let (_, stale) = product
+        .read_for_dispatch(&["current-home"], |_| Ok(()))
+        .unwrap();
+    product
+        .append_record("current-home", "member-grant", "revoked")
+        .unwrap();
+    assert!(retain_original_input_binding(
+        &mut product,
+        &inputs,
+        ISSUER,
+        HOME,
+        &input,
+        (&key, &public),
+        &stale
+    )
+    .is_err());
+    assert!(product.records(&scope, KIND).unwrap().is_empty());
+    assert!(product
+        .committed_record_snapshot(&scope, KEY)
+        .unwrap()
+        .is_none());
+    let (_, current) = product
+        .read_for_dispatch(&["current-home"], |_| Ok(()))
+        .unwrap();
+    retain_original_input_binding(
+        &mut product,
+        &inputs,
+        ISSUER,
+        HOME,
+        &input,
+        (&key, &public),
+        &current,
+    )
+    .unwrap();
+    let receipt = product.committed_record_snapshot(&scope, KEY).unwrap();
+    let expired = current.with_deadline(std::time::UNIX_EPOCH);
+    assert!(retain_original_input_binding(
+        &mut product,
+        &inputs,
+        ISSUER,
+        HOME,
+        &input,
+        (&key, &public),
+        &expired
+    )
+    .is_err());
+    assert_eq!(
+        product.committed_record_snapshot(&scope, KEY).unwrap(),
+        receipt
+    );
+}

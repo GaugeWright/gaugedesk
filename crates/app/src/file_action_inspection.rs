@@ -5,7 +5,7 @@ use super::*;
 use crate::action_policy::load_action_policy;
 use gaugedesk_store::command_dispatch::{CommittedDispatch, DispatchReadBasis};
 use gaugedesk_whip_runtime::{
-    host_actions::action_result::{ReadActionResult, ACTION_RESULT_PROTOCOL},
+    host_actions::action_result::{ReadActionResult, ACTION_RESULT_PROTOCOL_V2},
     sign_hosted_policy_envelope, ResourcePolicy,
 };
 use whipplescript_kernel::{gov::canonicalize, host_protocol::PinnedPosition};
@@ -14,6 +14,7 @@ use whipplescript_kernel::{gov::canonicalize, host_protocol::PinnedPosition};
 struct SavedObservationOptions<'a> {
     through: Option<PinnedPosition>,
     retained: Option<&'a ResourcePolicy>,
+    publish_metadata: bool,
 }
 
 /// Constructed only by a currently authorized read of original runtime/target
@@ -250,8 +251,7 @@ impl Workbench {
         retained_restrictions: Option<&ResourcePolicy>,
     ) -> Result<EditorFileSaveReadPreparation, String> {
         let invalid_profile = || "saved input is outside the registered native profile".to_owned();
-        if command.issuer != self.authority().as_str()
-            || command.provenance.initiator != command.provenance.executor
+        if command.provenance.initiator != command.provenance.executor
             || !command.provenance.delegation.is_empty()
             || !command.provenance.causes.is_empty()
             || command.provenance.origin != "editor.save"
@@ -302,8 +302,8 @@ impl Workbench {
             request_id: command.request_id.clone(),
         };
         let policy_scope = identity.storage_scope()?;
-        let key = SigningKey::from_seed(&self.governance_seed()).map_err(|e| e.reason)?;
-        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        let root = project_signature::NativeHistoryRoots::open(self)?
+            .original_root(self.store_ref(), command)?;
         let acknowledgment_scope = format!("host-action-runtime-ack:{scope}");
         let account_scopes = account_authority_scopes(context)?;
         let mut scopes = vec![
@@ -359,6 +359,12 @@ impl Workbench {
             return Err("saved input has no original Home outbox binding".into());
         }
         let retained = retained?;
+        let basis = current.bind_deadline(basis).map_err(|e| format!("{e:?}"))?;
+        let (key, basis) = self.native_project_signer_access(
+            &current.project_id,
+            basis,
+            NativeActionAccess::Inspect,
+        )?;
         let original: HostGovernancePolicy =
             serde_json::from_str(retained.signed_envelope()).map_err(|e| e.to_string())?;
         if canonicalize(&original.to_json()?)? != canonicalize(retained.signed_envelope())? {
@@ -378,7 +384,6 @@ impl Workbench {
                 *resource = restrictions.clone();
             }
         }
-        let basis = current.bind_deadline(basis).map_err(|e| format!("{e:?}"))?;
         Ok(EditorFileSaveReadPreparation {
             key,
             basis,
@@ -413,7 +418,7 @@ impl Workbench {
         }
         let EditorFileSaveReadPreparation {
             key,
-            basis,
+            mut basis,
             dispatch,
             restrictions,
             policy,
@@ -422,7 +427,21 @@ impl Workbench {
             path,
             base,
         } = self.prepare_editor_file_save_inspection(context, command, &[], options.retained)?;
-        let root = GovernanceRootVerifier::new(self.authority().clone(), key.public_key());
+        if options.publish_metadata {
+            let project = project_signature::command_project(command)?;
+            let handoff = crate::federation::handoff_scope(&project);
+            let (_, current) = self
+                .store_ref()
+                .read_for_dispatch(&[LIBRARY_SCOPE, &handoff], |store| {
+                    crate::federation::require_project_writes_available(store, &project)
+                })
+                .map_err(|e| format!("saved-source publication paused: {e:?}"))?;
+            basis = basis
+                .combine(current)
+                .map_err(|e| format!("saved-source publication authority changed: {e:?}"))?;
+        }
+        let issuer = crate::project_authority::authority(&key.public_key());
+        let root = GovernanceRootVerifier::new(issuer.clone(), key.public_key());
         let admission = match admission {
             Some(receipt) => Some(receipt.clone()),
             None => crate::host_action_delivery::retained_runtime_acknowledgment(
@@ -432,7 +451,7 @@ impl Workbench {
             .map_err(|e| format!("retained runtime evidence refused: {e:?}"))?
             .map(|acknowledgment| acknowledgment.receipt),
         };
-        let signed = sign_hosted_policy_envelope(&policy.to_json()?, self.authority(), &key, 1)?;
+        let signed = sign_hosted_policy_envelope(&policy.to_json()?, &issuer, &key, 1)?;
         let prepared = if admission.is_some() {
             let target = self
                 .engagements
@@ -444,7 +463,7 @@ impl Workbench {
                 return Err("saved input differs from its actual target".into());
             }
             let source = self.native_action_observation_source()?;
-            let history = dispatch_grant::NativeDispatchHistory::open(self, key.public_key())?;
+            let history = dispatch_grant::NativeDispatchHistory::open(self)?;
             Some((target, source, history))
         } else {
             None
@@ -472,8 +491,9 @@ impl Workbench {
                 )
                 .map_err(|e| StoreError::Conflict(format!("saved-input reader refused: {e:?}")))?;
                 let request = ReadActionResult {
-                    protocol: ACTION_RESULT_PROTOCOL.into(),
+                    protocol: ACTION_RESULT_PROTOCOL_V2.into(),
                     issuer: command.issuer.clone(),
+                    read_authority: Some(issuer.as_str().into()),
                     scope: command.scope.clone(),
                     policy: runtime.policy_ref().clone(),
                     provenance: ActionProvenance {
