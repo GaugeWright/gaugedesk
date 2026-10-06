@@ -221,6 +221,7 @@ interface OrganizationPolicyDraft {
     readonly requireMatchingRegion: boolean;
     readonly placementOperators: readonly PlacementOperator[];
     readonly requirePlacementApproval: boolean;
+    readonly projectSharing: "members" | "anyone";
     readonly allowAutoUpgrade: boolean;
     readonly sessionLifetimeHours: number;
     readonly idleTimeoutMinutes: number;
@@ -258,6 +259,7 @@ const organizationPolicyDraft = (model: OrganizationPolicyPageV1): OrganizationP
         requireMatchingRegion: rules.some(isMatchingRegionRule),
         placementOperators: model.placement.allowed_operators,
         requirePlacementApproval: model.archetype_approval.require_approval,
+        projectSharing: model.project_sharing,
         allowAutoUpgrade: security?.allow_auto_upgrade ?? false,
         sessionLifetimeHours: security ? security.session_lifetime_secs / 3_600 : 0,
         idleTimeoutMinutes: security ? security.idle_timeout_secs / 60 : 0,
@@ -269,6 +271,9 @@ const organizationPolicyDraft = (model: OrganizationPolicyPageV1): OrganizationP
         residencyRegion: security?.residency_region ?? null,
     };
 };
+
+const sharingLabel = (sharing: "members" | "anyone"): string =>
+    sharing === "anyone" ? "Anyone, invited by email" : "Organization members only";
 
 const setMembership = <T extends string>(values: readonly T[], value: T, checked: boolean): readonly T[] =>
     checked ? [...new Set([...values, value])] : values.filter((candidate) => candidate !== value);
@@ -313,6 +318,7 @@ function OrganizationPolicyEditor(props: {
         if (before.requireMatchingRegion !== after.requireMatchingRegion) changes.push(`Matching region: ${before.requireMatchingRegion ? "required" : "not required"} → ${after.requireMatchingRegion ? "required" : "not required"}`);
         if (JSON.stringify(before.placementOperators) !== JSON.stringify(after.placementOperators)) changes.push(`Eligible Project Hosts: ${before.placementOperators.join(", ") || "all"} → ${after.placementOperators.join(", ") || "all"}`);
         if (before.requirePlacementApproval !== after.requirePlacementApproval) changes.push(`New placements: ${before.requirePlacementApproval ? "approval required" : "admitted"} → ${after.requirePlacementApproval ? "approval required" : "admitted"}`);
+        if (before.projectSharing !== after.projectSharing) changes.push(`Project sharing: ${sharingLabel(before.projectSharing)} → ${sharingLabel(after.projectSharing)}`);
         if (before.allowAutoUpgrade !== after.allowAutoUpgrade) changes.push(`Publisher upgrades: ${before.allowAutoUpgrade ? "may apply" : "stay pinned"} → ${after.allowAutoUpgrade ? "may apply" : "stay pinned"}`);
         if (before.sessionLifetimeHours !== after.sessionLifetimeHours) changes.push(`Session lifetime: ${before.sessionLifetimeHours || "unset"} → ${after.sessionLifetimeHours || "unset"} hours`);
         if (before.idleTimeoutMinutes !== after.idleTimeoutMinutes) changes.push(`Idle timeout: ${before.idleTimeoutMinutes || "unset"} → ${after.idleTimeoutMinutes || "unset"} minutes`);
@@ -342,6 +348,7 @@ function OrganizationPolicyEditor(props: {
                 allowed_operators: value.placementOperators,
             },
             archetype_approval: { require_approval: value.requirePlacementApproval },
+            project_sharing: value.projectSharing,
         };
     };
     return <>
@@ -358,6 +365,9 @@ function OrganizationPolicyEditor(props: {
             <div class="gaugeapp-policy-group"><h2>Agent changes</h2>
                 <label class="gaugeapp-check"><input type="checkbox" checked={draft().requirePlacementApproval} onChange={(event) => setDraft((value) => ({ ...value, requirePlacementApproval: event.currentTarget.checked }))} />Require approval for newly added Agents</label>
                 <label class="gaugeapp-check"><input type="checkbox" checked={draft().allowAutoUpgrade} onChange={(event) => setDraft((value) => ({ ...value, allowAutoUpgrade: event.currentTarget.checked }))} />Allow publisher-requested upgrades to apply automatically</label>
+            </div>
+            <div class="gaugeapp-policy-group"><h2>Project sharing</h2><p>Who this organization's projects can be shared with. It applies to the next invitation; invitations already sent are unchanged.</p>
+                <fieldset><legend>Projects can be shared with</legend><For each={["members", "anyone"] as const}>{(sharing) => <label><input type="radio" name="project-sharing" checked={draft().projectSharing === sharing} onChange={() => setDraft((value) => ({ ...value, projectSharing: sharing }))} />{sharingLabel(sharing)}</label>}</For></fieldset>
             </div>
             <div class="gaugeapp-policy-group"><h2>Sessions &amp; history</h2>
                 <div class="gaugeapp-policy-numbers"><label><span>Maximum session (hours)</span><input type="number" min="0" step="1" value={draft().sessionLifetimeHours} onInput={(event) => setDraft((value) => ({ ...value, sessionLifetimeHours: Number(event.currentTarget.value) || 0 }))} /></label><label><span>Idle timeout (minutes)</span><input type="number" min="0" step="1" value={draft().idleTimeoutMinutes} onInput={(event) => setDraft((value) => ({ ...value, idleTimeoutMinutes: Number(event.currentTarget.value) || 0 }))} /></label><label><span>Minimum history guarantee (days)</span><input type="number" min="1" step="1" value={draft().auditGuaranteeDays} onInput={(event) => setDraft((value) => ({ ...value, auditGuaranteeDays: Number(event.currentTarget.value) || 1 }))} /></label></div>

@@ -59,9 +59,9 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
     // ENTSEC-1: the middleware needs its own handle to the workbench (the router
     // moves `wb` into `.with_state`).
     let auth_wb = wb.clone();
-    let federation_on = {
+    let (federation_on, member_use) = {
         let g = wb.lock_unpoisoned();
-        g.is_federation_enabled()
+        (g.is_federation_enabled(), g.member_use())
     };
     Router::new()
         .merge(gaugedesk_app::local_routes::routes(federation_on))
@@ -79,6 +79,12 @@ pub fn enterprise_control_plane(wb: SharedWorkbench) -> Router {
         .merge(gaugedesk_app::account_signin::gaugeapp_proxy_routes())
         .merge(gaugedesk_app::facility_routes::routes())
         .merge(gaugedesk_app::mobile_machine_session::routes())
+        // Inside `enterprise_auth`, so only an admitted request that
+        // succeeded counts as a member using its project (DR-0312).
+        .layer(axum::middleware::from_fn_with_state(
+            (wb.clone(), member_use),
+            gaugedesk_app::key_delegation::record_member_use,
+        ))
         // Materialize non-environment mutation idempotency inside the
         // enterprise identity boundary. An anonymous mutation must fail as
         // unauthenticated before request-shape or idempotency diagnostics reveal
@@ -330,7 +336,10 @@ async fn get_project_share_candidates(
         Ok(org) => (
             StatusCode::OK,
             Json(json!({
-                "candidates": project_share_candidates(&org, actor.0.as_str())
+                "candidates": project_share_candidates(&org, actor.0.as_str()),
+                // Whether someone outside may also be invited by email
+                // (DR-0332). The Home minting that invitation asks here too.
+                "sharing": org.effective_project_sharing(),
             })),
         )
             .into_response(),
@@ -497,6 +506,7 @@ mod project_share_directory_tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(value["candidates"][0]["authority"], "authority:owner");
+        assert_eq!(value["sharing"], "members", "members only unless opened");
 
         let forbidden = app
             .oneshot(

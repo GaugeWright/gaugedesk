@@ -62,6 +62,7 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     ensureCollectionRecipient: "command",
     handoffStatus: "projection",
     handoffParticipants: "projection",
+    getProjectKeyDelegations: "projection",
     listPeers: "projection",
     handoffRelocate: "command",
     handoffRevoke: "command",
@@ -77,7 +78,7 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     createChatUnderArchetype: "command",
     createChatUnderPlacement: "command",
     reviseChatTargets: "command",
-    useArchetype: "command",
+    previewAgent: "command",
     createEngagement: "command",
     forkChat: "command",
     renameChat: "command",
@@ -292,6 +293,11 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.handoffParticipants(this.routeJson(), project);
     }
 
+    /** What background work holds which of a project's keys (DR-0312). */
+    getProjectKeyDelegations(project: ProjectId): Promise<workbenchClient.ProjectKeyDelegations> {
+        return workbenchClient.getProjectKeyDelegations(this.workbenchTransport(), project);
+    }
+
     listPeers(): Promise<FederationPeer[]> {
         return workbenchClient.listPeers(this.routeJson());
     }
@@ -305,12 +311,14 @@ export class MobileControlPlane implements FacetBrowserApi {
     }
 
     createHomeInvitation(
-        authority: string,
+        recipient: string | { readonly email: string },
         project: ProjectId,
         role: "member" | "viewer" = "member",
     ): Promise<CreatedHomeInvitation> {
         return workbenchClient.createHomeInvitation(this.routeJson(), {
-            authority: authority.trim(),
+            ...(typeof recipient === "string"
+                ? { authority: recipient.trim() }
+                : { email: recipient.email.trim() }),
             project,
             endpoint: this.base,
             role,
@@ -392,8 +400,8 @@ export class MobileControlPlane implements FacetBrowserApi {
         await workbenchClient.reviseChatTargets(this.workbenchTransport(), id, targets);
     }
 
-    useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {
-        return workbenchClient.useArchetype(this.workbenchTransport(), archetypeId, title);
+    previewAgent(archetypeId: ArchetypeId, placementId?: PlacementId): Promise<EngagementId> {
+        return workbenchClient.previewAgent(this.workbenchTransport(), archetypeId, placementId);
     }
 
     createEngagement(): Promise<Engagement> {

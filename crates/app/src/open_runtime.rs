@@ -326,6 +326,14 @@ pub(crate) async fn supervise_home_reachability(
             Ok(false) => {}
             Err(error) => tracing::warn!("first Home not attached: {error}"),
         }
+        // What a claim gave its account is written down, so it outlives the
+        // claim (DR-0309, DR-0313, WS-588). After the first pass this writes
+        // nothing.
+        match wb.lock_unpoisoned().settle_claimed_ownership() {
+            Ok(0) => {}
+            Ok(written) => eprintln!("[ownership] recorded the claimant on {written} records"),
+            Err(error) => tracing::warn!("claimed ownership not recorded: {error}"),
+        }
         // Each learner's GaugeWright-maintained Tutorials project (DR-0225).
         // After the first pass its source is only compared with this release.
         match wb.lock_unpoisoned().ensure_shipped_tutorials() {

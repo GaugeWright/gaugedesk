@@ -23,7 +23,7 @@
  */
 
 import { createResource, For, Show } from "solid-js";
-import type { EngagementId, HumanTask } from "@gaugewright/control-plane-client";
+import { isProjectTask, type EngagementId, type HumanTask } from "@gaugewright/control-plane-client";
 import type { AssignedTrackerTask, AssignedTrackerTasks } from "./assigned-tracker-tasks";
 import { displayChatTitle } from "./chat-title";
 
@@ -48,6 +48,13 @@ const ASK_COPY: Record<string, { verb: string; hint: (title: string) => string }
     screen: {
         verb: "inbound",
         hint: (t) => `Inbound material is waiting for you in ${t}'s Inbox — review it before an agent can read it`,
+    },
+    // Background work paused because nobody used its project for 30 days
+    // (DR-0312). Like `inbound` it belongs to a project, and opening that
+    // project is the whole remedy: a member's use renews the work.
+    resume: {
+        verb: "paused",
+        hint: (t) => `Background work in ${t} paused because nobody used the project for 30 days — open it to resume`,
     },
 };
 
@@ -74,6 +81,9 @@ export function TaskBar(props: {
      *  when every waiting item came from it, otherwise the project's. Optional:
      *  an environment with no Inbox still shows the count, as a note. */
     onOpenInbox?: (inbox: { project: string; projectName: string; placement?: string }) => void;
+    /** A paused pill opens the project's background work (DR-0312). Reading
+     *  it is a member using the project, which resumes the work. */
+    onOpenBackgroundWork?: (project: { project: string; projectName: string }) => void;
     /** The signed-in person's tracker assignments, and where each opens.
      *  Absent when there is no account session: a signed-out person has no
      *  personal queue, which is different from one that could not be read. */
@@ -166,26 +176,32 @@ export function TaskBar(props: {
                 <For each={tasks()}>
                     {(t: HumanTask) => {
                         // Chat ask (answer/repair/reply): id is an EngagementId
-                        // (narrowed by kind). A `screen` task is the project's:
-                        // its id is the project and it names no chat.
+                        // (narrowed by kind). A `screen` or `resume` task is the
+                        // project's: its id is the project and it names no chat.
+                        const projectTask = isProjectTask(t);
                         const inbound = t.kind === "screen";
                         const engagement = t.id as EngagementId;
-                        const active = () => !inbound && props.selected === engagement;
+                        const active = () => !projectTask && props.selected === engagement;
                         const color = agentColor(t.agent);
                         const ask = ASK_COPY[t.kind] ?? ASK_COPY.reply;
                         // One canonical title everywhere (#4): never leak the raw
                         // "new chat" placeholder — show the same "Untitled" the tree
                         // and chat header show, so the pill is recognisably the same chat.
                         // An inbound pill's title is its project's name.
-                        const title = () => inbound ? t.title : displayChatTitle(t.title);
-                        // An inbound pill is a door onto an Inbox, which needs no
-                        // chat. Every other kind discharges inside its chat.
+                        const title = () => projectTask ? t.title : displayChatTitle(t.title);
+                        // An inbound pill is a door onto an Inbox and a paused
+                        // pill onto the project's background work; neither needs
+                        // a chat. Every other kind discharges inside its chat.
                         const openInbox = props.onOpenInbox;
-                        const opens = !inbound || (!!openInbox && !!t.project);
+                        const openBackgroundWork = props.onOpenBackgroundWork;
+                        const opens = !projectTask
+                            || (!!t.project && (inbound ? !!openInbox : !!openBackgroundWork));
                         const open = () => {
-                            if (!inbound) props.onSelect(engagement);
-                            else if (openInbox && t.project) {
+                            if (!projectTask) props.onSelect(engagement);
+                            else if (inbound && openInbox && t.project) {
                                 openInbox({ project: t.project, projectName: t.title, placement: t.placement });
+                            } else if (!inbound && openBackgroundWork && t.project) {
+                                openBackgroundWork({ project: t.project, projectName: t.title });
                             }
                         };
                         return (
@@ -205,7 +221,9 @@ export function TaskBar(props: {
                                 aria-label={
                                     inbound
                                         ? `${opens ? "open " : ""}${t.waiting ?? 0} inbound item(s) awaiting review in ${title()}`
-                                        : `open ${ask.verb} for ${title()}`
+                                        : projectTask
+                                            ? `${opens ? "open " : ""}background work paused in ${title()}`
+                                            : `open ${ask.verb} for ${title()}`
                                 }
                                 title={ask.hint(title())}
                                 style={color ? { "border-left": `3px solid ${color}` } : undefined}
@@ -219,7 +237,7 @@ export function TaskBar(props: {
                                 {/* The count is the point of an inbound pill: it
                                     says how much is waiting, which no other task
                                     kind needs because they are each one item. */}
-                                <Show when={inbound}>
+                                <Show when={projectTask}>
                                     <span class="task-count" data-task-count>{t.waiting ?? 0}</span>
                                 </Show>
                                 <span class="task-agent">{t.agent}</span>

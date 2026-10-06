@@ -574,9 +574,9 @@ export function EnterpriseWorkbench(): JSX.Element {
         onNewChat: () => undefined,
         projectRequest,
         clearProjectRequest: () => setProjectRequest(null),
-        get projectShareCandidates() {
+        get projectShareDirectory() {
             return tenant()
-                ? () => api.projectShareCandidates(tenant()!)
+                ? () => api.projectShareDirectory(tenant()!)
                 : undefined;
         },
         get openOrganizationPeople() {

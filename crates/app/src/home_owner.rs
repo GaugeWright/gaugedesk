@@ -181,6 +181,9 @@ fn claim_selected(wb: &SharedWorkbench, verified: Option<&str>) -> Result<HomeCl
         .store_mut()
         .append_records_atomically(&records)
         .map_err(err)?;
+    // The claim is what gives its account the computer's projects, Agents
+    // and credentials; write that down at once (DR-0309, DR-0313).
+    guard.settle_claimed_ownership()?;
     Ok(if governed {
         HomeClaim::Governed
     } else {

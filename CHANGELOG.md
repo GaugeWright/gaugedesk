@@ -19,6 +19,34 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- On a desktop, an Agent's, project's or Panel's settings chat runs on the
+  same OpenAI or Codex access as that account's chats there. Before, it looked
+  for model access where nothing a desktop links is kept, and refused every
+  message with "link OpenAI or Codex model access in Account Settings" while
+  chats worked.
+
+- A project you own can be shared with anyone by email: Project settings →
+  People & sharing makes an invitation link for an address, and only an
+  account that has verified that address can accept it. An organization's
+  projects still go to its members only, until an owner allows invitations by
+  email under Organization Policy → Project sharing.
+
+- Signing in to ChatGPT / Codex from a hosted Home or the Hub no longer needs
+  the Codex CLI: GaugeDesk speaks OpenAI's device-code sign-in itself. A Home
+  or Hub without `codex` installed now offers a code instead of failing.
+
+- A project can be forked from its menu: the fork is a new project of your
+  own with the original's files and Agents, and none of its people, chats,
+  credentials or deployments. Project settings → Work & data shows what a fork
+  came from and pulls the original's later changes, asking you to keep your
+  version or take theirs for any file both changed.
+
+- "test in a chat" on an Agent in the Workshop runs the draft as it stands,
+  without publishing, in a chat of its own with its own empty files. The chat
+  sits under the Agent beside its edit chats, and testing again replaces it
+  with one running the latest draft. Before, it ran the published version in
+  Personal, and on a Personal holding more than one target it opened nothing.
+
 - Native chat runtimes verify the policy's original signer and public key
   independently of the runtime actor. A harness factory carries public
   verification evidence without retaining a private governance signing key.

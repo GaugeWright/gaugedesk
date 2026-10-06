@@ -3229,7 +3229,7 @@
         ],
         "deployed": [],
         "property": [
-          "crates/app/src/codex_oauth.rs#device_app_server_completion_seals_only_the_bound_home_person_scope"
+          "crates/app/src/codex_oauth.rs#device_login_completion_seals_only_the_bound_home_person_scope"
         ]
       }
     },
@@ -3265,7 +3265,7 @@
         ],
         "deployed": [],
         "property": [
-          "crates/app/src/codex_oauth.rs#device_app_server_completion_seals_only_the_bound_home_person_scope"
+          "crates/app/src/codex_oauth.rs#device_login_completion_seals_only_the_bound_home_person_scope"
         ]
       }
     },
@@ -4672,6 +4672,114 @@
         "deployed": [],
         "property": [
           "crates/app/src/whip_costs.rs#a_store_that_will_not_open_withholds_the_total_rather_than_lowering_it"
+        ]
+      }
+    },
+    {
+      "id": "home.project.fork",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/projects/:id/fork",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project",
+      "capability": "fork-project-on-authoritative-home",
+      "requestSchema": "rust:gaugedesk-app/project_fork/ForkProject",
+      "responseSchema": "gw://schemas/project/fork/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/project_fork.rs#a_fork_copies_the_managed_files_exactly_and_records_its_upstream"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#project-authority-matrix"
+        ],
+        "journey": [
+          "crates/app/src/project_fork.rs#a_fork_copies_the_managed_files_exactly_and_records_its_upstream"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_fork.rs#a_retried_fork_returns_the_same_project"
+        ]
+      }
+    },
+    {
+      "id": "home.project.upstream",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/projects/:id/upstream",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project",
+      "capability": "read-project-fork-upstream",
+      "requestSchema": "http/path-project-id",
+      "responseSchema": "gw://schemas/project/upstream/v1",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/project_fork.rs#a_pull_brings_the_originals_changes_and_keeps_the_forks_own"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#project-authority-matrix"
+        ],
+        "journey": [
+          "crates/app/src/project_fork.rs#a_pull_brings_the_originals_changes_and_keeps_the_forks_own"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_fork.rs#deleting_the_original_leaves_the_fork_whole"
+        ]
+      }
+    },
+    {
+      "id": "home.project.upstream.pull",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/projects/:id/upstream/pull",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project",
+      "capability": "pull-project-fork-upstream",
+      "requestSchema": "rust:gaugedesk-app/project_fork/PullUpstream",
+      "responseSchema": "gw://schemas/project/upstream-pull/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/project_fork.rs#a_pull_brings_the_originals_changes_and_keeps_the_forks_own"
+        ],
+        "authority": [
+          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#project-authority-matrix"
+        ],
+        "journey": [
+          "crates/app/src/project_fork.rs#a_pull_brings_the_originals_changes_and_keeps_the_forks_own"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_fork.rs#a_conflict_is_settled_only_by_an_explicit_choice"
         ]
       }
     },
@@ -10577,6 +10685,13 @@
     {
       "method": "POST",
       "path": "/projects/{id}/settings/sessions",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "GET",
+      "path": "/projects/{project}/key-delegations",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

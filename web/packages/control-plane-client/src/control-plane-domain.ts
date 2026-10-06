@@ -269,11 +269,18 @@ export interface ProjectNode {
     readonly name: string;
     /** The always-visible zero-setup personal trust boundary (ADR 0097). */
     readonly isPersonal: boolean;
+    /** The organization tenant that owns this project, or `null` for the
+     *  person's own work. The navigator shows a project only under the
+     *  organization selection that owns it (DR-0325). */
+    readonly organization: string | null;
     /** Release-managed project, when the product owns its source and layout. */
     readonly product?: { readonly kind: "tutorials"; readonly publisher: string } | null;
     /** Network egress posture (RF-B3): `true` isolates this project's chats from
      *  the network (fail-closed); `false` (the default) lets them reach the model. */
     readonly networkIsolated: boolean;
+    /** The project this one was forked from (GaugeWright DR-0208), by id
+     *  only; its name is known where the original is visible. */
+    readonly upstream?: ProjectId | null;
     readonly targets: readonly WorkTargetNode[];
     readonly placements: PlacementNode[];
 }
@@ -492,6 +499,10 @@ export interface Workspace {
     /** The explicit Personal project's default placement. Retained as a direct
      * quick-start address alongside the rooted project tree. */
     readonly personalPlacement: PlacementId | null;
+    /** The organization this Home was provisioned for, which a project created
+     *  here belongs to; `null` on a Home that holds the person's own work
+     *  (DR-0325). */
+    readonly homeOrganization: string | null;
 }
 
 /** One chat-content search hit: a chat whose **log** (SEARCH-1) or **worktree file**
@@ -544,7 +555,14 @@ export function isWorkspaceRecord(v: unknown): v is WorkspaceChange["record"] {
  *  has parked on a person (`screen`, ADR 0110 §7). */
 /** `review` is absent by design: ADR 0136 retired that ask with the per-change
  *  hold. A server that still sends it degrades to `reply` in {@link getTasks}. */
-export type TaskKind = "answer" | "repair" | "reply" | "screen";
+export type TaskKind = "answer" | "repair" | "reply" | "screen" | "resume";
+
+/** Whether a task belongs to a project and names no chat: inbound material
+ *  waiting on a person (`screen`), or background work paused because nobody
+ *  used its project for 30 days (`resume`, DR-0312). Its `id` is not a chat. */
+export function isProjectTask(task: { readonly kind: TaskKind }): boolean {
+    return task.kind === "screen" || task.kind === "resume";
+}
 
 /** One item in the signed-in person's chat-derived queue (the top bar). The
  *  kind is the **ask** — the verb the person is being asked to perform (ADR
@@ -562,10 +580,11 @@ export interface HumanTask {
     /** The authority this task is assigned to: always the signed-in person,
      *  since the Home returns only their own (WHIP-4). */
     readonly assignee?: string;
-    /** `screen` only: the project whose quarantine this counts. Its Inbox is
-     *  where the task opens. */
+    /** `screen` and `resume`: the project the task belongs to. A `screen`
+     *  task opens its Inbox; a `resume` task opens its background work. */
     readonly project?: string;
-    /** `screen` only: how many items are waiting on a person. */
+    /** `screen`: how many items are waiting on a person. `resume`: how much
+     *  of the project's background work is paused. */
     readonly waiting?: number;
     /** `screen` only: the Panel placement every waiting item came from, when
      *  there is exactly one. Its Inbox in Panel Settings then holds all of it,
@@ -869,8 +888,10 @@ export function parseWorkspace(raw: unknown): Workspace {
             home_id?: string;
             name: string;
             is_personal?: boolean;
+            organization?: string | null;
             product?: { kind?: string; publisher?: string } | null;
             network_isolated?: boolean;
+            upstream?: string | null;
             targets: unknown[];
             placements: {
                 placement_id: string;
@@ -895,6 +916,7 @@ export function parseWorkspace(raw: unknown): Workspace {
         workstreams?: Parameters<typeof parseWorkstream>[0][];
         work_targets: unknown[];
         personal_placement?: string | null;
+        home_organization?: string | null;
     };
     return {
         archetypes: (o.archetypes ?? []).map((a) => ({
@@ -920,8 +942,10 @@ export function parseWorkspace(raw: unknown): Workspace {
             homeId: (p.home_id ?? "") as HomeId,
             name: p.name,
             isPersonal: p.is_personal ?? false,
+            organization: typeof p.organization === "string" && p.organization ? p.organization : null,
             product: p.product?.kind === "tutorials" ? { kind: "tutorials", publisher: p.product.publisher ?? "GaugeWright" } : null,
             networkIsolated: p.network_isolated ?? false,
+            upstream: typeof p.upstream === "string" ? (p.upstream as ProjectId) : null,
             targets: valueList(p.targets, "project.targets").map(parseWorkTarget),
             placements: p.placements.map((pl) => ({
                 placementId: pl.placement_id as PlacementId,
@@ -977,6 +1001,7 @@ export function parseWorkspace(raw: unknown): Workspace {
         workstreams: (o.workstreams ?? []).map(parseWorkstream),
         workTargets: valueList(o.work_targets, "work_targets").map(parseWorkTarget),
         personalPlacement: o.personal_placement ? (o.personal_placement as PlacementId) : null,
+        homeOrganization: typeof o.home_organization === "string" && o.home_organization ? o.home_organization : null,
     };
 }
 

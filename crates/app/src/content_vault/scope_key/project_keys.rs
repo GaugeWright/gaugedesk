@@ -143,10 +143,31 @@ impl ScopeProjectIndex {
     }
 }
 
-/// Unwrapped project keys, by key id, for the life of the process.
+/// Unwrapped project keys, by key id, while a session or step holds their
+/// project (WS-740).
 #[derive(Default)]
 pub(crate) struct ProjectKeyCache {
     keys: Mutex<HashMap<String, [u8; 32]>>,
+}
+
+impl ProjectKeyCache {
+    /// Forget `project`'s key.
+    pub(crate) fn forget(&self, project: &str) {
+        self.keys.lock().unwrap().remove(&project_key_id(project));
+    }
+
+    pub(crate) fn clear(&self) {
+        self.keys.lock().unwrap().clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.keys.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.lock().unwrap().is_empty()
+    }
 }
 
 fn project_key_id(project: &str) -> String {
@@ -209,7 +230,7 @@ impl ContentVault {
 
     /// A project's key, minted on first use when `create` is set. Never
     /// replaces one that exists.
-    fn project_key(&self, key_id: &str, create: bool) -> std::io::Result<[u8; 32]> {
+    pub(crate) fn project_key(&self, key_id: &str, create: bool) -> std::io::Result<[u8; 32]> {
         if let Some(key) = self.project_keys.keys.lock().unwrap().get(key_id) {
             return Ok(*key);
         }
@@ -483,6 +504,7 @@ mod tests {
                 .project_of_chat(&created.id)
                 .expect("a default chat lives in a project")
                 .to_owned();
+            guard.hold_session_for_tests(&project);
             guard
                 .store_mut()
                 .append_record(&created.id, "transcript", r#"{"said":"hello"}"#)
@@ -511,7 +533,15 @@ mod tests {
             DekCustody::Project(project_key_id(&project)),
             "starting the workbench moves it under its project's key"
         );
-        let guard = wb.lock_unpoisoned();
+        let mut guard = wb.lock_unpoisoned();
+        let vault = guard.content_vault.clone().unwrap();
+        assert_eq!(
+            vault.open_project_keys(),
+            0,
+            "the start-up re-wrap leaves no project key open (WS-740)"
+        );
+        assert!(vault.opened_projects().is_empty());
+        guard.hold_session_for_tests(&project);
         let transcript = guard.store_ref().records(&chat, "transcript").unwrap();
         assert_eq!(transcript, vec![r#"{"said":"hello"}"#.to_owned()]);
     }

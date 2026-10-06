@@ -26,7 +26,17 @@ pub struct AccountIdentity {
     /// responses and verified external id-tokens carry no durable evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<crate::account_session::AccountSessionEvidence>,
+    /// Present only when the caller named an address in
+    /// [`VERIFIED_EMAIL_HEADER`]: whether this account holds it as an active
+    /// verified email (DR-0332). It says nothing about any other account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holds_email: Option<bool>,
 }
+
+/// The address a Home asks about when it binds an email invitation to the
+/// account accepting it (DR-0332). A header rather than a query parameter, so
+/// the address never sits in a URL.
+pub const VERIFIED_EMAIL_HEADER: &str = "x-gaugedesk-verified-email";
 
 /// `GET /account/identity` — the [`AccountIdentity`] of the presented bearer.
 pub async fn get_account_identity(
@@ -34,10 +44,14 @@ pub async fn get_account_identity(
     headers: HeaderMap,
 ) -> axum::response::Response {
     let wb = wb.lock_unpoisoned();
+    let asked = headers
+        .get(VERIFIED_EMAIL_HEADER)
+        .and_then(|value| value.to_str().ok());
     identity_response(
         &wb,
         net_http::bearer(&headers),
         crate::workbench_auth::web_account_mode(),
+        asked,
     )
 }
 
@@ -45,8 +59,15 @@ fn identity_response(
     wb: &Workbench,
     bearer: Option<&str>,
     on_hub: bool,
+    asked_email: Option<&str>,
 ) -> axum::response::Response {
-    let mut response = match bearer_identity(wb, bearer, on_hub) {
+    let identity = bearer_identity(wb, bearer, on_hub).map(|mut identity| {
+        if let Some(email) = asked_email {
+            identity.holds_email = Some(holds_verified_email(wb, &identity.account, email));
+        }
+        identity
+    });
+    let mut response = match identity {
         Ok(identity) => (StatusCode::OK, Json(identity)).into_response(),
         Err((status, message)) => (status, Json(json!({ "error": message }))).into_response(),
     };
@@ -77,14 +98,83 @@ fn bearer_identity(
         return Ok(AccountIdentity {
             account,
             session: Some(session),
+            holds_email: None,
         });
     }
     wb.authenticate_bearer(token)
         .map(|authority| AccountIdentity {
             account: authority.as_str().to_owned(),
             session: None,
+            holds_email: None,
         })
         .ok_or((StatusCode::UNAUTHORIZED, "this bearer is not recognised"))
+}
+
+/// Whether `account` holds `email` as an active verified email. An address
+/// that does not normalize is held by nobody.
+fn holds_verified_email(wb: &Workbench, account: &str, email: &str) -> bool {
+    let Some(email) = crate::account_auth::normalize_email_contact(email) else {
+        return false;
+    };
+    crate::account_auth::AccountAuth::rebuild(wb.store_ref()).is_ok_and(|auth| {
+        auth.emails.values().any(|record| {
+            record.account_id == account
+                && record.status == crate::account_auth::AuthMethodStatus::Active
+                && record.email == email
+        })
+    })
+}
+
+/// What the Hub says about the account presenting `bearer` and `email`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EmailStanding {
+    /// The bearer is `account`'s, and that account holds `email` verified.
+    Holds { account: String },
+    /// The bearer is `account`'s, and that account does not hold `email`.
+    DoesNotHold { account: String },
+    /// The Hub does not recognise the bearer.
+    Unrecognised,
+}
+
+/// Ask the Hub at `hub` whether the account `bearer` belongs to holds `email`
+/// as a verified email (DR-0332). `Err` is not reaching a Hub that answers.
+pub fn hub_email_standing(hub: &str, bearer: &str, email: &str) -> Result<EmailStanding, String> {
+    let agent = ureq::AgentBuilder::new()
+        // Never follow a redirect with someone's bearer in hand.
+        .redirects(0)
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(15))
+        .build();
+    let response = match agent
+        .get(&format!("{}/account/identity", hub.trim_end_matches('/')))
+        .set("authorization", &format!("Bearer {bearer}"))
+        .set(VERIFIED_EMAIL_HEADER, email)
+        .call()
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(401 | 403, _)) => return Ok(EmailStanding::Unrecognised),
+        Err(ureq::Error::Status(status, _)) => {
+            return Err(format!("the account service answered {status}"))
+        }
+        Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
+    };
+    let identity: AccountIdentity = response
+        .into_json()
+        .map_err(|error| format!("the account service answered unreadably: {error}"))?;
+    if identity.account.is_empty() {
+        return Err("the account service named no account".to_owned());
+    }
+    // A Hub that predates DR-0332 ignores the header and omits the answer;
+    // that is not a yes.
+    match identity.holds_email {
+        Some(true) => Ok(EmailStanding::Holds {
+            account: identity.account,
+        }),
+        Some(false) => Ok(EmailStanding::DoesNotHold {
+            account: identity.account,
+        }),
+        None => Err("the account service cannot confirm an email yet".to_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +224,91 @@ mod tests {
         );
     }
 
+    /// A Home binding an email invitation learns only whether the caller's own
+    /// account holds the address it asked about (DR-0332).
+    #[tokio::test]
+    async fn a_home_learns_whether_the_caller_holds_an_email_and_nothing_more() {
+        use axum::{routing::get, Router};
+        use std::sync::Mutex;
+        let mut workbench = hub();
+        let alice = workbench
+            .mint_account_session("account-alice", "passkey", 60)
+            .unwrap();
+        let bob = workbench
+            .mint_account_session("account-bob", "passkey", 60)
+            .unwrap();
+        crate::account_auth::append_facts(
+            workbench.store_mut(),
+            &[crate::account_auth::AccountAuthFact::Email(
+                crate::account_auth::VerifiedEmailRecord::new(
+                    "account-alice",
+                    "Alice@Example.test",
+                    1,
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let wb = Arc::new(Mutex::new(workbench));
+        let app = Router::new()
+            .route(
+                "/account/identity",
+                get(
+                    |State(wb): State<SharedWorkbench>, headers: HeaderMap| async move {
+                        let asked = headers
+                            .get(VERIFIED_EMAIL_HEADER)
+                            .and_then(|value| value.to_str().ok());
+                        identity_response(
+                            &wb.lock_unpoisoned(),
+                            net_http::bearer(&headers),
+                            true,
+                            asked,
+                        )
+                    },
+                ),
+            )
+            .with_state(wb.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let service = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let answers = tokio::task::spawn_blocking(move || {
+            [
+                hub_email_standing(&hub, &alice, " alice@example.TEST "),
+                hub_email_standing(&hub, &bob, "alice@example.test"),
+                hub_email_standing(&hub, &alice, "someone@example.test"),
+                hub_email_standing(&hub, "not-a-session", "alice@example.test"),
+            ]
+        })
+        .await
+        .unwrap();
+        service.abort();
+        assert_eq!(
+            answers,
+            [
+                Ok(EmailStanding::Holds {
+                    account: "account-alice".into()
+                }),
+                Ok(EmailStanding::DoesNotHold {
+                    account: "account-bob".into()
+                }),
+                Ok(EmailStanding::DoesNotHold {
+                    account: "account-alice".into()
+                }),
+                Ok(EmailStanding::Unrecognised),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_identity_asked_nothing_about_email_says_nothing_about_it() {
+        let identity: AccountIdentity =
+            serde_json::from_value(json!({"account": "alice"})).unwrap();
+        assert!(identity.holds_email.is_none());
+        assert!(!serde_json::to_string(&identity)
+            .unwrap()
+            .contains("holds_email"));
+    }
+
     #[tokio::test]
     async fn identity_http_response_is_current_and_never_cacheable() {
         use axum::{body::Body, http::Request, routing::get, Router};
@@ -150,7 +325,12 @@ mod tests {
                 "/account/identity",
                 get(
                     |State(wb): State<SharedWorkbench>, headers: HeaderMap| async move {
-                        identity_response(&wb.lock_unpoisoned(), net_http::bearer(&headers), true)
+                        identity_response(
+                            &wb.lock_unpoisoned(),
+                            net_http::bearer(&headers),
+                            true,
+                            None,
+                        )
                     },
                 ),
             )

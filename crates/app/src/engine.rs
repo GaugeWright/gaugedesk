@@ -378,7 +378,7 @@ The files you edit are instructions for a different agent. They are not instruct
 
 ## Testing
 
-You cannot test the Agent from this chat. Your instructions are not the Agent's, so anything you try here is shaped by them and tells the user nothing reliable about how the Agent behaves. When the user wants to see the Agent in action, tell them to publish the draft and use "test in a chat" on the Agent in the Workshop. For a Panel agent, use "try in a preview chat". Do not role-play the Agent to show what it would say.
+You cannot test the Agent from this chat. Your instructions are not the Agent's, so anything you try here is shaped by them and tells the user nothing reliable about how the Agent behaves. When the user wants to see the Agent in action, tell them to use "test in a chat" on the Agent in the Workshop. It runs the draft as it stands, with no need to publish, in a separate chat with its own empty files, and testing again replaces that chat with one running the latest draft. For a Panel agent, "try in a preview chat" works the same way. Do not role-play the Agent to show what it would say.
 "#;
 
 /// Append a durable transcript record (admitted run evidence) to the engagement's
@@ -1836,7 +1836,13 @@ pub fn run_engagement_turn(
         return Err(EngineError::AlreadyRunning);
     };
     bind_turn_image_sources(id, input.images);
+    // A turn is its member's session using the chat's project for as long as
+    // it runs, including after the request that started it has gone
+    // (WS-740): a client that disconnects mid-turn does not strand its
+    // transcript.
+    let held = crate::key_delegation::hold_chat_project(wb, id);
     let settled = run_claimed_engagement_turn(wb, id, worktree, sender, input);
+    drop(held);
     drop(claim);
     // The chat's queue signals and notice change when its turn ends, however it
     // ended and whoever started it — a choice answer, a federated crossing, or

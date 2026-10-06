@@ -530,6 +530,7 @@ pub fn workspace_delta_value(
         "workstreams": selected_workstreams,
         "work_targets": selected_work_targets,
         "personal_placement": workspace.get("personal_placement").cloned().unwrap_or(serde_json::Value::Null),
+        "home_organization": workspace.get("home_organization").cloned().unwrap_or(serde_json::Value::Null),
         "order": {
             "archetypes": ids(&archetypes, "id"),
             "projects": ids(&projects, "id"),
@@ -630,10 +631,8 @@ pub async fn get_notices(
         None => (operator.is_some()
             && crate::net_http::bearer(&headers).is_none()
             && crate::mobile_machine_session::session_token(&headers).is_none())
-        .then(|| {
-            wb.home_owner_account()
-                .unwrap_or_else(|| wb.authority().as_str().to_owned())
-        }),
+        // Signed out, the reader is the local account (DR-0328 §2).
+        .then(|| wb.authority().as_str().to_owned()),
     };
     let Some(reader) = reader else {
         return (
@@ -1305,7 +1304,7 @@ pub async fn post_materialize_organization_shared_project(
     }
 }
 
-fn create_named_project_with_extra(
+pub(crate) fn create_named_project_with_extra(
     wb: &mut Workbench,
     id: &str,
     requested_name: &str,
@@ -1337,7 +1336,7 @@ pub(crate) fn create_personal_project(
     Ok(())
 }
 
-fn create_project_lifecycle(
+pub(crate) fn create_project_lifecycle(
     wb: &mut Workbench,
     id: &str,
     requested_name: &str,
@@ -1617,6 +1616,10 @@ fn use_or_place_admitted(wb: &Workbench, headers: &HeaderMap, agent: &str) -> bo
         .and_then(|token| wb.resolve_account_session(token))
     {
         Some((account, _)) => wb.agent_placeable_by(agent, &account),
+        // Signed out, the window is the local account (DR-0328 §2).
+        None if wb.desktop_account_mode() && net_http::bearer(headers).is_none() => {
+            wb.agent_placeable_by(agent, wb.authority().as_str())
+        }
         None => true,
     }
 }
@@ -1860,9 +1863,10 @@ pub struct StartPanelPreview {
     pub placement_id: Option<String>,
 }
 
-/// Try a Panel agent in a disposable work chat (DR-0272 §3): its draft, or a
-/// project placement's pinned version, with the caller's work-chat defaults.
-/// The chat is ended with `DELETE /chats/{id}`, which ends the preview.
+/// Try an Agent in a disposable work chat with the caller's work-chat defaults:
+/// its draft (DR-0324), or for a Panel agent a project placement's pinned
+/// version (DR-0272 §3). The chat is ended with `DELETE /chats/{id}`, which
+/// ends the preview.
 pub async fn start_panel_preview(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
@@ -2375,6 +2379,20 @@ pub async fn accept_boundary(
     if let Err((code, msg)) = wb.authenticate_request(crate::net_http::bearer(&headers)) {
         return (code, msg).into_response();
     }
+    // A device pairing is its account's: on a desktop only that account
+    // accepts it, as itself (DR-0328 §3). Other boundaries record a named
+    // party's acceptance under their own rules.
+    if bid.starts_with("pairing")
+        && wb
+            .pairing_actor(&headers)
+            .is_some_and(|actor| actor != body.participant)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "a device pairing is accepted only by its own account" })),
+        )
+            .into_response();
+    }
     match wb.accept_boundary(
         &bid,
         body.participant,
@@ -2420,10 +2438,13 @@ pub struct PairingRequest {
 /// route does not bypass `DEVICE_BINDS_DECLARED_BOUNDARY`.
 pub async fn create_pairing_request(
     State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
     Json(body): Json<PairingRequest>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    match wb.create_pairing_request(body.device, body.bridge_grant) {
+    // The pairing is the requesting account's to accept (DR-0328 §3).
+    let owner = wb.pairing_actor(&headers);
+    match wb.create_pairing_request(body.device, body.bridge_grant, owner) {
         Ok(pairing) => (
             StatusCode::CREATED,
             Json(json!({
@@ -2531,6 +2552,57 @@ mod tests {
         assert_eq!(
             guard.library.projects[&project_id].extra["organization"],
             tenant
+        );
+        // The navigator scopes to the selected organization by this field
+        // (DR-0325); the person's own projects carry none.
+        let workspace = super::workspace_value(&guard);
+        let organization_of = |id: &str| {
+            workspace["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|project| project["id"] == id)
+                .map(|project| project["organization"].clone())
+        };
+        assert_eq!(
+            organization_of(&project_id),
+            Some(serde_json::json!(tenant))
+        );
+        assert_eq!(
+            organization_of(crate::DEFAULT_PROJECT),
+            Some(serde_json::Value::Null)
+        );
+        // A Home provisioned for an organization owns its unnamed projects; a
+        // project that names its organization keeps it, and a Personal
+        // tenant's Home owns nothing.
+        let host = format!("organization:{}", "b".repeat(32));
+        guard.bind_owning_tenant(&host);
+        let bound = super::workspace_value(&guard);
+        let bound_organization_of = |id: &str| {
+            bound["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|project| project["id"] == id)
+                .map(|project| project["organization"].clone())
+        };
+        assert_eq!(
+            bound_organization_of(crate::DEFAULT_PROJECT),
+            Some(serde_json::json!(host))
+        );
+        assert_eq!(
+            bound_organization_of(&project_id),
+            Some(serde_json::json!(tenant))
+        );
+        guard.bind_owning_tenant("personal:account-root");
+        assert_eq!(
+            super::workspace_value(&guard)["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|project| project["id"] == crate::DEFAULT_PROJECT)
+                .map(|project| project["organization"].clone()),
+            Some(serde_json::Value::Null)
         );
         assert!(!guard.ensure_project_tasks_tracker(&project_id).unwrap());
         let grant_id = crate::org::MemberGrantRecord::make_id("account-root", &project_id);

@@ -45,6 +45,7 @@ import {
 import {
     bridgeGrantId,
     clientRequestId,
+    isProjectTask,
     type BridgeGrant,
     type EngagementId,
     type LocalState,
@@ -91,6 +92,8 @@ import {
     type CarouselState,
     type PaneKind,
     type SettingsGaugeAppAction,
+    navigatorScope,
+    projectInScope,
 } from "@gaugewright/workbench-ui";
 import { createMobileSession } from "./mobile-session";
 import { MobileControlPlane } from "./mobile-control-plane";
@@ -145,6 +148,8 @@ export interface MobileGaugeApps {
     readonly active: () => boolean;
     readonly accountActions: () => readonly SettingsGaugeAppAction[];
     readonly organizationSelector: () => JSX.Element;
+    /** The organization the navigator is scoped to (DR-0325). */
+    readonly selectedTenant?: () => { readonly id: string; readonly personal: boolean } | null;
     readonly chat: (controls: { readonly mobile: boolean; readonly onCollapse: () => void }) => JSX.Element;
     readonly content: () => JSX.Element;
     readonly menu: () => JSX.Element;
@@ -1056,7 +1061,8 @@ function MobileAccountShell(props: {
                             >
                                 <div class="mobile-account-project-list">
                                     <For
-                                        each={projects() ?? []}
+                                        each={(projects() ?? []).filter((summary) =>
+                                            projectInScope(summary.project, navigatorScope(props.gaugeApps?.selectedTenant?.())))}
                                         fallback={
                                             <div class="mobile-project-empty">
                                                 <div class="mobile-project-empty-title">
@@ -1500,7 +1506,7 @@ function MobileSession(props: {
     // no-op when none does. The inbound count names a project, not a chat
     // (DR-0143 §6), and the phone has no Inbox to open.
     function jumpToCurrentTask() {
-        const first = (tasks() ?? []).find((task) => task.kind !== "screen");
+        const first = (tasks() ?? []).find((task) => !isProjectTask(task));
         if (first) jumpToTask(first.id as EngagementId);
     }
 

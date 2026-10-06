@@ -114,6 +114,10 @@ pub struct Workbench {
     /// workbench. This is composition-bound state, never inferred from a
     /// process-global environment variable or from ordinary account login.
     pub(crate) hosted_home_mode: bool,
+    /// The organization tenant a hosted Home was provisioned for, when it was
+    /// provisioned for one. Its projects belong to that organization unless
+    /// they name another (DR-0325). Composition-bound, like `hosted_home_mode`.
+    pub(crate) owning_organization: Option<String>,
     /// Replaceable per-identity Home sessions. Account login alone never appears
     /// here; the target Home mints these only after admission.
     pub(crate) home_admissions: crate::home_admission::HomeAdmissionStore,
@@ -166,6 +170,13 @@ pub struct Workbench {
     /// launch scope, or `project::<id>` for every launch in a project.
     pub(crate) project_workflow_changed: broadcast::Sender<String>,
     pub(crate) project_workflow_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Which projects members used lately, shared by every composition so a
+    /// request is counted once however many layers see it (DR-0312).
+    pub(crate) member_use: crate::key_delegation::MemberUse,
+    /// Sessions a test opens to drive the workbench directly, as a request
+    /// handler would inside its session (WS-740).
+    #[cfg(test)]
+    pub(crate) test_session_holds: Vec<crate::content_vault::SessionHold>,
 }
 
 pub type SharedWorkbench = Arc<Mutex<Workbench>>;
@@ -400,6 +411,7 @@ impl Workbench {
             authority: AuthorityId::new(LOCAL_AUTHORITY),
             home_id: HomeId::new(format!("home:{LOCAL_AUTHORITY}")),
             hosted_home_mode: false,
+            owning_organization: None,
             home_admissions: crate::home_admission::HomeAdmissionStore::new(),
             idp: None,
             desktop_ui_session: None,
@@ -428,6 +440,9 @@ impl Workbench {
             native_editor_dispatch_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             project_workflow_changed: broadcast::channel(64).0,
             project_workflow_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            member_use: Default::default(),
+            #[cfg(test)]
+            test_session_holds: Vec::new(),
         }
     }
 

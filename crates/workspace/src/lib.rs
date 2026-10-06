@@ -1038,6 +1038,31 @@ impl Instance {
         .read(MAINLINE_BRANCH_ID, relative)?)
     }
 
+    /// [`read_main_file`](Self::read_main_file) as bytes, so content that is
+    /// not text — a picture, an archive — is read exactly as the store holds it.
+    pub fn read_main_file_bytes(&self, relative: &str) -> Result<Option<Vec<u8>>> {
+        Ok(NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?
+        .read_bytes(MAINLINE_BRANCH_ID, relative)?)
+    }
+
+    /// The mainline head's manifest: every file path it records with the
+    /// content identity of the bytes there, read from the store with nothing
+    /// created. Content identity is global, so two workspaces' manifests
+    /// compare path by path; a project fork records one as its upstream basis
+    /// and a pull compares against it (GaugeWright DR-0208). Empty for a
+    /// mainline with no head.
+    pub fn main_manifest(&self) -> Result<BTreeMap<String, String>> {
+        Ok(NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?
+        .manifest(MAINLINE_BRANCH_ID)?
+        .unwrap_or_default())
+    }
+
     /// Every path the mainline's head records, listed from the store with
     /// nothing created to list it: no engagement, no branch, no worktree, no
     /// import, no cut. Directories appear the way an engagement's [`tree`]
@@ -3224,6 +3249,19 @@ pub trait Workspace: Send {
             "this workspace has no durable Main ref authority",
         ))
     }
+    /// One file at the mainline's head as bytes; `None` when it has no such
+    /// file.
+    fn read_main_file_bytes(&self, _relative: &str) -> Result<Option<Vec<u8>>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no durable Main ref authority",
+        ))
+    }
+    /// The mainline head's paths and the content identity at each.
+    fn main_manifest(&self) -> Result<BTreeMap<String, String>> {
+        Err(WorkspaceError::msg(
+            "this workspace has no durable Main ref authority",
+        ))
+    }
     fn purge_unreachable_objects(&self) -> Result<()>;
     /// The identities of every active engagement line, with nothing
     /// materialized to list them.
@@ -3611,6 +3649,12 @@ impl Workspace for Instance {
     }
     fn main_tree(&self) -> Result<Vec<FileEntry>> {
         Self::main_tree(self)
+    }
+    fn read_main_file_bytes(&self, relative: &str) -> Result<Option<Vec<u8>>> {
+        Self::read_main_file_bytes(self, relative)
+    }
+    fn main_manifest(&self) -> Result<BTreeMap<String, String>> {
+        Self::main_manifest(self)
     }
     fn purge_unreachable_objects(&self) -> Result<()> {
         Self::purge_unreachable_objects(self)

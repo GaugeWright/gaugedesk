@@ -152,7 +152,7 @@ export async function getTasks(transport: WorkbenchTransport): Promise<HumanTask
             placement?: string;
         }[];
     };
-    const kinds = new Set(["answer", "repair", "reply", "screen"]);
+    const kinds = new Set(["answer", "repair", "reply", "screen", "resume"]);
     return o.tasks.map((t) => ({
         id: t.id,
         title: t.title,
@@ -520,6 +520,105 @@ export async function createProject(
     return o.id as ProjectId;
 }
 
+/** What forking a project made (GaugeWright DR-0208): the new project, and
+ * the Agents it could not re-place with why. */
+export interface ForkedProject {
+    readonly id: ProjectId;
+    readonly skippedAgents: readonly { readonly name: string; readonly reason: string }[];
+}
+
+/** Fork a project into a new one the caller owns: its managed files and its
+ * Agents at their pinned versions, and none of its people, chats, credentials
+ * or deployments. `operationId` makes a retry return the same fork. */
+export async function forkProject(
+    transport: WorkbenchTransport,
+    id: ProjectId,
+    name?: string,
+    operationId?: string,
+): Promise<ForkedProject> {
+    const o = (await transport.json("POST", `/projects/${id}/fork`, {
+        ...(name ? { name } : {}),
+        ...(operationId ? { operation_id: operationId } : {}),
+    })) as { id: string; skipped_agents?: { name?: string; reason?: string }[] };
+    return {
+        id: o.id as ProjectId,
+        skippedAgents: (o.skipped_agents ?? []).map((agent) => ({
+            name: agent.name ?? "",
+            reason: agent.reason ?? "",
+        })),
+    };
+}
+
+/** A fork's original, and what pulling it would bring now. */
+export type ProjectUpstream =
+    | {
+        readonly available: true;
+        readonly projectId: ProjectId;
+        readonly name: string | null;
+        readonly sourceCut: string | null;
+        readonly take: readonly string[];
+        readonly remove: readonly string[];
+        readonly conflicts: readonly string[];
+    }
+    | {
+        readonly available: false;
+        readonly projectId: ProjectId | null;
+        readonly name: string | null;
+        readonly reason: string;
+    };
+
+export async function projectUpstream(
+    transport: WorkbenchTransport,
+    id: ProjectId,
+): Promise<ProjectUpstream | null> {
+    const o = (await transport.json("GET", `/projects/${id}/upstream`)) as {
+        upstream: null | {
+            available: boolean;
+            project_id?: string;
+            name?: string | null;
+            source_cut?: string | null;
+            take?: string[];
+            remove?: string[];
+            conflicts?: string[];
+            reason?: string;
+        };
+    };
+    const u = o.upstream;
+    if (!u) return null;
+    if (!u.available) {
+        return {
+            available: false,
+            projectId: u.project_id ? (u.project_id as ProjectId) : null,
+            name: u.name ?? null,
+            reason: u.reason ?? "Pulling is unavailable.",
+        };
+    }
+    return {
+        available: true,
+        projectId: (u.project_id ?? "") as ProjectId,
+        name: u.name ?? null,
+        sourceCut: u.source_cut ?? null,
+        take: u.take ?? [],
+        remove: u.remove ?? [],
+        conflicts: u.conflicts ?? [],
+    };
+}
+
+/** Pull a fork's original into the fork's Main. `sourceCut` is the original's
+ * cut the caller previewed; every conflicting path needs a choice. */
+export async function pullProjectUpstream(
+    transport: WorkbenchTransport,
+    id: ProjectId,
+    sourceCut: string | null,
+    resolutions: Readonly<Record<string, "mine" | "theirs">>,
+): Promise<{ readonly pulled: number }> {
+    const o = (await transport.json("POST", `/projects/${id}/upstream/pull`, {
+        source_cut: sourceCut,
+        resolutions,
+    })) as { pulled?: number };
+    return { pulled: o.pulled ?? 0 };
+}
+
 /** Attach an existing repository/folder without exposing its native path in
  * the returned target projection. */
 export async function attachTarget(
@@ -708,11 +807,11 @@ export async function publicPublisherKey(
     return response.public_key;
 }
 
-/** Try a Panel agent in a disposable work chat with the caller's work-chat
- *  defaults: its draft, or a project placement's pinned version (DR-0272). A
- *  second preview of the same thing replaces the first; deleting the chat ends
- *  it. */
-export async function previewPanelAgent(
+/** Try an Agent in a disposable work chat with the caller's work-chat
+ *  defaults: its draft (DR-0324), or a Panel agent placement's pinned version
+ *  (DR-0272). A second try of the same thing replaces the first; deleting the
+ *  chat ends it. */
+export async function previewAgent(
     transport: WorkbenchTransport,
     archetypeId: ArchetypeId,
     placementId?: PlacementId,

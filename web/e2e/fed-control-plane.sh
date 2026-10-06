@@ -22,6 +22,9 @@ ln -sfn "$REPO/plugin" "$STATE/plugin"
 # left unset for the 7878 instance so it stays `local-user`, keeping the existing
 # single-instance suite unchanged).
 export GAUGEDESK_TEST_RESET=1
+# The controller-request scenario drives the direct phone protocol, which a
+# desktop no longer serves (DR-0329); this debug binary mounts it for the test.
+export GAUGEDESK_TEST_MACHINE_CONTROLLERS=1
 # Federation is part of the normal product composition. This harness supplies
 # explicit test identities and a hermetic relay; it does not enable a different
 # route surface.

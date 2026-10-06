@@ -47,6 +47,26 @@ pub(crate) fn recorded_owner(project: &ProjectRecord) -> Option<&str> {
         .filter(|owner| !owner.is_empty())
 }
 
+/// The `ACCOUNT_SCOPE` record kind naming whose that scope is: on a claimed
+/// desktop, the claimant's, which keeps the provider credentials, logins,
+/// boxes and settings the computer held before they were keyed per account
+/// (DR-0313).
+pub const INSTALL_SCOPE_OWNER_KIND: &str = "install_scope_owner";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InstallScopeOwner {
+    account: String,
+}
+
+/// Whether `project` takes the legacy owner rather than one its own record
+/// implies: no recorded owner, and no organization, learner or preview.
+pub(crate) fn takes_legacy_owner(project: &ProjectRecord) -> bool {
+    recorded_owner(project).is_none()
+        && !project.extra.contains_key("organization")
+        && !crate::shipped_tutorials::is_tutorial_project(project)
+        && crate::panel_preview::preview_marker(project).is_none()
+}
+
 /// The id of `account`'s own Personal on this host. Hashed, so no account id
 /// reaches a path or a directory name.
 pub fn personal_project_id(account: &str) -> String {
@@ -56,6 +76,55 @@ pub fn personal_project_id(account: &str) -> String {
 }
 
 impl Workbench {
+    /// A project that arrived as this computer's local account's passes to the
+    /// signed-in account that accepted it (DR-0328 §4). An account's project,
+    /// or one accepted signed out, stays as it arrived.
+    pub(crate) fn take_accepted_project(&mut self, headers: &axum::http::HeaderMap, project: &str) {
+        if !self.desktop_account_mode() {
+            return;
+        }
+        let Some((account, _)) =
+            crate::net_http::bearer(headers).and_then(|token| self.resolve_account_session(token))
+        else {
+            return;
+        };
+        let Some(mut record) = self.library.projects.get(project).cloned() else {
+            return;
+        };
+        if recorded_owner(&record) == Some(self.authority().as_str()) {
+            record_owner(&mut record.extra, &account);
+            self.write_project_record(record);
+        }
+    }
+
+    /// The account a desktop request acts as for host-level records such as
+    /// pairings: the account session's, or the local account when signed
+    /// out. `None` off a desktop, where those records keep their own rules.
+    pub(crate) fn pairing_actor(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        if !self.desktop_account_mode() {
+            return None;
+        }
+        match crate::net_http::bearer(headers) {
+            // A session that resolves to no account owns nothing here.
+            Some(token) => Some(
+                self.resolve_account_session(token)
+                    .map(|(account, _)| account)
+                    .unwrap_or_default(),
+            ),
+            None => Some(self.authority().as_str().to_owned()),
+        }
+    }
+
+    /// The account a pairing belongs to: the one it records, else the legacy
+    /// owner, as for the projects it predates (DR-0309, DR-0328 §3).
+    pub(crate) fn bridge_owner(&self, bridge: &crate::federation::BridgeRecord) -> String {
+        bridge
+            .account
+            .clone()
+            .filter(|account| !account.is_empty())
+            .unwrap_or_else(|| self.legacy_project_owner())
+    }
+
     /// The owner of a project with no recorded one: the account that claimed
     /// this computer, else the computer's local account.
     pub(crate) fn legacy_project_owner(&self) -> String {
@@ -79,6 +148,96 @@ impl Workbench {
             },
             _ => String::new(),
         }
+    }
+
+    /// The account a single valid claim names, if this computer was claimed.
+    fn claimed_account(&self) -> Option<String> {
+        let claims = self
+            .store_ref()
+            .records(crate::org::ORG_SCOPE, crate::home_owner::CLAIM_KIND)
+            .ok()?;
+        match claims.as_slice() {
+            [claim] => serde_json::from_str::<crate::home_owner::HomeOwnerClaim>(claim)
+                .ok()?
+                .account
+                .filter(|account| !account.is_empty()),
+            _ => None,
+        }
+    }
+
+    /// The account the install's account scope belongs to, once recorded.
+    pub(crate) fn install_scope_owner(&self) -> Option<String> {
+        self.store_ref()
+            .records(crate::account::ACCOUNT_SCOPE, INSTALL_SCOPE_OWNER_KIND)
+            .ok()?
+            .iter()
+            .rev()
+            .find_map(|raw| serde_json::from_str::<InstallScopeOwner>(raw).ok())
+            .map(|owner| owner.account)
+            .filter(|account| !account.is_empty())
+    }
+
+    /// Write down what a claim gave its account (DR-0309, DR-0313), so the
+    /// ownership outlives the claim when it is removed (WS-588): the claimant
+    /// becomes the recorded owner of every project and Agent that only the
+    /// claim made its, and of the install's account scope. Idempotent, and it
+    /// changes nobody's view. A computer nobody claimed, or whose claim
+    /// evidence is ambiguous, needs nothing: its default is already the local
+    /// account. Returns how many records it wrote.
+    pub(crate) fn settle_claimed_ownership(&mut self) -> Result<usize, String> {
+        if self.hosted_home_mode() || crate::workbench_auth::web_account_mode() {
+            return Ok(0);
+        }
+        let Some(claimant) = self.claimed_account() else {
+            return Ok(0);
+        };
+        let mut written = 0;
+        let projects: Vec<ProjectRecord> = self
+            .library
+            .projects
+            .values()
+            .filter(|project| takes_legacy_owner(project))
+            .cloned()
+            .collect();
+        for mut project in projects {
+            record_owner(&mut project.extra, &claimant);
+            self.write_project_record(project);
+            written += 1;
+        }
+        let agents: Vec<crate::library::AgentRecord> = self
+            .library
+            .agents
+            .values()
+            .filter(|agent| {
+                agent.authoring_owner.is_none()
+                    && !crate::app_support::is_builtin_agent(&agent.id)
+                    && agent
+                        .versions
+                        .get(&agent.current_version)
+                        .is_none_or(|version| version.source_owner_authority.is_none())
+            })
+            .cloned()
+            .collect();
+        for mut agent in agents {
+            agent.authoring_owner = Some(claimant.clone());
+            self.write_agent_record(agent);
+            written += 1;
+        }
+        if self.install_scope_owner().is_none() {
+            let record = serde_json::to_string(&InstallScopeOwner {
+                account: claimant.clone(),
+            })
+            .map_err(|error| error.to_string())?;
+            self.store_mut()
+                .append_record(
+                    crate::account::ACCOUNT_SCOPE,
+                    INSTALL_SCOPE_OWNER_KIND,
+                    &record,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+            written += 1;
+        }
+        Ok(written)
     }
 
     /// The owner of `project`. `legacy` is [`Self::legacy_project_owner`],
@@ -130,6 +289,71 @@ impl Workbench {
             }
         }
         ProjectOwner::Account(legacy.to_owned())
+    }
+
+    /// The owner of the project `id`, if it exists.
+    pub(crate) fn project_owner(&self, id: &str) -> Option<ProjectOwner> {
+        let project = self.library.projects.get(id)?;
+        Some(self.project_owner_with(project, &self.legacy_project_owner()))
+    }
+
+    /// The refusal for a desktop account session acting on a project it does
+    /// not own, where the act is the owner's alone: inviting into it, moving
+    /// it, admitting runs on it, publishing from it (DR-0328 §4, §5). An
+    /// organization's project keeps its organization's own checks, and the
+    /// credential-free local channel keeps its view until it acts as the
+    /// local account. An unknown project is left to the handler's own 404.
+    pub(crate) fn project_owner_refusal(
+        &self,
+        headers: &axum::http::HeaderMap,
+        project: &str,
+    ) -> Option<axum::response::Response> {
+        use axum::response::IntoResponse;
+        if !self.desktop_account_mode() {
+            return None;
+        }
+        let (account, _) = crate::net_http::bearer(headers)
+            .and_then(|token| self.resolve_account_session(token))?;
+        match self.project_owner(project)? {
+            ProjectOwner::Account(owner) if owner == account => None,
+            ProjectOwner::Organization(_) => None,
+            ProjectOwner::Account(_) => Some(
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "error": "only this project's owner may do that"
+                    })),
+                )
+                    .into_response(),
+            ),
+        }
+    }
+
+    /// [`Self::project_owner_refusal`] for the project a public deployment
+    /// was published from, by its hosted id or its binding id.
+    pub(crate) fn deployment_owner_refusal(
+        &self,
+        headers: &axum::http::HeaderMap,
+        deployment: &str,
+    ) -> Option<axum::response::Response> {
+        let project = self
+            .library
+            .public_deployments
+            .values()
+            .find(|binding| binding.id == deployment || binding.hosted_deployment_id == deployment)?
+            .project_id
+            .clone();
+        self.project_owner_refusal(headers, &project)
+    }
+
+    /// [`Self::project_owner_refusal`] for the project a placement is on.
+    pub(crate) fn placement_owner_refusal(
+        &self,
+        headers: &axum::http::HeaderMap,
+        placement: &str,
+    ) -> Option<axum::response::Response> {
+        let project = self.library.project_of_instance(placement)?.to_owned();
+        self.project_owner_refusal(headers, &project)
     }
 
     /// `account`'s Personal on this host, if it has one: the install's own
@@ -187,11 +411,18 @@ impl Workbench {
         &mut self,
         headers: &axum::http::HeaderMap,
     ) -> Result<Option<String>, String> {
-        let Some((account, _)) = crate::net_http::bearer(headers)
-            .filter(|_| self.desktop_account_mode())
-            .and_then(|token| self.resolve_account_session(token))
-        else {
+        if !self.desktop_account_mode() {
             return Ok(None);
+        }
+        let account = match crate::net_http::bearer(headers) {
+            Some(token) => match self.resolve_account_session(token) {
+                Some((account, _)) => account,
+                None => return Ok(None),
+            },
+            // Signed out, the window is the computer's local account. It works
+            // in the install's Personal unless that is a claimant's.
+            None if self.legacy_project_owner() == self.authority().as_str() => return Ok(None),
+            None => self.authority().as_str().to_owned(),
         };
         let personal = self.ensure_account_personal(&account)?;
         Ok((personal != crate::DEFAULT_PROJECT).then_some(personal))
@@ -246,20 +477,22 @@ pub(crate) async fn account_project_gate(
 ) -> axum::response::Response {
     use crate::LockUnpoisoned;
     use axum::response::IntoResponse;
-    let refused = crate::net_http::bearer(request.headers()).is_some_and(|bearer| {
+    // A phone's controller session has its own admission and is no account.
+    let controller = crate::mobile_machine_session::session_token(request.headers()).is_some();
+    let refused = !controller && {
         let wb = wb.lock_unpoisoned();
-        if !wb.desktop_account_mode() {
-            return false;
-        }
-        wb.scope_project_of_path(request.uri().path())
-            .is_some_and(|project| {
-                !wb.project_visibility_in(
-                    Some(bearer),
-                    &crate::workbench_auth::req_scope(request.headers()),
-                )
-                .allows(&project)
-            })
-    });
+        wb.desktop_account_mode()
+            && wb
+                .scope_project_of_path(request.uri().path())
+                .is_some_and(|project| {
+                    // Signed out, this is the local account (DR-0328 §2).
+                    !wb.project_visibility_in(
+                        crate::net_http::bearer(request.headers()),
+                        &crate::workbench_auth::req_scope(request.headers()),
+                    )
+                    .allows(&project)
+                })
+    };
     if refused {
         return (
             axum::http::StatusCode::FORBIDDEN,

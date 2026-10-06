@@ -44,7 +44,9 @@
   "overrides": {
     "officeparser": {
       "pdfjs-dist": "6.2.108"
-    }
+    },
+    "seroval": "^1.6.3",
+    "seroval-plugins": "^1.6.3"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

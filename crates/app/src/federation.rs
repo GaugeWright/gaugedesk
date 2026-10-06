@@ -497,6 +497,11 @@ pub struct BridgeRecord {
     pub grant_id: String,
     #[serde(default = "default_true")]
     pub active: bool,
+    /// The account that made this pairing on a desktop, which alone lists,
+    /// revokes or pre-authorizes it (DR-0328 §3). Absent on a pairing made
+    /// before pairings recorded it; that one is the legacy owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -506,12 +511,24 @@ fn default_true() -> bool {
 /// Append a bridge record to the durable roster (`ITGOV-2`). Called at pairing and at
 /// revoke; the in-memory [`Federation`] is the live projection, this is its log.
 pub fn persist_bridge(store: &mut Store, ticket: &PairingTicket, grant_id: &str, active: bool) {
+    persist_bridge_for(store, ticket, grant_id, active, None);
+}
+
+/// [`persist_bridge`] naming the account that made the pairing.
+pub fn persist_bridge_for(
+    store: &mut Store,
+    ticket: &PairingTicket,
+    grant_id: &str,
+    active: bool,
+    account: Option<&str>,
+) {
     let rec = BridgeRecord {
         id: ticket.authority.clone(),
         op: crate::library::RecordOp::Upsert,
         ticket: ticket.clone(),
         grant_id: grant_id.to_string(),
         active,
+        account: account.map(str::to_owned),
     };
     let _ = store.append_record(
         BRIDGE_SCOPE,
@@ -1583,11 +1600,28 @@ pub async fn post_pairing_ticket(
 /// for its crossings. Idempotent per peer; re-pairing rotates the pins.
 pub async fn post_pair(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(ticket): Json<PairingTicket>,
 ) -> impl IntoResponse {
     let peer = AuthorityId::new(&ticket.authority);
     let record = {
         let mut guard = wb.lock_unpoisoned();
+        // One pairing per peer: another account's stays its own (DR-0328 §3).
+        let actor = guard.pairing_actor(&headers);
+        if let Some(actor) = &actor {
+            if let Some(existing) = folded_bridges(guard.store_ref())
+                .into_iter()
+                .find(|bridge| bridge.id == ticket.authority && bridge.active)
+            {
+                if &guard.bridge_owner(&existing) != actor {
+                    return (
+                        StatusCode::CONFLICT,
+                        "another account on this computer is already paired with that host",
+                    )
+                        .into_response();
+                }
+            }
+        }
         let grant_id = crate::library::gen_id("grant");
         let record = match guard.federation_mut() {
             Some(fed) => fed.accept_ticket(&ticket, grant_id.clone()),
@@ -1598,7 +1632,13 @@ pub async fn post_pair(
         };
         // Persist the pairing to the durable roster (ITGOV-2) so the peer/grant/pin
         // survive a restart instead of living only in the in-memory maps.
-        persist_bridge(guard.store_mut(), &ticket, &grant_id, true);
+        persist_bridge_for(
+            guard.store_mut(),
+            &ticket,
+            &grant_id,
+            true,
+            actor.as_deref(),
+        );
         record
     };
     spawn_peer_receivers(&wb, peer);
@@ -1637,9 +1677,22 @@ pub fn respawn_restored_receivers(wb: &SharedWorkbench) {
 /// revoke survives a restart. Future-only; payload already crossed is `ERASE-1`.
 pub async fn delete_peer(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(authority): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let mut guard = wb.lock_unpoisoned();
+    let bridge = folded_bridges(guard.store_ref())
+        .into_iter()
+        .find(|b| b.id == authority);
+    if let (Some(actor), Some(bridge)) = (guard.pairing_actor(&headers), &bridge) {
+        if guard.bridge_owner(bridge) != actor {
+            return (
+                StatusCode::FORBIDDEN,
+                "this pairing belongs to another account",
+            )
+                .into_response();
+        }
+    }
     let Some(fed) = guard.federation_mut() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "federation not configured").into_response();
     };
@@ -1648,11 +1701,14 @@ pub async fn delete_peer(
     }
     // Tombstone the durable bridge: a fresh load no longer re-pins it. The roster keeps the
     // history (active=false), so IT's revoke is auditable (INV-18).
-    if let Some(b) = folded_bridges(guard.store_ref())
-        .into_iter()
-        .find(|b| b.id == authority)
-    {
-        persist_bridge(guard.store_mut(), &b.ticket, &b.grant_id, false);
+    if let Some(b) = bridge {
+        persist_bridge_for(
+            guard.store_mut(),
+            &b.ticket,
+            &b.grant_id,
+            false,
+            b.account.as_deref(),
+        );
     }
     (
         StatusCode::OK,
@@ -1662,12 +1718,23 @@ pub async fn delete_peer(
 }
 
 /// `GET /federation/peers` — the paired-peer projection.
-pub async fn get_peers(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+pub async fn get_peers(
+    State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     let guard = wb.lock_unpoisoned();
-    let peers = guard
+    let mut peers = guard
         .federation_ref()
         .map(|f| f.peers())
         .unwrap_or_default();
+    // An account lists only the pairings it made (DR-0328 §3).
+    if let Some(actor) = guard.pairing_actor(&headers) {
+        let owners: BTreeMap<String, String> = folded_bridges(guard.store_ref())
+            .into_iter()
+            .map(|bridge| (bridge.id.clone(), guard.bridge_owner(&bridge)))
+            .collect();
+        peers.retain(|peer| owners.get(&peer.authority) == Some(&actor));
+    }
     Json(serde_json::json!({ "peers": peers }))
 }
 
@@ -2330,8 +2397,15 @@ pub struct HandoffProjectRequest {
 /// cannot later promote the target after the origin has rolled back.
 pub async fn post_handoff_abort(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<HandoffProjectRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = wb
+        .lock_unpoisoned()
+        .project_owner_refusal(&headers, &req.project)
+    {
+        return refusal;
+    }
     let peer = {
         let guard = wb.lock_unpoisoned();
         pending_outgoing_peer(guard.store_ref(), &req.project)
@@ -4416,8 +4490,15 @@ async fn drive_relocate(
 /// Thin wrapper over [`drive_relocate`].
 pub async fn post_handoff_relocate(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<HandoffRelocateRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = wb
+        .lock_unpoisoned()
+        .project_owner_refusal(&headers, &req.project)
+    {
+        return refusal;
+    }
     let peer = AuthorityId::new(&req.peer);
     let (status, body) = drive_relocate(&wb, &req.project, &peer).await;
     (status, Json(body)).into_response()
@@ -4587,8 +4668,15 @@ pub struct InviteRequest {
 /// the QR + code + "waiting for the client to accept". The origin stays home.
 pub async fn post_invite(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<InviteRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = wb
+        .lock_unpoisoned()
+        .project_owner_refusal(&headers, &req.project)
+    {
+        return refusal;
+    }
     let invite_id = crate::library::gen_id("invite");
     let confirm = invite_confirm_code(&invite_id);
     let expiry = now_secs() + INVITE_TTL_SECS;
@@ -5563,8 +5651,15 @@ pub struct RunAllowRequest {
 /// operator on that project auto-admit; revoking is future-only (`INV-18`/`INV-20`).
 pub async fn post_run_allow(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RunAllowRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = wb
+        .lock_unpoisoned()
+        .project_owner_refusal(&headers, &req.project)
+    {
+        return refusal;
+    }
     let allow = req.allow.unwrap_or(true);
     let mut guard = wb.lock_unpoisoned();
     let rec = serde_json::json!({ "operator": req.operator, "allow": allow });
@@ -5574,6 +5669,7 @@ pub async fn post_run_allow(
         &rec.to_string(),
     );
     Json(serde_json::json!({ "project": req.project, "operator": req.operator, "allow": allow }))
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -5585,11 +5681,17 @@ pub struct RunDenyRequest {
 /// execution). Fail-closed: a denied run never executes (`run-admission.qnt`).
 pub async fn post_run_deny(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RunDenyRequest>,
 ) -> impl IntoResponse {
     let mut guard = wb.lock_unpoisoned();
+    if let Some((_, project, _, _)) = pending_run_by(guard.store_ref(), &req.correlation) {
+        if let Some(refusal) = guard.project_owner_refusal(&headers, &project) {
+            return refusal;
+        }
+    }
     resolve_run(guard.store_mut(), &req.correlation, "denied");
-    Json(serde_json::json!({ "correlation": req.correlation, "denied": true }))
+    Json(serde_json::json!({ "correlation": req.correlation, "denied": true })).into_response()
 }
 
 // --- Co-drive "Allow once": execute a queued run on admit + deliver the result --------
@@ -5653,6 +5755,7 @@ pub struct RunAdmitOnceRequest {
 /// the queue entry — without setting a standing allow (`run-admission.qnt`). Single-run.
 pub async fn post_run_admit_once(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RunAdmitOnceRequest>,
 ) -> impl IntoResponse {
     // Find the queued run + this host's signing identity.
@@ -5663,6 +5766,9 @@ pub async fn post_run_admit_once(
         else {
             return (StatusCode::NOT_FOUND, "no such queued run").into_response();
         };
+        if let Some(refusal) = guard.project_owner_refusal(&headers, &project) {
+            return refusal;
+        }
         let me = guard.federation_authority().clone();
         let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
@@ -5919,6 +6025,9 @@ pub async fn post_handoff_accept(
         }
         let committed =
             commit_incoming_handoff(&mut guard, &wire, incoming_handoff::Consent::Pending);
+        if committed {
+            guard.take_accepted_project(&headers, &req.project);
+        }
         let notify = handoff_notify_material(&guard, &req.source);
         (committed, notify)
     };
@@ -6020,16 +6129,31 @@ pub struct HandoffPreauthRequest {
 /// from `peer` auto-accept (friction reduction; default fail-closed without it).
 pub async fn post_handoff_preauth(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<HandoffPreauthRequest>,
 ) -> impl IntoResponse {
     let allow = req.allow.unwrap_or(true);
     let mut guard = wb.lock_unpoisoned();
+    // Standing consent from a peer is its pairing's account's to give.
+    if let Some(actor) = guard.pairing_actor(&headers) {
+        let owner = folded_bridges(guard.store_ref())
+            .into_iter()
+            .find(|bridge| bridge.id == req.peer)
+            .map(|bridge| guard.bridge_owner(&bridge));
+        if owner.is_some_and(|owner| owner != actor) {
+            return (
+                StatusCode::FORBIDDEN,
+                "this pairing belongs to another account",
+            )
+                .into_response();
+        }
+    }
     let _ = guard.store_mut().append_record(
         HANDOFF_PREAUTH_SCOPE,
         "peer",
         &serde_json::json!({ "peer": req.peer, "allow": allow }).to_string(),
     );
-    Json(serde_json::json!({ "peer": req.peer, "preauthorized": allow }))
+    Json(serde_json::json!({ "peer": req.peer, "preauthorized": allow })).into_response()
 }
 
 // --- Engagement surfaces: participants/ownership, revoke, connect-data (FO-2) -----
@@ -6210,8 +6334,15 @@ pub struct HandoffRevokeRequest {
 /// (licensing, not secrecy): future-only, fail-closed (`INV-18`/`INV-20`).
 pub async fn post_handoff_revoke(
     State(wb): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<HandoffRevokeRequest>,
 ) -> impl IntoResponse {
+    if let Some(refusal) = wb
+        .lock_unpoisoned()
+        .project_owner_refusal(&headers, &req.project)
+    {
+        return refusal;
+    }
     {
         let mut guard = wb.lock_unpoisoned();
         let rec = ParticipantRecord {
@@ -6232,6 +6363,7 @@ pub async fn post_handoff_revoke(
     Json(
         serde_json::json!({ "project": req.project, "authority": req.authority, "owns": req.owns, "revoked": true }),
     )
+    .into_response()
 }
 
 #[derive(Deserialize)]

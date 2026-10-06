@@ -287,6 +287,16 @@ fn home_facts(wire: &HandoffWire, home: &HomeId) -> Result<Vec<CommandRecordFact
             "project" => {
                 let mut original: ProjectRecord = serde_json::from_str(&record.payload)?;
                 original.home_id = home.clone();
+                // A local account belongs to its own computer and does not
+                // travel: a project its origin's local account owned, or one
+                // with no recorded owner, arrives as this computer's local
+                // account's, and the account that accepts it takes it from
+                // there (DR-0328 §4). An account's project keeps its owner.
+                if crate::project_owner::takes_legacy_owner(&original)
+                    || crate::project_owner::recorded_owner(&original) == Some(wire.source.as_str())
+                {
+                    crate::project_owner::record_owner(&mut original.extra, &wire.target);
+                }
                 facts.push(fact(LIBRARY_SCOPE, "project", &original)?);
             }
             "project_collaboration_workspace" => {

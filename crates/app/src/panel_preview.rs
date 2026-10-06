@@ -1,25 +1,29 @@
-//! Panel-agent Preview, run as a work chat (DR-0272 §3).
+//! Trying an Agent from the Workshop, run as a disposable work chat.
 //!
-//! A Panel agent is tried with the provider, model, and funding its author's
-//! work chats use by default, so Preview is an ordinary work chat rather than a
-//! public session. Every work-chat path assumes a placement of an ordinary
-//! Agent on a project, so a preview is built from exactly those parts and
-//! hidden:
+//! A Panel agent's Preview (DR-0272 §3) and an Agent's "test in a chat"
+//! (DR-0324) are the same thing: the author's draft, or for a Panel agent a
+//! placement's pinned version, run with the provider, model, and funding the
+//! author's work chats use by default. Every work-chat path assumes a placement
+//! of an ordinary Agent on a project, so a preview is built from exactly those
+//! parts and hidden:
 //!
-//! - a **hidden fork** of the Panel agent, made an ordinary Agent, whose one
-//!   preview version is the snapshot being tried — the draft, or a project
-//!   placement's pinned version — narrowed to the Panel agent's public
+//! - a **hidden fork**, an ordinary Agent whose one preview version is the
+//!   snapshot being tried — for a Panel agent narrowed to its public
 //!   abilities, which is what a visitor's session may use;
-//! - a **hidden project** holding one managed `workspace` target seeded with
-//!   the profile's initial files, so nothing the preview writes reaches a real
-//!   project, Personal, or an Inbox;
+//! - a **hidden project** holding one managed `workspace` target — seeded with
+//!   a Panel agent's initial files, empty for an Agent — so nothing the preview
+//!   writes reaches a real project, Personal, or an Inbox;
 //! - one work placement and one chat.
 //!
 //! Funding is the author's own: the hidden project has no organization model
 //! selection, so the engine resolves the provider, model, and credential the
 //! way it does for any work chat. Ending the preview deletes the project and
-//! the fork. The trade the founder accepted is that Preview exercises the
-//! agent, not the public runtime, its shared panels, or audience admission.
+//! the fork. The trade the founder accepted for a Panel agent is that Preview
+//! exercises the agent, not the public runtime, its shared panels, or audience
+//! admission; for an Agent, that a test sees no real project's files.
+//!
+//! The names here, and the `panel_preview` marker they persist, predate tests
+//! of ordinary Agents and are kept because records already carry them.
 
 use std::path::Path;
 
@@ -36,11 +40,11 @@ use crate::Workbench;
 pub const PANEL_PREVIEW_EXTRA: &str = "panel_preview";
 
 /// What a preview is of. Recorded on both hidden records so either one leads
-/// back to the Panel agent, and so a second preview of the same thing replaces
-/// the first.
+/// back to the Agent it tries, and so a second preview of the same thing
+/// replaces the first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PanelPreviewMarker {
-    /// The Panel agent being tried.
+    /// The Agent or Panel agent being tried.
     pub agent_id: String,
     /// The project placement whose pinned version is tried; absent for the
     /// Workshop draft.
@@ -153,7 +157,7 @@ fn narrow_abilities(package_root: &Path, public_abilities: &[String]) -> Result<
 }
 
 impl Workbench {
-    /// Every live preview of the Panel agent `agent_id`.
+    /// Every live preview of the Agent or Panel agent `agent_id`.
     pub(crate) fn panel_previews_of(&self, agent_id: &str) -> Vec<LivePanelPreview> {
         self.library
             .projects
@@ -242,7 +246,7 @@ impl Workbench {
         removed
     }
 
-    /// End every preview of the Panel agent `agent_id`.
+    /// End every preview of the Agent or Panel agent `agent_id`.
     pub(crate) fn end_panel_previews_of(&mut self, agent_id: &str) {
         let projects = self
             .panel_previews_of(agent_id)
@@ -264,8 +268,8 @@ impl Workbench {
         }
     }
 
-    /// Open a disposable work chat running the Panel agent `agent_id`: its
-    /// draft, or the version pinned by its project placement `placement_id`.
+    /// Open a disposable work chat running `agent_id`: its draft, or for a
+    /// Panel agent the version pinned by its project placement `placement_id`.
     ///
     /// A preview of the same thing that is already open is replaced, so trying
     /// a draft again picks up the edits made since. Returns the chat, as
@@ -279,45 +283,52 @@ impl Workbench {
             .library
             .agents
             .get(agent_id)
-            .filter(|agent| agent.agent_kind == AgentKind::Panel && !is_panel_preview_agent(agent))
+            .filter(|agent| !is_panel_preview_agent(agent))
             .cloned()
-            .ok_or_else(|| "preview requires a Panel agent".to_owned())?;
+            .ok_or_else(|| "no such Agent to try".to_owned())?;
         let source_target = self
             .library
             .authoring_target_for(&agent.id)
             .map(|target| target.id.clone())
-            .ok_or_else(|| "the Panel agent's authoring target is unavailable".to_owned())?;
-        let (version, profile) = match placement_id {
-            Some(placement_id) => {
-                let placement = self
-                    .library
-                    .instances
-                    .get(placement_id)
-                    .filter(|placement| {
-                        placement.kind == InstanceKind::Using
-                            && placement.placement_kind == PlacementKind::Panel
-                            && placement.agent_id == agent.id
-                    })
-                    .ok_or_else(|| {
-                        "a version preview requires this Panel agent's placement".to_owned()
-                    })?;
-                let profile = agent
-                    .versions
-                    .get(&placement.version)
-                    .and_then(|version| version.panel_profile.clone())
-                    .ok_or_else(|| {
-                        "the placement's version has no frozen public profile".to_owned()
-                    })?;
-                (Some(placement.version), profile)
-            }
-            None => (
-                None,
-                agent
-                    .panel_profile
-                    .clone()
-                    .ok_or_else(|| "the Panel agent's draft has no public profile".to_owned())?,
-            ),
-        };
+            .ok_or_else(|| "the Agent's authoring target is unavailable".to_owned())?;
+        let panel = agent.agent_kind == AgentKind::Panel;
+        let (version, profile) =
+            match placement_id {
+                // An Agent is tested on its draft, so the author can go back and
+                // forth between editing and trying it (DR-0324).
+                None if !panel => (None, None),
+                Some(_) if !panel => {
+                    return Err("a version preview requires a Panel agent's placement".to_owned())
+                }
+                Some(placement_id) => {
+                    let placement = self
+                        .library
+                        .instances
+                        .get(placement_id)
+                        .filter(|placement| {
+                            placement.kind == InstanceKind::Using
+                                && placement.placement_kind == PlacementKind::Panel
+                                && placement.agent_id == agent.id
+                        })
+                        .ok_or_else(|| {
+                            "a version preview requires this Panel agent's placement".to_owned()
+                        })?;
+                    let profile = agent
+                        .versions
+                        .get(&placement.version)
+                        .and_then(|version| version.panel_profile.clone())
+                        .ok_or_else(|| {
+                            "the placement's version has no frozen public profile".to_owned()
+                        })?;
+                    (Some(placement.version), Some(profile))
+                }
+                None => (
+                    None,
+                    Some(agent.panel_profile.clone().ok_or_else(|| {
+                        "the Panel agent's draft has no public profile".to_owned()
+                    })?),
+                ),
+            };
 
         // A second preview of the same thing replaces the first.
         let replaced = self
@@ -349,7 +360,7 @@ impl Workbench {
                 &agent.id,
                 &source_target,
                 version,
-                &profile,
+                profile.as_ref(),
                 PanelPreviewMarker {
                     project_id: Some(project_id.clone()),
                     ..marker.clone()
@@ -359,7 +370,7 @@ impl Workbench {
             self.create_panel_preview_project(
                 &project_id,
                 &format!("{} preview", agent.name),
-                &profile,
+                profile.as_ref(),
                 PanelPreviewMarker {
                     preview_agent_id: Some(preview_agent.clone()),
                     ..marker.clone()
@@ -369,7 +380,8 @@ impl Workbench {
                 self.place_archetype_on_project(&project_id, &preview_agent, Admission::Active)?;
             let title = match version {
                 Some(version) => format!("Preview of version {version}"),
-                None => "Preview of the draft".to_owned(),
+                None if panel => "Preview of the draft".to_owned(),
+                None => "Test of the draft".to_owned(),
             };
             self.create_chat_in_instance(&placement, &title)
         })();
@@ -387,24 +399,24 @@ impl Workbench {
         }
     }
 
-    /// Fork the Panel agent into a hidden ordinary Agent whose current version
-    /// is the snapshot being tried, narrowed to the public abilities.
+    /// Fork the Agent into a hidden ordinary Agent whose current version is
+    /// the snapshot being tried, narrowed to a Panel agent's public abilities.
     fn fork_panel_agent_for_preview(
         &mut self,
         agent_id: &str,
         source_target: &str,
         version: Option<u64>,
-        profile: &library::PanelPublicProfile,
+        profile: Option<&library::PanelPublicProfile>,
         marker: PanelPreviewMarker,
     ) -> Result<String, String> {
         let created = self
             .fork_archetype(agent_id, None)
             .map_err(|error| match error {
                 crate::library_state::ForkArchetypeError::NotFound => {
-                    "the Panel agent does not exist".to_owned()
+                    "the Agent does not exist".to_owned()
                 }
                 crate::library_state::ForkArchetypeError::SourceNotOpen => {
-                    "the Panel agent's authoring target is not open".to_owned()
+                    "the Agent's authoring target is not open".to_owned()
                 }
                 crate::library_state::ForkArchetypeError::Create(error) => error,
             })?;
@@ -465,8 +477,13 @@ impl Workbench {
                     .map_err(|error| error.to_string())?;
                 }
             }
-            let public = profile.public_abilities.iter().cloned().collect::<Vec<_>>();
-            narrow_abilities(&package_staging, &public)
+            match profile {
+                Some(profile) => {
+                    let public = profile.public_abilities.iter().cloned().collect::<Vec<_>>();
+                    narrow_abilities(&package_staging, &public)
+                }
+                None => Ok(()),
+            }
         })();
         let committed = prepared.and_then(|()| {
             self.commit_preview_version(
@@ -568,13 +585,13 @@ impl Workbench {
         result
     }
 
-    /// The hidden project: one managed `workspace` target seeded with the
-    /// profile's initial files, and no tracker or default Agent.
+    /// The hidden project: one managed `workspace` target seeded with a Panel
+    /// agent's initial files, and no tracker or default Agent.
     fn create_panel_preview_project(
         &mut self,
         project_id: &str,
         name: &str,
-        profile: &library::PanelPublicProfile,
+        profile: Option<&library::PanelPublicProfile>,
         marker: PanelPreviewMarker,
     ) -> Result<String, String> {
         let home_id = self.home_id().clone();
@@ -610,7 +627,10 @@ impl Workbench {
         // A public session sees its initial files under `workspace/`, which the
         // public host strips when it seeds; the target is that workspace.
         let mut seeds = Vec::new();
-        for file in &profile.initial_workspace {
+        for file in profile
+            .iter()
+            .flat_map(|profile| &profile.initial_workspace)
+        {
             let path = file
                 .path
                 .strip_prefix("workspace/")

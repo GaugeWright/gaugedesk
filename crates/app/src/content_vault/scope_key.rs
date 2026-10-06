@@ -241,6 +241,7 @@ impl ContentVault {
     /// Prepare only an existing scope. Ledger confirmation and KMS unwrapping
     /// may block; call before product/store transactions, never from a codec.
     pub fn prepare_scope_key(&self, scope: &str) -> std::io::Result<PreparedScopeKey> {
+        self.delegated(scope)?;
         let key_id = self.confirmed_scope(scope)?;
         let root = std::fs::canonicalize(&self.dir)?;
         let _lease = shared(&root, &key_id)?;
@@ -252,6 +253,7 @@ impl ContentVault {
     /// Explicit admitted initialization. Reuses a valid existing key; never
     /// replaces it or revives a tombstoned scope. Store reopening uses prepare.
     pub fn initialize_scope_key(&self, scope: &str) -> std::io::Result<PreparedScopeKey> {
+        self.delegated(scope)?;
         let key_id = self.confirmed_scope(scope)?;
         std::fs::create_dir_all(&self.dir)?;
         let root = std::fs::canonicalize(&self.dir)?;
@@ -292,6 +294,7 @@ impl ContentVault {
         create: bool,
         use_key: impl FnOnce([u8; 32]) -> Option<T>,
     ) -> Option<T> {
+        self.delegated(scope).ok()?;
         if create {
             std::fs::create_dir_all(&self.dir).ok()?;
         }

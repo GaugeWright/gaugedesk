@@ -734,11 +734,24 @@ pub(crate) fn snapshot_authored_discipline(
 /// first response, so a single precomputed authorization could never have
 /// covered both.
 pub struct PublisherCredential {
+    /// Whom the credential publishes as: the install's own authority for the
+    /// install's key, else the account whose own key this is (DR-0328 §5).
+    account: String,
     authority: String,
     signing_key: gaugedesk_core::signature::SigningKey,
 }
 
 impl PublisherCredential {
+    /// The public half every command this credential signs presents.
+    pub fn public_key(&self) -> String {
+        self.signing_key.public_key().as_str().to_owned()
+    }
+
+    /// The publisher authority the edge pins as a deployment's owner.
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
     /// Sign one exact hosted publisher command. Each call stamps its own
     /// timestamp and nonce, so a credential is reusable but a signature is not.
     pub fn authorize(
@@ -776,14 +789,176 @@ impl PublisherCredential {
     }
 }
 
+/// The [`PublicDeploymentBindingRecord`] extra naming the account whose own
+/// publisher key published the deployment (DR-0328 §5). The edge pins the
+/// first command's key as the deployment's owner, so every later command is
+/// signed by that key, whoever owns the project now. A binding without it was
+/// published under the install's key, as every deployment published before
+/// per-account publishing was, and stays with it.
+pub const BINDING_PUBLISHER_EXTRA: &str = "publisher_account";
+
+/// The account a binding records as its publisher, if not the install.
+fn binding_publisher(binding: &PublicDeploymentBindingRecord) -> Option<String> {
+    binding
+        .extra
+        .get(BINDING_PUBLISHER_EXTRA)
+        .and_then(serde_json::Value::as_str)
+        .filter(|account| !account.is_empty())
+        .map(str::to_owned)
+}
+
 impl Workbench {
-    /// Check out this account's publisher credential so a round trip can run
-    /// without holding the workbench.
+    /// Check out the install's publisher credential so a round trip can run
+    /// without holding the workbench. A hosted Home has no other; on a
+    /// desktop it is the publisher of the account owning the install's
+    /// account scope.
     pub fn publisher_credential(&self) -> io::Result<PublisherCredential> {
         Ok(PublisherCredential {
+            account: self.authority().as_str().to_owned(),
             authority: format!("gaugedesk:{}", self.authority().as_str()),
             signing_key: self.public_publisher_signing_key()?,
         })
+    }
+
+    /// The credential `account` publishes under (DR-0328 §5). The account
+    /// that owns the install's account scope keeps the install's key and
+    /// authority, so what it already published keeps verifying; every other
+    /// desktop account has a key of its own. Off a desktop there is only the
+    /// install's.
+    pub fn publisher_credential_for(&self, account: &str) -> io::Result<PublisherCredential> {
+        self.publisher_credential_of(self.own_publisher_account(account).as_deref())
+    }
+
+    /// [`Self::publisher_credential_for`] for a caller that may be nobody in
+    /// particular, which signs with the install's.
+    pub fn publisher_credential_as(
+        &self,
+        account: Option<&str>,
+    ) -> io::Result<PublisherCredential> {
+        match account {
+            Some(account) => self.publisher_credential_for(account),
+            None => self.publisher_credential(),
+        }
+    }
+
+    /// `Some(account)` when `account` publishes under a key of its own, and
+    /// `None` when under the install's: off a desktop, for the local account,
+    /// and for the account owning the install's account scope — the same rule
+    /// as `desktop_account_store_scope`.
+    fn own_publisher_account(&self, account: &str) -> Option<String> {
+        if !self.desktop_account_mode()
+            || account.is_empty()
+            || account == "anonymous"
+            || account == self.authority().as_str()
+        {
+            return None;
+        }
+        let install_owner = self
+            .install_scope_owner()
+            .unwrap_or_else(|| self.legacy_project_owner());
+        (account != install_owner).then(|| account.to_owned())
+    }
+
+    /// The install's credential for `None`, else `account`'s own key, with
+    /// no further resolution: a binding is signed by the key it recorded even
+    /// if that account later comes to own the install's account scope.
+    fn publisher_credential_of(&self, account: Option<&str>) -> io::Result<PublisherCredential> {
+        let Some(account) = account else {
+            return self.publisher_credential();
+        };
+        let key = gaugedesk_core::ids::AuthorityId::new(format!(
+            "{account}{PUBLIC_PUBLISHER_KEY_SUFFIX}"
+        ));
+        Ok(PublisherCredential {
+            account: account.to_owned(),
+            authority: format!("gaugedesk:{account}"),
+            signing_key: FileKeyStore::new(self.root_path().join("keys"))
+                .random_signing_key(&key)?,
+        })
+    }
+
+    /// The account whose own key publishes from `project`: its owning
+    /// account's. An organization's project keeps the install's.
+    fn project_publisher(&self, project: &str) -> Option<String> {
+        match self.project_owner(project)? {
+            crate::project_owner::ProjectOwner::Account(owner) => {
+                self.own_publisher_account(&owner)
+            }
+            crate::project_owner::ProjectOwner::Organization(_) => None,
+        }
+    }
+
+    /// The credential that publishes from `project`.
+    pub fn project_publisher_credential(&self, project: &str) -> io::Result<PublisherCredential> {
+        self.publisher_credential_of(self.project_publisher(project).as_deref())
+    }
+
+    /// The local binding of hosted deployment `deployment` on `edge`.
+    fn deployment_binding(
+        &self,
+        edge: &str,
+        deployment: &str,
+    ) -> Option<&PublicDeploymentBindingRecord> {
+        self.library.public_deployments.values().find(|binding| {
+            binding.hosted_deployment_id == deployment && binding.edge_origin == edge
+        })
+    }
+
+    /// The credential that signs commands about `binding`: the key that
+    /// published it.
+    pub fn binding_publisher_credential(
+        &self,
+        binding: &PublicDeploymentBindingRecord,
+    ) -> io::Result<PublisherCredential> {
+        self.publisher_credential_of(binding_publisher(binding).as_deref())
+    }
+
+    /// The credential that signs commands about hosted deployment
+    /// `deployment` on `edge`: its binding's. A deployment with no local
+    /// binding predates bindings, so the install's key published it.
+    fn deployment_publisher_credential(
+        &self,
+        edge: &str,
+        deployment: &str,
+    ) -> io::Result<PublisherCredential> {
+        match self.deployment_binding(edge, deployment) {
+            Some(binding) => self.binding_publisher_credential(binding),
+            None => self.publisher_credential(),
+        }
+    }
+
+    /// Whose key a publication from `project` signs with: the existing
+    /// binding's when it updates a deployment, else the project's owner's.
+    fn publication_publisher(
+        &self,
+        project: &str,
+        existing: Option<&PublicDeploymentBindingRecord>,
+    ) -> Option<String> {
+        match existing {
+            Some(binding) => binding_publisher(binding),
+            None => self.project_publisher(project),
+        }
+    }
+
+    /// The public key a publication from `placement` to `deployment` on
+    /// `edge_origin` will be signed with, which a managed-funding entitlement
+    /// minted before the publish must be bound to.
+    pub fn publication_publisher_key(
+        &self,
+        placement: &str,
+        edge_origin: &str,
+        deployment: &str,
+    ) -> io::Result<String> {
+        let edge = normalized_edge(edge_origin)?;
+        let project = self
+            .library
+            .project_of_instance(placement)
+            .unwrap_or_default();
+        let account =
+            self.publication_publisher(project, self.deployment_binding(&edge, deployment));
+        Ok(self
+            .publisher_credential_of(account.as_deref())?
+            .public_key())
     }
 
     /// The public half the Hub binds a managed-inference entitlement to.
@@ -795,6 +970,11 @@ impl Workbench {
             .public_key()
             .as_str()
             .to_owned())
+    }
+
+    /// [`Self::public_publisher_key`] for the key `account` publishes under.
+    pub fn public_publisher_key_as(&self, account: Option<&str>) -> io::Result<String> {
+        Ok(self.publisher_credential_as(account)?.public_key())
     }
 
     fn public_publisher_signing_key(&self) -> io::Result<gaugedesk_core::signature::SigningKey> {
@@ -829,6 +1009,17 @@ impl Workbench {
         &self,
         instance_id: &str,
         spec: ReleasePublishSpec,
+    ) -> io::Result<SignedAgentRelease> {
+        self.build_agent_release_as(instance_id, spec, &self.publisher_credential()?)
+    }
+
+    /// [`Self::build_agent_release`] signed by `publisher`, the credential
+    /// whose deployment will serve it (DR-0328 §5).
+    pub fn build_agent_release_as(
+        &self,
+        instance_id: &str,
+        spec: ReleasePublishSpec,
+        publisher: &PublisherCredential,
     ) -> io::Result<SignedAgentRelease> {
         let instance = self
             .library
@@ -945,7 +1136,8 @@ impl Workbench {
             ));
         }
         let required = spec.public_abilities.clone();
-        let signing_key = self.public_publisher_signing_key()?;
+        let signing_key = &publisher.signing_key;
+        let signer = gaugedesk_core::ids::AuthorityId::new(publisher.account.clone());
         let policy_principal = gaugedesk_whip_runtime::ResourcePolicy {
             reader: BTreeSet::from(["audience".to_owned()]),
             writer: BTreeSet::from(["audience".to_owned()]),
@@ -1036,8 +1228,8 @@ impl Workbench {
         const HOST_POLICY_EPOCH: u64 = 1;
         let signed_host_policy = gaugedesk_whip_runtime::sign_hosted_policy_envelope(
             &host_policy.to_json().map_err(invalid)?,
-            self.authority(),
-            &signing_key,
+            &signer,
+            signing_key,
             HOST_POLICY_EPOCH,
         )
         .map_err(invalid)?;
@@ -1066,7 +1258,7 @@ impl Workbench {
             host_policy: HostPolicyClosure {
                 epoch: HOST_POLICY_EPOCH,
                 signed_envelope: signed_host_policy,
-                expected_signer: self.authority().as_str().to_owned(),
+                expected_signer: signer.as_str().to_owned(),
                 signer_public_key_hex: signing_key.public_key().as_str().to_owned(),
                 provider_binding_ref: "model".to_owned(),
                 credential_class: spec.provider.credential_class.clone(),
@@ -1094,10 +1286,7 @@ impl Workbench {
         };
 
         release
-            .sign(
-                format!("gaugedesk:{}", self.authority().as_str()),
-                &signing_key,
-            )
+            .sign(publisher.authority.clone(), signing_key)
             .map_err(invalid)
     }
 
@@ -1180,6 +1369,11 @@ impl Workbench {
                 binding.hosted_deployment_id == request.deployment_id && binding.edge_origin == edge
             })
             .cloned();
+        // Every command below, and the release itself, is signed by the key
+        // that published this deployment, else by the project owner's
+        // (DR-0328 §5).
+        let publisher_account = self.publication_publisher(&project_id, existing.as_ref());
+        let credential = self.publisher_credential_of(publisher_account.as_deref())?;
         let names_retention = request.retention_idle_ttl_seconds.is_some()
             || request.retention_absolute_ttl_seconds.is_some();
         let retention_idle_ttl_seconds = request
@@ -1254,7 +1448,7 @@ impl Workbench {
             )?
         } else {
             let (key_provider, key_class) =
-                self.owner_key_record(&edge, &request.credential_ref)?;
+                owner_key_record(&credential, &edge, &request.credential_ref)?;
             release_provider(
                 &profile.model,
                 request.work_chat_default_model.as_deref(),
@@ -1300,8 +1494,7 @@ impl Workbench {
                 .funding_entitlement
                 .as_ref()
                 .ok_or_else(|| invalid("managed funding requires a Hub entitlement"))?;
-            let publisher_key = self.public_publisher_signing_key()?.public_key();
-            if entitlement.claims.authority != publisher_key.as_str() {
+            if entitlement.claims.authority != credential.public_key() {
                 return Err(invalid(
                     "managed funding entitlement is not bound to this publisher",
                 ));
@@ -1331,8 +1524,14 @@ impl Workbench {
         }
 
         let path = format!("/v1/deployments/{}", request.deployment_id);
-        let inspected =
-            send_publisher_response(self, &edge, "GET", &path, &[], "application/json")?;
+        let inspected = send_publisher_response_with(
+            &credential,
+            &edge,
+            "GET",
+            &path,
+            &[],
+            "application/json",
+        )?;
         if existing.is_none() && inspected.0 == 200 {
             return Err(invalid(
                 "legacy hosted deployment requires import and project confirmation before update",
@@ -1351,18 +1550,29 @@ impl Workbench {
             .as_millis()
             .try_into()
             .map_err(io::Error::other)?;
-        let release = self.build_agent_release(
+        let release = self.build_agent_release_as(
             &request.placement_id,
             release_spec(&profile, provider.clone(), published_at_unix_ms),
+            &credential,
         )?;
 
         let binding_id = existing
             .as_ref()
             .map(|binding| binding.id.clone())
             .unwrap_or_else(|| crate::library::gen_id("public-deployment"));
+        let mut extra = existing
+            .as_ref()
+            .map(|binding| binding.extra.clone())
+            .unwrap_or_default();
+        if let Some(account) = &publisher_account {
+            extra.insert(
+                BINDING_PUBLISHER_EXTRA.to_owned(),
+                serde_json::Value::String(account.clone()),
+            );
+        }
         let pending_binding = PublicDeploymentBindingRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
-            extra: Default::default(),
+            extra,
             id: binding_id.clone(),
             op: RecordOp::Upsert,
             project_id: project_id.clone(),
@@ -1387,8 +1597,8 @@ impl Workbench {
             self.write_public_deployment_record(pending_binding.clone())?;
         }
         let release_bytes = release.canonical_bytes().map_err(io::Error::other)?;
-        send_publisher_request(
-            self,
+        send_publisher_request_with(
+            &credential,
             &edge,
             "PUT",
             &format!("/v1/releases/{}", release.release_id()),
@@ -1459,7 +1669,14 @@ impl Workbench {
                     "initial_release_id": release.release_id(),
                 }))
                 .map_err(invalid)?;
-                send_publisher_request(self, &edge, "PUT", &path, &body, "application/json")?
+                send_publisher_request_with(
+                    &credential,
+                    &edge,
+                    "PUT",
+                    &path,
+                    &body,
+                    "application/json",
+                )?
             }
             (200, current) => {
                 let current: serde_json::Value = serde_json::from_str(&current).map_err(invalid)?;
@@ -1498,8 +1715,8 @@ impl Workbench {
                         "end_sessions": request.end_sessions,
                     }))
                     .map_err(invalid)?;
-                    send_publisher_request(
-                        self,
+                    send_publisher_request_with(
+                        &credential,
                         &edge,
                         "POST",
                         &format!("{path}/activate"),
@@ -1515,7 +1732,14 @@ impl Workbench {
                         "end_sessions": request.end_sessions,
                     }))
                     .map_err(invalid)?;
-                    send_publisher_request(self, &edge, "PUT", &path, &body, "application/json")?
+                    send_publisher_request_with(
+                        &credential,
+                        &edge,
+                        "PUT",
+                        &path,
+                        &body,
+                        "application/json",
+                    )?
                 }
             }
             (status, detail) => {
@@ -1552,8 +1776,9 @@ impl Workbench {
     ) -> io::Result<serde_json::Value> {
         validate_deployment_id(&request.deployment_id)?;
         let edge = normalized_edge(&request.edge_origin)?;
-        let response = send_publisher_request(
-            self,
+        let credential = self.deployment_publisher_credential(&edge, &request.deployment_id)?;
+        let response = send_publisher_request_with(
+            &credential,
             &edge,
             "GET",
             &format!("/v1/deployments/{}", request.deployment_id),
@@ -1600,8 +1825,12 @@ impl Workbench {
         }) {
             return Err(invalid("hosted deployment already has a local binding"));
         }
+        // A deployment from before local bindings was published under the
+        // install's key, and the binding written here records no other.
+        let credential = self.publisher_credential()?;
         let path = format!("/v1/deployments/{}", request.deployment_id);
-        let response = send_publisher_request(self, &edge, "GET", &path, &[], "application/json")?;
+        let response =
+            send_publisher_request_with(&credential, &edge, "GET", &path, &[], "application/json")?;
         let hosted: serde_json::Value = serde_json::from_str(&response).map_err(invalid)?;
         let active_release_id = hosted
             .pointer("/deployment/active_release_id")
@@ -1609,8 +1838,8 @@ impl Workbench {
             .filter(|release| !release.is_empty())
             .ok_or_else(|| invalid("hosted deployment inspection omitted its active release"))?
             .to_owned();
-        let hosted_release = send_publisher_request(
-            self,
+        let hosted_release = send_publisher_request_with(
+            &credential,
             &edge,
             "GET",
             &format!("/v1/releases/{active_release_id}"),
@@ -1726,7 +1955,11 @@ impl Workbench {
         &self,
         request: DrainCollectionsRequest,
     ) -> io::Result<serde_json::Value> {
-        drain_collections_with(&self.publisher_credential()?, &request)
+        let credential = self.deployment_publisher_credential(
+            &normalized_edge(&request.edge_origin)?,
+            &request.deployment_id,
+        )?;
+        drain_collections_with(&credential, &request)
     }
 
     /// Local custody for quarantined payload.
@@ -1894,7 +2127,11 @@ impl Workbench {
         &self,
         request: AcknowledgeCollectionsRequest,
     ) -> io::Result<serde_json::Value> {
-        acknowledge_collections_with(&self.publisher_credential()?, &request)
+        let credential = self.deployment_publisher_credential(
+            &normalized_edge(&request.edge_origin)?,
+            &request.deployment_id,
+        )?;
+        acknowledge_collections_with(&credential, &request)
     }
 
     pub fn control_public_deployment(
@@ -1911,8 +2148,9 @@ impl Workbench {
             "expected_revision": request.expected_revision,
         }))
         .map_err(invalid)?;
-        let response = send_publisher_request(
-            self,
+        let credential = self.deployment_publisher_credential(&edge, &request.deployment_id)?;
+        let response = send_publisher_request_with(
+            &credential,
             &edge,
             "POST",
             &format!("/v1/deployments/{}/control", request.deployment_id),
@@ -1936,8 +2174,9 @@ impl Workbench {
             return Err(invalid("public session id is invalid"));
         }
         let edge = normalized_edge(&request.edge_origin)?;
-        let response = send_publisher_request(
-            self,
+        let credential = self.deployment_publisher_credential(&edge, &request.deployment_id)?;
+        let response = send_publisher_request_with(
+            &credential,
             &edge,
             "DELETE",
             &format!(
@@ -1950,62 +2189,28 @@ impl Workbench {
         serde_json::from_str(&response).map_err(invalid)
     }
 
-    /// List only non-secret metadata for credentials owned by this account.
+    /// List only non-secret metadata for credentials owned by `account`'s
+    /// publisher, or the install's for `None` (DR-0328 §5).
     pub fn list_public_credentials(
         &self,
         request: ListPublicCredentialsRequest,
+        account: Option<&str>,
     ) -> io::Result<serde_json::Value> {
-        let edge = normalized_edge(&request.edge_origin)?;
-        let response = send_publisher_request(
-            self,
-            &edge,
-            "GET",
-            "/v1/public-credentials",
-            &[],
-            "application/json",
-        )?;
-        serde_json::from_str(&response).map_err(invalid)
+        list_public_credentials_with(
+            &self.publisher_credential_as(account)?,
+            &normalized_edge(&request.edge_origin)?,
+        )
     }
 
-    /// The provider and credential class the edge registry records for one
-    /// owner key. An owner key funds a release on its own provider, so this is
-    /// where a BYOK release learns which provider that is (DR-0272).
-    fn owner_key_record(&self, edge: &str, credential_ref: &str) -> io::Result<(String, String)> {
-        let listed = self.list_public_credentials(ListPublicCredentialsRequest {
-            edge_origin: edge.to_owned(),
-        })?;
-        listed
-            .get("credentials")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|entry| {
-                entry
-                    .get("credential_ref")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(credential_ref)
-            })
-            .and_then(|entry| {
-                Some((
-                    entry.get("provider")?.as_str()?.to_owned(),
-                    entry.get("credential_class")?.as_str()?.to_owned(),
-                ))
-            })
-            .ok_or_else(|| {
-                invalid(format!(
-                    "owner key `{credential_ref}` is not stored on {edge}; store a provider key \
-                     from the deployment panel or fund it with managed inference"
-                ))
-            })
-    }
-
-    /// Send a provider key directly to the account-owned edge registry.
+    /// Send a provider key directly to `account`'s edge registry, or the
+    /// install's for `None` (DR-0328 §5).
     ///
     /// GaugeDesk does not persist the request or the response. The edge returns
     /// metadata and an opaque reference only.
     pub fn provision_public_credential(
         &self,
         request: ProvisionPublicCredentialRequest,
+        account: Option<&str>,
     ) -> io::Result<serde_json::Value> {
         let edge = normalized_edge(&request.edge_origin)?;
         if !matches!(request.provider.as_str(), "openai" | "anthropic" | "xai")
@@ -2022,8 +2227,8 @@ impl Workbench {
             "label": request.label,
         }))
         .map_err(invalid)?;
-        let response = send_publisher_request(
-            self,
+        let response = send_publisher_request_with(
+            &self.publisher_credential_as(account)?,
             &edge,
             "POST",
             "/v1/public-credentials",
@@ -2033,9 +2238,12 @@ impl Workbench {
         serde_json::from_str(&response).map_err(invalid)
     }
 
+    /// Revoke a credential in `account`'s edge registry, or the install's for
+    /// `None` (DR-0328 §5).
     pub fn revoke_public_credential(
         &self,
         request: RevokePublicCredentialRequest,
+        account: Option<&str>,
     ) -> io::Result<serde_json::Value> {
         let edge = normalized_edge(&request.edge_origin)?;
         if !request.credential_ref.starts_with("credential:public:") {
@@ -2045,8 +2253,8 @@ impl Workbench {
             "credential_ref": request.credential_ref,
         }))
         .map_err(invalid)?;
-        let response = send_publisher_request(
-            self,
+        let response = send_publisher_request_with(
+            &self.publisher_credential_as(account)?,
             &edge,
             "DELETE",
             "/v1/public-credentials",
@@ -2055,6 +2263,56 @@ impl Workbench {
         )?;
         serde_json::from_str(&response).map_err(invalid)
     }
+}
+
+fn list_public_credentials_with(
+    credential: &PublisherCredential,
+    edge: &str,
+) -> io::Result<serde_json::Value> {
+    let response = send_publisher_request_with(
+        credential,
+        edge,
+        "GET",
+        "/v1/public-credentials",
+        &[],
+        "application/json",
+    )?;
+    serde_json::from_str(&response).map_err(invalid)
+}
+
+/// The provider and credential class the edge registry of `credential`'s
+/// publisher records for one owner key. An owner key funds a release on its
+/// own provider, so this is where a BYOK release learns which provider that is
+/// (DR-0272).
+fn owner_key_record(
+    credential: &PublisherCredential,
+    edge: &str,
+    credential_ref: &str,
+) -> io::Result<(String, String)> {
+    let listed = list_public_credentials_with(credential, edge)?;
+    listed
+        .get("credentials")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|entry| {
+            entry
+                .get("credential_ref")
+                .and_then(serde_json::Value::as_str)
+                == Some(credential_ref)
+        })
+        .and_then(|entry| {
+            Some((
+                entry.get("provider")?.as_str()?.to_owned(),
+                entry.get("credential_class")?.as_str()?.to_owned(),
+            ))
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "owner key `{credential_ref}` is not stored on {edge}; store a provider key \
+                 from the deployment panel or fund it with managed inference"
+            ))
+        })
 }
 
 /// Resolve the request dialect from the exact provider surface frozen into a
@@ -2189,7 +2447,7 @@ pub fn collect_into_project(
             .sibling()
             .map_err(|error| io::Error::other(format!("open a drain store connection: {error}")))?;
         (
-            guard.publisher_credential()?,
+            guard.binding_publisher_credential(&binding)?,
             guard.collection_recipients().open_seed(&recipient_id)?,
             store,
             guard.quarantine_payloads(),
@@ -2354,26 +2612,10 @@ pub fn collect_into_project(
     })
 }
 
-pub fn send_publisher_request(
-    workbench: &Workbench,
-    edge: &str,
-    method: &str,
-    path: &str,
-    body: &[u8],
-    content_type: &str,
-) -> io::Result<String> {
-    send_publisher_request_with(
-        &workbench.publisher_credential()?,
-        edge,
-        method,
-        path,
-        body,
-        content_type,
-    )
-}
-
-/// The same request against a checked-out credential, so it can be sent without
-/// holding the workbench (ADR 0115 §5).
+/// One publisher command against a checked-out credential, so it can be sent
+/// without holding the workbench (ADR 0115 §5). The credential is the
+/// deployment's own publisher's (DR-0328 §5); there is deliberately no form
+/// that picks one from the workbench.
 pub fn send_publisher_request_with(
     credential: &PublisherCredential,
     edge: &str,
@@ -2404,24 +2646,6 @@ pub fn send_publisher_request_with(
             detail: bounded_upstream(&response),
         }))
     }
-}
-
-fn send_publisher_response(
-    workbench: &Workbench,
-    edge: &str,
-    method: &str,
-    path: &str,
-    body: &[u8],
-    content_type: &str,
-) -> io::Result<(u16, String)> {
-    send_publisher_response_with(
-        &workbench.publisher_credential()?,
-        edge,
-        method,
-        path,
-        body,
-        content_type,
-    )
 }
 
 fn send_publisher_response_with(

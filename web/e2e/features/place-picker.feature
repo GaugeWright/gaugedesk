@@ -3,8 +3,8 @@ Feature: Choosing what to place, and quieter power controls (round 2)
 
   Adding a method to a *named* project lets the user CHOOSE which method (a picker),
   rather than silently placing an arbitrary one. But placement is never a
-  prerequisite for *using* an archetype: it is usable straight away in the hidden
-  Personal project, with no placement step (ADR 0045/0036). A new chat takes its
+  prerequisite for *trying* an Agent: its draft runs straight away in a disposable
+  chat of its own, with no placement or publish step (DR-0324). A new chat takes its
   title from the first message instead of staying "new chat", and the hold/stage
   power control stays out of the way of the obvious "send".
 
@@ -16,10 +16,10 @@ Feature: Choosing what to place, and quieter power controls (round 2)
     When I choose the first method in the picker
     Then the project "picker-co" shows its placements
 
-  Scenario: an archetype is usable with no placement — a chat in Personal
+  Scenario: an Agent is tested on its draft in a chat of its own
     Given the workbench is open
-    When I use the archetype "Default" from its menu
-    Then a work chat opens
+    When I test the archetype "Default" from its menu
+    Then a test chat of its draft opens under it
 
   @chat-title
   Scenario: a new chat gets a fallback title when no model is configured

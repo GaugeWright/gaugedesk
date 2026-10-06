@@ -9,7 +9,10 @@ import { isSecureControlPlaneEndpoint } from "./control-plane-transport";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 
 export interface HomeInvitationPreview {
+    /** The account it is for; empty for an email invitation still pending. */
     readonly authority: string;
+    /** The address an email invitation is for (DR-0332). */
+    readonly email?: string;
     readonly project: ProjectId;
     readonly homeId: HomeId;
     readonly endpoint: string;
@@ -63,9 +66,15 @@ function envelope(encoded: string): HomeInvitationEnvelope {
     if (!isSecureControlPlaneEndpoint(endpoint)) {
         throw new Error("Home invitation uses an insecure endpoint");
     }
+    const email = typeof raw.invited_email === "string" && raw.invited_email.trim()
+        ? raw.invited_email
+        : undefined;
+    const authority = typeof raw.invited_authority === "string" ? raw.invited_authority : "";
+    if (!email) requiredString(authority, "invited authority");
     return {
         invitation: requiredString(raw.invitation, "invitation"),
-        authority: requiredString(raw.invited_authority, "invited authority"),
+        authority,
+        ...(email ? { email } : {}),
         project: requiredString(raw.project, "project") as ProjectId,
         homeId: requiredString(raw.home_id, "Home") as HomeId,
         endpoint,
@@ -76,8 +85,8 @@ function envelope(encoded: string): HomeInvitationEnvelope {
 /** Decode only safe invitation metadata for confirmation UI. The capability is
  * deliberately omitted so callers cannot accidentally render or persist it. */
 export function parseHomeInvitation(encoded: string): HomeInvitationPreview {
-    const { authority, project, homeId, endpoint } = envelope(encoded);
-    return { authority, project, homeId, endpoint };
+    const { authority, email, project, homeId, endpoint } = envelope(encoded);
+    return { authority, ...(email ? { email } : {}), project, homeId, endpoint };
 }
 
 /** Accept directly on the owner's Home using ordinary account authentication.
@@ -110,26 +119,31 @@ export async function acceptHomeInvitation(
     return { ...parseHomeInvitation(encoded), admission: value.admission };
 }
 
-/** Owner/admin command. This uses the already-admitted Home transport. */
+/** Owner/admin command. This uses the already-admitted Home transport. It
+ * names exactly one recipient: an account chosen from the organization, or an
+ * email address the accepting account must hold verified (DR-0332). */
 export async function createHomeInvitation(
     json: RouteJson,
-    input: {
-        readonly authority: string;
+    input: ({ readonly authority: string; readonly email?: undefined }
+        | { readonly email: string; readonly authority?: undefined }) & {
         readonly project: ProjectId;
         readonly endpoint: string;
         readonly role?: "member" | "viewer";
     },
 ): Promise<CreatedHomeInvitation> {
     const value = (await json("POST", "/home/invitations", {
-        authority: input.authority,
+        ...(input.email !== undefined ? { email: input.email } : { authority: input.authority }),
         project: input.project,
         endpoint: input.endpoint,
         role: input.role ?? "member",
     })) as Record<string, unknown>;
     const parsed = parseHomeInvitation(requiredString(value.invite, "invite"));
     const url = requiredString(value.url, "URL");
+    const addressed = input.email !== undefined
+        ? parsed.email === input.email.trim().toLowerCase()
+        : parsed.authority === input.authority;
     if (
-        parsed.authority !== input.authority ||
+        !addressed ||
         parsed.project !== input.project ||
         parsed.endpoint !== input.endpoint.replace(/\/+$/, "") ||
         typeof value.expires_at !== "number"

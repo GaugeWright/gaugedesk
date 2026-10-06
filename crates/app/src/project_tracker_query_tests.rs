@@ -6,6 +6,8 @@ fn signed_out_local_personal_files_unassigned_into_its_only_exposed_tracker() {
     let root = tempfile::tempdir().unwrap();
     let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
     let mut wb = shared.lock_unpoisoned();
+    // An agent files from inside its turn, which holds the chat's project.
+    wb.hold_session_for_tests(DEFAULT_PROJECT);
     wb.create_default_engagement("local-chat".into(), "Local task".into())
         .unwrap_or_else(|_| panic!("local chat in Personal"));
     wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();

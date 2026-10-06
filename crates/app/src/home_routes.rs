@@ -152,13 +152,16 @@ pub async fn require_home_admission(
         }
     }
 
-    let admitted = {
+    let (admitted, member_use) = {
         let mut workbench = wb.lock_unpoisoned();
-        authenticate_home_work_request(
-            &mut workbench,
-            req.headers(),
-            req.method(),
-            req.uri().path(),
+        (
+            authenticate_home_work_request(
+                &mut workbench,
+                req.headers(),
+                req.method(),
+                req.uri().path(),
+            ),
+            workbench.member_use.clone(),
         )
     };
     let context = match admitted {
@@ -169,12 +172,33 @@ pub async fn require_home_admission(
     };
     // Preserve the identity actually verified and admitted by this Home.
     // Never promote a legacy fallback or an upstream extension into proof.
+    let verified = context.is_some();
     if let Some(context) = context {
         req.extensions_mut()
             .insert(crate::identity::AuthenticatedActor(context.actor().clone()));
         req.extensions_mut().insert(context);
     }
-    next.run(req).await
+    let (method, path) = (req.method().clone(), req.uri().path().to_owned());
+    // A verified member's session holds what it reaches (WS-740).
+    let holds = if verified {
+        crate::key_delegation::session_holds(&wb, req.headers(), &method, &path)
+    } else {
+        Vec::new()
+    };
+    let response = next.run(req).await;
+    if verified {
+        // A verified member's successful work on a project renews its
+        // background delegations (DR-0312).
+        crate::key_delegation::count_member_use(
+            &wb,
+            &member_use,
+            &method,
+            &path,
+            response.status(),
+        )
+        .await;
+    }
+    crate::key_delegation::hold_while_sent(response, holds)
 }
 
 /// The Home HTTP boundary shared by middleware and individually protected

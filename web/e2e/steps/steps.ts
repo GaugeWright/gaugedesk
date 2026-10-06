@@ -2008,9 +2008,9 @@ When("I choose the first method in the picker", async ({ page }) => {
     await pickFirstMethod(page);
 });
 
-// Use an archetype with no placement (ADR 0045): from the Workshop, its menu opens a
-// work chat in the hidden Personal project directly — no place picker.
-When("I use the archetype {string} from its menu", async ({ page }, name: string) => {
+// Test an Agent (DR-0324): from the Workshop, its menu opens a disposable work
+// chat running its draft — no place picker, no publish, nothing in Personal.
+When("I test the archetype {string} from its menu", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Workshop" }).click();
     await page
         .locator("[data-archetype]", { hasText: name })
@@ -2018,14 +2018,13 @@ When("I use the archetype {string} from its menu", async ({ page }, name: string
         .click({ button: "right" });
     // The label lives in `.menu-item-label`; the `.menu-item` text also carries the
     // hint, so anchor on the label span (the click bubbles to the item).
-    // The Workshop menu's test action — same behavior
-    // as the old "use": opens a work chat in the hidden Personal project.
     await page.locator(".menu-item-label", { hasText: /^test in a chat$/ }).click();
 });
 
-Then("a work chat opens", async ({ page }) => {
+Then("a test chat of its draft opens under it", async ({ page }) => {
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
-    await expect(page.locator('[data-chat].active .status-gem[data-kind="work"]')).toBeVisible();
+    await expect(page.locator('[data-panel-previews] [data-chat].active .status-gem[data-kind="work"]')).toBeVisible();
+    await expect(page.locator("[data-agent-test-note]")).toBeVisible();
 });
 
 // ---- auto-titling a new chat (#4, round 2) ----

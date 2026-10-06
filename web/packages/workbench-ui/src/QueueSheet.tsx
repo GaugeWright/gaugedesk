@@ -17,7 +17,7 @@
  */
 
 import { For, Show, type JSX } from "solid-js";
-import { type EngagementId, type HumanTask } from "@gaugewright/control-plane-client";
+import { isProjectTask, type EngagementId, type HumanTask } from "@gaugewright/control-plane-client";
 import { displayChatTitle } from "./chat-title";
 
 export interface QueueSheetProps {
@@ -60,18 +60,20 @@ export function QueueSheet(props: QueueSheetProps): JSX.Element {
                         {(t: HumanTask, i) => (
                             <li>
                                 <Show
-                                    when={t.kind !== "screen"}
+                                    when={!isProjectTask(t)}
                                     fallback={
                                         <div
                                             class="queue-sheet-item"
                                             classList={{ current: i() === 0 }}
                                             data-queue-task={t.id}
                                             role="note"
-                                            title={`Review it in ${t.title}'s Inbox`}
+                                            title={t.kind === "screen"
+                                                ? `Review it in ${t.title}'s Inbox`
+                                                : `Open ${t.title} to resume its background work`}
                                         >
-                                            <span class="queue-item-kind">inbound</span>
+                                            <span class="queue-item-kind">{t.kind === "screen" ? "inbound" : "paused"}</span>
                                             <span class="queue-item-title">{t.title}</span>
-                                            <span class="queue-item-agent">{t.waiting ?? 0} waiting</span>
+                                            <span class="queue-item-agent">{t.kind === "screen" ? `${t.waiting ?? 0} waiting` : "open to resume"}</span>
                                         </div>
                                     }
                                 >

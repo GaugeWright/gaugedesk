@@ -1124,7 +1124,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async createHomeInvitation(
-        authority: string,
+        recipient: string | { readonly email: string },
         project: ProjectId,
         role: "member" | "viewer" = "member",
     ): Promise<CreatedHomeInvitation> {
@@ -1133,7 +1133,9 @@ export class WorkbenchControlPlane implements ControlPlane {
         if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
         const transport = await this.requireHomeTransport();
         return accountClient.createHomeInvitation(transport.json, {
-            authority: authority.trim(),
+            ...(typeof recipient === "string"
+                ? { authority: recipient.trim() }
+                : { email: recipient.email.trim() }),
             project,
             endpoint: selected.endpoint,
             role,
@@ -1277,6 +1279,12 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     getShippedTutorial(name: string) {
         return workbenchClient.getShippedTutorial(this.workbenchTransport(), name);
+    }
+
+    /** What background work holds which of a project's keys (DR-0312), read
+     *  at the project's own Home. */
+    async getProjectKeyDelegations(project: ProjectId) {
+        return workbenchClient.getProjectKeyDelegations(await this.projectTrackerTransport(project), project);
     }
 
     async completeProjectTrackerIssue(project: ProjectId, queue: string, item: string, intent: workbenchClient.TrackerCompletionIntent) {
@@ -1490,6 +1498,22 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.deleteProject(this.workbenchTransport(), id);
     }
 
+    forkProject(id: ProjectId, name?: string): Promise<workbenchClient.ForkedProject> {
+        return workbenchClient.forkProject(this.workbenchTransport(), id, name, crypto.randomUUID());
+    }
+
+    projectUpstream(id: ProjectId): Promise<workbenchClient.ProjectUpstream | null> {
+        return workbenchClient.projectUpstream(this.workbenchTransport(), id);
+    }
+
+    pullProjectUpstream(
+        id: ProjectId,
+        sourceCut: string | null,
+        resolutions: Readonly<Record<string, "mine" | "theirs">>,
+    ): Promise<{ readonly pulled: number }> {
+        return workbenchClient.pullProjectUpstream(this.workbenchTransport(), id, sourceCut, resolutions);
+    }
+
     projectHome(id: ProjectId): Promise<ProjectHome> {
         return workbenchClient.projectHome(this.workbenchTransport(), id);
     }
@@ -1540,8 +1564,8 @@ export class WorkbenchControlPlane implements ControlPlane {
     /** A disposable work chat running a Panel agent with the caller's
      *  work-chat defaults (DR-0272). No entitlement is minted: the chat is
      *  funded the way any work chat is. */
-    previewPanelAgent(archetypeId: ArchetypeId, placementId?: PlacementId): Promise<EngagementId> {
-        return workbenchClient.previewPanelAgent(this.workbenchTransport(), archetypeId, placementId);
+    previewAgent(archetypeId: ArchetypeId, placementId?: PlacementId): Promise<EngagementId> {
+        return workbenchClient.previewAgent(this.workbenchTransport(), archetypeId, placementId);
     }
 
     private async dictationEntitlement(): Promise<string | undefined> {
@@ -1640,9 +1664,6 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.createChatUnderArchetype(this.workbenchTransport(), archetypeId, title);
     }
 
-    useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId> {
-        return workbenchClient.useArchetype(this.workbenchTransport(), archetypeId, title);
-    }
 
     createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetIds: readonly WorkTargetId[]): Promise<EngagementId> {
         return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title, targetIds);

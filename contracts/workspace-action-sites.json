@@ -726,6 +726,22 @@
         "signature": "fn resolve_conflict_taking (& self , _relative : & str , _ours : bool) -> Result < bool >"
       },
       "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "read_main_file_bytes",
+        "owner": "Workspace",
+        "signature": "fn read_main_file_bytes (& self , _relative : & str) -> Result < Option < Vec < u8 > > >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "main_manifest",
+        "owner": "Workspace",
+        "signature": "fn main_manifest (& self) -> Result < BTreeMap < String , String > >"
+      },
+      "classification": "requires-provenance-review"
     }
   ],
   "profiles": {
@@ -5794,6 +5810,116 @@
         "capability": "resolve_conflict_taking",
         "count": 1,
         "expression": "self . resolve_conflict_taking (relative , ours)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (message)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& line)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& line)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "engagement . remove_file (& format ! (\"{root}/{path}\"))",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "engagement . write_file_bytes (& format ! (\"{root}/{path}\") , bytes)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::managed_manifest",
+        "capability": "current_main_cut",
+        "count": 1,
+        "expression": "workspace . current_main_cut ()",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::managed_manifest",
+        "capability": "main_manifest",
+        "count": 1,
+        "expression": "workspace . main_manifest ()",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::read_managed_bytes",
+        "capability": "read_main_file_bytes",
+        "count": 1,
+        "expression": "self . collaboration_workspaces . get (& workspace_id) . ok_or_else (| | \"project collaboration workspace is not open\" . to_owned ()) ? . read_main_file_bytes (& format ! (\"{root}/{path}\"))",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::main_manifest",
+        "capability": "main_manifest",
+        "count": 1,
+        "expression": "Self :: main_manifest (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::read_main_file_bytes",
+        "capability": "read_main_file_bytes",
+        "count": 1,
+        "expression": "Self :: read_main_file_bytes (self , relative)",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"

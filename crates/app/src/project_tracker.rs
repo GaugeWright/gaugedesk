@@ -202,7 +202,8 @@ fn current_project(
     let deadline_ms = if local_personal {
         if home.as_str() != "home:local-user"
             || context.actor().as_str() != crate::LOCAL_AUTHORITY
-            || project != crate::DEFAULT_PROJECT
+            || (project != crate::DEFAULT_PROJECT
+                && project != crate::project_owner::personal_project_id(crate::LOCAL_AUTHORITY))
         {
             return Err(refused(
                 "local tracker authority serves only local Personal",
@@ -510,9 +511,11 @@ impl Workbench {
         &self,
         project: &str,
     ) -> Option<AuthenticatedActionContext> {
+        // Only the local account's own Personal: on a claimed computer the
+        // install's Personal is the claimant's (DR-0309, DR-0328 §2).
         (!self.hosted_home_mode()
             && self.home_id().as_str() == "home:local-user"
-            && project == crate::DEFAULT_PROJECT
+            && self.account_personal(self.authority().as_str()).as_deref() == Some(project)
             && self
                 .library
                 .projects

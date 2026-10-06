@@ -20,6 +20,7 @@ import {
     parseTenant,
     tenantFacilities,
     tenantProjectShareCandidates,
+    tenantProjectShareDirectory,
 } from "./control-plane-tenant";
 import type { RouteJson } from "./control-plane-transport";
 
@@ -242,6 +243,15 @@ describe("control-plane-tenant (ADR 0077 §7/§9)", () => {
         expect(calls).toEqual([[
             "GET", "/account/tenants/organization%2Facme/project-share-candidates", undefined,
         ]]);
+    });
+
+    it("reads an organization's sharing policy, members only unless it says anyone", async () => {
+        await expect(tenantProjectShareDirectory(fakeJson({ candidates: [], sharing: "anyone" }).json, "organization:a"))
+            .resolves.toEqual({ candidates: [], sharing: "anyone" });
+        for (const sharing of [undefined, "members", "ANYONE", 1]) {
+            await expect(tenantProjectShareDirectory(fakeJson({ candidates: [], sharing }).json, "organization:a"))
+                .resolves.toMatchObject({ sharing: "members" });
+        }
     });
 
     it("is total: garbage / empty envelopes degrade to empty lists, never throw", async () => {

@@ -43,6 +43,7 @@ export * from "./remote-control-plane";
 export * from "./workspace-delta";
 export * from "./project-tracker";
 export * from "./project-workflow";
+export * from "./key-delegations";
 export * from "./product-analytics";
 export * from "./native-file-actions";
 export * from "./native-file-save-journal";

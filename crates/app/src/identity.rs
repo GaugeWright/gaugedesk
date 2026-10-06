@@ -261,6 +261,29 @@ impl Workbench {
         self.idp.is_none() && !crate::workbench_auth::web_account_mode() && !self.hosted_home_mode
     }
 
+    /// Bind a hosted Home to the tenant it was provisioned for. Only an
+    /// organization tenant owns a Home's projects; a Personal tenant's Home
+    /// holds the person's own work, so binding one leaves its projects
+    /// unowned (DR-0325).
+    pub fn bind_owning_tenant(&mut self, tenant: &str) {
+        self.owning_organization = tenant
+            .starts_with("organization:")
+            .then(|| tenant.to_owned());
+    }
+
+    /// The organization that owns `project`: the one its record names, else
+    /// the one this Home was provisioned for, else none — the person's own.
+    pub(crate) fn project_organization<'a>(
+        &'a self,
+        project: &'a crate::library::ProjectRecord,
+    ) -> Option<&'a str> {
+        project
+            .extra
+            .get("organization")
+            .and_then(serde_json::Value::as_str)
+            .or(self.owning_organization.as_deref())
+    }
+
     pub(crate) fn configured_home_id() -> HomeId {
         if let Some(home) = gaugedesk_env::var("HOME_ID") {
             if !home.is_empty() {

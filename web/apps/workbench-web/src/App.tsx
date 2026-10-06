@@ -59,7 +59,7 @@ import {
     type ProjectId,
     type ProjectNode,
     type PlacementNode,
-    type ProjectShareCandidate,
+    type ProjectShareDirectory,
     Rejected,
     scopeId,
     type MergeAction,
@@ -180,6 +180,10 @@ import {
     NoticeTracker,
     notificationPreference,
     preferenceWants,
+    navigatorScope,
+    scopeProjects,
+    scopeTasks,
+    quickStartPlacement,
 } from "@gaugewright/workbench-ui";
 import { isMobileHarness, MobileApp } from "@gaugewright/mobile-web";
 
@@ -321,7 +325,7 @@ export interface WorkbenchGaugeApps {
     readonly clearProjectRequest?: () => void;
     /** The account plane supplies safe organization identities; the Project
      * Home remains authoritative for the invitation itself. */
-    readonly projectShareCandidates?: () => Promise<readonly ProjectShareCandidate[]>;
+    readonly projectShareDirectory?: () => Promise<ProjectShareDirectory>;
     readonly openOrganizationPeople?: () => void;
     /** Ordinary work navigation selects the preserved work surface again. */
     readonly close: () => void;
@@ -1423,15 +1427,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 };
             }
         }
-        // A Panel-agent preview is a work chat nobody else lists (DR-0272): its
-        // lineage names the Panel agent it tries, and its context says what.
+        // An Agent's test chat and a Panel agent's preview are work chats nobody
+        // else lists (DR-0272, DR-0324): the lineage names the Agent tried, and
+        // the context says which snapshot.
         for (const a of ws.archetypes) {
             const preview = a.previews.find((candidate) => candidate.chat.id === id);
             if (preview) {
                 const c = preview.chat;
                 return {
                     kind: c.kind,
-                    lineage: `${a.name} · Preview`,
+                    lineage: `${a.name} · ${a.kind === "panel" ? "Preview" : "Test"}`,
                     context: preview.version === null ? "Draft" : `Version ${preview.version}`,
                     conflict: c.conflict,
                     workstream: "Main",
@@ -1443,7 +1448,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     basis: c.targets.map((target) => target.basis).join(" · "),
                     candidate: c.candidateRevision,
                     acts: c.availableActs,
-                    preview: true,
+                    preview: a.kind,
                 };
             }
         }
@@ -1587,6 +1592,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             return next;
         });
     const [tasks] = createResource(navRefresh, () => api.getTasks().catch(() => []));
+    // Where the empty composer would start a chat under the selected
+    // organization, read only while no chat is open (DR-0325).
+    const [quickStart] = createResource(
+        () => selected() ? false : [navRefresh(), props.gaugeApps?.selectedTenant()?.id ?? null] as const,
+        async () => {
+            const scope = navigatorScope(props.gaugeApps?.selectedTenant());
+            if (!scope) return undefined;
+            // A failed read keeps the ordinary hint; starting reads again.
+            const workspace = await api.getWorkspace().catch(() => null);
+            return workspace ? quickStartPlacement(workspace, scope) : undefined;
+        },
+    );
     // `null` is a read that failed: it says nothing about which turns ended,
     // so the tracker below skips it rather than read it as "none".
     const [chatNotices] = createResource(navRefresh, () => api.getChatNotices().catch(() => null));
@@ -2013,10 +2030,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const prompt = initialPrompt?.trim() || undefined;
         try {
             const workspace = await api.getWorkspace();
-            const placementId = workspace.personalPlacement;
-            const project = placementId
-                ? workspace.projects.find((candidate) => candidate.placements.some((placement) => placement.placementId === placementId))
-                : undefined;
+            // The fresh chat goes to a project the navigator shows under the
+            // selected organization, so it appears where it was started
+            // (DR-0325).
+            const scope = navigatorScope(props.gaugeApps?.selectedTenant());
+            const start = quickStartPlacement(workspace, scope);
+            if (scope && !start) {
+                setStatus("there is no project here to start a chat in");
+                return;
+            }
+            const placementId = start?.placementId ?? workspace.personalPlacement;
+            const project = start?.project;
             const placement = project?.placements.find((candidate) => candidate.placementId === placementId);
             const targets = (placement?.targetIds ?? [])
                 .map((targetId) => workspace.workTargets.find((target) => target.id === targetId))
@@ -2028,6 +2052,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             if (project && placementId && targets.length === 1) {
                 const id = await api.createChatUnderPlacement(project.id, placementId, "new chat", [targets[0].id]);
                 await finishNewChat(id, prompt, images);
+                return;
+            }
+            if (scope) {
+                setStatus("no available work target can be read");
                 return;
             }
             const eng = await api.createEngagement();
@@ -2518,8 +2546,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
             onChatRemoved={(id) => selected() === id && setSelected(null)}
             onStatus={setStatus}
+            onFailure={(message) => reportFailure("nav", message)}
             runToneOf={runToneOf}
             refreshKey={navRefresh()}
+            scope={navigatorScope(props.gaugeApps?.selectedTenant())}
         />
     </>);
 
@@ -2861,14 +2891,21 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         stop: stopTurn,
         draft: { value: paneDraft, set: setPaneDraft },
         retainDraftOnScopeChange: true,
-        // A Panel-agent preview says what it is where you type into it: a test
-        // on your own model and funding, which does not exercise the website
-        // panels or visitor sign-in (DR-0272).
+        // A test chat says what it is where you type into it: the draft on your
+        // own model and funding. A Panel agent's preview does not exercise the
+        // website panels or visitor sign-in (DR-0272); an Agent's test sees only
+        // its own empty files (DR-0324).
         modelToolbar: (stacked?: boolean) => <>
-            <Show when={chatInfo()?.preview}>
+            <Show when={chatInfo()?.preview === "panel"}>
                 <p class="composer-preview-note" role="note" data-panel-preview-note>
                     Preview: a test chat on your usual model and funding. It doesn't exercise the
                     website panels or visitor sign-in. Delete the chat to end it.
+                </p>
+            </Show>
+            <Show when={chatInfo()?.preview === "work"}>
+                <p class="composer-preview-note" role="note" data-agent-test-note>
+                    Test: the draft as it stands, on your usual model and funding, with its own
+                    empty files. Test again from the Workshop to pick up edits; delete the chat to end it.
                 </p>
             </Show>
             {composerModelToolbar(stacked)}
@@ -3159,8 +3196,13 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             at the bottom — not a second, lesser input at the top. */}
                         <div class="transcript empty-chat-welcome" data-empty-chat-welcome>
                             <p class="empty-chat-hint">
-                                No chat is open. Task the agent below — your first
-                                message starts a chat in Personal.
+                                <Show
+                                    when={!quickStart.loading && quickStart() === null}
+                                    fallback={<>No chat is open. Task the agent below — your first
+                                    message starts a chat in {quickStart()?.project.name ?? "Personal"}.</>}
+                                >
+                                    No chat is open, and there is no project here to start one in.
+                                </Show>
                             </p>
                         </div>
                         {paneComposer()}
@@ -3534,6 +3576,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             Join {invite().project} on {invite().homeId}. Your free account
                             uses the owner’s Home; it does not create hosted work here.
                         </span>
+                        <Show when={invite().email}>
+                            {(email) => <span data-home-invite-email>
+                                It is for {email()}: accept it signed in to the account that has verified that address.
+                            </span>}
+                        </Show>
                         <small>{invite().endpoint}</small>
                         <button type="button" class="homegate-link" disabled={homeBusy()} onClick={dismissHomeInvite}>
                             Not now
@@ -4257,21 +4304,39 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     headings={{ nav: false, chat: false, content: false, files: false }}
                     taskBar={() => (
                         <TaskBar
-                            api={api}
+                            api={{
+                                // The asks follow the navigator's organization
+                                // (DR-0325); an unscoped read needs no workspace.
+                                getTasks: async () => {
+                                    const scope = navigatorScope(props.gaugeApps?.selectedTenant());
+                                    const tasks = await api.getTasks();
+                                    return scope ? scopeTasks(tasks, await api.getWorkspace(), scope) : tasks;
+                                },
+                            }}
                             selected={selected()}
-                            refreshKey={[navRefresh(), trackerTick()]}
+                            refreshKey={[navRefresh(), trackerTick(), props.gaugeApps?.selectedTenant()?.id]}
                             onSelect={(item) => {
                                 props.gaugeApps?.close();
                                 openChat(item);
                             }}
                             onOpenInbox={(inbox) => void openInbox(inbox)}
+                            onOpenBackgroundWork={({ project, projectName }) => {
+                                const id = project as ProjectId;
+                                setRoutedProject(id);
+                                api.setCurrentProject(id);
+                                props.gaugeApps?.close();
+                                closePanelSettings();
+                                setProjectSettings({ id, name: projectName });
+                                setProjectSettingsPage("background-work");
+                            }}
                             assigned={bearer() !== null ? {
                                 // The personal queue across every project this Home
                                 // lists (WHIP-4). Only with an account session: the
                                 // assigned-task read derives its actor from it.
                                 read: async () => {
                                     const workspace = await api.getWorkspace();
-                                    return readAssignedTrackerTasks(api, workspace.projects);
+                                    const scope = navigatorScope(props.gaugeApps?.selectedTenant());
+                                    return readAssignedTrackerTasks(api, scopeProjects(workspace.projects, scope));
                                 },
                                 onOpen: (task) => {
                                     props.gaugeApps?.close();
@@ -4368,7 +4433,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                             ? (kind) => void attachTarget(workspace().project.id, workspace().project.name, kind, "content")
                                             : undefined}
                                         onManageDeployment={setDeployment}
-                                        projectShareCandidates={props.gaugeApps?.projectShareCandidates}
+                                        projectShareDirectory={props.gaugeApps?.projectShareDirectory}
                                         onOpenOrganizationPeople={props.gaugeApps?.openOrganizationPeople}
                                     />}
                                 </Show>

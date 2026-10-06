@@ -235,6 +235,17 @@ export function DevicesModal(props: {
     const [controllers, { refetch: refetchControllers }] = createResource(
         emptyOnFailure(() => props.api.listMachineControllers()),
     );
+    // A desktop serves no direct phone pairing: a phone reaches it through
+    // the relay as its own signed-in account (DR-0329). The section shows only
+    // on a host that answers the controller protocol.
+    const [controllersServed] = createResource(async () => {
+        try {
+            await props.api.listMachineControllers();
+            return true;
+        } catch {
+            return false;
+        }
+    });
 
     const mintControllerInvitation = async () => {
         try {
@@ -523,8 +534,7 @@ export function DevicesModal(props: {
                     </button>
                 </div>
 
-                {/* Secure enrollment handshake (ACCT-1): the holder shows a ticket + compares
-                    the SAS before authorizing; the account key is transferred sealed. */}
+                <Show when={controllersServed()}>
                 <h4 style={{ "margin-top": "16px" }}>Control this Project Host from a trusted device</h4>
                 <p class="status" style={{ margin: "0 0 8px" }}>
                     Create a one-use invitation for this Project Host. The phone proves its
@@ -619,7 +629,10 @@ export function DevicesModal(props: {
                         )}
                     </For>
                 </ul>
+                </Show>
 
+                {/* Secure enrollment handshake (ACCT-1): the holder shows a ticket + compares
+                    the SAS before authorizing; the account key is transferred sealed. */}
                 <h4 style={{ "margin-top": "16px" }}>Add a device securely</h4>
                 <p class="status" style={{ margin: "0 0 8px" }}>
                     Enroll a new device into this account. Show it this ticket, then compare the

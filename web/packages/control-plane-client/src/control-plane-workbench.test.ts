@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { engagementId } from "./control-plane-domain";
-import type { PlacementId } from "./control-plane-domain";
+import type { PlacementId, ProjectId } from "./control-plane-domain";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 import {
     exportResourceToDisk,
+    forkProject,
+    projectUpstream,
+    pullProjectUpstream,
     getPlacementDistribution,
     getPlacementDistributionAudit,
     getResourceExport,
@@ -180,5 +183,39 @@ describe("chat notices", () => {
         const transport = { base: "", json } as WorkbenchTransport;
 
         expect(await getChatNotices(transport)).toEqual([]);
+    });
+});
+
+describe("project fork and pull", () => {
+    it("forks with an idempotency key and reports Agents that were not placed", async () => {
+        const json = vi.fn().mockResolvedValue({
+            id: "proj-fork-1",
+            skipped_agents: [{ agent_id: "a", name: "Reviewer", reason: "this Agent belongs to another account" }],
+        });
+        const transport = { base: "", json } as WorkbenchTransport;
+        const forked = await forkProject(transport, "proj-1" as ProjectId, undefined, "op-1");
+        expect(json).toHaveBeenCalledWith("POST", "/projects/proj-1/fork", { operation_id: "op-1" });
+        expect(forked).toEqual({
+            id: "proj-fork-1",
+            skippedAgents: [{ name: "Reviewer", reason: "this Agent belongs to another account" }],
+        });
+    });
+
+    it("reads an unavailable original as unavailable, never as up to date", async () => {
+        const json = vi.fn().mockResolvedValue({ upstream: { available: false, reason: "you can no longer open the original" } });
+        const upstream = await projectUpstream({ base: "", json } as WorkbenchTransport, "proj-2" as ProjectId);
+        expect(upstream).toEqual({ available: false, projectId: null, name: null, reason: "you can no longer open the original" });
+    });
+
+    it("pulls against the previewed cut with a choice for every conflict", async () => {
+        const json = vi.fn()
+            .mockResolvedValueOnce({ upstream: { available: true, project_id: "proj-1", name: "Peach", source_cut: "cut-9", take: ["a.md"], remove: [], conflicts: ["b.md"] } })
+            .mockResolvedValueOnce({ pulled: 2 });
+        const transport = { base: "", json } as WorkbenchTransport;
+        const upstream = await projectUpstream(transport, "proj-2" as ProjectId);
+        expect(upstream).toMatchObject({ available: true, sourceCut: "cut-9", take: ["a.md"], conflicts: ["b.md"] });
+        const result = await pullProjectUpstream(transport, "proj-2" as ProjectId, "cut-9", { "b.md": "theirs" });
+        expect(json).toHaveBeenLastCalledWith("POST", "/projects/proj-2/upstream/pull", { source_cut: "cut-9", resolutions: { "b.md": "theirs" } });
+        expect(result.pulled).toBe(2);
     });
 });

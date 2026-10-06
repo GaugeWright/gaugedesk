@@ -20,6 +20,7 @@ use crate::gaugeapp_contract::{
     GaugeAppClient, GaugeAppCommandEnvelope, GaugeAppCommandGrant, GaugeAppKind, GaugeAppPageGrant,
     GaugeAppScope, GaugeAppSession, ReviewPolicy,
 };
+use crate::workbench_auth::web_account_mode;
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 use gaugedesk_core::boundary::Authority;
 use gaugedesk_core::content_erasure::{
@@ -1621,7 +1622,7 @@ pub fn contains_secret_text(value: &str) -> bool {
 
 const OPENAI_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 
-enum AgentCredential {
+pub(crate) enum AgentCredential {
     OpenAi { token: String, endpoint: String },
     Codex { access: String, account_id: String },
 }
@@ -1676,35 +1677,56 @@ fn managed_agent_endpoint(configured: Option<String>) -> Result<String, GaugeApp
     Ok(raw.to_owned())
 }
 
-fn resolve_agent_credential(
+/// Which account scope a management turn reads its credential from, and which
+/// execution class it asks that credential for.
+///
+/// A hosted Hub or Home runs the turn server-side for the authenticated person,
+/// so it reads `account::<actor>` and asks for `private-home`. A desktop runs
+/// it in the person's own process, as it runs any chat turn: it reads the scope
+/// DR-0313 gives that actor — the install's own for the claimant and the local
+/// channel, a scope of its own for every other account — and asks for the
+/// `local-interactive` class every desktop link carries (ADR 0085). Reading
+/// `account::<actor>` there found nothing, because nothing a desktop links is
+/// kept under it, and answered every Agent settings turn `NoModelAccess` while
+/// that person's chats ran on the same credential.
+fn agent_credential_source(
+    workbench: &SharedWorkbench,
+    actor: &str,
+) -> (String, ModelExecutionClass) {
+    let guard = workbench.lock_unpoisoned();
+    if guard.hosted_home_mode() || web_account_mode() {
+        (account_scope(actor), ModelExecutionClass::PrivateHome)
+    } else {
+        (
+            guard.account_scope_for_actor(actor),
+            guard.model_execution_class(),
+        )
+    }
+}
+
+pub(crate) fn resolve_agent_credential(
     workbench: &SharedWorkbench,
     actor: &str,
 ) -> Result<AgentCredential, GaugeAppAgentError> {
-    let scope = account_scope(actor);
+    let (scope, class) = agent_credential_source(workbench, actor);
     let records = {
         let guard = workbench.lock_unpoisoned();
         credentials_in_scope(guard.store_ref(), &scope)
     };
     if records
         .get("openai-codex")
-        .is_some_and(|record| record.admits(ModelExecutionClass::PrivateHome))
+        .is_some_and(|record| record.admits(class))
     {
-        let credential = crate::codex_oauth::resolve_runtime_credential_in(
-            workbench,
-            &scope,
-            ModelExecutionClass::PrivateHome,
-        )
-        .map_err(GaugeAppAgentError::Credential)?
-        .ok_or(GaugeAppAgentError::NoModelAccess)?;
+        let credential =
+            crate::codex_oauth::resolve_runtime_credential_in(workbench, &scope, class)
+                .map_err(GaugeAppAgentError::Credential)?
+                .ok_or(GaugeAppAgentError::NoModelAccess)?;
         return Ok(AgentCredential::Codex {
             access: credential.access,
             account_id: credential.account_id,
         });
     }
-    let Some(record) = records
-        .get("openai")
-        .filter(|record| record.admits(ModelExecutionClass::PrivateHome))
-    else {
+    let Some(record) = records.get("openai").filter(|record| record.admits(class)) else {
         if environment_flag("MANAGEMENT_AGENT_MANAGED") {
             let token = gaugedesk_env::var("MANAGEMENT_AGENT_OPENAI_KEY")
                 .filter(|value| !value.trim().is_empty())

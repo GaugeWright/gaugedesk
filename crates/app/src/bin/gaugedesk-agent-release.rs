@@ -219,7 +219,7 @@ fn main() -> io::Result<()> {
                 "{}",
                 workbench
                     .lock_unpoisoned()
-                    .list_public_credentials(ListPublicCredentialsRequest { edge_origin },)?,
+                    .list_public_credentials(ListPublicCredentialsRequest { edge_origin }, None)?,
             );
         }
         Some("credential-provision") => {
@@ -233,7 +233,7 @@ fn main() -> io::Result<()> {
                 "{}",
                 workbench
                     .lock_unpoisoned()
-                    .provision_public_credential(request)?,
+                    .provision_public_credential(request, None)?,
             );
         }
         Some("credential-revoke") => {
@@ -247,7 +247,7 @@ fn main() -> io::Result<()> {
                 "{}",
                 workbench
                     .lock_unpoisoned()
-                    .revoke_public_credential(request)?,
+                    .revoke_public_credential(request, None)?,
             );
         }
         Some("credential-export") => {

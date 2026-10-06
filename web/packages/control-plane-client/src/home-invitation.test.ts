@@ -81,4 +81,34 @@ describe("ordinary Home invitations", () => {
             project: "proj-1",
         }));
     });
+
+    it("carries an email invitation's address and no account until it is accepted", async () => {
+        const encoded = invitation({ invited_authority: "", invited_email: "alex@example.test" });
+        expect(parseHomeInvitation(encoded)).toEqual({
+            authority: "",
+            email: "alex@example.test",
+            project: "proj-1",
+            homeId: "home:owner",
+            endpoint: "https://home.example",
+        });
+        expect(() => parseHomeInvitation(invitation({ invited_authority: "" }))).toThrow(/invited authority/);
+        const route = vi.fn(async () => ({
+            invite: encoded,
+            url: `https://desk.gaugewright.com/invite?d=${encoded}`,
+            expires_at: 123,
+        }));
+        await expect(createHomeInvitation(route, {
+            email: " Alex@Example.test ",
+            project: "proj-1" as never,
+            endpoint: "https://home.example",
+        })).resolves.toMatchObject({ homeId: "home:owner" });
+        expect(route).toHaveBeenCalledWith("POST", "/home/invitations", expect.not.objectContaining({
+            authority: expect.anything(),
+        }));
+        await expect(createHomeInvitation(route, {
+            email: "someone-else@example.test",
+            project: "proj-1" as never,
+            endpoint: "https://home.example",
+        })).rejects.toThrow(/malformed/);
+    });
 });

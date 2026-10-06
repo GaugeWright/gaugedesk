@@ -51,6 +51,7 @@ export function projectScopedWorkspace(
             && placements.has(workspace.personalPlacement)
                 ? workspace.personalPlacement
                 : null,
+        homeOrganization: workspace.homeOrganization,
     };
 }
 

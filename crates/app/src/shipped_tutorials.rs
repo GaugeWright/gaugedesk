@@ -337,6 +337,12 @@ impl Workbench {
             return Err("Tutorials are unavailable to this account".into());
         }
         let project = tutorial_project_id(actor);
+        // The learner's session reads its run, in Tutorials or an older one
+        // in Personal (WS-740).
+        let _held = [
+            self.hold_for_session(&project),
+            self.hold_for_session(DEFAULT_PROJECT),
+        ];
         let record = self
             .library
             .projects
@@ -412,6 +418,12 @@ impl Workbench {
         let actor = context.actor().as_str().to_owned();
         let request_id = tutorial_request_id(name);
         let limits = ProjectWorkflowLimits::PRODUCT;
+        // The learner's session launches or resumes its run, in Tutorials or
+        // an older one in Personal (WS-740).
+        let _held = [
+            self.hold_for_session(&tutorial_project_id(&actor)),
+            self.hold_for_session(DEFAULT_PROJECT),
+        ];
         // Runs already admitted in Personal retain their pinned source and tasks.
         if self.project_workflow_launched(DEFAULT_PROJECT, &actor, &request_id)? {
             return self.resume_project_workflow(context, DEFAULT_PROJECT, &request_id, limits);

@@ -380,9 +380,12 @@ fn an_owner_role_no_longer_sees_another_accounts_projects() {
         ProjectVisibility::Only(["p-other".to_owned()].into())
     );
 
-    // The credential-free local channel keeps its view until the local
-    // account has its own Personal (WS-588).
-    assert_eq!(visibility(&wb, None), ProjectVisibility::All);
+    // Signed out, the window is the local account, which owns nothing the
+    // claimant does (DR-0328 §2).
+    assert_eq!(
+        visibility(&wb, None),
+        ProjectVisibility::Account(Default::default())
+    );
 
     let guard = wb.lock_unpoisoned();
     assert_eq!(
@@ -679,9 +682,9 @@ async fn a_quick_chat_starts_in_the_callers_own_personal() {
     let (status, chat) = send(&app, "POST", "/chats", None, Some(serde_json::json!({}))).await;
     assert_eq!(status, StatusCode::CREATED, "{chat}");
     assert_eq!(
-        project_of(&chat).as_deref(),
-        Some(DEFAULT_PROJECT),
-        "the local channel keeps the install's Personal until WS-588"
+        project_of(&chat),
+        Some(personal_project_id(crate::LOCAL_AUTHORITY)),
+        "signed out, the local account works in its own Personal (DR-0328 §2)"
     );
 }
 
@@ -892,8 +895,8 @@ fn the_claimant_keeps_the_installs_credentials_and_another_account_has_its_own()
     assert_eq!(guard.credential_scope_for(Some(&claimant)), install);
     assert_eq!(
         guard.credential_scope_for(None),
-        install,
-        "the local channel shares the claimant's until WS-588"
+        crate::account::account_scope(guard.authority().as_str()),
+        "signed out, the local account has its own (DR-0328 §2)"
     );
     assert_eq!(
         guard.credential_scope_for(Some(&other)),
@@ -958,4 +961,808 @@ async fn an_account_sees_and_links_only_its_own_provider_credentials() {
     assert!(!guard
         .linked_providers_in_class(&guard.account_scope_for_actor(OTHER), class)
         .contains(&"anthropic".to_owned()));
+}
+
+#[test]
+fn a_claims_ownership_is_written_down_so_it_outlives_the_claim() {
+    let (_root, wb) = open();
+    project(&wb, "p-legacy", serde_json::json!({}));
+    project(
+        &wb,
+        "p-org",
+        serde_json::json!({ "organization": "organization:abc" }),
+    );
+    project(&wb, "p-other", serde_json::json!({ "owner": OTHER }));
+    let agent = legacy_agent(&wb);
+
+    // A computer nobody claimed already defaults to the local account.
+    assert_eq!(wb.lock_unpoisoned().settle_claimed_ownership().unwrap(), 0);
+
+    claim(&wb, CLAIMANT);
+    let mut guard = wb.lock_unpoisoned();
+    assert!(guard.settle_claimed_ownership().unwrap() > 0);
+    let recorded = |guard: &crate::Workbench, id: &str| {
+        recorded_owner(&guard.library.projects[id]).map(str::to_owned)
+    };
+    assert_eq!(recorded(&guard, "p-legacy").as_deref(), Some(CLAIMANT));
+    assert_eq!(recorded(&guard, DEFAULT_PROJECT).as_deref(), Some(CLAIMANT));
+    assert_eq!(
+        recorded(&guard, "p-org"),
+        None,
+        "an organization project keeps its owner"
+    );
+    assert_eq!(recorded(&guard, "p-other").as_deref(), Some(OTHER));
+    assert_eq!(
+        guard.library.agents[&agent].authoring_owner.as_deref(),
+        Some(CLAIMANT)
+    );
+    assert_eq!(
+        guard.library.agents[crate::DEFAULT_AGENT].authoring_owner,
+        None,
+        "the built-in Agents stay the library's own"
+    );
+    assert_eq!(guard.install_scope_owner().as_deref(), Some(CLAIMANT));
+    assert_eq!(
+        guard.desktop_account_store_scope(CLAIMANT),
+        crate::account::ACCOUNT_SCOPE
+    );
+    assert_eq!(guard.settle_claimed_ownership().unwrap(), 0, "idempotent");
+}
+
+fn bearer_headers(token: &str) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    headers
+}
+
+#[test]
+fn only_a_projects_owner_takes_its_owner_acts() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    project(&wb, "p-other", serde_json::json!({ "owner": OTHER }));
+    project(
+        &wb,
+        "p-org",
+        serde_json::json!({ "organization": "organization:abc" }),
+    );
+    let claimant = bearer_headers(&session(&wb, CLAIMANT));
+    let other = bearer_headers(&session(&wb, OTHER));
+    let guard = wb.lock_unpoisoned();
+    let refused = |headers: &axum::http::HeaderMap, project: &str| {
+        guard
+            .project_owner_refusal(headers, project)
+            .map(|response| response.status())
+    };
+    assert_eq!(refused(&claimant, DEFAULT_PROJECT), None);
+    assert_eq!(
+        refused(&other, DEFAULT_PROJECT),
+        Some(StatusCode::FORBIDDEN)
+    );
+    assert_eq!(refused(&other, "p-other"), None);
+    assert_eq!(refused(&claimant, "p-other"), Some(StatusCode::FORBIDDEN));
+    assert_eq!(
+        refused(&other, "p-org"),
+        None,
+        "an organization's project keeps its organization's own checks"
+    );
+    assert_eq!(
+        refused(&other, "no-such-project"),
+        None,
+        "left to the handler's 404"
+    );
+    assert_eq!(
+        refused(&axum::http::HeaderMap::new(), DEFAULT_PROJECT),
+        None,
+        "the local channel keeps its view until it is the local account"
+    );
+    // A placement answers for its project.
+    let placement = crate::app_support::DEFAULT_PLACEMENT;
+    assert_eq!(
+        guard
+            .placement_owner_refusal(&other, placement)
+            .map(|response| response.status()),
+        Some(StatusCode::FORBIDDEN)
+    );
+    assert!(guard
+        .placement_owner_refusal(&claimant, placement)
+        .is_none());
+}
+
+#[tokio::test]
+async fn an_account_cannot_invite_into_another_accounts_project() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = crate::open_control_plane(wb.clone());
+    let other = session(&wb, OTHER);
+    // An organization role is not project ownership (DR-0268 §1, DR-0328 §4).
+    append(
+        &wb,
+        "membership",
+        &MembershipRecord {
+            id: OTHER.into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: OTHER.into(),
+            email: String::new(),
+            role: "admin".into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        },
+    );
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/home/invitations",
+        Some(&other),
+        Some(serde_json::json!({
+            "authority": "acct-invitee",
+            "project": DEFAULT_PROJECT,
+            "role": "member",
+            "endpoint": "https://home.example.test",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "only this project's owner may do that");
+}
+
+#[tokio::test]
+async fn signed_out_the_window_is_the_local_account_on_a_claimed_computer() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    wb.lock_unpoisoned().settle_claimed_ownership().unwrap();
+    let app = gated(&wb);
+    let home = |id: &str| format!("/projects/{id}/home");
+
+    // The claimant's projects, Personal included, are not the local account's.
+    assert_eq!(
+        send(&app, "GET", &home(DEFAULT_PROJECT), None, None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let (_, workspace) = send(&app, "GET", "/workspace", None, None).await;
+    assert!(!listed_ids(&workspace, "projects", "id").contains(&DEFAULT_PROJECT.to_owned()));
+
+    // It works in a Personal of its own, and its tracker there.
+    let (status, chat) = send(&app, "POST", "/chats", None, Some(serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{chat}");
+    let personal = personal_project_id(crate::LOCAL_AUTHORITY);
+    assert_eq!(
+        send(&app, "GET", &home(&personal), None, None).await.0,
+        StatusCode::OK
+    );
+    let (_, workspace) = send(&app, "GET", "/workspace", None, None).await;
+    assert_eq!(listed_ids(&workspace, "projects", "id")[0], personal);
+    let guard = wb.lock_unpoisoned();
+    assert!(guard.local_personal_tracker_context(&personal).is_some());
+    assert!(guard
+        .local_personal_tracker_context(DEFAULT_PROJECT)
+        .is_none());
+}
+
+#[test]
+fn an_unclaimed_computers_local_account_keeps_the_installs_personal_and_credentials() {
+    let (_root, wb) = open();
+    let mut guard = wb.lock_unpoisoned();
+    assert_eq!(
+        guard
+            .request_personal(&axum::http::HeaderMap::new())
+            .unwrap(),
+        None,
+        "the install's Personal is the local account's"
+    );
+    assert_eq!(
+        guard.credential_scope_for(None),
+        crate::account::ACCOUNT_SCOPE
+    );
+    assert!(guard.project_visibility(None).allows(DEFAULT_PROJECT));
+}
+
+fn join(wb: &SharedWorkbench, account: &str, role: &str) {
+    append(
+        wb,
+        "membership",
+        &MembershipRecord {
+            id: account.into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: account.into(),
+            email: String::new(),
+            role: role.into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        },
+    );
+}
+
+#[test]
+fn a_pairing_belongs_to_the_account_that_made_it() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let ticket = |authority: &str| crate::federation::PairingTicket {
+        authority: authority.into(),
+        governance_pubkey: String::new(),
+        cert_fingerprint: String::new(),
+        broker_addr: String::new(),
+        scope: "bridge:invoke".into(),
+        expiry: 0,
+    };
+    let mut guard = wb.lock_unpoisoned();
+    crate::federation::persist_bridge(guard.store_mut(), &ticket("peer-legacy"), "g1", true);
+    crate::federation::persist_bridge_for(
+        guard.store_mut(),
+        &ticket("peer-other"),
+        "g2",
+        true,
+        Some(OTHER),
+    );
+    let bridges = crate::federation::folded_bridges(guard.store_ref());
+    let owner = |id: &str| guard.bridge_owner(bridges.iter().find(|b| b.id == id).unwrap());
+    assert_eq!(
+        owner("peer-legacy"),
+        CLAIMANT,
+        "an older pairing is the legacy owner's"
+    );
+    assert_eq!(owner("peer-other"), OTHER);
+
+    let signed_out = axum::http::HeaderMap::new();
+    assert_eq!(
+        guard.pairing_actor(&signed_out).as_deref(),
+        Some(guard.authority().as_str())
+    );
+    let unknown = bearer_headers("not-a-session");
+    assert_eq!(
+        guard.pairing_actor(&unknown).as_deref(),
+        Some(""),
+        "a session that resolves to no account owns nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_device_pairing_is_accepted_only_by_its_own_account() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    join(&wb, OTHER, "member");
+    let app = gated(&wb);
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+
+    let (status, pairing) = send(
+        &app,
+        "POST",
+        "/pairing-requests",
+        Some(&other),
+        Some(serde_json::json!({ "device": "device-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{pairing}");
+    let accept = format!(
+        "/boundaries/{}/accept",
+        pairing["pairing_id"].as_str().unwrap()
+    );
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &accept,
+        Some(&claimant),
+        Some(serde_json::json!({ "participant": OTHER })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &accept,
+        Some(&other),
+        Some(serde_json::json!({ "participant": OTHER })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+const EDGE: &str = "https://edge.example.test";
+
+fn bind_deployment(wb: &SharedWorkbench, deployment: &str, project: &str, publisher: Option<&str>) {
+    use crate::library::{
+        DeploymentAudience, DeploymentBindingStatus, DeploymentOperationalConfig,
+        PublicDeploymentBindingRecord,
+    };
+    let mut extra = std::collections::BTreeMap::new();
+    if let Some(publisher) = publisher {
+        extra.insert(
+            crate::agent_release::BINDING_PUBLISHER_EXTRA.to_owned(),
+            serde_json::Value::String(publisher.to_owned()),
+        );
+    }
+    wb.lock_unpoisoned()
+        .write_public_deployment_record(PublicDeploymentBindingRecord {
+            schema: LIBRARY_RECORD_SCHEMA,
+            extra,
+            id: format!("binding-{deployment}"),
+            op: RecordOp::Upsert,
+            project_id: project.into(),
+            placement_id: "inst-panel".into(),
+            hosted_deployment_id: deployment.into(),
+            edge_origin: EDGE.into(),
+            active_release_id: Some("sha256:release".into()),
+            operational: DeploymentOperationalConfig {
+                allowed_origins: vec!["https://site.example.test".into()],
+                audience: DeploymentAudience::default(),
+                funding_ref: "managed:plan".into(),
+                credential_class: "managed".into(),
+                credential_ref: String::new(),
+                max_spend_cents: None,
+                max_session_spend_cents: None,
+                max_turn_spend_cents: None,
+                per_visitor_turn_limit: 10,
+                max_concurrent_sessions: 10,
+                white_label: false,
+                retention_idle_ttl_seconds: 600,
+                retention_absolute_ttl_seconds: 3600,
+            },
+            status: DeploymentBindingStatus::Active,
+        })
+        .unwrap();
+}
+
+/// The public key and authority a credential presents to the edge.
+fn presented(credential: crate::agent_release::PublisherCredential) -> (String, String) {
+    (credential.public_key(), credential.authority().to_owned())
+}
+
+#[test]
+fn each_account_publishes_under_its_own_key_and_the_claimant_keeps_the_installs() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    project(&wb, "p-mine", serde_json::json!({ "owner": CLAIMANT }));
+    project(&wb, "p-other", serde_json::json!({ "owner": OTHER }));
+    project(
+        &wb,
+        "p-org",
+        serde_json::json!({ "organization": "organization:abc" }),
+    );
+    let guard = wb.lock_unpoisoned();
+    let install = presented(guard.publisher_credential().unwrap());
+    assert_eq!(
+        install.1,
+        format!("gaugedesk:{}", guard.authority().as_str()),
+        "the install's authority is unchanged"
+    );
+    assert_eq!(install.0, guard.public_publisher_key().unwrap());
+
+    // The claimant, and the local account, keep the install's key and
+    // authority, so everything already published keeps verifying.
+    for account in [CLAIMANT, guard.authority().as_str()] {
+        assert_eq!(
+            presented(guard.publisher_credential_for(account).unwrap()),
+            install
+        );
+    }
+    for project in [DEFAULT_PROJECT, "p-mine", "p-org"] {
+        assert_eq!(
+            presented(guard.project_publisher_credential(project).unwrap()),
+            install,
+            "{project}"
+        );
+    }
+
+    // Another account has a key of its own, under its own authority, and it
+    // is the same key every time.
+    let other = presented(guard.project_publisher_credential("p-other").unwrap());
+    assert_ne!(other.0, install.0);
+    assert_eq!(other.1, format!("gaugedesk:{OTHER}"));
+    assert_eq!(
+        presented(guard.publisher_credential_for(OTHER).unwrap()),
+        other
+    );
+    assert_eq!(
+        presented(guard.publisher_credential_for(OTHER).unwrap()),
+        other,
+        "the key is kept, not minted again"
+    );
+}
+
+#[test]
+fn an_unclaimed_computers_local_account_keeps_the_installs_publisher() {
+    let (_root, wb) = open();
+    project(&wb, "p-legacy", serde_json::json!({}));
+    let guard = wb.lock_unpoisoned();
+    let install = presented(guard.publisher_credential().unwrap());
+    assert_eq!(
+        presented(guard.project_publisher_credential("p-legacy").unwrap()),
+        install
+    );
+    assert_ne!(
+        presented(guard.publisher_credential_for(OTHER).unwrap()).0,
+        install.0
+    );
+}
+
+#[test]
+fn a_deployment_stays_with_the_key_that_published_it() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    project(&wb, "p-other", serde_json::json!({ "owner": OTHER }));
+    // Published before per-account publishing: no recorded publisher.
+    bind_deployment(&wb, "dep-legacy", "p-other", None);
+    bind_deployment(&wb, "dep-other", "p-other", Some(OTHER));
+    let guard = wb.lock_unpoisoned();
+    let install = guard.publisher_credential().unwrap().public_key();
+    let other = guard.publisher_credential_for(OTHER).unwrap().public_key();
+    let binding = |deployment: &str| {
+        guard
+            .library
+            .public_deployments
+            .values()
+            .find(|binding| binding.hosted_deployment_id == deployment)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        guard
+            .binding_publisher_credential(&binding("dep-legacy"))
+            .unwrap()
+            .public_key(),
+        install,
+        "a deployment published before this stays with the claimant"
+    );
+    assert_eq!(
+        guard
+            .binding_publisher_credential(&binding("dep-other"))
+            .unwrap()
+            .public_key(),
+        other
+    );
+    // A republish signs with the deployment's key, and a new deployment from
+    // the project with its owner's.
+    let publication = |deployment: &str| {
+        guard
+            .publication_publisher_key("inst-panel", EDGE, deployment)
+            .unwrap()
+    };
+    assert_eq!(publication("dep-legacy"), install);
+    assert_eq!(publication("dep-other"), other);
+    drop(guard);
+    let mut guard = wb.lock_unpoisoned();
+    let personal = guard.ensure_account_personal(OTHER).unwrap();
+    let placement = guard
+        .personal_placement_of(&personal)
+        .expect("a Personal has a placement");
+    assert_eq!(
+        guard
+            .publication_publisher_key(&placement, EDGE, "dep-new")
+            .unwrap(),
+        other
+    );
+}
+
+#[tokio::test]
+async fn the_publisher_authority_answers_for_its_caller() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = gated(&wb);
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+    let (install, own) = {
+        let guard = wb.lock_unpoisoned();
+        (
+            guard.public_publisher_key().unwrap(),
+            guard.publisher_credential_for(OTHER).unwrap().public_key(),
+        )
+    };
+    let read = |bearer: Option<String>| {
+        let app = app.clone();
+        async move {
+            let (status, body) = send(
+                &app,
+                "GET",
+                "/public-deployments/publisher-authority",
+                bearer.as_deref(),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["public_key"].as_str().unwrap().to_owned()
+        }
+    };
+    assert_eq!(read(Some(claimant)).await, install);
+    assert_eq!(read(None).await, install, "the local channel");
+    assert_ne!(own, install);
+    assert_eq!(read(Some(other)).await, own);
+}
+
+#[test]
+fn off_a_desktop_there_is_only_the_installs_publisher() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    project(&wb, "p-other", serde_json::json!({ "owner": OTHER }));
+    let mut guard = wb.lock_unpoisoned();
+    guard.enable_hosted_home_mode();
+    let install = presented(guard.publisher_credential().unwrap());
+    assert_eq!(
+        presented(guard.publisher_credential_for(OTHER).unwrap()),
+        install
+    );
+    assert_eq!(
+        presented(guard.project_publisher_credential("p-other").unwrap()),
+        install
+    );
+    assert_eq!(
+        guard.public_publisher_key_as(Some(OTHER)).unwrap(),
+        install.0
+    );
+}
+
+/// A synthetic edge that admits a first BYOK publication and records the
+/// publisher authority and key every command presented, and every body.
+#[allow(clippy::type_complexity)]
+fn recording_edge() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>>,
+) {
+    use std::io::{BufRead, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let shared = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut parts = line.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_owned();
+            let path = parts.next().unwrap_or_default().to_owned();
+            let (mut length, mut authority, mut key) = (0_usize, String::new(), String::new());
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header.trim().is_empty() {
+                    break;
+                }
+                let (name, value) = header.split_once(':').unwrap_or_default();
+                let value = value.trim().to_owned();
+                match name.to_ascii_lowercase().as_str() {
+                    "content-length" => length = value.parse().unwrap_or_default(),
+                    "x-gw-publisher-authority" => authority = value,
+                    "x-gw-publisher-key" => key = value,
+                    _ => {}
+                }
+            }
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).unwrap();
+            let (status, response) = if method == "GET" && path == "/v1/public-credentials" {
+                (
+                    200,
+                    serde_json::json!({ "credentials": [{
+                        "credential_ref": "credential:public:mine:openai:key",
+                        "provider": "openai",
+                        "credential_class": "openai-api-key",
+                    }] }),
+                )
+            } else if method == "GET" {
+                (404, serde_json::json!({ "error": "not found" }))
+            } else {
+                (
+                    200,
+                    serde_json::json!({ "deployment": { "lifecycle": "active" } }),
+                )
+            };
+            shared
+                .lock()
+                .unwrap()
+                .push((format!("{method} {path}"), authority, key, bytes));
+            let response = response.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
+    });
+    (origin, seen)
+}
+
+#[test]
+fn a_publication_from_another_accounts_project_is_signed_and_recorded_as_its() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let (edge, seen) = recording_edge();
+    let own = {
+        let mut guard = wb.lock_unpoisoned();
+        let seeded = guard
+            .seed_panel_placement("inst-panel", crate::library::PanelPublicProfile::default())
+            .unwrap();
+        let project = seeded["project_id"].as_str().unwrap().to_owned();
+        let mut record = guard.library.projects[&project].clone();
+        record_owner(&mut record.extra, OTHER);
+        guard.write_project_record(record);
+        guard.publisher_credential_for(OTHER).unwrap()
+    };
+    let mut request: crate::agent_release::PublishDeploymentRequest =
+        serde_json::from_value(serde_json::json!({
+            "placement_id": "inst-panel",
+            "deployment_id": "theirs",
+            "edge_origin": edge,
+            "allowed_origins": ["https://customer.example"],
+            "per_visitor_turn_limit": 5,
+            "max_concurrent_sessions": 5,
+            "funding_ref": "credential:public:mine:openai:key",
+            "credential_ref": "credential:public:mine:openai:key",
+            "audience": { "anonymous_allowed": true },
+            "white_label": false,
+            "end_sessions": false,
+        }))
+        .unwrap();
+    request.work_chat_default_model = Some("gpt-5.5".to_owned());
+    let mut guard = wb.lock_unpoisoned();
+    let outcome = guard.publish_agent_deployment(request).unwrap();
+    assert_eq!(
+        guard.library.public_deployments[&outcome.binding_id].extra
+            [crate::agent_release::BINDING_PUBLISHER_EXTRA],
+        OTHER
+    );
+    guard
+        .control_public_deployment(crate::agent_release::ControlDeploymentRequest {
+            deployment_id: "theirs".into(),
+            edge_origin: edge.clone(),
+            command: "pause".into(),
+            expected_revision: 1,
+        })
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 4, "{seen:?}");
+    for (command, authority, key, _) in seen.iter() {
+        assert_eq!(authority, own.authority(), "{command}");
+        assert_eq!(key, &own.public_key(), "{command}");
+    }
+    let release = seen
+        .iter()
+        .find(|(command, ..)| command.starts_with("PUT /v1/releases/"))
+        .map(|(.., body)| body)
+        .unwrap();
+    let release: gaugedesk_core::agent_release::SignedAgentRelease =
+        ciborium::from_reader(release.as_slice()).unwrap();
+    assert_eq!(release.signer_key_id, own.authority());
+    assert_eq!(release.signer_public_key.as_str(), own.public_key());
+    assert_eq!(release.payload.host_policy.expected_signer, OTHER);
+    assert_eq!(
+        release.payload.host_policy.signer_public_key_hex,
+        own.public_key()
+    );
+}
+
+/// The token a management agent turn would run on for `actor`, or the
+/// refusal it would answer with. `AgentCredential` holds a secret and so is
+/// deliberately not `Debug`; this flattens it for assertions.
+fn management_agent_token(
+    wb: &SharedWorkbench,
+    actor: &str,
+) -> Result<String, crate::gaugeapp_agent::GaugeAppAgentError> {
+    use crate::gaugeapp_agent::AgentCredential;
+    crate::gaugeapp_agent::resolve_agent_credential(wb, actor).map(|credential| match credential {
+        AgentCredential::OpenAi { token, .. } => token,
+        AgentCredential::Codex { access, .. } => access,
+    })
+}
+
+// DR-0313: the desktop keeps the claimant's provider links in the install's
+// account scope, where the local `/account/credentials` route puts them. The
+// management agent read `account::<actor>` instead, found nothing there, and
+// answered every Agent settings turn 412 while the same person's chats ran.
+// On a claimed computer the signed-out window is the local account, which
+// has links of its own and not the claimant's (DR-0328 §2).
+#[tokio::test]
+async fn the_management_agent_finds_the_claimants_desktop_credentials() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = gated(&wb);
+    let claimant = session(&wb, CLAIMANT);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(&claimant),
+        Some(serde_json::json!({ "provider": "openai", "token": "sk-claimant" })),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+
+    match management_agent_token(&wb, CLAIMANT) {
+        Ok(token) => assert_eq!(token, "sk-claimant"),
+        Err(error) => panic!("the claimant found no management credential: {error}"),
+    }
+    let local = wb.lock_unpoisoned().authority().as_str().to_owned();
+    if let Ok(token) = management_agent_token(&wb, &local) {
+        assert_ne!(
+            token, "sk-claimant",
+            "the local account ran on the claimant's key"
+        );
+    }
+}
+
+// On a computer nobody claimed, the signed-out window's own links are the
+// install's, and its settings agents run on them.
+#[tokio::test]
+async fn the_management_agent_finds_an_unclaimed_computers_local_credentials() {
+    let (_root, wb) = open();
+    let app = gated(&wb);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        None,
+        Some(serde_json::json!({ "provider": "openai", "token": "sk-local" })),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let local = wb.lock_unpoisoned().authority().as_str().to_owned();
+    match management_agent_token(&wb, &local) {
+        Ok(token) => assert_eq!(token, "sk-local"),
+        Err(error) => panic!("the local account found no management credential: {error}"),
+    }
+}
+
+// The desktop's own Codex login lives in the same install scope, and the
+// agent's Codex path reads it through the same scope and class.
+#[test]
+fn the_management_agent_finds_the_desktops_codex_login_for_the_claimant() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    crate::codex_oauth::store_credential(
+        &wb,
+        &crate::codex_oauth::CodexOAuthCredential {
+            access: "codex-access".into(),
+            refresh: "codex-refresh".into(),
+            expires: i64::MAX / 2,
+            account_id: "codex-account".into(),
+        },
+    )
+    .unwrap();
+    match management_agent_token(&wb, CLAIMANT) {
+        Ok(access) => assert_eq!(access, "codex-access"),
+        Err(error) => panic!("the claimant found no Codex login: {error}"),
+    }
+}
+
+// No account borrows another's (DR-0313 §2): a second account's link is in
+// its own scope, so the claimant's agent does not run on it.
+#[tokio::test]
+async fn a_second_accounts_desktop_credential_is_not_the_claimants() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = gated(&wb);
+    let other = session(&wb, OTHER);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(&other),
+        Some(serde_json::json!({ "provider": "openai", "token": "sk-other" })),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+
+    match management_agent_token(&wb, OTHER) {
+        Ok(token) => assert_eq!(token, "sk-other"),
+        Err(error) => panic!("the second account found no management credential: {error}"),
+    }
+    match management_agent_token(&wb, CLAIMANT) {
+        Err(crate::gaugeapp_agent::GaugeAppAgentError::NoModelAccess) => {}
+        Ok(token) => assert_ne!(
+            token, "sk-other",
+            "the claimant ran on another account's key"
+        ),
+        Err(error) => panic!("unexpected refusal: {error}"),
+    }
 }

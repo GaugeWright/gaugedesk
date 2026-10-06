@@ -35,7 +35,11 @@ use crate::workbench_state::Workbench;
 /// legacy/plaintext row (mixed logs and the pre-encryption history stay readable).
 const MARKER: &str = "gwenc:1:";
 
+mod acting;
+mod holds;
 mod scope_key;
+pub use acting::act_for;
+pub use holds::{held_body, SessionHold, LINGER_MS};
 pub use scope_key::{PreparedScopeKey, PreparedScopeTransfer, ScopeKeyCapsule, ScopeProjectIndex};
 
 /// The content record kinds sealed at rest by default.
@@ -126,10 +130,12 @@ pub(crate) fn configured_content_vault(
     // erasures OUT-OF-BAND through the edge Worker's object-locked R2 store, so the
     // record cannot be rolled back by a data-disk restore; a desktop / self-hosted
     // deployment sets nothing and uses the co-located local file.
-    Ok(Some(Arc::new(
-        ContentVault::new(root.join("content-keys"), content_keywrap(root)?)
-            .with_ledger(configured_erasure_ledger(root)),
-    )))
+    let vault = ContentVault::new(root.join("content-keys"), content_keywrap(root)?)
+        .with_ledger(configured_erasure_ledger(root));
+    // Every workbench opened to serve refuses a project scope that no
+    // session holds and no unattended step declared (DR-0312, WS-740).
+    vault.enforce_session_holds();
+    Ok(Some(Arc::new(vault)))
 }
 
 /// Select the erasure-ledger backend (SOC 2 finding 4.7 / DR-0086). Creds-driven, like
@@ -250,6 +256,11 @@ impl Workbench {
         if moved > 0 {
             tracing::info!(moved, "content keys moved under their projects' keys");
         }
+        // The re-wrap opened project keys with nobody present; none of them
+        // stays open past it (WS-740).
+        if let Some(vault) = &self.content_vault {
+            vault.release_unheld();
+        }
     }
 }
 
@@ -277,6 +288,8 @@ pub struct ContentVault {
     scope_projects: Arc<scope_key::ScopeProjectIndex>,
     /// Unwrapped project keys, by key id.
     project_keys: scope_key::ProjectKeyCache,
+    /// Which projects a session holds now (WS-740).
+    holds: holds::Holds,
 }
 
 #[derive(Default)]
@@ -303,6 +316,7 @@ impl ContentVault {
             ledger: None,
             scope_projects: Arc::default(),
             project_keys: scope_key::ProjectKeyCache::default(),
+            holds: holds::Holds::default(),
         }
     }
 

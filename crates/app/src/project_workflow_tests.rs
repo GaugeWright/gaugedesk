@@ -17,10 +17,17 @@ fn open(root: &std::path::Path) -> crate::SharedWorkbench {
     // Lean: a project workflow runs in the Personal project's target and reads
     // neither the archetype library nor the onboarding tracker
     // (`StartupSeed::lean`).
-    crate::workbench_state::open_lean_workbench_with_content_keywrap(root, |_| {
+    let shared = crate::workbench_state::open_lean_workbench_with_content_keywrap(root, |_| {
         Ok(Box::new(LoopbackKeyWrap::new([37; 32])))
     })
-    .unwrap()
+    .unwrap();
+    // The launcher's session is open, as it is when a route serves them,
+    // including on a reopened workbench; unattended steps still act only
+    // under their delegation.
+    shared
+        .lock_unpoisoned()
+        .hold_session_for_tests(DEFAULT_PROJECT);
+    shared
 }
 fn fixture(
     source: &str,

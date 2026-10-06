@@ -16,6 +16,13 @@ pub async fn publish_deployment(
     headers: axum::http::HeaderMap,
     Json(mut request): Json<PublishDeploymentRequest>,
 ) -> Response {
+    // Publishing from a project is its owner's act (DR-0328 §5).
+    if let Some(refusal) = workbench
+        .lock_unpoisoned()
+        .placement_owner_refusal(&headers, &request.placement_id)
+    {
+        return refusal;
+    }
     let structured = request.funding.clone();
     if structured.is_some()
         && (!request.funding_ref.trim().is_empty()
@@ -65,7 +72,12 @@ pub async fn publish_deployment(
             )
                 .into_response();
         };
-        let publisher_key = match workbench.lock_unpoisoned().public_publisher_key() {
+        // Bound to the key this publication will be signed with (DR-0328 §5).
+        let publisher_key = match workbench.lock_unpoisoned().publication_publisher_key(
+            &request.placement_id,
+            &request.edge_origin,
+            &request.deployment_id,
+        ) {
             Ok(key) => key,
             Err(error) => {
                 return (
@@ -123,11 +135,31 @@ fn work_chat_default_model(
     workbench.work_chat_default_model_in(&scope).1
 }
 
-/// Public half of the key used for every signed publisher command. Hosted
-/// account planes use this to mint an entitlement before the Home publishes;
-/// no private key or bearer crosses this route.
-pub async fn publisher_authority(State(workbench): State<SharedWorkbench>) -> Response {
-    match workbench.lock_unpoisoned().public_publisher_key() {
+/// The account a request publishes as (DR-0328 §5): a desktop account
+/// session's own. `None` — the install's key — for the credential-free local
+/// channel, which is the local account, and for every hosted composition.
+fn publisher_account(
+    workbench: &crate::Workbench,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    if !workbench.desktop_account_mode() {
+        return None;
+    }
+    crate::net_http::bearer(headers)
+        .and_then(|token| workbench.resolve_account_session(token))
+        .map(|(account, _)| account)
+}
+
+/// Public half of the caller's publisher key, which signs the commands it
+/// publishes with. Hosted account planes use this to mint an entitlement
+/// before the Home publishes; no private key or bearer crosses this route.
+pub async fn publisher_authority(
+    State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let workbench = workbench.lock_unpoisoned();
+    let account = publisher_account(&workbench, &headers);
+    match workbench.public_publisher_key_as(account.as_deref()) {
         Ok(public_key) => {
             (StatusCode::OK, Json(json!({ "public_key": public_key }))).into_response()
         }
@@ -141,8 +173,15 @@ pub async fn publisher_authority(State(workbench): State<SharedWorkbench>) -> Re
 
 pub async fn import_legacy_deployment(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ImportLegacyDeploymentRequest>,
 ) -> Response {
+    if let Some(refusal) = workbench
+        .lock_unpoisoned()
+        .placement_owner_refusal(&headers, &request.placement_id)
+    {
+        return refusal;
+    }
     let result = tokio::task::spawn_blocking(move || {
         workbench
             .lock_unpoisoned()
@@ -166,8 +205,15 @@ pub async fn import_legacy_deployment(
 
 pub async fn inspect_deployment(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<InspectDeploymentRequest>,
 ) -> Response {
+    if let Some(refusal) = workbench
+        .lock_unpoisoned()
+        .deployment_owner_refusal(&headers, &request.deployment_id)
+    {
+        return refusal;
+    }
     publisher_task(workbench, move |workbench| {
         workbench.inspect_public_deployment(request)
     })
@@ -176,8 +222,15 @@ pub async fn inspect_deployment(
 
 pub async fn control_deployment(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ControlDeploymentRequest>,
 ) -> Response {
+    if let Some(refusal) = workbench
+        .lock_unpoisoned()
+        .deployment_owner_refusal(&headers, &request.deployment_id)
+    {
+        return refusal;
+    }
     publisher_task(workbench, move |workbench| {
         workbench.control_public_deployment(request)
     })
@@ -186,8 +239,15 @@ pub async fn control_deployment(
 
 pub async fn erase_session(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ErasePublicSessionRequest>,
 ) -> Response {
+    if let Some(refusal) = workbench
+        .lock_unpoisoned()
+        .deployment_owner_refusal(&headers, &request.deployment_id)
+    {
+        return refusal;
+    }
     publisher_task(workbench, move |workbench| {
         workbench.erase_public_session(request)
     })
@@ -196,30 +256,36 @@ pub async fn erase_session(
 
 pub async fn list_credentials(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ListPublicCredentialsRequest>,
 ) -> Response {
     publisher_task(workbench, move |workbench| {
-        workbench.list_public_credentials(request)
+        let account = publisher_account(workbench, &headers);
+        workbench.list_public_credentials(request, account.as_deref())
     })
     .await
 }
 
 pub async fn provision_credential(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ProvisionPublicCredentialRequest>,
 ) -> Response {
     publisher_task(workbench, move |workbench| {
-        workbench.provision_public_credential(request)
+        let account = publisher_account(workbench, &headers);
+        workbench.provision_public_credential(request, account.as_deref())
     })
     .await
 }
 
 pub async fn revoke_credential(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<RevokePublicCredentialRequest>,
 ) -> Response {
     publisher_task(workbench, move |workbench| {
-        workbench.revoke_public_credential(request)
+        let account = publisher_account(workbench, &headers);
+        workbench.revoke_public_credential(request, account.as_deref())
     })
     .await
 }
@@ -288,8 +354,15 @@ pub async fn ensure_collection_recipient(
 /// the async runtime free; it never made the lock hold acceptable.
 pub async fn collect_into_project(
     State(workbench): State<SharedWorkbench>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<crate::agent_release::CollectIntoProjectRequest>,
 ) -> Response {
+    if let Some(refusal) = workbench
+        .lock_unpoisoned()
+        .deployment_owner_refusal(&headers, &request.binding_id)
+    {
+        return refusal;
+    }
     let result = tokio::task::spawn_blocking(move || {
         crate::agent_release::collect_into_project(&workbench, request)
     })

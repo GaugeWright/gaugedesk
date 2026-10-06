@@ -3,8 +3,8 @@
 use axum::Router;
 
 use crate::{
-    account_routes, command_idempotency, facility_routes, local_routes, mobile_machine_session,
-    net_http, LockUnpoisoned, SharedWorkbench,
+    account_routes, command_idempotency, facility_routes, local_routes, net_http, LockUnpoisoned,
+    SharedWorkbench,
 };
 
 pub fn open_control_plane(wb: SharedWorkbench) -> Router {
@@ -37,6 +37,10 @@ fn compose(
         // authority. These exact aliases attach the co-resident sealed account
         // session; the WebView receives only ordinary GaugeApp projections.
         .merge(crate::account_signin::gaugeapp_proxy_routes())
+        // Project sharing's organization-member picker. The enterprise
+        // composition serves the roster itself, so this alias is mounted here
+        // alone; without it the desktop answered 404 and could not share.
+        .merge(crate::account_signin::project_share_candidate_proxy_routes())
         // Facilities, tenants and invitations. `facility_routes` already
         // describes itself as "ungated on loopback; the hub adds auth on top",
         // and its `/account/tenants` note describes what the *solo desktop
@@ -58,15 +62,29 @@ fn compose(
         .merge(crate::auth_oidc::auth_routes(
             crate::auth_oidc::AuthShellState::new(),
         ))
-        .merge(mobile_machine_session::routes())
         .with_state(wb.clone());
+    // A phone reaches a desktop through the relay as its own signed-in
+    // account, never by direct pairing (DR-0329). The controller protocol
+    // stays with the hosts that serve it, which compose their own routers. A
+    // debug build mounts it here only for the test lanes that drive the
+    // protocol against this binary, so no release desktop serves it.
+    #[cfg(debug_assertions)]
+    if gaugedesk_env::enabled("TEST_MACHINE_CONTROLLERS") {
+        routes = routes.merge(crate::mobile_machine_session::routes().with_state(wb.clone()));
+    }
     if let Some(storage) = storage {
         routes = routes.merge(crate::file_action_submission_routes::routes(
             wb.clone(),
             storage,
         ));
     }
+    let member_use = wb.lock_unpoisoned().member_use.clone();
     routes
+        // Innermost, so a request a composition's gate refused never reaches it.
+        .layer(axum::middleware::from_fn_with_state(
+            (wb.clone(), member_use),
+            crate::key_delegation::record_member_use,
+        ))
         .layer(net_http::cors_layer())
         .layer(axum::middleware::from_fn_with_state(
             wb,
@@ -157,6 +175,22 @@ mod tests {
                 "{method} {uri} is not mounted in the desktop composition",
             );
         }
+    }
+
+    /// Project sharing's member picker is forwarded to the account authority.
+    /// With no account signed in the alias answers its own refusal, which has
+    /// a body; axum's unmatched-route `404` is empty.
+    #[tokio::test]
+    async fn the_desktop_serves_the_project_share_member_picker() {
+        let (status, body) = send(
+            &desktop(),
+            "GET",
+            "/account/tenants/organization%3Aexample/project-share-candidates",
+            None,
+        )
+        .await;
+        assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.is_empty(), "{status}");
     }
 
     /// Detaching a facility is asserted as a success, not as "not 404".

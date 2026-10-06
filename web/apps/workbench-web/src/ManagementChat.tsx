@@ -1,6 +1,6 @@
 import { createMemo, createResource, createSignal, onCleanup, Show, type Accessor, type JSX } from "solid-js";
 import { engagementId } from "@gaugewright/control-plane-client";
-import { ChatPanel, ChatPaneHeader, localTurnActivity, type Session, type Transcript } from "@gaugewright/workbench-ui";
+import { ChatPanel, ChatPaneHeader, Icon, localTurnActivity, type Session, type Transcript } from "@gaugewright/workbench-ui";
 import type { ManagementSession, ManagementTarget, WorkbenchControlPlane } from "./workbench-control-plane";
 
 /** How the chat names its GaugeApp. It carries no notice or placeholder: an
@@ -150,8 +150,9 @@ function SettingsManagementChat(props: SettingsProps): JSX.Element {
                     ? <><p>{copy().label} chat is unavailable: {String(session.error)}</p><button type="button" onClick={() => void refetchSession()}>Retry</button></>
                     : `Opening ${copy().label.toLowerCase()}…`}
             </div>}
-            menu={<button type="button" class="management-chat-menu" title={clearLabel()}
-                aria-label={clearLabel()} onClick={() => setConfirmClear(true)}>⋯</button>}
+            menu={<div class="chat-options-anchor"><button type="button" class="chat-options-trigger"
+                classList={{ active: confirmClear() }} title={clearLabel()} aria-label={clearLabel()}
+                onClick={() => setConfirmClear(true)}><Icon name="menu" /></button></div>}
             beforeComposer={<>
                 <Show when={confirmClear()}><div class="management-chat-confirm" role="alert">
                     <span>Clear this conversation?</span>

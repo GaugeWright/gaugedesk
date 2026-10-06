@@ -211,6 +211,9 @@ fn an_older_project_run_keeps_its_pinned_tutorials_tracker() {
     let mut guard = wb.lock_unpoisoned();
     guard.ensure_shipped_tutorials().unwrap();
     let project = tutorial_project_id("account-root");
+    // The run is launched directly, as the route would inside the learner's
+    // session.
+    guard.hold_session_for_tests(&project);
     let target_id = tutorial_target_id("account-root");
     let legacy_source = include_str!("tutorials/basics.whip")
         .replace("tracker tasks", "tracker tutorials")
@@ -563,6 +566,7 @@ fn an_older_personal_run_resumes_without_starting_a_second_basics() {
         release: false,
     };
     guard.write_work_target_record(record);
+    guard.hold_session_for_tests(DEFAULT_PROJECT);
     guard
         .declare_project_tracker(
             &context,

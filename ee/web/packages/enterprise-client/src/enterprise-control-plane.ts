@@ -46,7 +46,7 @@ import {
     type RouteJson,
     type RouteRequest,
     type RouteEventStream,
-    tenantProjectShareCandidates,
+    tenantProjectShareDirectory,
 } from "@gaugewright/control-plane-client";
 import * as enterprise from "./control-plane-enterprise";
 import type {
@@ -129,8 +129,8 @@ export class EnterpriseControlPlane implements EnterpriseAdminApi {
         return enterprise.placementPolicy(this.json);
     }
 
-    projectShareCandidates(tenant: string) {
-        return tenantProjectShareCandidates(this.json, tenant);
+    projectShareDirectory(tenant: string) {
+        return tenantProjectShareDirectory(this.json, tenant);
     }
 
     createOrganization(displayName: string) {

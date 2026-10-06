@@ -123,6 +123,17 @@ pub fn gaugeapp_proxy_routes() -> Router<SharedWorkbench> {
         )
 }
 
+/// The organization-member picker behind project sharing, forwarded to the
+/// account authority that holds the roster. Only the open (desktop)
+/// composition mounts it: the enterprise composition serves the real handler
+/// at the same path, and a path registered twice panics the router.
+pub fn project_share_candidate_proxy_routes() -> Router<SharedWorkbench> {
+    Router::new().route(
+        "/account/tenants/{tenant}/project-share-candidates",
+        get(proxy_project_share_candidates),
+    )
+}
+
 /// Legacy single-session record, read until the first additional sign-in or
 /// selection migrates it. Never reinterpret its fixed id as an account id.
 const RECORD_KIND: &str = "hub-session";
@@ -266,6 +277,23 @@ pub async fn proxy_account_authority(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    forward_to_account_authority(
+        wb,
+        method,
+        path_and_query,
+        forwarded_account_headers(&headers),
+        body,
+    )
+    .await
+}
+
+async fn forward_to_account_authority(
+    wb: &SharedWorkbench,
+    method: Method,
+    path_and_query: String,
+    forwarded: Vec<(String, String)>,
+    body: Bytes,
+) -> Response {
     let Some(hub) = hub_base() else {
         return (
             StatusCode::CONFLICT,
@@ -273,7 +301,7 @@ pub async fn proxy_account_authority(
         )
             .into_response();
     };
-    proxy_account_authority_at(wb, hub, method, path_and_query, headers, body).await
+    proxy_account_authority_at(wb, hub, method, path_and_query, forwarded, body).await
 }
 
 async fn proxy_account_authority_at(
@@ -281,7 +309,7 @@ async fn proxy_account_authority_at(
     hub: String,
     method: Method,
     path_and_query: String,
-    headers: HeaderMap,
+    forwarded: Vec<(String, String)>,
     body: Bytes,
 ) -> Response {
     let revision = selected_revision(wb);
@@ -297,7 +325,6 @@ async fn proxy_account_authority_at(
         return StatusCode::CONFLICT.into_response();
     };
     let url = format!("{hub}{path_and_query}");
-    let forwarded = forwarded_account_headers(&headers);
     let method_name = method.as_str().to_owned();
     let dispatch_fence = fence.clone();
     let response = tokio::task::spawn_blocking(move || {
@@ -442,6 +469,40 @@ async fn proxy_account_gaugeapp(
         .map(|value| value.as_str().to_owned())
         .unwrap_or_else(|| uri.path().to_owned());
     proxy_account_authority(&wb, method, path, headers, body).await
+}
+
+/// The account authority reads the roster of the tenant named by
+/// `x-gaugewright-tenant` and refuses a path naming another, so the alias
+/// derives that header from the path rather than forwarding the window's.
+fn project_share_candidates_request(
+    tenant: &str,
+    headers: &HeaderMap,
+) -> Option<(String, Vec<(String, String)>)> {
+    if tenant.is_empty() || !tenant.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return None;
+    }
+    let path = format!(
+        "/account/tenants/{}/project-share-candidates",
+        url::form_urlencoded::byte_serialize(tenant.as_bytes()).collect::<String>()
+    );
+    let mut forwarded = forwarded_account_headers(headers);
+    forwarded.push(("x-gaugewright-tenant".to_owned(), tenant.to_owned()));
+    Some((path, forwarded))
+}
+
+async fn proxy_project_share_candidates(
+    State(wb): State<SharedWorkbench>,
+    Path(tenant): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((path, forwarded)) = project_share_candidates_request(&tenant, &headers) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid organization id" })),
+        )
+            .into_response();
+    };
+    forward_to_account_authority(&wb, Method::GET, path, forwarded, Bytes::new()).await
 }
 
 #[derive(Deserialize)]
@@ -859,6 +920,33 @@ fn small_json_response(response: AccountAuthorityResponse, what: &str) -> Result
         return Err(format!("{what} is too large"));
     }
     serde_json::from_slice(&bytes).map_err(|_| format!("{what} is malformed"))
+}
+
+/// Whether `tenant`'s projects may be shared with anyone by email, as the
+/// Hub at `hub` answers for `bearer` (DR-0332). It reads the same projection
+/// the sharing picker does, so only one of the organization's members can ask.
+pub(crate) fn organization_project_sharing_at(
+    hub: &str,
+    bearer: &str,
+    tenant: &str,
+) -> Result<crate::org::ProjectSharing, String> {
+    let url = hub_tenant_url(hub, tenant, &["project-share-candidates"])?;
+    let read = small_json_response(
+        open_account_authority_request(
+            "GET",
+            &url,
+            bearer,
+            &[("x-gaugewright-tenant".to_owned(), tenant.to_owned())],
+            &[],
+        )?,
+        "organization sharing policy",
+    )?;
+    // A Hub that predates DR-0332 sends no policy: members only.
+    Ok(read
+        .get("sharing")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default())
 }
 
 /// Read the Hub's durable organization-project reservation and bind its first
@@ -2448,7 +2536,7 @@ mod tests {
             hub,
             Method::PUT,
             "/account/homes/selected".into(),
-            headers,
+            forwarded_account_headers(&headers),
             Bytes::from_static(b"{\"home_id\":\"home:mine\"}"),
         )
         .await;
@@ -2459,6 +2547,68 @@ mod tests {
         assert!(bytes.is_empty());
         assert_eq!(hub_session_actor(&wb).as_deref(), Some("account-root"));
         service.abort();
+    }
+
+    #[tokio::test]
+    async fn project_share_candidates_reach_the_hub_scoped_to_the_paths_organization() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        store_session_for_test(&wb);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/account/tenants/{tenant}/project-share-candidates",
+            get(
+                |Path(tenant): Path<String>, headers: HeaderMap| async move {
+                    assert_eq!(tenant, "organization:abcd");
+                    assert_eq!(headers["x-gaugewright-tenant"], "organization:abcd");
+                    assert_eq!(headers["authorization"], "Bearer opaque-account-session");
+                    assert!(headers.get("cookie").is_none());
+                    Json(json!({ "candidates": [
+                    { "authority": "authority:teammate", "label": "teammate@example.test" }
+                ] }))
+                },
+            ),
+        );
+        let service = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        // The window's own tenant header names a different organization; the
+        // path decides which roster is read.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-gaugewright-tenant",
+            "organization:other".parse().unwrap(),
+        );
+        headers.insert("cookie", "session=untrusted-cookie".parse().unwrap());
+        let (path, forwarded) =
+            project_share_candidates_request("organization:abcd", &headers).unwrap();
+        assert_eq!(
+            path,
+            "/account/tenants/organization%3Aabcd/project-share-candidates"
+        );
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|(name, _)| name == "x-gaugewright-tenant")
+                .count(),
+            1
+        );
+        let response =
+            proxy_account_authority_at(&wb, hub, Method::GET, path, forwarded, Bytes::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["candidates"][0]["authority"], "authority:teammate");
+        service.abort();
+    }
+
+    #[test]
+    fn project_share_candidates_refuse_an_organization_id_no_header_can_carry() {
+        let headers = HeaderMap::new();
+        assert!(project_share_candidates_request("", &headers).is_none());
+        assert!(project_share_candidates_request("organization:a\nb", &headers).is_none());
+        assert!(project_share_candidates_request("organization: a", &headers).is_none());
     }
 
     #[tokio::test]

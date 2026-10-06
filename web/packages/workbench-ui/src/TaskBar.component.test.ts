@@ -18,7 +18,20 @@ const inbound: HumanTask = {
 };
 const answer: HumanTask = { id: "chat-1", title: "Draft", agent: "Writer", kind: "answer" };
 
-async function mount(tasks: HumanTask[], onOpenInbox?: Parameters<typeof TaskBar>[0]["onOpenInbox"]) {
+const paused: HumanTask = {
+    id: "proj-b:paused",
+    title: "Research",
+    agent: "",
+    kind: "resume",
+    project: "proj-b",
+    waiting: 2,
+};
+
+async function mount(
+    tasks: HumanTask[],
+    onOpenInbox?: Parameters<typeof TaskBar>[0]["onOpenInbox"],
+    onOpenBackgroundWork?: Parameters<typeof TaskBar>[0]["onOpenBackgroundWork"],
+) {
     const host = document.createElement("div");
     document.body.append(host);
     const onSelect = vi.fn<(id: EngagementId) => void>();
@@ -28,6 +41,7 @@ async function mount(tasks: HumanTask[], onOpenInbox?: Parameters<typeof TaskBar
         refreshKey: 0,
         onSelect,
         onOpenInbox,
+        onOpenBackgroundWork,
         // Signed in: only then is there a personal queue to read.
         assigned: { read: async () => ({ tasks: [], unavailable: [] }), onOpen: vi.fn() },
     }), host);
@@ -56,6 +70,30 @@ it("shows the count as a note where there is no Inbox to open", async () => {
     const pill = host.querySelector('[data-task-kind="screen"]') as HTMLElement;
     expect(pill.getAttribute("role")).toBe("note");
     expect(pill.hasAttribute("tabindex")).toBe(false);
+    pill.click();
+    expect(onSelect).not.toHaveBeenCalled();
+});
+
+// Paused background work belongs to its project (DR-0312): it opens that
+// project's background work, whose read is the member use that resumes it.
+it("opens a project's background work for paused work, never a chat or an Inbox", async () => {
+    const onOpenInbox = vi.fn();
+    const onOpenBackgroundWork = vi.fn();
+    const { host, onSelect } = await mount([paused, inbound], onOpenInbox, onOpenBackgroundWork);
+    const pill = host.querySelector('[data-task-kind="resume"]') as HTMLElement;
+    expect(pill.querySelector(".task-kind")?.textContent).toBe("paused");
+    expect(pill.querySelector("[data-task-count]")?.textContent).toBe("2");
+    expect(pill.getAttribute("aria-label")).toBe("open background work paused in Research");
+    pill.click();
+    expect(onOpenBackgroundWork).toHaveBeenCalledWith({ project: "proj-b", projectName: "Research" });
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(onOpenInbox).not.toHaveBeenCalled();
+});
+
+it("shows paused work as a note where it cannot be opened", async () => {
+    const { host, onSelect } = await mount([paused]);
+    const pill = host.querySelector('[data-task-kind="resume"]') as HTMLElement;
+    expect(pill.getAttribute("role")).toBe("note");
     pill.click();
     expect(onSelect).not.toHaveBeenCalled();
 });

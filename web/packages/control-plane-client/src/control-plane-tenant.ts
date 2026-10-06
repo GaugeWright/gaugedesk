@@ -158,21 +158,43 @@ export function parseProjectShareCandidate(v: unknown): ProjectShareCandidate {
     };
 }
 
-/** Active members of the selected organization, excluding the current actor.
- * This is a picker projection, not an administration directory. */
+/** Who an organization's projects may be shared with (DR-0332). */
+export type ProjectSharing = "members" | "anyone";
+
+/** The project-sharing picker for one organization: its active members, and
+ * whether anyone else may be invited by email. */
+export interface ProjectShareDirectory {
+    readonly candidates: readonly ProjectShareCandidate[];
+    readonly sharing: ProjectSharing;
+}
+
+/** Active members of the selected organization, excluding the current actor,
+ * and its sharing policy. This is a picker projection, not an administration
+ * directory. Anything but an explicit "anyone" is members only. */
+export async function tenantProjectShareDirectory(
+    json: RouteJson,
+    tenant: string,
+): Promise<ProjectShareDirectory> {
+    const o = (await json(
+        "GET",
+        `/account/tenants/${encodeURIComponent(tenant)}/project-share-candidates`,
+    )) as { candidates?: unknown[]; sharing?: unknown };
+    return {
+        candidates: Array.isArray(o?.candidates)
+            ? o.candidates
+                .map(parseProjectShareCandidate)
+                .filter((candidate) => candidate.authority && candidate.label)
+            : [],
+        sharing: o?.sharing === "anyone" ? "anyone" : "members",
+    };
+}
+
+/** [`tenantProjectShareDirectory`]'s members alone. */
 export async function tenantProjectShareCandidates(
     json: RouteJson,
     tenant: string,
 ): Promise<ProjectShareCandidate[]> {
-    const o = (await json(
-        "GET",
-        `/account/tenants/${encodeURIComponent(tenant)}/project-share-candidates`,
-    )) as { candidates?: unknown[] };
-    return Array.isArray(o?.candidates)
-        ? o.candidates
-            .map(parseProjectShareCandidate)
-            .filter((candidate) => candidate.authority && candidate.label)
-        : [];
+    return [...(await tenantProjectShareDirectory(json, tenant)).candidates];
 }
 
 /** The person's account-level facilities (`GET /account/facilities`). */

@@ -48,6 +48,7 @@ import { forkSource } from "./fork-lineage";
 import { groupChatsByWorkstream } from "./workstream-grouping";
 import { Icon, type IconName } from "./icons";
 import { canTransferToMain, canTransferToWorkstream } from "./workstream-transfer";
+import { scopeWorkspace, type NavigatorScope } from "./workspace-scope";
 import {
     archetypeVisible,
     childrenFor,
@@ -152,15 +153,16 @@ export interface FacetBrowserApi {
     createChatUnderArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId>;
     createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetIds: readonly WorkTargetId[]): Promise<EngagementId>;
     reviseChatTargets(id: EngagementId, targets: readonly { targetId: WorkTargetId; participation: "read-only" | "writable" }[]): Promise<void>;
-    useArchetype(archetypeId: ArchetypeId, title: string): Promise<EngagementId>;
-    /** Try a Panel agent in a disposable work chat (DR-0272): its draft, or a
-     *  placement's pinned version. */
-    previewPanelAgent?(archetypeId: ArchetypeId, placementId?: PlacementId): Promise<EngagementId>;
+    /** Try an Agent in a disposable work chat: its draft (DR-0324), or a Panel
+     *  agent placement's pinned version (DR-0272). */
+    previewAgent(archetypeId: ArchetypeId, placementId?: PlacementId): Promise<EngagementId>;
     createEngagement(): Promise<Engagement>;
     deleteChat(id: EngagementId): Promise<void>;
     organizeChat(id: EngagementId, change: { archived?: boolean; pinned?: boolean }): Promise<void>;
     forkChat(id: EngagementId, destination?: { kind: "inherit" } | { kind: "main" } | { kind: "workstream"; workstream_id: string }): Promise<EngagementId>;
     deleteProject(id: ProjectId): Promise<void>;
+    /** Fork a project into a new one the caller owns (GaugeWright DR-0208). */
+    forkProject?(id: ProjectId, name?: string): Promise<import("@gaugewright/control-plane-client").ForkedProject>;
     upgradePlacement(placementId: PlacementId): Promise<number>;
     acceptPlacement(placementId: PlacementId): Promise<void>;
     removePlacement(pid: ProjectId, placementId: PlacementId): Promise<void>;
@@ -207,6 +209,8 @@ export function FacetBrowser(props: {
     onOpenForkTree: (chat: EngagementId) => void;
     onChatRemoved: (id: EngagementId) => void;
     onStatus: (msg: string) => void;
+    /** Where an action's failure is shown; without one it goes to `onStatus`. */
+    onFailure?: (msg: string) => void;
     /** A chat's agent run tone (round-13): drives the status dot beside its name —
      *  working / needs-review / error, or undefined when idle (no dot). Optional so
      *  the mobile shell can omit it. */
@@ -220,6 +224,9 @@ export function FacetBrowser(props: {
     /** Called after a delta lands so the shell may refresh sibling projections
      * such as the task queue without coupling them to the nav tree. */
     onWorkspaceChange?: (change: WorkspaceChange) => void;
+    /** The selected organization (DR-0325). Projects and Recent show only the
+     *  work it owns; absent, the navigator shows everything this Home lists. */
+    scope?: NavigatorScope;
 }) {
     // Projects remains the structural default. Recent is a read-only current-first
     // selection lens whose rows spell out their roots; it never hosts workstream
@@ -273,7 +280,16 @@ export function FacetBrowser(props: {
         if (v) setDeltaFreshness(null);
         setStore("tree", v ? reconcile(v, { key: "id" }) : null);
     });
-    const tree = () => store.tree ?? undefined;
+    // Deltas patch the whole tree; the navigator renders it scoped to the
+    // selected organization.
+    const fullTree = () => store.tree ?? undefined;
+    const scopedTree = createMemo(() => store.tree ? scopeWorkspace(store.tree, props.scope) : undefined);
+    const tree = () => scopedTree();
+    // A project made here belongs to whoever owns this Home: the person, or the
+    // organization a hosted Home was provisioned for. The create action shows
+    // only where the new project would appear (DR-0325).
+    const canCreateProject = () => !props.scope
+        || (store.tree?.homeOrganization ?? null) === props.scope.organization;
     // Same rethrow hazard: a bare `carriage()` here would throw straight through
     // the freshness banner's render.
     const fresh = () => deltaFreshness() ?? (carriage.error ? undefined : carriage()?.freshness);
@@ -320,12 +336,12 @@ export function FacetBrowser(props: {
             queue = queue
                 .then(async () => {
                     if (!active) return;
-                    if (!tree()) {
+                    if (!fullTree()) {
                         await refetch();
                     } else {
                         const delta = await props.api.getWorkspaceDeltaCarriage!(change);
                         if (!active) return;
-                        setStore("tree", reconcile(applyWorkspaceDelta(tree()!, delta.value), { key: "id" }));
+                        setStore("tree", reconcile(applyWorkspaceDelta(fullTree()!, delta.value), { key: "id" }));
                         setDeltaFreshness(delta.freshness);
                     }
                     props.onWorkspaceChange?.(change);
@@ -443,16 +459,21 @@ export function FacetBrowser(props: {
             else next.add(id);
             return next;
         });
+    const expand = (id: string) => setExpanded((s) => (s.has(id) ? s : new Set(s).add(id)));
     // inline editor: creating or renaming a named tree node.
     const [editing, setEditing] = createSignal<
         | { kind: "new-project" }
         | { kind: "rename-archetype"; id: ArchetypeId }
         | { kind: "rename-project"; id: ProjectId }
+        | { kind: "fork-project"; id: ProjectId }
         | { kind: "rename-chat"; id: EngagementId }
         | { kind: "new-workstream"; placementId: PlacementId }
         | { kind: "new-workstream-from-chat"; placementId: PlacementId; chat: EngagementId }
         | null
     >(null);
+    // A project fork in flight, by source project: copying its files takes long
+    // enough that a row must say so, or the click reads as having done nothing.
+    const [forking, setForking] = createSignal<{ source: ProjectId; name: string } | null>(null);
     // A workstream promotion is explicit but deserves a compact, non-modal guard.
     // This is presentation state only: the control plane still owns all merge gates.
     const [confirmingMerge, setConfirmingMerge] = createSignal<WorkstreamId | null>(null);
@@ -611,7 +632,11 @@ export function FacetBrowser(props: {
             await action();
             props.onStatus(ok);
         } catch (e) {
-            props.onStatus(e instanceof Rejected ? e.reason : String(e));
+            // A failure goes to the host's failure notice when it has one: its
+            // status line is only a refresh key, so a create that failed there
+            // alone read as a button that did nothing.
+            const reason = e instanceof Rejected ? e.reason : e instanceof Error ? e.message : String(e);
+            (props.onFailure ?? props.onStatus)(reason);
         } finally {
             // The mobile delta subscriber receives the mutation's reference and
             // patches the tree. Other consumers retain the immediate full refresh.
@@ -688,6 +713,8 @@ export function FacetBrowser(props: {
                 return withRefresh(() => props.api.renameArchetype(e.id, text), "renamed");
             case "rename-project":
                 return withRefresh(() => props.api.renameProject(e.id, text), "renamed");
+            case "fork-project":
+                return forkProject(e.id, text);
             case "rename-chat":
                 return withRefresh(() => props.api.renameChat(e.id, text), "renamed");
             case "new-workstream":
@@ -818,6 +845,8 @@ export function FacetBrowser(props: {
     async function newEditChat(archetypeId: ArchetypeId) {
         await withRefresh(async () => {
             const id = await props.api.createChatUnderArchetype(archetypeId, "edit chat");
+            // The new chat is listed under its Agent, so the Agent unfolds.
+            expand(archetypeId);
             props.onSelect(id);
         }, "editing this Agent");
     }
@@ -928,24 +957,16 @@ export function FacetBrowser(props: {
             "started settlement for every writable target candidate",
         );
     }
-    // USE an archetype with no placement ceremony (ADR 0045/0036): a work chat in
-    // the explicit Personal project. The server finds/creates its placement.
-    async function useArchetype(archetypeId: ArchetypeId) {
+    // TRY an Agent: a disposable work chat running its draft (DR-0324), or a
+    // Panel agent placement's pinned version (DR-0272), on the author's
+    // work-chat model and funding. Trying the same thing again replaces the
+    // previous one, so the author can go back and forth with the edit chat.
+    async function previewAgent(archetypeId: ArchetypeId, placementId?: PlacementId) {
         await withRefresh(async () => {
-            const id = await props.api.useArchetype(archetypeId, "new chat");
+            const id = await props.api.previewAgent(archetypeId, placementId);
+            if (!placementId) expand(archetypeId);
             props.onSelect(id);
-        }, "new work chat");
-    }
-
-    // TRY a Panel agent (DR-0272): a disposable work chat running its draft or a
-    // placement's pinned version, on the author's work-chat model and funding.
-    // Trying the same thing again replaces the previous preview.
-    async function previewPanelAgent(archetypeId: ArchetypeId, placementId?: PlacementId) {
-        if (!props.api.previewPanelAgent) return;
-        await withRefresh(async () => {
-            const id = await props.api.previewPanelAgent!(archetypeId, placementId);
-            props.onSelect(id);
-        }, "preview chat opened");
+        }, "test chat opened");
     }
 
     function openMenu(e: MouseEvent, items: MenuState["items"]) {
@@ -985,7 +1006,7 @@ export function FacetBrowser(props: {
     // The inline name editor for create/rename. A placeholder tells a first-timer
     // exactly what to do (type a name, Enter to confirm, Esc to cancel) — a bare
     // empty box was a dead end (#7).
-    const renameInput = (placeholder = "name…") => (
+    const renameInput = (placeholder = "name…", blurCommits = true) => (
         <input
             class="inline-edit"
             // autofocus alone is unreliable when the field is inserted by a click
@@ -999,7 +1020,9 @@ export function FacetBrowser(props: {
             placeholder={placeholder}
             value={editText()}
             onInput={(ev) => setEditText(ev.currentTarget.value)}
-            onBlur={() => void commitEdit()}
+            // A fork copies a whole project, so leaving its field cancels it
+            // rather than starting one.
+            onBlur={() => (blurCommits ? void commitEdit() : setEditing(null))}
             onClick={(ev) => ev.stopPropagation()}
             onKeyDown={(ev) => {
                 // The project tree item uses Space and Enter to open itself.
@@ -1113,6 +1136,41 @@ export function FacetBrowser(props: {
             props.onSelect(eng.id);
         }, "new chat");
     }
+    // The first free "<name> (fork)", "<name> (fork 2)", … so forks of one
+    // project can be told apart in the list.
+    const forkName = (name: string): string => {
+        const taken = new Set((tree()?.projects ?? []).map((project) => project.name));
+        const base = `${name} (fork)`;
+        if (!taken.has(base)) return base;
+        for (let n = 2; ; n += 1) {
+            const candidate = `${name} (fork ${n})`;
+            if (!taken.has(candidate)) return candidate;
+        }
+    };
+
+    async function forkProject(source: ProjectId, name: string) {
+        if (!props.api.forkProject) return;
+        setForking({ source, name });
+        try {
+            const forked = await props.api.forkProject(source, name);
+            if (!props.deltaSync) await refetch();
+            props.onStatus(`forked into "${name}"`);
+            // Open what was made: the fork's settings say where it came from.
+            props.onOpenProjectHome(forked.id, name);
+            if (forked.skippedAgents.length) {
+                (props.onFailure ?? props.onStatus)(
+                    `"${name}" was made, but not every Agent came across — ${forked.skippedAgents.map((agent) => `${agent.name}: ${agent.reason}`).join("; ")}`,
+                );
+            }
+        } catch (e) {
+            const reason = e instanceof Rejected ? e.reason : e instanceof Error ? e.message : String(e);
+            (props.onFailure ?? props.onStatus)(`could not fork: ${reason}`);
+            if (!props.deltaSync) await refetch();
+        } finally {
+            setForking(null);
+        }
+    }
+
     const projectMenuItems = (p: ProjectNode): MenuState["items"] => {
         if (p.product?.kind === "tutorials") return [
             { label: "open tutorials", run: () => props.onOpenTutorials?.(p.id) },
@@ -1144,6 +1202,12 @@ export function FacetBrowser(props: {
             // absent: they moved inside project settings, and a second door to a
             // surface that has moved is worse than no door.
             ...(props.onOpenProjectTasks ? [{ label: "tasks…", hint: "Open the project’s task backlog, including unassigned work", run: () => props.onOpenProjectTasks?.(p.id, p.name) }] : []),
+            ...(props.api.forkProject && !forking() ? [{
+                label: "fork…",
+                icon: "fork" as const,
+                hint: "Make a new project of your own with this project's files and Agents, and none of its people, chats or credentials",
+                run: () => startEdit({ kind: "fork-project", id: p.id }, forkName(p.name)),
+            }] : []),
             ...(p.isPersonal ? [] : [
                 { label: "rename", run: () => startEdit({ kind: "rename-project", id: p.id }, p.name) },
                 { label: "delete", danger: true, confirmHint: projectBlastRadius(p), run: () => void withRefresh(() => props.api.deleteProject(p.id), "project deleted") },
@@ -1165,7 +1229,7 @@ export function FacetBrowser(props: {
 
     // A placement row's menu (shared by right-click and the row's ⋯ button).
     const placementMenuItems = (p: ProjectNode, pl: ProjectNode["placements"][number]): MenuState["items"] => pl.kind === "panel" ? [
-        ...(props.api.previewPanelAgent ? [{ label: "preview this version", icon: "eye" as const, hint: `Run version ${pl.version} in a disposable work chat on your usual model and funding`, run: () => void previewPanelAgent(pl.archetypeId, pl.placementId) }] : []),
+        { label: "preview this version", icon: "eye" as const, hint: `Run version ${pl.version} in a disposable work chat on your usual model and funding`, run: () => void previewAgent(pl.archetypeId, pl.placementId) },
         ...(props.onOpenPanelPlacement || props.onOpenPanelAgent ? [{ label: "open", hint: "Open this placement's settings: its pinned version, deployments and Inbox", run: () => openPanelPlacement(p, pl) }] : []),
         ...(props.onDeployPlacement && pl.panelProfile ? [{
             label: pl.deployments.length ? "manage deployments…" : "deploy…",
@@ -1241,11 +1305,9 @@ export function FacetBrowser(props: {
     type ArchetypeNode = Workspace["archetypes"][number];
     const archetypeMenuItems = (a: ArchetypeNode): MenuState["items"] => [
         ...(a.kind === "work"
-            ? [{ label: "test in a chat", icon: "eye" as const, hint: "Try this Agent in a Personal work chat", run: () => void useArchetype(a.id) }]
+            ? [{ label: "test in a chat", icon: "eye" as const, hint: "Run the draft as it stands in a disposable chat with its own empty files. Testing again replaces it with the latest draft.", run: () => void previewAgent(a.id) }]
             : [
-                ...(props.api.previewPanelAgent
-                    ? [{ label: "try in a preview chat", icon: "eye" as const, hint: "Run the draft in a disposable work chat on your usual model and funding. It doesn't exercise the website panels or visitor sign-in; deploying does.", run: () => void previewPanelAgent(a.id) }]
-                    : []),
+                { label: "try in a preview chat", icon: "eye" as const, hint: "Run the draft in a disposable work chat on your usual model and funding. It doesn't exercise the website panels or visitor sign-in; deploying does.", run: () => void previewAgent(a.id) },
                 // Opening shows the contract beside the edit chat.
                 ...(props.onOpenPanelAgent
                     ? [{ label: "open", hint: "Open this Panel agent: its edit chat and public contract", run: () => props.onOpenPanelAgent?.(a) }]
@@ -1885,13 +1947,13 @@ export function FacetBrowser(props: {
                 </Show>
             </div>
             <div class="facet-toolbar" data-facet-toolbar={facet()}>
-                <Show when={facet() === "projects"}>
+                <Show when={facet() === "projects" && canCreateProject()}>
                     {createBtn("+ project", () => { setStatus("active"); startEdit({ kind: "new-project" }); }, { title: "Create a new project" })}
                 </Show>
                 <Show when={facet() === "library"}>
                     {createBtn("+ agent", openCreateAgent, { title: "Create an Agent or Panel agent" })}
                 </Show>
-                <Show when={facet() === "recent"}><span class="facet-toolbar-spacer" /></Show>
+                <Show when={facet() === "recent" || (facet() === "projects" && !canCreateProject())}><span class="facet-toolbar-spacer" /></Show>
                 <button type="button" class="facet-toolbar-icon" classList={{ active: searchOpen() }}
                     title={searchOpen() ? "Close search" : "Search"} aria-label={searchOpen() ? "Close search" : "Search"}
                     aria-expanded={searchOpen()} onClick={() => {
@@ -2004,7 +2066,7 @@ export function FacetBrowser(props: {
                             <Show when={projectStatus() !== "archived"}>
                             <For
                                 each={t().projects.filter((p) => projectVisible(p, query(), contentHits()))}
-                                fallback={<div class="status">no projects</div>}
+                                fallback={<div class="status">{props.scope?.organization ? "no projects in this organization" : "no projects"}</div>}
                             >
                                 {(p) => (
                                     <div class="tree-group" data-project={p.id}>
@@ -2061,6 +2123,12 @@ export function FacetBrowser(props: {
                                                 menuItems: () => projectMenuItems(p),
                                             })}
                                         </div>
+                                        <Show when={editingIs("fork-project", p.id)}>
+                                            <div class="tree-leaf" data-fork-name>{renameInput("name the fork, then Enter", false)}</div>
+                                        </Show>
+                                        <Show when={forking()?.source === p.id}>
+                                            <div class="tree-leaf status" data-forking role="status">forking into “{forking()!.name}”…</div>
+                                        </Show>
                                         <Show when={!isCollapsed(p.id)}>
                                         <Show when={p.product?.kind === "tutorials"}>
                                             <button type="button" class="tree-leaf" data-tutorial-file="basics.whip" onClick={() => props.onOpenTutorials?.(p.id)}>
@@ -2261,7 +2329,7 @@ export function FacetBrowser(props: {
                                         {wsEditorFor(a.instanceId)}
                                         {/* The method's edit chats, grouped by workstream (WS-F). */}
                                         {chatGroups(chatsFor(a.name, a.chats), a.workstreams)}
-                                        {/* A Panel agent's live previews (DR-0272); deleting one ends it. */}
+                                        {/* An Agent's live test chats and a Panel agent's previews; deleting one ends it. */}
                                         <Show when={a.previews.length}>
                                             <div class="facet-preview-chats" data-panel-previews={a.id}>
                                                 {chatGroups(chatsFor(a.name, a.previews.map((preview) => preview.chat)), [])}

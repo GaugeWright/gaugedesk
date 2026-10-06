@@ -1,4 +1,4 @@
-import { createMemo, createResource, createSignal, For, Show, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Show, type JSX } from "solid-js";
 import type {
     ArchetypeId,
     ArchetypeNode,
@@ -8,9 +8,12 @@ import type {
     HandoffStatus,
     Participant,
     PlacementId,
+    KeyDelegationView,
     ProjectId,
+    ProjectKeyDelegations,
     ProjectNode,
-    ProjectShareCandidate,
+    ProjectShareDirectory,
+    ProjectUpstream,
 } from "@gaugewright/control-plane-client";
 import { ProjectModelAccessContent, type ProjectModelAccessApi } from "./ProjectModelAccessPanel";
 import { WhipCostsSection, type WhipCostsApi } from "./WhipCosts";
@@ -18,7 +21,7 @@ import type { DeploymentSelection } from "./DeploymentPanel";
 import { availableProjectShareCandidates } from "./project-sharing";
 import "./project-settings.css";
 
-export type ProjectSettingsPage = "overview" | "people" | "work-data" | "agents" | "model-access";
+export type ProjectSettingsPage = "overview" | "people" | "work-data" | "agents" | "model-access" | "background-work";
 
 const PAGE_LABELS: Readonly<Record<ProjectSettingsPage, string>> = {
     overview: "Overview",
@@ -26,6 +29,7 @@ const PAGE_LABELS: Readonly<Record<ProjectSettingsPage, string>> = {
     "work-data": "Work & data",
     agents: "Agents & placements",
     "model-access": "Model access",
+    "background-work": "Background work",
 };
 
 export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi {
@@ -35,8 +39,10 @@ export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi 
     readonly desktopFederationAvailable?: boolean;
     handoffRelocate(project: ProjectId, peer: string): Promise<HandoffStatus>;
     handoffRevoke(project: ProjectId, authority: string, owns: string): Promise<void>;
+    /** An account chosen from the organization, or an email address the
+     *  accepting account must hold verified (DR-0332). */
     createHomeInvitation(
-        authority: string,
+        recipient: string | { readonly email: string },
         project: ProjectId,
         role?: "member" | "viewer",
     ): Promise<CreatedHomeInvitation>;
@@ -49,6 +55,15 @@ export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi 
     acceptPlacement(placement: PlacementId): Promise<void>;
     upgradePlacement(placement: PlacementId): Promise<number>;
     removePlacement(project: ProjectId, placement: PlacementId): Promise<void>;
+    /** A fork's original and what pulling it would bring (GaugeWright DR-0208). */
+    projectUpstream?(project: ProjectId): Promise<ProjectUpstream | null>;
+    pullProjectUpstream?(
+        project: ProjectId,
+        sourceCut: string | null,
+        resolutions: Readonly<Record<string, "mine" | "theirs">>,
+    ): Promise<{ readonly pulled: number }>;
+    /** What background work holds which of the project's keys (DR-0312). */
+    getProjectKeyDelegations(project: ProjectId): Promise<ProjectKeyDelegations>;
 }
 
 interface ProjectSettingsProps {
@@ -61,7 +76,8 @@ interface ProjectSettingsProps {
     readonly onChanged: () => Promise<void> | void;
     readonly onAttachTarget?: (kind: "external-vcs" | "external-folder") => void;
     readonly onManageDeployment?: (selection: DeploymentSelection) => void;
-    readonly projectShareCandidates?: () => Promise<readonly ProjectShareCandidate[]>;
+    /** The selected organization's members and sharing policy (DR-0332). */
+    readonly projectShareDirectory?: () => Promise<ProjectShareDirectory>;
     readonly onOpenOrganizationPeople?: () => void;
 }
 
@@ -94,11 +110,17 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
         () => props.api.desktopFederationAvailable !== false && source(),
         () => props.api.listPeers(),
     );
-    const [shareCandidates, { refetch: refetchShareCandidates }] = createResource(
-        () => props.project.isPersonal || !props.projectShareCandidates ? false : refresh(),
-        () => props.projectShareCandidates?.() ?? Promise.resolve([]),
+    // Only an organization's project has a roster or a policy to read; a
+    // project an account owns is shared by email alone (DR-0332).
+    const organizationProject = () => !props.project.isPersonal && props.project.organization !== null;
+    const [shareDirectory, { refetch: refetchShareDirectory }] = createResource(
+        () => !organizationProject() || !props.projectShareDirectory ? false : refresh(),
+        () => props.projectShareDirectory?.() ?? Promise.resolve({ candidates: [], sharing: "members" as const }),
     );
+    const emailOpen = () => !props.project.isPersonal
+        && (props.project.organization === null || shareDirectory()?.sharing === "anyone");
     const [authority, setAuthority] = createSignal("");
+    const [email, setEmail] = createSignal("");
     const [role, setRole] = createSignal<"member" | "viewer">("member");
     const [peer, setPeer] = createSignal("");
     const [invite, setInvite] = createSignal<CreatedHomeInvitation | null>(null);
@@ -107,7 +129,7 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
     const [busy, setBusy] = createSignal(false);
     const activePeers = () => (peers() ?? []).filter((candidate) => candidate.active);
     const availableCandidates = createMemo(() => availableProjectShareCandidates(
-        shareCandidates() ?? [],
+        shareDirectory()?.candidates ?? [],
         participants() ?? [],
     ));
 
@@ -135,6 +157,22 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
             setInvite(await props.api.createHomeInvitation(recipient, props.project.id, role()));
             setAuthority("");
             setStatus("Invitation ready. It is shown once and expires automatically.");
+        } catch (error) {
+            setStatus(describeError(error));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const createEmailInvite = async () => {
+        const address = email().trim();
+        if (!address) return;
+        setBusy(true);
+        setStatus("");
+        try {
+            setInvite(await props.api.createHomeInvitation({ email: address }, props.project.id, role()));
+            setEmail("");
+            setStatus(`Invitation ready. Only an account that has verified ${address} can accept it. It is shown once and expires automatically.`);
         } catch (error) {
             setStatus(describeError(error));
         } finally {
@@ -171,20 +209,35 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
         </section>
 
         <section class="project-settings-section">
-            <ProjectPageHeader title="Invite to this project" description="Choose someone who already belongs to this organization." />
-            <Show when={props.projectShareCandidates} fallback={<p class="project-settings-empty">Choose an organization to share this project.</p>}>
-                <Show when={!shareCandidates.error} fallback={<div class="project-settings-empty project-settings-empty-action"><span>Organization members could not be loaded.</span><button type="button" onClick={() => void refetchShareCandidates()}>Retry</button></div>}>
-                    <Show when={!shareCandidates.loading} fallback={<p class="project-settings-empty">Loading organization members…</p>}>
-                        <Show when={availableCandidates().length > 0} fallback={<div class="project-settings-empty project-settings-empty-action"><span>Everyone available from the organization already has access.</span><Show when={props.onOpenOrganizationPeople}><button type="button" onClick={props.onOpenOrganizationPeople}>Open People</button></Show></div>}>
-                            <div class="project-settings-form project-settings-invite-form">
-                                <label><span>Person</span><select value={authority()} onChange={(event) => setAuthority(event.currentTarget.value)}><option value="">Choose organization member</option><For each={availableCandidates()}>{(candidate) => <option value={candidate.authority}>{candidate.label}</option>}</For></select></label>
-                                <label><span>Access</span><select value={role()} onChange={(event) => setRole(event.currentTarget.value as "member" | "viewer")}><option value="member">Member</option><option value="viewer">Viewer</option></select></label>
-                                <button type="button" disabled={busy() || !availableCandidates().some((candidate) => candidate.authority === authority())} onClick={() => void createInvite()}>Create invite</button>
-                            </div>
-                            <Show when={props.onOpenOrganizationPeople}><p class="project-settings-help">Need someone else? <button type="button" class="project-settings-text-action" onClick={props.onOpenOrganizationPeople}>Invite them to the organization first</button>.</p></Show>
+            <ProjectPageHeader title="Invite to this project" description={organizationProject()
+                ? emailOpen()
+                    ? "Choose a member of this organization, or invite anyone by email."
+                    : "Choose someone who already belongs to this organization."
+                : "Invite anyone by email. Only an account that has verified that address can accept."} />
+            <Show when={organizationProject()}>
+                <Show when={props.projectShareDirectory} fallback={<p class="project-settings-empty">Choose an organization to share this project.</p>}>
+                    <Show when={!shareDirectory.error} fallback={<div class="project-settings-empty project-settings-empty-action"><span>Organization members could not be loaded.</span><button type="button" onClick={() => void refetchShareDirectory()}>Retry</button></div>}>
+                        <Show when={!shareDirectory.loading} fallback={<p class="project-settings-empty">Loading organization members…</p>}>
+                            <Show when={availableCandidates().length > 0} fallback={<div class="project-settings-empty project-settings-empty-action"><span>Everyone available from the organization already has access.</span><Show when={props.onOpenOrganizationPeople}><button type="button" onClick={props.onOpenOrganizationPeople}>Open People</button></Show></div>}>
+                                <div class="project-settings-form project-settings-invite-form">
+                                    <label><span>Person</span><select value={authority()} onChange={(event) => setAuthority(event.currentTarget.value)}><option value="">Choose organization member</option><For each={availableCandidates()}>{(candidate) => <option value={candidate.authority}>{candidate.label}</option>}</For></select></label>
+                                    <label><span>Access</span><select value={role()} onChange={(event) => setRole(event.currentTarget.value as "member" | "viewer")}><option value="member">Member</option><option value="viewer">Viewer</option></select></label>
+                                    <button type="button" disabled={busy() || !availableCandidates().some((candidate) => candidate.authority === authority())} onClick={() => void createInvite()}>Create invite</button>
+                                </div>
+                            </Show>
+                            <Show when={!emailOpen()}>
+                                <p class="project-settings-help" data-sharing-members-only>Only members of this organization can be invited. An owner can allow invitations by email in Organization Policy.<Show when={props.onOpenOrganizationPeople}> <button type="button" class="project-settings-text-action" onClick={props.onOpenOrganizationPeople}>Invite them to the organization first</button>.</Show></p>
+                            </Show>
                         </Show>
                     </Show>
                 </Show>
+            </Show>
+            <Show when={emailOpen()}>
+                <div class="project-settings-form project-settings-invite-form" data-invite-by-email>
+                    <label><span>Email</span><input type="email" autocomplete="off" placeholder="name@example.com" value={email()} onInput={(event) => setEmail(event.currentTarget.value)} /></label>
+                    <label><span>Access</span><select value={role()} onChange={(event) => setRole(event.currentTarget.value as "member" | "viewer")}><option value="member">Member</option><option value="viewer">Viewer</option></select></label>
+                    <button type="button" disabled={busy() || !email().includes("@")} onClick={() => void createEmailInvite()}>Create invite</button>
+                </div>
             </Show>
             <Show when={invite()}>{(value) => <div class="project-settings-once">
                 <div><strong>Invitation link</strong><small>Copy it now; the capability is not retained in this page.</small></div>
@@ -281,6 +334,89 @@ function WorkAndData(props: ProjectSettingsProps): JSX.Element {
     </>;
 }
 
+function plural(count: number, one: string, many = `${one}s`): string {
+    return `${count} ${count === 1 ? one : many}`;
+}
+
+/** A fork's original: where it came from, and pulling what changed there
+ *  since. The fork takes the original's work through its own merge; a file
+ *  both changed is settled only by the choice made for it here. */
+function ForkedFrom(props: ProjectSettingsProps): JSX.Element {
+    const [refresh, setRefresh] = createSignal(0);
+    const [upstream] = createResource(
+        () => props.project.upstream && props.api.projectUpstream ? [props.project.id, refresh()] as const : false,
+        ([project]) => props.api.projectUpstream!(project),
+    );
+    const [choices, setChoices] = createSignal<Record<string, "mine" | "theirs">>({});
+    const [busy, setBusy] = createSignal(false);
+    const [status, setStatus] = createSignal("");
+    const ready = () => {
+        const u = upstream();
+        return u && u.available ? u : null;
+    };
+    const unresolved = () => ready()?.conflicts.filter((path) => !choices()[path]) ?? [];
+    const pull = async () => {
+        const u = ready();
+        if (!u || !props.api.pullProjectUpstream) return;
+        setBusy(true);
+        setStatus("");
+        try {
+            const result = await props.api.pullProjectUpstream(props.project.id, u.sourceCut, choices());
+            setStatus(result.pulled ? `Pulled ${plural(result.pulled, "file")} from ${u.name ?? "the original"}.` : "Your choices were recorded; nothing else changed.");
+            setChoices({});
+            setRefresh((n) => n + 1);
+            await props.onChanged();
+        } catch (error) {
+            setStatus(describeError(error));
+            setRefresh((n) => n + 1);
+        } finally {
+            setBusy(false);
+        }
+    };
+    return <Show when={props.project.upstream}>
+        <section class="project-settings-section" data-forked-from>
+            <ProjectPageHeader
+                title="Forked from"
+                description="This project began as a copy of another one. Pulling brings in what changed there since; it never changes the original, and it gives neither project access to the other."
+                action={<Show when={ready()}>{(u) => <button type="button" disabled={busy() || unresolved().length > 0 || (u().take.length + u().remove.length + u().conflicts.length === 0)} onClick={() => void pull()}>Pull changes</button>}</Show>}
+            />
+            <Show when={upstream()} fallback={<p class="project-settings-empty">{upstream.loading ? "Checking the original…" : "Pulling is not available here."}</p>}>
+                {(u) => <Show
+                    when={ready()}
+                    fallback={<p class="project-settings-policy-state"><strong>{u().name ?? "The original"}</strong><span>{u().available ? "" : (u() as { reason: string }).reason}</span></p>}
+                >
+                    {(r) => <>
+                        <p class="project-settings-policy-state">
+                            <strong>{r().name ?? "The original"}</strong>
+                            <span>{r().take.length + r().remove.length + r().conflicts.length === 0
+                                ? "Up to date with the original."
+                                : [
+                                    r().take.length ? `${plural(r().take.length, "file")} to bring in` : "",
+                                    r().remove.length ? `${plural(r().remove.length, "file")} the original removed` : "",
+                                    r().conflicts.length ? `${plural(r().conflicts.length, "file")} changed in both` : "",
+                                ].filter(Boolean).join(" · ")}</span>
+                        </p>
+                        <Show when={r().conflicts.length > 0}>
+                            <div class="project-settings-rows">
+                                <For each={r().conflicts}>
+                                    {(path) => <div class="project-settings-row" data-conflict={path}>
+                                        <div><strong>{path}</strong><small>Changed here and in the original</small></div>
+                                        <span class="project-settings-inline-actions">
+                                            <button type="button" aria-pressed={choices()[path] === "mine"} classList={{ active: choices()[path] === "mine" }} onClick={() => setChoices({ ...choices(), [path]: "mine" })}>Keep mine</button>
+                                            <button type="button" aria-pressed={choices()[path] === "theirs"} classList={{ active: choices()[path] === "theirs" }} onClick={() => setChoices({ ...choices(), [path]: "theirs" })}>Take theirs</button>
+                                        </span>
+                                    </div>}
+                                </For>
+                            </div>
+                        </Show>
+                    </>}
+                </Show>}
+            </Show>
+            <Show when={status()}>{(message) => <p class="project-settings-status" role="status">{message()}</p>}</Show>
+        </section>
+    </Show>;
+}
+
 function AgentsAndPlacements(props: ProjectSettingsProps): JSX.Element {
     const placements = () => props.project.placements.filter((placement) => !placement.isDefault);
     const available = createMemo(() => props.library.filter((agent) => !agent.isDefault));
@@ -349,6 +485,82 @@ function AgentsAndPlacements(props: ProjectSettingsProps): JSX.Element {
     </>;
 }
 
+function day(ms: number): string {
+    return new Date(ms).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function workTitle(delegation: KeyDelegationView): string {
+    return delegation.work.targetName ? `${delegation.work.path} · ${delegation.work.targetName}` : delegation.work.path;
+}
+
+function steps(count: number): string {
+    return `${count} unattended ${count === 1 ? "step" : "steps"}`;
+}
+
+/** What background work holds which of the project's keys (DR-0312). It is a
+ *  record, never a control: nothing here grants or revokes anything. Reading
+ *  it is a member using the project, which is what renews paused work. */
+function BackgroundWork(props: ProjectSettingsProps): JSX.Element {
+    const [record, { refetch }] = createResource(
+        () => props.project.id,
+        (project) => props.api.getProjectKeyDelegations(project),
+    );
+    // Opening the project renewed any paused work, so whatever showed it as
+    // paused — the task bar's pill — is read again once, after the first read.
+    let refreshed = false;
+    createEffect(() => {
+        if (record() && !refreshed) {
+            refreshed = true;
+            void props.onChanged();
+        }
+    });
+    const held = (delegation: KeyDelegationView) => delegation.state === "held"
+        ? `Holds its keys until ${day(delegation.expiresAtMs ?? 0)} unless someone uses this project first`
+        : `Paused ${day(delegation.lapsedSinceMs ?? 0)}: nobody had used this project for 30 days. Opening it renewed the work, which resumes on the Home's next pass.`;
+    return <>
+        <section class="project-settings-section">
+            <ProjectPageHeader
+                title="Holding keys now"
+                description="Work that runs while nobody is here holds only the keys it declared. It pauses after 30 days in which nobody uses this project, and resumes when someone does."
+                action={<button type="button" onClick={() => void refetch()}>Refresh</button>}
+            />
+            <Show when={!record.error} fallback={<p class="project-settings-status" role="alert">Background work could not be read: {describeError(record.error)}</p>}>
+                <div class="project-settings-rows">
+                    <For each={record()?.delegations ?? []} fallback={<p class="project-settings-empty">{record.loading ? "Reading…" : "No background work holds this project's keys."}</p>}>
+                        {(delegation) => <div class="project-settings-row project-settings-delegation" data-delegation-state={delegation.state}>
+                            <div>
+                                <strong>{workTitle(delegation)}</strong>
+                                <small>Started by {compactAuthority(delegation.grantedFrom)} on {day(delegation.grantedAtMs)} · holds {delegation.keys.map((key) => key.label).join(", ") || "no keys"}</small>
+                                <small>{held(delegation)}</small>
+                                <Show when={delegation.refusals.length > 0}>
+                                    <small class="project-settings-delegation-refused">Refused outside its declaration: {[...new Set(delegation.refusals.map((refusal) => refusal.label))].join(", ")}</small>
+                                </Show>
+                            </div>
+                            <span>{delegation.state === "lapsed" ? "Paused" : steps(delegation.useCount)}</span>
+                        </div>}
+                    </For>
+                </div>
+            </Show>
+        </section>
+        <Show when={(record()?.ended.length ?? 0) > 0}>
+            <section class="project-settings-section">
+                <ProjectPageHeader title="Finished" description="Work that has ended holds no keys." />
+                <div class="project-settings-rows">
+                    <For each={record()?.ended ?? []}>
+                        {(delegation) => <div class="project-settings-row project-settings-delegation" data-delegation-state="ended">
+                            <div>
+                                <strong>{workTitle(delegation)}</strong>
+                                <small>Started by {compactAuthority(delegation.grantedFrom)} · {delegation.ended?.outcome ?? "ended"} {day(delegation.ended?.atMs ?? 0)}</small>
+                            </div>
+                            <span>{steps(delegation.useCount)}</span>
+                        </div>}
+                    </For>
+                </div>
+            </section>
+        </Show>
+    </>;
+}
+
 export function ProjectSettingsContent(props: ProjectSettingsProps): JSX.Element {
     return <main class="project-settings-content">
         <article class="project-settings-page">
@@ -364,14 +576,15 @@ export function ProjectSettingsContent(props: ProjectSettingsProps): JSX.Element
                         <Show when={!props.project.isPersonal}>
                             <button type="button" onClick={() => props.onSelectPage("people")}><strong>People & sharing</strong><span>Participants and project access</span></button>
                         </Show>
-                        <button type="button" onClick={() => props.onSelectPage("work-data")}><strong>Work & data</strong><span>{props.project.targets.length} work {props.project.targets.length === 1 ? "target" : "targets"} · {props.project.networkIsolated ? "network isolated" : "network open"}</span></button>
+                        <button type="button" onClick={() => props.onSelectPage("work-data")}><strong>Work & data</strong><span>{props.project.upstream ? "forked · pull from the original · " : ""}{props.project.targets.length} work {props.project.targets.length === 1 ? "target" : "targets"} · {props.project.networkIsolated ? "network isolated" : "network open"}</span></button>
                         <button type="button" onClick={() => props.onSelectPage("agents")}><strong>Agents & placements</strong><span>{props.project.placements.filter((placement) => !placement.isDefault).length} placed</span></button>
                         <button type="button" onClick={() => props.onSelectPage("model-access")}><strong>Model access</strong><span>Connections, models, and usage</span></button>
+                        <button type="button" onClick={() => props.onSelectPage("background-work")}><strong>Background work</strong><span>What runs while nobody is here, and the keys it holds</span></button>
                     </div>
                 </section>
             </Show>
             <Show when={props.page === "people"}><PeopleAndSharing {...props} /></Show>
-            <Show when={props.page === "work-data"}><WorkAndData {...props} /></Show>
+            <Show when={props.page === "work-data"}><ForkedFrom {...props} /><WorkAndData {...props} /></Show>
             <Show when={props.page === "agents"}><AgentsAndPlacements {...props} /></Show>
             <Show when={props.page === "model-access"}>
                 <section class="project-settings-section project-settings-model"><ProjectModelAccessContent api={props.api} project={props.project.id} projectName={props.project.name} /></section>
@@ -379,6 +592,7 @@ export function ProjectSettingsContent(props: ProjectSettingsProps): JSX.Element
                     says which ones this project may use. */}
                 <WhipCostsSection api={props.api} project={props.project.id} />
             </Show>
+            <Show when={props.page === "background-work"}><BackgroundWork {...props} /></Show>
         </article>
     </main>;
 }
@@ -395,8 +609,8 @@ export function ProjectSettingsMenu(props: {
     const pages = (): readonly ProjectSettingsPage[] => props.isPersonal === undefined
         ? []
         : props.isPersonal
-            ? ["overview", "work-data", "agents", "model-access"]
-            : ["overview", "people", "work-data", "agents", "model-access"];
+            ? ["overview", "work-data", "agents", "model-access", "background-work"]
+            : ["overview", "people", "work-data", "agents", "model-access", "background-work"];
     if (props.compact) return <nav class="project-settings-menu project-settings-menu-compact" aria-label={`Settings for ${props.projectName}`}>
         <button type="button" class="project-settings-menu-close" onClick={props.onClose}>{props.closeLabel ?? "Back to files"}</button>
         <label>

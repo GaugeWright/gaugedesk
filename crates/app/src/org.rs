@@ -583,6 +583,31 @@ pub struct ArchetypeApprovalPolicyRecord {
     pub require_approval: bool,
 }
 
+/// Who the organization's projects may be shared with (DR-0332).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSharing {
+    /// Only the organization's active members may be invited. The default, so
+    /// no organization admits outsiders without an owner choosing it.
+    #[default]
+    Members,
+    /// Anyone may also be invited by email address.
+    Anyone,
+}
+
+/// The org-level **project sharing policy** (DR-0332). The Home minting an
+/// email invitation for one of the organization's projects asks for it then.
+/// Singleton; absent means [`ProjectSharing::Members`].
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ProjectSharingPolicyRecord {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+    #[serde(default)]
+    pub sharing: ProjectSharing,
+}
+
 /// The org's billing/seat state (B16 / `BILL-1`). **Operational, never authority**
 /// (`BILL-3`/`INV-18`): a paid seat is not a grant and a lapsed plan rewrites no
 /// history; seat state may *refuse future* activation only. It never grants a
@@ -702,6 +727,7 @@ pub struct Org {
     pub billing: Option<BillingRecord>,
     pub billing_contact: Option<BillingContactRecord>,
     pub archetype_approval: Option<ArchetypeApprovalPolicyRecord>,
+    pub project_sharing: Option<ProjectSharingPolicyRecord>,
     /// Organization-only session revocations keyed by stable session id.
     pub session_revocations: BTreeMap<String, OrganizationSessionRevocationRecord>,
 }
@@ -861,6 +887,13 @@ impl Org {
             match r.op {
                 RecordOp::Tombstone => org.archetype_approval = None,
                 RecordOp::Upsert => org.archetype_approval = Some(r),
+            }
+        }
+        for row in store.records(scope, "project_sharing")? {
+            let r: ProjectSharingPolicyRecord = serde_json::from_str(&row)?;
+            match r.op {
+                RecordOp::Tombstone => org.project_sharing = None,
+                RecordOp::Upsert => org.project_sharing = Some(r),
             }
         }
         for row in store.records(scope, "organization_session_revocation")? {
@@ -1025,6 +1058,15 @@ impl Org {
             .as_ref()
             .map(|r| r.require_approval)
             .unwrap_or(false)
+    }
+
+    /// Who the organization's projects may be shared with (DR-0332): members
+    /// only unless an owner has opened it.
+    pub fn effective_project_sharing(&self) -> ProjectSharing {
+        self.project_sharing
+            .as_ref()
+            .map(|r| r.sharing)
+            .unwrap_or_default()
     }
 
     /// The org session-timeout policy as `(absolute_lifetime_ms, idle_timeout_ms)` (`SEC-2`);

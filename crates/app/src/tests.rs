@@ -4142,6 +4142,99 @@ async fn placements_share_project_targets_and_cross_project_targets_are_rejected
         .is_some_and(|basis| !basis.is_empty()));
 }
 
+/// Using an Agent in Personal opens on Personal's own files even when Personal
+/// holds more than one target: the Tutorials target retained from before
+/// DR-0225, or a folder the owner attached. It used to refuse with "select one
+/// or more work targets".
+#[tokio::test]
+async fn using_an_agent_in_personal_opens_on_its_files_beside_other_targets() {
+    let _fake_agent = fake_agent_env();
+    let (_dir, wb) = seeded_workbench();
+    let inspect = wb.clone();
+    {
+        let mut guard = wb.lock_unpoisoned();
+        let home = guard.home_id();
+        let legacy = crate::library_state::managed_target_record(
+            crate::shipped_tutorials::TUTORIALS_TARGET.into(),
+            "Tutorials".into(),
+            crate::library::WorkTargetOwner::Project {
+                project_id: DEFAULT_PROJECT.into(),
+            },
+            home,
+            "cut-legacy".into(),
+        );
+        guard.write_work_target_record(legacy);
+    }
+    let app = open_control_plane(wb);
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("work.txt"), "basis\n").unwrap();
+    let attach_body = serde_json::json!({
+        "name": "Existing folder",
+        "kind": "external-folder",
+        "path": source.path(),
+        "path_scope": ["."],
+    })
+    .to_string();
+    let (status, attached) = send(
+        &app,
+        "POST",
+        &format!("/projects/{DEFAULT_PROJECT}/targets"),
+        Some(&attach_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{attached}");
+    let attached: serde_json::Value = serde_json::from_str(&attached).unwrap();
+    let attached_id = attached["id"].as_str().unwrap().to_owned();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/archetypes",
+        Some(r#"{"name":"Tested","kind":"work"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let agent_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let personal_files = crate::library_state::managed_project_target_id(DEFAULT_PROJECT);
+    for attempt in ["first", "second"] {
+        let (status, chat_body) = send(
+            &app,
+            "POST",
+            &format!("/archetypes/{agent_id}/use"),
+            Some(r#"{"title":"new chat"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{attempt}: {chat_body}");
+        let chat: serde_json::Value = serde_json::from_str(&chat_body).unwrap();
+        assert_eq!(chat["target_id"], personal_files.as_str(), "{attempt}");
+    }
+
+    let guard = inspect.lock_unpoisoned();
+    let placement = guard
+        .library
+        .instances
+        .values()
+        .find(|instance| {
+            instance.kind == crate::library::InstanceKind::Using
+                && instance.agent_id == agent_id
+                && instance.project_id.as_deref() == Some(DEFAULT_PROJECT)
+        })
+        .expect("the Agent is placed in Personal");
+    let eligible = &guard.library.placement_targets[&placement.id].target_ids;
+    assert!(eligible.contains(&personal_files), "{eligible:?}");
+    assert!(eligible.contains(&attached_id), "{eligible:?}");
+    assert!(
+        !eligible
+            .iter()
+            .any(|id| id == crate::shipped_tutorials::TUTORIALS_TARGET),
+        "the retained Tutorials target serves only runs pinned before DR-0225: {eligible:?}"
+    );
+}
+
 #[tokio::test]
 async fn panel_agents_preview_and_place_without_becoming_work_chat_hosts() {
     let (_dir, wb) = seeded_workbench();
@@ -8345,21 +8438,158 @@ async fn a_panel_preview_is_a_hidden_work_chat_that_ends_with_its_chat() {
         .any(crate::panel_preview::is_panel_preview_agent));
 }
 
-/// Ordinary Agents are not tried this way, and a Panel agent's previews end
-/// with it instead of holding it bound.
+/// "test in a chat" runs an Agent's current draft in a disposable chat of its
+/// own (DR-0324), so the author can edit and try it in turn without
+/// publishing, and nothing lands in Personal or a project.
 #[tokio::test]
-async fn a_panel_preview_is_refused_for_an_agent_and_ends_with_its_panel_agent() {
+async fn testing_an_agent_runs_its_draft_in_a_disposable_chat() {
     let (_dir, wb) = seeded_workbench();
     let app = open_control_plane(wb.clone());
     let (status, body) = send(
         &app,
         "POST",
-        &format!("/archetypes/{}/preview", crate::DEFAULT_AGENT),
+        "/archetypes",
+        Some(r#"{"name":"Tutor","kind":"work"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let agent_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let edit_draft = |body: &str| {
+        let guard = wb.lock_unpoisoned();
+        let target_id = library_state::authoring_target_id(&agent_id);
+        let workspace = guard.targets.get(&target_id).expect("authoring workspace");
+        let id = library::gen_id("test-edit");
+        let edit = workspace.create_engagement(&id).expect("edit engagement");
+        edit.write_file("agent/SYSTEM.md", body)
+            .expect("edit system instructions");
+        edit.commit_turn("edit draft").expect("commit draft");
+        assert_eq!(
+            edit.merge_into_main().expect("merge draft"),
+            gaugedesk_workspace::MergeOutcome::Clean
+        );
+        workspace.remove_engagement(&id).expect("remove edit");
+    };
+    let package_text = |chat_id: &str| {
+        let guard = wb.lock_unpoisoned();
+        let (version, _) = guard.package_selection_for_chat(chat_id).unwrap();
+        let root = guard.package_root_for_chat(chat_id, version).unwrap();
+        std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default())
+            .collect::<String>()
+    };
+    let personal_placements = |wb: &SharedWorkbench| {
+        wb.lock_unpoisoned()
+            .library
+            .instances
+            .values()
+            .filter(|instance| {
+                instance.kind == crate::library::InstanceKind::Using
+                    && instance.project_id.as_deref() == Some(DEFAULT_PROJECT)
+            })
+            .count()
+    };
+    let (_, before) = send(&app, "GET", "/workspace", None).await;
+    let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+    let personal_before = personal_placements(&wb);
+    let version_before = wb.lock_unpoisoned().library.agents[&agent_id].current_version;
+
+    edit_draft("first draft persona");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{agent_id}/preview"),
         Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let first = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    assert_eq!(first["title"], "Test of the draft");
+    let first = first["id"].as_str().unwrap().to_owned();
+    assert!(package_text(&first).contains("first draft persona"));
+    {
+        let guard = wb.lock_unpoisoned();
+        let chat = &guard.library.chats[&first];
+        let placement = &guard.library.instances[&chat.instance_id];
+        let project = placement.project_id.as_deref().unwrap();
+        assert!(guard.is_panel_preview_project_id(project));
+        let tried = &guard.library.agents[&placement.agent_id];
+        assert!(crate::panel_preview::is_panel_preview_agent(tried));
+        assert!(
+            !guard
+                .placement_abilities(&chat.instance_id)
+                .unwrap()
+                .is_empty(),
+            "an Agent's test is not narrowed as a Panel agent's preview is",
+        );
+    }
+
+    edit_draft("second draft persona");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{agent_id}/preview"),
+        Some("{}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let second = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(package_text(&second).contains("second draft persona"));
+    assert!(!wb.lock_unpoisoned().library.chats.contains_key(&first));
+    assert_eq!(wb.lock_unpoisoned().panel_previews_of(&agent_id).len(), 1);
+
+    let (_, after) = send(&app, "GET", "/workspace", None).await;
+    let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(after["projects"], before["projects"], "no project appears");
+    assert_eq!(
+        personal_placements(&wb),
+        personal_before,
+        "Personal is untouched"
+    );
+    let tested = after["archetypes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["id"] == agent_id.as_str())
+        .unwrap();
+    assert_eq!(tested["previews"][0]["chat_id"], second.as_str());
+    assert_eq!(
+        wb.lock_unpoisoned().library.agents[&agent_id].current_version,
+        version_before,
+        "testing publishes nothing",
+    );
+
+    // A version is previewed through a Panel agent's placement only.
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/archetypes/{agent_id}/preview"),
+        Some(r#"{"placement_id":"inst-default"}"#),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+    let (status, body) = send(&app, "DELETE", &format!("/chats/{second}"), None).await;
+    assert!(status.is_success(), "{status} {body}");
+    assert!(!wb
+        .lock_unpoisoned()
+        .library
+        .projects
+        .values()
+        .any(crate::panel_preview::is_panel_preview_project));
+}
+
+/// A Panel agent's previews end with it instead of holding it bound.
+#[tokio::test]
+async fn a_panel_preview_ends_with_its_panel_agent() {
+    let (_dir, wb) = seeded_workbench();
+    let app = open_control_plane(wb.clone());
     let (_, body) = send(
         &app,
         "POST",

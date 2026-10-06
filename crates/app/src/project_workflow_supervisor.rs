@@ -67,13 +67,56 @@ impl Workbench {
         scope: &str,
         limits: ProjectWorkflowLimits,
     ) -> Result<ProjectWorkflowStep, String> {
+        self.step_project_workflow_unattended_at(scope, limits, crate::key_delegation::now_ms())
+    }
+
+    /// The unattended step at `now_ms`. It acts only under the launch's
+    /// background delegation (DR-0312): ended or lapsed work does not step,
+    /// and the vault refuses any project key the delegation does not name.
+    pub(crate) fn step_project_workflow_unattended_at(
+        &mut self,
+        scope: &str,
+        limits: ProjectWorkflowLimits,
+        now_ms: u64,
+    ) -> Result<ProjectWorkflowStep, String> {
         let (project, actor, request) =
             launch_scope_parts(scope).ok_or("not a workflow launch scope")?;
+        let delegation = self.held_workflow_delegation(scope, now_ms)?;
         let context = AuthenticatedActionContext::project_workflow_invocation(
             AuthorityId::new(actor),
             scope.to_owned(),
         );
-        self.step_project_workflow(&context, &project, &request, limits)
+        let (step, refused) = crate::content_vault::act_for(&project, &delegation.scopes, || {
+            self.step_project_workflow(&context, &project, &request, limits)
+        });
+        // What the step opened is dropped with it unless a session holds the
+        // project (WS-740).
+        if let Some(vault) = &self.content_vault {
+            vault.release_unless_held(&project);
+        }
+        if !refused.is_empty() {
+            self.record_delegation_refusals(&delegation, &refused, now_ms);
+            let reached = refused.into_iter().collect::<Vec<_>>().join(", ");
+            return Err(match step {
+                Ok(_) => format!("this work reached outside what it declared: {reached}"),
+                Err(error) => {
+                    format!("this work reached outside what it declared: {reached}: {error}")
+                }
+            });
+        }
+        let step = step?;
+        match step
+            .executed_effect
+            .as_ref()
+            .or(step.recovered_effect.as_ref())
+        {
+            Some(effect) => self.record_unattended_use(&delegation, effect, now_ms),
+            None => self.record_unattended_check(&delegation, now_ms),
+        }
+        if let Some(outcome) = finished(&step.snapshot.instance_status) {
+            self.end_delegation(&delegation, &outcome, now_ms);
+        }
+        Ok(step)
     }
 
     /// Wake the supervisor for one launch or a whole project. Best effort: a
@@ -110,6 +153,21 @@ fn drive(
     config: ProjectWorkflowSupervisorConfig,
     shutdown: &watch::Receiver<bool>,
 ) -> Option<ProjectWorkflowOutcome> {
+    // Paused work waits for a member without a fault each sweep, and work
+    // whose delegation ended is finished however its run reads (DR-0312).
+    let standing = wb
+        .lock_unpoisoned()
+        .workflow_standing(scope, crate::key_delegation::now_ms());
+    match standing {
+        Ok(crate::key_delegation::Standing::Held(_)) => {}
+        Ok(crate::key_delegation::Standing::Lapsed(_)) => {
+            return Some(ProjectWorkflowOutcome::Parked)
+        }
+        Ok(crate::key_delegation::Standing::Ended(outcome)) => {
+            return Some(ProjectWorkflowOutcome::Finished(outcome))
+        }
+        Err(detail) => return Some(ProjectWorkflowOutcome::NeedsAttention { detail }),
+    }
     for _ in 0..config.steps_per_wake.max(1) {
         if stopping(shutdown) {
             return None;
@@ -231,6 +289,13 @@ pub async fn supervise_project_workflows(
                 }
                 // No receiver or a full channel cannot withhold execution.
                 let _ = notices.try_send(ProjectWorkflowNotice { scope, outcome });
+            }
+            // Every pass also drops the keys of projects whose sessions have
+            // lingered out (WS-740); a hold that ends without lingering drops
+            // its own.
+            let vault = wb.lock_unpoisoned().content_vault.clone();
+            if let Some(vault) = vault {
+                vault.release_idle(crate::key_delegation::now_ms());
             }
         }
         tokio::select! {

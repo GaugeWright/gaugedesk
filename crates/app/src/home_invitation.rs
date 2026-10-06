@@ -46,6 +46,11 @@ struct HomeInvitationRecord {
     expires_at: u64,
     token_sha256: String,
     status: InvitationStatus,
+    /// An email invitation's normalized address (DR-0332). Its
+    /// `invited_authority` is empty until an account holding the address as a
+    /// verified email accepts it, and is that account afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invited_email: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,11 +62,18 @@ struct InvitationEnvelope {
     home_id: String,
     endpoint: String,
     secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invited_email: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct CreateInvitationBody {
+    #[serde(default)]
     authority: String,
+    /// An address instead of an account (DR-0332). Exactly one of the two is
+    /// named.
+    #[serde(default)]
+    email: Option<String>,
     project: String,
     #[serde(default = "member_role")]
     role: String,
@@ -121,6 +133,65 @@ fn json_error(status: StatusCode, message: &'static str) -> axum::response::Resp
     (status, Json(json!({ "error": message }))).into_response()
 }
 
+/// For an email invitation, the organization whose policy decides it, or
+/// `None` for a project an account owns, which is always open (DR-0332). The
+/// Personal project is never shared.
+fn email_invitation_owner(
+    wb: &crate::Workbench,
+    project: &str,
+    by_email: bool,
+) -> Result<Option<String>, (StatusCode, &'static str)> {
+    if !by_email {
+        return Ok(None);
+    }
+    let Some(record) = wb.library.projects.get(project) else {
+        return Err((StatusCode::NOT_FOUND, "project is not on this Home"));
+    };
+    if record.is_default {
+        return Err((StatusCode::FORBIDDEN, "Personal cannot be shared"));
+    }
+    Ok(wb
+        .project_organization(record)
+        .filter(|organization| organization.starts_with("organization:"))
+        .map(str::to_owned))
+}
+
+/// Refuse an email invitation to `organization`'s project unless the
+/// organization lets anyone be invited, asked of the account authority now
+/// with the inviter's own sign-in. Not being able to ask is a refusal.
+async fn organization_sharing_refusal(
+    shared: &SharedWorkbench,
+    headers: &HeaderMap,
+    organization: &str,
+    hub: Option<String>,
+) -> Option<axum::response::Response> {
+    let bearer = net_http::bearer(headers)
+        .map(str::to_owned)
+        .or_else(|| crate::account_signin::hub_session_token(shared));
+    let (Some(hub), Some(bearer)) = (hub, bearer) else {
+        return Some(json_error(
+            StatusCode::CONFLICT,
+            "sign in to the account service to invite by email",
+        ));
+    };
+    let organization = organization.to_owned();
+    let asked = tokio::task::spawn_blocking(move || {
+        crate::account_signin::organization_project_sharing_at(&hub, &bearer, &organization)
+    })
+    .await;
+    match asked {
+        Ok(Ok(crate::org::ProjectSharing::Anyone)) => None,
+        Ok(Ok(crate::org::ProjectSharing::Members)) => Some(json_error(
+            StatusCode::FORBIDDEN,
+            "this organization shares its projects only with its members; an owner can change that in Organization Policy",
+        )),
+        Ok(Err(_)) | Err(_) => Some(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "could not confirm the organization's sharing policy; try again",
+        )),
+    }
+}
+
 /// Owner/admin: mint and durably hash an authority-bound invitation. Membership
 /// and project access remain unchanged until acceptance commits all three facts.
 /// No content, project name, or provider credential leaves the Home.
@@ -129,8 +200,34 @@ pub async fn post_invitation(
     headers: HeaderMap,
     Json(body): Json<CreateInvitationBody>,
 ) -> axum::response::Response {
-    if body.authority.trim().is_empty()
-        || body.project.trim().is_empty()
+    create_invitation(wb, headers, body, crate::account_signin::hub_base()).await
+}
+
+async fn create_invitation(
+    shared: SharedWorkbench,
+    headers: HeaderMap,
+    body: CreateInvitationBody,
+    hub: Option<String>,
+) -> axum::response::Response {
+    let email = match body.email.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match crate::account_auth::normalize_email_contact(raw) {
+            Some(email) => Some(email),
+            None => {
+                return json_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "a valid email address is required",
+                )
+            }
+        },
+    };
+    if body.authority.trim().is_empty() == email.is_none() {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invite either an account or an email address",
+        );
+    }
+    if body.project.trim().is_empty()
         || !crate::account_routes::secure_home_endpoint(&body.endpoint)
         || !is_valid_role(&body.role)
         || matches!(
@@ -152,12 +249,32 @@ pub async fn post_invitation(
     }
 
     let authority = body.authority.trim().to_owned();
-    let mut wb = wb.lock_unpoisoned();
-    if let Err((status, message)) =
-        wb.authorize(net_http::bearer(&headers), Some(Capability::ManageMembers))
-    {
-        return json_error(status, message);
+    let organization = {
+        let wb = shared.lock_unpoisoned();
+        if let Err((status, message)) =
+            wb.authorize(net_http::bearer(&headers), Some(Capability::ManageMembers))
+        {
+            return json_error(status, message);
+        }
+        if !wb.owns_project(&body.project) {
+            return json_error(StatusCode::NOT_FOUND, "project is not on this Home");
+        }
+        if let Some(refusal) = wb.project_owner_refusal(&headers, &body.project) {
+            return refusal;
+        }
+        match email_invitation_owner(&wb, &body.project, email.is_some()) {
+            Ok(organization) => organization,
+            Err((status, message)) => return json_error(status, message),
+        }
+    };
+    if let Some(organization) = organization {
+        if let Some(refusal) =
+            organization_sharing_refusal(&shared, &headers, &organization, hub).await
+        {
+            return refusal;
+        }
     }
+    let mut wb = shared.lock_unpoisoned();
     if !wb.owns_project(&body.project) {
         return json_error(StatusCode::NOT_FOUND, "project is not on this Home");
     }
@@ -177,6 +294,7 @@ pub async fn post_invitation(
         expires_at: now_secs().saturating_add(ttl),
         token_sha256: token_hash(&secret),
         status: InvitationStatus::Pending,
+        invited_email: email.clone(),
     };
     let record_json = serde_json::to_string(&record).expect("invitation serializes");
     if let Err(error) =
@@ -197,6 +315,7 @@ pub async fn post_invitation(
         home_id,
         endpoint,
         secret,
+        invited_email: email,
     };
     let encoded = match encode_envelope(&envelope) {
         Ok(encoded) => encoded,
@@ -220,34 +339,86 @@ pub async fn post_invitation(
 /// authority-bound capability, atomically activate membership+grant+invite, and
 /// mint a replaceable Home session. Repeating a completed acceptance is
 /// idempotent and mints a fresh session so a lost HTTP response is recoverable.
+/// An email invitation is bound to the accepting account first, once the
+/// account authority confirms that account holds the address (DR-0332).
 pub async fn post_accept_invitation(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
     Json(body): Json<AcceptInvitationBody>,
 ) -> axum::response::Response {
+    accept_invitation(wb, headers, body, crate::account_signin::hub_base()).await
+}
+
+/// The capability matches the record and this Home, and the invitation is
+/// addressed to `actor` or, for an email invitation still pending, to whoever
+/// holds its address.
+fn invitation_matches(
+    wb: &crate::Workbench,
+    envelope: &InvitationEnvelope,
+    record: &HomeInvitationRecord,
+    actor: &str,
+) -> bool {
+    // Comparing fixed-size SHA-256 digests leaks no useful prefix of the random
+    // capability (the digest is not itself accepted and has 256-bit preimage work).
+    let hash_matches = token_hash(&envelope.secret) == record.token_sha256;
+    let addressed = match &record.invited_email {
+        None => record.invited_authority == actor && envelope.invited_authority == actor,
+        Some(email) => {
+            envelope.invited_email.as_deref() == Some(email.as_str())
+                && (record.status == InvitationStatus::Pending || record.invited_authority == actor)
+        }
+    };
+    hash_matches
+        && addressed
+        && envelope.project == record.project
+        && envelope.home_id == record.home_id
+        && envelope.endpoint == record.endpoint
+        && envelope.home_id == wb.home_id().as_str()
+}
+
+async fn accept_invitation(
+    shared: SharedWorkbench,
+    headers: HeaderMap,
+    body: AcceptInvitationBody,
+    hub: Option<String>,
+) -> axum::response::Response {
     let Some(envelope) = decode_envelope(&body.invite) else {
         return json_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid Home invitation");
     };
-    let mut wb = wb.lock_unpoisoned();
-    let actor = match wb.authenticate_identity(net_http::bearer(&headers)) {
-        Ok(actor) => actor,
-        Err((status, message)) => return json_error(status, message),
+    let (actor, email_to_confirm) = {
+        let wb = shared.lock_unpoisoned();
+        let actor = match wb.authenticate_identity(net_http::bearer(&headers)) {
+            Ok(actor) => actor,
+            Err((status, message)) => return json_error(status, message),
+        };
+        let Some(record) = latest_invitation(wb.store_ref(), &envelope.invitation) else {
+            return json_error(StatusCode::NOT_FOUND, "invitation is unknown");
+        };
+        if !invitation_matches(&wb, &envelope, &record, actor.as_str()) {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "invitation does not match this identity and Home",
+            );
+        }
+        let pending = record.status == InvitationStatus::Pending;
+        if pending && record.expires_at <= now_secs() {
+            return json_error(StatusCode::GONE, "invitation has expired");
+        }
+        (actor, record.invited_email.filter(|_| pending))
     };
+    if let Some(email) = email_to_confirm {
+        if let Some(refusal) = email_refusal(&headers, actor.as_str(), &email, hub).await {
+            return refusal;
+        }
+    }
+
+    let mut wb = shared.lock_unpoisoned();
+    // Read again: another account may have taken an email invitation while
+    // the account authority was asked.
     let Some(record) = latest_invitation(wb.store_ref(), &envelope.invitation) else {
         return json_error(StatusCode::NOT_FOUND, "invitation is unknown");
     };
-    let expected_hash = token_hash(&envelope.secret);
-    // Comparing fixed-size SHA-256 digests leaks no useful prefix of the random
-    // capability (the digest is not itself accepted and has 256-bit preimage work).
-    let hash_matches = expected_hash == record.token_sha256;
-    if !hash_matches
-        || record.invited_authority != actor.as_str()
-        || envelope.invited_authority != actor.as_str()
-        || envelope.project != record.project
-        || envelope.home_id != record.home_id
-        || envelope.endpoint != record.endpoint
-        || envelope.home_id != wb.home_id().as_str()
-    {
+    if !invitation_matches(&wb, &envelope, &record, actor.as_str()) {
         return json_error(
             StatusCode::FORBIDDEN,
             "invitation does not match this identity and Home",
@@ -259,6 +430,7 @@ pub async fn post_accept_invitation(
     if record.status == InvitationStatus::Pending {
         let mut accepted = record.clone();
         accepted.status = InvitationStatus::Accepted;
+        accepted.invited_authority = actor.as_str().to_owned();
         let org = match Org::rebuild(wb.store_ref()) {
             Ok(org) => org,
             Err(_) => {
@@ -277,7 +449,7 @@ pub async fn post_accept_invitation(
                 op: RecordOp::Upsert,
                 org_id: ORG_ID.to_owned(),
                 authority: actor.as_str().to_owned(),
-                email: String::new(),
+                email: record.invited_email.clone().unwrap_or_default(),
                 role: record.role.clone(),
                 status: MembershipStatus::Active,
                 managed_by_scim: false,
@@ -319,6 +491,45 @@ pub async fn post_accept_invitation(
         })),
     )
         .into_response()
+}
+
+/// Refuse to bind an email invitation unless the account authority says the
+/// account presenting this bearer is `actor` and holds `email` verified.
+async fn email_refusal(
+    headers: &HeaderMap,
+    actor: &str,
+    email: &str,
+    hub: Option<String>,
+) -> Option<axum::response::Response> {
+    let (Some(hub), Some(bearer)) = (hub, net_http::bearer(headers).map(str::to_owned)) else {
+        return Some(json_error(
+            StatusCode::UNAUTHORIZED,
+            "sign in with your GaugeWright account to accept this invitation",
+        ));
+    };
+    let email = email.to_owned();
+    let standing = tokio::task::spawn_blocking(move || {
+        crate::account_identity::hub_email_standing(&hub, &bearer, &email)
+    })
+    .await;
+    use crate::account_identity::EmailStanding;
+    match standing {
+        Ok(Ok(EmailStanding::Holds { account })) if account == actor => None,
+        Ok(Ok(EmailStanding::Holds { .. } | EmailStanding::DoesNotHold { .. })) => {
+            Some(json_error(
+                StatusCode::FORBIDDEN,
+                "this invitation is for an email address your account has not verified",
+            ))
+        }
+        Ok(Ok(EmailStanding::Unrecognised)) => Some(json_error(
+            StatusCode::UNAUTHORIZED,
+            "sign in with your GaugeWright account to accept this invitation",
+        )),
+        Ok(Err(_)) | Err(_) => Some(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "could not confirm your email address; try again",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -382,12 +593,273 @@ mod tests {
             home_id: "home:owner".to_owned(),
             endpoint: "https://home.example".to_owned(),
             secret: "redacted-capability".to_owned(),
+            invited_email: None,
         };
         let encoded = encode_envelope(&envelope).unwrap();
         let decoded = decode_envelope(&encoded).unwrap();
         assert_eq!(decoded.invitation, envelope.invitation);
         assert_eq!(decoded.home_id, envelope.home_id);
         assert!(decode_envelope("not-an-invite").is_none());
+    }
+
+    const OPEN_ORG: &str = "organization:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const CLOSED_ORG: &str = "organization:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A Home with an owner, two other accounts, a project the owner owns and
+    /// one project for each of an open and a members-only organization.
+    fn email_fixture() -> (tempfile::TempDir, SharedWorkbench) {
+        let dir = tempfile::tempdir().unwrap();
+        let wb = open_workbench(dir.path()).unwrap();
+        {
+            let mut guard = wb.lock_unpoisoned();
+            guard.set_identity_provider(Some(Arc::new(
+                LoopbackIdentityProvider::new()
+                    .enroll(
+                        "owner-login",
+                        AuthorityId::new("owner"),
+                        AuthorityAttributes::default(),
+                    )
+                    .enroll(
+                        "invitee-login",
+                        AuthorityId::new("invitee"),
+                        AuthorityAttributes::default(),
+                    )
+                    .enroll(
+                        "other-login",
+                        AuthorityId::new("other"),
+                        AuthorityAttributes::default(),
+                    ),
+            )));
+            let owner = MembershipRecord {
+                id: "owner".to_owned(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.to_owned(),
+                authority: "owner".to_owned(),
+                email: "owner@example.test".to_owned(),
+                role: "owner".to_owned(),
+                status: MembershipStatus::Active,
+                managed_by_scim: false,
+                team: None,
+            };
+            guard
+                .store_mut()
+                .append_record(
+                    ORG_SCOPE,
+                    "membership",
+                    &serde_json::to_string(&owner).unwrap(),
+                )
+                .unwrap();
+            let mut mine = std::collections::BTreeMap::new();
+            crate::project_owner::record_owner(&mut mine, "owner");
+            crate::library_routes::create_named_project_with_extra(
+                &mut guard,
+                "proj-mine",
+                "Mine",
+                mine,
+            )
+            .unwrap();
+            for (id, organization) in [("proj-open", OPEN_ORG), ("proj-closed", CLOSED_ORG)] {
+                crate::library_routes::create_named_project_with_extra(
+                    &mut guard,
+                    id,
+                    id,
+                    std::collections::BTreeMap::from([(
+                        "organization".to_owned(),
+                        serde_json::Value::String(organization.to_owned()),
+                    )]),
+                )
+                .unwrap();
+            }
+        }
+        (dir, wb)
+    }
+
+    /// An account authority on loopback: `invitee` holds the invited address,
+    /// `other` holds none, and the two organizations answer their policies.
+    async fn stub_account_authority() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::Path;
+        use axum::routing::get;
+        let app = Router::new()
+            .route(
+                "/account/identity",
+                get(|headers: HeaderMap| async move {
+                    let account = match net_http::bearer(&headers) {
+                        Some("invitee-login") => "invitee",
+                        Some("other-login") => "other",
+                        _ => return StatusCode::UNAUTHORIZED.into_response(),
+                    };
+                    let asked = headers
+                        .get(crate::account_identity::VERIFIED_EMAIL_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default();
+                    Json(json!({
+                        "account": account,
+                        "holds_email": account == "invitee" && asked == "invitee@example.test",
+                    }))
+                    .into_response()
+                }),
+            )
+            .route(
+                "/account/tenants/{tenant}/project-share-candidates",
+                get(
+                    |Path(tenant): Path<String>, headers: HeaderMap| async move {
+                        assert_eq!(headers["x-gaugewright-tenant"], tenant.as_str());
+                        assert_eq!(headers["authorization"], "Bearer owner-login");
+                        let sharing = if tenant == OPEN_ORG {
+                            "anyone"
+                        } else {
+                            "members"
+                        };
+                        Json(json!({ "candidates": [], "sharing": sharing }))
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let service = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (hub, service)
+    }
+
+    fn signed_in(login: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {login}").parse().unwrap());
+        headers
+    }
+
+    async fn invite(
+        wb: &SharedWorkbench,
+        body: serde_json::Value,
+        hub: Option<String>,
+    ) -> (StatusCode, serde_json::Value) {
+        let body: CreateInvitationBody = serde_json::from_value(body).unwrap();
+        let response = create_invitation(wb.clone(), signed_in("owner-login"), body, hub).await;
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    async fn accept(
+        wb: &SharedWorkbench,
+        login: &str,
+        invite: &str,
+        hub: Option<String>,
+    ) -> (StatusCode, serde_json::Value) {
+        let body = AcceptInvitationBody {
+            invite: invite.to_owned(),
+        };
+        let response = accept_invitation(wb.clone(), signed_in(login), body, hub).await;
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn by_email(project: &str) -> serde_json::Value {
+        json!({
+            "email": " Invitee@Example.test ",
+            "project": project,
+            "role": "member",
+            "endpoint": "https://owner-home.example",
+        })
+    }
+
+    #[tokio::test]
+    async fn an_email_invitation_binds_the_account_that_holds_the_address() {
+        let (_dir, wb) = email_fixture();
+        let (hub, service) = stub_account_authority().await;
+        let (status, created) = invite(&wb, by_email("proj-mine"), Some(hub.clone())).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let encoded = created["invite"].as_str().unwrap().to_owned();
+
+        let (refused, body) = accept(&wb, "other-login", &encoded, Some(hub.clone())).await;
+        assert_eq!(refused, StatusCode::FORBIDDEN, "{body}");
+        let (unreachable, _) = accept(&wb, "invitee-login", &encoded, None).await;
+        assert_eq!(unreachable, StatusCode::UNAUTHORIZED);
+
+        let (accepted, body) = accept(&wb, "invitee-login", &encoded, Some(hub.clone())).await;
+        assert_eq!(accepted, StatusCode::OK, "{body}");
+        {
+            let guard = wb.lock_unpoisoned();
+            let org = Org::rebuild(guard.store_ref()).unwrap();
+            assert!(org.can_access_project("invitee", "proj-mine"));
+            assert!(!org.can_access_project("other", "proj-mine"));
+            let member = org.member_by_authority("invitee").unwrap();
+            assert_eq!(member.email, "invitee@example.test");
+            let record = latest_invitation(
+                guard.store_ref(),
+                &decode_envelope(&encoded).unwrap().invitation,
+            )
+            .unwrap();
+            assert_eq!(record.invited_authority, "invitee");
+        }
+
+        // Taken: nobody else can use it, and its holder may repeat it.
+        let (taken, _) = accept(&wb, "other-login", &encoded, Some(hub.clone())).await;
+        assert_eq!(taken, StatusCode::FORBIDDEN);
+        let (again, body) = accept(&wb, "invitee-login", &encoded, Some(hub)).await;
+        assert_eq!(again, StatusCode::OK, "{body}");
+        service.abort();
+    }
+
+    #[tokio::test]
+    async fn an_organization_project_takes_email_invitations_only_when_it_allows() {
+        let (_dir, wb) = email_fixture();
+        let (hub, service) = stub_account_authority().await;
+        let (open, body) = invite(&wb, by_email("proj-open"), Some(hub.clone())).await;
+        assert_eq!(open, StatusCode::CREATED, "{body}");
+        let (closed, body) = invite(&wb, by_email("proj-closed"), Some(hub)).await;
+        assert_eq!(closed, StatusCode::FORBIDDEN, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Organization Policy"));
+        service.abort();
+
+        let (unconfigured, _) = invite(&wb, by_email("proj-open"), None).await;
+        assert_eq!(unconfigured, StatusCode::CONFLICT);
+        let (unreachable, _) = invite(
+            &wb,
+            by_email("proj-open"),
+            Some("http://127.0.0.1:9".into()),
+        )
+        .await;
+        assert_eq!(unreachable, StatusCode::SERVICE_UNAVAILABLE);
+        // A member chosen from the roster needs no policy and no Hub.
+        let (addressed, body) = invite(
+            &wb,
+            json!({
+                "authority": "invitee",
+                "project": "proj-closed",
+                "endpoint": "https://owner-home.example",
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(addressed, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_email_invitation_names_one_valid_address_and_never_personal() {
+        let (_dir, wb) = email_fixture();
+        let endpoint = "https://owner-home.example";
+        for (body, expected) in [
+            (by_email(crate::DEFAULT_PROJECT), StatusCode::FORBIDDEN),
+            (
+                json!({ "authority": "invitee", "email": "invitee@example.test",
+                        "project": "proj-mine", "endpoint": endpoint }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({ "project": "proj-mine", "endpoint": endpoint }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({ "email": "not an address", "project": "proj-mine", "endpoint": endpoint }),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let (status, response) = invite(&wb, body.clone(), None).await;
+            assert_eq!(status, expected, "{body} -> {response}");
+        }
     }
 
     #[tokio::test]

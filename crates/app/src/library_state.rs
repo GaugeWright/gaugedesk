@@ -6355,11 +6355,14 @@ impl Workbench {
         if agent.agent_kind == AgentKind::Panel {
             return Err("panel agents require an explicit project binding".to_owned());
         }
+        // Personal keeps the pre-DR-0225 Tutorials target only for the runs
+        // pinned to it; a new placement does not work on it.
         let target_ids = self
             .library
             .targets_for_project(project_id)
             .into_iter()
             .filter(|target| target.status == WorkTargetStatus::Available)
+            .filter(|target| target.id != crate::shipped_tutorials::TUTORIALS_TARGET)
             .map(|target| target.id.clone())
             .collect::<Vec<_>>();
         if target_ids.is_empty() {
@@ -6392,7 +6395,7 @@ impl Workbench {
         Ok(inst_id)
     }
 
-    fn place_panel_agent_on_project(
+    pub(crate) fn place_panel_agent_on_project(
         &mut self,
         project_id: &str,
         agent_id: &str,
@@ -6950,7 +6953,16 @@ impl Workbench {
                 .place_archetype_on_project(personal, agent_id, Admission::Active)
                 .map_err(CreateArchetypeChatError::Create)?,
         };
-        self.create_chat_in_instance(&placement_id, title)
+        // The chat works on Personal's own files. Personal may hold other
+        // targets too, and with none named a placement of several refuses.
+        let personal_files = managed_project_target_id(personal);
+        let requested = self
+            .library
+            .placement_targets
+            .get(&placement_id)
+            .is_some_and(|record| record.target_ids.contains(&personal_files))
+            .then_some(personal_files.as_str());
+        self.create_chat_in_instance_on_target(&placement_id, title, requested)
             .map_err(CreateArchetypeChatError::Create)
     }
 
@@ -8077,11 +8089,18 @@ impl Workbench {
                     "name": project.name,
                     "authority": self.authority.as_str(),
                     "is_personal": project.is_default,
+                    // The organization tenant that owns this project, or null
+                    // for the person's own work. The navigator scopes to the
+                    // selected organization by this field (DR-0325).
+                    "organization": self.project_organization(project),
                     "product": if crate::shipped_tutorials::is_tutorial_project(project) {
                         Some(serde_json::json!({"kind":"tutorials", "publisher":"GaugeWright"}))
                     } else { None },
                     "home_id": project.home_id.as_str(),
                     "network_isolated": project.network_isolated,
+                    // A fork names its original's id and nothing else; the
+                    // name comes from the original only where it is visible.
+                    "upstream": crate::project_fork::upstream_of(project).map(|upstream| upstream.project_id),
                     "targets": lib.targets_for_project(&project.id).into_iter().map(Self::work_target_json).collect::<Vec<_>>(),
                     "placements": placements,
                 })
@@ -8140,6 +8159,9 @@ impl Workbench {
                 .map(Self::work_target_json)
                 .collect::<Vec<_>>(),
             "personal_placement": DEFAULT_PLACEMENT,
+            // The organization this Home was provisioned for, which a project
+            // created here belongs to (DR-0325).
+            "home_organization": self.owning_organization.as_deref(),
         })
     }
 
@@ -8494,6 +8516,40 @@ impl Workbench {
             tasks.push(task);
         }
 
+        // Background work paused because no member used its project for 30
+        // days (DR-0312). Every member is told, since any member's use of the
+        // project renews it; opening the project is the whole remedy.
+        let now = crate::key_delegation::now_ms();
+        let mut directory = None;
+        for project in self.library.projects.values() {
+            if project.home_id != self.home_id || project.op != crate::library::RecordOp::Upsert {
+                continue;
+            }
+            let paused = self.lapsed_background_work(&project.id, now);
+            if paused == 0 {
+                continue;
+            }
+            let directory = directory.get_or_insert_with(|| {
+                crate::org::Org::rebuild_in(self.store_ref(), crate::org::ORG_SCOPE).ok()
+            });
+            let member = actor == self.project_addressee()
+                || directory
+                    .as_ref()
+                    .is_some_and(|org| self.account_project_ids(actor, org).contains(&project.id));
+            if !member {
+                continue;
+            }
+            tasks.push(serde_json::json!({
+                "id": format!("{}:paused", project.id),
+                "title": project.name,
+                "agent": "",
+                "kind": "resume",
+                "assignee": actor,
+                "project": project.id,
+                "waiting": paused,
+            }));
+        }
+
         // Ask-typed chat tasks (ADR 0082 §2–3), current-first. Each chat raises
         // its signals from durable lifecycle state (the projection owns no
         // truth) and contributes at most one task: the highest-priority raised
@@ -8602,15 +8658,22 @@ impl Workbench {
         })
     }
 
+    /// `owner` is the account the pairing is for, which alone may accept it;
+    /// `None` names the host's own authority, as before accounts were kept
+    /// apart (DR-0328 §3).
     pub(crate) fn create_pairing_request(
         &mut self,
         device: String,
         bridge_grant: Option<String>,
+        owner: Option<String>,
     ) -> Result<CreatedPairingRequest, AdmitError> {
         let pairing_id = library::gen_id("pairing");
         let device = DeviceId::new(device);
         let grant = BridgeGrantId::new(bridge_grant.unwrap_or_else(|| library::gen_id("grant")));
-        let required = std::collections::BTreeSet::from([self.authority().as_str().to_string()]);
+        let owner = owner
+            .filter(|owner| !owner.is_empty())
+            .unwrap_or_else(|| self.authority().as_str().to_string());
+        let required = std::collections::BTreeSet::from([owner]);
         self.store_mut()
             .admit::<BoundaryState>(&pairing_id, BoundaryCommand::Propose(required))?;
         self.store_mut().admit::<BoundaryState>(

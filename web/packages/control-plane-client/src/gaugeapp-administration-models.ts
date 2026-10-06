@@ -187,6 +187,7 @@ const securityPolicy = shape({
     residency_region: nullable(stringValue), audit_retention_min_days: integerValue,
     allow_auto_upgrade: booleanValue,
 });
+const projectSharingValue = oneOf("members", "anyone");
 export const parseOrganizationPolicyModel = shape({
     resource: shape({ rules: arrayOf(jsonValue) }),
     security: nullable(securityPolicy),
@@ -195,6 +196,9 @@ export const parseOrganizationPolicyModel = shape({
         allowed_operators: arrayOf(oneOf("local", "counterparty", "neutral")),
     }),
     archetype_approval: shape({ require_approval: booleanValue }),
+    // DR-0332. A Hub that predates it sends nothing, which is members only.
+    project_sharing: (value: unknown, path: string) =>
+        value === undefined ? "members" as const : projectSharingValue(value, path),
 });
 export type OrganizationPolicyPageV1 = ReturnType<typeof parseOrganizationPolicyModel>;
 

@@ -5,7 +5,6 @@
 
 .management-chat { display: flex; flex-direction: column; min-height: 0; height: 100%; }
 .management-chat-loading { margin: 36px auto; color: var(--muted); font-family: var(--font-chrome); }
-.management-chat-menu { border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 20px; line-height: 1; }
 .management-chat-confirm { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--edge); font: var(--fs-small) var(--font-chrome); }
 .management-chat-confirm span { flex: 1; }
 .management-chat-error { margin: 0; padding: 8px 12px; color: var(--danger, #e88); font: var(--fs-small) var(--font-chrome); }
@@ -463,4 +462,17 @@ div.project-settings-empty p {
     .project-settings-overview-grid {
         grid-template-columns: minmax(0, 1fr);
     }
+}
+
+.project-settings-delegation > div:first-child {
+    display: grid;
+    gap: 2px;
+}
+
+.project-settings-delegation[data-delegation-state="lapsed"] > span {
+    color: var(--warn);
+}
+
+.project-settings-delegation-refused {
+    color: var(--bad);
 }

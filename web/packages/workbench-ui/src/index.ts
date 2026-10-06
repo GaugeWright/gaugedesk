@@ -166,6 +166,7 @@ export { ForkTreePanel } from "./ForkTreePanel";
 export type { ForkTreeApi } from "./ForkTreePanel";
 export { FacetBrowser } from "./FacetBrowser";
 export type { FacetBrowserApi } from "./FacetBrowser";
+export { navigatorScope, projectInScope, quickStartPlacement, scopeProjects, scopeTasks, scopeWorkspace, type NavigatorScope } from "./workspace-scope";
 export { archetypeVisible, childrenFor, groupChatsByArchetype, hit, lineageVaries, markMatch, placementVisible, projectVisible, searching } from "./facet-filter";
 export type { ChatGroup, FilterArchetype, FilterChat, FilterPlacement, FilterProject, MatchSplit, RecentChat } from "./facet-filter";
 export { forkSource, isFork } from "./fork-lineage";

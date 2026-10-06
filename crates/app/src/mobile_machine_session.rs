@@ -718,7 +718,12 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use crate::{open_route_stack::open_control_plane, open_workbench};
+    use crate::open_workbench;
+
+    /// The controller protocol as the hosts that serve it mount it.
+    fn open_control_plane(wb: crate::SharedWorkbench) -> Router {
+        super::routes().with_state(wb)
+    }
 
     async fn json_call(
         app: &Router,

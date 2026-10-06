@@ -49,6 +49,12 @@ pub enum ProjectVisibility {
     Account(BTreeSet<String>),
 }
 
+/// The member of an [`Account`](ProjectVisibility::Account) set that admits
+/// the chats no project holds — work from before chats were rooted in a
+/// project. They are the legacy owner's, as the install's Personal is
+/// (DR-0309). No project id is empty, so it names no project.
+pub(crate) const UNSCOPED_CHATS: &str = "";
+
 impl ProjectVisibility {
     /// Whether `project_id` is visible under this policy.
     pub fn allows(&self, project_id: &str) -> bool {
@@ -814,8 +820,17 @@ impl Workbench {
                     "Home identity provider unavailable",
                 ));
             }
-            // single-user local / loopback: the operator's own channel.
-            return Ok(self.authority().as_str().to_string());
+            // The local channel acts as the computer's local account, which
+            // reaches only the projects it owns or was granted (DR-0328 §2).
+            let local = self.authority().as_str().to_string();
+            if let Some(project) = project {
+                let org = org::Org::rebuild_in(self.store_ref(), org_scope)
+                    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
+                if !self.account_project_ids(&local, &org).contains(project) {
+                    return Err((StatusCode::FORBIDDEN, "not in scope for this project"));
+                }
+            }
+            return Ok(local);
         }
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
@@ -1043,15 +1058,20 @@ impl Workbench {
         // an IdP. Expiry or revocation must not widen that person to the local
         // operator's projection. Only the credential-free operator channel
         // retains the legacy all-project view (WS-545 / ENTSEC-2).
-        if self.idp.is_none() && !web_account_mode() && bearer.is_none() {
-            if self.hosted_home_mode() {
-                return ProjectVisibility::Only(BTreeSet::new());
-            }
-            return ProjectVisibility::All; // solo / loopback: the operator's own channel
+        if self.idp.is_none() && !web_account_mode() && bearer.is_none() && self.hosted_home_mode()
+        {
+            return ProjectVisibility::Only(BTreeSet::new());
         }
         let Ok(org) = org::Org::rebuild_in(self.store_ref(), org_scope) else {
             return ProjectVisibility::Only(BTreeSet::new()); // directory unreadable: leak nothing
         };
+        // The credential-free channel is the computer's local account, which
+        // sees what it owns or was granted like any account (DR-0328 §2).
+        if self.desktop_account_mode() && bearer.is_none() {
+            return ProjectVisibility::Account(
+                self.desktop_account_visible(self.authority().as_str(), &org),
+            );
+        }
         // A desktop's signed-in account sees what it owns or was granted, and
         // no role widens that (DR-0268 §1, §6). The computer's owner or admin
         // is a whole account. Anyone else stays a member limited to those
@@ -1067,7 +1087,7 @@ impl Workbench {
                     if role == gaugedesk_core::abac::Role::owner()
                         || role == gaugedesk_core::abac::Role::admin() =>
                 {
-                    ProjectVisibility::Account(projects)
+                    ProjectVisibility::Account(self.desktop_account_visible(account.as_str(), &org))
                 }
                 _ => ProjectVisibility::Only(projects),
             };
@@ -1103,11 +1123,16 @@ impl Workbench {
     pub fn chat_visible(&self, chat_id: &str, vis: &ProjectVisibility) -> bool {
         match vis {
             ProjectVisibility::All => true,
-            ProjectVisibility::Only(_) | ProjectVisibility::Account(_) => self
+            ProjectVisibility::Only(_) => self
                 .library
                 .project_of_chat(chat_id)
                 .map(|p| vis.allows(p))
                 .unwrap_or(false),
+            ProjectVisibility::Account(set) => self
+                .library
+                .project_of_chat(chat_id)
+                .map(|p| vis.allows(p))
+                .unwrap_or_else(|| set.contains(UNSCOPED_CHATS)),
         }
     }
 
@@ -1285,8 +1310,30 @@ impl Workbench {
     /// install's account scope, which already holds the computer's, and the
     /// local channel shares it until the claim is removed (WS-588). Every
     /// other account has its own.
+    /// What a desktop account sees: its own and granted projects, and, for
+    /// the legacy owner, the chats no project holds.
+    fn desktop_account_visible(&self, account: &str, org: &org::Org) -> BTreeSet<String> {
+        let mut visible = self.account_project_ids(account, org);
+        if account == self.legacy_project_owner() {
+            visible.insert(UNSCOPED_CHATS.to_owned());
+        }
+        visible
+    }
+
     pub(crate) fn desktop_account_store_scope(&self, account: &str) -> String {
-        if account == self.authority().as_str() || account == self.legacy_project_owner() {
+        // The install's scope is its recorded owner's: the claimant on a
+        // claimed computer, else the local account. Every other account,
+        // the local account of a claimed computer included, has its own
+        // (DR-0313, DR-0328 §2).
+        let owner = self
+            .install_scope_owner()
+            .unwrap_or_else(|| self.legacy_project_owner());
+        let owner = if owner.is_empty() {
+            self.authority().as_str().to_owned()
+        } else {
+            owner
+        };
+        if account == owner {
             crate::account::ACCOUNT_SCOPE.to_string()
         } else {
             crate::account::account_scope(account)
@@ -1300,10 +1347,14 @@ impl Workbench {
     /// sessions, tenants — stay where `account_scope_for` puts them.
     pub fn credential_scope_for(&self, bearer: Option<&str>) -> String {
         if self.desktop_account_mode() {
-            return bearer
-                .and_then(|token| self.resolve_account_session(token))
-                .map(|(account, _)| self.desktop_account_store_scope(&account))
-                .unwrap_or_else(|| crate::account::ACCOUNT_SCOPE.to_string());
+            let account = match bearer {
+                Some(token) => match self.resolve_account_session(token) {
+                    Some((account, _)) => account,
+                    None => return crate::account::ACCOUNT_SCOPE.to_string(),
+                },
+                None => self.authority().as_str().to_owned(),
+            };
+            return self.desktop_account_store_scope(&account);
         }
         self.account_scope_for(bearer)
     }
@@ -1907,7 +1958,8 @@ mod provider_neutral_identity_tests {
                 .1,
             second_initial
         );
-        let after_original_idle = initial.expires_at_ms + 1;
+        // Observe after both independently minted sessions’ original idle deadlines.
+        let after_original_idle = initial.expires_at_ms.max(second_initial.expires_at_ms) + 1;
         assert!(wb
             .account_session_evidence_at(&first, after_original_idle)
             .is_some());
@@ -2565,7 +2617,12 @@ mod staff_project_visibility_tests {
         let owner = wb.mint_account_session("owner", "passkey", 60).unwrap();
         let outsider = wb.mint_account_session("outsider", "passkey", 60).unwrap();
         assert!(wb.idp.is_none());
-        assert_eq!(wb.project_visibility(None), ProjectVisibility::All);
+        // DR-0328 §2: the local channel is the local account, the legacy
+        // owner of an unclaimed computer, which owns nothing here yet.
+        assert_eq!(
+            wb.project_visibility(None),
+            ProjectVisibility::Account(BTreeSet::from([UNSCOPED_CHATS.to_owned()]))
+        );
         // DR-0309: the owner role sees what it owns, which here is nothing.
         assert_eq!(
             wb.project_visibility(Some(&owner)),
@@ -2626,6 +2683,7 @@ mod staff_project_visibility_tests {
                     )
                     .unwrap();
                 let chat_id = chat["id"].as_str().unwrap();
+                guard.hold_session_for_tests(project["id"].as_str().unwrap());
                 guard
                     .store_mut()
                     .append_record(

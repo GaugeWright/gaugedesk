@@ -156,5 +156,6 @@ export function applyWorkspaceDelta(current: Workspace, delta: WorkspaceDelta): 
             (value) => value.id,
         ),
         personalPlacement: delta.replacements.personalPlacement,
+        homeOrganization: delta.replacements.homeOrganization,
     };
 }

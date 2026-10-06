@@ -1,10 +1,10 @@
 //! GaugeDesk-owned OpenAI Codex OAuth lifecycle (LLM-1, ADR 0062).
 //!
-//! Desktop uses the loopback PKCE helper. A hosted Home drives the official Codex
-//! app-server device-code flow in a short-lived, isolated `CODEX_HOME`, immediately
-//! imports the resulting bundle into the authenticated person's sealed Home scope,
-//! and deletes the temporary Codex store. The browser and Durable Objects receive
-//! only a verification code/status; WhippleScript does not own credentials.
+//! Desktop uses the loopback PKCE helper. A hosted Home or Hub speaks OpenAI's
+//! ChatGPT device authorization directly — no Codex CLI, no subprocess — and seals
+//! the resulting bundle into the authenticated person's account scope. The
+//! browser and Durable Objects receive only a verification code/status;
+//! WhippleScript does not own credentials.
 
 use axum::{
     extract::State,
@@ -16,9 +16,11 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::account::{
     credentials_in_scope, seal_token, unseal_token, CredentialAuthentication, ModelExecutionClass,
@@ -227,7 +229,6 @@ fn node_bin() -> String {
 #[serde(rename_all = "snake_case")]
 enum DeviceLoginState {
     Pending,
-    Cancelling,
     Linked,
     Failed,
     Cancelled,
@@ -246,7 +247,9 @@ struct DeviceLogin {
     user_code: String,
     state: DeviceLoginState,
     error: Option<String>,
-    stdin: Option<Arc<Mutex<ChildStdin>>>,
+    /// Read by the polling thread before each poll and again before it seals a
+    /// credential, so a cancelled login never links.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl DeviceLogin {
@@ -261,10 +264,7 @@ impl DeviceLogin {
     }
 
     fn active(&self) -> bool {
-        matches!(
-            self.state,
-            DeviceLoginState::Pending | DeviceLoginState::Cancelling
-        )
+        self.state == DeviceLoginState::Pending
     }
 }
 
@@ -282,7 +282,7 @@ fn device_logins() -> &'static Mutex<BTreeMap<String, DeviceLogin>> {
 /// wrong `user_code` and `verification_url`, so a person would be told to enter
 /// a code that authorizes nothing. And `start_device_login_blocking`, which
 /// reuses an existing login through this same lookup, saw `None` whenever the
-/// first-sorting login was inactive and spawned a second app-server for a scope
+/// first-sorting login was inactive and started a second login for a scope
 /// that already had one.
 ///
 /// Active wins over recency deliberately: at most one login can be live for a
@@ -299,50 +299,14 @@ fn device_login_for_scope(scope: &str) -> Option<DeviceLogin> {
         .cloned()
 }
 
-fn set_device_login_state(login_id: &str, state: DeviceLoginState, error: Option<String>) {
+/// Settle a pending login. A login that has already settled keeps its outcome,
+/// so a poll that finishes after a cancel cannot turn it back into `linked`.
+fn settle_device_login(login_id: &str, state: DeviceLoginState, error: Option<String>) {
     if let Ok(mut logins) = device_logins().lock() {
-        if let Some(login) = logins.get_mut(login_id) {
+        if let Some(login) = logins.get_mut(login_id).filter(|login| login.active()) {
             login.state = state;
             login.error = error;
-            if !login.active() {
-                login.stdin = None;
-            }
         }
-    }
-}
-
-fn write_rpc(stdin: &mut ChildStdin, message: Value) -> Result<(), String> {
-    serde_json::to_writer(&mut *stdin, &message)
-        .map_err(|error| format!("encode Codex app-server request: {error}"))?;
-    stdin
-        .write_all(b"\n")
-        .and_then(|_| stdin.flush())
-        .map_err(|error| format!("write Codex app-server request: {error}"))
-}
-
-fn read_rpc_response(reader: &mut BufReader<impl std::io::Read>, id: i64) -> Result<Value, String> {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let count = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("read Codex app-server response: {error}"))?;
-        if count == 0 {
-            return Err("Codex app-server stopped before replying".to_owned());
-        }
-        let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        if message.get("id").and_then(Value::as_i64) != Some(id) {
-            continue;
-        }
-        if let Some(error) = message.get("error") {
-            return Err(format!("Codex app-server rejected the request: {error}"));
-        }
-        return message
-            .get("result")
-            .cloned()
-            .ok_or_else(|| "Codex app-server returned no result".to_owned());
     }
 }
 
@@ -378,24 +342,20 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn read_codex_auth(path: &std::path::Path) -> Result<CodexOAuthCredential, String> {
-    let encoded = std::fs::read_to_string(path.join("auth.json"))
-        .map_err(|error| format!("read isolated Codex credential: {error}"))?;
-    let auth: Value = serde_json::from_str(&encoded)
-        .map_err(|error| format!("parse isolated Codex credential: {error}"))?;
-    let tokens = auth
-        .get("tokens")
-        .ok_or_else(|| "Codex app-server stored no ChatGPT tokens".to_owned())?;
+/// The sealed bundle from a token response: the `oauth/token` reply's own
+/// field names, with the account id read from the namespaced claim when the
+/// reply does not carry it outright.
+fn credential_from_tokens(tokens: &Value) -> Result<CodexOAuthCredential, String> {
     let access = tokens
         .get("access_token")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Codex app-server stored no access token".to_owned())?;
+        .ok_or_else(|| "OpenAI returned no access token".to_owned())?;
     let refresh = tokens
         .get("refresh_token")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "Codex app-server stored no refresh token".to_owned())?;
+        .ok_or_else(|| "OpenAI returned no refresh token".to_owned())?;
     let account_id = tokens
         .get("account_id")
         .and_then(Value::as_str)
@@ -408,9 +368,9 @@ fn read_codex_auth(path: &std::path::Path) -> Result<CodexOAuthCredential, Strin
                 .and_then(account_id_from_jwt)
         })
         .or_else(|| account_id_from_jwt(access))
-        .ok_or_else(|| "Codex app-server stored no ChatGPT account id".to_owned())?;
+        .ok_or_else(|| "OpenAI returned no ChatGPT account id".to_owned())?;
     let expires = jwt_expiry_ms(access)
-        .ok_or_else(|| "Codex app-server access token has no usable expiry".to_owned())?;
+        .ok_or_else(|| "OpenAI's access token has no usable expiry".to_owned())?;
     Ok(CodexOAuthCredential {
         access: access.to_owned(),
         refresh: refresh.to_owned(),
@@ -419,96 +379,147 @@ fn read_codex_auth(path: &std::path::Path) -> Result<CodexOAuthCredential, Strin
     })
 }
 
-fn codex_bin() -> String {
-    gaugedesk_env::var("CODEX_BIN").unwrap_or_else(|| "codex".to_owned())
+// A hosted Home or Hub speaks OpenAI's ChatGPT device authorization itself.
+// It is the flow the official Codex CLI drives in
+// `codex-rs/login/src/device_code_auth.rs`, read at rust-v0.144.4:
+//
+//   1. POST `{issuer}/api/accounts/deviceauth/usercode` `{client_id}` answers a
+//      `device_auth_id`, the `user_code` a person types at
+//      `{issuer}/codex/device`, and a poll `interval` in seconds, as a string.
+//   2. POST `{issuer}/api/accounts/deviceauth/token` `{device_auth_id,
+//      user_code}` answers 403 (or 404) while the person has not approved, and
+//      then an `authorization_code` with the PKCE pair the issuer generated.
+//   3. That code is exchanged at `{issuer}/oauth/token` against the issuer's own
+//      `deviceauth/callback` redirect, as any PKCE authorization code is.
+//
+// It used to spawn `codex app-server` to do this, which made the Codex CLI and
+// Node a runtime dependency of every process that could start a sign-in. The
+// Hub image had neither, so its Account Settings answered every Codex sign-in
+// with 502 (gaugewright-cloud WS-744).
+
+/// Upper bound on one device login, the CLI's own: its prompt says the code
+/// expires in fifteen minutes.
+const DEVICE_LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+fn issuer() -> String {
+    gaugedesk_env::var("CODEX_OAUTH_ISSUER")
+        .unwrap_or_else(|| "https://auth.openai.com".to_owned())
+        .trim_end_matches('/')
+        .to_owned()
 }
 
-fn start_device_login_blocking(wb: SharedWorkbench, scope: String) -> Result<Value, String> {
+struct DeviceCode {
+    device_auth_id: String,
+    user_code: String,
+    interval: Duration,
+}
+
+#[derive(Deserialize)]
+struct AuthorizationCode {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+enum DevicePoll {
+    Pending,
+    Approved(AuthorizationCode),
+}
+
+fn request_device_code(issuer: &str) -> Result<DeviceCode, String> {
+    let body: Value = ureq::post(&format!("{issuer}/api/accounts/deviceauth/usercode"))
+        .set("accept", "application/json")
+        .send_json(json!({ "client_id": CLIENT_ID }))
+        .map_err(|error| format!("Codex device authorization failed: {error}"))?
+        .into_json()
+        .map_err(|error| format!("Codex device authorization was not valid JSON: {error}"))?;
+    let field = |name: &str| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let device_auth_id = field("device_auth_id")
+        .ok_or_else(|| "Codex device authorization returned no device id".to_owned())?;
+    let user_code = field("user_code")
+        .or_else(|| field("usercode"))
+        .ok_or_else(|| "Codex device authorization returned no user code".to_owned())?;
+    let interval = body
+        .get("interval")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.trim().parse().ok())
+        })
+        .unwrap_or(5)
+        .clamp(1, 30);
+    Ok(DeviceCode {
+        device_auth_id,
+        user_code,
+        interval: Duration::from_secs(interval),
+    })
+}
+
+fn poll_device_code(issuer: &str, device: &DeviceCode) -> Result<DevicePoll, String> {
+    match ureq::post(&format!("{issuer}/api/accounts/deviceauth/token"))
+        .set("accept", "application/json")
+        .send_json(json!({
+            "device_auth_id": device.device_auth_id,
+            "user_code": device.user_code,
+        })) {
+        Ok(response) => response
+            .into_json()
+            .map(DevicePoll::Approved)
+            .map_err(|error| format!("Codex device authorization was not valid JSON: {error}")),
+        Err(ureq::Error::Status(403 | 404, _)) => Ok(DevicePoll::Pending),
+        Err(error) => Err(format!("Codex device authorization failed: {error}")),
+    }
+}
+
+fn exchange_authorization_code(
+    issuer: &str,
+    code: &AuthorizationCode,
+) -> Result<CodexOAuthCredential, String> {
+    let redirect_uri = format!("{issuer}/deviceauth/callback");
+    let tokens: Value = ureq::post(&format!("{issuer}/oauth/token"))
+        .set("accept", "application/json")
+        .send_form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.authorization_code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", CLIENT_ID),
+            ("code_verifier", code.code_verifier.as_str()),
+        ])
+        .map_err(|error| format!("Codex token exchange failed: {error}"))?
+        .into_json()
+        .map_err(|error| format!("Codex token exchange returned invalid JSON: {error}"))?;
+    credential_from_tokens(&tokens)
+}
+
+fn random_login_id() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|error| format!("create Codex login id: {error}"))?;
+    Ok(hex::encode(bytes))
+}
+
+fn start_device_login_blocking(
+    wb: SharedWorkbench,
+    scope: String,
+    issuer: String,
+) -> Result<Value, String> {
     if let Some(existing) = device_login_for_scope(&scope).filter(DeviceLogin::active) {
         return Ok(existing.projection());
     }
-
-    let codex_home = tempfile::Builder::new()
-        .prefix("gaugewright-codex-login-")
-        .tempdir()
-        .map_err(|error| format!("create isolated Codex login store: {error}"))?;
-    std::fs::write(
-        codex_home.path().join("config.toml"),
-        "cli_auth_credentials_store = \"file\"\n",
-    )
-    .map_err(|error| format!("configure isolated Codex login store: {error}"))?;
-
-    let mut child = Command::new(codex_bin())
-        .arg("app-server")
-        .env("CODEX_HOME", codex_home.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("spawn Codex app-server: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Codex app-server exposed no input pipe".to_owned())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Codex app-server exposed no output pipe".to_owned())?;
-    if let Some(mut stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-        });
-    }
-    let mut reader = BufReader::new(stdout);
-    write_rpc(
-        &mut stdin,
-        json!({
-            "method": "initialize",
-            "id": 1,
-            "params": {
-                "clientInfo": {
-                    "name": "gaugewright",
-                    "title": "GaugeWright",
-                    "version": env!("CARGO_PKG_VERSION"),
-                }
-            }
-        }),
-    )?;
-    let _ = read_rpc_response(&mut reader, 1)?;
-    write_rpc(&mut stdin, json!({ "method": "initialized", "params": {} }))?;
-    write_rpc(
-        &mut stdin,
-        json!({
-            "method": "account/login/start",
-            "id": 2,
-            "params": { "type": "chatgptDeviceCode" }
-        }),
-    )?;
-    let result = read_rpc_response(&mut reader, 2)?;
-    let login_id = result
-        .get("loginId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Codex app-server returned no login id".to_owned())?
-        .to_owned();
-    let verification_url = result
-        .get("verificationUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Codex app-server returned no verification URL".to_owned())?
-        .to_owned();
-    let user_code = result
-        .get("userCode")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Codex app-server returned no user code".to_owned())?
-        .to_owned();
-    let shared_stdin = Arc::new(Mutex::new(stdin));
+    let device = request_device_code(&issuer)?;
+    let login_id = random_login_id()?;
+    let cancelled = Arc::new(AtomicBool::new(false));
     let login = DeviceLogin {
         login_id: login_id.clone(),
         scope: scope.clone(),
-        verification_url,
-        user_code,
+        verification_url: format!("{issuer}/codex/device"),
+        user_code: device.user_code.clone(),
         state: DeviceLoginState::Pending,
         error: None,
-        stdin: Some(shared_stdin),
+        cancelled: Arc::clone(&cancelled),
         started_at: now_ms(),
     };
     let projection = login.projection();
@@ -518,96 +529,55 @@ fn start_device_login_blocking(wb: SharedWorkbench, scope: String) -> Result<Val
             .map_err(|_| "Codex device-login state is unavailable".to_owned())?;
         // Nothing ever removed a login, so this map grew for the life of the
         // process and every stale entry was another candidate for the lookup
-        // above. Settled logins for this scope are dropped as a new one starts:
-        // `set_device_login_state` clears `stdin` the moment a login stops being
-        // active, so a non-active entry holds no live process and removing it
-        // cannot orphan one.
+        // above. Settled logins for this scope are dropped as a new one starts.
         logins.retain(|_, login| login.scope != scope || login.active());
         logins.insert(login_id.clone(), login);
     }
 
     std::thread::spawn(move || {
-        let mut line = String::new();
-        let mut completed = false;
-        while reader
-            .read_line(&mut line)
-            .map(|count| count > 0)
-            .unwrap_or(false)
-        {
-            let message = serde_json::from_str::<Value>(line.trim()).ok();
-            line.clear();
-            let Some(params) = message
-                .as_ref()
-                .filter(|message| {
-                    message.get("method").and_then(Value::as_str) == Some("account/login/completed")
-                })
-                .and_then(|message| message.get("params"))
-            else {
-                continue;
-            };
-            if params.get("loginId").and_then(Value::as_str) != Some(login_id.as_str()) {
-                continue;
+        let deadline = std::time::Instant::now() + DEVICE_LOGIN_WINDOW;
+        loop {
+            if cancelled.load(Ordering::SeqCst) {
+                return;
             }
-            if params.get("success").and_then(Value::as_bool) == Some(true) {
-                let stored = read_codex_auth(codex_home.path()).and_then(|credential| {
-                    store_credential_in(
-                        &wb,
-                        &scope,
-                        &credential,
-                        BTreeSet::from([ModelExecutionClass::PrivateHome]),
-                    )
-                });
-                match stored {
-                    Ok(()) => set_device_login_state(&login_id, DeviceLoginState::Linked, None),
-                    Err(error) => {
-                        set_device_login_state(&login_id, DeviceLoginState::Failed, Some(error))
+            match poll_device_code(&issuer, &device) {
+                Ok(DevicePoll::Pending) => {}
+                Ok(DevicePoll::Approved(code)) => {
+                    let linked =
+                        exchange_authorization_code(&issuer, &code).and_then(|credential| {
+                            if cancelled.load(Ordering::SeqCst) {
+                                return Err("Codex device login was cancelled".to_owned());
+                            }
+                            store_credential_in(
+                                &wb,
+                                &scope,
+                                &credential,
+                                BTreeSet::from([ModelExecutionClass::PrivateHome]),
+                            )
+                        });
+                    match linked {
+                        Ok(()) => settle_device_login(&login_id, DeviceLoginState::Linked, None),
+                        Err(error) => {
+                            settle_device_login(&login_id, DeviceLoginState::Failed, Some(error))
+                        }
                     }
+                    return;
                 }
-            } else {
-                let cancelled = device_logins()
-                    .lock()
-                    .ok()
-                    .and_then(|logins| logins.get(&login_id).map(|login| login.state))
-                    == Some(DeviceLoginState::Cancelling);
-                let error = params
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                set_device_login_state(
-                    &login_id,
-                    if cancelled {
-                        DeviceLoginState::Cancelled
-                    } else {
-                        DeviceLoginState::Failed
-                    },
-                    error,
-                );
+                Err(error) => {
+                    settle_device_login(&login_id, DeviceLoginState::Failed, Some(error));
+                    return;
+                }
             }
-            completed = true;
-            break;
+            if std::time::Instant::now() + device.interval >= deadline {
+                settle_device_login(
+                    &login_id,
+                    DeviceLoginState::Failed,
+                    Some("Codex device code expired before it was approved".to_owned()),
+                );
+                return;
+            }
+            std::thread::sleep(device.interval);
         }
-        if !completed {
-            let cancelling = device_logins()
-                .lock()
-                .ok()
-                .and_then(|logins| logins.get(&login_id).map(|login| login.state))
-                == Some(DeviceLoginState::Cancelling);
-            set_device_login_state(
-                &login_id,
-                if cancelling {
-                    DeviceLoginState::Cancelled
-                } else {
-                    DeviceLoginState::Failed
-                },
-                if cancelling {
-                    None
-                } else {
-                    Some("Codex app-server stopped before login completed".to_owned())
-                },
-            );
-        }
-        let _ = child.kill();
-        let _ = child.wait();
     });
     Ok(projection)
 }
@@ -616,40 +586,17 @@ pub async fn start_home_login_for_scope(
     wb: SharedWorkbench,
     scope: String,
 ) -> Result<Value, String> {
-    tokio::task::spawn_blocking(move || start_device_login_blocking(wb, scope))
+    tokio::task::spawn_blocking(move || start_device_login_blocking(wb, scope, issuer()))
         .await
         .map_err(|_| "Codex device-login task panicked".to_owned())?
 }
 
-pub fn cancel_home_login_for_scope(scope: &str) -> Result<(), String> {
-    let Some(login) = device_login_for_scope(scope).filter(DeviceLogin::active) else {
-        return Ok(());
-    };
-    set_device_login_state(&login.login_id, DeviceLoginState::Cancelling, None);
-    let sent = login
-        .stdin
-        .as_ref()
-        .and_then(|stdin| stdin.lock().ok())
-        .map(|mut stdin| {
-            write_rpc(
-                &mut stdin,
-                json!({
-                    "method": "account/login/cancel",
-                    "id": 3,
-                    "params": { "loginId": login.login_id }
-                }),
-            )
-        });
-    match sent {
-        Some(Ok(())) => Ok(()),
-        _ => {
-            set_device_login_state(
-                &login.login_id,
-                DeviceLoginState::Failed,
-                Some("could not cancel Codex device login".to_owned()),
-            );
-            Err("could not cancel Codex device login".into())
-        }
+/// End this scope's pending device login. Cancelling when nothing is pending
+/// is the state the caller asked for, not a failure.
+pub fn cancel_home_login_for_scope(scope: &str) {
+    if let Some(login) = device_login_for_scope(scope).filter(DeviceLogin::active) {
+        login.cancelled.store(true, Ordering::SeqCst);
+        settle_device_login(&login.login_id, DeviceLoginState::Cancelled, None);
     }
 }
 
@@ -673,10 +620,8 @@ pub async fn post_home_codex_login_cancel(
     let scope = wb
         .lock_unpoisoned()
         .credential_scope_for(net_http::bearer(&headers));
-    match cancel_home_login_for_scope(&scope) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
-    }
+    cancel_home_login_for_scope(&scope);
+    StatusCode::NO_CONTENT
 }
 
 /// The helper script rides inside the binary: spawning it must not depend on the
@@ -1048,16 +993,8 @@ pub fn resolve_runtime_credential_versioned_in(
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    fn executable(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(path, permissions).unwrap();
-    }
-
     /// Seed a login directly: these tests are about the lookup, not about
-    /// spawning a real Codex app-server.
+    /// the issuer.
     fn seed_login(scope: &str, login_id: &str, state: DeviceLoginState, started_at: i64) {
         device_logins().lock().unwrap().insert(
             login_id.to_owned(),
@@ -1068,7 +1005,7 @@ mod tests {
                 user_code: login_id.to_owned(),
                 state,
                 error: None,
-                stdin: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
                 started_at,
             },
         );
@@ -1188,58 +1125,41 @@ mod tests {
     }
 
     #[test]
-    fn codex_auth_file_is_imported_without_returning_secret_fields() {
-        let root = tempfile::tempdir().unwrap();
+    fn token_response_is_imported_without_returning_secret_fields() {
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(br#"{"exp":4102444800,"chatgpt_account_id":"acct-home"}"#);
         let access = format!("{header}.{claims}.signature");
-        std::fs::write(
-            root.path().join("auth.json"),
-            json!({
-                "auth_mode": "chatgpt",
-                "tokens": {
-                    "id_token": access,
-                    "access_token": access,
-                    "refresh_token": "refresh-home",
-                    "account_id": "acct-home"
-                }
-            })
-            .to_string(),
-        )
+        let credential = credential_from_tokens(&json!({
+            "id_token": access,
+            "access_token": access,
+            "refresh_token": "refresh-home",
+            "account_id": "acct-home"
+        }))
         .unwrap();
-        let credential = read_codex_auth(root.path()).unwrap();
         assert_eq!(credential.account_id, "acct-home");
         assert_eq!(credential.expires, 4_102_444_800_000);
         assert_eq!(credential.refresh, "refresh-home");
     }
 
-    // Exercises the JWT fallback, which every other test here skips by supplying
-    // `tokens.account_id`. The payload is the shape the issuer really mints: the
-    // account id sits inside the `https://api.openai.com/auth` claim object, so
-    // a reader that looks for a top-level `chatgpt_account_id` finds nothing.
+    // Exercises the JWT fallback. The payload is the shape the issuer really
+    // mints: the account id sits inside the `https://api.openai.com/auth` claim
+    // object, so a reader that looks for a top-level `chatgpt_account_id` finds
+    // nothing. The `oauth/token` reply carries no `account_id` of its own, so
+    // every real sign-in takes this path.
     #[test]
     fn account_id_falls_back_to_the_namespaced_access_token_claim() {
-        let root = tempfile::tempdir().unwrap();
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             br#"{"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-nested","chatgpt_plan_type":"pro"}}"#,
         );
         let access = format!("{header}.{claims}.signature");
-        std::fs::write(
-            root.path().join("auth.json"),
-            json!({
-                "auth_mode": "chatgpt",
-                "tokens": {
-                    "id_token": access,
-                    "access_token": access,
-                    "refresh_token": "refresh-nested"
-                }
-            })
-            .to_string(),
-        )
+        let credential = credential_from_tokens(&json!({
+            "id_token": access,
+            "access_token": access,
+            "refresh_token": "refresh-nested"
+        }))
         .unwrap();
-        let credential = read_codex_auth(root.path()).unwrap();
         assert_eq!(credential.account_id, "acct-nested");
     }
 
@@ -1322,67 +1242,183 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// A stand-in for OpenAI's issuer that answers the three device-login calls
+    /// the way the real one does: a string interval, 403 until the person has
+    /// approved, then an authorization code carrying the PKCE verifier the
+    /// issuer generated. It records the token-exchange form it was sent.
+    struct FakeIssuer {
+        url: String,
+        exchanged: Arc<Mutex<Option<String>>>,
+    }
+
+    fn fake_issuer(pending_polls: usize, access: String) -> FakeIssuer {
+        use axum::routing::post;
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let exchanged = Arc::new(Mutex::new(None));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::clone(&exchanged);
+        let router = axum::Router::new()
+            .route(
+                "/api/accounts/deviceauth/usercode",
+                post(|Json(body): Json<Value>| async move {
+                    assert_eq!(body, json!({ "client_id": CLIENT_ID }));
+                    Json(json!({
+                        "device_auth_id": "deviceauth_test",
+                        "user_code": "ABCD-1234",
+                        "interval": "1",
+                    }))
+                }),
+            )
+            .route(
+                "/api/accounts/deviceauth/token",
+                post(move |Json(body): Json<Value>| async move {
+                    assert_eq!(
+                        body,
+                        json!({ "device_auth_id": "deviceauth_test", "user_code": "ABCD-1234" })
+                    );
+                    if polls.fetch_add(1, Ordering::SeqCst) < pending_polls {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(
+                                json!({ "error": { "code": "deviceauth_authorization_pending" } }),
+                            ),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "authorization_code": "code-test",
+                            "code_challenge": "challenge-test",
+                            "code_verifier": "verifier-test",
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/oauth/token",
+                post(move |form: String| async move {
+                    *recorded.lock().unwrap() = Some(form);
+                    Json(json!({
+                        "id_token": access,
+                        "access_token": access,
+                        "refresh_token": "refresh-device",
+                    }))
+                }),
+            );
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    axum::serve(listener, router).await.unwrap();
+                });
+        });
+        FakeIssuer { url, exchanged }
+    }
+
+    fn wait_for_settled(scope: &str) -> Option<DeviceLoginState> {
+        // A test synchronization bound, not a product deadline: leave room for
+        // a loaded gate host to schedule the polling thread.
+        for _ in 0..1000 {
+            match device_login_for_scope(scope) {
+                Some(login) if !login.active() => return Some(login.state),
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        device_login_for_scope(scope).map(|login| login.state)
+    }
+
     #[test]
-    fn device_app_server_completion_seals_only_the_bound_home_person_scope() {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    fn device_login_completion_seals_only_the_bound_home_person_scope() {
         let root = tempfile::tempdir().unwrap();
         let workbench = crate::open_workbench(root.path()).unwrap();
         workbench.lock_unpoisoned().enable_hosted_home_mode();
         let scope = crate::account::account_scope("person:device-flow");
 
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
-        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"exp":4102444800,"chatgpt_account_id":"acct-device"}"#);
-        let access = format!("{header}.{claims}.signature");
-        let helper = root.path().join("fake-codex");
-        std::fs::write(
-            &helper,
-            format!(
-                r#"#!/bin/sh
-IFS= read -r initialize
-printf '%s\n' '{{"id":1,"result":{{}}}}'
-IFS= read -r initialized
-IFS= read -r start
-printf '%s\n' '{{"id":2,"result":{{"type":"chatgptDeviceCode","loginId":"login-device-test","verificationUrl":"https://auth.openai.com/codex/device","userCode":"ABCD-1234"}}}}'
-printf '%s' '{{"auth_mode":"chatgpt","tokens":{{"id_token":"{access}","access_token":"{access}","refresh_token":"refresh-device","account_id":"acct-device"}}}}' > "$CODEX_HOME/auth.json"
-printf '%s\n' '{{"method":"account/login/completed","params":{{"loginId":"login-device-test","success":true,"error":null}}}}'
-IFS= read -r done
-"#
-            ),
-        )
-        .unwrap();
-        executable(&helper);
-        std::env::set_var("GAUGEDESK_CODEX_BIN", &helper);
-        let projection = start_device_login_blocking(workbench.clone(), scope.clone()).unwrap();
-        std::env::remove_var("GAUGEDESK_CODEX_BIN");
-        assert_eq!(projection["user_code"], "ABCD-1234");
-
-        // Completion is observed from the helper reader thread. This is a test
-        // synchronization bound, not a product deadline, so leave enough room
-        // for a loaded gate host to schedule that thread.
-        for _ in 0..1000 {
-            if device_login_for_scope(&scope)
-                .is_some_and(|login| login.state == DeviceLoginState::Linked)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(
-            device_login_for_scope(&scope).map(|login| login.state),
-            Some(DeviceLoginState::Linked)
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            br#"{"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-device"}}"#,
         );
+        let access = format!("{header}.{claims}.signature");
+        // One unapproved poll first, so the 403-means-pending path is the one
+        // that reaches the approval.
+        let issuer = fake_issuer(1, access.clone());
+
+        let projection =
+            start_device_login_blocking(workbench.clone(), scope.clone(), issuer.url.clone())
+                .unwrap();
+        assert_eq!(projection["user_code"], "ABCD-1234");
+        assert_eq!(
+            projection["verification_url"],
+            format!("{}/codex/device", issuer.url)
+        );
+        assert_eq!(projection["status"], "pending");
+        assert_eq!(wait_for_settled(&scope), Some(DeviceLoginState::Linked));
+
+        let form = issuer.exchanged.lock().unwrap().clone().unwrap();
+        let fields: BTreeMap<String, String> = url::form_urlencoded::parse(form.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(fields["grant_type"], "authorization_code");
+        assert_eq!(fields["code"], "code-test");
+        assert_eq!(fields["code_verifier"], "verifier-test");
+        assert_eq!(fields["client_id"], CLIENT_ID);
+        assert_eq!(
+            fields["redirect_uri"],
+            format!("{}/deviceauth/callback", issuer.url)
+        );
+
         let records = credentials_in_scope(workbench.lock_unpoisoned().store_ref(), &scope);
         let record = records.get(PROVIDER).unwrap();
         assert!(record.admits(ModelExecutionClass::PrivateHome));
         assert!(!record.admits(ModelExecutionClass::PublicDeployment));
+        let (credential, _) =
+            load_credential_in(&workbench, &scope, ModelExecutionClass::PrivateHome).unwrap();
+        assert_eq!(credential.account_id, "acct-device");
+        assert_eq!(credential.refresh, "refresh-device");
+        assert_eq!(credential.expires, 4_102_444_800_000);
         assert!(!credentials_in_scope(
             workbench.lock_unpoisoned().store_ref(),
             &crate::account::account_scope("person:someone-else")
         )
         .contains_key(PROVIDER));
+    }
+
+    /// A cancelled login settles at once and never links, even though the
+    /// polling thread only notices on its next wake.
+    #[test]
+    fn a_cancelled_device_login_never_links() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        workbench.lock_unpoisoned().enable_hosted_home_mode();
+        let scope = crate::account::account_scope("person:device-cancel");
+        let issuer = fake_issuer(usize::MAX, String::new());
+
+        start_device_login_blocking(workbench.clone(), scope.clone(), issuer.url.clone()).unwrap();
+        cancel_home_login_for_scope(&scope);
+        assert_eq!(
+            device_login_for_scope(&scope).map(|login| login.state),
+            Some(DeviceLoginState::Cancelled)
+        );
+        // Past the poll interval: the thread has woken, seen the flag, and left.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        assert_eq!(
+            device_login_for_scope(&scope).map(|login| login.state),
+            Some(DeviceLoginState::Cancelled)
+        );
+        assert!(issuer.exchanged.lock().unwrap().is_none());
+        assert!(
+            !credentials_in_scope(workbench.lock_unpoisoned().store_ref(), &scope)
+                .contains_key(PROVIDER)
+        );
+        // Cancelling nothing is the state the caller asked for.
+        cancel_home_login_for_scope(&scope);
     }
 
     /// The browser helper holds one fixed loopback port for as long as it waits,

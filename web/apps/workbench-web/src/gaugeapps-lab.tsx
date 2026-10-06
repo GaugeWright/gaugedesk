@@ -413,7 +413,8 @@ function fixtureWorkspace(scope: ScopeFixture, projectFixtures: readonly Project
         ];
         return {
             id, homeId: fixtureHomeId(`${scope.id}:${projectFixture.id}:home`), name: projectFixture.name,
-            isPersonal: projectFixture.isPersonal, networkIsolated: projectFixture.id === "security-operations",
+            isPersonal: projectFixture.isPersonal, organization: scope.kind === "organization" ? scope.id : null,
+            networkIsolated: projectFixture.id === "security-operations",
             targets: [target], placements,
         };
     });
@@ -449,6 +450,7 @@ function fixtureWorkspace(scope: ScopeFixture, projectFixtures: readonly Project
     return {
         archetypes, projects, recent, workstreams: [], workTargets: [...projectTargets, ...methodTargets],
         personalPlacement: projects.find((project) => project.isPersonal)?.placements.find((placement) => placement.isDefault)?.placementId ?? null,
+        homeOrganization: scope.kind === "organization" ? scope.id : null,
     };
 }
 
@@ -497,7 +499,7 @@ function fixtureFacetApi(readWorkspace: () => Workspace): FacetBrowserApi {
         archiveWorkstream: async () => undefined,
         createChatUnderArchetype: async () => generatedChat(),
         createChatUnderPlacement: async () => generatedChat(),
-        useArchetype: async () => generatedChat(),
+        previewAgent: async () => generatedChat(),
         createEngagement: async (): Promise<Engagement> => ({ id: generatedChat(), branch: "fixture", path: "/fixture" }),
         deleteChat: async () => undefined,
         organizeChat: async () => undefined,

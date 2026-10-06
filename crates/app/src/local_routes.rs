@@ -79,6 +79,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             post(crate::project_workflow_routes::launch),
         )
         .route(
+            "/projects/{project}/key-delegations",
+            get(crate::key_delegation::project_key_delegations),
+        )
+        .route(
             "/tutorials/{name}/start",
             post(crate::project_workflow_routes::start_shipped_tutorial),
         )
@@ -274,6 +278,18 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             put(lr::update_project).delete(lr::delete_project),
         )
         .route("/projects/{id}/home", get(lr::project_home))
+        .route(
+            "/projects/{id}/fork",
+            post(crate::project_fork::fork_project),
+        )
+        .route(
+            "/projects/{id}/upstream",
+            get(crate::project_fork::get_upstream),
+        )
+        .route(
+            "/projects/{id}/upstream/pull",
+            post(crate::project_fork::pull_upstream),
+        )
         .merge(crate::gaugeapp_host::routes())
         .route("/projects/{id}/whips", get(lr::project_whips))
         .route("/projects/{id}/whip-costs", get(lr::project_whip_costs))

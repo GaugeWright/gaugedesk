@@ -150,6 +150,16 @@ impl Workbench {
         limits: ProjectWorkflowLimits,
     ) -> Result<ProjectWorkflowInvocation, String> {
         let result = self.launch_project_workflow_admitted(context, request, limits);
+        if let Ok(invocation) = &result {
+            // The member who launched it hands the host the keys it declares
+            // (DR-0312). The record is never a gate: a step derives it again.
+            if let Err(error) = self.derive_workflow_delegation(
+                &invocation.product_scope,
+                crate::key_delegation::now_ms(),
+            ) {
+                tracing::warn!(%error, project = %request.project, "workflow delegation not recorded at launch");
+            }
+        }
         if result.is_ok() {
             self.hint_project_workflows(
                 result
@@ -161,7 +171,7 @@ impl Workbench {
         result
     }
 
-    fn launch_project_workflow_admitted(
+    pub(super) fn launch_project_workflow_admitted(
         &mut self,
         context: &AuthenticatedActionContext,
         request: &ProjectWorkflowLaunch,

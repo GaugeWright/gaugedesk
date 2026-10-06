@@ -38,10 +38,10 @@ use gaugedesk_app::org::{
     sha256_hex, ArchetypeApprovalPolicyRecord, BillingContactRecord, GroupMappingRecord,
     MemberGrantRecord, MembershipStatus, Org, OrganizationInvitationRecord,
     OrganizationInvitationStatus, OrganizationSessionRevocationRecord, PlacementPolicyRecord,
-    PolicyRecord, RecordOp, ScimSyncStatus, ScimTokenRecord, SecurityPolicyRecord,
-    SoftwarePolicyRecord, SsoAdmissionMode, SsoAdmissionRecord, SsoConnectionRecord,
-    SsoCredentialRecord, BILLING_CONTACT_KIND, ORGANIZATION_INVITATION_KIND, ORG_ID,
-    SSO_ADMISSION_KIND, SSO_CREDENTIAL_KIND,
+    PolicyRecord, ProjectSharing, ProjectSharingPolicyRecord, RecordOp, ScimSyncStatus,
+    ScimTokenRecord, SecurityPolicyRecord, SoftwarePolicyRecord, SsoAdmissionMode,
+    SsoAdmissionRecord, SsoConnectionRecord, SsoCredentialRecord, BILLING_CONTACT_KIND,
+    ORGANIZATION_INVITATION_KIND, ORG_ID, SSO_ADMISSION_KIND, SSO_CREDENTIAL_KIND,
 };
 use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 use gaugedesk_core::abac::Policy;
@@ -1521,6 +1521,7 @@ fn project_page(
             "security": org.security,
             "placement": org.effective_placement_policy(),
             "archetype_approval": { "require_approval": org.effective_require_archetype_approval() },
+            "project_sharing": org.effective_project_sharing(),
         }),
         // `organization-sessions.read-affected` is declared on this page, and
         // until now nothing served it: the model carried the four policy fields
@@ -2235,6 +2236,10 @@ struct PolicyPayload {
     security: SecurityPolicyRecord,
     placement: gaugedesk_core::boundary_lifecycle::PlacementPolicy,
     archetype_approval: ArchetypeApprovalPolicyRecord,
+    /// Absent from an editor that predates DR-0332, which then leaves the
+    /// organization's setting as it is.
+    #[serde(default)]
+    project_sharing: Option<ProjectSharing>,
 }
 
 /// The accepted Organization Policy page intentionally exposes only the fixed,
@@ -3566,19 +3571,30 @@ fn plan_command(
             let mut approval = value.archetype_approval;
             approval.id = ORG_ID.into();
             approval.op = RecordOp::Upsert;
+            let mut facts = vec![
+                fact(&scope, "policy", &resource)?,
+                fact(&scope, "security", &security)?,
+                fact(&scope, "placement_policy", &placement)?,
+                fact(&scope, "archetype_approval", &approval)?,
+            ];
+            let mut notices = vec![
+                ("policy", ORG_ID.into(), "upsert"),
+                ("security", ORG_ID.into(), "upsert"),
+                ("placement_policy", ORG_ID.into(), "upsert"),
+                ("archetype_approval", ORG_ID.into(), "upsert"),
+            ];
+            if let Some(sharing) = value.project_sharing {
+                let record = ProjectSharingPolicyRecord {
+                    id: ORG_ID.into(),
+                    op: RecordOp::Upsert,
+                    sharing,
+                };
+                facts.push(fact(&scope, "project_sharing", &record)?);
+                notices.push(("project_sharing", ORG_ID.into(), "upsert"));
+            }
             MutationPlan {
-                facts: vec![
-                    fact(&scope, "policy", &resource)?,
-                    fact(&scope, "security", &security)?,
-                    fact(&scope, "placement_policy", &placement)?,
-                    fact(&scope, "archetype_approval", &approval)?,
-                ],
-                notices: vec![
-                    ("policy", ORG_ID.into(), "upsert"),
-                    ("security", ORG_ID.into(), "upsert"),
-                    ("placement_policy", ORG_ID.into(), "upsert"),
-                    ("archetype_approval", ORG_ID.into(), "upsert"),
-                ],
+                facts,
+                notices,
                 audit_action: "organization-policy.set",
                 audit_target: ORG_ID.into(),
                 transient_result: None,

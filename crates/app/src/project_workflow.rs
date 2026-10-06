@@ -140,6 +140,46 @@ impl Workbench {
     }
 }
 
+/// What a retained launch declared, from its committed command: the work a
+/// background delegation is derived from (DR-0312).
+pub(crate) struct WorkflowDeclaration {
+    pub project: String,
+    pub launcher: String,
+    pub target: String,
+    pub path: String,
+    /// The project scopes whose keys the workflow uses. Its source and inputs
+    /// are retained in workflow storage, so that is the one content key it
+    /// names; its trackers and signed policy are not sealed content.
+    pub scopes: std::collections::BTreeSet<String>,
+}
+
+impl Workbench {
+    pub(crate) fn workflow_launch_declaration(
+        &self,
+        scope: &str,
+    ) -> Result<WorkflowDeclaration, String> {
+        let (project, launcher, _) =
+            launch_scope_parts(scope).ok_or("not a workflow launch scope")?;
+        let command = self
+            .store_ref()
+            .fold::<ProductActionAdmission>(scope)
+            .map_err(debug_error)?
+            .command
+            .ok_or("workflow authority has no retained launch")?;
+        if command.provenance.initiator != launcher {
+            return Err("workflow launch names another launcher".into());
+        }
+        let binding = launch::source_binding(&command)?;
+        Ok(WorkflowDeclaration {
+            scopes: std::iter::once(content_scope(&project).map_err(debug_error)?).collect(),
+            project,
+            launcher,
+            target: binding.target,
+            path: binding.path,
+        })
+    }
+}
+
 /// The launcher a launch scope was keyed to, or `None` if `scope` is not one.
 pub(crate) fn launch_scope_actor(scope: &str) -> Option<String> {
     launch_scope_parts(scope).map(|(_, actor, _)| actor)
