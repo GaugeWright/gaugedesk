@@ -130,6 +130,7 @@ impl Workbench {
             content: "",
         };
         let home = self.home_id().clone();
+        let owners = self.project_owner_resolver();
         let scope = command.instance_ref().map_err(|_| refused())?;
         let identity = ActionPolicyIdentity {
             issuer: command.issuer.clone(),
@@ -138,6 +139,13 @@ impl Workbench {
         };
         let policy_scope = identity.storage_scope()?;
         let roots = project_signature::NativeHistoryRoots::open(self)?;
+        let live_office = match context.authentication() {
+            ActorAuthentication::NativeEditorDispatchGrant { grant_ref } => {
+                dispatch_grant::live_office_source(self, command, grant_ref, &roots)
+                    .map_err(|error| format!("native dispatch source refused: {error:?}"))?
+            }
+            _ => None,
+        };
         let handoff_scope = crate::federation::handoff_scope(&project_id);
         let account_scopes = account_authority_scopes(context)?;
         let mut scopes = vec![
@@ -163,11 +171,21 @@ impl Workbench {
                 let result = match context.authentication() {
                     ActorAuthentication::NativeEditorDispatchGrant { grant_ref } => {
                         dispatch_grant::current_granted_authority(
-                            store, &home, context, grant_ref, command, &request, &roots,
+                            store,
+                            &home,
+                            &owners,
+                            dispatch_grant::GrantedAuthentication {
+                                context,
+                                live_office: live_office.as_ref(),
+                            },
+                            grant_ref,
+                            command,
+                            &request,
+                            &roots,
                         )
                         .map(|(authority, cause)| (authority, Some(cause)))
                     }
-                    _ => current_authority(store, &home, context, &request)
+                    _ => current_authority(store, &home, &owners, context, &request)
                         .map(|authority| (authority, None)),
                 }?;
                 access.require_available(store, &result.0.project_id)?;
@@ -185,7 +203,7 @@ impl Workbench {
         }
         let root = roots.original_root(self.store_ref(), command)?;
         let basis = authority
-            .bind_deadline(basis)
+            .bind_deadline(self.store_ref(), basis)
             .map_err(|error| format!("editor authority deadline refused: {error:?}"))?;
         let (key, basis) =
             self.native_project_signer_access(&authority.project_id, basis, access)?;
@@ -223,6 +241,9 @@ impl Workbench {
         {
             return Err(refused());
         }
+        let basis = authority
+            .bind_deadline(self.store_ref(), basis)
+            .map_err(|error| format!("editor authority deadline refused: {error:?}"))?;
         Ok(NativeEditorPreparation {
             scope,
             chat_id,

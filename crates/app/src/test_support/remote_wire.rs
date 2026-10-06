@@ -123,6 +123,8 @@ impl From<&WireTurnOutcome> for TurnOutcome {
             // people, not ours (ADR 0113).
             asked_questions: Vec::new(),
             runtime_evidence_pointers: w.runtime_evidence_pointers.clone(),
+            // This test wire carries no owner-certified native workspace cut.
+            runtime_workspace_witness: None,
             output_flow_signature: Vec::new(),
             // The wire protocol predates DR-0036; a remote peer certifies no
             // guarantees here — consumers fall back to local truth.
@@ -230,6 +232,7 @@ mod tests {
             pending_approvals: vec!["fs:read (id-7)".into()],
             asked_questions: Vec::new(),
             runtime_evidence_pointers: vec!["{\"pointer_kind\":\"event\"}".into()],
+            runtime_workspace_witness: None,
             output_flow_signature: Vec::new(),
             guarantee_outcomes: Vec::new(),
             runtime_start_position: None,

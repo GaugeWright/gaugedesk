@@ -34,6 +34,10 @@ pub enum ActorAuthentication {
         session_ref: String,
     },
     IdentityProvider,
+    /// Exact, live office lease and Home admission; never a stored login session.
+    OfficeStaff {
+        authority: crate::office_home_admission::lease::OfficeStaffActionAuthority,
+    },
     /// Retained authority for one already-admitted command, never a request
     /// credential or permission to construct new commands.
     NativeEditorDispatchGrant {
@@ -110,6 +114,16 @@ impl AuthenticatedActionContext {
         }
     }
 
+    pub(crate) fn office_staff(
+        authority: crate::office_home_admission::lease::OfficeStaffActionAuthority,
+    ) -> Self {
+        Self {
+            actor: authority.actor().clone(),
+            authentication: ActorAuthentication::OfficeStaff { authority },
+            claims: AuthorityAttributes::default(),
+        }
+    }
+
     /// Unattended authority for one retained launch (DR-0191). Constructed
     /// only by the Home from a committed launch command, never from a request.
     pub(crate) fn project_workflow_invocation(actor: AuthorityId, scope: String) -> Self {
@@ -131,6 +145,41 @@ impl AuthenticatedActionContext {
             claims: AuthorityAttributes::default(),
         }
     }
+}
+
+// Session authority spans the legacy/custody catalog and the actor's current
+// authentication and device/refresh scopes. Every explicit dispatch snapshot
+// must fence all of them, including when a retained grant reconstructs its source.
+pub(crate) fn account_authority_scopes(
+    context: &AuthenticatedActionContext,
+) -> Result<[String; 2], String> {
+    let actor = context.actor().as_str();
+    Ok([
+        crate::account::account_scope(actor),
+        crate::account_auth_custody::account_auth_scope(actor)
+            .map_err(|error| format!("account authority scope refused: {error:?}"))?,
+    ])
+}
+
+/// Durable premises consulted by workflow and tracker authentication. Retained
+/// invocation authority also reads its exact launch; it never borrows a session.
+pub(crate) fn workflow_authority_scopes(
+    context: &AuthenticatedActionContext,
+) -> Result<Vec<String>, String> {
+    let mut scopes = vec![
+        crate::account_auth::ACCOUNT_AUTH_SCOPE.into(),
+        crate::mobile_machine_session::SCOPE.into(),
+    ];
+    if matches!(
+        context.authentication(),
+        ActorAuthentication::AccountSession { .. }
+    ) {
+        scopes.extend(account_authority_scopes(context)?);
+    }
+    if let ActorAuthentication::ProjectWorkflowInvocation { scope } = context.authentication() {
+        scopes.push(scope.clone());
+    }
+    Ok(scopes)
 }
 
 /// Revalidate the authentication source inside a caller's product read basis.
@@ -166,6 +215,16 @@ pub(crate) fn revalidate_action_context(
                     "controller action grant has the wrong Home or device",
                 ));
             }
+        }
+        ActorAuthentication::OfficeStaff { authority } => {
+            valid_until_ms = Some(authority.revalidate(store, home, context.actor()).map_err(
+                |error| match error {
+                    crate::office_home_admission::lease::LeaseError::Storage(error) => error,
+                    crate::office_home_admission::lease::LeaseError::Refused => {
+                        invalid("office action lease or Home admission is not active")
+                    }
+                },
+            )?);
         }
         ActorAuthentication::IdentityProvider => {}
         ActorAuthentication::LocalPersonalTracker

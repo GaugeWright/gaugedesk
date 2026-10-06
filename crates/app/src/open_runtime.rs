@@ -2,9 +2,11 @@
 
 use crate::{federation, open_control_plane, open_workbench, LockUnpoisoned};
 
-/// The window's loopback port is an operator channel for local work, but an
-/// account selected in that window cannot inherit the co-resident Home owner's
-/// operator authority. The relay uses its own listener and its own admission.
+/// The window's loopback port. Every request on it acts as one account: the
+/// selected account's session, or the computer's local account when signed
+/// out, each reaching only the projects it owns or was granted
+/// (DR-0268, DR-0328). No account owns the computer, so no selection is
+/// refused here. The relay uses its own listener and its own admission.
 /// The desktop serves this behind [`crate::local_operator::guard`], so only its
 /// own window, holding the per-launch secret, reaches it at all (DR-0269).
 pub(crate) fn desktop_operator_plane(wb: crate::SharedWorkbench) -> axum::Router {
@@ -21,46 +23,6 @@ pub(crate) fn desktop_operator_plane(wb: crate::SharedWorkbench) -> axum::Router
         ))
         .merge(home_broker)
         .layer(axum::Extension(crate::account_signin::DesktopOperatorPlane))
-        .layer(axum::middleware::from_fn_with_state(
-            wb,
-            selected_account_guard,
-        ))
-}
-
-async fn selected_account_guard(
-    axum::extract::State(wb): axum::extract::State<crate::SharedWorkbench>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let path = request.uri().path();
-    // Sign-in and the hosted Account Settings proxy use only the selected
-    // account's sealed Hub session. No Home data or local credential is served
-    // through these exact surfaces.
-    if request.method() == axum::http::Method::OPTIONS
-        || path == "/health"
-        || path.starts_with("/account/hub-session")
-        || path.starts_with("/gaugeapps/account-settings/")
-        || path.starts_with("/auth/")
-    {
-        return next.run(request).await;
-    }
-    let selected = crate::account_signin::live_hub_session_actor(&wb);
-    let owner = wb.lock_unpoisoned().home_owner_account();
-    if (selected.is_some() && selected != owner)
-        || (owner.is_some()
-            && selected.is_none()
-            && !crate::account_signin::local_operator_selected(&wb))
-    {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!({
-                "error": "the selected account has no admission to this local Home"
-            })),
-        )
-            .into_response();
-    }
-    next.run(request).await
 }
 
 /// Resolve the directory the open control plane roots its decision and workspace stores in.
@@ -903,9 +865,10 @@ mod reachability_tests {
         tasks.iter().for_each(|task| task.abort());
     }
 
-    /// Another account the Hub recognises is still not this Home's owner.
+    /// An account the Hub recognises but that is not signed in on this
+    /// computer is a stranger here (DR-0328 §6, DR-0302).
     #[tokio::test]
-    async fn another_account_over_the_relay_is_refused() {
+    async fn an_account_not_signed_in_here_is_refused_over_the_relay() {
         let (_relay, _root, client, tasks) = reachable_home().await;
         let (status, body) = carried(
             client,
@@ -915,7 +878,7 @@ mod reachability_tests {
         )
         .await;
         assert_eq!(status, 403, "{body}");
-        assert!(body.contains("belongs to another account"), "{body}");
+        assert!(body.contains("not signed in on this computer"), "{body}");
         tasks.iter().for_each(|task| task.abort());
     }
 }

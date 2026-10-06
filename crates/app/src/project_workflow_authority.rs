@@ -31,16 +31,12 @@ impl Workbench {
         request: &ProjectWorkflowLaunch,
     ) -> Result<LaunchAuthority, String> {
         let handoff = crate::federation::handoff_scope(&request.project);
+        let mut scopes = crate::identity::workflow_authority_scopes(context)?;
+        scopes.extend([LIBRARY_SCOPE.into(), ORG_SCOPE.into(), handoff]);
         let ((workspace, source, actor_attributes, org_policy, purpose, deadline), basis) = self
             .store_ref()
             .read_for_dispatch(
-                &[
-                    LIBRARY_SCOPE,
-                    ORG_SCOPE,
-                    crate::account_auth::ACCOUNT_AUTH_SCOPE,
-                    crate::mobile_machine_session::SCOPE,
-                    &handoff,
-                ],
+                &scopes.iter().map(String::as_str).collect::<Vec<_>>(),
                 |store: &Store| {
                     let deadline = crate::identity::revalidate_workflow_context(
                         store,
@@ -64,6 +60,9 @@ impl Workbench {
                         .work_targets
                         .get(&request.target)
                         .ok_or_else(|| denied("workflow source target is unavailable"))?;
+                    let owners = self.project_owner_resolver();
+                    let members =
+                        owners.members_in(&library, &owners.legacy_owner(store), project, &org);
                     if &project.home_id != self.home_id()
                         || workspace.home_id != project.home_id
                         || workspace.workspace_id.is_empty()
@@ -74,7 +73,7 @@ impl Workbench {
                                 other.project_id != request.project
                                     && other.workspace_id == workspace.workspace_id
                             })
-                        || !org.can_access_project(context.actor().as_str(), &request.project)
+                        || !members.contains(context.actor().as_str())
                         || target.owner
                             != (WorkTargetOwner::Project {
                                 project_id: request.project.clone(),

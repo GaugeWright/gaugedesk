@@ -23,12 +23,13 @@ use gaugedesk_harness::sandbox::Network;
 use gaugedesk_harness::{
     ContextWindowReading, CredentialCapability, CredentialProbe, EgressGate, Harness,
     HarnessContinuitySpec, HarnessFactory, HarnessSpec, ImageContent, ModelContextHandle,
-    Observation, OutputFieldFlow, RuntimePosition, TargetRenamer, TaskFiler, ToolInfo, TurnOutcome,
+    Observation, OutputFieldFlow, RuntimePosition, RuntimeTurnPreparation, TargetRenamer,
+    TaskFiler, ToolInfo, TurnOutcome,
 };
 
 type TargetRenamerSlot = Arc<Mutex<Option<Arc<dyn TargetRenamer>>>>;
 pub use whipplescript::gov::{
-    external_signing_bytes, external_signing_bytes_v2, ExternalAttestation,
+    canonicalize, external_signing_bytes, external_signing_bytes_v2, ExternalAttestation,
     GovernanceAttestationVerifier, SignedEnvelope,
 };
 pub use whipplescript::host_policy::{
@@ -45,9 +46,9 @@ pub use whipplescript::host_runtime::{
     native_workspace_tool_specs, native_workspace_tool_specs_with_capabilities,
     native_workspace_tool_specs_with_command, AuthoredAgentPackage, CertifiedOutputFieldFlow,
     GovernedHostRuntime, HostCancellationHandle, HostRuntimeError, LabeledTurnOutput,
-    ModelProvider, NativeWorkspaceResolver, PackageResolver, ProjectedToolCall, ResolvedImage,
-    ResolvedPackage, ResolvedProviderBinding, ResourceResolver, SecretResolver, ToolCall,
-    TurnContentSegment, TurnExecution,
+    ModelProvider, NativeWorkspaceResolver, PackageResolver, ProjectedToolCall,
+    RecordedWorkspaceWitness, ResolvedImage, ResolvedPackage, ResolvedProviderBinding,
+    ResourceResolver, SecretResolver, ToolCall, TurnContentSegment, TurnExecution, TurnWitness,
 };
 /// WhippleScript's information-flow surface, re-exported so a host can parse and
 /// check the governance envelopes it ships rather than trusting their text.
@@ -1441,6 +1442,14 @@ impl WhipHarnessFactory {
         self
     }
 
+    /// Bind the public root selected by the product's verified policy epoch.
+    /// This preserves the actor and execution transport. Callers must resolve
+    /// the root independently of any incoming envelope's key declaration.
+    pub fn with_policy_root(mut self, root: GovernanceRootVerifier) -> Self {
+        self.policy_root = root;
+        self
+    }
+
     /// Route WhippleScript-built provider requests through one exact
     /// organization final-fetch authority for this turn factory. Hosted DO
     /// placements have their own Home callback and therefore reject this
@@ -1468,12 +1477,8 @@ impl WhipHarnessFactory {
     ) -> io::Result<GovernedHostRuntime> {
         // The original policy issuer is independent of the actor/transport
         // identity. Verify the complete pinned root before touching its store.
-        AdmittedPolicyEpoch::verify_with(
-            PolicyEpoch::new(epoch).map_err(invalid_data)?,
-            signed_policy,
-            &self.policy_root,
-        )
-        .map_err(invalid_data)?;
+        self.verify_policy(epoch, signed_policy)
+            .map_err(invalid_data)?;
         std::fs::create_dir_all(&self.runtime_root)?;
         GovernedHostRuntime::open_with_verifier(
             chat_runtime_database(&self.runtime_root, chat_id),
@@ -1482,6 +1487,16 @@ impl WhipHarnessFactory {
             &self.policy_root,
         )
         .map_err(invalid_data)
+    }
+
+    /// Verify original policy meaning under this factory's independently
+    /// selected public root. This grants no execution or current membership.
+    pub fn verify_policy(
+        &self,
+        epoch: u64,
+        signed_policy: &str,
+    ) -> Result<AdmittedPolicyEpoch, PolicyAdmissionError> {
+        AdmittedPolicyEpoch::verify_with(PolicyEpoch::new(epoch)?, signed_policy, &self.policy_root)
     }
 
     fn refresh_agent_skill_catalogue(&self, chat_id: &str, worktree: &Path) -> io::Result<()> {
@@ -1862,11 +1877,14 @@ impl WhipHarnessFactory {
             user_context_sources: Some(Vec::new()),
             turn_sequence: 0,
             next_command_id: None,
+            prepared_runtime: None,
             task_filer: None,
             target_renamer,
             worktree: spec.worktree.clone(),
             sandbox_read_only,
             external_tool_handler: None,
+            turn_access: None,
+            payload_retention: None,
             cancellation: Arc::new(Mutex::new(None)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             pursuing_cancel: Arc::new(AtomicBool::new(false)),
@@ -1893,6 +1911,111 @@ impl HarnessFactory for WhipHarnessFactory {
             .map(|harness| Box::new(harness) as Box<dyn Harness>)
     }
 
+    fn recorded_policy_epoch(&self, preparation: &RuntimeTurnPreparation) -> io::Result<u64> {
+        let command: StartTurnCommand =
+            serde_json::from_str(&preparation.command_json).map_err(invalid_data)?;
+        command.validate().map_err(invalid_data)?;
+        Ok(command.policy.epoch)
+    }
+
+    fn observe_recorded_runtime(
+        &self,
+        spec: &gaugedesk_harness::RecordedRuntimeSpec<'_>,
+    ) -> io::Result<TurnOutcome> {
+        if self.hosted.is_some() {
+            return Err(invalid_data(
+                "original runtime observation requires a native Home",
+            ));
+        }
+        let access = RecordedResources {
+            access: spec.access,
+        };
+        access.check_live_access().map_err(invalid_data)?;
+        let command: StartTurnCommand =
+            serde_json::from_str(&spec.preparation.command_json).map_err(invalid_data)?;
+        command.validate().map_err(invalid_data)?;
+        if command.command_id != spec.command_id
+            || command.policy.epoch != spec.policy_epoch
+            || command.instance_ref != spec.preparation.start_position.instance_ref
+            || spec.preparation.input_digest
+                != gaugedesk_harness::runtime_input_digest(&command.input.text, spec.images)
+        {
+            return Err(invalid_data("original runtime preparation changed"));
+        }
+        let runtime = whipplescript::host_runtime::RecordedHostRuntime::open_with_verifier(
+            chat_runtime_database(&self.runtime_root, spec.chat_id),
+            spec.policy_epoch,
+            spec.signed_policy_envelope,
+            &self.policy_root,
+            &access,
+        )
+        .map_err(turn_failure)?;
+        let start = whipplescript::host_protocol::PinnedPosition {
+            instance_ref: spec.preparation.start_position.instance_ref.clone(),
+            sequence: spec.preparation.start_position.sequence,
+            head_digest: spec.preparation.start_head_digest.clone(),
+        };
+        let execution = runtime
+            .recorded_turn_execution(&command, &start, &access)
+            .map_err(turn_failure)?
+            .ok_or_else(|| invalid_data("original saved runtime execution unavailable"))?;
+        let recorded = runtime
+            .turn_workspace_witness(&command, &start, &access)
+            .map_err(turn_failure)?
+            .ok_or_else(|| invalid_data("original saved runtime workspace witness unavailable"))?;
+        if execution.receipt.as_ref() != Some(&recorded.receipt) {
+            return Err(invalid_data("original runtime workspace receipt changed"));
+        }
+        let report = runtime
+            .turn_guarantee_report(&command, &start, &access)
+            .map_err(turn_failure)?
+            .ok_or_else(|| invalid_data("original saved runtime guarantee report unavailable"))?;
+        let context_tokens = execution
+            .usage
+            .as_ref()
+            .map(|usage| usage.last_input_tokens)
+            .filter(|tokens| *tokens > 0);
+        let original_envelope = VerifiedEnvelope::verify_signed_text_with(
+            spec.signed_policy_envelope,
+            &self.policy_root,
+        )
+        .map_err(invalid_data)?;
+        let binding = original_envelope
+            .resolve_provider_binding(
+                &command.provider_binding.binding_id,
+                &command.provider_binding.credential.credential_id,
+                &command.placement_ceiling_ref,
+            )
+            .ok_or_else(|| invalid_data("original runtime provider binding unavailable"))?;
+        let context_reading = context_tokens.map(|last_input_tokens| ContextWindowReading {
+            provider: binding.provider.clone(),
+            model: binding.model.clone(),
+            last_input_tokens,
+        });
+        let pointers = execution.evidence_pointers();
+        let mut outcome =
+            project_turn_execution(execution, pointers, &command, &mut |_| {}, false)?;
+        outcome.context_reading = context_reading;
+        outcome.runtime_start_position = Some(spec.preparation.start_position.clone());
+        outcome.runtime_workspace_witness = Some(gaugedesk_harness::RuntimeWorkspaceWitness {
+            receipt_json: serde_json::to_string(&recorded.receipt).map_err(invalid_data)?,
+            writes: recorded
+                .writes
+                .into_iter()
+                .map(|write| gaugedesk_harness::WorkspaceWriteWitness {
+                    path: write.path,
+                    kind: write.kind,
+                    content_hash: write.content_hash,
+                    bytes: write.bytes,
+                })
+                .collect(),
+            reads: recorded.reads,
+        });
+        outcome.guarantee_outcomes = gaugedesk_harness::GuaranteeOutcome::from_report(&report);
+        access.check_live_access().map_err(invalid_data)?;
+        Ok(outcome)
+    }
+
     fn reuse_across_turns(&self) -> bool {
         // The final-fetch path binds current actor session, organization,
         // project selection and broker admission. Reopen the persistent
@@ -1914,7 +2037,7 @@ impl HarnessFactory for WhipHarnessFactory {
         target: &HarnessContinuitySpec,
     ) -> io::Result<()> {
         if let Some(config) = &self.hosted {
-            return hosted::clone_continuity(config, source, target);
+            return hosted::clone_continuity(self, config, source, target);
         }
         if source.policy_epoch.is_none() && source.signed_policy_envelope.is_none() {
             return Ok(());
@@ -2008,7 +2131,7 @@ impl HarnessFactory for WhipHarnessFactory {
 
     fn discard_continuity(&self, target: &HarnessContinuitySpec) -> io::Result<()> {
         if let Some(config) = &self.hosted {
-            return hosted::discard_continuity(config, target);
+            return hosted::discard_continuity(self, config, target);
         }
         let database = self
             .runtime_root
@@ -2069,6 +2192,7 @@ struct WhipHarness {
     user_context_sources: Option<Vec<String>>,
     turn_sequence: u64,
     next_command_id: Option<String>,
+    prepared_runtime: Option<RuntimeTurnPreparation>,
     task_filer: Option<Arc<dyn TaskFiler>>,
     /// The Home's recorder of target-folder renames for the running turn
     /// (DR-0248). Shared with the workspace resolver's rename admission,
@@ -2079,6 +2203,8 @@ struct WhipHarness {
     worktree: PathBuf,
     sandbox_read_only: Vec<PathBuf>,
     external_tool_handler: Option<gaugedesk_harness::ExternalToolHandler>,
+    turn_access: Option<Arc<dyn gaugedesk_harness::TurnAccess>>,
+    payload_retention: Option<Arc<dyn gaugedesk_harness::WorkspacePayloadRetention>>,
     cancellation: Arc<Mutex<Option<HostCancellationHandle>>>,
     /// That a cancellation has been asked for, held separately from the handle
     /// that performs it. The handle exists only from `install_cancellation` to
@@ -2219,6 +2345,51 @@ impl Harness for WhipHarness {
         self.next_command_id = command_id.map(str::to_owned);
     }
 
+    fn prepare_runtime_turn(
+        &mut self,
+        prompt: &str,
+        images: &[ImageContent],
+    ) -> io::Result<RuntimeTurnPreparation> {
+        let access = CurrentTurnAccess {
+            inner: self.turn_access.clone(),
+            ended: AtomicBool::new(false),
+        };
+        access.current()?;
+        let command_id = self.next_command_id.clone().ok_or_else(|| {
+            invalid_data("runtime preparation requires the original admitted command")
+        })?;
+        let command = self.new_turn_command(prompt, images, 0, Some(command_id));
+        command.validate().map_err(invalid_data)?;
+        let command_json = serde_json::to_string(&command).map_err(invalid_data)?;
+        let prepared = if let Some(original) = &self.prepared_runtime {
+            if original.command_json != command_json
+                || original.workspace_targets != self.workspace_targets
+                || original.input_digest != gaugedesk_harness::runtime_input_digest(prompt, images)
+            {
+                return Err(invalid_data("prepared runtime intent changed"));
+            }
+            original.clone()
+        } else {
+            let start = self
+                .runtime
+                .pinned_position(&self.instance_ref)
+                .map_err(invalid_data)?;
+            RuntimeTurnPreparation {
+                input_digest: gaugedesk_harness::runtime_input_digest(prompt, images),
+                command_json,
+                start_position: RuntimePosition {
+                    instance_ref: start.instance_ref,
+                    sequence: start.sequence,
+                },
+                start_head_digest: start.head_digest,
+                workspace_targets: self.workspace_targets.clone(),
+            }
+        };
+        access.current()?;
+        self.prepared_runtime = Some(prepared.clone());
+        Ok(prepared)
+    }
+
     fn bind_user_context_provenance(&mut self, sources: Option<&[String]>) {
         self.user_context_sources = sources.map(|handles| handles.to_vec());
     }
@@ -2259,6 +2430,22 @@ impl Harness for WhipHarness {
         self.external_tool_handler = handler;
     }
 
+    fn bind_turn_access(
+        &mut self,
+        access: Option<Arc<dyn gaugedesk_harness::TurnAccess>>,
+    ) -> io::Result<()> {
+        self.turn_access = access;
+        Ok(())
+    }
+
+    fn bind_workspace_payload_retention(
+        &mut self,
+        retention: Option<Arc<dyn gaugedesk_harness::WorkspacePayloadRetention>>,
+    ) -> io::Result<()> {
+        self.payload_retention = retention;
+        Ok(())
+    }
+
     fn run_turn(
         &mut self,
         _legacy_gate: &dyn EgressGate,
@@ -2266,10 +2453,26 @@ impl Harness for WhipHarness {
         images: &[ImageContent],
         sink: &mut dyn FnMut(&Observation),
     ) -> io::Result<TurnOutcome> {
-        let runtime_start_position = self
-            .runtime
-            .current_position(&self.instance_ref)
-            .map_err(invalid_data)?;
+        // Consume once: a reused harness cannot borrow this person's check for
+        // another submission. The runtime latches refusal for this invocation.
+        let turn_access = CurrentTurnAccess {
+            inner: self.turn_access.take(),
+            ended: AtomicBool::new(false),
+        };
+        let retention = self.payload_retention.take();
+        turn_access.current()?;
+        if turn_access.inner.is_some() && retention.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "office workspace payload retention unavailable",
+            ));
+        }
+        // Callback custody is limited to this invocation. Target rebinding and
+        // harness reuse cannot retain a prior person's callback or witness.
+        let retained_workspace = self.workspace_with_retention(retention)?;
+        let mut guarded_sink = |observation: &Observation| {
+            turn_access.observe(observation, sink);
+        };
         self.turn_sequence += 1;
         let admitted_command_id = self.next_command_id.take();
         let nonce = SystemTime::now()
@@ -2277,17 +2480,35 @@ impl Harness for WhipHarness {
             .unwrap_or_default()
             .as_nanos();
         let command = self.new_turn_command(prompt, images, nonce, admitted_command_id);
+        let runtime_start_position = if let Some(prepared) = self.prepared_runtime.take() {
+            let original: StartTurnCommand =
+                serde_json::from_str(&prepared.command_json).map_err(invalid_data)?;
+            if original != command
+                || prepared.workspace_targets != self.workspace_targets
+                || prepared.input_digest != gaugedesk_harness::runtime_input_digest(prompt, images)
+            {
+                return Err(invalid_data("prepared runtime intent changed"));
+            }
+            EventPosition {
+                instance_ref: prepared.start_position.instance_ref,
+                sequence: prepared.start_position.sequence,
+            }
+        } else {
+            self.runtime
+                .current_position(&self.instance_ref)
+                .map_err(invalid_data)?
+        };
         let resources = TurnResources {
-            workspace: &self.workspace,
+            workspace: retained_workspace.as_ref().unwrap_or(&self.workspace),
             workspace_resources: &command.resources,
             chat_id: &self.chat_id,
             mode: self.mode,
             images,
             task_filer: self.task_filer.as_deref(),
-            asked: std::cell::RefCell::new(Vec::new()),
             external_tool_handler: self.external_tool_handler.as_ref(),
+            access: Some(&turn_access),
             command_id: command.command_id.clone(),
-            live: std::cell::RefCell::new(sink),
+            live: std::cell::RefCell::new(&mut guarded_sink),
             streamed: std::cell::Cell::new(false),
         };
         // ADR 0111: a question settles the turn. There is no suspended epoch to
@@ -2350,7 +2571,14 @@ impl Harness for WhipHarness {
         .map_err(turn_failure);
         self.clear_cancellation();
         let execution = execution?;
+        turn_access.current()?;
         let evidence_pointers = execution.evidence_pointers();
+        let workspace_witness = original_workspace_witness(
+            &self.runtime,
+            &command,
+            &resources,
+            execution.receipt.as_ref(),
+        )?;
         // The runtime's settled context reading (its own compaction-trigger
         // number), taken before the execution moves into the projection. The
         // provider/model ride along so the reading is measured against the
@@ -2364,6 +2592,7 @@ impl Harness for WhipHarness {
         let sink = resources.live.into_inner();
         let mut outcome =
             project_turn_execution(execution, evidence_pointers, &command, sink, !streamed)?;
+        outcome.runtime_workspace_witness = workspace_witness;
         if outcome.error.is_some() {
             if let Some(reason) = self
                 .runtime
@@ -2378,7 +2607,6 @@ impl Harness for WhipHarness {
             model: self.provider.model.clone(),
             last_input_tokens,
         });
-        outcome.asked_questions = resources.asked.into_inner();
         outcome.runtime_start_position = Some(RuntimePosition {
             instance_ref: runtime_start_position.instance_ref,
             sequence: runtime_start_position.sequence,
@@ -2402,6 +2630,7 @@ impl Harness for WhipHarness {
         if let Ok(Some(report)) = self.runtime.turn_guarantee_report(&command) {
             outcome.guarantee_outcomes = gaugedesk_harness::GuaranteeOutcome::from_report(&report);
         }
+        turn_access.current()?;
         Ok(outcome)
     }
 
@@ -2486,6 +2715,35 @@ fn registered_agent_skill_sources(
 }
 
 impl WhipHarness {
+    fn workspace_with_retention(
+        &self,
+        retention: Option<Arc<dyn gaugedesk_harness::WorkspacePayloadRetention>>,
+    ) -> io::Result<Option<NativeWorkspaceResolver>> {
+        retention
+            .map(|retention| {
+                workspace_resolver(
+                    &self.worktree,
+                    &self.sandbox_read_only,
+                    &self.workspace_targets,
+                    &self.target_renamer,
+                )
+                .map(|workspace| {
+                    workspace.with_payload_retention(move |file, body| {
+                        retention.retain(
+                            &gaugedesk_harness::PreparedWorkspaceFile {
+                                path: file.path.clone(),
+                                kind: file.kind.clone(),
+                                sha256: file.content_hash.clone(),
+                                bytes: file.bytes,
+                            },
+                            body,
+                        )
+                    })
+                })
+            })
+            .transpose()
+    }
+
     fn initial_model_provenance(
         &self,
         command: &StartTurnCommand,
@@ -2711,6 +2969,83 @@ fn current_cancellation(
         .clone()
 }
 
+/// Query the original native receipt/witness, never a later resolver drain or
+/// live worktree scan. The owner checks complete command identity and current
+/// product access before and after the read, including on retained replay.
+fn original_workspace_witness<R: ResourceResolver + ?Sized>(
+    runtime: &GovernedHostRuntime,
+    command: &StartTurnCommand,
+    resources: &R,
+    receipt: Option<&TurnReceipt>,
+) -> io::Result<Option<gaugedesk_harness::RuntimeWorkspaceWitness>> {
+    let Some(recorded) = runtime
+        .turn_workspace_witness(command, resources)
+        .map_err(turn_failure)?
+    else {
+        if receipt.is_some_and(|receipt| receipt.workspace_cut_ref.is_some()) {
+            return Err(invalid_data(
+                "original runtime workspace witness unavailable",
+            ));
+        }
+        return Ok(None);
+    };
+    if Some(&recorded.receipt) != receipt {
+        return Err(invalid_data("original runtime workspace receipt changed"));
+    }
+    Ok(Some(gaugedesk_harness::RuntimeWorkspaceWitness {
+        receipt_json: serde_json::to_string(&recorded.receipt).map_err(invalid_data)?,
+        writes: recorded
+            .writes
+            .into_iter()
+            .map(|write| gaugedesk_harness::WorkspaceWriteWitness {
+                path: write.path,
+                kind: write.kind,
+                content_hash: write.content_hash,
+                bytes: write.bytes,
+            })
+            .collect(),
+        reads: recorded.reads,
+    }))
+}
+
+fn original_asked_question(
+    arguments: &serde_json::Value,
+) -> io::Result<gaugedesk_harness::AskedQuestion> {
+    let question = arguments
+        .get("question")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if question.is_empty() {
+        return Err(invalid_data("`ask` requires a question"));
+    }
+    let choices = arguments
+        .get("choices")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let to = arguments
+        .get("to")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let blocking = arguments
+        .get("blocking")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    Ok(gaugedesk_harness::AskedQuestion {
+        question,
+        choices,
+        to,
+        blocking,
+    })
+}
+
 fn project_turn_execution(
     execution: TurnExecution,
     evidence_pointers: Vec<RuntimeEvidencePointer>,
@@ -2777,6 +3112,11 @@ fn project_turn_execution(
                     });
                 }
                 TurnContentSegment::Tool(call) => {
+                    if call.name == "ask" && call.ok == Some(true) {
+                        outcome
+                            .asked_questions
+                            .push(original_asked_question(&call.arguments)?);
+                    }
                     let target = tool_target(&call);
                     let observation = Observation {
                         kind: "tool_result",
@@ -3414,6 +3754,62 @@ impl SecretResolver for ProviderConfig {
     }
 }
 
+/// Keep refusal terminal across owner execution and GaugeDesk's later projection.
+struct CurrentTurnAccess {
+    inner: Option<Arc<dyn gaugedesk_harness::TurnAccess>>,
+    ended: AtomicBool,
+}
+
+impl gaugedesk_harness::TurnAccess for CurrentTurnAccess {
+    fn check_current(&self) -> Result<(), String> {
+        if self.ended.load(Ordering::Acquire)
+            || self
+                .inner
+                .as_ref()
+                .is_some_and(|access| access.check_current().is_err())
+        {
+            self.ended.store(true, Ordering::Release);
+            return Err("original turn access ended".into());
+        }
+        Ok(())
+    }
+}
+impl CurrentTurnAccess {
+    fn current(&self) -> io::Result<()> {
+        gaugedesk_harness::TurnAccess::check_current(self).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "original turn access ended",
+            )
+        })
+    }
+    fn observe(&self, observation: &Observation, sink: &mut dyn FnMut(&Observation)) {
+        if self.current().is_ok() {
+            sink(observation);
+            let _ = self.current();
+        }
+    }
+}
+
+/// Only current original authority is available to the recorded owner. Any
+/// accidental resource/effect request refuses rather than reaching a live tool.
+struct RecordedResources<'a> {
+    access: &'a dyn gaugedesk_harness::TurnAccess,
+}
+impl ResourceResolver for RecordedResources<'_> {
+    fn check_live_access(&self) -> Result<(), String> {
+        self.access
+            .check_current()
+            .map_err(|_| "original turn access ended".into())
+    }
+    fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
+        Err("saved runtime observation cannot resolve images".into())
+    }
+    fn execute_tool(&self, _: &[ResourceRef], _: &ToolCall) -> Result<String, String> {
+        Err("saved runtime observation cannot execute tools".into())
+    }
+}
+
 struct TurnResources<'a> {
     workspace: &'a NativeWorkspaceResolver,
     workspace_resources: &'a [ResourceRef],
@@ -3421,11 +3817,8 @@ struct TurnResources<'a> {
     mode: gaugedesk_harness::ChatMode,
     images: &'a [ImageContent],
     task_filer: Option<&'a dyn TaskFiler>,
-    /// Questions asked during this turn. Interior mutability because
-    /// `execute_tool` takes `&self`; the engine drains these once the turn
-    /// settles, since it holds the store across the run (ADR 0113).
-    asked: std::cell::RefCell<Vec<gaugedesk_harness::AskedQuestion>>,
     external_tool_handler: Option<&'a gaugedesk_harness::ExternalToolHandler>,
+    access: Option<&'a dyn gaugedesk_harness::TurnAccess>,
     command_id: String,
     /// The engine's observation sink, held for the duration of the blocking
     /// `run_turn` call so WhippleScript's `observe_text_delta` can project
@@ -3439,6 +3832,20 @@ struct TurnResources<'a> {
 }
 
 impl ResourceResolver for TurnResources<'_> {
+    fn take_turn_witness(&self) -> TurnWitness {
+        // Only the actual workspace resolver can witness effects. Incomplete
+        // owner evidence stays incomplete instead of becoming empty work.
+        self.workspace.take_turn_witness()
+    }
+
+    fn take_workspace_reads(&self) -> Vec<whipplescript_kernel::whip_shell::ShellRead> {
+        self.workspace.take_workspace_reads()
+    }
+
+    fn check_live_access(&self) -> Result<(), String> {
+        self.access.map_or(Ok(()), |access| access.check_current())
+    }
+
     fn model_visible_environment(&self) -> whipplescript_kernel::world_state::EnvironmentState {
         // The file tools use a virtual view: model paths begin at the target's
         // presented name, never at the host's materialized storage partition.
@@ -3656,44 +4063,7 @@ impl ResourceResolver for TurnResources<'_> {
             {
                 return Err("turn has no admitted question capability".to_owned());
             }
-            let arguments = &call.arguments;
-            // The tool's argument name, which coincides with the resource handle but
-            // is a different thing — do not fold them onto one constant.
-            let question = arguments
-                .get("question")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            if question.is_empty() {
-                return Err("`ask` requires a question".to_owned());
-            }
-            let choices = arguments
-                .get("choices")
-                .and_then(|value| value.as_array())
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str().map(str::to_owned))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let to = arguments
-                .get("to")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned);
-            let blocking = arguments
-                .get("blocking")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            self.asked
-                .borrow_mut()
-                .push(gaugedesk_harness::AskedQuestion {
-                    question,
-                    choices,
-                    to,
-                    blocking,
-                });
+            original_asked_question(&call.arguments).map_err(|error| error.to_string())?;
             // The answer arrives in a later turn (ADR 0111): the turn settles,
             // it does not park waiting for one.
             return Ok(serde_json::json!({
@@ -3910,6 +4280,15 @@ impl AdmittedPolicyEpoch {
     ) -> Result<Self, PolicyAdmissionError> {
         let envelope = VerifiedEnvelope::verify_signed_text_with(signed_envelope, verifier)
             .map_err(PolicyAdmissionError::EnvelopeRejected)?;
+        if envelope
+            .attestation()
+            .and_then(|attestation| attestation.epoch)
+            .is_some_and(|signed_epoch| signed_epoch != epoch.get())
+        {
+            return Err(PolicyAdmissionError::EnvelopeRejected(
+                "requested policy epoch differs from its signed binding".to_owned(),
+            ));
+        }
         let policy_ref = PolicyEpochRef::from_verified(epoch.get(), &envelope)
             .map_err(PolicyAdmissionError::Protocol)?;
         if policy_ref.signer != verifier.expected_signer().as_str() {
@@ -3984,6 +4363,49 @@ impl std::error::Error for PolicyAdmissionError {}
 #[cfg(test)]
 mod tests {
     #[test]
+    fn turn_observation_revocation_is_terminal_through_final_return() {
+        struct MutableAccess(Arc<AtomicBool>);
+        impl gaugedesk_harness::TurnAccess for MutableAccess {
+            fn check_current(&self) -> Result<(), String> {
+                if self.0.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err("private reason".into())
+                }
+            }
+        }
+        let standing = Arc::new(AtomicBool::new(true));
+        let access = CurrentTurnAccess {
+            inner: Some(Arc::new(MutableAccess(standing.clone()))),
+            ended: AtomicBool::new(false),
+        };
+        let observation = Observation {
+            kind: "text",
+            detail: "synthetic clinical output".into(),
+            tool: None,
+        };
+        let mut released = Vec::new();
+        access.observe(&observation, &mut |observation| {
+            released.push(observation.detail.clone());
+            standing.store(false, Ordering::Release);
+        });
+        assert_eq!(released.len(), 1); // an already delivered delta cannot be recalled
+        standing.store(true, Ordering::Release);
+        access.observe(&observation, &mut |observation| {
+            released.push(observation.detail.clone())
+        });
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            access.current().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            gaugedesk_harness::TurnAccess::check_current(&access).unwrap_err(),
+            "original turn access ended"
+        );
+    }
+
+    #[test]
     fn native_agent_skill_catalogue_tracks_the_mounted_version() {
         use super::*;
         let root = tempfile::tempdir().unwrap();
@@ -4040,8 +4462,8 @@ mod tests {
             mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
             task_filer: None,
-            asked: std::cell::RefCell::new(Vec::new()),
             external_tool_handler: None,
+            access: None,
             command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
@@ -4183,7 +4605,7 @@ mod tests {
             mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
             task_filer: None,
-            asked: std::cell::RefCell::new(Vec::new()),
+            access: None,
             external_tool_handler: None,
             command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
@@ -4265,8 +4687,8 @@ mod tests {
             mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
             task_filer: Some(&filer),
-            asked: std::cell::RefCell::new(Vec::new()),
             external_tool_handler: None,
+            access: None,
             command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
@@ -4355,6 +4777,108 @@ mod tests {
     }
 
     #[test]
+    fn native_turn_adapter_preserves_exact_writes_and_shell_read_sources() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("read.txt"), "synthetic source").unwrap();
+        std::fs::write(
+            root.path().join("unrelated.txt"),
+            "unrelated unimported work",
+        )
+        .unwrap();
+        let workspace = NativeWorkspaceResolver::new(root.path()).unwrap();
+        let mut sink = |_observation: &Observation| {};
+        let resources = TurnResources {
+            workspace: &workspace,
+            workspace_resources: &[],
+            chat_id: "test-chat",
+            mode: gaugedesk_harness::ChatMode::Use,
+            images: &[],
+            task_filer: None,
+            external_tool_handler: None,
+            access: None,
+            command_id: "original-command".into(),
+            live: std::cell::RefCell::new(&mut sink),
+            streamed: std::cell::Cell::new(false),
+        };
+        let admitted = [
+            ResourceRef {
+                handle: "project".into(),
+                kind: "file_store".into(),
+                selector: None,
+                writable: Some(true),
+                presented_as: None,
+            },
+            ResourceRef {
+                handle: "command".into(),
+                kind: "command".into(),
+                selector: None,
+                writable: None,
+                presented_as: None,
+            },
+        ];
+        resources
+            .execute_tool(
+                &admitted,
+                &ToolCall {
+                    id: "write".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({"path":"out.txt","content":"synthetic output"}),
+                },
+            )
+            .unwrap();
+        resources
+            .execute_tool(
+                &admitted,
+                &ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"read.txt"}),
+                },
+            )
+            .unwrap();
+        resources
+            .execute_tool(
+                &admitted,
+                &ToolCall {
+                    id: "shell".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command":"cat read.txt"}),
+                },
+            )
+            .unwrap();
+        let shell = resources.take_workspace_reads();
+        assert_eq!(shell.len(), 1);
+        assert_eq!(shell[0].path, "read.txt");
+        assert_eq!(
+            shell[0].content_hash,
+            whipplescript_store::stable_hash_bytes_hex(b"synthetic source")
+        );
+        assert_eq!(shell[0].bytes, 16);
+        assert!(resources.take_workspace_reads().is_empty());
+        let TurnWitness::Witnessed { writes, reads } = resources.take_turn_witness() else {
+            panic!("the real native resolver must publish a complete witness");
+        };
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].path, "out.txt");
+        assert_eq!(writes[0].kind, "add");
+        assert_eq!(
+            writes[0].content_hash,
+            hex::encode(Sha256::digest(b"synthetic output"))
+        );
+        assert_eq!(writes[0].bytes, 16);
+        assert!(reads.iter().any(|path| path == "read.txt"));
+        assert!(!reads.iter().any(|path| path.contains("unrelated")));
+        assert!(
+            matches!(resources.take_turn_witness(), TurnWitness::Witnessed { writes, reads } if writes.is_empty() && reads.is_empty())
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("unrelated.txt")).unwrap(),
+            b"unrelated unimported work"
+        );
+    }
+
+    #[test]
     fn native_read_and_search_use_exact_file_witnesses() {
         use whipplescript::host_runtime::{NativeWorkspaceResolver, ResourceResolver};
 
@@ -4372,8 +4896,8 @@ mod tests {
             mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
             task_filer: None,
-            asked: std::cell::RefCell::new(Vec::new()),
             external_tool_handler: None,
+            access: None,
             command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
@@ -4639,7 +5163,7 @@ mod tests {
             mode: gaugedesk_harness::ChatMode::Use,
             images: &[],
             task_filer: None,
-            asked: std::cell::RefCell::new(Vec::new()),
+            access: None,
             external_tool_handler: None,
             command_id: "first-turn".into(),
             live: std::cell::RefCell::new(&mut sink),
@@ -4751,8 +5275,8 @@ mod tests {
                 mode: gaugedesk_harness::ChatMode::Use,
                 images: &[],
                 task_filer: None,
-                asked: std::cell::RefCell::new(Vec::new()),
                 external_tool_handler: None,
+                access: None,
                 command_id: "test-turn".to_owned(),
                 live: std::cell::RefCell::new(&mut sink),
                 streamed: std::cell::Cell::new(false),
@@ -4863,6 +5387,7 @@ mod tests {
             &[],
         );
         let admitted = admit_organization_model_request(&openai, "gpt-5-mini", &request).unwrap();
+        // The pinned owner catalogue distinguishes input from completion limits.
         assert_eq!(admitted.token_bound, 272_000);
         assert_eq!(
             admitted.request_digest,
@@ -5349,7 +5874,7 @@ mod tests {
             .expect("signed harness policy")
     }
 
-    fn harness_policy_at(base_url: &str) -> String {
+    pub(super) fn harness_policy_at(base_url: &str) -> String {
         let principal = ResourcePolicy {
             principal: true,
             ..ResourcePolicy::default()
@@ -6109,7 +6634,7 @@ workflow Method {
         (origin, calls, server)
     }
 
-    fn continuity_spec(
+    pub(super) fn continuity_spec(
         worktree: &Path,
         origin: &str,
         mode: gaugedesk_harness::ChatMode,
@@ -6270,6 +6795,7 @@ workflow Method {
 
     #[test]
     fn whip_harness_reopens_the_same_instance_and_owns_workspace_tools() {
+        use std::sync::atomic::AtomicUsize;
         let root = tempfile::tempdir().expect("runtime root");
         let worktree = tempfile::tempdir().expect("worktree");
         let package_root = worktree.path().join(".whipple/versions/1");
@@ -6459,9 +6985,644 @@ workflow Method {
             .iter()
             .any(|tool| tool.name == "bash"));
         assert!(first.interrupt_handle().is_some());
+        // First check is the GaugeDesk turn-entry check; the owner must call
+        // the actual TurnResources hook next, before any provider resolution.
+        struct EndsAtOwner(std::sync::atomic::AtomicUsize);
+        impl gaugedesk_harness::TurnAccess for EndsAtOwner {
+            fn check_current(&self) -> Result<(), String> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err("private authority detail must not escape".into())
+                }
+            }
+        }
+        let access = Arc::new(EndsAtOwner(std::sync::atomic::AtomicUsize::new(0)));
+        struct RequiredPayloads;
+        impl gaugedesk_harness::WorkspacePayloadRetention for RequiredPayloads {
+            fn retain(
+                &self,
+                _: &gaugedesk_harness::PreparedWorkspaceFile,
+                _: &[u8],
+            ) -> Result<(), String> {
+                Err("synthetic custody fixture refuses mutation".into())
+            }
+        }
+        struct CurrentAccess;
+        impl gaugedesk_harness::TurnAccess for CurrentAccess {
+            fn check_current(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        first
+            .bind_turn_access(Some(Arc::new(CurrentAccess)))
+            .unwrap();
+        let missing_before = first.runtime.current_position(&first.instance_ref).unwrap();
+        let missing = first
+            .run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "synthetic clinical input",
+                &[],
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("office workspace payload retention unavailable"));
+        assert_eq!(
+            first.runtime.current_position(&first.instance_ref).unwrap(),
+            missing_before
+        );
+        first.bind_turn_access(Some(access.clone())).unwrap();
+        first
+            .bind_workspace_payload_retention(Some(Arc::new(RequiredPayloads)))
+            .unwrap();
+        let before = first.runtime.current_position(&first.instance_ref).unwrap();
+        let mut observations = Vec::new();
+        let refusal = first
+            .run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "synthetic clinical input",
+                &[],
+                &mut |observation| observations.push(observation.clone()),
+            )
+            .unwrap_err();
+        assert!(access.0.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(
+            refusal.to_string().contains("host turn access ended"),
+            "{refusal}"
+        );
+        assert!(!refusal.to_string().contains("private authority detail"));
+        assert!(observations.is_empty());
+        assert_eq!(
+            first.runtime.current_position(&first.instance_ref).unwrap(),
+            before
+        );
+        assert!(first.turn_access.is_none());
+        assert!(first.payload_retention.is_none());
+        first.bind_turn_access(Some(access)).unwrap();
+        first.bind_turn_access(None).unwrap();
+        assert!(first.turn_access.is_none());
+        // Run the actual product TurnResources through the owner runtime. The
+        // response script is local; no network or hosted model is involved.
+        use whipplescript_kernel::sansio::{HostDriver, IoRequest, IoResult};
+        struct WitnessDriver(std::cell::RefCell<std::collections::VecDeque<serde_json::Value>>);
+        impl HostDriver for WitnessDriver {
+            fn fulfill(&self, _request: &IoRequest) -> IoResult {
+                IoResult::Http(Ok(sansio_types::HttpResponse {
+                    status: 200,
+                    body: self.0.borrow_mut().pop_front().expect("scripted response"),
+                }))
+            }
+        }
+        let command = first.new_turn_command("write synthetic fixture", &[], 2, None);
+        assert!(first
+            .prepare_runtime_turn("write synthetic fixture", &[])
+            .is_err());
+        first.bind_runtime_command_id(Some(&command.command_id));
+        let image = ImageContent {
+            kind: gaugedesk_harness::ImageKind::Image,
+            data: "AA==".into(),
+            mime_type: "image/png".into(),
+        };
+        let mut changed_image = image.clone();
+        changed_image.data = "AQ==".into();
+        let before_images = first.runtime.pinned_position(&first.instance_ref).unwrap();
+        let image_prepared = first
+            .prepare_runtime_turn("write synthetic fixture", std::slice::from_ref(&image))
+            .unwrap();
+        let same_index_command = first.new_turn_command(
+            "write synthetic fixture",
+            std::slice::from_ref(&changed_image),
+            0,
+            Some(command.command_id.clone()),
+        );
+        assert_eq!(
+            serde_json::from_str::<StartTurnCommand>(&image_prepared.command_json).unwrap(),
+            same_index_command
+        );
+        assert!(first
+            .prepare_runtime_turn(
+                "write synthetic fixture",
+                std::slice::from_ref(&changed_image)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("prepared runtime intent changed"));
+        let mut changed_mime = image.clone();
+        changed_mime.mime_type = "image/jpeg".into();
+        assert!(first
+            .prepare_runtime_turn("write synthetic fixture", &[changed_mime])
+            .is_err());
+        assert_eq!(
+            first
+                .prepare_runtime_turn("write synthetic fixture", &[image])
+                .unwrap(),
+            image_prepared
+        );
+        let refusal = first
+            .run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "write synthetic fixture",
+                &[changed_image],
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("prepared runtime intent changed"),
+            "{refusal}"
+        );
+        assert_eq!(
+            first.runtime.pinned_position(&first.instance_ref).unwrap(),
+            before_images
+        );
+        assert!(first.prepared_runtime.is_none());
+        first.bind_runtime_command_id(Some(&command.command_id));
+        let original_start = first.runtime.pinned_position(&first.instance_ref).unwrap();
+        struct PreparationAccess {
+            calls: AtomicUsize,
+            deny_at: usize,
+        }
+        impl gaugedesk_harness::TurnAccess for PreparationAccess {
+            fn check_current(&self) -> Result<(), String> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) + 1 >= self.deny_at {
+                    Err("private preparation authority detail".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for deny_at in [1, 2] {
+            let access = Arc::new(PreparationAccess {
+                calls: AtomicUsize::new(0),
+                deny_at,
+            });
+            first.bind_turn_access(Some(access.clone())).unwrap();
+            let error = first
+                .prepare_runtime_turn("write synthetic fixture", &[])
+                .unwrap_err();
+            assert!(!error
+                .to_string()
+                .contains("private preparation authority detail"));
+            assert_eq!(access.calls.load(Ordering::SeqCst), deny_at);
+            assert!(first.prepared_runtime.is_none());
+            assert_eq!(
+                first.runtime.pinned_position(&first.instance_ref).unwrap(),
+                original_start
+            );
+        }
+        first.bind_turn_access(None).unwrap();
+        let prepared = first
+            .prepare_runtime_turn("write synthetic fixture", &[])
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<StartTurnCommand>(&prepared.command_json).unwrap(),
+            command
+        );
+        assert_eq!(
+            prepared.start_position.instance_ref,
+            original_start.instance_ref
+        );
+        assert_eq!(prepared.start_position.sequence, original_start.sequence);
+        assert_eq!(prepared.start_head_digest, original_start.head_digest);
+        assert!(!prepared.command_json.contains("test-key"));
+        assert_eq!(
+            first.runtime.pinned_position(&first.instance_ref).unwrap(),
+            original_start
+        );
+        assert_eq!(
+            first
+                .prepare_runtime_turn("write synthetic fixture", &[])
+                .unwrap(),
+            prepared
+        );
+        assert!(first
+            .prepare_runtime_turn("changed original task", &[])
+            .is_err());
+        let mut sink = |_observation: &Observation| {};
+        type CapturedPayloads =
+            Arc<Mutex<Vec<(gaugedesk_harness::PreparedWorkspaceFile, Vec<u8>)>>>;
+        #[derive(Clone)]
+        struct CapturePayloads(CapturedPayloads);
+        impl gaugedesk_harness::WorkspacePayloadRetention for CapturePayloads {
+            fn retain(
+                &self,
+                file: &gaugedesk_harness::PreparedWorkspaceFile,
+                body: &[u8],
+            ) -> Result<(), String> {
+                self.0.lock().unwrap().push((file.clone(), body.to_vec()));
+                Ok(())
+            }
+        }
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let retained_workspace = first
+            .workspace_with_retention(Some(Arc::new(CapturePayloads(captures.clone()))))
+            .unwrap()
+            .unwrap();
+        let resources = TurnResources {
+            workspace: &retained_workspace,
+            workspace_resources: &command.resources,
+            chat_id: &first.chat_id,
+            mode: first.mode,
+            images: &[],
+            task_filer: None,
+            external_tool_handler: None,
+            access: None,
+            command_id: command.command_id.clone(),
+            live: std::cell::RefCell::new(&mut sink),
+            streamed: std::cell::Cell::new(false),
+        };
+        let driver = WitnessDriver(std::cell::RefCell::new(std::collections::VecDeque::from([
+            serde_json::json!({ "output": [{ "type":"function_call", "call_id":"write-one", "name":"write", "arguments":"{\"path\":\"result.txt\",\"content\":\"synthetic result\"}" }], "usage":{"input_tokens":10,"output_tokens":2} }),
+            serde_json::json!({ "output_text":"wrote the fixture", "usage":{"input_tokens":12,"output_tokens":3} }),
+        ])));
+        let provenance = first.initial_model_provenance(&command, &[]);
+        let execution = first
+            .runtime
+            .run_turn_with_driver_and_provenance(
+                &command,
+                &first.package,
+                &first.provider,
+                &resources,
+                &driver,
+                &provenance,
+            )
+            .expect("native witnessed turn");
+        // Typed projection probe; these synthetic calls are never stored or executed.
+        let question_arguments = serde_json::json!({ "question": " Choose a path ",
+            "choices": ["first", 3, "second"], "to": "staff", "blocking": true });
+        let mut question_execution = execution.clone();
+        let question_call = ProjectedToolCall {
+            call_id: "synthetic-question".into(),
+            name: "ask".into(),
+            arguments: question_arguments.clone(),
+            result: Some("{\"asked\":true}".into()),
+            ok: Some(true),
+        };
+        question_execution.output.as_mut().unwrap().segments =
+            vec![TurnContentSegment::Tool(question_call.clone())];
+        let projected = project_turn_execution(
+            question_execution.clone(),
+            Vec::new(),
+            &command,
+            &mut |_| {},
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            projected.asked_questions,
+            vec![gaugedesk_harness::AskedQuestion {
+                question: "Choose a path".into(),
+                choices: vec!["first".into(), "second".into()],
+                to: Some("staff".into()),
+                blocking: true,
+            }]
+        );
+        for status in [Some(false), None] {
+            let mut failed = question_execution.clone();
+            let mut call = question_call.clone();
+            call.ok = status;
+            failed.output.as_mut().unwrap().segments = vec![TurnContentSegment::Tool(call)];
+            assert!(
+                project_turn_execution(failed, Vec::new(), &command, &mut |_| {}, false)
+                    .unwrap()
+                    .asked_questions
+                    .is_empty()
+            );
+        }
+        let mut invalid = question_execution;
+        let mut call = question_call;
+        call.arguments = serde_json::json!({ "question": " " });
+        invalid.output.as_mut().unwrap().segments = vec![TurnContentSegment::Tool(call)];
+        assert!(project_turn_execution(invalid, Vec::new(), &command, &mut |_| {}, false).is_err());
+        let receipt = execution.receipt.unwrap();
+        receipt.validate_for(&command).unwrap();
+        assert_eq!(receipt.status, TurnStatus::Completed);
+        let cut_ref = receipt
+            .workspace_cut_ref
+            .as_ref()
+            .expect("the actual adapter must preserve the complete owner witness");
+        let recorded = whipplescript_store::SqliteStore::open_read_only(chat_runtime_database(
+            root.path(),
+            &spec.chat_id,
+        ))
+        .unwrap()
+        .list_evidence(&command.instance_ref)
+        .unwrap()
+        .into_iter()
+        .find(|evidence| &evidence.evidence_id == cut_ref)
+        .unwrap();
+        assert_eq!(recorded.kind, "host.turn.workspace_cut");
+        assert_eq!(
+            recorded.correlation_id.as_deref(),
+            Some(command.command_id.as_str())
+        );
+        let body: serde_json::Value = serde_json::from_str(&recorded.metadata_json).unwrap();
+        assert_eq!(body["complete"], true);
+        let writes = body["writes"].as_array().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0]["path"], "result.txt");
+        assert_eq!(writes[0]["kind"], "add");
+        assert_eq!(writes[0]["bytes"], 16);
+        let captured = captures.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0.path, "result.txt");
+        assert_eq!(captured[0].0.kind, "add");
+        assert_eq!(captured[0].0.bytes, 16);
+        assert_eq!(captured[0].0.sha256, stable_text_hash("synthetic result"));
+        assert_eq!(captured[0].1, b"synthetic result");
+        drop(captured);
+        assert_eq!(
+            writes[0]["content_hash"],
+            stable_text_hash("synthetic result")
+        );
+        assert_eq!(
+            std::fs::read(worktree.path().join("result.txt")).unwrap(),
+            b"synthetic result"
+        );
+        assert!(driver.0.borrow().is_empty());
+        assert!(
+            matches!(resources.take_turn_witness(), TurnWitness::Witnessed { writes, reads } if writes.is_empty() && reads.is_empty())
+        );
+        let mut absent = command.clone();
+        absent.command_id = "unrecorded-original-command".into();
+        assert!(
+            original_workspace_witness(&first.runtime, &absent, &resources, None)
+                .unwrap()
+                .is_none()
+        );
+        let missing =
+            original_workspace_witness(&first.runtime, &absent, &resources, Some(&receipt))
+                .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("original runtime workspace witness unavailable"));
+        let mut changed_receipt = receipt.clone();
+        changed_receipt.command_id = "another-completed-command".into();
+        let changed = original_workspace_witness(
+            &first.runtime,
+            &command,
+            &resources,
+            Some(&changed_receipt),
+        )
+        .unwrap_err();
+        assert!(changed
+            .to_string()
+            .contains("original runtime workspace receipt changed"));
+        drop(resources);
+        std::fs::write(worktree.path().join("result.txt"), "later unadmitted edit").unwrap();
+        std::fs::write(
+            worktree.path().join("unrelated.txt"),
+            "unrelated pending work",
+        )
+        .unwrap();
+        let original_position = first.runtime.current_position(&first.instance_ref).unwrap();
+        assert!(original_position.sequence > prepared.start_position.sequence);
+        struct OriginalReadAccess;
+        impl gaugedesk_harness::TurnAccess for OriginalReadAccess {
+            fn check_current(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let read_spec = gaugedesk_harness::RecordedRuntimeSpec {
+            chat_id: &spec.chat_id,
+            command_id: &command.command_id,
+            policy_epoch: spec.policy_epoch.unwrap(),
+            signed_policy_envelope: spec.signed_policy_envelope.as_deref().unwrap(),
+            preparation: &prepared,
+            images: &[],
+            access: &OriginalReadAccess,
+        };
+        assert_eq!(
+            factory.recorded_policy_epoch(&prepared).unwrap(),
+            spec.policy_epoch.unwrap()
+        );
+        let database = chat_runtime_database(root.path(), &spec.chat_id);
+        let before_read = std::fs::read(&database).unwrap();
+        let observed = factory.observe_recorded_runtime(&read_spec).unwrap();
+        assert_eq!(
+            observed.runtime_start_position,
+            Some(prepared.start_position.clone())
+        );
+        let saved_witness = observed.runtime_workspace_witness.unwrap();
+        assert_eq!(
+            serde_json::from_str::<TurnReceipt>(&saved_witness.receipt_json).unwrap(),
+            receipt
+        );
+        assert_eq!(saved_witness.writes.len(), 1);
+        assert_eq!(
+            saved_witness.writes[0].content_hash,
+            stable_text_hash("synthetic result")
+        );
+        assert_eq!(std::fs::read(&database).unwrap(), before_read);
+        assert_eq!(
+            first.runtime.current_position(&first.instance_ref).unwrap(),
+            original_position
+        );
+        assert_eq!(
+            std::fs::read(worktree.path().join("result.txt")).unwrap(),
+            b"later unadmitted edit"
+        );
+        let mut changed = prepared.clone();
+        changed.input_digest = gaugedesk_harness::runtime_input_digest("substituted prompt", &[]);
+        let changed_spec = gaugedesk_harness::RecordedRuntimeSpec {
+            preparation: &changed,
+            ..read_spec
+        };
+        assert!(factory
+            .observe_recorded_runtime(&changed_spec)
+            .unwrap_err()
+            .to_string()
+            .contains("original runtime preparation changed"));
+        struct CountingReadAccess {
+            calls: AtomicUsize,
+            deny_at: usize,
+        }
+        impl gaugedesk_harness::TurnAccess for CountingReadAccess {
+            fn check_current(&self) -> Result<(), String> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) + 1 >= self.deny_at {
+                    Err("private authority detail".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let counted = CountingReadAccess {
+            calls: AtomicUsize::new(0),
+            deny_at: usize::MAX,
+        };
+        let counted_spec = gaugedesk_harness::RecordedRuntimeSpec {
+            access: &counted,
+            ..read_spec
+        };
+        factory.observe_recorded_runtime(&counted_spec).unwrap();
+        let count = counted.calls.load(Ordering::SeqCst);
+        assert!(count > 2);
+        for deny_at in 1..=count {
+            let access = CountingReadAccess {
+                calls: AtomicUsize::new(0),
+                deny_at,
+            };
+            let revoked_spec = gaugedesk_harness::RecordedRuntimeSpec {
+                access: &access,
+                ..read_spec
+            };
+            let error = factory
+                .observe_recorded_runtime(&revoked_spec)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("private authority detail"));
+            assert_eq!(std::fs::read(&database).unwrap(), before_read);
+            assert_eq!(
+                first.runtime.current_position(&first.instance_ref).unwrap(),
+                original_position
+            );
+        }
+        let mut absent_command = command.clone();
+        absent_command.command_id = "unrecorded-original-command".into();
+        let mut absent_preparation = prepared.clone();
+        absent_preparation.command_json = serde_json::to_string(&absent_command).unwrap();
+        let absent_spec = gaugedesk_harness::RecordedRuntimeSpec {
+            command_id: &absent_command.command_id,
+            preparation: &absent_preparation,
+            ..read_spec
+        };
+        assert!(factory
+            .observe_recorded_runtime(&absent_spec)
+            .unwrap_err()
+            .to_string()
+            .contains("original saved runtime execution unavailable"));
+        let invalid_policy_spec = gaugedesk_harness::RecordedRuntimeSpec {
+            signed_policy_envelope: "invalid signed original policy",
+            ..read_spec
+        };
+        assert!(factory
+            .observe_recorded_runtime(&invalid_policy_spec)
+            .is_err());
+        assert_eq!(std::fs::read(&database).unwrap(), before_read);
+        let missing_chat = "absent-native-runtime";
+        let missing_spec = gaugedesk_harness::RecordedRuntimeSpec {
+            chat_id: missing_chat,
+            ..read_spec
+        };
+        assert!(factory.observe_recorded_runtime(&missing_spec).is_err());
+        assert!(!chat_runtime_database(root.path(), missing_chat).exists());
+        struct RemovedReadAccess;
+        impl gaugedesk_harness::TurnAccess for RemovedReadAccess {
+            fn check_current(&self) -> Result<(), String> {
+                Err("private reason".into())
+            }
+        }
+        let denied_spec = gaugedesk_harness::RecordedRuntimeSpec {
+            access: &RemovedReadAccess,
+            ..read_spec
+        };
+        let denied = factory
+            .observe_recorded_runtime(&denied_spec)
+            .unwrap_err()
+            .to_string();
+        assert!(denied.contains("original turn access ended"));
+        assert!(!denied.contains("private reason"));
+        assert_eq!(std::fs::read(&database).unwrap(), before_read);
+
+        assert_eq!(
+            first
+                .prepare_runtime_turn("write synthetic fixture", &[])
+                .unwrap(),
+            prepared
+        );
+        for substitution in ["command", "targets"] {
+            let mut changed = prepared.clone();
+            if substitution == "command" {
+                let mut intent = command.clone();
+                intent.input.text.push_str("changed");
+                changed.command_json = serde_json::to_string(&intent).unwrap();
+            } else {
+                changed
+                    .workspace_targets
+                    .push(gaugedesk_harness::WorkspaceTargetBinding {
+                        target_id: "substituted-target".into(),
+                        resource_handle: "substituted".into(),
+                        root: worktree.path().to_string_lossy().into_owned(),
+                        name: String::new(),
+                        readable: true,
+                        writable: false,
+                        output: false,
+                    });
+            }
+            first.prepared_runtime = Some(changed);
+            first.bind_runtime_command_id(Some(&command.command_id));
+            assert!(first
+                .run_turn(
+                    &gaugedesk_harness::AllowAllGate,
+                    "write synthetic fixture",
+                    &[],
+                    &mut sink
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("prepared runtime intent changed"));
+            assert_eq!(
+                first.runtime.current_position(&first.instance_ref).unwrap(),
+                original_position
+            );
+        }
+        first.prepared_runtime = Some(prepared.clone());
+        first.bind_runtime_command_id(Some(&command.command_id));
+        let replay = first
+            .run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "write synthetic fixture",
+                &[],
+                &mut sink,
+            )
+            .expect("actual native harness retained replay");
+        assert_eq!(
+            replay.runtime_start_position.as_ref(),
+            Some(&prepared.start_position)
+        );
+        assert!(first.prepared_runtime.is_none());
+        let witness = replay
+            .runtime_workspace_witness
+            .expect("original owner witness in outcome");
+        let carried_receipt: TurnReceipt = serde_json::from_str(&witness.receipt_json).unwrap();
+        assert_eq!(carried_receipt, receipt);
+        assert_eq!(witness.writes.len(), 1);
+        assert_eq!(witness.writes[0].path, "result.txt");
+        assert_eq!(witness.writes[0].kind, "add");
+        assert_eq!(
+            witness.writes[0].content_hash,
+            stable_text_hash("synthetic result")
+        );
+        assert_eq!(witness.writes[0].bytes, 16);
+        assert_eq!(
+            first.runtime.current_position(&first.instance_ref).unwrap(),
+            original_position
+        );
+        assert_eq!(
+            std::fs::read(worktree.path().join("result.txt")).unwrap(),
+            b"later unadmitted edit"
+        );
         let instance = first.instance_ref.clone();
         drop(first);
-        let reopened = factory.create_harness(&spec).expect("reopened harness");
+        let mut reopened = factory.create_harness(&spec).expect("reopened harness");
+        reopened.bind_task_filer(Some(Arc::new(AdmittedTask)));
+        reopened.bind_runtime_command_id(Some(&command.command_id));
+        let replay = reopened
+            .run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "write synthetic fixture",
+                &[],
+                &mut sink,
+            )
+            .expect("actual restarted native harness replay");
+        assert_eq!(replay.runtime_workspace_witness.as_ref(), Some(&witness));
+        assert_eq!(
+            reopened.runtime.current_position(&instance).unwrap(),
+            original_position
+        );
         assert_eq!(reopened.instance_ref, instance);
         let mut changed_policy = spec.clone();
         changed_policy.policy_epoch = Some(2);

@@ -87,6 +87,7 @@ struct ProjectAuthority {
     deadline_ms: Option<u64>,
     org: Org,
     local_personal: bool,
+    project_members: std::collections::BTreeSet<String>,
 }
 
 struct Snapshot {
@@ -192,6 +193,7 @@ fn registry(store: &Store, scope: &str) -> Result<Registry, AdmitError> {
 fn current_project(
     store: &Store,
     home: &HomeId,
+    owners: &crate::project_owner::ProjectOwnerResolver,
     context: &AuthenticatedActionContext,
     project: &str,
 ) -> Result<ProjectAuthority, AdmitError> {
@@ -225,13 +227,13 @@ fn current_project(
         .project_collaboration_workspaces
         .get(project)
         .ok_or_else(|| refused("tracker project has no collaboration workspace"))?;
+    let legacy = owners.legacy_owner(store);
+    let project_members = owners.members_in(&library, &legacy, record, &org);
     if &record.home_id != home
         || &workspace.home_id != home
         || workspace.project_id != project
         || workspace.workspace_id.trim().is_empty()
-        || (!local_personal
-            && !org.can_access_project(context.actor().as_str(), project)
-            && crate::project_owner::recorded_owner(record) != Some(context.actor().as_str()))
+        || (!local_personal && !project_members.contains(context.actor().as_str()))
         || library
             .project_collaboration_workspaces
             .values()
@@ -249,12 +251,14 @@ fn current_project(
         deadline_ms,
         org,
         local_personal,
+        project_members,
     })
 }
 
 fn capture(
     store: &Store,
     home: &HomeId,
+    owners: &crate::project_owner::ProjectOwnerResolver,
     context: &AuthenticatedActionContext,
     project: &str,
     queue: &str,
@@ -280,7 +284,7 @@ fn capture(
     {
         return Err(refused("workflow authority cannot change tracker access"));
     }
-    current_project(store, home, context, project)?;
+    current_project(store, home, owners, context, project)?;
     let before = registry(store, &scope)?;
     let commands = command_scope(&scope, context.actor().as_str());
     // New access scopes must be empty and fenced just like existing ones. A
@@ -305,12 +309,11 @@ fn capture(
     let mut scopes = vec![
         LIBRARY_SCOPE.into(),
         ORG_SCOPE.into(),
-        crate::account_auth::ACCOUNT_AUTH_SCOPE.into(),
-        crate::mobile_machine_session::SCOPE.into(),
         scope.clone(),
         commands.clone(),
         handoff,
     ];
+    scopes.extend(crate::identity::workflow_authority_scopes(context).map_err(AdmitError::Codec)?);
     scopes.extend(before.bases.keys().map(|id| access_scope(&scope, id)));
     scopes.extend(anticipated.iter().map(|id| access_scope(&scope, id)));
     scopes.sort();
@@ -318,7 +321,7 @@ fn capture(
     let (snapshot, basis) = store.read_for_dispatch(
         &scopes.iter().map(String::as_str).collect::<Vec<_>>(),
         |store| {
-            let authority = current_project(store, home, context, project)?;
+            let authority = current_project(store, home, owners, context, project)?;
             if request_id.is_some() {
                 crate::federation::require_project_writes_available(store, project)?;
             }
@@ -475,10 +478,7 @@ fn permitted(snapshot: &Snapshot, recipient: &str, permission: TrackerPermission
             && recipient == crate::LOCAL_AUTHORITY;
     }
     if snapshot.home_owned {
-        return snapshot
-            .authority
-            .org
-            .can_access_project(recipient, &snapshot.project);
+        return snapshot.authority.project_members.contains(recipient);
     }
     snapshot.registry.bases.values().any(|grant| {
         grant.recipient == recipient
@@ -538,6 +538,7 @@ impl Workbench {
         let (snapshot, basis) = capture(
             self.store_ref(),
             self.home_id(),
+            &self.project_owner_resolver(),
             context,
             project,
             queue,
@@ -711,6 +712,7 @@ impl Workbench {
         let (snapshot, basis) = capture(
             self.store_ref(),
             self.home_id(),
+            &self.project_owner_resolver(),
             context,
             project,
             queue,
@@ -728,10 +730,7 @@ impl Workbench {
         }
         let actor = context.actor().as_str();
         if (actor != recipient && actor != tracker.resource.resource.owner.as_str())
-            || !snapshot
-                .authority
-                .org
-                .can_access_project(recipient, project)
+            || !snapshot.authority.project_members.contains(recipient)
         {
             return Err(refused(
                 "tracker access request exceeds recipient authority",
@@ -792,6 +791,7 @@ impl Workbench {
         let (snapshot, basis) = capture(
             self.store_ref(),
             self.home_id(),
+            &self.project_owner_resolver(),
             context,
             project,
             queue,
@@ -822,8 +822,8 @@ impl Workbench {
             && (grant.purpose != snapshot.authority.purpose
                 || !snapshot
                     .authority
-                    .org
-                    .can_access_project(&grant.recipient, project))
+                    .project_members
+                    .contains(&grant.recipient))
         {
             return Err(refused(
                 "tracker approval exceeds current recipient or purpose authority",
@@ -878,6 +878,7 @@ impl Workbench {
         let (snapshot, basis) = capture(
             self.store_ref(),
             self.home_id(),
+            &self.project_owner_resolver(),
             context,
             project,
             queue,
@@ -917,6 +918,7 @@ impl Workbench {
         let (snapshot, basis) = capture(
             self.store_ref(),
             self.home_id(),
+            &self.project_owner_resolver(),
             context,
             project,
             queue,
@@ -958,10 +960,7 @@ impl Workbench {
         let choices: std::collections::BTreeMap<String, String> = candidates
             .into_iter()
             .filter_map(|recipient| {
-                if !snapshot
-                    .authority
-                    .org
-                    .can_access_project(recipient, project)
+                if !snapshot.authority.project_members.contains(recipient)
                     || !permitted(&snapshot, recipient, TrackerPermission::Read)
                 {
                     return None;

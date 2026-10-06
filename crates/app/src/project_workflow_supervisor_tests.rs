@@ -133,6 +133,18 @@ fn an_unattended_step_outlives_the_launch_session() {
 fn losing_membership_stops_an_unattended_run_until_it_returns() {
     let (_root, shared, context, request) = fixture(include_str!("tutorials/basics.whip"));
     let mut wb = shared.lock_unpoisoned();
+    // This launcher holds a legacy organization-issued project grant, so
+    // directory deprovisioning really revokes its project standing.
+    let mut project = wb.library.projects[DEFAULT_PROJECT].clone();
+    crate::project_owner::record_owner(&mut project.extra, "another-account");
+    wb.store_mut()
+        .append_record(
+            crate::library::LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    project_grant(&mut wb, LOCAL_AUTHORITY, DEFAULT_PROJECT);
     declare(&mut wb, &context);
     let invocation = wb
         .launch_project_workflow(&context, &request, LIMITS)

@@ -89,28 +89,8 @@ impl Workbench {
         library: &crate::library::Library,
         id: &str,
     ) -> Option<String> {
-        let agent = library.agents.get(id)?;
-        agent
-            .authoring_owner
-            .clone()
-            .or_else(|| {
-                agent
-                    .versions
-                    .get(&agent.current_version)
-                    .and_then(|version| version.source_owner_authority.clone())
-            })
-            .or_else(|| {
-                (!self.hosted_home_mode() && !crate::workbench_auth::web_account_mode()).then(
-                    || {
-                        if crate::app_support::is_builtin_agent(id) {
-                            self.authority().as_str().to_owned()
-                        } else {
-                            self.legacy_project_owner()
-                        }
-                    },
-                )
-            })
-            .filter(|owner| !owner.is_empty() && owner != "anonymous")
+        self.project_owner_resolver()
+            .agent_owner_in(library, id, &self.legacy_project_owner())
     }
 
     /// Whether `actor` may place Agent `id` on a project: a built-in Agent,

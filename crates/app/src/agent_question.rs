@@ -40,7 +40,7 @@ pub use gaugedesk_whip_runtime::{QUESTION_ASK_CAPABILITY, QUESTION_RESOURCE};
 /// The GaugeWright package manifest, registered beside the std set.
 pub const GAUGEDESK_PACKAGE_MANIFEST: &str = include_str!("../packages/gaugewright.json");
 
-const QUESTION_KIND: &str = "agent-question";
+pub(crate) const QUESTION_KIND: &str = "agent-question";
 
 /// One person an agent may address.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -118,7 +118,7 @@ impl std::fmt::Display for AskError {
 
 impl std::error::Error for AskError {}
 
-fn question_scope(chat_id: &str) -> String {
+pub(crate) fn question_scope(chat_id: &str) -> String {
     format!("questions::{chat_id}")
 }
 

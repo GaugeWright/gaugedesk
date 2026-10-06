@@ -4,7 +4,7 @@
 use std::io;
 
 use gaugedesk_core::ids::{AuthorityId, PublicKey};
-use gaugedesk_core::signature::SigningKey;
+use gaugedesk_core::signature::{Signature, SigningKey};
 use gaugedesk_store::project_authority::ProjectAuthorityKey;
 use sha2::{Digest, Sha256};
 
@@ -137,6 +137,26 @@ impl Workbench {
         self.require_owned_project(project)?;
         self.require_signing_activation(project)?;
         self.retained_project_signing_key(project)
+    }
+
+    /// Sign an independently admitted hosted payload with existing project
+    /// custody. Ownership and handoff availability are read in one snapshot;
+    /// this never initializes a key or returns private signing material.
+    /// The trusted caller still fences current admission through publication.
+    pub fn sign_project_payload(&self, project: &str, payload: &[u8]) -> io::Result<Signature> {
+        let handoff = crate::federation::handoff_scope(project);
+        let (signature, _) = self
+            .store_ref()
+            .read_for_dispatch(&[crate::library::LIBRARY_SCOPE, &handoff], |store| {
+                crate::federation::require_project_writes_available(store, project)?;
+                Ok(self
+                    .project_signing_key(project)
+                    .map(|key| key.sign(payload)))
+            })
+            .map_err(|error| {
+                io::Error::other(format!("project payload signing refused: {error:?}"))
+            })?;
+        signature
     }
 
     fn require_signing_activation(&self, project: &str) -> io::Result<()> {
@@ -370,6 +390,71 @@ mod tests {
     }
 
     #[test]
+    fn hosted_payload_uses_the_registered_project_without_host_or_other_project_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let mut wb = workbench(root.path());
+        assert!(wb.sign_project_payload("a", b"hosted grant").is_err());
+        assert!(wb.store_ref().project_authority_key("a").unwrap().is_none());
+        wb.initialize_project_authority("a").unwrap();
+        wb.initialize_project_authority("b").unwrap();
+        let (_, a) = wb.project_authority_identity("a").unwrap();
+        let (_, b) = wb.project_authority_identity("b").unwrap();
+        let signature = wb.sign_project_payload("a", b"hosted grant").unwrap();
+        assert_eq!(verify_signature(b"hosted grant", &signature, &a), Ok(true));
+        assert_eq!(verify_signature(b"hosted grant", &signature, &b), Ok(false));
+        assert_eq!(
+            verify_signature(b"hosted grant", &signature, &wb.governance_public_key()),
+            Ok(false)
+        );
+        assert_eq!(
+            verify_signature(b"changed grant", &signature, &a),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn hosted_payload_refuses_pending_handoff_and_current_ownership_loss() {
+        let root = tempfile::tempdir().unwrap();
+        let mut wb = workbench(root.path());
+        wb.initialize_project_authority("a").unwrap();
+        wb.initialize_project_authority("b").unwrap();
+        let events = gaugedesk_core::handoff::decide(
+            &gaugedesk_core::handoff::HandoffState::default(),
+            gaugedesk_core::handoff::HandoffCommand::OfferHandoff,
+        )
+        .unwrap();
+        for event in events {
+            wb.store_mut()
+                .append_record(
+                    &crate::federation::handoff_scope("a"),
+                    "event",
+                    &serde_json::to_string(&event).unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(wb
+            .sign_project_payload("a", b"new hosted grant")
+            .unwrap_err()
+            .to_string()
+            .contains("pending handoff"));
+        let mut deleted = wb.library.projects["b"].clone();
+        deleted.op = crate::library::RecordOp::Tombstone;
+        wb.store_mut()
+            .append_record(
+                crate::library::LIBRARY_SCOPE,
+                "project",
+                &serde_json::to_string(&deleted).unwrap(),
+            )
+            .unwrap();
+        assert!(wb.library.projects.contains_key("b"));
+        assert!(wb
+            .sign_project_payload("b", b"new hosted grant")
+            .unwrap_err()
+            .to_string()
+            .contains("not local"));
+    }
+
+    #[test]
     fn same_process_missing_custody_refuses_without_reminting() {
         let root = tempfile::tempdir().unwrap();
         let mut wb = workbench(root.path());
@@ -380,6 +465,7 @@ mod tests {
             .join(format!("{}.key", crate::org::sha256_hex("a")));
         std::fs::remove_file(&path).unwrap();
         assert!(wb.project_signing_key("a").is_err());
+        assert!(wb.sign_project_payload("a", b"hosted grant").is_err());
         assert!(wb.initialize_project_authority("a").is_err());
         assert!(!path.exists());
     }

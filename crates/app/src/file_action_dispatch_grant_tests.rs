@@ -584,6 +584,14 @@ fn controller_dispatch_uses_the_exact_revocable_device_source_and_home() {
     let ActionBasis::Version { version_ref } = &original.resources["target"].basis else {
         panic!("base")
     };
+    assert!(wb
+        .prepare_editor_file_save_request(&context, &chat, "note.txt", "device-save")
+        .is_err());
+    super::super::tests::project_grant(
+        &mut wb,
+        controller.device.as_str(),
+        crate::org::RecordOp::Upsert,
+    );
     let identity = wb
         .prepare_editor_file_save_request(&context, &chat, "note.txt", "device-save")
         .unwrap();
@@ -852,6 +860,8 @@ fn retained_dispatch_keeps_its_original_idle_ceiling_after_provider_refresh() {
     assert_eq!(retry.grant_ref, grant.grant_ref);
 }
 
+#[path = "file_action_office_dispatch_tests.rs"]
+mod office;
 #[test]
 fn project_fact_frame_binds_the_original_project_authority_and_complete_body() {
     for fault in ["project", "authority", "protocol", "body", "removed"] {

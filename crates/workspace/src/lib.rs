@@ -54,6 +54,14 @@ pub use resolution_recording_target::{
     NativeResolutionRecordingEvidenceTarget, NativeResolutionRecordingTarget,
 };
 
+mod guarded_upload;
+mod streamed_upload;
+pub use streamed_upload::{NativeStreamedUpload, NativeStreamedUploadTarget};
+mod witnessed_turn;
+pub use witnessed_turn::{
+    NativeHistoricalSettledTurn, NativeObservedOfficeResult, NativeReviewedTurn, NativeSettledTurn,
+    NativeTurnFileWitness, NativeWitnessedTurn, NativeWitnessedTurnTarget,
+};
 mod import_receipt;
 mod snapshot;
 mod workflow_source;
@@ -2223,6 +2231,76 @@ impl Engagement {
         Ok((retained == served).then_some(cut))
     }
 
+    /// Verify one completed streamed upload against the exact recorded cut and
+    /// actual confined projection in bounded windows. The native content owner
+    /// separately proves payload availability. This is read evidence only;
+    /// publication requires its own current authority fence.
+    pub fn recorded_streamed_file_hash(
+        &self,
+        relative: &str,
+        cut: &str,
+        sha256: &str,
+        byte_len: u64,
+    ) -> Result<Option<String>> {
+        use sha2::Digest;
+        use std::io::Read;
+        self.ensure_selected_path(relative)?;
+        if !valid_native_action_target_path(relative)
+            || sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Ok(None);
+        }
+        let writer = workspace_writer(&self.store_root, &self.branch);
+        let _writing = writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut file = safe_read_file(&self.path, relative)?;
+        if file.metadata().map_err(WorkspaceError::io)?.len() != byte_len {
+            return Ok(None);
+        }
+        let mut hasher = sha2::Sha256::new();
+        let mut window = [0u8; 64 * 1024];
+        let mut read_len = 0u64;
+        loop {
+            let read = file.read(&mut window).map_err(WorkspaceError::io)?;
+            if read == 0 {
+                break;
+            }
+            read_len = read_len.saturating_add(read as u64);
+            if read_len > byte_len {
+                return Ok(None);
+            }
+            hasher.update(&window[..read]);
+        }
+        if read_len != byte_len || hex::encode(hasher.finalize()) != sha256 {
+            return Ok(None);
+        }
+        let vcs = NativeWorkspaceVcs::open_read_only(
+            self.store_root.join("branches.sqlite"),
+            self.store_root.join("content.sqlite"),
+        )?;
+        if vcs
+            .get_cut(cut)?
+            .is_none_or(|record| record.branch_id != self.branch)
+        {
+            return Ok(None);
+        }
+        let Some(manifest) = vcs.cut_manifest(cut)? else {
+            return Ok(None);
+        };
+        // The pinned owner's public content identity is SHA-256/128, as used
+        // by stable_hash_bytes_hex. Full SHA-256 comparison above proves the
+        // upload; this prefix compares that same body to its native identity.
+        let hash = &sha256[..32];
+        if manifest.get(relative).map(String::as_str) != Some(hash)
+            || !vcs.content_store().cached_read_available(hash)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(hash.to_owned()))
+    }
+
     pub fn write_file(&self, relative: &str, content: &str) -> Result<()> {
         self.write_file_bytes(relative, content.as_bytes())
     }
@@ -3508,6 +3586,43 @@ pub trait ChatWorkspace: Send {
     fn recorded_file_cut(&self, _rel: &str, _served: &[u8]) -> Result<Option<String>> {
         Ok(None)
     }
+    /// Unsupported adapters refuse streamed-byte evidence, never manufacture
+    /// a hash from caller input or import the current projection to obtain one.
+    /// Unsupported adapters cannot substitute an unguarded upload history path.
+    fn streamed_upload_target(&self, _relative: &str) -> Result<NativeStreamedUploadTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no guarded native upload target",
+        ))
+    }
+    /// Original guarded native startup base, without scanning mutable files.
+    fn witnessed_turn_start_guarded(
+        &self,
+        _actor: &str,
+        _command: &str,
+        _check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<NativeWitnessedTurnTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no guarded native startup base",
+        ))
+    }
+    /// Exact witnessed project files at a recorded original native base.
+    /// Unsupported adapters cannot fall back to a broad worktree import.
+    fn witnessed_turn_target_at(&self, _base_cut: &str) -> Result<NativeWitnessedTurnTarget> {
+        Err(WorkspaceError::msg(
+            "this workspace has no native witnessed turn boundary",
+        ))
+    }
+    fn recorded_streamed_file_hash(
+        &self,
+        _relative: &str,
+        _cut: &str,
+        _sha256: &str,
+        _byte_len: u64,
+    ) -> Result<Option<String>> {
+        Err(WorkspaceError::msg(
+            "this workspace cannot witness streamed bytes",
+        ))
+    }
     fn write_file(&self, rel: &str, content: &str) -> Result<()>;
     fn create_file_if_absent(&self, _rel: &str) -> Result<()> {
         Err(WorkspaceError::msg("this workspace cannot create files"))
@@ -3538,6 +3653,18 @@ pub trait ChatWorkspace: Send {
         self.write_file_bytes(rel, &body)?;
         let _ = std::fs::remove_file(source);
         Ok(())
+    }
+    /// Guarded placement has no buffered or unchecked adapter fallback. The
+    /// original authority check must span the adapter's actual file effects.
+    fn write_file_from_path_guarded(
+        &self,
+        _relative: &str,
+        _source: &Path,
+        _check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        Err(WorkspaceError::msg(
+            "this workspace has no guarded upload placement boundary",
+        ))
     }
     fn remove_file(&self, rel: &str) -> Result<()> {
         let _ = rel;
@@ -3873,6 +4000,30 @@ impl ChatWorkspace for Engagement {
     fn recorded_file_cut(&self, relative: &str, served: &[u8]) -> Result<Option<String>> {
         Engagement::recorded_file_cut(self, relative, served)
     }
+    fn streamed_upload_target(&self, relative: &str) -> Result<NativeStreamedUploadTarget> {
+        Engagement::streamed_upload_target(self, relative)
+    }
+    fn witnessed_turn_start_guarded(
+        &self,
+        actor: &str,
+        command: &str,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<NativeWitnessedTurnTarget> {
+        Engagement::witnessed_turn_start_guarded(self, actor, command, check)
+    }
+    fn witnessed_turn_target_at(&self, base_cut: &str) -> Result<NativeWitnessedTurnTarget> {
+        Engagement::witnessed_turn_target_at(self, base_cut)
+    }
+    fn recorded_streamed_file_hash(
+        &self,
+        relative: &str,
+        cut: &str,
+        sha256: &str,
+        byte_len: u64,
+    ) -> Result<Option<String>> {
+        Engagement::recorded_streamed_file_hash(self, relative, cut, sha256, byte_len)
+    }
+
     fn write_file(&self, relative: &str, content: &str) -> Result<()> {
         self.write_file(relative, content)
     }
@@ -3899,6 +4050,14 @@ impl ChatWorkspace for Engagement {
     }
     fn write_file_from_path(&self, relative: &str, source: &std::path::Path) -> Result<()> {
         self.write_file_from_path(relative, source)
+    }
+    fn write_file_from_path_guarded(
+        &self,
+        relative: &str,
+        source: &Path,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.write_file_from_path_guarded(relative, source, check)
     }
     fn remove_file(&self, relative: &str) -> Result<()> {
         self.ensure_projection()?;
@@ -4158,7 +4317,7 @@ fn copy_dir(source: &Path, target: &Path) -> Result<usize> {
 mod tests {
     use super::*;
 
-    fn instance() -> (tempfile::TempDir, Instance) {
+    pub(super) fn instance() -> (tempfile::TempDir, Instance) {
         let directory = tempfile::tempdir().expect("temp");
         let instance = Instance::init(
             directory.path().join("repo"),
@@ -4408,6 +4567,75 @@ mod tests {
         let mut files = BTreeMap::new();
         walk(root, &mut files);
         files
+    }
+
+    #[test]
+    fn recorded_streamed_witness_requires_exact_projection_cut_and_retained_payload() {
+        use sha2::Digest;
+        let (directory, instance) = instance();
+        let eng = instance.create_engagement("stream-witness").unwrap();
+        let binary = [0xff, 0, 0x89, b'P', b'N', b'G'];
+        eng.write_file_bytes("recording.bin", &binary).unwrap();
+        let cut = eng.commit_turn("uploaded").unwrap().unwrap().0;
+        let digest = hex::encode(sha2::Sha256::digest(binary));
+        let expected = whipplescript_store::stable_hash_bytes_hex(&binary);
+        let before = observation_files(directory.path());
+        assert_eq!(
+            eng.recorded_streamed_file_hash("recording.bin", &cut, &digest, binary.len() as u64)
+                .unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            observation_files(directory.path()),
+            before,
+            "witness imports and writes nothing"
+        );
+        assert!(eng
+            .recorded_streamed_file_hash("recording.bin", &cut, &digest, 1)
+            .unwrap()
+            .is_none());
+        assert!(eng
+            .recorded_streamed_file_hash(
+                "recording.bin",
+                "unknown-cut",
+                &digest,
+                binary.len() as u64
+            )
+            .unwrap()
+            .is_none());
+        assert!(eng
+            .recorded_streamed_file_hash(
+                "recording.bin",
+                &cut,
+                &"0".repeat(64),
+                binary.len() as u64
+            )
+            .unwrap()
+            .is_none());
+        assert!(eng
+            .recorded_streamed_file_hash("../recording.bin", &cut, &digest, binary.len() as u64)
+            .unwrap()
+            .is_none());
+        let other = instance.create_engagement("other-stream").unwrap();
+        other.write_file_bytes("recording.bin", &binary).unwrap();
+        let other_cut = other.commit_turn("other").unwrap().unwrap().0;
+        assert!(eng
+            .recorded_streamed_file_hash("recording.bin", &other_cut, &digest, binary.len() as u64)
+            .unwrap()
+            .is_none());
+        eng.write_file_bytes("recording.bin", &[1, 2, 3, 4, 5, 6])
+            .unwrap();
+        assert!(eng
+            .recorded_streamed_file_hash("recording.bin", &cut, &digest, binary.len() as u64)
+            .unwrap()
+            .is_none());
+        eng.write_file_bytes("recording.bin", &binary).unwrap();
+        let vcs = eng.store().unwrap();
+        vcs.content_store().erase(&expected, "now").unwrap();
+        assert!(eng
+            .recorded_streamed_file_hash("recording.bin", &cut, &digest, binary.len() as u64)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -6507,11 +6735,11 @@ mod workspace_store_contention {
         holder.join().unwrap();
 
         assert!(
-            outcome.is_ok(),
-            "the write failed after {}ms (lock released first: {saw_release}) — busy_timeout is \
-             not in force for this statement: {:?}",
+            matches!(outcome, Ok(whipplescript_store::vcs::VcsWriteOutcome::Written { .. }))
+                && saw_release
+                && waited >= std::time::Duration::from_millis(1000),
+            "the write did not wait and publish after {}ms (lock released first: {saw_release}): {outcome:?}",
             waited.as_millis(),
-            outcome.err(),
         );
     }
 

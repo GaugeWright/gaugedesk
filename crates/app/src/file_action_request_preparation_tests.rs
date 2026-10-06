@@ -141,6 +141,19 @@ fn request_preparation_project_move_cannot_rebind_an_unsubmitted_or_lost_respons
         let old_project = placement.project_id.clone().unwrap();
         let mut project = library.projects[&old_project].clone();
         project.id = "moved-project".into();
+        let grant = crate::org::MemberGrantRecord {
+            id: crate::org::MemberGrantRecord::make_id("alice", &project.id),
+            authority: "alice".into(),
+            project_id: project.id.clone(),
+            op: crate::org::RecordOp::Upsert,
+        };
+        wb.store_mut()
+            .append_record(
+                ORG_SCOPE,
+                "member_grant",
+                &serde_json::to_string(&grant).unwrap(),
+            )
+            .unwrap();
         placement.project_id = Some(project.id.clone());
         let set = library.current_target_set(&intent.chat_id).unwrap();
         let mut target = library.work_targets[&set.members[0].target_id].clone();
@@ -159,9 +172,15 @@ fn request_preparation_project_move_cannot_rebind_an_unsubmitted_or_lost_respons
         // Current authority is otherwise valid. The old in-memory projection
         // and target workspace remain deliberately available to catch fallback.
         assert_eq!(
-            current_authority(wb.store_ref(), wb.home_id(), &context, &request(&intent))
-                .unwrap()
-                .project_id,
+            current_authority(
+                wb.store_ref(),
+                wb.home_id(),
+                &wb.project_owner_resolver(),
+                &context,
+                &request(&intent)
+            )
+            .unwrap()
+            .project_id,
             project.id
         );
         let rows = product_rows(&wb);

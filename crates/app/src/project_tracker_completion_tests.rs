@@ -372,6 +372,7 @@ fn readable_contributor_can_close_an_away_assignees_task_as_themselves() {
         "id":"colleague", "op":"upsert", "org_id":crate::org::ORG_ID,
         "authority":"colleague", "email":"", "role":"admin", "status":"active", "managed_by_scim":false
     }).to_string()).unwrap();
+    project_grant(&mut wb, "colleague", DEFAULT_PROJECT);
     let token = wb
         .mint_account_session("colleague", "passkey", 3600)
         .unwrap();

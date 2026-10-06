@@ -336,7 +336,7 @@ export function FacetBrowser(props: {
             queue = queue
                 .then(async () => {
                     if (!active) return;
-                    if (!fullTree()) {
+                    if (!fullTree() || change.id === "") {
                         await refetch();
                     } else {
                         const delta = await props.api.getWorkspaceDeltaCarriage!(change);

@@ -255,17 +255,28 @@ impl Workbench {
                 .tracker,
             ]);
         }
+        let mut authority_scopes = crate::identity::workflow_authority_scopes(context)?;
+        authority_scopes.extend([
+            LIBRARY_SCOPE.into(),
+            ORG_SCOPE.into(),
+            crate::federation::handoff_scope(project),
+        ]);
         let (authority, mut basis) = self
             .store_ref()
             .read_for_dispatch(
-                &[
-                    LIBRARY_SCOPE,
-                    ORG_SCOPE,
-                    crate::account_auth::ACCOUNT_AUTH_SCOPE,
-                    crate::mobile_machine_session::SCOPE,
-                    &crate::federation::handoff_scope(project),
-                ],
-                |store| current_project(store, self.home_id(), context, project),
+                &authority_scopes
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                |store| {
+                    current_project(
+                        store,
+                        self.home_id(),
+                        &self.project_owner_resolver(),
+                        context,
+                        project,
+                    )
+                },
             )
             .map_err(query_error)?;
         if let Some(ms) = authority.deadline_ms {
@@ -296,6 +307,7 @@ impl Workbench {
             let (snapshot, observed) = capture(
                 self.store_ref(),
                 self.home_id(),
+                &self.project_owner_resolver(),
                 context,
                 project,
                 &queue,
@@ -331,6 +343,7 @@ impl Workbench {
         let (snapshot, basis) = capture(
             self.store_ref(),
             self.home_id(),
+            &self.project_owner_resolver(),
             context,
             project,
             queue,

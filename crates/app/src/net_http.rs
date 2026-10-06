@@ -312,6 +312,46 @@ impl HttpClient {
         }
     }
 
+    /// JSON `PUT` with custom headers, returning `(status, body)` as
+    /// [`Self::post_json_headers`] does.
+    pub fn put_json_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &str,
+    ) -> Result<(u16, String), String> {
+        let mut req = self.agent.put(url).set("Content-Type", "application/json");
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        match req.send_string(body) {
+            Ok(resp) => Ok((resp.status(), resp.into_string().unwrap_or_default())),
+            Err(ureq::Error::Status(code, resp)) => {
+                Ok((code, resp.into_string().unwrap_or_default()))
+            }
+            Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
+        }
+    }
+
+    /// `DELETE` with custom headers, returning `(status, body)`.
+    pub fn delete_headers(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<(u16, String), String> {
+        let mut req = self.agent.delete(url);
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        match req.call() {
+            Ok(resp) => Ok((resp.status(), resp.into_string().unwrap_or_default())),
+            Err(ureq::Error::Status(code, resp)) => {
+                Ok((code, resp.into_string().unwrap_or_default()))
+            }
+            Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
+        }
+    }
+
     /// JSON `PUT`, returning `(status, body)`. A transport failure is `Err`; an HTTP error status
     /// is `Ok` with that status (the caller inspects it). Used by the blind-directory publish
     /// (`PUT /directory/:root`, ADR 0054).

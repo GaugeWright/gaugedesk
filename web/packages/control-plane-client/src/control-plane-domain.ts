@@ -524,6 +524,7 @@ export interface SearchHit {
  *  delta projection on receipt. */
 export interface WorkspaceChange {
     readonly record: "archetype" | "project" | "placement" | "chat" | "workstream" | "work_target";
+    /** Empty for a full authorized refresh after access changes or missed events. */
     readonly id: string;
     readonly op: "upsert" | "tombstone";
 }

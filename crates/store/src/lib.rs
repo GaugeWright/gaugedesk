@@ -30,6 +30,9 @@ pub mod home_reference_journal;
 mod home_reference_storage;
 pub mod project_authority;
 mod record_admission;
+mod record_admission_pair;
+pub use record_admission_pair::RecordedLifecyclePair;
+mod record_admission_prefix;
 #[cfg(test)]
 mod record_claim_tests;
 mod request_admission;
@@ -244,7 +247,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 10;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 11;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -631,6 +634,21 @@ const MIGRATIONS: &[Migration] = &[
                         OR public_key = NEW.public_key)
                   BEGIN SELECT RAISE(ABORT, 'project authority key is immutable'); END;",
     },
+    Migration {
+        version: 11,
+        name: "recorded-pair-provenance",
+        // Only selected atomic publication creates this binding. A later event
+        // append cannot retrofit provenance onto an older command receipt.
+        sql: "CREATE TABLE IF NOT EXISTS command_pair_results (
+                 command_id TEXT PRIMARY KEY REFERENCES commands(command_id),
+                 command_scope TEXT NOT NULL,
+                 command_key TEXT NOT NULL,
+                 result_scope TEXT NOT NULL,
+                 marker_position INTEGER NOT NULL CHECK (marker_position >= 0),
+                 marker_sha256 TEXT NOT NULL CHECK (length(marker_sha256) = 64),
+                 UNIQUE (command_scope, command_key)
+             );",
+    },
 ];
 
 /// The fail-closed downgrade-guard refusal (DR-0054 Phase B): diagnosable — it
@@ -977,9 +995,42 @@ impl Store {
         idempotency_key: &str,
         snapshot_json: &str,
     ) -> Result<(CommandRecord, bool), AdmitError> {
+        self.claim_command_with_basis(command_id, scope_id, idempotency_key, snapshot_json, None)
+    }
+
+    /// Claim exact caller intent under current product and process standing.
+    /// This authorizes only the receipt commit, never later native execution.
+    pub fn claim_command_against(
+        &mut self,
+        command_id: &str,
+        scope_id: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        basis: &command_dispatch::DispatchReadBasis,
+    ) -> Result<(CommandRecord, bool), AdmitError> {
+        self.claim_command_with_basis(
+            command_id,
+            scope_id,
+            idempotency_key,
+            snapshot_json,
+            Some(basis),
+        )
+    }
+
+    fn claim_command_with_basis(
+        &mut self,
+        command_id: &str,
+        scope_id: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        basis: Option<&command_dispatch::DispatchReadBasis>,
+    ) -> Result<(CommandRecord, bool), AdmitError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(basis) = basis {
+            command_dispatch::check_dispatch_basis(&tx, &self.path, basis)?;
+        }
         tx.prepare_cached(
             "INSERT OR IGNORE INTO commands
              (command_id, scope_id, idempotency_key, status, snapshot_json)
@@ -1012,8 +1063,36 @@ impl Store {
         if claimed {
             record.status = "processing".to_string();
         }
+        if let Some(basis) = basis {
+            command_dispatch::check_dispatch_basis(&tx, &self.path, basis)?;
+        }
         tx.commit()?;
         Ok((record, claimed))
+    }
+
+    /// Record failure only for an unfinished, unreceipted command. A denied
+    /// response after publication cannot rewrite the already committed fact.
+    pub fn set_unreceipted_command_failure(
+        &mut self,
+        command_id: &str,
+        status: &str,
+    ) -> Result<bool, AdmitError> {
+        if !matches!(status, "rejected" | "expired") {
+            return Err(AdmitError::Rejected(gaugedesk_core::Rejection {
+                reason: "command failure requires rejected or expired status",
+            }));
+        }
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE commands SET status = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE command_id = ?1 AND status IN ('received', 'processing')
+             AND NOT EXISTS (SELECT 1 FROM command_receipts r
+                 WHERE r.scope_id = commands.scope_id
+                   AND r.command_key = commands.idempotency_key)",
+            )?
+            .execute(params![command_id, status])?;
+        Ok(changed == 1)
     }
 
     pub fn set_command_status(
@@ -1231,6 +1310,25 @@ impl Store {
             None,
             &[],
             Some((expected_scope, expected_position)),
+        )
+    }
+
+    /// Observe an exact uncompleted command claim in one read. A lagging
+    /// mutable status cannot make a command with a durable receipt pending.
+    /// This is retained intent evidence, never an execution grant.
+    pub fn pending_command_matches(
+        &self,
+        command_id: &str,
+        scope_id: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+    ) -> Result<bool, AdmitError> {
+        crate::record_admission::pending_command_matches(
+            &self.conn,
+            command_id,
+            scope_id,
+            idempotency_key,
+            snapshot_json,
         )
     }
 
@@ -2321,6 +2419,55 @@ mod tests {
         assert_eq!(store.synchronous().unwrap(), 1, "NORMAL == 1");
     }
 
+    #[test]
+    fn main_v10_upgrades_to_recorded_pairs_without_replacing_existing_authorities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main-v10.sqlite");
+        let original = {
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            store.conn.execute_batch("DROP TABLE command_pair_results; DELETE FROM schema_migrations WHERE version=11;").unwrap();
+            store.conn.execute("INSERT INTO home_reference_journal_bindings(project_id,home_id,incarnation) VALUES ('original-project','original-home',?1)", ["a".repeat(32)]).unwrap();
+            store.conn.execute("INSERT INTO project_authority_keys(project_id,authority_id,public_key,custody,wrapped_seed) VALUES ('original-project','original-authority',?1,'project-v1',?2)", rusqlite::params![format!("04{}", "a".repeat(128)), vec![42_u8; 32]]).unwrap();
+            let created: String = store
+                .conn
+                .query_row(
+                    "SELECT value FROM store_meta WHERE key='created_at'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(store.schema_version().unwrap(), 10);
+            created
+        };
+        for _ in 0..2 {
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 11);
+            let created: String = store
+                .conn
+                .query_row(
+                    "SELECT value FROM store_meta WHERE key='created_at'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(created, original);
+            assert_eq!(store.conn.query_row("SELECT home_id FROM home_reference_journal_bindings WHERE project_id='original-project'", [], |row| row.get::<_, String>(0)).unwrap(), "original-home");
+            let key = store
+                .project_authority_key("original-project")
+                .unwrap()
+                .unwrap();
+            assert_eq!(key.authority_id, "original-authority");
+            assert_eq!(key.wrapped_seed, vec![42_u8; 32]);
+            let rows: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM command_pair_results", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "upgrade cannot retrofit origin evidence");
+        }
+    }
+
     /// DR-0054 Phase C: a fresh store is created *by* the migration ledger —
     /// every migration applied in order, each recorded, and the exercised v2
     /// step's artifact (`store_meta.created_at`) is really there.
@@ -3321,6 +3468,57 @@ mod tests {
             .unwrap();
         assert!(!mismatch_claimed);
         assert_eq!(mismatch.snapshot_json, r#"{"input":1}"#);
+    }
+
+    #[test]
+    fn command_claim_refuses_stale_expired_revoked_and_foreign_authority_without_writes() {
+        for change in ["stale", "expired", "revoked", "foreign"] {
+            let mut store = Store::open_in_memory().unwrap();
+            let (_, mut basis) = store.read_for_dispatch(&["grants"], |_| Ok(())).unwrap();
+            let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let observed = active.clone();
+            basis = basis
+                .with_process_guard(move || observed.load(std::sync::atomic::Ordering::Acquire));
+            // A replay is also an authority-bearing disclosure, and a retained
+            // received row cannot be promoted after its standing ends.
+            assert!(
+                store
+                    .claim_command_against("existing", "scope", "existing", "original", &basis)
+                    .unwrap()
+                    .1
+            );
+            store.set_command_status("existing", "received").unwrap();
+            match change {
+                "stale" => {
+                    store.append_record("grants", "grant", "removed").unwrap();
+                }
+                "expired" => {
+                    basis = basis.with_deadline(std::time::UNIX_EPOCH);
+                }
+                "revoked" => active.store(false, std::sync::atomic::Ordering::Release),
+                "foreign" => {
+                    let other = Store::open_in_memory().unwrap();
+                    basis = other.read_for_dispatch(&["grants"], |_| Ok(())).unwrap().1;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                store
+                    .claim_command_against("new", "scope", "new", "new input", &basis)
+                    .is_err(),
+                "{change}"
+            );
+            assert!(store.command("new").unwrap().is_none(), "{change}");
+            assert!(
+                store
+                    .claim_command_against("existing", "scope", "existing", "original", &basis)
+                    .is_err(),
+                "{change}"
+            );
+            let original = store.command("existing").unwrap().unwrap();
+            assert_eq!(original.status, "received", "{change}");
+            assert_eq!(original.snapshot_json, "original", "{change}");
+        }
     }
 
     #[test]

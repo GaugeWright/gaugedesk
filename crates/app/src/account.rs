@@ -1516,6 +1516,12 @@ impl Workbench {
         for session_id in bound_session_ids {
             self.revoke_account_session_id(&session_id);
         }
+        // Its copies of the account's provider links go with it, and nothing
+        // is sealed to it again (DR-0334 §5).
+        let links = crate::account_links::LinkSet::rebuild(self.store_ref(), scope)?;
+        for fact in crate::account_links::forget_device(&links, &id).0 {
+            fact.append(self, scope)?;
+        }
         Ok(Some(record))
     }
 

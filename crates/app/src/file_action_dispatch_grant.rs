@@ -20,8 +20,17 @@ const PROTOCOL: &str = "gaugedesk.native-editor-dispatch-grant.v1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum Source {
-    AccountSession { session_ref: String },
-    MachineController { grant_ref: String },
+    AccountSession {
+        session_ref: String,
+    },
+    MachineController {
+        grant_ref: String,
+    },
+    OfficeStaff {
+        lease_ref: String,
+        process_epoch: String,
+        admission_ref: String,
+    },
 }
 
 impl Source {
@@ -35,6 +44,11 @@ impl Source {
             }),
             ActorAuthentication::MachineController { grant_ref } => Ok(Self::MachineController {
                 grant_ref: grant_ref.clone(),
+            }),
+            ActorAuthentication::OfficeStaff { authority } => Ok(Self::OfficeStaff {
+                lease_ref: authority.source_reference().into(),
+                process_epoch: authority.process_epoch().into(),
+                admission_ref: authority.admission_reference().into(),
             }),
             ActorAuthentication::IdentityProvider => Err(
                 "identity provider has no durable revocable background authentication reference"
@@ -53,8 +67,25 @@ impl Source {
         &self,
         store: &Store,
         actor: &str,
+        live_office: Option<&AuthenticatedActionContext>,
     ) -> Result<AuthenticatedActionContext, AdmitError> {
         match self {
+            Self::OfficeStaff { .. } => {
+                let context = live_office
+                    .filter(|context| context.actor().as_str() == actor)
+                    .ok_or_else(|| {
+                        invalid("dispatch office source has no exact live Home admission")
+                    })?;
+                if &Self::from_request(context)
+                    .map_err(|_| invalid("invalid live office source"))?
+                    != self
+                {
+                    return Err(invalid(
+                        "dispatch office source differs from its live admission",
+                    ));
+                }
+                Ok(context.clone())
+            }
             Self::AccountSession { session_ref } => {
                 Ok(AuthenticatedActionContext::account_session(
                     AuthorityId::new(actor),
@@ -226,7 +257,10 @@ fn load_grant(
                 .map_err(|_| invalid("invalid dispatch command"))?
         || data.original_admission.command_id != command_id
         || grant_scope(home, command, &data.request_id)? != grant_ref
-        || matches!(data.source, Source::AccountSession { .. }) != data.expires_at_ms.is_some()
+        || matches!(
+            data.source,
+            Source::AccountSession { .. } | Source::OfficeStaff { .. }
+        ) != data.expires_at_ms.is_some()
         || history.first() != Some(&(0, GRANT_KIND.into(), original))
     {
         return Err(invalid("dispatch grant differs from its exact admission"));
@@ -259,10 +293,49 @@ fn load_grant(
     }
 }
 
+pub(super) struct GrantedAuthentication<'a> {
+    pub context: &'a AuthenticatedActionContext,
+    pub live_office: Option<&'a AuthenticatedActionContext>,
+}
+
+/// Inspect only a verified grant to discover its process-local office parent.
+/// Current grant/source standing is checked again in the fenced read below.
+/// Missing live authority never becomes a reconstructed account session.
+pub(super) fn live_office_source(
+    wb: &Workbench,
+    command: &HostActionCommand,
+    grant_ref: &str,
+    roots: &NativeHistoryRoots,
+) -> Result<Option<AuthenticatedActionContext>, AdmitError> {
+    let (grant, revoked) = load_grant(wb.store_ref(), wb.home_id(), command, grant_ref, roots)?
+        .ok_or_else(|| invalid("dispatch grant is not admitted"))?;
+    if revoked {
+        return Err(invalid("dispatch grant is revoked"));
+    }
+    match &grant.body.source {
+        Source::OfficeStaff {
+            lease_ref,
+            process_epoch,
+            admission_ref,
+        } => wb
+            .office_staff_dispatch_context(
+                &grant.body.actor,
+                lease_ref,
+                process_epoch,
+                admission_ref,
+            )
+            .map(Some)
+            .ok_or_else(|| invalid("dispatch office source has no exact live Home admission")),
+        _ => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn current_granted_authority(
     store: &Store,
     home: &HomeId,
-    context: &AuthenticatedActionContext,
+    owners: &crate::project_owner::ProjectOwnerResolver,
+    authentication: GrantedAuthentication<'_>,
     grant_ref: &str,
     command: &HostActionCommand,
     request: &EditorFileSave<'_>,
@@ -270,16 +343,17 @@ pub(super) fn current_granted_authority(
 ) -> Result<(FileAuthority, ActionCause), AdmitError> {
     let (grant, revoked) = load_grant(store, home, command, grant_ref, roots)?
         .ok_or_else(|| invalid("dispatch grant is not admitted"))?;
-    if revoked || context.actor().as_str() != grant.body.actor {
+    if revoked || authentication.context.actor().as_str() != grant.body.actor {
         return Err(invalid(
             "dispatch grant is revoked or belongs to another actor",
         ));
     }
-    let source = grant
-        .body
-        .source
-        .current_context(store, &grant.body.actor)?;
-    let mut authority = current_authority(store, home, &source, request)?;
+    let source =
+        grant
+            .body
+            .source
+            .current_context(store, &grant.body.actor, authentication.live_office)?;
+    let mut authority = current_authority(store, home, owners, &source, request)?;
     if let Some(ceiling) = grant.body.expires_at_ms {
         if ceiling <= crate::account::session_now_ms() {
             return Err(invalid("dispatch grant has expired"));
@@ -624,6 +698,8 @@ impl Workbench {
     /// Resolve a retained address after restart. This observes current authority
     /// but grants no interval of unchecked execution; the driver must pass this
     /// scoped context through native preparation for every subsequent operation.
+    /// An office source additionally requires the original running Home epoch
+    /// and exact live admission; its stored address cannot recreate either.
     pub fn load_editor_file_save_dispatch_authority(
         &mut self,
         inputs: &NativeActionInputCustody,

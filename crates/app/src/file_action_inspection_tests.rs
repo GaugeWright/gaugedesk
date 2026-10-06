@@ -1,4 +1,5 @@
 use super::*;
+use crate::file_action_factory::tests::project_grant;
 use crate::{
     file_action_factory::{
         tests::{home_storage_fixture, membership},
@@ -111,6 +112,7 @@ pub(super) fn save_fixture(root: &std::path::Path, interrupted: bool) -> Fixture
 }
 pub(super) fn reader(wb: &mut Workbench) -> (AuthenticatedActionContext, String) {
     membership(wb, "bob", "owner");
+    project_grant(wb, "bob", crate::org::RecordOp::Upsert);
     let token = wb.mint_account_session("bob", "passkey", 3600).unwrap();
     (wb.authenticate_action_context(&token).unwrap(), token)
 }
@@ -242,6 +244,7 @@ fn saved_input_read_policy_preserves_stricter_original_input_compartments() {
     let mut current = current_target_authority(
         wb.store_ref(),
         wb.home_id(),
+        &wb.project_owner_resolver(),
         &context,
         &NativeTargetIntent {
             chat_id: &chat,

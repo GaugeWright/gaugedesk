@@ -85,6 +85,7 @@ fn correction_result_preserves_original_outcomes_under_an_independent_admitting_
     wb.revoke_account_session(&fixture.author_token);
     wb.revoke_account_session(&bob_token);
     membership(&mut wb, "charlie", "owner");
+    project_grant(&mut wb, "charlie", crate::org::RecordOp::Upsert);
     let token = wb.mint_account_session("charlie", "passkey", 3600).unwrap();
     let charlie = wb.authenticate_action_context(&token).unwrap();
     read_only(&mut wb, &fixture.command);
@@ -277,6 +278,7 @@ fn correction_result_reads_are_current_authorized_metadata_without_runtime_initi
         )
         .is_err());
     membership(&mut wb, "charlie", "owner");
+    project_grant(&mut wb, "charlie", crate::org::RecordOp::Upsert);
     let token = wb.mint_account_session("charlie", "passkey", 3600).unwrap();
     let charlie = wb.authenticate_action_context(&token).unwrap();
     let mut removed = vec![];

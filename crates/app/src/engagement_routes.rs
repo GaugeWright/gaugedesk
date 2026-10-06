@@ -13,7 +13,6 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use futures::Stream;
 use gaugedesk_core::instance::{InstanceCommand, InstanceState};
 use gaugedesk_core::merge::{MergeCommand, MergeState};
 #[cfg(debug_assertions)]
@@ -1470,6 +1469,18 @@ impl Workbench {
             self.publish(id, event);
         }
         Some(result)
+    }
+
+    /// Coordinates for a foreground turn, with no native history import.
+    /// Current task admission owns its original base and all durable startup.
+    pub(crate) fn engagement_turn_location(
+        &mut self,
+        id: &str,
+    ) -> Option<(std::path::PathBuf, broadcast::Sender<ServerEvent>, ChatMode)> {
+        let worktree = self.engagements.get(id)?.path().to_path_buf();
+        let mode = self.library_chat_mode(id);
+        let sender = self.sender(id);
+        Some((worktree, sender, mode))
     }
 
     pub fn engagement_task_context(&mut self, id: &str) -> Option<EngagementTaskContext> {
@@ -3218,6 +3229,8 @@ mod raw_model_context_tests {
             let chat = wb
                 .create_default_engagement(format!("{name}-file-chat"), name.to_owned())
                 .unwrap_or_else(|_| panic!("create file witness chat"));
+            let project = wb.library.project_of_chat(&chat.id).unwrap().to_owned();
+            wb.hold_session_for_tests(&project);
             let path = wb.engagement_workspace_path(&chat.id, "notes.txt");
             let bytes = b"retained context\n";
             let source = format!(
@@ -3683,6 +3696,7 @@ pub(crate) async fn post_choice_answer(
             crate::workbench_auth::req_scope(&headers),
         )
     };
+    let client_build = crate::client_admission::ClientBuild::from_headers(&headers);
     let wb2 = wb.clone();
     let id2 = id.clone();
     let prompt = crate::choice_prompt::continuation_text(&card);
@@ -3699,12 +3713,14 @@ pub(crate) async fn post_choice_answer(
                 mode: context.mode,
                 authenticated_actor: Some(&respondent),
                 authenticated_context: authenticated.as_ref(),
+                client_build: Some(&client_build),
                 local_operator: false,
                 contribution_by: None,
                 account_scope: &account_scope,
                 tenant_scope: &tenant_scope,
                 account_bearer: account_bearer.as_deref(),
                 runtime_command_id: Some(&command_id),
+                original_http_command: None,
                 harness_factory: None,
             },
         )
@@ -4212,13 +4228,30 @@ pub(crate) async fn post_merge_command(
 pub(crate) async fn engagement_events(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    headers: HeaderMap,
+    context: Option<axum::Extension<crate::identity::AuthenticatedActionContext>>,
+) -> axum::response::Response {
+    if let Some(axum::Extension(context)) = context {
+        if matches!(
+            context.authentication(),
+            crate::identity::ActorAuthentication::OfficeStaff { .. }
+        ) {
+            return crate::office_home_admission::chat_stream::response(
+                wb,
+                &context,
+                id,
+                crate::client_admission::ClientBuild::from_headers(&headers),
+            );
+        }
+    }
     let rx = wb.lock_unpoisoned().sender(&id).subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|msg| {
         msg.ok()
-            .map(|ev: ServerEvent| Ok(Event::default().data(ev.to_json())))
+            .map(|ev: ServerEvent| Ok::<_, Infallible>(Event::default().data(ev.to_json())))
     });
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// Live **workspace** event stream (SSE): a "changed" ping whenever the library
@@ -4228,13 +4261,37 @@ pub(crate) async fn engagement_events(
 /// on, not a poll). Subscribes to the reserved `library` stream key.
 pub(crate) async fn workspace_events(
     State(wb): State<SharedWorkbench>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    headers: HeaderMap,
+    context: Option<axum::Extension<crate::identity::AuthenticatedActionContext>>,
+) -> axum::response::Response {
+    if let Some(axum::Extension(context)) = context {
+        if matches!(
+            context.authentication(),
+            crate::identity::ActorAuthentication::OfficeStaff { .. }
+        ) {
+            return crate::office_home_admission::workspace_stream::response(
+                wb,
+                &context,
+                crate::client_admission::ClientBuild::from_headers(&headers),
+            );
+        }
+    }
     let rx = wb.lock_unpoisoned().workspace_sender().subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| {
+    // Each subscriber hears only of what it can see (DR-0268 §5).
+    let bearer = crate::net_http::bearer(&headers).map(str::to_owned);
+    let shared = wb.clone();
+    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
         msg.ok()
-            .map(|ev: ServerEvent| Ok(Event::default().data(ev.to_json())))
+            .filter(|ev: &ServerEvent| {
+                shared
+                    .lock_unpoisoned()
+                    .workspace_event_visible(bearer.as_deref(), ev)
+            })
+            .map(|ev: ServerEvent| Ok::<_, Infallible>(Event::default().data(ev.to_json())))
     });
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -4279,6 +4336,7 @@ fn task_failure_status(error: &crate::engine::EngineError) -> StatusCode {
 
 /// Task an engagement: drive one governed WhippleScript turn in its worktree,
 /// streaming operational events live (SSE) and returning the diff + output.
+#[allow(clippy::too_many_arguments)] // Independent request authority and original command extractors.
 pub(crate) async fn post_task(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
@@ -4286,15 +4344,30 @@ pub(crate) async fn post_task(
     actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     authenticated: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
     operator: Option<axum::extract::Extension<crate::account_signin::DesktopOperatorPlane>>,
+    original: Option<axum::extract::Extension<crate::command_idempotency::ClaimedHttpCommand>>,
     Json(body): Json<TaskBody>,
 ) -> impl IntoResponse {
+    let original = original.map(|axum::extract::Extension(original)| original);
+    if authenticated.as_ref().is_some_and(|context| {
+        matches!(
+            context.authentication(),
+            crate::identity::ActorAuthentication::OfficeStaff { .. }
+        )
+    }) && original.is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "office task requires its original HTTP command claim",
+        )
+            .into_response();
+    }
     // Brief lock: confirm the engagement and grab its worktree, live sender, mode.
     let (worktree, sender, mode) = {
         let mut g = wb.lock_unpoisoned();
-        let Some(context) = g.engagement_task_context(&id) else {
+        let Some(location) = g.engagement_turn_location(&id) else {
             return (StatusCode::NOT_FOUND, "no such engagement").into_response();
         };
-        (context.worktree, context.sender, context.mode)
+        location
     };
 
     let account_bearer = crate::net_http::bearer(&headers).map(str::to_owned);
@@ -4305,6 +4378,7 @@ pub(crate) async fn post_task(
             crate::workbench_auth::req_scope(&headers),
         )
     };
+    let client_build = crate::client_admission::ClientBuild::from_headers(&headers);
     let wb2 = wb.clone();
     let task = body.prompt;
     let images = body.images;
@@ -4324,12 +4398,14 @@ pub(crate) async fn post_task(
                 mode,
                 authenticated_actor: actor.as_ref(),
                 authenticated_context: authenticated.as_ref(),
+                client_build: Some(&client_build),
                 local_operator,
                 contribution_by: None,
                 account_scope: &account_scope,
                 tenant_scope: &tenant_scope,
                 account_bearer: account_bearer.as_deref(),
                 runtime_command_id: None,
+                original_http_command: original.as_ref(),
                 harness_factory: None,
             },
         )

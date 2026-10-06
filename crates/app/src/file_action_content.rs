@@ -24,6 +24,7 @@ impl Workbench {
         path: &str,
     ) -> Result<NativeFileContentObservation, String> {
         let home = self.home_id().clone();
+        let owners = self.project_owner_resolver();
         let account_scopes = account_authority_scopes(context)?;
         let (authority, basis) = self
             .store_ref()
@@ -40,6 +41,7 @@ impl Workbench {
                     current_target_authority(
                         store,
                         &home,
+                        &owners,
                         context,
                         &NativeTargetIntent {
                             chat_id: chat,
@@ -58,7 +60,7 @@ impl Workbench {
             .native_file_read_target(&authority.workspace_path)
             .map_err(|e| format!("{e:?}"))?;
         let basis = authority
-            .bind_deadline(basis)
+            .bind_deadline(self.store_ref(), basis)
             .map_err(|e| format!("file read deadline refused: {e:?}"))?;
         let observer = self
             .store_ref()

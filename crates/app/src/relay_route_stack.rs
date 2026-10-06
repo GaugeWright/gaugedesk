@@ -7,15 +7,18 @@
 //! leg is published in the account's directory record, which anyone may read,
 //! so everything the operator could do was open to anyone holding it.
 //!
-//! This is the relay leg's alone. It admits only the Home's owner:
+//! This is the relay leg's alone. It admits any account signed in on this
+//! computer, as itself (DR-0328 §6):
 //!
 //! 1. the Hub says whose account the caller's bearer is
-//!    ([`crate::account_identity`]), and it must be the Home's owner;
+//!    ([`crate::account_identity`]), and that account must hold a live
+//!    sign-in here — any other is a stranger, answered and hung up on;
 //! 2. `POST /home/admissions` then mints an admission bound to that account,
 //!    and every later call must carry it, as on a hosted Home (`HOME-1`);
-//! 3. the call is served by the ordinary router under the owner's own Home
-//!    session — the one the desktop's window would hold — so every handler
-//!    treats it exactly as it treats the owner at the computer.
+//! 3. the call is served by the ordinary router under that account's own
+//!    relay session, so it reaches only the projects that account owns or
+//!    holds a grant to, exactly as at the computer. The computer's own
+//!    account records never cross ([`local_only`]).
 //!
 //! Anything the caller brought besides is removed before it gets there.
 
@@ -200,10 +203,25 @@ fn peer_of(request: &Request) -> Option<SocketAddr> {
 }
 
 /// Whether a route is this computer's own business, and so is never served
-/// over the relay even to the owner (DR-0206 §4).
-fn local_only(method: &Method, path: &str) -> bool {
-    // Signing this computer in and out of the Hub: done at it, not to it.
-    (path.starts_with("/account/hub-session") && method != Method::GET)
+/// over the relay to anyone (DR-0206 §4).
+///
+/// Any account the Hub names may cross now (DR-0328 §6), so the computer's
+/// own account records — its signed-in accounts, Homes, routes, devices,
+/// sessions, directory, organizations and Account Settings — never cross.
+/// Only the caller's own provider credentials, logins, boxes and settings
+/// do, which a desktop keys by the caller's account.
+fn local_only(_method: &Method, path: &str) -> bool {
+    let caller_scoped = [
+        "/account/credentials",
+        "/account/boxes",
+        "/account/settings",
+        "/account/default-model",
+        "/account/oauth/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix));
+    (path.starts_with("/account/") && !caller_scoped)
+        || path.starts_with("/gaugeapps/account-settings/")
         // The login shell and the test fixtures have no remote caller.
         || path.starts_with("/auth/")
         || path.starts_with("/test/")
@@ -281,19 +299,29 @@ async fn admit_relay_caller(
         }
     };
 
-    let (owner, home) = {
-        let guard = relay.wb.lock_unpoisoned();
-        (guard.home_owner_account(), guard.home_id().clone())
+    // Any account the Hub names crosses as itself; what it reaches is decided
+    // per project behind this (DR-0328 §6). Only an account signed in on this
+    // computer is served; any other is a stranger here, answered and hung up
+    // on (DR-0302).
+    let signed_in_here = {
+        let wb = relay.wb.clone();
+        let person = account.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::account_signin::hub_standing_for(&wb, &person).is_some()
+        })
+        .await
+        .unwrap_or(false)
     };
-    if owner.as_deref() != Some(account.as_str()) {
+    if !signed_in_here {
         return hang_up(
             peer,
             refuse(
                 StatusCode::FORBIDDEN,
-                "this Home belongs to another account",
+                "this account is not signed in on this computer",
             ),
         );
     }
+    let home = relay.wb.lock_unpoisoned().home_id().clone();
     let actor = AuthorityId::new(account.clone());
 
     // The admission ceremony is answered here, bound to the account the Hub

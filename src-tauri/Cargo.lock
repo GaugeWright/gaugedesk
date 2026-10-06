@@ -2364,6 +2364,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
+ "whipplescript-core",
  "whipplescript-kernel",
  "whipplescript-store",
 ]
@@ -2431,6 +2432,7 @@ dependencies = [
  "gaugedesk-env",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]
@@ -8435,8 +8437,8 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "whipplescript"
-version = "0.8.0"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=8b040bb10d5f209622faabb1d75d327a8f4b4b25#8b040bb10d5f209622faabb1d75d327a8f4b4b25"
+version = "0.9.0"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=3756c47ce5af4b7909f5f9162bc44294595a1959#3756c47ce5af4b7909f5f9162bc44294595a1959"
 dependencies = [
  "chrono",
  "htmd",
@@ -8463,8 +8465,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-canon"
-version = "0.8.0"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=8b040bb10d5f209622faabb1d75d327a8f4b4b25#8b040bb10d5f209622faabb1d75d327a8f4b4b25"
+version = "0.9.0"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=3756c47ce5af4b7909f5f9162bc44294595a1959#3756c47ce5af4b7909f5f9162bc44294595a1959"
 dependencies = [
  "sha2 0.11.0",
  "tree-sitter",
@@ -8475,8 +8477,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-core"
-version = "0.8.0"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=8b040bb10d5f209622faabb1d75d327a8f4b4b25#8b040bb10d5f209622faabb1d75d327a8f4b4b25"
+version = "0.9.0"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=3756c47ce5af4b7909f5f9162bc44294595a1959#3756c47ce5af4b7909f5f9162bc44294595a1959"
 dependencies = [
  "serde",
  "serde_json",
@@ -8485,8 +8487,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-custody"
-version = "0.8.0"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=8b040bb10d5f209622faabb1d75d327a8f4b4b25#8b040bb10d5f209622faabb1d75d327a8f4b4b25"
+version = "0.9.0"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=3756c47ce5af4b7909f5f9162bc44294595a1959#3756c47ce5af4b7909f5f9162bc44294595a1959"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -8498,8 +8500,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-kernel"
-version = "0.8.0"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=8b040bb10d5f209622faabb1d75d327a8f4b4b25#8b040bb10d5f209622faabb1d75d327a8f4b4b25"
+version = "0.9.0"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=3756c47ce5af4b7909f5f9162bc44294595a1959#3756c47ce5af4b7909f5f9162bc44294595a1959"
 dependencies = [
  "bashkit",
  "chrono",
@@ -8526,8 +8528,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-parser"
-version = "0.8.0"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=8b040bb10d5f209622faabb1d75d327a8f4b4b25#8b040bb10d5f209622faabb1d75d327a8f4b4b25"
+version = "0.9.0"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=3756c47ce5af4b7909f5f9162bc44294595a1959#3756c47ce5af4b7909f5f9162bc44294595a1959"
 dependencies = [
  "serde",
  "serde_json",
@@ -8538,8 +8540,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-remote-execution"
-version = "0.8.0"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=8b040bb10d5f209622faabb1d75d327a8f4b4b25#8b040bb10d5f209622faabb1d75d327a8f4b4b25"
+version = "0.9.0"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=3756c47ce5af4b7909f5f9162bc44294595a1959#3756c47ce5af4b7909f5f9162bc44294595a1959"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -8550,8 +8552,8 @@ dependencies = [
 
 [[package]]
 name = "whipplescript-store"
-version = "0.8.0"
-source = "git+https://github.com/GaugeWright/whipplescript.git?rev=8b040bb10d5f209622faabb1d75d327a8f4b4b25#8b040bb10d5f209622faabb1d75d327a8f4b4b25"
+version = "0.9.0"
+source = "git+https://github.com/GaugeWright/whipplescript.git?rev=3756c47ce5af4b7909f5f9162bc44294595a1959#3756c47ce5af4b7909f5f9162bc44294595a1959"
 dependencies = [
  "rusqlite",
  "serde",

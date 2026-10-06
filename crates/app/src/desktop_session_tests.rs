@@ -33,10 +33,10 @@ fn nobody_signed_in_gets_no_session() {
     assert_eq!(home_session(&wb), None);
 }
 
-/// A signed-in account with no standing here keeps the local posture rather
-/// than being handed a credential every route would refuse.
+/// A signed-in account with no role in this computer's directory still works
+/// here as itself (DR-0328); what it reaches is decided per project.
 #[test]
-fn a_signed_in_account_without_standing_gets_no_session() {
+fn a_signed_in_account_without_a_role_works_here_as_itself() {
     let (_root, wb) = open();
     let owner = MembershipRecord {
         id: "the-owner".into(),
@@ -59,7 +59,8 @@ fn a_signed_in_account_without_standing_gets_no_session() {
         .unwrap();
     crate::account_signin::store_session_for_test(&wb);
     claim_if_never_claimed(&wb).unwrap();
-    assert_eq!(home_session(&wb), None, "someone else's Home");
+    let token = home_session(&wb).expect("a session for the signed-in account");
+    assert_eq!(actor(&wb, &token).as_deref(), Some("account-root"));
 }
 
 #[test]
@@ -93,11 +94,8 @@ fn losing_standing_or_changing_account_revokes_the_session() {
     let (_root, wb) = signed_in_owner();
     let token = home_session(&wb).unwrap();
     crate::account_signin::store_session_as_for_test(&wb, "someone-else");
-    assert_eq!(
-        home_session(&wb),
-        None,
-        "another account has no standing here"
-    );
+    let theirs = home_session(&wb).expect("another account works here as itself");
+    assert_eq!(actor(&wb, &theirs).as_deref(), Some("someone-else"));
     assert_eq!(
         actor(&wb, &token),
         None,
@@ -125,8 +123,33 @@ fn losing_standing_or_changing_account_revokes_the_session() {
             &serde_json::to_string(&deprovisioned).unwrap(),
         )
         .unwrap();
-    assert_eq!(home_session(&wb), None);
-    assert_eq!(actor(&wb, &again), None);
+    // A role is not standing on a desktop, so losing one keeps the session.
+    assert_eq!(home_session(&wb).as_deref(), Some(again.as_str()));
+}
+
+async fn workspace_projects(app: &axum::Router, bearer: Option<&str>) -> Vec<String> {
+    let mut request = Request::builder().uri("/workspace");
+    if let Some(token) = bearer {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let workspace: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    workspace["projects"]
+        .as_array()
+        .map(|projects| {
+            projects
+                .iter()
+                .filter_map(|project| project["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn get(app: &axum::Router, path: &str, bearer: Option<&str>) -> axum::http::StatusCode {
@@ -192,7 +215,7 @@ async fn the_desktop_ui_reaches_native_and_legacy_routes_as_its_owner() {
 /// Home. The loopback operator shortcut must not serve A's work to B, even if
 /// B sends no bearer, while the separately admitted relay can still serve A.
 #[tokio::test]
-async fn another_selected_account_cannot_borrow_the_local_home() {
+async fn another_selected_account_reaches_none_of_the_first_accounts_projects() {
     let (_root, wb) = signed_in_owner();
     let owner_relay = relay_session(&wb, "account-root").unwrap();
     let app = crate::open_runtime::desktop_operator_plane(wb.clone());
@@ -202,19 +225,15 @@ async fn another_selected_account_cannot_borrow_the_local_home() {
     );
 
     crate::account_signin::store_session_as_for_test(&wb, "someone-else");
-    assert_eq!(home_session(&wb), None);
-    for path in [
-        "/workspace",
-        "/archetypes",
-        "/chats",
-        "/tasks",
-        "/notices",
-        "/account/facilities",
-    ] {
-        assert_eq!(
-            get(&app, path, None).await,
-            axum::http::StatusCode::FORBIDDEN,
-            "{path} exposed the owner's local authority"
+    let theirs = home_session(&wb).expect("it works here as itself");
+    // Its own window session, and the local channel alike, reach none of A's
+    // projects (DR-0328 §2).
+    for bearer in [Some(theirs.as_str()), None] {
+        assert!(
+            !workspace_projects(&app, bearer)
+                .await
+                .contains(&crate::DEFAULT_PROJECT.to_owned()),
+            "A's Personal is not shown to {bearer:?}"
         );
     }
     assert_eq!(
@@ -237,7 +256,7 @@ async fn another_selected_account_cannot_borrow_the_local_home() {
 }
 
 #[tokio::test]
-async fn sign_out_needs_an_explicit_local_selection_before_reopening_the_owner_home() {
+async fn sign_out_shows_the_local_account_not_the_owners_projects() {
     let (_root, wb) = signed_in_owner();
     let app = crate::open_runtime::desktop_operator_plane(wb.clone());
     assert_eq!(
@@ -246,10 +265,11 @@ async fn sign_out_needs_an_explicit_local_selection_before_reopening_the_owner_h
     );
 
     crate::account_signin::post_signin_logout(axum::extract::State(wb.clone())).await;
-    assert_eq!(
-        get(&app, "/workspace", None).await,
-        axum::http::StatusCode::FORBIDDEN,
-        "sign-out must not fall through to the owner's local operator view"
+    assert!(
+        !workspace_projects(&app, None)
+            .await
+            .contains(&crate::DEFAULT_PROJECT.to_owned()),
+        "sign-out shows the local account's work, not the owner's"
     );
     let status = crate::account_signin::get_signin_status(axum::extract::State(wb.clone()))
         .await

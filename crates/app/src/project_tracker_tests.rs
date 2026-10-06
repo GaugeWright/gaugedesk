@@ -19,10 +19,170 @@ fn member(wb: &mut Workbench, actor: &str, role: &str, status: MembershipStatus)
         .unwrap();
 }
 
+fn project_grant(wb: &mut Workbench, actor: &str, project: &str, op: RecordOp) {
+    let grant = crate::org::MemberGrantRecord {
+        id: crate::org::MemberGrantRecord::make_id(actor, project),
+        authority: actor.into(),
+        project_id: project.into(),
+        op,
+    };
+    wb.store_mut()
+        .append_record(ORG_SCOPE, "member_grant", &encode(&grant).unwrap())
+        .unwrap();
+}
+
 fn context(wb: &mut Workbench, actor: &str, role: &str) -> (AuthenticatedActionContext, String) {
     member(wb, actor, role, MembershipStatus::Active);
+    // These resource-sharing fixtures start with explicit project standing.
+    project_grant(wb, actor, DEFAULT_PROJECT, RecordOp::Upsert);
     let token = wb.mint_account_session(actor, "passkey", 3600).unwrap();
     (wb.authenticate_action_context(&token).unwrap(), token)
+}
+
+#[test]
+fn project_standing_fences_home_trackers_resource_grants_and_assignment_recipients() {
+    let directory = tempfile::tempdir().unwrap();
+    let shared = crate::workbench_state::open_lean_workbench(directory.path()).unwrap();
+    let mut wb = shared.lock_unpoisoned();
+    let (alice, _) = context(&mut wb, "alice", "owner");
+    let (bob, _) = context(&mut wb, "bob", "admin");
+    let mut project = wb.library.projects[DEFAULT_PROJECT].clone();
+    crate::project_owner::record_owner(&mut project.extra, "alice");
+    wb.store_mut()
+        .append_record(LIBRARY_SCOPE, "project", &encode(&project).unwrap())
+        .unwrap();
+    project_grant(&mut wb, "alice", DEFAULT_PROJECT, RecordOp::Tombstone);
+    wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    // A recorded owner needs no redundant project grant; organization rank
+    // supplies no access to Home-owned tasks after Bob's grant is removed.
+    wb.read_project_tracker(
+        &alice,
+        DEFAULT_PROJECT,
+        PROJECT_TASKS,
+        TrackerPermission::Read,
+    )
+    .unwrap();
+    member(&mut wb, "alice", "owner", MembershipStatus::Deprovisioned);
+    wb.read_project_tracker(
+        &alice,
+        DEFAULT_PROJECT,
+        PROJECT_TASKS,
+        TrackerPermission::Read,
+    )
+    .expect("the account's own Home tasks do not require directory membership");
+    let (_, recipients, _, _) = wb
+        .prepare_project_tracker_recipients(&alice, DEFAULT_PROJECT, PROJECT_TASKS)
+        .unwrap();
+    assert!(recipients.iter().any(|recipient| recipient == "alice"));
+    member(&mut wb, "alice", "owner", MembershipStatus::Active);
+    project_grant(&mut wb, "bob", DEFAULT_PROJECT, RecordOp::Tombstone);
+    assert!(wb
+        .read_project_tracker(
+            &bob,
+            DEFAULT_PROJECT,
+            PROJECT_TASKS,
+            TrackerPermission::Read
+        )
+        .is_err());
+    wb.declare_project_tracker(
+        &alice,
+        DEFAULT_PROJECT,
+        "private",
+        "declare-private",
+        ResourceAttributes::default(),
+    )
+    .unwrap();
+    let before = wb.store_ref().scope_high_water_marks().unwrap();
+    assert!(wb
+        .request_project_tracker_access(
+            &alice,
+            DEFAULT_PROJECT,
+            "private",
+            "ungranted-recipient",
+            "bob",
+            TrackerPermission::Read
+        )
+        .is_err());
+    assert_eq!(wb.store_ref().scope_high_water_marks().unwrap(), before);
+
+    project_grant(&mut wb, "bob", DEFAULT_PROJECT, RecordOp::Upsert);
+    let read = wb
+        .request_project_tracker_access(
+            &alice,
+            DEFAULT_PROJECT,
+            "private",
+            "read-bob",
+            "bob",
+            TrackerPermission::Read,
+        )
+        .unwrap();
+    wb.decide_project_tracker_access(
+        &alice,
+        DEFAULT_PROJECT,
+        "private",
+        "approve-bob",
+        &read.id,
+        TrackerAccessDecision::Approve,
+    )
+    .unwrap();
+    wb.read_project_tracker(&bob, DEFAULT_PROJECT, "private", TrackerPermission::Read)
+        .unwrap();
+    let (_, recipients, _, _) = wb
+        .prepare_project_tracker_recipients(&alice, DEFAULT_PROJECT, "private")
+        .unwrap();
+    assert!(recipients.iter().any(|recipient| recipient == "bob"));
+    let pending = wb
+        .request_project_tracker_access(
+            &alice,
+            DEFAULT_PROJECT,
+            "private",
+            "pending-contribution",
+            "bob",
+            TrackerPermission::Contribute,
+        )
+        .unwrap();
+    let (_, stale) = capture(
+        wb.store_ref(),
+        wb.home_id(),
+        &wb.project_owner_resolver(),
+        &alice,
+        DEFAULT_PROJECT,
+        "private",
+        Some("stale-request"),
+    )
+    .unwrap();
+
+    project_grant(&mut wb, "bob", DEFAULT_PROJECT, RecordOp::Tombstone);
+    assert!(wb
+        .read_project_tracker(&bob, DEFAULT_PROJECT, "private", TrackerPermission::Read)
+        .is_err());
+    let (_, recipients, _, _) = wb
+        .prepare_project_tracker_recipients(&alice, DEFAULT_PROJECT, "private")
+        .unwrap();
+    assert!(!recipients.iter().any(|recipient| recipient == "bob"));
+    assert!(wb.store_mut().with_dispatch_basis(&stale, || ()).is_err());
+    // An outstanding resource request cannot be approved around the new
+    // project membership decision, even by the resource's actual owner.
+    assert!(wb
+        .decide_project_tracker_access(
+            &alice,
+            DEFAULT_PROJECT,
+            "private",
+            "approve-bob-again",
+            &pending.id,
+            TrackerAccessDecision::Approve
+        )
+        .is_err());
+
+    project_grant(&mut wb, "bob", DEFAULT_PROJECT, RecordOp::Upsert);
+    member(&mut wb, "bob", "admin", MembershipStatus::Deprovisioned);
+    assert!(wb
+        .read_project_tracker(&bob, DEFAULT_PROJECT, "private", TrackerPermission::Read)
+        .is_err());
+    let (_, recipients, _, _) = wb
+        .prepare_project_tracker_recipients(&alice, DEFAULT_PROJECT, "private")
+        .unwrap();
+    assert!(!recipients.iter().any(|recipient| recipient == "bob"));
 }
 
 #[test]
@@ -79,6 +239,7 @@ fn tracker_identity_is_workspace_owned_and_does_not_grant_admins_payload_access(
 
     let mut project = wb.library.projects[DEFAULT_PROJECT].clone();
     project.id = "other-project".into();
+    crate::project_owner::record_owner(&mut project.extra, "bob");
     project.is_default = false;
     let mut workspace = wb.library.project_collaboration_workspaces[DEFAULT_PROJECT].clone();
     workspace.project_id = project.id.clone();
@@ -398,6 +559,7 @@ fn authority_changes_and_handoff_pause_prevent_tracker_writes() {
     let (_, stale) = capture(
         wb.store_ref(),
         wb.home_id(),
+        &wb.project_owner_resolver(),
         &alice,
         DEFAULT_PROJECT,
         "tasks",
@@ -590,6 +752,7 @@ fn new_access_scopes_are_fenced_and_orphaned_evidence_is_refused() {
     let (_, captured) = capture(
         wb.store_ref(),
         wb.home_id(),
+        &wb.project_owner_resolver(),
         &alice,
         DEFAULT_PROJECT,
         "tasks",
@@ -836,13 +999,17 @@ fn desktop_account_and_local_turns_bind_the_real_task_filer() {
             mode: turn.mode,
             authenticated_actor: None,
             authenticated_context: None,
+            client_build: None,
             contribution_by: None,
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,
             account_bearer: Some(&token),
             local_operator: false,
             runtime_command_id: None,
-            harness_factory: Some(Arc::new(FilingFactory(observed.clone()))),
+            original_http_command: None,
+            harness_factory: Some(crate::engine::TurnHarnessFactory::Custom(Arc::new(
+                FilingFactory(observed.clone()),
+            ))),
         },
     );
     let (actor, id) = observed.lock().unwrap().clone().unwrap();
@@ -874,13 +1041,17 @@ fn desktop_account_and_local_turns_bind_the_real_task_filer() {
             mode: local_turn.mode,
             authenticated_actor: None,
             authenticated_context: None,
+            client_build: None,
             contribution_by: None,
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,
             account_bearer: None,
             local_operator: true,
             runtime_command_id: None,
-            harness_factory: Some(Arc::new(FilingFactory(local_observed.clone()))),
+            original_http_command: None,
+            harness_factory: Some(crate::engine::TurnHarnessFactory::Custom(Arc::new(
+                FilingFactory(local_observed.clone()),
+            ))),
         },
     );
     let (actor, id) = local_observed.lock().unwrap().clone().unwrap();
@@ -894,4 +1065,58 @@ fn desktop_account_and_local_turns_bind_the_real_task_filer() {
         .issues
         .iter()
         .any(|issue| issue.id == id && issue.assigned_to.is_none()));
+}
+
+#[test]
+fn prepared_tracker_authority_fences_the_actual_account_device() {
+    let root = tempfile::tempdir().unwrap();
+    let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+    let mut wb = shared.lock_unpoisoned();
+    let (alice, token) = context(&mut wb, "alice", "owner");
+    wb.ensure_project_tasks_tracker(DEFAULT_PROJECT).unwrap();
+    let scope = crate::account::account_scope("alice");
+    let mut device = crate::account::DeviceRecord {
+        id: "tracker-device".into(),
+        op: crate::account::RecordOp::Upsert,
+        label: "Tracker fixture".into(),
+        kind: crate::account::DeviceKind::Computer,
+        subkey_pubkey: "fixture-key".into(),
+        status: crate::account::DeviceStatus::Active,
+        enrolled_at: 1,
+    };
+    wb.upsert_account_device_in(&scope, &device).unwrap();
+    assert!(wb.bind_account_session_device(
+        &crate::account_session::session_id(&token),
+        "alice",
+        &device.id
+    ));
+    let (_, prepared) = capture(
+        wb.store_ref(),
+        wb.home_id(),
+        &wb.project_owner_resolver(),
+        &alice,
+        DEFAULT_PROJECT,
+        PROJECT_TASKS,
+        None,
+    )
+    .unwrap();
+    assert!(wb.store_mut().with_dispatch_basis(&prepared, || ()).is_ok());
+    let before = wb.store_ref().scope_high_water_marks().unwrap();
+    device.status = crate::account::DeviceStatus::Revoked;
+    wb.upsert_account_device_in(&scope, &device).unwrap();
+    let after = wb.store_ref().scope_high_water_marks().unwrap();
+    assert_eq!(
+        before.get(crate::account_auth::ACCOUNT_AUTH_SCOPE),
+        after.get(crate::account_auth::ACCOUNT_AUTH_SCOPE)
+    );
+    assert!(wb.account_sessions().resolve_now(&token).is_some());
+    assert!(wb
+        .read_project_tracker_backlog(&alice, DEFAULT_PROJECT, PROJECT_TASKS)
+        .is_err());
+    assert!(wb
+        .store_mut()
+        .with_dispatch_basis(&prepared, || panic!(
+            "revoked device published prepared tracker work"
+        ))
+        .is_err());
 }

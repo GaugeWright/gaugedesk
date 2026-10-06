@@ -153,6 +153,7 @@ fn personal_tasks_follow_actual_assignment_status_and_current_read_authority() {
     let (_root, shared, context, invocation, request) = completion::setup();
     let mut wb = shared.lock_unpoisoned();
     wb.store_mut().append_record(crate::org::ORG_SCOPE, "membership", &serde_json::json!({"id":"reader", "op":"upsert", "org_id":crate::org::ORG_ID, "authority":"reader", "email":"", "role":"admin", "status":"active", "managed_by_scim":false}).to_string()).unwrap();
+    project_grant(&mut wb, "reader", DEFAULT_PROJECT);
     let token = wb.mint_account_session("reader", "passkey", 3600).unwrap();
     let reader = wb.authenticate_action_context(&token).unwrap();
     let mut native = stores(&wb, &invocation);
@@ -401,6 +402,7 @@ fn discovery_and_backlog_require_current_read_grant_not_administrator_membership
     let (_root, shared, context, _invocation, request) = completion::setup();
     let mut wb = shared.lock_unpoisoned();
     wb.store_mut().append_record(crate::org::ORG_SCOPE, "membership", &serde_json::json!({"id":"reader", "op":"upsert", "org_id":crate::org::ORG_ID, "authority":"reader", "email":"", "role":"admin", "status":"active", "managed_by_scim":false}).to_string()).unwrap();
+    project_grant(&mut wb, "reader", DEFAULT_PROJECT);
     let token = wb.mint_account_session("reader", "passkey", 3600).unwrap();
     let reader = wb.authenticate_action_context(&token).unwrap();
     assert!(wb

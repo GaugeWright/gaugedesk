@@ -3667,14 +3667,14 @@ async fn context_upload_refuses_an_ambiguous_or_empty_file() {
 #[tokio::test]
 async fn streamed_upload_lands_the_exact_bytes() {
     let (_d, wb) = lean_workbench();
-    let app = open_control_plane(wb);
+    let app = open_control_plane(wb.clone());
     let (s, _) = send(&app, "POST", "/chats", Some(r#"{"id":"stream-chat"}"#)).await;
     assert_eq!(s, StatusCode::CREATED);
 
     // Larger than the buffered route's whole-body ceiling would comfortably
     // allow, and not valid UTF-8, so neither path could have carried it before.
-    let mut recording = Vec::with_capacity(3 * 1024 * 1024);
-    for i in 0..(3 * 1024 * 1024u32) {
+    let mut recording = Vec::with_capacity(9 * 1024 * 1024);
+    for i in 0..(9 * 1024 * 1024u32) {
         recording.push((i % 251) as u8);
     }
     assert!(std::str::from_utf8(&recording).is_err());
@@ -3687,6 +3687,38 @@ async fn streamed_upload_lands_the_exact_bytes() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "streamed upload accepted: {body}");
+    let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let resource = response["resource"].as_str().unwrap();
+    let imports =
+        crate::resource_store::context_imports(wb.lock_unpoisoned().store_ref(), "stream-chat")
+            .unwrap();
+    let import = &imports[resource];
+    assert!(import.complete);
+    assert_eq!(import.files.len(), 1);
+    {
+        let caller = crate::command_idempotency::caller_hash(&axum::http::HeaderMap::new());
+        let (scope, command_id) = crate::command_idempotency::command_identity(
+            &axum::http::Method::POST,
+            "/chats/stream-chat/context/stream",
+            &caller,
+            "stream-key-1",
+        );
+        let guard = wb.lock_unpoisoned();
+        let command = guard
+            .store_ref()
+            .command_for_key(&scope, "stream-key-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.command_id, command_id);
+        assert_eq!(command.status, "applied");
+    }
+    let imported_path = wb
+        .lock_unpoisoned()
+        .engagement_workspace_path("stream-chat", "take.wav");
+    assert_eq!(
+        import.files[&imported_path],
+        whipplescript_store::stable_hash_bytes_hex(&recording)
+    );
 
     let (s, served) = send_bytes(&app, "GET", "/chats/stream-chat/file?path=take.wav").await;
     assert_eq!(s, StatusCode::OK);
@@ -3737,6 +3769,52 @@ async fn streamed_upload_refuses_a_replay_and_a_reused_key() {
         body.contains("key-reused-with-different-input"),
         "and says which refusal it is: {body}"
     );
+}
+
+#[tokio::test]
+async fn streamed_upload_receipt_binds_all_declared_resource_meaning() {
+    let (_d, wb) = lean_workbench();
+    let app = open_control_plane(wb.clone());
+    assert_eq!(
+        send(&app, "POST", "/chats", Some(r#"{"id":"meaning-chat"}"#))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+    let original = "/chats/meaning-chat/context/stream?name=a.bin";
+    assert_eq!(
+        send_stream(&app, original, b"same payload".to_vec(), "meaning-key")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    for changed in [
+        "name=b.bin",
+        "name=a.bin&target_id=another-target",
+        "name=a.bin&classification=pii",
+        "name=a.bin&region=another-region",
+    ] {
+        let route = format!("/chats/meaning-chat/context/stream?{changed}");
+        let (status, body) =
+            send_stream(&app, &route, b"same payload".to_vec(), "meaning-key").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{changed}: {body}");
+        assert!(
+            body.contains("key-reused-with-different-input"),
+            "{changed}: {body}"
+        );
+    }
+    assert_eq!(
+        wb.lock_unpoisoned()
+            .read_engagement_file("meaning-chat", "a.bin")
+            .unwrap()
+            .unwrap(),
+        "same payload"
+    );
+    assert!(wb
+        .lock_unpoisoned()
+        .read_engagement_file("meaning-chat", "b.bin")
+        .unwrap()
+        .is_err());
 }
 
 /// A refused upload admits nothing and leaves nothing staged.
@@ -5981,6 +6059,101 @@ fn deleting_a_forked_ancestor_defers_crypto_erasure_until_the_last_descendant() 
         .records("era-c", "transcript")
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn legacy_question_keys_follow_actual_chat_deletion_and_ancestor_reachability() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("question-erasure.sqlite");
+    let keys = dir.path().join("keys");
+    let vault = Arc::new(content_vault::ContentVault::new(
+        keys.clone(),
+        Box::new(at_rest::LoopbackKeyWrap::new([3u8; 32])),
+    ));
+    let store = Store::open(database.to_str().unwrap())
+        .unwrap()
+        .with_codec(vault.clone());
+    let mut wb = Workbench::new(store).with_content_vault(vault);
+    wb.write_chat_record(lineage_chat("question-parent", None, None));
+    let (_, cut) = append_turn(
+        &mut wb,
+        "question-parent",
+        "Synthetic parent",
+        "Synthetic reply",
+    );
+    wb.write_chat_record(lineage_chat(
+        "question-child",
+        Some("question-parent"),
+        Some(cut),
+    ));
+    append_turn(
+        &mut wb,
+        "question-child",
+        "Synthetic child",
+        "Synthetic reply",
+    );
+    wb.write_chat_record(lineage_chat("question-other", None, None));
+    for chat in ["question-parent", "question-child", "question-other"] {
+        let id = wb
+            .ask_question(chat, "Synthetic private question", &[], None, false)
+            .unwrap();
+        wb.answer_question(chat, &id, "Synthetic private answer", "synthetic-clinician")
+            .unwrap();
+        assert_eq!(wb.take_undelivered_answers(chat).len(), 1);
+    }
+    assert!(wb.delete_chat_cascade("question-parent"));
+    assert!(!wb.library.chats.contains_key("question-parent"));
+    assert_eq!(
+        crate::agent_question::list(wb.store_ref(), "question-parent")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        crate::agent_question::list(wb.store_ref(), "question-other")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(wb.delete_chat_cascade("question-child"));
+    for chat in ["question-parent", "question-child"] {
+        assert!(crate::agent_question::list(wb.store_ref(), chat)
+            .unwrap()
+            .is_empty());
+        assert!(wb.content_scope_erased(&crate::agent_question::question_scope(chat)));
+    }
+    assert_eq!(
+        crate::agent_question::list(wb.store_ref(), "question-other")
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(wb);
+    let reopened_vault = Arc::new(content_vault::ContentVault::new(
+        keys,
+        Box::new(at_rest::LoopbackKeyWrap::new([3u8; 32])),
+    ));
+    let mut reopened = Store::open(database.to_str().unwrap())
+        .unwrap()
+        .with_codec(reopened_vault);
+    for chat in ["question-parent", "question-child"] {
+        assert!(crate::agent_question::list(&reopened, chat)
+            .unwrap()
+            .is_empty());
+        assert!(reopened
+            .append_record(
+                &crate::agent_question::question_scope(chat),
+                crate::agent_question::QUESTION_KIND,
+                "{}"
+            )
+            .is_err());
+    }
+    assert_eq!(
+        crate::agent_question::list(&reopened, "question-other")
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// The deferral is scoped to real inheritance: a pre-ADR-0141 fork edge (no

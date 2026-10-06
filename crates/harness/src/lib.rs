@@ -88,6 +88,10 @@ pub struct TurnOutcome {
     /// Serialized values from the runtime's own published pointer schema.
     /// These name authoritative evidence; they never contain evidence bodies.
     pub runtime_evidence_pointers: Vec<String>,
+    /// Original completed-turn workspace evidence read through the runtime
+    /// owner under current access. Absence is uncertified, never an empty diff.
+    /// This is evidence for admission, not authority to import or publish files.
+    pub runtime_workspace_witness: Option<RuntimeWorkspaceWitness>,
     /// Runtime-certified per-field resource dependencies for the host-visible
     /// output projection. Empty only for legacy/test adapters that do not
     /// publish an IFC signature.
@@ -114,6 +118,26 @@ pub struct TurnOutcome {
     pub error: Option<String>,
 }
 
+/// Neutral carriage of the owner-verified original workspace cut. The receipt
+/// uses the owner's published schema; consumers parse it through that owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkspaceWitness {
+    pub receipt_json: String,
+    pub writes: Vec<WorkspaceWriteWitness>,
+    pub reads: Vec<String>,
+}
+
+/// Exact per-file evidence, with the original full SHA-256 and byte length.
+/// The native admission boundary must still validate kind, path and current
+/// bytes under the original command's authority before admitting a result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceWriteWitness {
+    pub path: String,
+    pub kind: String,
+    pub content_hash: String,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub usage_ref: String,
@@ -138,6 +162,19 @@ pub struct ContextWindowReading {
 pub struct RuntimePosition {
     pub instance_ref: String,
     pub sequence: u64,
+}
+
+/// Original prepared runtime intent for a product-owned phase. This contains
+/// references and input text, never credential secrets or image bytes. It is
+/// customer content when retained, and supplies no execution or recovery grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTurnPreparation {
+    pub input_digest: String,
+    pub command_json: String,
+    pub start_position: RuntimePosition,
+    pub start_head_digest: String,
+    pub workspace_targets: Vec<WorkspaceTargetBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,8 +316,28 @@ pub type ModelContextHandle = Arc<dyn Fn() -> std::io::Result<String> + Send + S
 pub type ExternalToolHandler =
     Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<String, String> + Send + Sync>;
 
-/// The seam between the admission shell and any agent runtime (ADR 0031): drive one
-/// turn → a neutral [`TurnOutcome`]. WhippleScript implements this trait.
+/// Original product authority for one submitted turn. Implementations recheck
+/// current access without replacing its captured parent or extending its bounds.
+pub trait TurnAccess: Send + Sync {
+    fn check_current(&self) -> Result<(), String>;
+}
+
+/// Exact owner-prepared file intent. Capture alone does not prove a successful write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedWorkspaceFile {
+    pub path: String,
+    pub kind: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// Custody of prepared bytes under the original product task, before mutation.
+pub trait WorkspacePayloadRetention: Send + Sync {
+    fn retain(&self, file: &PreparedWorkspaceFile, body: &[u8]) -> Result<(), String>;
+}
+
+/// The seam between the admission shell and any agent runtime (DR-0031): drive one
+/// turn to a neutral [`TurnOutcome`]. WhippleScript implements this trait.
 pub trait Harness: Send {
     /// Refresh the GaugeDesk-authenticated actor for the next turn. Persistent
     /// harnesses must not retain the actor from the turn that created them.
@@ -292,6 +349,20 @@ pub trait Harness: Send {
     /// schedulers use this so crash/retry addresses the same WhippleScript
     /// command and receipt instead of minting a second effect.
     fn bind_runtime_command_id(&mut self, _command_id: Option<&str>) {}
+
+    /// Capture the exact next admitted command and original runtime coordinate
+    /// before execution. The shell must retain this through its original task
+    /// writer; preparing intent itself admits no work or execution permission.
+    fn prepare_runtime_turn(
+        &mut self,
+        _prompt: &str,
+        _images: &[ImageContent],
+    ) -> io::Result<RuntimeTurnPreparation> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime preparation unsupported",
+        ))
+    }
 
     /// The shell may prepend answer context to this turn's user text. Each
     /// exact answer needs a source handle for the server's current read check;
@@ -314,6 +385,33 @@ pub trait Harness: Send {
     /// adapter without one refuses every rename.
     fn bind_target_renamer(&mut self, _renamer: Option<Arc<dyn TargetRenamer>>) {}
     fn bind_external_tool_handler(&mut self, _handler: Option<ExternalToolHandler>) {}
+
+    /// Replace the next turn's access check. Unsupported adapters refuse office
+    /// work rather than accepting a binding they cannot enforce.
+    fn bind_turn_access(&mut self, access: Option<Arc<dyn TurnAccess>>) -> io::Result<()> {
+        if access.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "turn access unsupported",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replace the next turn's file custody callback. Unsupported adapters refuse
+    /// a required binding. Persistent adapters consume it once per turn.
+    fn bind_workspace_payload_retention(
+        &mut self,
+        retention: Option<Arc<dyn WorkspacePayloadRetention>>,
+    ) -> io::Result<()> {
+        if retention.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "workspace payload retention unsupported",
+            ));
+        }
+        Ok(())
+    }
 
     /// Deliver `prompt` (+ any native `images` for this turn), mediate every tool
     /// call through `gate`, stream each [`Observation`] to `sink`, and return the
@@ -529,6 +627,18 @@ pub trait CredentialCapability: Send + Sync + std::fmt::Debug {
     fn resolve(&self, credential_ref: &str) -> io::Result<CredentialMaterial>;
 }
 
+/// Inputs for observing an original completed runtime turn. No provider,
+/// credential, package or execution capability participates in this path.
+pub struct RecordedRuntimeSpec<'a> {
+    pub chat_id: &'a str,
+    pub command_id: &'a str,
+    pub policy_epoch: u64,
+    pub signed_policy_envelope: &'a str,
+    pub preparation: &'a RuntimeTurnPreparation,
+    pub images: &'a [ImageContent],
+    pub access: &'a dyn TurnAccess,
+}
+
 /// Constructs a [`Harness`] per chat from a resolved [`HarnessSpec`] — the
 /// construction seam beside the settled [`Harness::run_turn`] contract.
 ///
@@ -540,6 +650,22 @@ pub trait HarnessFactory: Send + Sync {
     /// The adapter's stable id (`"whip"` or `"scripted-fake"`).
     fn kind(&self) -> &'static str;
     fn create(&self, spec: &HarnessSpec) -> io::Result<Box<dyn Harness>>;
+    /// Read the original command's policy locator. This is not a verified
+    /// envelope or an access grant; observation verifies the selected envelope.
+    fn recorded_policy_epoch(&self, _preparation: &RuntimeTurnPreparation) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "original runtime observation unavailable",
+        ))
+    }
+    /// Observe saved evidence only; absence refuses, never executes.
+    fn observe_recorded_runtime(&self, _spec: &RecordedRuntimeSpec<'_>) -> io::Result<TurnOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "original runtime observation unavailable",
+        ))
+    }
+
     /// Cache the created harness across turns in the workbench's session map?
     /// The scripted fake returns `false` for a fresh harness per turn.
     fn reuse_across_turns(&self) -> bool {
@@ -575,3 +701,74 @@ pub trait HarnessFactory: Send + Sync {
 // Compile-time proof the factory seam stays object-safe — the shell selects a
 // factory per turn and holds it as `Arc<dyn HarnessFactory>`.
 const _: fn(&dyn HarnessFactory) = |_| {};
+
+/// Witness exact semantic model inputs without retaining image contents.
+pub fn runtime_input_digest(prompt: &str, images: &[ImageContent]) -> String {
+    use sha2::{Digest, Sha256};
+    fn field(hash: &mut Sha256, bytes: &[u8]) {
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"gaugedesk.runtime-input/v1\0");
+    field(&mut hash, prompt.as_bytes());
+    hash.update((images.len() as u64).to_be_bytes());
+    for image in images {
+        let kind = match image.kind {
+            ImageKind::Image => "image",
+        };
+        field(&mut hash, kind.as_bytes());
+        field(&mut hash, image.mime_type.as_bytes());
+        field(&mut hash, image.data.as_bytes());
+    }
+    format!("sha256:{:x}", hash.finalize())
+}
+
+#[cfg(test)]
+mod runtime_input_tests {
+    use super::*;
+    #[test]
+    fn witnesses_ordered_model_inputs_and_field_boundaries() {
+        let image = ImageContent {
+            kind: ImageKind::Image,
+            data: "AA==".into(),
+            mime_type: "image/png".into(),
+        };
+        let original = runtime_input_digest("original", std::slice::from_ref(&image));
+        assert_eq!(
+            original,
+            runtime_input_digest("original", std::slice::from_ref(&image))
+        );
+        assert_ne!(
+            original,
+            runtime_input_digest("changed", std::slice::from_ref(&image))
+        );
+        assert_ne!(original, runtime_input_digest("original", &[]));
+        let mut other = image.clone();
+        other.data = "AQ==".into();
+        assert_ne!(original, runtime_input_digest("original", &[other.clone()]));
+        assert_ne!(
+            runtime_input_digest("original", &[image.clone(), other.clone()]),
+            runtime_input_digest("original", &[other.clone(), image.clone()])
+        );
+        other = image.clone();
+        other.mime_type = "image/jpeg".into();
+        assert_ne!(original, runtime_input_digest("original", &[other]));
+        let a = ImageContent {
+            mime_type: "ab".into(),
+            data: "c".into(),
+            ..image.clone()
+        };
+        let b = ImageContent {
+            mime_type: "a".into(),
+            data: "bc".into(),
+            ..image
+        };
+        assert_ne!(
+            runtime_input_digest("original", &[a]),
+            runtime_input_digest("original", &[b])
+        );
+        assert!(original.starts_with("sha256:"));
+        assert_eq!(original.len(), 71);
+    }
+}

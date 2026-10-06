@@ -1693,7 +1693,7 @@ pub struct LinkBody {
 
 /// Link a provider account: seal the OAuth token (`SEC-4`) and store the ciphertext.
 pub async fn post_credential(
-    State(wb): State<SharedWorkbench>,
+    State(shared): State<SharedWorkbench>,
     headers: HeaderMap,
     Json(body): Json<LinkBody>,
 ) -> impl IntoResponse {
@@ -1704,7 +1704,7 @@ pub async fn post_credential(
         )
             .into_response();
     }
-    let mut wb = wb.lock_unpoisoned();
+    let mut wb = shared.lock_unpoisoned();
     let scope = wb.credential_scope_for(net_http::bearer(&headers));
     // The seal is at-rest encryption under this account's seed-derived key (ADR 0053 §4);
     // the per-person access boundary is the scope (INV-1), so a person only ever reads their
@@ -1733,6 +1733,13 @@ pub async fn post_credential(
         Ok(reference) => reference,
         Err(e) => return err_response(e),
     };
+    // A signed-in account's link is the account's: seal it for its other
+    // devices too (DR-0334).
+    let account = crate::account_links_sync::hub_account_for(&wb, net_http::bearer(&headers));
+    drop(wb);
+    if let Some(account) = account {
+        crate::account_links_sync::spawn_publish(&shared, &account, &provider);
+    }
     (
         StatusCode::OK,
         Json(json!({
@@ -2038,14 +2045,20 @@ async fn carry_to_box(
 }
 
 pub async fn delete_credential(
-    State(wb): State<SharedWorkbench>,
+    State(shared): State<SharedWorkbench>,
     headers: HeaderMap,
     Path(provider): Path<String>,
 ) -> impl IntoResponse {
-    let mut wb = wb.lock_unpoisoned();
+    let mut wb = shared.lock_unpoisoned();
     let scope = wb.credential_scope_for(net_http::bearer(&headers));
     if let Err(e) = wb.tombstone_account_credential_in(&scope, provider.clone()) {
         return err_response(e);
+    }
+    // Unlinking a signed-in account's link unlinks it on every device.
+    let account = crate::account_links_sync::hub_account_for(&wb, net_http::bearer(&headers));
+    drop(wb);
+    if let Some(account) = account {
+        crate::account_links_sync::spawn_revoke(&shared, &account, &provider);
     }
     (
         StatusCode::OK,

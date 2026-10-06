@@ -152,13 +152,22 @@ fn member(
     authority: &str,
     project: Option<&str>,
 ) -> AuthenticatedActionContext {
+    member_with_role(wb, authority, project, "member")
+}
+
+fn member_with_role(
+    wb: &mut Workbench,
+    authority: &str,
+    project: Option<&str>,
+    role: &str,
+) -> AuthenticatedActionContext {
     let membership = crate::org::MembershipRecord {
         id: authority.into(),
         op: crate::org::RecordOp::Upsert,
         org_id: crate::org::ORG_ID.into(),
         authority: authority.into(),
         email: String::new(),
-        role: "member".into(),
+        role: role.into(),
         status: crate::org::MembershipStatus::Active,
         managed_by_scim: false,
         team: None,
@@ -187,6 +196,199 @@ fn member(
     }
     let token = wb.mint_account_session(authority, "passkey", 3600).unwrap();
     wb.authenticate_action_context(&token).unwrap()
+}
+
+#[test]
+fn workflow_access_requires_current_project_ownership_or_grant_even_for_org_admins() {
+    let (_root, shared, _local, request) = fixture(ECHO);
+    let chat = chat(&shared);
+    let mut wb = shared.lock_unpoisoned();
+    home_owned(&mut wb, &request.target);
+    let mut project = wb.library.projects[DEFAULT_PROJECT].clone();
+    crate::project_owner::record_owner(&mut project.extra, "project-owner");
+    wb.store_mut()
+        .append_record(
+            crate::library::LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    // Deliberately leave the Workbench library stale: authorization reads the
+    // retained owner, rather than the former local ownership or directory role.
+    let source = wb
+        .chat_workflow_source(&chat, "lessons/hello.whip")
+        .unwrap();
+    let org_owner = member_with_role(&mut wb, "org-owner", None, "owner");
+    let admin = member_with_role(&mut wb, "org-admin", None, "admin");
+    for context in [&org_owner, &admin] {
+        assert!(wb
+            .describe_project_workflow(context, &source, LIMITS)
+            .is_err());
+        assert!(wb
+            .launch_project_workflow(context, &request, LIMITS)
+            .is_err());
+        assert!(wb.chat_whip_runs(context, &chat, None).is_err());
+        let scope = request_scope(
+            DEFAULT_PROJECT,
+            context.actor().as_str(),
+            &request.request_id,
+        )
+        .unwrap();
+        assert!(wb
+            .store_ref()
+            .fold::<ProductActionAdmission>(&scope)
+            .unwrap()
+            .command
+            .is_none());
+    }
+
+    let project_owner = member(&mut wb, "project-owner", None);
+    wb.describe_project_workflow(&project_owner, &source, LIMITS)
+        .unwrap();
+    let invocation = wb
+        .launch_project_workflow(&project_owner, &request, LIMITS)
+        .unwrap();
+    assert_eq!(
+        wb.chat_whip_runs(&project_owner, &chat, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut grant = crate::org::MemberGrantRecord {
+        id: crate::org::MemberGrantRecord::make_id("org-admin", DEFAULT_PROJECT),
+        op: crate::org::RecordOp::Upsert,
+        authority: "org-admin".into(),
+        project_id: DEFAULT_PROJECT.into(),
+    };
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "member_grant",
+            &serde_json::to_string(&grant).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(wb.chat_whip_runs(&admin, &chat, None).unwrap().len(), 1);
+    let mut admin_request = request.clone();
+    admin_request.request_id = "admin-with-project-grant".into();
+    wb.launch_project_workflow(&admin, &admin_request, LIMITS)
+        .unwrap();
+    let events = stores(&wb, &invocation)
+        .runtime
+        .list_events(&invocation.admission.instance_ref)
+        .unwrap();
+
+    grant.op = crate::org::RecordOp::Tombstone;
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "member_grant",
+            &serde_json::to_string(&grant).unwrap(),
+        )
+        .unwrap();
+    assert!(wb.chat_whip_runs(&admin, &chat, None).is_err());
+    assert!(wb
+        .describe_project_workflow(&admin, &source, LIMITS)
+        .is_err());
+    assert!(wb
+        .stop_chat_whip_run(
+            &admin,
+            &chat,
+            "lessons/hello.whip",
+            "project-owner",
+            &request.request_id,
+            "revoked-stop"
+        )
+        .is_err());
+    assert_eq!(
+        stores(&wb, &invocation)
+            .runtime
+            .list_events(&invocation.admission.instance_ref)
+            .unwrap(),
+        events
+    );
+    assert!(wb
+        .resume_project_workflow(&admin, DEFAULT_PROJECT, &admin_request.request_id, LIMITS)
+        .is_err());
+
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "membership",
+            &serde_json::json!({
+                "id":"project-owner", "op":"upsert", "org_id":crate::org::ORG_ID,
+                "authority":"project-owner", "email":"", "role":"member",
+                "status":"deprovisioned", "managed_by_scim":false
+            })
+            .to_string(),
+        )
+        .unwrap();
+    // Removing directory standing does not revoke this account's project.
+    // It does remove the role-derived clearance needed by this source.
+    assert_eq!(
+        wb.chat_whip_runs(&project_owner, &chat, None)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(wb
+        .describe_project_workflow(&project_owner, &source, LIMITS)
+        .is_err());
+    member(&mut wb, "project-owner", None);
+
+    crate::project_owner::record_owner(&mut project.extra, "new-owner");
+    wb.store_mut()
+        .append_record(
+            crate::library::LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    assert!(wb.chat_whip_runs(&project_owner, &chat, None).is_err());
+    assert!(wb
+        .resume_project_workflow(&project_owner, DEFAULT_PROJECT, &request.request_id, LIMITS)
+        .is_err());
+}
+
+#[test]
+fn workflow_history_uses_current_chat_placement_instead_of_cached_project_membership() {
+    let (_root, shared, owner, request) = fixture(ECHO);
+    let chat = chat(&shared);
+    let mut wb = shared.lock_unpoisoned();
+    wb.launch_project_workflow(&owner, &request, LIMITS)
+        .unwrap();
+    assert_eq!(wb.chat_whip_runs(&owner, &chat, None).unwrap().len(), 1);
+    let mut project = wb.library.projects[DEFAULT_PROJECT].clone();
+    project.id = "another-project".into();
+    project.is_default = false;
+    crate::project_owner::record_owner(&mut project.extra, "another-owner");
+    wb.store_mut()
+        .append_record(
+            crate::library::LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    let instance_id = wb.library.chats[&chat].instance_id.clone();
+    let mut placement = wb.library.instances[&instance_id].clone();
+    placement.project_id = Some(project.id.clone());
+    wb.store_mut()
+        .append_record(
+            crate::library::LIBRARY_SCOPE,
+            "instance",
+            &serde_json::to_string(&placement).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        wb.library.instances[&instance_id].project_id.as_deref(),
+        Some(DEFAULT_PROJECT)
+    );
+    assert_eq!(
+        wb.chat_workflow_source(&chat, "lessons/hello.whip")
+            .unwrap()
+            .project,
+        project.id
+    );
+    assert!(wb.chat_whip_runs(&owner, &chat, None).is_err());
 }
 
 /// Basics, filing into the project's own tracker instead of the learner's.

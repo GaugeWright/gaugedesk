@@ -306,6 +306,7 @@ fn a_spent_reconciliation_identity_cannot_replace_its_original_investigator() {
         )
         .unwrap();
     membership(&mut wb, "charlie", "owner");
+    project_grant(&mut wb, "charlie", crate::org::RecordOp::Upsert);
     let token = wb.mint_account_session("charlie", "passkey", 3600).unwrap();
     let charlie = wb.authenticate_action_context(&token).unwrap();
     // Charlie is a valid current investigator of the same original evidence.

@@ -82,8 +82,9 @@ pub struct Workbench {
     /// A turn needs exclusive access to one chat's harness for as long as the model
     /// call takes. Holding the workbench lock for that would serialize every other
     /// chat behind it, so a turn instead clones the `Arc` out under a brief lock and
-    /// then locks only the harness. "This harness is locked" is therefore the same
-    /// fact as "this chat is busy" — one representation, not two.
+    /// then locks only the harness. An empty slot reserves initialization without
+    /// holding the Workbench across the factory's transport or authority callbacks.
+    /// The turn claim (DR-0138) covers startup as well as execution.
     pub(crate) sessions: BTreeMap<String, SharedHarness>,
     /// One remote harness per remotely placed engagement (ADR 0020/0031).
     pub(crate) remote_sessions: BTreeMap<String, Box<dyn gaugedesk_harness::RemoteHarness>>,
@@ -121,6 +122,10 @@ pub struct Workbench {
     /// Replaceable per-identity Home sessions. Account login alone never appears
     /// here; the target Home mints these only after admission.
     pub(crate) home_admissions: crate::home_admission::HomeAdmissionStore,
+    /// Native workforce verification for the separately composed office route.
+    /// No source bearer is copied into the local account-session store.
+    pub(crate) office_staff_auth:
+        Option<crate::office_home_admission::authentication::OfficeStaffAuthentication>,
     /// The identity adapter that authenticates bearer credentials.
     pub(crate) idp: Option<Arc<dyn identity::IdentityProvider + Send + Sync>>,
     /// The Home session this process last handed its desktop UI (DR-0188).
@@ -128,7 +133,9 @@ pub struct Workbench {
     pub(crate) desktop_ui_session: Option<crate::desktop_session::DesktopUiSession>,
     /// The Home session relay crossings for the owner are served under
     /// (DR-0206). Its own slot, so neither rotates the other out from under it.
-    pub(crate) relay_owner_session: Option<crate::desktop_session::DesktopUiSession>,
+    /// The session each account's relay crossings are served under.
+    pub(crate) relay_sessions:
+        std::collections::BTreeMap<String, Option<crate::desktop_session::DesktopUiSession>>,
     /// Opaque Hub sessions authenticate a durable GaugeDesk account before any
     /// organization-specific membership decision.
     pub(crate) account_sessions: Arc<crate::account_session::AccountSessionStore>,
@@ -183,7 +190,7 @@ pub type SharedWorkbench = Arc<Mutex<Workbench>>;
 
 /// One chat's agent harness, independently lockable so a turn can hold it without
 /// holding the workbench (ADR 0031 + the per-chat serialization unit).
-pub(crate) type SharedHarness = Arc<Mutex<Box<dyn gaugedesk_harness::Harness>>>;
+pub(crate) type SharedHarness = Arc<Mutex<Option<Box<dyn gaugedesk_harness::Harness>>>>;
 
 /// Shut a harness down, but only if this is the last reference to it. A harness a
 /// turn still holds is left to that turn, which drops the final reference when it
@@ -193,7 +200,9 @@ pub(crate) fn shutdown_shared_harness(harness: SharedHarness) {
         let harness = harness
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = harness.shutdown();
+        if let Some(harness) = harness {
+            let _ = harness.shutdown();
+        }
     }
 }
 
@@ -413,9 +422,10 @@ impl Workbench {
             hosted_home_mode: false,
             owning_organization: None,
             home_admissions: crate::home_admission::HomeAdmissionStore::new(),
+            office_staff_auth: None,
             idp: None,
             desktop_ui_session: None,
-            relay_owner_session: None,
+            relay_sessions: Default::default(),
             account_sessions: Arc::new(crate::account_session::AccountSessionStore::new()),
             audit_sink: None,
             audit_signer: None,

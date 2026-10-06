@@ -128,6 +128,7 @@ fn recorded_input_with_authority(
         let authority = current_target_authority(
             wb.store_ref(),
             wb.home_id(),
+            &wb.project_owner_resolver(),
             &context,
             &NativeTargetIntent {
                 chat_id: &file.chat_id,
@@ -317,6 +318,7 @@ fn read_only(wb: &mut Workbench, command: &HostActionCommand) {
 
 fn reader(wb: &mut Workbench) -> (AuthenticatedActionContext, String) {
     membership(wb, "bob", "owner");
+    project_grant(wb, "bob", crate::org::RecordOp::Upsert);
     let token = wb.mint_account_session("bob", "passkey", 3600).unwrap();
     (wb.authenticate_action_context(&token).unwrap(), token)
 }

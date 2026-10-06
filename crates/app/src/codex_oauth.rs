@@ -931,8 +931,21 @@ pub fn resolve_runtime_credential_in(
         return Ok(None);
     };
     if credential.expires <= now_ms() + REFRESH_SKEW_MS {
-        credential = refresh_credential(&credential)?;
-        store_credential_in(wb, scope, &credential, execution_classes)?;
+        use crate::account_links_sync::{after_refresh, before_refresh, RefreshTurn};
+        match before_refresh(wb, scope, PROVIDER) {
+            RefreshTurn::Refresh => {
+                credential = refresh_credential(&credential)?;
+                store_credential_in(wb, scope, &credential, execution_classes)?;
+                after_refresh(wb, scope, PROVIDER);
+            }
+            // Another device refreshed it; use the version it published.
+            RefreshTurn::Taken => {
+                credential = load_credential_in(wb, scope, execution_class)
+                    .map(|(credential, _)| credential)
+                    .ok_or_else(|| "the refreshed Codex sign-in is not admitted here".to_owned())?;
+            }
+            RefreshTurn::Busy(reason) => return Err(reason),
+        }
     }
     Ok(Some(CodexRuntimeCredential {
         access: credential.access,

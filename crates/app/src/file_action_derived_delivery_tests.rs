@@ -1,5 +1,5 @@
 use super::*;
-use crate::file_action_factory::tests::membership;
+use crate::file_action_factory::tests::{membership, project_grant};
 use crate::file_action_factory::{EditorCorrectionReconciliation, EditorCorrectionResultRequest};
 use gaugedesk_whip_runtime::host_actions::{action_result::ActionWorkflowStatus, RuntimeStore};
 use whipplescript_store::effect_recovery::ExternalDisposition;
@@ -151,6 +151,7 @@ fn derived_correction_executes_and_recovers_independently_after_source_erasure()
             .unwrap();
         wb.revoke_account_session(&token);
         membership(&mut wb, "charlie", "owner");
+        project_grant(&mut wb, "charlie", crate::org::RecordOp::Upsert);
         let investigator_token = wb.mint_account_session("charlie", "passkey", 3600).unwrap();
         drop(runtime);
         drop(wb);

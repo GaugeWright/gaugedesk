@@ -87,13 +87,22 @@ fn this_computers_own_sign_in_and_login_shell_stay_local() {
         (Method::POST, "/account/hub-session/reach"),
         (Method::GET, "/auth/login"),
         (Method::POST, "/test/reset"),
+        // The computer's own account records never cross (DR-0328 §6).
+        (Method::GET, "/account/hub-session"),
+        (Method::GET, "/account/hub-sessions"),
+        (Method::GET, "/account/homes"),
+        (Method::GET, "/account/devices"),
+        (Method::POST, "/account/library-sync"),
+        (Method::GET, "/gaugeapps/account-settings/page"),
     ] {
         assert!(local_only(&method, path), "{method} {path}");
     }
     for (method, path) in [
-        (Method::GET, "/account/hub-session"),
         (Method::GET, "/workspace"),
         (Method::POST, "/home/invitations"),
+        // The caller's own credentials are keyed by its account.
+        (Method::GET, "/account/credentials"),
+        (Method::GET, "/account/oauth/openai-codex"),
     ] {
         assert!(!local_only(&method, path), "{method} {path}");
     }
@@ -158,7 +167,7 @@ async fn a_signed_out_computer_admits_its_owner_to_nothing() {
     let _ = crate::account_signin::post_signin_logout(axum::extract::State(wb.clone())).await;
     let (status, body) = send(&app, "GET", "/workspace", &admitted).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(body.contains(RELAY_REFUSAL), "{body}");
+    assert!(body.contains("not signed in on this computer"), "{body}");
 }
 
 /// Served under the owner's own Home session, so a handler that attributes
@@ -349,4 +358,44 @@ async fn the_owner_keeps_the_connection_through_a_refusal() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(close, None);
+}
+
+/// DR-0328 §6: any account signed in on this computer crosses the relay as
+/// itself, beside the claimant, and reaches only its own projects.
+#[tokio::test]
+async fn another_account_signed_in_here_crosses_as_itself() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    crate::account_signin::store_session_for_test(&wb);
+    crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+    crate::account_signin::store_session_as_for_test(&wb, "someone-else");
+    let app = relay_control_plane(wb.clone(), Arc::new(Stranger));
+    let bearer = [("authorization", "Bearer someone-elses-bearer")];
+    let (status, body) = send(&app, "POST", "/home/admissions", &bearer).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let admission = serde_json::from_str::<serde_json::Value>(&body).unwrap()["admission"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let admitted = [
+        ("authorization", "Bearer someone-elses-bearer"),
+        ("x-gaugewright-home-admission", admission.as_str()),
+    ];
+    let (status, body) = send(&app, "GET", "/workspace", &admitted).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let workspace: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        workspace["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|project| project["id"] != crate::DEFAULT_PROJECT),
+        "the claimant's Personal is not this account's: {body}"
+    );
+    let (status, _) = send(&app, "GET", "/account/hub-sessions", &admitted).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the computer's accounts stay local"
+    );
 }

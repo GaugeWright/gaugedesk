@@ -700,6 +700,22 @@ fn workflow_member(wb: &mut Workbench) -> crate::identity::AuthenticatedActionCo
     wb.authenticate_action_context(&token).unwrap()
 }
 
+fn workflow_project_grant(wb: &mut Workbench, project: &str) {
+    let grant = crate::org::MemberGrantRecord {
+        id: crate::org::MemberGrantRecord::make_id("member", project),
+        authority: "member".into(),
+        project_id: project.into(),
+        op: crate::org::RecordOp::Upsert,
+    };
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "member_grant",
+            &serde_json::to_string(&grant).unwrap(),
+        )
+        .unwrap();
+}
+
 #[test]
 fn actual_project_signed_workflow_moves_and_resumes_under_same_authority_after_restart() {
     use crate::project_workflow::{ProjectWorkflowLaunch, ProjectWorkflowLimits};
@@ -738,6 +754,10 @@ fn actual_project_signed_workflow_moves_and_resumes_under_same_authority_after_r
         request_id: "move-workflow".into(),
         inputs: BTreeMap::from([("learner".into(), serde_json::json!({"authority":"member"}))]),
     };
+    assert!(source
+        .launch_project_workflow(&context, &request, limits)
+        .is_err());
+    workflow_project_grant(&mut source, "p1");
     let original = source
         .launch_project_workflow(&context, &request, limits)
         .unwrap();
@@ -789,6 +809,10 @@ fn actual_project_signed_workflow_moves_and_resumes_under_same_authority_after_r
         commit(&mut guard, &wire, Consent::Pending).unwrap();
         let target_context = workflow_member(&mut guard);
         assert_eq!(guard.project_authority_identity("p1").unwrap(), identity);
+        assert!(guard
+            .resume_project_workflow(&target_context, "p1", "move-workflow", limits)
+            .is_err());
+        workflow_project_grant(&mut guard, "p1");
         let resumed = guard
             .resume_project_workflow(&target_context, "p1", "move-workflow", limits)
             .unwrap();

@@ -6,6 +6,9 @@ use tower::ServiceExt;
 
 use crate::{home_admission::HOME_ADMISSION_HEADER, org::ORG_SCOPE};
 
+#[path = "office_native_request_tests.rs"]
+mod native;
+
 fn membership(wb: &SharedWorkbench, actor: &str, status: crate::org::MembershipStatus) {
     let record = crate::org::MembershipRecord {
         id: actor.into(),
@@ -120,6 +123,10 @@ async fn send(
                 .extension(crate::identity::AuthenticatedActor(AuthorityId::new(
                     "operator",
                 )))
+                .extension(AuthenticatedActionContext::account_session(
+                    AuthorityId::new("operator"),
+                    "forged".into(),
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )

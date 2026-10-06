@@ -30,13 +30,9 @@ impl Workbench {
         if !path.ends_with(".whip") {
             return Err("only a .whip file can be run".into());
         }
-        let chat = self
-            .library
-            .chats
-            .get(chat_id)
-            .ok_or("chat is unavailable")?;
-        let instance = self
-            .library
+        let library = crate::library::Library::rebuild(self.store_ref()).map_err(debug_error)?;
+        let chat = library.chats.get(chat_id).ok_or("chat is unavailable")?;
+        let instance = library
             .instances
             .get(&chat.instance_id)
             .ok_or("chat placement is unavailable")?;
@@ -45,8 +41,7 @@ impl Workbench {
             .clone()
             .filter(|_| instance.kind == InstanceKind::Using)
             .ok_or("only a project chat can run a workflow")?;
-        let set = self
-            .library
+        let set = library
             .current_target_set(chat_id)
             .ok_or("chat has no committed target selection")?;
         let (target, relative) = if let Some(rooted) = path.strip_prefix("targets/") {

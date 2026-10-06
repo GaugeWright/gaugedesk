@@ -117,6 +117,8 @@ impl Workbench {
             return Err("correction input custody belongs to another Home".into());
         }
         let home = self.home_id().clone();
+        let owners = self.project_owner_resolver();
+        let account_scopes = crate::identity::account_authority_scopes(context)?;
         let intent = NativeTargetIntent {
             chat_id: request.chat_id,
             request_id: request.request_id,
@@ -126,6 +128,7 @@ impl Workbench {
             let authority = current_target_authority_with_source(
                 store,
                 &home,
+                &owners,
                 context,
                 &intent,
                 NativeActionKind::RecordCorrections,
@@ -136,6 +139,8 @@ impl Workbench {
             Ok(authority)
         };
         let authority_scopes = [
+            &account_scopes[0],
+            &account_scopes[1],
             LIBRARY_SCOPE,
             ORG_SCOPE,
             crate::account_auth::ACCOUNT_AUTH_SCOPE,
@@ -179,7 +184,7 @@ impl Workbench {
             &legacy_root,
         )?;
         let preparation_basis = authority
-            .bind_deadline(preparation_basis)
+            .bind_deadline(self.store_ref(), preparation_basis)
             .map_err(|e| format!("{e:?}"))?;
         let (signing_key, preparation_basis) =
             self.native_project_signer(&authority.project_id, preparation_basis)?;
@@ -285,7 +290,7 @@ impl Workbench {
             return Err("correction authority changed during preparation".into());
         }
         let basis = current
-            .bind_deadline(basis)
+            .bind_deadline(self.store_ref(), basis)
             .map_err(|error| format!("correction authority deadline refused: {error:?}"))?;
         Ok(PreparedCorrections {
             command,

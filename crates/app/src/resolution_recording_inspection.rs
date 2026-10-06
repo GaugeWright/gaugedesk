@@ -190,6 +190,8 @@ impl Workbench {
             return Err("original correction input binding is invalid".into());
         }
         let home = self.home_id().clone();
+        let owners = self.project_owner_resolver();
+        let account_scopes = crate::identity::account_authority_scopes(context)?;
         let identity = ActionPolicyIdentity {
             issuer: command.issuer.clone(),
             scope: command.scope.clone(),
@@ -204,6 +206,8 @@ impl Workbench {
         let roots = project_signature::NativeHistoryRoots::open(self)?;
         let root = roots.original_root(self.store_ref(), command)?;
         let mut scopes = vec![
+            &account_scopes[0],
+            &account_scopes[1],
             LIBRARY_SCOPE,
             ORG_SCOPE,
             crate::account_auth::ACCOUNT_AUTH_SCOPE,
@@ -220,6 +224,7 @@ impl Workbench {
                 let current = current_target_authority(
                     store,
                     &home,
+                    &owners,
                     context,
                     &NativeTargetIntent {
                         chat_id: &chat,
@@ -269,7 +274,7 @@ impl Workbench {
         }
         let read_policy = policy::compile(&current, &original_scope, &original)?;
         let basis = current
-            .bind_deadline(basis)
+            .bind_deadline(self.store_ref(), basis)
             .map_err(|error| format!("{error:?}"))?;
         let (key, basis) = self.native_project_signer_access(
             &current.project_id,
@@ -285,6 +290,9 @@ impl Workbench {
             .native_resolution_recording_evidence_target(&path, original_scope)
             .map_err(|error| format!("{error:?}"))?;
         let source = self.native_action_observation_source()?;
+        let basis = current
+            .bind_deadline(self.store_ref(), basis)
+            .map_err(|error| format!("{error:?}"))?;
         Ok(CorrectionInspectionPreparation {
             key,
             basis,
@@ -372,3 +380,7 @@ pub use reconciliation::{
     EditorCorrectionResultRequest, NativeCorrectionReconciliationRuntime,
     NativeEditorCorrectionResult,
 };
+
+#[cfg(test)]
+#[path = "resolution_recording_authority_tests.rs"]
+mod authority_tests;

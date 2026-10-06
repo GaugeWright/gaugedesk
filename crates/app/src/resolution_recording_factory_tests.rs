@@ -165,6 +165,7 @@ async fn correction_home_admission_retains_exact_input_and_outbox_without_a_file
         let authority = current_authority(
             wb.store_ref(),
             wb.home_id(),
+            &wb.project_owner_resolver(),
             &context,
             &EditorFileSave {
                 chat_id: &file.chat_id,

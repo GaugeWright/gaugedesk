@@ -181,6 +181,19 @@ pub(crate) fn local_content_keywrap(root: &std::path::Path) -> std::io::Result<B
 fn local_content_kek(root: &std::path::Path) -> std::io::Result<[u8; 32]> {
     let dir = root.join("keys");
     let path = dir.join("content-kek");
+    std::fs::create_dir_all(&dir)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // This inode is permanent. Retain exclusive custody BEFORE the first read,
+    // through staging and publication: another process must reload our winner,
+    // never rename a different generated KEK over it (DR-0354).
+    let custody = options.open(dir.join("content-kek.lock"))?;
+    custody.lock()?;
     match std::fs::read(&path) {
         Ok(bytes) => <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
             std::io::Error::new(
@@ -434,6 +447,105 @@ mod tests {
             EnvelopeEncryptor::open(wrapped, &kek).err(),
             Some(AtRestError::Decrypt)
         );
+    }
+
+    #[test]
+    fn local_key_initializers_block_and_preserve_content_across_processes() {
+        use gaugedesk_store::ContentCodec;
+        // The same test entry serves as a real child-process fixture. Ordinary
+        // runs execute the parent assertions; children receive only a disposable
+        // root and public role label, never a key through the environment.
+        if let Ok(root) = std::env::var("GAUGEDESK_TEST_LOCAL_KEK_ROOT") {
+            let root = std::path::Path::new(&root);
+            let role = std::env::var("GAUGEDESK_TEST_LOCAL_KEK_ROLE").unwrap();
+            std::fs::write(root.join(format!("ready-{role}")), b"ready").unwrap();
+            let vault = crate::content_vault::ContentVault::new(
+                root.join("content-keys"),
+                local_content_keywrap(root).unwrap(),
+            )
+            .require_authenticated_records();
+            let sealed = vault
+                .encode(&role, "transcript", "synthetic content")
+                .unwrap();
+            std::fs::write(root.join(format!("sealed-{role}")), sealed).unwrap();
+            return;
+        }
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                // Release only this fixture's child, including after assertion failure.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("keys");
+        std::fs::create_dir_all(&directory).unwrap();
+        let custody = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join("content-kek.lock"))
+            .unwrap();
+        custody.lock().unwrap();
+        let spawn = |role: &str| {
+            OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "at_rest::tests::local_key_initializers_block_and_preserve_content_across_processes"])
+                .env("GAUGEDESK_TEST_LOCAL_KEK_ROOT", root.path())
+                .env("GAUGEDESK_TEST_LOCAL_KEK_ROLE", role)
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .spawn().unwrap()
+        )
+        };
+        let mut children = [spawn("a"), spawn("b")];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !root.path().join("ready-a").exists() || !root.path().join("ready-b").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child initializer did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for child in &mut children {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "initializer bypassed retained key custody"
+            );
+        }
+        assert!(
+            !directory.join("content-kek").exists(),
+            "initializer minted a key outside custody"
+        );
+        drop(custody);
+        for child in &mut children {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    assert!(status.success(), "initializer failed after custody release");
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "initializer did not finish after custody release"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let vault = crate::content_vault::ContentVault::new(
+            root.path().join("content-keys"),
+            local_content_keywrap(root.path()).unwrap(),
+        )
+        .require_authenticated_records();
+        for role in ["a", "b"] {
+            let sealed =
+                std::fs::read_to_string(root.path().join(format!("sealed-{role}"))).unwrap();
+            assert!(
+                vault.decode(role, "transcript", &sealed).as_deref() == Some("synthetic content"),
+                "initializer orphaned an earlier scope key"
+            );
+        }
     }
 
     #[test]

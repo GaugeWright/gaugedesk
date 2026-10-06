@@ -46,7 +46,29 @@ async fn post_admission(
         Err((code, message)) => return (code, Json(json!({ "error": message }))).into_response(),
     };
     let home = wb.home_id().clone();
-    let token = wb.home_admissions.open(home.clone(), actor);
+    let token = if let Some(bearer) =
+        net_http::bearer(&headers).filter(|bearer| wb.has_office_staff_source(bearer))
+    {
+        let Some(lease) = wb.office_staff_lease(bearer) else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "office source lease is expired or revoked"})),
+            )
+                .into_response();
+        };
+        match wb.home_admissions.open_office(&home, &lease) {
+            Ok(token) => token,
+            Err(_) => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "office source does not match this Home"})),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        wb.home_admissions.open(home.clone(), actor)
+    };
     (
         StatusCode::CREATED,
         Json(json!({
@@ -261,6 +283,15 @@ pub(crate) fn authenticate_home_work_request(
             StatusCode::MISDIRECTED_REQUEST,
             "project is authoritative on another Home",
         ));
+    }
+    if let Some(lease) = bearer.and_then(|token| wb.office_staff_lease(token)) {
+        return wb
+            .office_staff_action_context(&lease, &token)
+            .map(Some)
+            .ok_or((
+                StatusCode::FORBIDDEN,
+                "Home admission does not match the exact office source lease",
+            ));
     }
     Ok(bearer
         .and_then(|token| wb.authenticate_action_context(token))

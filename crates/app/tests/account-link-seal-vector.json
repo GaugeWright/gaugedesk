@@ -1,0 +1,19 @@
+{
+  "comment": "DR-0334 cross-language vector. rust_copy was sealed by crates/app/src/account_link_seal.rs (print_account_link_vector) and is opened by the browser's test; browser_copy was sealed by web/packages/control-plane-client/src/account-link-seal.ts and is opened by tests/account_link_seal_vector.rs. A change to either construction fails both until the vector is regenerated from both sides.",
+  "recipient_private_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+  "recipient_public_key_hex": "043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d",
+  "account": "acct-person",
+  "provider": "openai",
+  "version": 5,
+  "secret": "sk-vector-secret",
+  "rust_copy": {
+    "device_id": "device:vector",
+    "ephemeral_pubkey": "045e0b88955478752f20b52c86f7cf76a6a2f65e350293b09b5bc48afe12ef6d8888fce0bddd9dac2d7a522ca845cb400a11b415028a1f83e36d97104bd3505e29",
+    "ciphertext": "868a0865b0a97701e085e5df4c7f356796cfeb72aade5a737dd7955409c38b762b868a6fe608a5c5d90e25f7"
+  },
+  "browser_copy": {
+    "device_id": "device:vector",
+    "ephemeral_pubkey": "048a9d347782dd8fa6ef52ab6cfe1914a61ee0908e4de4c91aa68b61437e861705019d668d218056378cddc5176c43419d43b6e1f54914bc21d1906b5d2b5fb690",
+    "ciphertext": "e70c7f3d69f61db700a82f166078db010793edb76f63c9af1ea49596c4036973a7abfa2065692f9d406ea1ca"
+  }
+}

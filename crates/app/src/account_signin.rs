@@ -1968,6 +1968,9 @@ pub async fn post_signin_callback(
                 crate::desktop_session::revoke(&wb);
                 reconcile_first_home_after_signin(&wb, &record.person);
             }
+            // The account's provider links reach this device now, whichever
+            // account the window shows (DR-0334).
+            crate::account_links_sync::spawn_reconcile(&wb, &record.person, true);
             Json(status_json(Some(&record), true)).into_response()
         }
         Err(message) => {
@@ -2102,6 +2105,10 @@ pub async fn get_signin_status(State(wb): State<SharedWorkbench>) -> impl IntoRe
     let Some(record) = latest_session(&wb) else {
         return Json(desktop_status_json(&wb, None, available)).into_response();
     };
+    // The account surfaces poll this, so it is also where a signed-in
+    // desktop keeps the account's provider links current, at most once a
+    // minute (DR-0334).
+    crate::account_links_sync::spawn_reconcile(&wb, &record.person, false);
     let fence = SelectionFence::new(&wb, record.person.clone(), revision);
     let current_ms = now_ms();
     let due = record.refresh_after > 0

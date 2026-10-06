@@ -295,6 +295,7 @@ impl Workbench {
             return Err(invalid_profile());
         }
         let home = self.home_id().clone();
+        let owners = self.project_owner_resolver();
         let scope = command.instance_ref().map_err(|_| invalid_profile())?;
         let identity = ActionPolicyIdentity {
             issuer: command.issuer.clone(),
@@ -324,6 +325,7 @@ impl Workbench {
                 let current = current_target_authority(
                     store,
                     &home,
+                    &owners,
                     context,
                     &NativeTargetIntent {
                         chat_id: &chat,
@@ -359,7 +361,9 @@ impl Workbench {
             return Err("saved input has no original Home outbox binding".into());
         }
         let retained = retained?;
-        let basis = current.bind_deadline(basis).map_err(|e| format!("{e:?}"))?;
+        let basis = current
+            .bind_deadline(self.store_ref(), basis)
+            .map_err(|e| format!("{e:?}"))?;
         let (key, basis) = self.native_project_signer_access(
             &current.project_id,
             basis,
@@ -384,6 +388,9 @@ impl Workbench {
                 *resource = restrictions.clone();
             }
         }
+        let basis = current
+            .bind_deadline(self.store_ref(), basis)
+            .map_err(|e| format!("{e:?}"))?;
         Ok(EditorFileSaveReadPreparation {
             key,
             basis,

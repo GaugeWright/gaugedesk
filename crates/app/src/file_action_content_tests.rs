@@ -157,6 +157,7 @@ fn retained_file_read_keeps_original_restrictions_after_target_relaxation() {
     let authority = current_target_authority(
         wb.store_ref(),
         wb.home_id(),
+        &wb.project_owner_resolver(),
         &context,
         &NativeTargetIntent {
             chat_id: &intent.chat_id,
@@ -201,6 +202,7 @@ fn retained_file_read_keeps_original_restrictions_after_target_relaxation() {
     let current = current_target_authority(
         wb.store_ref(),
         wb.home_id(),
+        &wb.project_owner_resolver(),
         &context,
         &NativeTargetIntent {
             chat_id: &intent.chat_id,

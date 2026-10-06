@@ -91,7 +91,7 @@ impl Default for MergeState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MergeCommand {
     /// The engagement's work is committed; attempt to merge into the standing ref.
     StartMerge,

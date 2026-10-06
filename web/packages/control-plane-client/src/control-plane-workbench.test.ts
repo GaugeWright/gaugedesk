@@ -18,7 +18,25 @@ import {
     revokePlacementDistribution,
     runTask,
     setPlacementDistribution,
+    subscribeWorkspace,
 } from "./control-plane-workbench";
+
+describe("workspace refresh references", () => {
+    it("carries an identifier-free refresh to the subscriber", () => {
+        let accept: ((data: string) => void) | undefined;
+        const changed = vi.fn();
+        const stop = vi.fn();
+        const transport = {
+            base: "", json: vi.fn(),
+            events: (_path: string, callback: (data: string) => void) => { accept = callback; return stop; },
+        } as WorkbenchTransport;
+        const unsubscribe = subscribeWorkspace(transport, changed);
+        accept!(JSON.stringify({ type: "workspacechanged", record: "project", id: "", op: "upsert" }));
+        expect(changed).toHaveBeenCalledExactlyOnceWith({ record: "project", id: "", op: "upsert" });
+        unsubscribe();
+        expect(stop).toHaveBeenCalledOnce();
+    });
+});
 
 describe("placement distribution profiles", () => {
     it("keeps licensed distribution explicit and addresses the full commercial lifecycle", async () => {

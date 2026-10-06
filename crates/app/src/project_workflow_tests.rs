@@ -92,6 +92,21 @@ fn fixture(
     drop(wb);
     (root, shared, context, request)
 }
+fn project_grant(wb: &mut Workbench, actor: &str, project: &str) {
+    let grant = crate::org::MemberGrantRecord {
+        id: crate::org::MemberGrantRecord::make_id(actor, project),
+        authority: actor.into(),
+        project_id: project.into(),
+        op: crate::org::RecordOp::Upsert,
+    };
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "member_grant",
+            &serde_json::to_string(&grant).unwrap(),
+        )
+        .unwrap();
+}
 fn stores(
     wb: &Workbench,
     invocation: &ProjectWorkflowInvocation,
@@ -112,6 +127,54 @@ fn stores(
         .unwrap()
         .open_existing_protected(&protection)
         .unwrap()
+}
+
+#[test]
+fn account_owned_workflow_does_not_require_organization_membership() {
+    let (_root, shared, context, request) = fixture(ECHO);
+    let mut wb = shared.lock_unpoisoned();
+    let mut project = wb.library.projects[DEFAULT_PROJECT].clone();
+    crate::project_owner::record_owner(&mut project.extra, context.actor().as_str());
+    wb.store_mut()
+        .append_record(
+            crate::library::LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    let mut member =
+        crate::org::Org::rebuild(wb.store_ref()).unwrap().members[context.actor().as_str()].clone();
+    member.status = crate::org::MembershipStatus::Deprovisioned;
+    wb.store_mut()
+        .append_record(
+            crate::org::ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&member).unwrap(),
+        )
+        .unwrap();
+    wb.rebuild_library();
+    assert!(crate::org::Org::rebuild(wb.store_ref())
+        .unwrap()
+        .role_of(context.actor().as_str())
+        .is_none());
+    // Project ownership supplies no additional source clearance. The default
+    // regulated source is still refused when the directory supplies no role.
+    assert_eq!(
+        wb.launch_project_workflow(&context, &request, LIMITS)
+            .unwrap_err(),
+        "workflow source exceeds actor clearance"
+    );
+    let mut target = wb.library.work_targets[&request.target].clone();
+    target.attributes.classification = gaugedesk_core::abac::Classification::Public;
+    wb.store_mut()
+        .append_record(
+            crate::library::LIBRARY_SCOPE,
+            "work_target",
+            &serde_json::to_string(&target).unwrap(),
+        )
+        .unwrap();
+    wb.launch_project_workflow(&context, &request, LIMITS)
+        .expect("an account's own project does not depend on organization membership");
 }
 
 #[test]
@@ -437,6 +500,19 @@ fn project_administration_is_not_a_source_party_grant() {
 #[test]
 fn two_clients_share_one_request_and_revocation_stops_resume() {
     let (root, shared, context, request) = fixture(ECHO);
+    {
+        let mut wb = shared.lock_unpoisoned();
+        let mut project = wb.library.projects[DEFAULT_PROJECT].clone();
+        crate::project_owner::record_owner(&mut project.extra, "another-account");
+        wb.store_mut()
+            .append_record(
+                crate::library::LIBRARY_SCOPE,
+                "project",
+                &serde_json::to_string(&project).unwrap(),
+            )
+            .unwrap();
+        project_grant(&mut wb, LOCAL_AUTHORITY, DEFAULT_PROJECT);
+    }
     let second = open(root.path());
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let run = |wb: crate::SharedWorkbench| {
@@ -522,6 +598,151 @@ fn an_empty_input_contract_rejects_extra_values_before_product_admission() {
         .launch_project_workflow(&context, &request, LIMITS)
         .unwrap();
     assert!(invocation.command.inputs.is_empty());
+}
+
+#[test]
+fn prepared_workflow_authority_fences_device_and_migrated_session_revocation() {
+    for migrated in [false, true] {
+        let (_root, shared, context, request) = fixture(ECHO);
+        let mut wb = shared.lock_unpoisoned();
+        let crate::identity::ActorAuthentication::AccountSession { session_ref } =
+            context.authentication()
+        else {
+            panic!("fixture must use actual account authentication");
+        };
+        let account_scope = crate::account::account_scope(LOCAL_AUTHORITY);
+        let mut device = crate::account::DeviceRecord {
+            id: "workflow-device".into(),
+            op: crate::account::RecordOp::Upsert,
+            label: "Workflow fixture".into(),
+            kind: crate::account::DeviceKind::Computer,
+            subkey_pubkey: "fixture-key".into(),
+            status: crate::account::DeviceStatus::Active,
+            enrolled_at: 1,
+        };
+        wb.upsert_account_device_in(&account_scope, &device)
+            .unwrap();
+        assert!(wb.bind_account_session_device(session_ref, LOCAL_AUTHORITY, &device.id));
+        let mut session = crate::account_auth::AccountAuth::rebuild(wb.store_ref())
+            .unwrap()
+            .sessions[session_ref]
+            .clone();
+        if migrated {
+            use crate::account_auth_custody::{
+                command_record_facts, AccountAuthCustodyCatalog, CustodyCommand,
+            };
+            // Retain this exact session in its real account-auth scope, then
+            // advance its catalog through the ordinary custody reducer.
+            for command in [
+                CustodyCommand::BeginMigration {
+                    operation_id: "fixture-session-migration".into(),
+                    source_basis: "fixture-original-session".into(),
+                },
+                CustodyCommand::CompleteMigration {
+                    operation_id: "fixture-session-migration".into(),
+                    destination_basis: "fixture-current-session".into(),
+                    evidence_id: "fixture-retained-session".into(),
+                },
+            ] {
+                let state = AccountAuthCustodyCatalog::rebuild(wb.store_ref())
+                    .unwrap()
+                    .account(LOCAL_AUTHORITY);
+                for fact in command_record_facts(LOCAL_AUTHORITY, &state, command).unwrap() {
+                    wb.store_mut()
+                        .append_record(&fact.scope_id, &fact.kind, &fact.payload)
+                        .unwrap();
+                }
+                crate::account_auth::append_facts(
+                    wb.store_mut(),
+                    &[crate::account_auth::AccountAuthFact::Session(
+                        session.clone(),
+                    )],
+                )
+                .unwrap();
+            }
+        }
+        let prepared = wb.prepare_workflow_authority(&context, &request).unwrap();
+        assert!(wb
+            .store_mut()
+            .with_dispatch_basis(&prepared.basis, || ())
+            .is_ok());
+        let before = wb.store_ref().scope_high_water_marks().unwrap();
+        if migrated {
+            session.op = crate::account_auth::RecordOp::Tombstone;
+            crate::account_auth::append_facts(
+                wb.store_mut(),
+                &[crate::account_auth::AccountAuthFact::Session(session)],
+            )
+            .unwrap();
+        } else {
+            // Keep the session fact and hot cache unchanged: only the actual
+            // enrolled device's standing moves.
+            device.status = crate::account::DeviceStatus::Revoked;
+            wb.upsert_account_device_in(&account_scope, &device)
+                .unwrap();
+        }
+        let after = wb.store_ref().scope_high_water_marks().unwrap();
+        for scope in [
+            crate::library::LIBRARY_SCOPE,
+            crate::org::ORG_SCOPE,
+            crate::account_auth::ACCOUNT_AUTH_SCOPE,
+            crate::mobile_machine_session::SCOPE,
+        ] {
+            assert_eq!(before.get(scope), after.get(scope), "unrelated scope moved");
+        }
+        assert!(wb.prepare_workflow_authority(&context, &request).is_err());
+        assert!(wb
+            .store_mut()
+            .with_dispatch_basis(&prepared.basis, || panic!(
+                "revoked account authority published prepared workflow work"
+            ))
+            .is_err());
+    }
+}
+
+#[test]
+fn retained_workflow_authority_does_not_borrow_the_creators_device_session() {
+    let (_root, shared, context, request) = fixture(ECHO);
+    let mut wb = shared.lock_unpoisoned();
+    let crate::identity::ActorAuthentication::AccountSession { session_ref } =
+        context.authentication()
+    else {
+        panic!("fixture must use account authentication");
+    };
+    let scope = crate::account::account_scope(LOCAL_AUTHORITY);
+    let mut device = crate::account::DeviceRecord {
+        id: "launch-device".into(),
+        op: crate::account::RecordOp::Upsert,
+        label: "Launch fixture".into(),
+        kind: crate::account::DeviceKind::Computer,
+        subkey_pubkey: "fixture-key".into(),
+        status: crate::account::DeviceStatus::Active,
+        enrolled_at: 1,
+    };
+    wb.upsert_account_device_in(&scope, &device).unwrap();
+    assert!(wb.bind_account_session_device(session_ref, LOCAL_AUTHORITY, &device.id));
+    let invocation = wb
+        .launch_project_workflow(&context, &request, LIMITS)
+        .unwrap();
+    let unattended = AuthenticatedActionContext::project_workflow_invocation(
+        context.actor().clone(),
+        invocation.product_scope,
+    );
+    let prepared = wb
+        .prepare_workflow_authority(&unattended, &request)
+        .unwrap();
+    assert!(wb
+        .store_mut()
+        .with_dispatch_basis(&prepared.basis, || ())
+        .is_ok());
+    device.status = crate::account::DeviceStatus::Revoked;
+    wb.upsert_account_device_in(&scope, &device).unwrap();
+    assert!(wb.prepare_workflow_authority(&context, &request).is_err());
+    assert!(wb.prepare_workflow_authority(&unattended, &request).is_ok());
+    assert!(wb
+        .store_mut()
+        .with_dispatch_basis(&prepared.basis, || ())
+        .is_ok());
 }
 
 #[path = "project_workflow_execution_tests.rs"]

@@ -372,12 +372,12 @@ fn an_owner_role_no_longer_sees_another_accounts_projects() {
         "the computer's owner role does not reach another account's project"
     );
 
-    // An account holding no role here stays limited to its own projects, so
-    // routes naming no project stay closed to it (WS-580).
+    // An account holding no role here is a whole account, reaching only its
+    // own projects (DR-0328).
     let other = session(&wb, OTHER);
     assert_eq!(
         visibility(&wb, Some(&other)),
-        ProjectVisibility::Only(["p-other".to_owned()].into())
+        ProjectVisibility::Account(["p-other".to_owned()].into())
     );
 
     // Signed out, the window is the local account, which owns nothing the
@@ -1765,4 +1765,83 @@ async fn a_second_accounts_desktop_credential_is_not_the_claimants() {
         ),
         Err(error) => panic!("unexpected refusal: {error}"),
     }
+}
+
+#[test]
+fn an_account_hears_only_of_changes_to_what_it_can_see() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    project(&wb, "p-other", serde_json::json!({ "owner": OTHER }));
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+    let changed = |record: &str, id: &str| crate::stream::ServerEvent::WorkspaceChanged {
+        record: record.into(),
+        id: id.into(),
+        op: "upsert".into(),
+    };
+    let guard = wb.lock_unpoisoned();
+    assert!(guard.workspace_event_visible(Some(&other), &changed("project", "p-other")));
+    assert!(!guard.workspace_event_visible(Some(&other), &changed("project", DEFAULT_PROJECT)));
+    assert!(!guard.workspace_event_visible(Some(&claimant), &changed("project", "p-other")));
+    assert!(guard.workspace_event_visible(Some(&claimant), &changed("project", DEFAULT_PROJECT)));
+    assert!(
+        guard.workspace_event_visible(Some(&other), &changed("project", "gone")),
+        "a removed record crosses as its id alone"
+    );
+    assert!(guard.workspace_event_visible(Some(&other), &changed("agent", crate::DEFAULT_AGENT)));
+}
+
+#[tokio::test]
+async fn the_people_list_shows_an_account_only_its_own_projects_people() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = gated(&wb);
+    let other = session(&wb, OTHER);
+    let people = |body: &serde_json::Value| {
+        body["people"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|person| person["authority"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let (_, theirs) = send(&app, "GET", "/roster", Some(&other), None).await;
+    assert_eq!(people(&theirs), vec![OTHER.to_owned()]);
+    let claimant = session(&wb, CLAIMANT);
+    let (_, mine) = send(&app, "GET", "/roster", Some(&claimant), None).await;
+    assert!(people(&mine).contains(&CLAIMANT.to_owned()));
+    assert!(!people(&mine).contains(&OTHER.to_owned()));
+}
+
+#[tokio::test]
+async fn a_projects_owner_invites_into_it_without_a_role() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    let app = crate::open_control_plane(wb.clone());
+    let other = session(&wb, OTHER);
+    let personal = wb.lock_unpoisoned().ensure_account_personal(OTHER).unwrap();
+    let (_, created) = send(
+        &app,
+        "POST",
+        "/projects",
+        Some(&other),
+        Some(serde_json::json!({ "name": "Shared" })),
+    )
+    .await;
+    let theirs = created["id"].as_str().unwrap().to_owned();
+    assert_ne!(theirs, personal);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/home/invitations",
+        Some(&other),
+        Some(serde_json::json!({
+            "authority": "acct-invitee",
+            "project": theirs,
+            "role": "member",
+            "endpoint": "https://home.example.test",
+        })),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
 }

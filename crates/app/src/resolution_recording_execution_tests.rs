@@ -90,6 +90,7 @@ fn home_correction_execution_records_exact_first_winner_without_changing_files()
     let mut wb = shared.lock_unpoisoned();
     let mut context = wb.authenticate_action_context(&token).unwrap();
     membership(&mut wb, "bob", "owner");
+    project_grant(&mut wb, "bob", crate::org::RecordOp::Upsert);
     let bob = wb.mint_account_session("bob", "passkey", 3600).unwrap();
     let (chat, path) = coordinates(&command);
     let before = wb.engagements[&chat].observe().unwrap().recorded_cut;

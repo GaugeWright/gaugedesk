@@ -7,11 +7,11 @@ use gaugedesk_store::{AdmitError, Store};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const CARD_KIND: &str = "choice-card";
+pub(crate) const CARD_KIND: &str = "choice-card";
 const ANSWER_KIND: &str = "choice-answer";
 const CONTINUATION_KIND: &str = "choice-continuation";
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChoiceRequest {
     pub questions: Vec<RequestedQuestion>,
@@ -21,7 +21,7 @@ pub struct ChoiceRequest {
     pub blocking: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestedQuestion {
     pub prompt: String,
@@ -33,7 +33,7 @@ pub struct RequestedQuestion {
     pub recommended: Option<usize>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestedOption {
     pub label: String,
@@ -62,6 +62,12 @@ pub struct ChoiceCard {
     pub conversation_id: String,
     pub origin_call_key: String,
     pub recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_command_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_request_digest: Option<String>,
     pub blocking: bool,
     pub questions: Vec<ChoiceQuestion>,
     pub asked_at_unix_ms: u64,
@@ -139,6 +145,33 @@ pub fn ask(
     {
         return Ok(existing);
     }
+    let card = prepare_card(conversation_id, call_key, recipient, request, now_ms())?;
+    let payload = serde_json::to_string(&card).map_err(|error| error.to_string())?;
+    let (_, inserted) = store
+        .append_record_with_key(
+            &scope(conversation_id),
+            &format!("ask:{call_key}"),
+            CARD_KIND,
+            &payload,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+    if inserted {
+        Ok(card)
+    } else {
+        get(store, conversation_id, &card.id)
+            .map_err(|error| format!("{error:?}"))?
+            .ok_or_else(|| "choice card receipt has no card".to_owned())
+    }
+}
+
+/// Validate and construct a card without writing a receipt or acquiring authority.
+pub(crate) fn prepare_card(
+    conversation_id: &str,
+    call_key: &str,
+    recipient: &str,
+    request: &ChoiceRequest,
+    asked_at_unix_ms: u64,
+) -> Result<ChoiceCard, String> {
     if !(1..=3).contains(&request.questions.len()) {
         return Err("a choice card needs one to three questions".to_owned());
     }
@@ -172,33 +205,20 @@ pub fn ask(
             multiple: question.multiple,
         });
     }
-    let card = ChoiceCard {
+    Ok(ChoiceCard {
         id: id_for(call_key),
         conversation_id: conversation_id.to_owned(),
         origin_call_key: call_key.to_owned(),
         recipient: recipient.to_owned(),
+        asked_by: None,
+        origin_command_id: None,
+        origin_request_digest: None,
         blocking: request.blocking,
         questions,
-        asked_at_unix_ms: now_ms(),
+        asked_at_unix_ms,
         answer: None,
         continuation: None,
-    };
-    let payload = serde_json::to_string(&card).map_err(|error| error.to_string())?;
-    let (_, inserted) = store
-        .append_record_with_key(
-            &scope(conversation_id),
-            &format!("ask:{call_key}"),
-            CARD_KIND,
-            &payload,
-        )
-        .map_err(|error| format!("{error:?}"))?;
-    if inserted {
-        Ok(card)
-    } else {
-        get(store, conversation_id, &card.id)
-            .map_err(|error| format!("{error:?}"))?
-            .ok_or_else(|| "choice card receipt has no card".to_owned())
-    }
+    })
 }
 
 pub fn list(store: &Store, conversation_id: &str) -> Result<Vec<ChoiceCard>, AdmitError> {

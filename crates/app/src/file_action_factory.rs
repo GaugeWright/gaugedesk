@@ -9,7 +9,7 @@ use crate::{
     action_inputs::NativeActionInputCustody,
     action_policy::ActionPolicyIdentity,
     file_action_policy::{compile_file_save_policy, FileSavePolicyInput},
-    identity::{ActorAuthentication, AuthenticatedActionContext},
+    identity::{account_authority_scopes, ActorAuthentication, AuthenticatedActionContext},
     library::{
         InstanceKind, Library, TargetParticipationMode, TargetVcsPosture, WorkTargetKind,
         WorkTargetOwner, WorkTargetStatus, LIBRARY_SCOPE,
@@ -83,6 +83,9 @@ pub struct EditorFileSave<'a> {
 pub struct AdmittedEditorFileSave {
     pub command: HostActionCommand,
     pub replayed: bool,
+    // Only a fresh committed user admission creates this process-local marker.
+    // It cannot be serialized, copied, or recreated by replaying a receipt.
+    user_activity: Option<user_activity::NewOfficeUserActivity>,
 }
 
 /// Addresses one recorded attempt; it conveys no authority or outcome.
@@ -105,6 +108,7 @@ struct FileAuthority {
     workspace_path: String,
     policy: HostGovernancePolicy,
     valid_until_ms: Option<u64>,
+    office_authority: Option<crate::office_home_admission::lease::OfficeStaffActionAuthority>,
     resolution_scope: whipplescript_store::vcs::resolution_scope::ResolutionMemoryScope,
     read_clearances: BTreeSet<String>,
 }
@@ -112,8 +116,13 @@ struct FileAuthority {
 impl FileAuthority {
     fn bind_deadline(
         &self,
+        store: &Store,
         basis: gaugedesk_store::command_dispatch::DispatchReadBasis,
     ) -> Result<gaugedesk_store::command_dispatch::DispatchReadBasis, AdmitError> {
+        let basis = match &self.office_authority {
+            Some(authority) => authority.bind_basis(store, basis, self.valid_until_ms)?,
+            None => basis,
+        };
         match self.valid_until_ms {
             Some(milliseconds) => std::time::UNIX_EPOCH
                 .checked_add(std::time::Duration::from_millis(milliseconds))
@@ -139,6 +148,7 @@ fn normalized(path: &str) -> bool {
 fn current_authority(
     store: &Store,
     home: &gaugedesk_core::ids::HomeId,
+    owners: &crate::project_owner::ProjectOwnerResolver,
     context: &AuthenticatedActionContext,
     request: &EditorFileSave<'_>,
 ) -> Result<FileAuthority, AdmitError> {
@@ -148,6 +158,7 @@ fn current_authority(
     current_target_authority(
         store,
         home,
+        owners,
         context,
         &NativeTargetIntent {
             chat_id: request.chat_id,
@@ -189,16 +200,18 @@ enum NativeActionKind {
 fn current_target_authority(
     store: &Store,
     home: &gaugedesk_core::ids::HomeId,
+    owners: &crate::project_owner::ProjectOwnerResolver,
     context: &AuthenticatedActionContext,
     request: &NativeTargetIntent<'_>,
     kind: NativeActionKind,
 ) -> Result<FileAuthority, AdmitError> {
-    current_target_authority_with_source(store, home, context, request, kind, None)
+    current_target_authority_with_source(store, home, owners, context, request, kind, None)
 }
 
 fn current_target_authority_with_source(
     store: &Store,
     home: &gaugedesk_core::ids::HomeId,
+    owners: &crate::project_owner::ProjectOwnerResolver,
     context: &AuthenticatedActionContext,
     request: &NativeTargetIntent<'_>,
     kind: NativeActionKind,
@@ -234,7 +247,11 @@ fn current_target_authority_with_source(
         .projects
         .get(project_id)
         .ok_or_else(|| invalid("project is unavailable"))?;
-    if &project.home_id != home || !org.can_access_project(context.actor().as_str(), project_id) {
+    if &project.home_id != home
+        || !owners
+            .members_in(&library, &owners.legacy_owner(store), project, &org)
+            .contains(context.actor().as_str())
+    {
         return Err(invalid("actor has no current grant on this Home project"));
     }
     let set = library
@@ -381,19 +398,11 @@ fn current_target_authority_with_source(
         read_clearances,
         policy,
         valid_until_ms,
+        office_authority: match context.authentication() {
+            ActorAuthentication::OfficeStaff { authority } => Some(authority.clone()),
+            _ => None,
+        },
     })
-}
-
-// Session authority spans the legacy/custody catalog and the actor's current
-// authentication and device/refresh scopes. Every explicit dispatch snapshot
-// must fence all of them, including when a retained grant reconstructs its source.
-fn account_authority_scopes(context: &AuthenticatedActionContext) -> Result<[String; 2], String> {
-    let actor = context.actor().as_str();
-    Ok([
-        crate::account::account_scope(actor),
-        crate::account_auth_custody::account_auth_scope(actor)
-            .map_err(|error| format!("account authority scope refused: {error:?}"))?,
-    ])
 }
 
 impl Workbench {
@@ -413,9 +422,10 @@ impl Workbench {
             return Err("file input custody belongs to another Home".into());
         }
         let home = self.home_id().clone();
+        let owners = self.project_owner_resolver();
         let account_scopes = account_authority_scopes(context)?;
         let read = |store: &Store| {
-            let authority = current_authority(store, &home, context, request)?;
+            let authority = current_authority(store, &home, &owners, context, request)?;
             crate::federation::require_project_writes_available(store, &authority.project_id)?;
             Ok(authority)
         };
@@ -456,7 +466,7 @@ impl Workbench {
             request_id: original.request_id.clone(),
         };
         let preparation_basis = authority
-            .bind_deadline(preparation_basis)
+            .bind_deadline(self.store_ref(), preparation_basis)
             .map_err(|error| format!("file preparation deadline refused: {error:?}"))?;
         let (signing_key, preparation_basis) =
             self.native_project_signer(&authority.project_id, preparation_basis)?;
@@ -600,7 +610,7 @@ impl Workbench {
             return Err("file authority changed during preparation".into());
         }
         let basis = current
-            .bind_deadline(basis)
+            .bind_deadline(self.store_ref(), basis)
             .map_err(|error| format!("file authority deadline refused: {error:?}"))?;
         let observer = self
             .store_ref()
@@ -640,9 +650,13 @@ impl Workbench {
             })
             .map_err(|error| format!("file action authorization refused: {error:?}"))?
             .map_err(|error| format!("{error:?}"))?;
+        let user_activity = (!admitted.replayed)
+            .then(|| user_activity::NewOfficeUserActivity::from_admission(context, &command))
+            .flatten();
         Ok(AdmittedEditorFileSave {
             command,
             replayed: admitted.replayed,
+            user_activity,
         })
     }
 }
@@ -720,3 +734,6 @@ pub use recording::{
     EditorCorrectionReconciliation, EditorCorrectionResultRequest, EditorCorrections,
     NativeCorrectionReconciliationRuntime, NativeEditorCorrectionResult,
 };
+
+#[path = "file_action_user_activity.rs"]
+mod user_activity;

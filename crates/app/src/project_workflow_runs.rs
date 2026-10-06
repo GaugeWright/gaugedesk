@@ -58,15 +58,32 @@ impl Workbench {
         ) {
             return Err("workflow authority cannot list runs".into());
         }
+        let mut scopes = crate::identity::workflow_authority_scopes(context)?;
+        scopes.extend([
+            crate::library::LIBRARY_SCOPE.into(),
+            crate::org::ORG_SCOPE.into(),
+        ]);
+        let (runs, _) = self
+            .store_ref()
+            .read_for_dispatch(
+                &scopes.iter().map(String::as_str).collect::<Vec<_>>(),
+                |_| Ok(self.chat_whip_runs_current(context, chat_id, path)),
+            )
+            .map_err(debug_error)?;
+        runs
+    }
+
+    fn chat_whip_runs_current(
+        &self,
+        context: &AuthenticatedActionContext,
+        chat_id: &str,
+        path: Option<&str>,
+    ) -> Result<Vec<ChatWhipRun>, String> {
         crate::identity::revalidate_workflow_context(self.store_ref(), self.home_id(), context)
             .map_err(debug_error)?;
-        let chat = self
-            .library
-            .chats
-            .get(chat_id)
-            .ok_or("chat is unavailable")?;
-        let project = self
-            .library
+        let library = crate::library::Library::rebuild(self.store_ref()).map_err(debug_error)?;
+        let chat = library.chats.get(chat_id).ok_or("chat is unavailable")?;
+        let project = library
             .instances
             .get(&chat.instance_id)
             .filter(|instance| instance.kind == InstanceKind::Using)
@@ -74,7 +91,20 @@ impl Workbench {
             .ok_or("only a project chat has runs")?;
         let actor = context.actor().as_str();
         let org = crate::org::Org::rebuild(self.store_ref()).map_err(debug_error)?;
-        if !org.can_access_project(actor, &project) {
+        let project_record = library
+            .projects
+            .get(&project)
+            .ok_or("project is unavailable")?;
+        let owners = self.project_owner_resolver();
+        if !owners
+            .members_in(
+                &library,
+                &owners.legacy_owner(self.store_ref()),
+                project_record,
+                &org,
+            )
+            .contains(actor)
+        {
             return Err("runs exceed current project authority".into());
         }
         let only = path
@@ -83,8 +113,7 @@ impl Workbench {
                     .map(|source| (source.target, source.path))
             })
             .transpose()?;
-        let targets: BTreeMap<String, String> = self
-            .library
+        let targets: BTreeMap<String, String> = library
             .current_target_set(chat_id)
             .ok_or("chat has no committed target selection")?
             .members
@@ -95,8 +124,7 @@ impl Workbench {
                     .map(|encoded| (member.target_id.clone(), encoded))
             })
             .collect();
-        let workspace = self
-            .library
+        let workspace = library
             .project_collaboration_workspaces
             .get(&project)
             .map(|workspace| workspace.workspace_id.clone());
@@ -150,8 +178,7 @@ impl Workbench {
                 }) {
                     continue;
                 }
-                let shared = self
-                    .library
+                let shared = library
                     .work_targets
                     .get(&binding.target)
                     .is_some_and(|target| target.authority == self.home_id().as_str());

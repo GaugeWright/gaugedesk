@@ -539,6 +539,8 @@ mod tests {
         label: &str,
         body: &[u8],
     ) -> (String, String) {
+        let project = wb.library.project_of_chat(chat_id).unwrap().to_owned();
+        wb.hold_session_for_tests(&project);
         let files = [("report.txt".to_owned(), body.to_vec())];
         let (_, cut) = wb
             .ingest_upload_into_engagement(chat_id, &files, None)
@@ -654,6 +656,8 @@ mod tests {
     /// Write a file into the chat's worktree that no import claims, as the
     /// agent's output or the reader's own edit is.
     fn written(wb: &mut Workbench, chat_id: &str, name: &str) -> String {
+        let project = wb.library.project_of_chat(chat_id).unwrap().to_owned();
+        wb.hold_session_for_tests(&project);
         let path = wb.engagement_workspace_path(chat_id, name);
         wb.engagements
             .get(chat_id)

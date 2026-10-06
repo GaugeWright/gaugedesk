@@ -46,6 +46,7 @@ pub struct DoHostConfig {
     transport: Arc<dyn DoHostTransport>,
     pub tenant_id: String,
     reuse_across_turns: bool,
+    original_policy: Option<PolicyEpochRef>,
 }
 
 impl std::fmt::Debug for DoHostConfig {
@@ -55,6 +56,7 @@ impl std::fmt::Debug for DoHostConfig {
             .field("transport", &self.transport)
             .field("tenant_id", &self.tenant_id)
             .field("reuse_across_turns", &self.reuse_across_turns)
+            .field("original_policy", &self.original_policy)
             .finish()
     }
 }
@@ -68,6 +70,10 @@ pub struct DoHostRequest {
     pub path: String,
     pub body: Vec<u8>,
     pub accept: Option<String>,
+    /// Exact original policy verified by the adapter's selected public root.
+    /// Owning Home transports must independently verify retained chat history
+    /// and current execution admission; this metadata is not a grant.
+    pub original_policy: Option<PolicyEpochRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +183,7 @@ impl DoHostConfig {
             }),
             tenant_id,
             reuse_across_turns: true,
+            original_policy: None,
         })
     }
 
@@ -196,12 +203,42 @@ impl DoHostConfig {
             transport,
             tenant_id,
             reuse_across_turns,
+            original_policy: None,
         })
     }
 
     pub(crate) fn reuse_across_turns(&self) -> bool {
         self.reuse_across_turns
     }
+}
+
+fn bind_hosted_policy(
+    factory: &WhipHarnessFactory,
+    config: &DoHostConfig,
+    placement: &str,
+    epoch: u64,
+    signed: &str,
+) -> io::Result<(DoHostConfig, PolicyEpochRef)> {
+    let policy = factory
+        .verify_policy(epoch, signed)
+        .map_err(invalid_data)?
+        .protocol_ref()
+        .clone();
+    let mut verified_config = config.clone();
+    verified_config.original_policy = Some(policy.clone());
+    let registered: PolicyEpochRef = serde_json::from_value(post_json(
+        &verified_config,
+        placement,
+        "/host/policy",
+        &json!({ "epoch": epoch, "signed_envelope": signed }),
+    )?)
+    .map_err(invalid_data)?;
+    if registered != policy {
+        return Err(invalid_data(
+            "hosted policy registration differs from the verified original policy",
+        ));
+    }
+    Ok((verified_config, policy))
 }
 
 pub(crate) fn create_harness(
@@ -226,16 +263,8 @@ pub(crate) fn create_harness(
     )?;
     let placement = required_ref(spec.runtime_placement_id.as_deref(), "runtime placement id")?;
     let policy_started = Instant::now();
-    let policy: PolicyEpochRef = serde_json::from_value(post_json(
-        config,
-        placement,
-        "/host/policy",
-        &json!({
-            "epoch": epoch,
-            "signed_envelope": signed,
-        }),
-    )?)
-    .map_err(invalid_data)?;
+    let (verified_config, policy) = bind_hosted_policy(factory, config, placement, epoch, signed)?;
+    let config = &verified_config;
     let policy_ms = policy_started.elapsed().as_secs_f64() * 1000.0;
     let open = super::OpenInstanceCommand {
         protocol: HOST_PROTOCOL.to_owned(),
@@ -339,6 +368,7 @@ pub(crate) fn create_harness(
 }
 
 pub(crate) fn clone_continuity(
+    factory: &WhipHarnessFactory,
     config: &DoHostConfig,
     source: &HarnessContinuitySpec,
     target: &HarnessContinuitySpec,
@@ -379,13 +409,8 @@ pub(crate) fn clone_continuity(
         source.signed_policy_envelope.as_deref(),
         "WhippleScript source signed policy",
     )?;
-    let policy: PolicyEpochRef = serde_json::from_value(post_json(
-        config,
-        placement,
-        "/host/policy",
-        &json!({ "epoch": epoch, "signed_envelope": signed }),
-    )?)
-    .map_err(invalid_data)?;
+    let (verified_config, policy) = bind_hosted_policy(factory, config, placement, epoch, signed)?;
+    let config = &verified_config;
     let source_open = continuity_open_command(
         &source.chat_id,
         source_package.version_ref(),
@@ -456,6 +481,7 @@ pub(crate) fn clone_continuity(
 }
 
 pub(crate) fn discard_continuity(
+    factory: &WhipHarnessFactory,
     config: &DoHostConfig,
     target: &HarnessContinuitySpec,
 ) -> io::Result<()> {
@@ -474,13 +500,8 @@ pub(crate) fn discard_continuity(
         target.signed_policy_envelope.as_deref(),
         "WhippleScript target signed policy",
     )?;
-    let policy: PolicyEpochRef = serde_json::from_value(post_json(
-        config,
-        placement,
-        "/host/policy",
-        &json!({ "epoch": epoch, "signed_envelope": signed }),
-    )?)
-    .map_err(invalid_data)?;
+    let (verified_config, policy) = bind_hosted_policy(factory, config, placement, epoch, signed)?;
+    let config = &verified_config;
     let open = continuity_open_command(&target.chat_id, package.version_ref(), policy.clone());
     let opened = post_json(
         config,
@@ -1473,6 +1494,7 @@ fn transport_request(
         path: path.to_owned(),
         body,
         accept: accept.map(str::to_owned),
+        original_policy: config.original_policy.clone(),
     }
 }
 
@@ -1887,9 +1909,19 @@ mod tests {
         requests: Mutex<Vec<DoHostRequest>>,
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct DiscardTransport {
         requests: Mutex<Vec<DoHostRequest>>,
+        policy: PolicyEpochRef,
+    }
+
+    impl DiscardTransport {
+        fn new(policy: PolicyEpochRef) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                policy,
+            }
+        }
     }
 
     impl DoHostTransport for DiscardTransport {
@@ -1897,16 +1929,15 @@ mod tests {
             let path = request.path.clone();
             self.requests.lock().unwrap().push(request);
             let body = if path == "/host/policy" {
-                serde_json::to_vec(&json!({
-                    "epoch": 3,
-                    "envelope_hash": "sha256:policy",
-                    "signer": "gaugedesk",
-                }))
-                .unwrap()
+                serde_json::to_vec(&self.policy).unwrap()
             } else if path == "/host/instances/open" {
                 br#"{"instance_ref":"whip:instance:fork"}"#.to_vec()
             } else if path == "/host/instances/whip%3Ainstance%3Afork/discard" {
                 br#"{"instance_ref":"whip:instance:fork","discarded_at":{"instance_ref":"whip:instance:fork","sequence":4}}"#.to_vec()
+            } else if path == "/host/instances/whip%3Ainstance%3Afork/fork-export?sequence=4" {
+                br#"{}"#.to_vec()
+            } else if path == "/host/forks/import" || path.ends_with("/files/sync") {
+                br#"{"ok":true}"#.to_vec()
             } else {
                 return Err(io::Error::other(format!("unexpected request {path}")));
             };
@@ -1989,11 +2020,40 @@ mod tests {
         );
     }
 
+    fn hosted_policy_fixture(root: &Path) -> (WhipHarnessFactory, String, PolicyEpochRef) {
+        let issuer = gaugedesk_core::ids::AuthorityId::new("project:original");
+        let (signed, verifier) = {
+            let key = gaugedesk_core::signature::SigningKey::from_seed(&[8u8; 32]).unwrap();
+            (
+                super::super::sign_hosted_policy_envelope(
+                    &super::super::tests::harness_policy_at("https://api.openai.com"),
+                    &issuer,
+                    &key,
+                    3,
+                )
+                .unwrap(),
+                super::super::GovernanceRootVerifier::new(issuer, key.public_key()),
+            )
+        };
+        let factory = WhipHarnessFactory::new(
+            gaugedesk_core::ids::AuthorityId::new("transport:host"),
+            verifier,
+            root,
+        );
+        let policy = factory
+            .verify_policy(3, &signed)
+            .unwrap()
+            .protocol_ref()
+            .clone();
+        (factory, signed, policy)
+    }
+
     #[test]
     fn hosted_continuity_discard_is_policy_bound_and_receipted() {
-        let transport = Arc::new(DiscardTransport::default());
-        let config = DoHostConfig::with_transport("tenant", transport.clone(), false).unwrap();
         let root = tempfile::tempdir().unwrap();
+        let (factory, signed, policy) = hosted_policy_fixture(root.path());
+        let transport = Arc::new(DiscardTransport::new(policy.clone()));
+        let config = DoHostConfig::with_transport("tenant", transport.clone(), false).unwrap();
         let target = HarnessContinuitySpec {
             chat_id: "fork-chat".into(),
             runtime_placement_id: Some("placement".into()),
@@ -2003,14 +2063,17 @@ mod tests {
             package_version_ref: None,
             system_prompt: Some("edit safely".into()),
             policy_epoch: Some(3),
-            signed_policy_envelope: Some("signed-policy".into()),
+            signed_policy_envelope: Some(signed),
             source_position: None,
         };
 
-        discard_continuity(&config, &target).expect("discard");
+        discard_continuity(&factory, &config, &target).expect("discard");
 
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|request| request.original_policy.as_ref() == Some(&policy)));
         assert_eq!(
             requests[2].path,
             "/host/instances/whip%3Ainstance%3Afork/discard"
@@ -2018,6 +2081,107 @@ mod tests {
         let body: Value = serde_json::from_slice(&requests[2].body).unwrap();
         assert_eq!(body["command"]["request_id"], "gaugedesk:discard:fork-chat");
         assert_eq!(body["command"]["policy"]["epoch"], 3);
+    }
+
+    #[test]
+    fn hosted_create_and_clone_carry_the_verified_original_policy_on_every_operation() {
+        let runtime_root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let (factory, signed, policy) = hosted_policy_fixture(runtime_root.path());
+        let transport = Arc::new(DiscardTransport::new(policy.clone()));
+        let config = DoHostConfig::with_transport("tenant", transport.clone(), true).unwrap();
+        let mut spec = super::super::tests::continuity_spec(
+            worktree.path(),
+            "https://api.openai.com",
+            gaugedesk_harness::ChatMode::Edit,
+            None,
+            Some("edit safely"),
+        );
+        spec.policy_epoch = Some(3);
+        spec.signed_policy_envelope = Some(signed.clone());
+        create_harness(&factory, &config, &spec).unwrap();
+        let source = HarnessContinuitySpec {
+            chat_id: spec.chat_id.clone(),
+            runtime_placement_id: spec.runtime_placement_id.clone(),
+            worktree: spec.worktree.clone(),
+            mode: spec.mode,
+            package_root: None,
+            package_version_ref: None,
+            system_prompt: spec.system_prompt.clone(),
+            policy_epoch: Some(3),
+            signed_policy_envelope: Some(signed),
+            source_position: Some(gaugedesk_harness::RuntimePosition {
+                instance_ref: "whip:instance:fork".into(),
+                sequence: 4,
+            }),
+        };
+        let mut target = source.clone();
+        target.chat_id = "target-chat".into();
+        clone_continuity(&factory, &config, &source, &target).unwrap();
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(requests
+            .iter()
+            .all(|request| request.original_policy.as_ref() == Some(&policy)));
+        assert!(requests.iter().any(|request| request.method == "GET"));
+        assert!(requests
+            .iter()
+            .any(|request| request.path == "/host/forks/import"));
+        assert!(
+            config.original_policy.is_none(),
+            "binding does not mutate a shared factory config"
+        );
+    }
+
+    #[test]
+    fn hosted_policy_binding_refuses_foreign_original_roots_before_transport() {
+        let root = tempfile::tempdir().unwrap();
+        let (factory, signed, policy) = hosted_policy_fixture(root.path());
+        let transport = Arc::new(DiscardTransport::new(policy));
+        let config = DoHostConfig::with_transport("tenant", transport.clone(), false).unwrap();
+        let foreign_key = gaugedesk_core::signature::SigningKey::from_seed(&[9u8; 32]).unwrap();
+        let same_key = gaugedesk_core::signature::SigningKey::from_seed(&[8u8; 32]).unwrap();
+        for verifier in [
+            super::super::GovernanceRootVerifier::new(
+                gaugedesk_core::ids::AuthorityId::new("project:original"),
+                foreign_key.public_key(),
+            ),
+            super::super::GovernanceRootVerifier::new(
+                gaugedesk_core::ids::AuthorityId::new("project:other"),
+                same_key.public_key(),
+            ),
+        ] {
+            let foreign = factory.clone().with_policy_root(verifier);
+            assert!(bind_hosted_policy(&foreign, &config, "placement", 3, &signed).is_err());
+        }
+        assert!(bind_hosted_policy(&factory, &config, "placement", 4, &signed).is_err());
+        assert!(bind_hosted_policy(&factory, &config, "placement", 3, "malformed").is_err());
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hosted_registration_cannot_replace_any_original_policy_coordinate() {
+        let root = tempfile::tempdir().unwrap();
+        let (factory, signed, policy) = hosted_policy_fixture(root.path());
+        for coordinate in ["epoch", "hash", "signer", "key"] {
+            let mut substituted = policy.clone();
+            match coordinate {
+                "epoch" => substituted.epoch += 1,
+                "hash" => substituted.envelope_hash = "sha256:substituted".into(),
+                "signer" => substituted.signer = "project:other".into(),
+                "key" => substituted.key_id = Some("foreign-key".into()),
+                _ => unreachable!(),
+            }
+            let transport = Arc::new(DiscardTransport::new(substituted));
+            let config = DoHostConfig::with_transport("tenant", transport.clone(), false).unwrap();
+            let error = bind_hosted_policy(&factory, &config, "placement", 3, &signed).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("differs from the verified original policy"));
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].original_policy.as_ref(), Some(&policy));
+        }
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) {

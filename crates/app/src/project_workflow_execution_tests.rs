@@ -212,6 +212,7 @@ fn assignment_requires_recipient_read_access_even_for_an_administrator() {
             &serde_json::to_string(&member).unwrap(),
         )
         .unwrap();
+    project_grant(&mut wb, "colleague", DEFAULT_PROJECT);
     request.inputs.insert(
         "learner".into(),
         serde_json::json!({"authority":"colleague"}),

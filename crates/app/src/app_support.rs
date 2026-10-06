@@ -243,6 +243,27 @@ impl Workbench {
         }))
     }
 
+    /// Native original-result observation skips hosted configuration and key enrollment.
+    pub(crate) fn recorded_whip_harness_factory(
+        &self,
+    ) -> std::io::Result<gaugedesk_whip_runtime::WhipHarnessFactory> {
+        if self.root_path().as_os_str().is_empty() {
+            return Err(std::io::Error::other(
+                "original runtime requires a persisted Home",
+            ));
+        }
+        let key = crate::key_store::FileKeyStore::new(self.root_path().join("keys"))
+            .existing_signing_key(self.authority())?;
+        Ok(gaugedesk_whip_runtime::WhipHarnessFactory::new(
+            self.authority().clone(),
+            gaugedesk_whip_runtime::GovernanceRootVerifier::new(
+                self.authority().clone(),
+                key.public_key(),
+            ),
+            self.root_path().join("whip-runtimes"),
+        ))
+    }
+
     pub fn whip_harness_factory(
         &self,
     ) -> std::io::Result<gaugedesk_whip_runtime::WhipHarnessFactory> {

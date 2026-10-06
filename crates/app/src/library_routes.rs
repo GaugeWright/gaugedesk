@@ -649,9 +649,39 @@ pub async fn get_notices(
 /// A read-only projection of `Active` memberships (`INV-5`, `INV-20`): the same
 /// list the `ask` tool offers an agent. Project tracker assignment checks the
 /// project's current readers separately.
-pub async fn get_roster(State(wb): State<SharedWorkbench>) -> impl IntoResponse {
+pub async fn get_roster(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    Json(serde_json::json!({ "people": wb.roster() })).into_response()
+    let mut people = wb.roster();
+    // On a desktop an account sees itself and the members of its own
+    // projects, never another account's people (DR-0268 §5).
+    if let Some(actor) = wb.pairing_actor(&headers) {
+        let visible = wb.project_visibility(net_http::bearer(&headers));
+        let co_members: std::collections::BTreeSet<String> =
+            crate::org::Org::rebuild(wb.store_ref())
+                .map(|org| {
+                    org.grants
+                        .values()
+                        .filter(|grant| visible.allows(&grant.project_id))
+                        .map(|grant| grant.authority.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+        people.retain(|person| person.authority == actor || co_members.contains(&person.authority));
+        if !people.iter().any(|person| person.authority == actor) {
+            people.insert(
+                0,
+                crate::agent_question::Addressee {
+                    authority: actor.clone(),
+                    display: actor.clone(),
+                    role: "owner".to_owned(),
+                },
+            );
+        }
+    }
+    Json(serde_json::json!({ "people": people })).into_response()
 }
 
 // ---- agents --------------------------------------------------------------

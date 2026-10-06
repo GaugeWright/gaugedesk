@@ -126,14 +126,198 @@ pub(super) fn project_grant(wb: &mut Workbench, actor: &str, op: crate::org::Rec
         .unwrap();
 }
 
+pub(in crate::file_action_factory) fn authenticated_chat_fixture(
+    root: &std::path::Path,
+) -> (SharedWorkbench, String, String) {
+    let (shared, intent, token) = setup(root);
+    (shared, intent.chat_id, token)
+}
+
 fn setup(root: &std::path::Path) -> (SharedWorkbench, Intent, String) {
     setup_content(root, "recorded base", "private editor draft")
+}
+
+#[test]
+fn account_owned_native_file_reads_do_not_require_directory_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, intent, token) = setup_content_with_classification(
+        dir.path(),
+        "recorded public base",
+        "public editor draft",
+        gaugedesk_core::abac::Classification::Public,
+    );
+    let mut wb = shared.lock_unpoisoned();
+    let alice = wb.authenticate_action_context(&token).unwrap();
+    let mut project = wb.library.projects[crate::DEFAULT_PROJECT].clone();
+    crate::project_owner::record_owner(&mut project.extra, "alice");
+    wb.store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    project_grant(&mut wb, "alice", crate::org::RecordOp::Tombstone);
+    let mut member = crate::org::Org::rebuild(wb.store_ref()).unwrap().members["alice"].clone();
+    member.status = crate::org::MembershipStatus::Deprovisioned;
+    wb.store_mut()
+        .append_record(
+            ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&member).unwrap(),
+        )
+        .unwrap();
+    wb.observe_native_file_content(&alice, &intent.chat_id, &intent.path)
+        .expect("a current account owner reads its own authorized source without a directory role");
+    let prepared = wb
+        .prepare_editor_file_save_request(
+            &alice,
+            &intent.chat_id,
+            &intent.path,
+            "roleless-owner-save",
+        )
+        .unwrap();
+    crate::project_owner::record_owner(&mut project.extra, "new-owner");
+    wb.store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    assert!(wb
+        .observe_native_file_content(&alice, &intent.chat_id, &intent.path)
+        .is_err());
+    let custody = NativeActionInputCustody::open(
+        dir.path().join("roleless-inputs.sqlite"),
+        wb.home_id().as_str(),
+        4096,
+    )
+    .unwrap();
+    let before = wb.store_ref().scope_high_water_marks().unwrap();
+    assert!(wb
+        .admit_editor_file_save(
+            &alice,
+            &custody,
+            &prepared,
+            &EditorFileSave {
+                chat_id: &intent.chat_id,
+                request_id: "roleless-owner-save",
+                path: &intent.path,
+                base_cut: &intent.base_cut,
+                content: &intent.content,
+            }
+        )
+        .is_err());
+    assert_eq!(wb.store_ref().scope_high_water_marks().unwrap(), before);
+}
+
+#[test]
+fn native_file_reads_and_admission_require_current_project_standing_not_org_rank() {
+    use gaugedesk_whip_runtime::host_actions::RuntimeStore;
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, intent, token) = setup(dir.path());
+    let mut wb = shared.lock_unpoisoned();
+    let alice = wb.authenticate_action_context(&token).unwrap();
+    let mut project = wb.library.projects[crate::DEFAULT_PROJECT].clone();
+    crate::project_owner::record_owner(&mut project.extra, "alice");
+    wb.store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    project_grant(&mut wb, "alice", crate::org::RecordOp::Tombstone);
+    let inputs = NativeActionInputCustody::open(
+        dir.path().join("inputs.sqlite"),
+        wb.home_id().as_str(),
+        4096,
+    )
+    .unwrap();
+    let request = EditorFileSave {
+        chat_id: &intent.chat_id,
+        request_id: &intent.request_id,
+        path: &intent.path,
+        base_cut: &intent.base_cut,
+        content: &intent.content,
+    };
+    // The recorded owner still works without an explicit grant. The cached
+    // project remains unchanged: all these paths must read its retained owner.
+    wb.observe_native_file_content(&alice, &intent.chat_id, &intent.path)
+        .unwrap();
+    let admitted = wb
+        .admit_editor_file_save(&alice, &inputs, &intent.identity, &request)
+        .unwrap();
+    let mut runtime = editor_runtime(&wb, &admitted.command, dir.path());
+    membership(&mut wb, "bob", "admin");
+    let token = wb.mint_account_session("bob", "passkey", 3600).unwrap();
+    let bob = wb.authenticate_action_context(&token).unwrap();
+    let before = wb.store_ref().scope_high_water_marks().unwrap();
+    assert!(wb
+        .observe_native_file_content(&bob, &intent.chat_id, &intent.path)
+        .is_err());
+    assert!(wb
+        .prepare_editor_file_save_request(&bob, &intent.chat_id, &intent.path, "ungranted-admin")
+        .is_err());
+    assert!(wb
+        .admit_editor_file_save(&bob, &inputs, &intent.identity, &request)
+        .is_err());
+    assert_eq!(wb.store_ref().scope_high_water_marks().unwrap(), before);
+
+    project_grant(&mut wb, "bob", crate::org::RecordOp::Upsert);
+    wb.observe_native_file_content(&bob, &intent.chat_id, &intent.path)
+        .unwrap();
+    wb.prepare_editor_file_save_request(&bob, &intent.chat_id, &intent.path, "granted-admin")
+        .unwrap();
+    project_grant(&mut wb, "bob", crate::org::RecordOp::Tombstone);
+    assert!(wb
+        .observe_native_file_content(&bob, &intent.chat_id, &intent.path)
+        .is_err());
+    assert!(wb
+        .prepare_editor_file_save_request(&bob, &intent.chat_id, &intent.path, "revoked-admin")
+        .is_err());
+
+    crate::project_owner::record_owner(&mut project.extra, "new-owner");
+    wb.store_mut()
+        .append_record(
+            LIBRARY_SCOPE,
+            "project",
+            &serde_json::to_string(&project).unwrap(),
+        )
+        .unwrap();
+    assert!(wb
+        .observe_native_file_content(&alice, &intent.chat_id, &intent.path)
+        .is_err());
+    assert!(wb
+        .deliver_editor_file_save(&alice, &inputs, &admitted.command, &mut runtime)
+        .is_err());
+    assert!(runtime
+        .kernel()
+        .store()
+        .list_instances()
+        .unwrap()
+        .is_empty());
 }
 
 fn setup_content(
     root: &std::path::Path,
     base_body: &str,
     draft: &str,
+) -> (SharedWorkbench, Intent, String) {
+    setup_content_with_classification(
+        root,
+        base_body,
+        draft,
+        gaugedesk_core::abac::Classification::Regulated,
+    )
+}
+
+fn setup_content_with_classification(
+    root: &std::path::Path,
+    base_body: &str,
+    draft: &str,
+    classification: gaugedesk_core::abac::Classification,
 ) -> (SharedWorkbench, Intent, String) {
     // Lean: these tests host one chat in the default placement and read
     // neither the archetype library nor the onboarding tracker, and a full
@@ -151,6 +335,22 @@ fn setup_content(
             .create_chat_in_instance(DEFAULT_PLACEMENT, "File action")
             .unwrap();
         let chat_id = chat["id"].as_str().unwrap().to_owned();
+        // Classify the authored source before its first signed version. A
+        // later target relabel must not erase retained version restrictions.
+        let target_id = wb.library.current_target_set(&chat_id).unwrap().members[0]
+            .target_id
+            .clone();
+        let mut target = wb.library.work_targets[&target_id].clone();
+        if target.attributes.classification != classification {
+            target.attributes.classification = classification;
+            wb.store_mut()
+                .append_record(
+                    LIBRARY_SCOPE,
+                    "work_target",
+                    &serde_json::to_string(&target).unwrap(),
+                )
+                .unwrap();
+        }
         let path = wb.engagement_workspace_path(&chat_id, "note.txt");
         let engagement = &wb.engagements[&chat_id];
         engagement.write_file(&path, base_body).unwrap();
@@ -191,6 +391,7 @@ pub(super) fn governed_fixture_write(
     let authority = current_authority(
         wb.store_ref(),
         wb.home_id(),
+        &wb.project_owner_resolver(),
         context,
         &EditorFileSave {
             chat_id: chat,
@@ -545,6 +746,7 @@ fn native_factory_refuses_revoked_or_unretained_account_context_before_preparati
     assert!(current_authority(
         wb.store_ref(),
         wb.home_id(),
+        &wb.project_owner_resolver(),
         &fabricated,
         &EditorFileSave {
             chat_id: &intent.chat_id,
@@ -632,6 +834,7 @@ fn controller_factory_checks_current_grant_and_refuses_malformed_history() {
     };
     // This is an explicit device directory grant, never an inferred human owner.
     membership(&mut wb, grant.device.as_str(), "owner");
+    project_grant(&mut wb, grant.device.as_str(), crate::org::RecordOp::Upsert);
     wb.store_mut()
         .append_record(
             crate::mobile_machine_session::SCOPE,
@@ -647,7 +850,14 @@ fn controller_factory_checks_current_grant_and_refuses_malformed_history() {
         base_cut: &intent.base_cut,
         content: &intent.content,
     };
-    assert!(current_authority(wb.store_ref(), wb.home_id(), &context, &request).is_ok());
+    assert!(current_authority(
+        wb.store_ref(),
+        wb.home_id(),
+        &wb.project_owner_resolver(),
+        &context,
+        &request
+    )
+    .is_ok());
     let mut revoked = grant.clone();
     revoked.status = crate::mobile_machine_session::ControllerGrantStatus::Revoked;
     wb.store_mut()
@@ -658,7 +868,13 @@ fn controller_factory_checks_current_grant_and_refuses_malformed_history() {
         )
         .unwrap();
     assert!(matches!(
-        current_authority(wb.store_ref(), wb.home_id(), &context, &request),
+        current_authority(
+            wb.store_ref(),
+            wb.home_id(),
+            &wb.project_owner_resolver(),
+            &context,
+            &request
+        ),
         Err(AdmitError::Rejected(_))
     ));
     wb.store_mut()
@@ -678,7 +894,14 @@ fn controller_factory_checks_current_grant_and_refuses_malformed_history() {
     assert!(
         crate::mobile_machine_session::current_action_grant(wb.store_ref(), &grant.id).is_err()
     );
-    assert!(current_authority(wb.store_ref(), wb.home_id(), &context, &request).is_err());
+    assert!(current_authority(
+        wb.store_ref(),
+        wb.home_id(),
+        &wb.project_owner_resolver(),
+        &context,
+        &request
+    )
+    .is_err());
 }
 
 pub(super) fn admitted_fixture(
@@ -776,8 +999,14 @@ fn home_storage_fixture_with_original(
                 base_cut: &intent.base_cut,
                 content: &intent.content,
             };
-            let authority =
-                current_authority(wb.store_ref(), wb.home_id(), &context, &request).unwrap();
+            let authority = current_authority(
+                wb.store_ref(),
+                wb.home_id(),
+                &wb.project_owner_resolver(),
+                &context,
+                &request,
+            )
+            .unwrap();
             let original_key = SigningKey::from_seed(&wb.governance_seed()).unwrap();
             prepare_action_policy(
                 wb.store_mut(),
@@ -1745,6 +1974,95 @@ fn native_editor_preparation_carries_the_actual_account_expiration_into_the_writ
 }
 
 #[test]
+fn office_staff_admit_native_save_as_themselves_and_revocation_stops_prepared_work() {
+    use crate::office_home_admission::{
+        lease::OfficeStaffLeases,
+        source::{SourceCheck, VerifiedSourceSession},
+    };
+    for revoke_home in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, intent, _) = setup(dir.path());
+        let mut wb = shared.lock_unpoisoned();
+        let home = wb.home_id().clone();
+        let mut leases = OfficeStaffLeases::new(home.clone());
+        let issuer = "https://auth.example/account/identity";
+        let now = crate::account::session_now_ms();
+        let lease = leases
+            .observe(
+                wb.store_mut(),
+                issuer,
+                "office-source",
+                SourceCheck::Verified(VerifiedSourceSession::for_test(
+                    issuer,
+                    "alice",
+                    crate::account_session::AccountSessionEvidence {
+                        session_ref: "office-source".into(),
+                        method: "passkey".into(),
+                        issued_at_ms: now.saturating_sub(1000),
+                        expires_at_ms: now + 7_200_000,
+                    },
+                    now,
+                )),
+            )
+            .unwrap();
+        let token = wb.home_admissions.open_office(&home, &lease).unwrap();
+        let standing = wb.home_admissions.office_standing(&lease, &token).unwrap();
+        let context = leases
+            .action_context(wb.store_ref(), lease.reference(), standing)
+            .unwrap();
+        let inputs = NativeActionInputCustody::open(
+            dir.path().join("office-inputs.sqlite"),
+            home.as_str(),
+            4096,
+        )
+        .unwrap();
+        let command = wb
+            .admit_editor_file_save(
+                &context,
+                &inputs,
+                &intent.identity,
+                &EditorFileSave {
+                    chat_id: &intent.chat_id,
+                    request_id: &intent.request_id,
+                    path: &intent.path,
+                    base_cut: &intent.base_cut,
+                    content: &intent.content,
+                },
+            )
+            .unwrap()
+            .command;
+        assert_eq!(command.provenance.initiator, "alice");
+        assert_eq!(command.provenance.executor, "alice");
+        let prepared = wb
+            .prepare_native_editor_action(&context, &inputs, &command, &command.policy)
+            .unwrap();
+        assert_eq!(
+            prepared.basis.deadline(),
+            Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(lease.deadline_ms()))
+        );
+        if revoke_home {
+            wb.home_admissions.revoke(&home, context.actor());
+        } else {
+            leases.revoke(wb.store_mut(), lease.reference()).unwrap();
+        }
+        let mut invoked = false;
+        assert!(wb
+            .store_mut()
+            .with_dispatch_basis(&prepared.basis, || {
+                invoked = true;
+            })
+            .is_err());
+        assert!(!invoked);
+        assert!(wb
+            .prepare_native_editor_action(&context, &inputs, &command, &command.policy)
+            .is_err());
+        assert!(wb
+            .observe_native_file_content(&context, &intent.chat_id, &intent.path)
+            .is_err());
+    }
+}
+
+#[test]
 fn native_resolution_scope_is_shared_by_authorized_actors_and_checks_current_path_grant() {
     use gaugedesk_whip_runtime::host_actions::RuntimeStore;
     let dir = tempfile::tempdir().unwrap();
@@ -1773,33 +2091,59 @@ fn native_resolution_scope_is_shared_by_authorized_actors_and_checks_current_pat
         content: "",
     };
     assert_eq!(
-        current_authority(wb.store_ref(), wb.home_id(), &context, &request)
-            .unwrap()
-            .resolution_scope,
+        current_authority(
+            wb.store_ref(),
+            wb.home_id(),
+            &wb.project_owner_resolver(),
+            &context,
+            &request
+        )
+        .unwrap()
+        .resolution_scope,
         expected
     );
     membership(&mut wb, "agent:editor", "owner");
+    project_grant(&mut wb, "agent:editor", crate::org::RecordOp::Upsert);
     let agent_token = wb
         .mint_account_session("agent:editor", "fixture-auth", 3600)
         .unwrap();
     let agent = wb.authenticate_action_context(&agent_token).unwrap();
-    let authority = current_authority(wb.store_ref(), wb.home_id(), &agent, &request).unwrap();
+    let authority = current_authority(
+        wb.store_ref(),
+        wb.home_id(),
+        &wb.project_owner_resolver(),
+        &agent,
+        &request,
+    )
+    .unwrap();
     assert_eq!(authority.project_id, project);
     assert_eq!(authority.resolution_scope, expected);
     assert_ne!(
         authority.policy,
-        current_authority(wb.store_ref(), wb.home_id(), &context, &request)
-            .unwrap()
-            .policy
+        current_authority(
+            wb.store_ref(),
+            wb.home_id(),
+            &wb.project_owner_resolver(),
+            &context,
+            &request
+        )
+        .unwrap()
+        .policy
     );
     let other_file = EditorFileSave {
         path: "another.txt",
         ..request
     };
     assert_eq!(
-        current_authority(wb.store_ref(), wb.home_id(), &agent, &other_file)
-            .unwrap()
-            .resolution_scope,
+        current_authority(
+            wb.store_ref(),
+            wb.home_id(),
+            &wb.project_owner_resolver(),
+            &agent,
+            &other_file
+        )
+        .unwrap()
+        .resolution_scope,
         expected
     );
     let mut runtime = editor_runtime(&wb, &command, dir.path());
@@ -1814,7 +2158,14 @@ fn native_resolution_scope_is_shared_by_authorized_actors_and_checks_current_pat
             &serde_json::to_string(&target).unwrap(),
         )
         .unwrap();
-    let changed = current_authority(wb.store_ref(), wb.home_id(), &context, &request).unwrap();
+    let changed = current_authority(
+        wb.store_ref(),
+        wb.home_id(),
+        &wb.project_owner_resolver(),
+        &context,
+        &request,
+    )
+    .unwrap();
     assert_ne!(changed.resolution_scope, expected);
     assert!(wb
         .deliver_editor_file_save(&context, &inputs, &command, &mut runtime)
@@ -2169,7 +2520,14 @@ fn pending_handoff_refuses_new_file_admission_without_creating_an_outbox() {
         base_cut: &intent.base_cut,
         content: &intent.content,
     };
-    let authority = current_authority(wb.store_ref(), wb.home_id(), &context, &request).unwrap();
+    let authority = current_authority(
+        wb.store_ref(),
+        wb.home_id(),
+        &wb.project_owner_resolver(),
+        &context,
+        &request,
+    )
+    .unwrap();
     let scope = crate::federation::handoff_scope(&authority.project_id);
     wb.store_mut()
         .append_record(
@@ -2186,3 +2544,6 @@ fn pending_handoff_refuses_new_file_admission_without_creating_an_outbox() {
         .contains("pending handoff"));
     assert_eq!(wb.store_ref().scope_high_water_marks().unwrap(), before);
 }
+
+#[path = "file_action_user_activity_tests.rs"]
+mod user_activity_tests;

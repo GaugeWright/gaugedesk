@@ -4134,6 +4134,294 @@
       }
     },
     {
+      "id": "account.link-recipients.list",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/account/link-recipients",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "read-own-link-recipients",
+      "requestSchema": "http/empty",
+      "responseSchema": "rust:gaugedesk-app/account_link_seal/LinkRecipient",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ]
+      }
+    },
+    {
+      "id": "account.link-recipients.register",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/link-recipients",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "register-own-device-recipient-key",
+      "requestSchema": "rust:gaugedesk-app/account_links/RecipientBody",
+      "responseSchema": "rust:gaugedesk-app/account_links/LinkRecipientRecord",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#only_a_trusted_device_registers_and_a_new_key_voids_its_old_copies"
+        ]
+      }
+    },
+    {
+      "id": "account.links.list",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/account/links",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "read-own-provider-links",
+      "requestSchema": "http/empty",
+      "responseSchema": "rust:gaugedesk-app/account_links_sync/LinkSummary",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ]
+      }
+    },
+    {
+      "id": "account.links.put",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "PUT",
+      "path": "/account/links/:provider",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "link-own-provider-for-every-device",
+      "requestSchema": "rust:gaugedesk-app/account_links/PutLink",
+      "responseSchema": "rust:gaugedesk-app/account_links/AccountLinkRecord",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#a_new_version_must_be_sealed_for_exactly_the_trusted_devices"
+        ]
+      }
+    },
+    {
+      "id": "account.links.revoke",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "DELETE",
+      "path": "/account/links/:provider",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "revoke-own-provider-link",
+      "requestSchema": "http/path-provider-id",
+      "responseSchema": "rust:gaugedesk-app/account_links/AccountLinkRecord",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#a_revoked_link_keeps_its_record_and_loses_every_copy"
+        ]
+      }
+    },
+    {
+      "id": "account.links.copy.read",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/account/links/:provider/copy",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "read-own-device-link-copy",
+      "requestSchema": "http/path-provider-id",
+      "responseSchema": "rust:gaugedesk-app/account_links_sync/CopyEnvelope",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ]
+      }
+    },
+    {
+      "id": "account.links.copies.add",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/links/:provider/copies",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "seal-own-link-for-waiting-device",
+      "requestSchema": "rust:gaugedesk-app/account_links/CopiesBody",
+      "responseSchema": "rust:gaugedesk-app/account_links/LinkCopyRecord",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#a_device_trusted_later_waits_until_a_holder_seals_for_it"
+        ]
+      }
+    },
+    {
+      "id": "account.links.refresh-lease.take",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/links/:provider/refresh-lease",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "lease-own-oauth-link-refresh",
+      "requestSchema": "rust:gaugedesk-app/account_links/LeaseBody",
+      "responseSchema": "rust:gaugedesk-app/account_links/RefreshLeaseRecord",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#one_device_refreshes_an_oauth_link_at_a_time"
+        ]
+      }
+    },
+    {
       "id": "control-plane.health",
       "jurisdiction": "control-plane-operations",
       "transport": "http-json",
@@ -7443,7 +7731,7 @@
         ],
         "deployed": [],
         "property": [
-          "crates/app/src/desktop_session_tests.rs#another_selected_account_cannot_borrow_the_local_home"
+          "crates/app/src/desktop_session_tests.rs#another_selected_account_reaches_none_of_the_first_accounts_projects"
         ]
       }
     },

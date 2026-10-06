@@ -78,6 +78,11 @@ impl FileKeyStore {
         file.sync_all()
     }
 
+    /// Original recovery requires an enrolled key and never creates one.
+    pub(crate) fn existing_signing_key(&self, authority: &AuthorityId) -> io::Result<SigningKey> {
+        read_signing_key(&self.path(authority))
+    }
+
     /// Load or create an unguessable key for a real external authority.
     ///
     /// Unlike [`KeyStore::signing_key`], this never derives private material
@@ -176,6 +181,31 @@ impl Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_recovery_key_read_never_enrolls_or_repairs_a_key() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("keys");
+        let store = FileKeyStore::new(&directory);
+        let authority = AuthorityId::new("synthetic-original-home");
+        assert!(store.existing_signing_key(&authority).is_err());
+        assert!(!directory.exists());
+        let key = SigningKey::from_seed(&[7; 32]).unwrap();
+        store.enroll(&authority, &key).unwrap();
+        let path = store.path(&authority);
+        let original = std::fs::read(&path).unwrap();
+        assert_eq!(
+            store.existing_signing_key(&authority).unwrap().public_key(),
+            key.public_key()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::write(&path, b"damaged original key").unwrap();
+        assert!(store.existing_signing_key(&authority).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"damaged original key");
+        std::fs::remove_file(&path).unwrap();
+        assert!(store.existing_signing_key(&authority).is_err());
+        assert!(!path.exists());
+    }
 
     #[test]
     fn loopback_keys_are_stable_per_authority_and_distinct_across() {

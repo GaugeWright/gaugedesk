@@ -16,9 +16,18 @@ pub struct DispatchReadBasis {
     store_path: String,
     heads: std::collections::BTreeMap<String, Option<i64>>,
     deadline: Option<std::time::SystemTime>,
+    process_guards: Vec<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl DispatchReadBasis {
+    /// Add a process-local authentication condition checked under the final
+    /// writer fence. Guards must inspect only clocks/atomic standing: no I/O,
+    /// store reads, locks or side effects. They grant no product permission.
+    pub fn with_process_guard(mut self, guard: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.process_guards.push(std::sync::Arc::new(guard));
+        self
+    }
+
     /// Add a validity ceiling from the captured authority. An existing ceiling
     /// can only be shortened; this observation still grants no authority.
     pub fn with_deadline(mut self, deadline: std::time::SystemTime) -> Self {
@@ -45,6 +54,7 @@ impl DispatchReadBasis {
             }));
         }
         self.heads.extend(other.heads);
+        self.process_guards.extend(other.process_guards);
         if let Some(deadline) = other.deadline {
             self = self.with_deadline(deadline);
         }
@@ -56,6 +66,44 @@ impl DispatchReadBasis {
     }
 }
 
+/// A borrowed check of the original authority while its product writer fence
+/// is held. Native adapters invoke it at each effect/commit boundary; neither
+/// a successful check nor a runtime receipt grants authority for later work.
+/// A refusal is terminal for this invocation, even if a caller later repairs a
+/// process flag. This check cannot be cloned or returned from the callback.
+pub struct NativeDispatchCheck<'a> {
+    _authority_transaction: &'a rusqlite::Transaction<'a>,
+    deadline: Option<std::time::SystemTime>,
+    process_guards: &'a [std::sync::Arc<dyn Fn() -> bool + Send + Sync>],
+    ended: &'a std::cell::Cell<bool>,
+}
+
+impl NativeDispatchCheck<'_> {
+    /// Inspect only the original clocks and atomic standing. Product authority
+    /// writers are excluded by the held transaction; this performs no I/O,
+    /// takes no locks and does not refresh or reconstruct authority.
+    pub fn check_current(&self) -> Result<(), AdmitError> {
+        check_latched_validity(self.deadline, self.process_guards, self.ended)
+    }
+}
+
+/// Pending typed commands folded and decided under the actual product writer.
+/// This is data, with no authority and no precomputed lifecycle events.
+pub struct LifecycleBatch<L: Lifecycle> {
+    pub scope: String,
+    pub commands: Vec<L::Command>,
+}
+
+/// An original phase's positions, in typed-event then caller-fact order.
+/// Unlike an ordinary completion replay, a prefix replay returns its original
+/// positions so callers keep the same transcript/run anchors. This is retained
+/// evidence, never a fresh execution or publication grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedCommandPrefix {
+    pub positions: Vec<i64>,
+    pub replayed: bool,
+}
+
 /// One product commit while its current-authority writer transaction is held.
 /// The evidence publisher consumes this inside its retention callback. Dropping
 /// it rolls back; a successful commit remains durable if the callback then fails.
@@ -63,9 +111,74 @@ pub struct DispatchRecordAdmission<'tx> {
     tx: rusqlite::Transaction<'tx>,
     codec: Option<std::sync::Arc<dyn crate::ContentCodec>>,
     store_path: String,
+    deadline: Option<std::time::SystemTime>,
+    process_guards: Vec<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    native_ended: std::cell::Cell<bool>,
 }
 
 impl DispatchRecordAdmission<'_> {
+    /// Run bounded native work under this same product publication fence.
+    /// The check borrows the handle and cannot escape; after native work returns,
+    /// the handle can be consumed inside the native evidence retention callback.
+    /// A refused check remains terminal for every later use of this handle.
+    /// No product writes, network work or lock-reacquiring check belong here.
+    ///
+    /// ```compile_fail
+    /// use gaugedesk_store::Store;
+    /// let mut store = Store::open_in_memory().unwrap();
+    /// let (_, basis) = store.read_for_dispatch(&["authority"], |_| Ok(())).unwrap();
+    /// store.with_dispatch_record_admission(&basis, |writer| {
+    ///     writer.with_native_check(|check| check)
+    /// });
+    /// ```
+    pub fn with_native_check<T>(
+        &self,
+        native: impl for<'check> FnOnce(&NativeDispatchCheck<'check>) -> T,
+    ) -> Result<T, AdmitError> {
+        let check = NativeDispatchCheck {
+            _authority_transaction: &self.tx,
+            deadline: self.deadline,
+            process_guards: &self.process_guards,
+            ended: &self.native_ended,
+        };
+        check.check_current()?;
+        let result = native(&check);
+        check.check_current()?;
+        Ok(result)
+    }
+
+    /// Require the exact original pending intent under the held writer before
+    /// any native effect. A refusal ends this handle even if a caller attempts
+    /// to repair intent inside it. This check grants no later execution right.
+    pub fn require_pending_claim(
+        &self,
+        command_id: &str,
+        scope: &str,
+        key: &str,
+        snapshot: &str,
+    ) -> Result<(), AdmitError> {
+        let result =
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)
+                .and_then(|()| {
+                    crate::record_admission::pending_command_matches(
+                        &self.tx, command_id, scope, key, snapshot,
+                    )
+                })
+                .and_then(|pending| {
+                    if pending {
+                        Ok(())
+                    } else {
+                        Err(AdmitError::Rejected(Rejection {
+                            reason: "native work has no exact pending original command",
+                        }))
+                    }
+                });
+        if result.is_err() {
+            self.native_ended.set(true);
+        }
+        result
+    }
+
     /// Stage caller-selected original commands, events and receipts in this
     /// admission's transaction. Nothing is committed until the returned handle
     /// is committed; dropping it rolls the import back with the admission.
@@ -97,7 +210,10 @@ impl DispatchRecordAdmission<'_> {
         L::Command: serde::Serialize,
     {
         let prepared = PreparedDispatch::<L>::new(scope_id, idempotency_key, command, dispatch)?;
-        commit_dispatch::<L>(self.tx, prepared)
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+        commit_dispatch::<L>(self.tx, prepared, || {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)
+        })
     }
 
     /// Consume the held source fence to publish normal lifecycle admission and
@@ -117,7 +233,11 @@ impl DispatchRecordAdmission<'_> {
     {
         let prepared = PreparedDispatch::<L>::new(scope_id, idempotency_key, command, dispatch)?;
         check_dispatch_basis(&self.tx, &self.store_path, basis)?;
-        commit_dispatch::<L>(self.tx, prepared)
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+        commit_dispatch::<L>(self.tx, prepared, || {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            check_validity(basis.deadline, &basis.process_guards)
+        })
     }
 
     /// Commit the exact command and its facts before releasing external evidence
@@ -130,6 +250,7 @@ impl DispatchRecordAdmission<'_> {
         facts: &[crate::CommandRecordFact],
     ) -> Result<crate::MaterializedRecordAdmission, AdmitError> {
         let stored = crate::record_admission::encode_facts(self.codec.as_ref(), facts)?;
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
         crate::record_admission::commit(
             self.tx,
             self.codec,
@@ -138,6 +259,274 @@ impl DispatchRecordAdmission<'_> {
             snapshot_json,
             stored,
             None,
+            None,
+            || check_latched_validity(self.deadline, &self.process_guards, &self.native_ended),
+        )
+    }
+
+    /// Record one exact startup phase without finishing its pending parent.
+    /// This phase has its own durable receipt and never grants later authority.
+    /// Replay returns the original event positions after verifying their retained
+    /// bytes; it does not decide commands against a later lifecycle state.
+    /// A facts-only phase can bind a declaration to an earlier phase's assigned
+    /// position without fabricating a lifecycle event. An empty phase refuses.
+    #[allow(clippy::too_many_arguments)] // Original parent, named phase and typed facts.
+    pub fn commit_claimed_lifecycle_prefix<L: Lifecycle>(
+        self,
+        command_id: &str,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        phase: &str,
+        batch: LifecycleBatch<L>,
+        facts: &[crate::CommandRecordFact],
+    ) -> Result<MaterializedCommandPrefix, AdmitError>
+    where
+        L::Command: serde::Serialize,
+    {
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+        crate::record_admission_prefix::commit(
+            self.tx,
+            self.codec,
+            command_id,
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            phase,
+            batch,
+            facts,
+            || check_latched_validity(self.deadline, &self.process_guards, &self.native_ended),
+        )
+    }
+
+    /// Verify an existing exact original phase without consuming this writer.
+    /// This stages/repairs nothing and returns only original positions. The
+    /// same original authority and retained key must govern subsequent use;
+    /// every refusal terminally ends this handle for native work and commit.
+    #[allow(clippy::too_many_arguments)] // Same original pending parent and full phase meaning.
+    pub fn require_claimed_lifecycle_prefix<L: Lifecycle>(
+        &self,
+        command_id: &str,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        phase: &str,
+        batch: &LifecycleBatch<L>,
+        facts: &[crate::CommandRecordFact],
+    ) -> Result<Vec<i64>, AdmitError>
+    where
+        L::Command: serde::Serialize,
+    {
+        let result = (|| {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            let positions = crate::record_admission_prefix::verify(
+                &self.tx,
+                self.codec.as_ref(),
+                command_id,
+                command_scope,
+                idempotency_key,
+                snapshot_json,
+                phase,
+                batch,
+                facts,
+            )?;
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            Ok(positions)
+        })();
+        if result.is_err() {
+            self.native_ended.set(true);
+        }
+        result
+    }
+
+    /// Verify an original pre-result phase under this current reader's writer.
+    /// Rechecks the exact recorded pair and phase bytes without pending task
+    /// authority, reducers or repair. Positions grant no recipient access.
+    /// Every refusal ends this handle for subsequent native work or commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn require_recorded_lifecycle_prefix<P: Lifecycle, L: Lifecycle, M: Lifecycle>(
+        &self,
+        command_id: &str,
+        command_scope: &str,
+        key: &str,
+        snapshot: &str,
+        phase: &str,
+        batch: &LifecycleBatch<P>,
+        facts: &[crate::CommandRecordFact],
+    ) -> Result<Vec<i64>, AdmitError>
+    where
+        P::Command: serde::Serialize,
+    {
+        let result = (|| {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            let positions = crate::record_admission_prefix::verify_recorded::<P, L, M>(
+                &self.tx,
+                self.codec.as_ref(),
+                command_id,
+                command_scope,
+                key,
+                snapshot,
+                phase,
+                batch,
+                facts,
+            )?;
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            Ok(positions)
+        })();
+        if result.is_err() {
+            self.native_ended.set(true);
+        }
+        result
+    }
+
+    /// Finish the exact original claim with typed lifecycle decisions, retained
+    /// result-reference facts and one durable receipt under this writer fence.
+    /// Any rejected decision or final authority refusal rolls the entire batch
+    /// back. A committed retry never applies the lifecycle commands again.
+    pub fn commit_claimed_lifecycle<L: Lifecycle>(
+        self,
+        command_id: &str,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        batch: LifecycleBatch<L>,
+        facts: &[crate::CommandRecordFact],
+    ) -> Result<crate::MaterializedRecordAdmission, AdmitError> {
+        let stored = crate::record_admission::encode_facts(self.codec.as_ref(), facts)?;
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+        crate::record_admission::commit_lifecycle(
+            self.tx,
+            self.codec,
+            command_id,
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            batch,
+            stored,
+            || check_latched_validity(self.deadline, &self.process_guards, &self.native_ended),
+        )
+    }
+
+    /// Finish two distinct lifecycles in one scope with the original receipt.
+    /// The pure fact builder receives the first available position AFTER both
+    /// typed batches are decided and staged under this writer. It must perform
+    /// no I/O, acquire no locks and return only facts in that same scope. This
+    /// lets transcript/boundary references use actual assigned positions.
+    /// A rejected decision, builder/codec error or final authority refusal rolls
+    /// everything back. Committed replay never calls the builder or reducers.
+    #[allow(clippy::too_many_arguments)] // Exact original claim plus two typed intents.
+    pub fn commit_claimed_lifecycle_pair<L: Lifecycle, M: Lifecycle>(
+        self,
+        command_id: &str,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        first: LifecycleBatch<L>,
+        second: LifecycleBatch<M>,
+        facts: impl FnOnce(i64) -> Result<Vec<crate::CommandRecordFact>, AdmitError>,
+    ) -> Result<crate::MaterializedRecordAdmission, AdmitError> {
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+        crate::record_admission::commit_lifecycle_pair(
+            self.tx,
+            self.codec,
+            command_id,
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            first,
+            second,
+            facts,
+            || check_latched_validity(self.deadline, &self.process_guards, &self.native_ended),
+        )
+    }
+
+    /// Publish a new exact paired result with independently verifiable provenance.
+    /// Both typed batches, facts, owner marker and parent receipt commit atomically.
+    /// Replay verifies original intents and retained rows without invoking the builder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_recorded_claimed_lifecycle_pair<L: Lifecycle, M: Lifecycle>(
+        self,
+        command_id: &str,
+        command_scope: &str,
+        key: &str,
+        snapshot: &str,
+        first: LifecycleBatch<L>,
+        second: LifecycleBatch<M>,
+        facts: impl FnOnce(i64) -> Result<Vec<crate::CommandRecordFact>, AdmitError>,
+    ) -> Result<crate::MaterializedRecordAdmission, AdmitError>
+    where
+        L::Command: serde::Serialize,
+        M::Command: serde::Serialize,
+    {
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+        crate::record_admission_pair::commit(
+            self.tx,
+            self.codec,
+            command_id,
+            command_scope,
+            key,
+            snapshot,
+            first,
+            second,
+            facts,
+            || check_latched_validity(self.deadline, &self.process_guards, &self.native_ended),
+        )
+    }
+
+    /// Verify original committed pair rows under this current reader's writer.
+    /// No reducer, repair, write or pending-task authority is supplied. Any
+    /// refusal terminally ends this writer for subsequent work or publication.
+    pub fn require_recorded_claimed_lifecycle_pair<L: Lifecycle, M: Lifecycle>(
+        &self,
+        command_id: &str,
+        command_scope: &str,
+        key: &str,
+        snapshot: &str,
+        result_scope: &str,
+    ) -> Result<crate::RecordedLifecyclePair<L, M>, AdmitError> {
+        let result = (|| {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            let original = crate::record_admission_pair::verify::<L, M>(
+                &self.tx,
+                self.codec.as_ref(),
+                command_id,
+                command_scope,
+                key,
+                snapshot,
+                result_scope,
+            )?;
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            Ok(original)
+        })();
+        if result.is_err() {
+            self.native_ended.set(true);
+        }
+        result
+    }
+
+    /// Finish an already claimed exact command together with its facts and
+    /// durable receipt. The claim is not an execution grant: the original
+    /// captured basis is checked at this transaction's final commit.
+    pub fn commit_claimed(
+        self,
+        command_id: &str,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        facts: &[crate::CommandRecordFact],
+    ) -> Result<crate::MaterializedRecordAdmission, AdmitError> {
+        let stored = crate::record_admission::encode_facts(self.codec.as_ref(), facts)?;
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+        crate::record_admission::commit(
+            self.tx,
+            self.codec,
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            stored,
+            None,
+            Some(command_id),
+            || check_latched_validity(self.deadline, &self.process_guards, &self.native_ended),
         )
     }
 }
@@ -179,19 +568,46 @@ struct DispatchSnapshot<Command> {
     dispatch: CommandDispatch,
 }
 
-pub(crate) fn check_dispatch_basis(
-    tx: &rusqlite::Transaction<'_>,
-    store_path: &str,
-    basis: &DispatchReadBasis,
+fn check_latched_validity(
+    deadline: Option<std::time::SystemTime>,
+    guards: &[std::sync::Arc<dyn Fn() -> bool + Send + Sync>],
+    ended: &std::cell::Cell<bool>,
 ) -> Result<(), AdmitError> {
-    if basis
-        .deadline
-        .is_some_and(|deadline| std::time::SystemTime::now() >= deadline)
-    {
+    if ended.get() {
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "native dispatch authority ended",
+        }));
+    }
+    let result = check_validity(deadline, guards);
+    if result.is_err() {
+        ended.set(true);
+    }
+    result
+}
+
+fn check_validity(
+    deadline: Option<std::time::SystemTime>,
+    guards: &[std::sync::Arc<dyn Fn() -> bool + Send + Sync>],
+) -> Result<(), AdmitError> {
+    if deadline.is_some_and(|end| std::time::SystemTime::now() >= end) {
         return Err(AdmitError::Rejected(Rejection {
             reason: "dispatch authorization expired while waiting",
         }));
     }
+    if guards.iter().any(|guard| !guard()) {
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "dispatch authentication is no longer active",
+        }));
+    }
+    Ok(())
+}
+
+pub(super) fn check_dispatch_basis(
+    tx: &rusqlite::Transaction<'_>,
+    store_path: &str,
+    basis: &DispatchReadBasis,
+) -> Result<(), AdmitError> {
+    check_validity(basis.deadline, &basis.process_guards)?;
     if basis.store_path != store_path {
         return Err(AdmitError::Rejected(Rejection {
             reason: "dispatch authorization came from another store",
@@ -227,6 +643,9 @@ impl Store {
             tx,
             codec,
             store_path,
+            deadline: None,
+            process_guards: Vec::new(),
+            native_ended: std::cell::Cell::new(false),
         }))
     }
 
@@ -257,6 +676,9 @@ impl Store {
             tx,
             codec,
             store_path,
+            deadline: basis.deadline,
+            process_guards: basis.process_guards.clone(),
+            native_ended: std::cell::Cell::new(false),
         }))
     }
 
@@ -276,6 +698,59 @@ impl Store {
         let result = admit_runtime();
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Run bounded native work with the original authority check available at
+    /// its actual effect/commit boundaries. No product writes or network work
+    /// belong in this callback. Native effects that committed before refusal
+    /// remain facts; this boundary cannot promise rollback in another authority.
+    ///
+    /// The check cannot escape to become a later execution grant:
+    /// ```compile_fail
+    /// use gaugedesk_store::Store;
+    /// let mut store = Store::open_in_memory().unwrap();
+    /// let (_, basis) = store.read_for_dispatch(&["authority"], |_| Ok(())).unwrap();
+    /// let escaped = store.with_checked_dispatch_basis(&basis, |check| check);
+    /// ```
+    pub fn with_checked_dispatch_basis<T>(
+        &mut self,
+        basis: &DispatchReadBasis,
+        admit_runtime: impl for<'check> FnOnce(&NativeDispatchCheck<'check>) -> T,
+    ) -> Result<T, AdmitError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_dispatch_basis(&tx, &self.path, basis)?;
+        let ended = std::cell::Cell::new(false);
+        let result = {
+            let check = NativeDispatchCheck {
+                _authority_transaction: &tx,
+                deadline: basis.deadline,
+                process_guards: &basis.process_guards,
+                ended: &ended,
+            };
+            let result = admit_runtime(&check);
+            check.check_current()?;
+            result
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// The scope to include when observing a subordinate original phase.
+    /// This locator conveys no command or publication authority.
+    pub fn claimed_lifecycle_prefix_scope(command_id: &str, phase: &str) -> String {
+        crate::record_admission_prefix::prefix_scope(command_id, phase)
+    }
+
+    /// Observe consistent phase-marker/receipt presence. Exact replay and retained
+    /// content still require commit_claimed_lifecycle_prefix under its writer.
+    pub fn claimed_lifecycle_prefix_recorded(
+        &self,
+        command_id: &str,
+        phase: &str,
+    ) -> Result<bool, AdmitError> {
+        crate::record_admission_prefix::recorded(self, command_id, phase)
     }
 
     /// Fold the declared event scopes in one read snapshot. Callers must name
@@ -307,6 +782,7 @@ impl Store {
                 store_path: self.path.clone(),
                 heads,
                 deadline: None,
+                process_guards: Vec::new(),
             },
         ))
     }
@@ -465,7 +941,10 @@ impl Store {
         if let Some(basis) = basis {
             check_dispatch_basis(&tx, &self.path, basis)?;
         }
-        commit_dispatch::<L>(tx, prepared)
+        commit_dispatch::<L>(tx, prepared, || match basis {
+            Some(basis) => check_validity(basis.deadline, &basis.process_guards),
+            None => Ok(()),
+        })
     }
 }
 
@@ -528,6 +1007,7 @@ where
 fn commit_dispatch<L: Lifecycle>(
     tx: rusqlite::Transaction<'_>,
     prepared: PreparedDispatch<'_, L>,
+    final_check: impl FnOnce() -> Result<(), AdmitError>,
 ) -> Result<MaterializedAdmission<L::State>, AdmitError>
 where
     L::Command: serde::Serialize,
@@ -640,6 +1120,7 @@ where
              WHERE scope_id = ?1 AND idempotency_key = ?2",
     )?
     .execute(params![scope_id, idempotency_key])?;
+    final_check()?;
     tx.commit()?;
     Ok(MaterializedAdmission { state, replayed })
 }
@@ -651,6 +1132,10 @@ mod record_tests;
 #[cfg(test)]
 #[path = "command_dispatch_retained_tests.rs"]
 mod retained_tests;
+
+#[cfg(test)]
+#[path = "command_dispatch_process_guard_tests.rs"]
+mod process_guard_tests;
 
 #[cfg(test)]
 mod tests {
@@ -710,6 +1195,221 @@ mod tests {
             .is_err());
         assert!(store.command_for_key("scope", "key").unwrap().is_none());
         assert!(store.records("scope", DISPATCH_KIND).unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_admission_native_check_shares_fence_and_finishes_original_claim() {
+        let mut product = Store::open_in_memory().unwrap();
+        product
+            .claim_command("upload", "chat", "key", "exact bytes")
+            .unwrap();
+        let competing = rusqlite::Connection::open(product.path()).unwrap();
+        competing.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let (_, basis) = product
+            .read_for_dispatch(&["authority"], |_| Ok(()))
+            .unwrap();
+        let facts = [crate::CommandRecordFact {
+            scope_id: "chat".into(),
+            kind: "resource".into(),
+            payload: "exact native binding".into(),
+        }];
+        let admitted = product
+            .with_dispatch_record_admission(&basis, |writer| {
+                writer
+                    .with_native_check(|check| {
+                        check.check_current().unwrap();
+                        assert!(competing.execute_batch("BEGIN IMMEDIATE").is_err());
+                        // Returning read evidence does not release the product fence.
+                        "retained native evidence"
+                    })
+                    .unwrap();
+                assert!(competing.execute_batch("BEGIN IMMEDIATE").is_err());
+                writer.commit_claimed("upload", "chat", "key", "exact bytes", &facts)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!admitted.replayed);
+        assert_eq!(
+            product.records("chat", "resource").unwrap(),
+            ["exact native binding"]
+        );
+        assert_eq!(
+            product
+                .command_for_key("chat", "key")
+                .unwrap()
+                .unwrap()
+                .command_id,
+            "upload"
+        );
+        assert_eq!(
+            product
+                .command_for_key("chat", "key")
+                .unwrap()
+                .unwrap()
+                .status,
+            "applied"
+        );
+        competing
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+    }
+
+    #[test]
+    fn record_admission_native_refusal_cannot_be_repaired_before_any_product_commit() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        for claimed in [false, true] {
+            let mut product = Store::open_in_memory().unwrap();
+            let mut native = Store::open_in_memory().unwrap();
+            if claimed {
+                product
+                    .claim_command("upload", "chat", "key", "exact bytes")
+                    .unwrap();
+            }
+            let current = Arc::new(AtomicBool::new(true));
+            let live = current.clone();
+            let (_, basis) = product
+                .read_for_dispatch(&["authority"], |_| Ok(()))
+                .unwrap();
+            let basis = basis.with_process_guard(move || live.load(Ordering::SeqCst));
+            let facts = [crate::CommandRecordFact {
+                scope_id: "chat".into(),
+                kind: "resource".into(),
+                payload: "must not publish".into(),
+            }];
+            let result = product
+                .with_dispatch_record_admission(&basis, |writer| {
+                    assert!(writer
+                        .with_native_check(|check| {
+                            check.check_current().unwrap();
+                            native
+                                .append_record("runtime", "outcome", "already committed")
+                                .unwrap();
+                            current.store(false, Ordering::SeqCst);
+                            assert!(check.check_current().is_err());
+                            current.store(true, Ordering::SeqCst);
+                        })
+                        .is_err());
+                    assert!(writer
+                        .with_native_check(|_| panic!("ended admission reentered"))
+                        .is_err());
+                    // Even a caller that discards the error cannot revive publication.
+                    if claimed {
+                        writer.commit_claimed("upload", "chat", "key", "exact bytes", &facts)
+                    } else {
+                        writer.commit("chat", "key", "exact bytes", &facts)
+                    }
+                })
+                .unwrap();
+            assert!(result.is_err());
+            assert!(product.records("chat", "resource").unwrap().is_empty());
+            assert_eq!(
+                native.records("runtime", "outcome").unwrap(),
+                ["already committed"]
+            );
+            if claimed {
+                assert_eq!(
+                    product
+                        .command_for_key("chat", "key")
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "processing"
+                );
+            } else {
+                assert!(product.command_for_key("chat", "key").unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn native_dispatch_check_holds_writer_and_original_ceiling_and_latches_refusal() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let mut product = Store::open_in_memory().unwrap();
+        let competing = rusqlite::Connection::open(product.path()).unwrap();
+        competing.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let current = Arc::new(AtomicBool::new(true));
+        let live = current.clone();
+        let (_, basis) = product
+            .read_for_dispatch(&["authority"], |_| Ok(()))
+            .unwrap();
+        let ceiling = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+        let basis = basis
+            .with_process_guard(move || live.load(Ordering::SeqCst))
+            .with_deadline(ceiling);
+        let mut refused_inside = false;
+        assert!(product
+            .with_checked_dispatch_basis(&basis, |check| {
+                assert!(competing.execute_batch("BEGIN IMMEDIATE").is_err());
+                check.check_current().unwrap();
+                current.store(false, Ordering::SeqCst);
+                assert!(check.check_current().is_err());
+                refused_inside = true;
+                current.store(true, Ordering::SeqCst);
+                assert!(
+                    check.check_current().is_err(),
+                    "repair cannot revive this invocation"
+                );
+            })
+            .is_err());
+        assert!(refused_inside);
+        assert_eq!(basis.deadline(), Some(ceiling));
+        competing
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+        let expired = basis.with_deadline(std::time::SystemTime::UNIX_EPOCH);
+        assert!(product
+            .with_checked_dispatch_basis(&expired, |_| panic!("expired native work entered"))
+            .is_err());
+        let (_, stale) = product
+            .read_for_dispatch(&["authority"], |_| Ok(()))
+            .unwrap();
+        product
+            .append_record("authority", "grant", "removed")
+            .unwrap();
+        assert!(product
+            .with_checked_dispatch_basis(&stale, |_| panic!("stale native work entered"))
+            .is_err());
+    }
+
+    #[test]
+    fn native_dispatch_final_check_refuses_unobserved_process_loss_and_preserves_prior_native_facts(
+    ) {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let mut product = Store::open_in_memory().unwrap();
+        let mut native = Store::open_in_memory().unwrap();
+        let current = Arc::new(AtomicBool::new(true));
+        let live = current.clone();
+        let (_, basis) = product
+            .read_for_dispatch(&["authority"], |_| Ok(()))
+            .unwrap();
+        let basis = basis.with_process_guard(move || live.load(Ordering::SeqCst));
+        assert!(product
+            .with_checked_dispatch_basis(&basis, |check| {
+                check.check_current().unwrap();
+                native
+                    .append_record("runtime", "outcome", "already committed")
+                    .unwrap();
+                current.store(false, Ordering::SeqCst);
+            })
+            .is_err());
+        assert_eq!(
+            native.records("runtime", "outcome").unwrap(),
+            ["already committed"]
+        );
+        assert!(product.records("authority", "grant").unwrap().is_empty());
+        let mut foreign = Store::open_in_memory().unwrap();
+        assert!(foreign
+            .with_checked_dispatch_basis(&basis, |_| panic!("foreign authority entered"))
+            .is_err());
     }
 
     #[test]

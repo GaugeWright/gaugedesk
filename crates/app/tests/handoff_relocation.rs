@@ -1375,6 +1375,23 @@ fn workflow_actor(wb: &mut Workbench) -> gaugedesk_app::identity::AuthenticatedA
     wb.authenticate_action_context(&token).unwrap()
 }
 
+fn workflow_project_grant(wb: &mut Workbench, project: &str) {
+    use gaugedesk_app::org::{MemberGrantRecord, RecordOp, ORG_SCOPE};
+    let grant = MemberGrantRecord {
+        id: MemberGrantRecord::make_id("alice", project),
+        authority: "alice".into(),
+        project_id: project.into(),
+        op: RecordOp::Upsert,
+    };
+    wb.store_mut()
+        .append_record(
+            ORG_SCOPE,
+            "member_grant",
+            &serde_json::to_string(&grant).unwrap(),
+        )
+        .unwrap();
+}
+
 async fn relocated_workstream_chat(protected: bool) {
     use gaugedesk_app::{
         at_rest::LoopbackKeyWrap,
@@ -1551,6 +1568,7 @@ async fn relocated_workstream_chat(protected: bool) {
         source.seed_main(&[("lessons/hello.whip", "workflow Greeting(learner: Learner) -> string\nclass Learner { authority string }\nrule greet\n  when Learner as learner\n=> { complete result learner.authority }\n")]).unwrap();
         let mut guard = alice_wb.lock().unwrap();
         let context = workflow_actor(&mut guard);
+        workflow_project_grant(&mut guard, &project_id);
         // Explicit source-party grant in the fixture; project administration
         // alone cannot grant this human access to Home-owned source content.
         let library = gaugedesk_app::library::Library::rebuild(guard.store_ref()).unwrap();
@@ -1596,7 +1614,11 @@ async fn relocated_workstream_chat(protected: bool) {
     let (stop_supervisor, supervisor_shutdown) = tokio::sync::watch::channel(false);
     let (notice_tx, mut notices) = tokio::sync::mpsc::channel(16);
     let receiving_supervisor = launched.as_ref().map(|_| {
-        workflow_actor(&mut bob_wb.lock().unwrap());
+        {
+            let mut guard = bob_wb.lock().unwrap();
+            workflow_actor(&mut guard);
+            workflow_project_grant(&mut guard, &project_id);
+        }
         tokio::spawn(
             gaugedesk_app::project_workflow::supervise_project_workflows(
                 bob_wb.clone(),

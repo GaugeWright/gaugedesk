@@ -31,9 +31,24 @@ use gaugedesk_store::{ContentCodec, Store};
 use crate::at_rest::{Encryptor, KeyWrap, LocalAeadEncryptor};
 use crate::workbench_state::Workbench;
 
-/// Marks an encrypted payload so [`ContentVault::decode`] can tell ciphertext from a
-/// legacy/plaintext row (mixed logs and the pre-encryption history stay readable).
+/// Legacy encrypted record marker. Ordinary readers retain historical plaintext
+/// compatibility; strict readers require BOUND_MARKER (DR-0350).
 const MARKER: &str = "gwenc:1:";
+const BOUND_MARKER: &str = "gwenc:2:";
+const ENCRYPTED_PREFIX: &str = "gwenc:";
+
+#[derive(Clone, Copy)]
+enum RecordProtection {
+    Legacy,
+    Transition,
+    Required,
+}
+
+fn record_binding(scope: &str, kind: &str) -> Vec<u8> {
+    // A JSON tuple is unambiguous even when names contain delimiters or Unicode.
+    serde_json::to_vec(&("gaugedesk-content-record", 2, scope, kind))
+        .expect("string tuple serialization")
+}
 
 mod acting;
 mod holds;
@@ -57,6 +72,29 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     "choice-card",
     "choice-answer",
     "choice-continuation",
+    crate::agent_question::QUESTION_KIND,
+    // Turn paths, resource identities and result diagnostics are customer
+    // content even when they contain no file body (DR-0319).
+    "resource",
+    "read",
+    "runtime_evidence_pointer",
+    "turn_boundary",
+    "turn_summary",
+    "context_window_reading",
+    "workspace_result",
+    "workspace_local_result",
+    crate::engine::office_turn_result::CREATION_KIND,
+    "office_runtime_receipt",
+    "office_model_usage",
+    "office_turn_base",
+    crate::engine::office_turn_startup::SNAPSHOT_KIND,
+    crate::engine::office_turn_startup::RUNTIME_SNAPSHOT_KIND,
+    crate::engine::office_turn_payload::KIND,
+    "office_turn_result_gap",
+    "office_turn_settlement_gap",
+    "office_native_settlement",
+    "office_task_filing",
+    "office_legacy_answers",
     // Historical Agent improve records may still contain private scenario
     // text. Keep their at-rest protection and account-erasure coverage after
     // the campaign adapter is removed.
@@ -108,6 +146,8 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     "account_auth_recovery_attempt",
     "account_auth_root_custody",
     "account_auth_session",
+    // Derived workforce session evidence stays under its office Home.
+    crate::office_home_admission::lease::LEASE_KIND,
 ];
 
 pub(crate) fn configured_content_vault(
@@ -271,8 +311,10 @@ pub struct ContentVault {
     dir: PathBuf,
     /// The KEK seam (`SEC-4`) wrapping each per-scope DEK.
     wrap: Box<dyn KeyWrap>,
-    /// The record kinds treated as content (everything else passes through plaintext).
+    /// The record kinds treated as content. Other kinds pass ordinary plaintext;
+    /// encrypted envelopes cannot be reclassified as unprotected metadata.
     kinds: BTreeSet<String>,
+    record_protection: RecordProtection,
     /// Synchronized live-key cache and permanent write fences. Keeping both under one
     /// lock makes crypto-erasure linearizable with a concurrent writer: either the
     /// writer finishes first and erasure destroys its key, or it observes the fence
@@ -312,12 +354,28 @@ impl ContentVault {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            record_protection: RecordProtection::Legacy,
             key_state: Mutex::new(VaultKeyState::default()),
             ledger: None,
             scope_projects: Arc::default(),
             project_keys: scope_key::ProjectKeyCache::default(),
             holds: holds::Holds::default(),
         }
+    }
+
+    /// Write context-authenticated records while retaining legacy reads for migration.
+    /// This transition mode does not qualify a clinical Home (DR-0350).
+    pub fn with_authenticated_record_writes(mut self) -> Self {
+        self.record_protection = RecordProtection::Transition;
+        self
+    }
+
+    /// Require context-authenticated writes and reads for configured content kinds.
+    /// Trusted composition must separately establish complete kind coverage,
+    /// historical migration, key custody and profile admission (DR-0350).
+    pub fn require_authenticated_records(mut self) -> Self {
+        self.record_protection = RecordProtection::Required;
+        self
     }
 
     /// Override which record kinds are treated as content (builder).
@@ -534,12 +592,22 @@ impl ContentCodec for ContentVault {
         if !self.is_content(kind) {
             return Ok(payload.to_string());
         }
+        let bound = !matches!(self.record_protection, RecordProtection::Legacy);
+        let aad = if bound {
+            record_binding(scope, kind)
+        } else {
+            Vec::new()
+        };
         match self.with_legacy_key(scope, true, |dek| {
             LocalAeadEncryptor::new(dek)
-                .encrypt(payload.as_bytes())
+                .encrypt_with_aad(payload.as_bytes(), &aad)
                 .ok()
         }) {
-            Some(ct) => Ok(format!("{MARKER}{}", hex::encode(ct))),
+            Some(ct) => Ok(format!(
+                "{}{}",
+                if bound { BOUND_MARKER } else { MARKER },
+                hex::encode(ct)
+            )),
             None => Err(format!(
                 "content encryption unavailable for scope {scope}; append refused (SECAUD-9)"
             )),
@@ -548,17 +616,26 @@ impl ContentCodec for ContentVault {
 
     fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String> {
         if !self.is_content(kind) {
-            return Some(payload.to_string());
+            return (!payload.starts_with(ENCRYPTED_PREFIX)).then(|| payload.to_string());
         }
-        let Some(hexct) = payload.strip_prefix(MARKER) else {
-            return Some(payload.to_string()); // legacy / pre-encryption plaintext
+        let (hexct, aad) = if let Some(ct) = payload.strip_prefix(BOUND_MARKER) {
+            (ct, record_binding(scope, kind))
+        } else if let Some(ct) = payload.strip_prefix(MARKER) {
+            if matches!(self.record_protection, RecordProtection::Required) {
+                return None;
+            }
+            (ct, Vec::new())
+        } else {
+            // Unknown encrypted formats never fall through as plaintext.
+            return (!payload.starts_with(ENCRYPTED_PREFIX)
+                && !matches!(self.record_protection, RecordProtection::Required))
+            .then(|| payload.to_string());
         };
-        if hexct == "UNENCRYPTABLE" {
-            return None;
-        }
         let ct = hex::decode(hexct).ok()?;
         self.with_legacy_key(scope, false, |dek| {
-            let plain = LocalAeadEncryptor::new(dek).decrypt(&ct).ok()?;
+            let plain = LocalAeadEncryptor::new(dek)
+                .decrypt_with_aad(&ct, &aad)
+                .ok()?;
             String::from_utf8(plain).ok()
         })
     }
@@ -617,14 +694,15 @@ fn require_erasure_key_id(key_id: &str) -> std::io::Result<()> {
 
 /// A [`ErasureLedger`] backed by an append-only file, one key-id per line.
 ///
-/// **Durability boundary (SOC 2 finding 4.7 / DR-0086).** This file is CO-LOCATED with
-/// the wrapped-DEK keyring on the data root, so it is durable **only for the desktop /
-/// self-hosted path**. On a HOSTED deployment a whole-disk backup restore that
-/// resurrects an erased scope's DEK file would roll this ledger back in the same motion,
-/// leaving nothing for the sweep to replay. A hosted deployment MUST therefore inject an
-/// OUT-OF-BAND backend (R2 object-lock) via [`ContentVault::with_ledger`] so the record
-/// of an erasure cannot be undone by a data-disk restore. That injection is the ops
-/// step; it is not built here.
+/// **Durability boundary (SOC 2 finding 4.7 / DR-0086).** This file is co-located
+/// with the wrapped-DEK keyring. Keeping the current ledger prevents a restored
+/// key from reviving erased content. Restoring an older complete data root also
+/// rolls back this ledger, on desktop, self-hosted and hosted deployments alike;
+/// the sweep cannot recover erasures missing from that snapshot. The encrypted
+/// B17 archive carries the same limitation. Restore qualification requires current
+/// erasure state retained independently of the restored cut. Hosted deployments
+/// inject the out-of-band R2 backend via [`ContentVault::with_ledger`]; the office
+/// profile's independent office-controlled restore authority remains unqualified.
 pub struct LocalFileErasureLedger {
     path: PathBuf,
 }
@@ -882,6 +960,159 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_records_bind_kind_scope_and_revision_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let v = vault(root.path()).require_authenticated_records();
+        let payload = "synthetic patient content";
+        let sealed = v.encode("chat:a", "transcript", payload).unwrap();
+        assert!(sealed.starts_with(BOUND_MARKER));
+        assert_eq!(
+            v.decode("chat:a", "transcript", &sealed).as_deref(),
+            Some(payload)
+        );
+        assert_eq!(v.decode("chat:a", "office_turn_startup", &sealed), None);
+        // Install the SAME DEK under a different scope. This isolates AAD scope
+        // binding from the independently useful per-scope key separation.
+        let wrapped = std::fs::read(v.key_path("chat:a")).unwrap();
+        std::fs::write(v.key_path("chat:b"), wrapped).unwrap();
+        assert_eq!(v.decode("chat:b", "transcript", &sealed), None);
+        assert_eq!(v.decode("chat:a", "audit", &sealed), None);
+        let compat = vault(root.path());
+        assert_eq!(
+            compat.decode("chat:a", "transcript", &sealed).as_deref(),
+            Some(payload)
+        );
+        let downgraded = sealed.replacen(BOUND_MARKER, MARKER, 1);
+        assert_eq!(compat.decode("chat:a", "transcript", &downgraded), None);
+        let mut damaged = sealed.clone().into_bytes();
+        let last = damaged.last_mut().unwrap();
+        *last = if *last == b'0' { b'1' } else { b'0' };
+        for broken in [
+            sealed.replacen(BOUND_MARKER, "gwenc:3:", 1),
+            format!("{BOUND_MARKER}00"),
+            format!("{BOUND_MARKER}not-hex"),
+            String::from_utf8(damaged).unwrap(),
+        ] {
+            assert_eq!(v.decode("chat:a", "transcript", &broken), None);
+            assert_eq!(compat.decode("chat:a", "transcript", &broken), None);
+        }
+        // Delimiter placement cannot make two different contexts share AAD.
+        assert_ne!(
+            record_binding("chat:a", "transcript"),
+            record_binding("chat", "a:transcript")
+        );
+    }
+
+    #[test]
+    fn strict_records_refuse_legacy_without_silent_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = vault(root.path());
+        let sealed = legacy
+            .encode("chat", "transcript", "old private content")
+            .unwrap();
+        assert!(sealed.starts_with(MARKER));
+        let transition = vault(root.path()).with_authenticated_record_writes();
+        assert_eq!(
+            transition.decode("chat", "transcript", &sealed).as_deref(),
+            Some("old private content")
+        );
+        assert_eq!(
+            transition
+                .decode("chat", "transcript", "old plaintext")
+                .as_deref(),
+            Some("old plaintext")
+        );
+        let strict = vault(root.path()).require_authenticated_records();
+        assert_eq!(strict.decode("chat", "transcript", &sealed), None);
+        assert_eq!(strict.decode("chat", "transcript", "old plaintext"), None);
+        let next = transition
+            .encode("chat", "transcript", "new private content")
+            .unwrap();
+        assert!(next.starts_with(BOUND_MARKER));
+        assert_eq!(
+            strict.decode("chat", "transcript", &next).as_deref(),
+            Some("new private content")
+        );
+        assert_eq!(
+            strict
+                .decode("chat", "audit", "ordinary metadata")
+                .as_deref(),
+            Some("ordinary metadata")
+        );
+        assert_eq!(legacy.decode("chat", "transcript", "gwenc:99:abcd"), None);
+    }
+
+    #[test]
+    fn authenticated_store_rows_refuse_reclassification_and_key_recreation() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("bound.sqlite");
+        let key_dir = root.path().join("keys");
+        let vault = Arc::new(vault_with_ledger(&key_dir).require_authenticated_records());
+        let mut store = Store::open(database.to_str().unwrap())
+            .unwrap()
+            .with_codec(vault.clone());
+        store
+            .append_record("chat", "transcript", "synthetic patient content")
+            .unwrap();
+        assert_eq!(
+            store.records("chat", "transcript").unwrap(),
+            ["synthetic patient content"]
+        );
+        let raw = rusqlite::Connection::open(&database).unwrap();
+        let sealed: String = raw
+            .query_row(
+                "SELECT payload FROM events WHERE kind='transcript'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sealed.starts_with(BOUND_MARKER));
+        assert!(!sealed.contains("synthetic patient content"));
+        raw.execute(
+            "UPDATE events SET kind='office_turn_startup' WHERE kind='transcript'",
+            [],
+        )
+        .unwrap();
+        assert!(store
+            .records("chat", "office_turn_startup")
+            .unwrap()
+            .is_empty());
+        raw.execute(
+            "UPDATE events SET kind='transcript' WHERE kind='office_turn_startup'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            store.records("chat", "transcript").unwrap(),
+            ["synthetic patient content"]
+        );
+        assert!(vault.crypto_erase("chat"));
+        assert!(store.records("chat", "transcript").unwrap().is_empty());
+        assert!(store
+            .append_record("chat", "transcript", "must not recreate")
+            .is_err());
+        drop(store);
+        drop(vault);
+        let reopened = Arc::new(vault_with_ledger(&key_dir).require_authenticated_records());
+        reopened.reerase_recorded();
+        let mut store = Store::open(database.to_str().unwrap())
+            .unwrap()
+            .with_codec(reopened);
+        assert!(store.records("chat", "transcript").unwrap().is_empty());
+        assert!(store
+            .append_record("chat", "transcript", "must not recreate after reopen")
+            .is_err());
+        let count: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE scope_id='chat'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn content_is_encrypted_at_rest_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let v = vault(dir.path());
@@ -912,6 +1143,134 @@ mod tests {
             v.decode("eng-1", "audit", "advanced by rule R7").as_deref(),
             Some("advanced by rule R7")
         );
+    }
+
+    #[test]
+    fn office_turn_and_resource_records_are_sealed_and_erased_through_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("result.sqlite");
+        let vault = Arc::new(vault(&root.path().join("keys")));
+        let mut store = Store::open(database.to_str().unwrap())
+            .unwrap()
+            .with_codec(vault.clone());
+        let kinds = [
+            "resource",
+            "read",
+            "runtime_evidence_pointer",
+            "turn_boundary",
+            "turn_summary",
+            "context_window_reading",
+            "workspace_result",
+            "workspace_local_result",
+            crate::engine::office_turn_result::CREATION_KIND,
+            "office_runtime_receipt",
+            "office_model_usage",
+            "office_turn_base",
+            crate::engine::office_turn_startup::SNAPSHOT_KIND,
+            crate::engine::office_turn_startup::RUNTIME_SNAPSHOT_KIND,
+            "office_turn_result_gap",
+            "office_turn_settlement_gap",
+            "office_native_settlement",
+            "office_task_filing",
+        ];
+        for kind in kinds {
+            store
+                .append_record("office-chat", kind, "private patient path and dependency")
+                .unwrap();
+            assert_eq!(
+                store.records("office-chat", kind).unwrap(),
+                ["private patient path and dependency"]
+            );
+        }
+        let raw = rusqlite::Connection::open(database).unwrap();
+        let rows: Vec<String> = raw
+            .prepare("SELECT payload FROM events WHERE scope_id='office-chat'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), kinds.len());
+        assert!(rows
+            .iter()
+            .all(|row| row.starts_with(MARKER) && !row.contains("private patient")));
+        assert!(vault.crypto_erase("office-chat"));
+        for kind in kinds {
+            assert!(
+                store.records("office-chat", kind).unwrap().is_empty(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_question_answer_and_delivery_records_use_their_actual_scope_key() {
+        use crate::agent_question::{AgentQuestion, QuestionState};
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("questions.sqlite");
+        let vault = Arc::new(vault(&root.path().join("keys")));
+        let mut store = Store::open(database.to_str().unwrap())
+            .unwrap()
+            .with_codec(vault.clone());
+        for chat in ["first-chat", "second-chat"] {
+            let mut question = AgentQuestion {
+                id: format!("q-{chat}-1"),
+                chat_id: chat.into(),
+                question: "Synthetic patient question".into(),
+                choices: vec![],
+                recipient: "synthetic-staff".into(),
+                blocking: false,
+                asked_at_unix_ms: 1,
+                state: QuestionState::Open,
+                answer_delivered: false,
+            };
+            let scope = format!("questions::{chat}");
+            for stage in 0..3 {
+                if stage == 1 {
+                    question.state = QuestionState::Answered {
+                        answer: "Synthetic patient answer".into(),
+                        answered_by: "synthetic-clinician".into(),
+                    };
+                }
+                if stage == 2 {
+                    question.answer_delivered = true;
+                }
+                store
+                    .append_record(
+                        &scope,
+                        crate::agent_question::QUESTION_KIND,
+                        &serde_json::to_string(&question).unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    crate::agent_question::get(&store, chat, &question.id).unwrap(),
+                    Some(question.clone())
+                );
+            }
+        }
+        let raw = rusqlite::Connection::open(&database).unwrap();
+        let bodies: Vec<String> = raw
+            .prepare("SELECT payload FROM events WHERE kind='agent-question'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(bodies.len(), 6);
+        assert!(bodies.iter().all(|body| body.starts_with(MARKER)
+            && !body.contains("Synthetic patient")
+            && !body.contains("synthetic-clinician")));
+        assert!(vault.crypto_erase("questions::first-chat"));
+        assert!(crate::agent_question::list(&store, "first-chat")
+            .unwrap()
+            .is_empty());
+        let unaffected = crate::agent_question::list(&store, "second-chat").unwrap();
+        assert_eq!(unaffected.len(), 1);
+        assert!(unaffected[0].answer_delivered);
+        assert!(matches!(
+            unaffected[0].state,
+            QuestionState::Answered { .. }
+        ));
     }
 
     #[test]
@@ -1093,9 +1452,9 @@ mod tests {
     }
 
     #[test]
-    fn reerase_recorded_survives_a_backup_restore() {
-        // (b) SOC 2 finding 4.7: the re-erase-on-open sweep undoes a restore that
-        //     resurrected an erased scope's wrapped-DEK file.
+    fn reerase_recorded_survives_wrapped_key_restore_with_current_ledger() {
+        // SOC 2 finding 4.7: restore a wrapped key while retaining the current
+        // erasure ledger. A complete older data-root restore is a separate gap.
         let dir = tempfile::tempdir().unwrap();
         let v = vault_with_ledger(dir.path());
         let ct = v

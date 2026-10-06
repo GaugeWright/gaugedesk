@@ -13,8 +13,9 @@ use gaugedesk_core::abac::{
 };
 use gaugedesk_core::resource::ResourceRecord;
 use gaugedesk_whip_runtime::{
-    sign_policy_envelope, HostGovernancePolicy, ProviderBindingPolicy, ResourcePolicy,
-    WhipplePlacementPolicy, QUESTION_ASK_CAPABILITY, QUESTION_RESOURCE, TARGET_MANIFEST_RESOURCE,
+    sign_hosted_policy_envelope, GovernanceRootVerifier, HostGovernancePolicy,
+    ProviderBindingPolicy, ResourcePolicy, WhipplePlacementPolicy, QUESTION_ASK_CAPABILITY,
+    QUESTION_RESOURCE, TARGET_MANIFEST_RESOURCE,
 };
 
 use crate::library::RecordOp;
@@ -62,6 +63,7 @@ pub(crate) struct PolicyCompilationInput {
 pub(crate) struct CompiledPolicyEpoch {
     pub epoch: u64,
     pub signed_envelope: String,
+    pub policy_root: GovernanceRootVerifier,
     pub provider_binding_ref: String,
     pub credential_ref: String,
     pub placement_ceiling_ref: String,
@@ -76,6 +78,14 @@ struct PolicyEpochRecord {
     epoch: u64,
     unsigned_policy: String,
     signed_envelope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issuer: Option<String>,
+}
+
+#[derive(Default)]
+struct PolicyEpochHistory {
+    active: Option<PolicyEpochRecord>,
+    last_published: u64,
 }
 
 impl Workbench {
@@ -88,44 +98,356 @@ impl Workbench {
         let policy = compile_policy(&input)?;
         let task_tracker_admitted = policy.bindings.contains_key("tasks");
         let unsigned_policy = declare_guarantees(policy.to_json()?, &input.advancement_scopes)?;
-        let previous = latest_epoch(self, &input.chat_id)?;
-        let record = match previous {
-            Some(previous) if previous.unsigned_policy == unsigned_policy => previous,
-            previous => {
-                let epoch = previous.map_or(1, |record| record.epoch.saturating_add(1));
-                if epoch == 0 {
-                    return Err("WhippleScript policy epoch overflowed".to_owned());
-                }
-                let signing_key =
-                    gaugedesk_core::signature::SigningKey::from_seed(&self.governance_seed())
-                        .map_err(|error| error.reason)?;
-                let signed_envelope =
-                    sign_policy_envelope(&unsigned_policy, self.authority(), &signing_key)?;
-                let record = PolicyEpochRecord {
-                    id: POLICY_RECORD_ID.to_owned(),
-                    op: RecordOp::Upsert,
-                    epoch,
-                    unsigned_policy,
-                    signed_envelope,
-                };
-                self.store
-                    .append_record(
-                        &input.chat_id,
-                        POLICY_RECORD_KIND,
-                        &serde_json::to_string(&record).map_err(|error| error.to_string())?,
-                    )
+        let (history, basis) =
+            self.chat_policy_basis(&input.chat_id, input.project_id.as_deref())?;
+        let unchanged = history
+            .active
+            .as_ref()
+            .map(|previous| gaugedesk_whip_runtime::canonicalize(&previous.unsigned_policy))
+            .transpose()?
+            .as_ref()
+            == Some(&gaugedesk_whip_runtime::canonicalize(&unsigned_policy)?);
+        let (record, policy_root) = match history.active {
+            Some(previous) if unchanged => {
+                let (root, roots_basis) =
+                    self.chat_policy_root(&input.chat_id, input.project_id.as_deref(), &previous)?;
+                let combined = basis
+                    .combine(roots_basis)
                     .map_err(|error| format!("{error:?}"))?;
-                record
+                self.store_mut()
+                    .with_dispatch_basis(&combined, || ())
+                    .map_err(|error| format!("chat policy authority changed: {error:?}"))?;
+                (previous, root)
+            }
+            previous => {
+                let epoch = history
+                    .last_published
+                    .checked_add(1)
+                    .ok_or("WhippleScript policy epoch overflowed")?;
+                if let Some(previous) = &previous {
+                    let (_, roots_basis) = self.chat_policy_root(
+                        &input.chat_id,
+                        input.project_id.as_deref(),
+                        previous,
+                    )?;
+                    // Original history must verify even when the new document differs.
+                    // Its captured roots are fenced with this publication below.
+                    let basis = basis
+                        .combine(roots_basis)
+                        .map_err(|error| format!("{error:?}"))?;
+                    return self.publish_chat_policy(
+                        input,
+                        unsigned_policy,
+                        task_tracker_admitted,
+                        epoch,
+                        &basis,
+                    );
+                }
+                return self.publish_chat_policy(
+                    input,
+                    unsigned_policy,
+                    task_tracker_admitted,
+                    epoch,
+                    &basis,
+                );
             }
         };
         Ok(CompiledPolicyEpoch {
             epoch: record.epoch,
             signed_envelope: record.signed_envelope,
+            policy_root,
             provider_binding_ref: PROVIDER_BINDING_HANDLE.to_owned(),
             credential_ref: input.credential_ref,
             placement_ceiling_ref: PLACEMENT_HANDLE.to_owned(),
             task_tracker_admitted,
         })
+    }
+
+    fn publish_chat_policy(
+        &mut self,
+        input: PolicyCompilationInput,
+        unsigned_policy: String,
+        task_tracker_admitted: bool,
+        epoch: u64,
+        basis: &gaugedesk_store::command_dispatch::DispatchReadBasis,
+    ) -> Result<CompiledPolicyEpoch, String> {
+        let (issuer, key) = match input.project_id.as_deref() {
+            Some(project) => {
+                self.initialize_project_authority_against(project, basis)
+                    .map_err(|e| e.to_string())?;
+                let (issuer, _) = self
+                    .project_authority_identity(project)
+                    .map_err(|e| e.to_string())?;
+                (
+                    issuer,
+                    self.project_signing_key(project)
+                        .map_err(|e| e.to_string())?,
+                )
+            }
+            None => (
+                self.authority().clone(),
+                gaugedesk_core::signature::SigningKey::from_seed(&self.governance_seed())
+                    .map_err(|e| e.reason)?,
+            ),
+        };
+        let root = GovernanceRootVerifier::new(issuer.clone(), key.public_key());
+        let record = PolicyEpochRecord {
+            id: POLICY_RECORD_ID.into(),
+            op: RecordOp::Upsert,
+            epoch,
+            signed_envelope: sign_hosted_policy_envelope(&unsigned_policy, &issuer, &key, epoch)?,
+            unsigned_policy,
+            issuer: Some(issuer.as_str().into()),
+        };
+        let snapshot = policy_snapshot(&input.chat_id, &record, &root)?;
+        let facts = [gaugedesk_store::CommandRecordFact {
+            scope_id: input.chat_id.clone(),
+            kind: POLICY_RECORD_KIND.into(),
+            payload: serde_json::to_string(&record).map_err(|e| e.to_string())?,
+        }];
+        self.store_mut()
+            .with_dispatch_record_admission(basis, |admission| {
+                admission.commit(&input.chat_id, &policy_epoch_key(epoch), &snapshot, &facts)
+            })
+            .map_err(|error| format!("chat policy authority changed: {error:?}"))?
+            .map_err(|error| format!("chat policy publication refused: {error:?}"))?;
+        if let Some(harness) = self.sessions.remove(&input.chat_id) {
+            crate::workbench_state::shutdown_shared_harness(harness);
+        }
+        Ok(CompiledPolicyEpoch {
+            epoch,
+            signed_envelope: record.signed_envelope,
+            policy_root: root,
+            provider_binding_ref: PROVIDER_BINDING_HANDLE.into(),
+            credential_ref: input.credential_ref,
+            placement_ceiling_ref: PLACEMENT_HANDLE.into(),
+            task_tracker_admitted,
+        })
+    }
+
+    fn chat_policy_basis(
+        &self,
+        chat: &str,
+        project: Option<&str>,
+    ) -> Result<
+        (
+            PolicyEpochHistory,
+            gaugedesk_store::command_dispatch::DispatchReadBasis,
+        ),
+        String,
+    > {
+        let handoff = project.map(crate::federation::handoff_scope);
+        let mut scopes = vec![crate::library::LIBRARY_SCOPE, chat];
+        if let Some(scope) = &handoff {
+            scopes.push(scope);
+        }
+        self.store_ref()
+            .read_for_dispatch(&scopes, |store| {
+                let library = crate::library::Library::rebuild(store)?;
+                let record = library
+                    .chats
+                    .get(chat)
+                    .ok_or_else(|| policy_rejection("chat policy owner is unavailable"))?;
+                let instance = library
+                    .instances
+                    .get(&record.instance_id)
+                    .ok_or_else(|| policy_rejection("chat policy placement is unavailable"))?;
+                if instance.project_id.as_deref() != project {
+                    return Err(policy_rejection(
+                        "chat policy project does not match its durable owner",
+                    ));
+                }
+                match project {
+                    Some(project) => {
+                        if instance.kind != crate::library::InstanceKind::Using
+                            || library
+                                .projects
+                                .get(project)
+                                .is_none_or(|p| p.home_id != *self.home_id())
+                        {
+                            return Err(policy_rejection(
+                                "chat policy project authority is not local",
+                            ));
+                        }
+                        crate::federation::require_project_writes_available(store, project)?;
+                    }
+                    None => {
+                        if instance.kind != crate::library::InstanceKind::Authoring
+                            || !library.agents.contains_key(&instance.agent_id)
+                        {
+                            return Err(policy_rejection("chat has no admitted authoring owner"));
+                        }
+                    }
+                }
+                latest_epoch_in(store, chat)
+            })
+            .map_err(|error| format!("chat policy basis refused: {error:?}"))
+    }
+
+    pub(crate) fn recorded_chat_policy_root(
+        &self,
+        chat: &str,
+        project: &str,
+        epoch: u64,
+    ) -> Result<
+        (
+            GovernanceRootVerifier,
+            gaugedesk_store::command_dispatch::DispatchReadBasis,
+        ),
+        String,
+    > {
+        let record = recorded_policy_record(self.store_ref(), chat, epoch)?;
+        self.chat_policy_root(chat, Some(project), &record)
+    }
+
+    fn chat_policy_root(
+        &self,
+        chat: &str,
+        project: Option<&str>,
+        record: &PolicyEpochRecord,
+    ) -> Result<
+        (
+            GovernanceRootVerifier,
+            gaugedesk_store::command_dispatch::DispatchReadBasis,
+        ),
+        String,
+    > {
+        let issuer = record
+            .issuer
+            .as_deref()
+            .unwrap_or(self.authority().as_str());
+        let (root, basis) = match project {
+            Some(project) => {
+                if self
+                    .store_ref()
+                    .project_authority_key(project)
+                    .map_err(|e| format!("{e:?}"))?
+                    .is_some_and(|key| key.authority_id == issuer)
+                {
+                    let (issuer, key) = self
+                        .project_authority_identity(project)
+                        .map_err(|e| e.to_string())?;
+                    let (_, basis) = self
+                        .store_ref()
+                        .read_for_dispatch(
+                            &[&crate::federation::handoff_scope(project)],
+                            |_| Ok(()),
+                        )
+                        .map_err(|e| format!("{e:?}"))?;
+                    (GovernanceRootVerifier::new(issuer, key), basis)
+                } else {
+                    self.project_policy_root(project, issuer)?
+                }
+            }
+            None => {
+                if issuer != self.authority().as_str() {
+                    return Err("original authoring policy authority is unavailable".into());
+                }
+                let (_, basis) = self
+                    .store_ref()
+                    .read_for_dispatch(&[crate::library::LIBRARY_SCOPE], |_| Ok(()))
+                    .map_err(|e| format!("{e:?}"))?;
+                (
+                    GovernanceRootVerifier::new(
+                        self.authority().clone(),
+                        self.governance_public_key(),
+                    ),
+                    basis,
+                )
+            }
+        };
+        gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(record.epoch).map_err(|e| e.to_string())?,
+            &record.signed_envelope,
+            &root,
+        )
+        .map_err(|e| e.to_string())?;
+        if gaugedesk_whip_runtime::canonicalize(&record.signed_envelope)?
+            != gaugedesk_whip_runtime::canonicalize(&record.unsigned_policy)?
+        {
+            return Err("retained chat policy differs from its signed document".into());
+        }
+        if record.issuer.is_some()
+            && self
+                .store_ref()
+                .committed_record_snapshot(chat, &policy_epoch_key(record.epoch))
+                .map_err(|e| format!("{e:?}"))?
+                .as_deref()
+                != Some(policy_snapshot(chat, record, &root)?.as_str())
+        {
+            return Err("chat policy has no matching original publication receipt".into());
+        }
+        Ok((root, basis))
+    }
+
+    /// Verify a transport's original policy coordinate from this Home's
+    /// retained chat history and independently selected public root. This
+    /// preserves original epochs and supplies no current execution grant.
+    pub fn verify_retained_chat_policy(
+        &self,
+        chat: &str,
+        project: Option<&str>,
+        expected: &gaugedesk_whip_runtime::PolicyEpochRef,
+    ) -> Result<gaugedesk_whip_runtime::AdmittedPolicyEpoch, String> {
+        let (_, basis) = self.chat_policy_basis(chat, project)?;
+        let mut original = None;
+        for body in self
+            .store_ref()
+            .records(chat, POLICY_RECORD_KIND)
+            .map_err(|e| format!("{e:?}"))?
+        {
+            let record: PolicyEpochRecord =
+                serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            if record.op == RecordOp::Upsert
+                && record.epoch == expected.epoch
+                && original.replace(record).is_some()
+            {
+                return Err("original chat policy epoch is ambiguous".into());
+            }
+        }
+        let original = original.ok_or("original chat policy epoch is unavailable")?;
+        let (root, root_basis) = self.chat_policy_root(chat, project, &original)?;
+        let basis = basis.combine(root_basis).map_err(|e| format!("{e:?}"))?;
+        let admitted = gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(original.epoch).map_err(|e| e.to_string())?,
+            &original.signed_envelope,
+            &root,
+        )
+        .map_err(|e| e.to_string())?;
+        if admitted.protocol_ref() != expected {
+            return Err(
+                "original chat policy reference differs from its retained publication".into(),
+            );
+        }
+        let (_, current) = self.chat_policy_basis(chat, project)?;
+        basis
+            .combine(current)
+            .map_err(|e| format!("original chat policy basis changed: {e:?}"))?;
+        Ok(admitted)
+    }
+
+    pub(crate) fn whipple_policy_binding(
+        &self,
+        chat: &str,
+    ) -> Result<
+        Option<(
+            GovernanceRootVerifier,
+            gaugedesk_store::command_dispatch::DispatchReadBasis,
+        )>,
+        String,
+    > {
+        let library =
+            crate::library::Library::rebuild(self.store_ref()).map_err(|e| format!("{e:?}"))?;
+        let (history, basis) = self.chat_policy_basis(chat, library.project_of_chat(chat))?;
+        history
+            .active
+            .map(|record| {
+                let (root, root_basis) =
+                    self.chat_policy_root(chat, library.project_of_chat(chat), &record)?;
+                let basis = basis.combine(root_basis).map_err(|e| format!("{e:?}"))?;
+                Ok((root, basis))
+            })
+            .transpose()
     }
 
     pub(crate) fn latest_whipple_policy(
@@ -157,21 +479,97 @@ fn declare_guarantees(unsigned_policy: String, scopes: &[String]) -> Result<Stri
     serde_json::to_string(&value).map_err(|error| error.to_string())
 }
 
-fn latest_epoch(wb: &Workbench, chat_id: &str) -> Result<Option<PolicyEpochRecord>, String> {
-    let mut latest = None;
-    for body in wb
-        .store
+/// Locate an original epoch without compiling or selecting current settings.
+/// The native recorded-runtime owner still verifies the envelope and its exact
+/// identity against the original command; this lookup grants no access.
+pub(crate) fn recorded_policy_envelope(
+    store: &gaugedesk_store::Store,
+    chat_id: &str,
+    epoch: u64,
+) -> Result<String, String> {
+    Ok(recorded_policy_record(store, chat_id, epoch)?.signed_envelope)
+}
+
+fn recorded_policy_record(
+    store: &gaugedesk_store::Store,
+    chat_id: &str,
+    epoch: u64,
+) -> Result<PolicyEpochRecord, String> {
+    if epoch == 0 {
+        return Err("original runtime policy unavailable".into());
+    }
+    let records = store
         .records(chat_id, POLICY_RECORD_KIND)
         .map_err(|error| format!("{error:?}"))?
-    {
-        let record: PolicyEpochRecord =
-            serde_json::from_str(&body).map_err(|error| error.to_string())?;
-        latest = match record.op {
+        .into_iter()
+        .map(|body| {
+            serde_json::from_str::<PolicyEpochRecord>(&body).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let matches = records
+        .iter()
+        .filter(|record| record.epoch == epoch)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [record]
+            if record.id == POLICY_RECORD_ID
+                && record.op == RecordOp::Upsert
+                && !record.unsigned_policy.is_empty()
+                && !record.signed_envelope.is_empty() =>
+        {
+            Ok((*record).clone())
+        }
+        _ => Err("original runtime policy unavailable".into()),
+    }
+}
+
+fn policy_epoch_key(epoch: u64) -> String {
+    format!("whip-policy-epoch:{epoch}")
+}
+
+fn policy_snapshot(
+    chat: &str,
+    record: &PolicyEpochRecord,
+    root: &GovernanceRootVerifier,
+) -> Result<String, String> {
+    serde_json::to_string(&(
+        "gaugedesk.chat-policy-epoch.v1",
+        chat,
+        record.epoch,
+        gaugedesk_whip_runtime::canonicalize(&record.unsigned_policy)?,
+        root.expected_signer().as_str(),
+        root.expected_key().as_str(),
+    ))
+    .map_err(|e| e.to_string())
+}
+
+fn policy_rejection(reason: &'static str) -> gaugedesk_store::AdmitError {
+    gaugedesk_store::AdmitError::Rejected(gaugedesk_core::Rejection { reason })
+}
+
+fn latest_epoch(wb: &Workbench, chat_id: &str) -> Result<Option<PolicyEpochRecord>, String> {
+    latest_epoch_in(wb.store_ref(), chat_id)
+        .map(|history| history.active)
+        .map_err(|error| format!("{error:?}"))
+}
+
+fn latest_epoch_in(
+    store: &gaugedesk_store::Store,
+    chat_id: &str,
+) -> Result<PolicyEpochHistory, gaugedesk_store::AdmitError> {
+    let mut history = PolicyEpochHistory::default();
+    for body in store.records(chat_id, POLICY_RECORD_KIND)? {
+        let record: PolicyEpochRecord = serde_json::from_str(&body)?;
+        if record.id != POLICY_RECORD_ID || (record.op == RecordOp::Upsert && record.epoch == 0) {
+            return Err(policy_rejection("retained chat policy identity is invalid"));
+        }
+        history.last_published = history.last_published.max(record.epoch);
+        history.active = match record.op {
             RecordOp::Upsert => Some(record),
             RecordOp::Tombstone => None,
         };
     }
-    Ok(latest)
+    Ok(history)
 }
 
 fn compile_policy(input: &PolicyCompilationInput) -> Result<HostGovernancePolicy, String> {
@@ -623,6 +1021,7 @@ mod tests {
     use gaugedesk_core::boundary::Authority;
     use gaugedesk_core::resource::{ContentLocator, Resource, ResourceId, ResourceKind};
     use gaugedesk_store::Store;
+    use gaugedesk_whip_runtime::sign_policy_envelope;
 
     fn input() -> PolicyCompilationInput {
         PolicyCompilationInput {
@@ -957,9 +1356,505 @@ mod tests {
         assert!(compile_policy(&input).is_ok());
     }
 
+    fn project_chat(wb: &mut Workbench, project: &str, chat: &str) {
+        let rows = [
+            (
+                "project",
+                serde_json::json!({
+                    "id": project, "name": project, "home_id": wb.home_id(),
+                    "is_default": false, "network_isolated": false
+                }),
+            ),
+            (
+                "instance",
+                serde_json::json!({
+                    "id": format!("placement:{chat}"), "kind": "using",
+                    "agent_id": "agent", "project_id": project
+                }),
+            ),
+            (
+                "chat",
+                serde_json::json!({
+                    "id": chat, "instance_id": format!("placement:{chat}"), "title": chat
+                }),
+            ),
+        ];
+        for (kind, body) in rows {
+            wb.store_mut()
+                .append_record(crate::library::LIBRARY_SCOPE, kind, &body.to_string())
+                .unwrap();
+        }
+    }
+
+    fn project_workbench() -> Workbench {
+        let mut wb = Workbench::new(Store::open_in_memory().unwrap());
+        project_chat(&mut wb, "project-1", "chat-1");
+        wb
+    }
+
+    fn legacy_epoch(wb: &mut Workbench, epoch: u64) -> PolicyEpochRecord {
+        let input = input();
+        let unsigned_policy = compile_policy(&input).unwrap().to_json().unwrap();
+        let key = gaugedesk_core::signature::SigningKey::from_seed(&wb.governance_seed()).unwrap();
+        let record = PolicyEpochRecord {
+            id: POLICY_RECORD_ID.into(),
+            op: RecordOp::Upsert,
+            epoch,
+            signed_envelope: sign_policy_envelope(&unsigned_policy, wb.authority(), &key).unwrap(),
+            unsigned_policy,
+            issuer: None,
+        };
+        wb.store_mut()
+            .append_record(
+                "chat-1",
+                POLICY_RECORD_KIND,
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+        record
+    }
+
+    fn persistent_project_workbench(root: &std::path::Path) -> Workbench {
+        let mut wb =
+            Workbench::new(Store::open(root.join("product.sqlite").to_str().unwrap()).unwrap())
+                .with_root(root)
+                .with_content_vault(std::sync::Arc::new(
+                    crate::content_vault::ContentVault::new(
+                        root.join("content-keys"),
+                        Box::new(crate::at_rest::LoopbackKeyWrap::new([7; 32])),
+                    ),
+                ));
+        project_chat(&mut wb, "project-1", "chat-1");
+        wb
+    }
+
+    #[test]
+    fn new_project_policy_binds_its_own_public_authority_and_epoch() {
+        let mut wb = project_workbench();
+        let first = wb.compile_whipple_policy(input()).unwrap();
+        let (issuer, key) = wb.project_authority_identity("project-1").unwrap();
+        assert_eq!(
+            first.policy_root,
+            GovernanceRootVerifier::new(issuer.clone(), key)
+        );
+        assert_ne!(first.policy_root.expected_signer(), wb.authority());
+        let attestation = gaugedesk_whip_runtime::SignedEnvelope::verify_attestation_with(
+            &first.signed_envelope,
+            &first.policy_root,
+        )
+        .unwrap();
+        assert_eq!(attestation.epoch, Some(first.epoch));
+        assert_eq!(attestation.authority.as_deref(), Some(issuer.as_str()));
+        assert_eq!(attestation.signer, issuer.as_str());
+        assert!(
+            gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+                gaugedesk_whip_runtime::PolicyEpoch::new(first.epoch + 1).unwrap(),
+                &first.signed_envelope,
+                &first.policy_root,
+            )
+            .is_err(),
+            "epoch substitution must fail"
+        );
+        let root = tempfile::tempdir().unwrap();
+        gaugedesk_whip_runtime::GovernedHostRuntime::open_with_verifier(
+            root.path().join("runtime.sqlite"),
+            first.epoch,
+            &first.signed_envelope,
+            &first.policy_root,
+        )
+        .expect("the actual native runtime admits the compiler output");
+    }
+
+    #[test]
+    fn two_projects_on_the_same_host_never_share_chat_policy_roots() {
+        let mut wb = project_workbench();
+        project_chat(&mut wb, "project-2", "chat-2");
+        let one = wb.compile_whipple_policy(input()).unwrap();
+        let mut second = input();
+        second.chat_id = "chat-2".into();
+        second.project_id = Some("project-2".into());
+        let two = wb.compile_whipple_policy(second).unwrap();
+        assert_ne!(one.policy_root, two.policy_root);
+        assert!(gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(one.epoch).unwrap(),
+            &one.signed_envelope,
+            &two.policy_root,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn retained_chat_policy_reader_checks_every_original_coordinate_and_owner() {
+        let mut wb = project_workbench();
+        project_chat(&mut wb, "project-2", "chat-2");
+        let one = wb.compile_whipple_policy(input()).unwrap();
+        let admitted = gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(one.epoch).unwrap(),
+            &one.signed_envelope,
+            &one.policy_root,
+        )
+        .unwrap();
+        let reference = admitted.protocol_ref().clone();
+        let mut other_input = input();
+        other_input.chat_id = "chat-2".into();
+        other_input.project_id = Some("project-2".into());
+        let other = wb.compile_whipple_policy(other_input).unwrap();
+        let other_reference = gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(other.epoch).unwrap(),
+            &other.signed_envelope,
+            &other.policy_root,
+        )
+        .unwrap()
+        .protocol_ref()
+        .clone();
+        assert!(wb
+            .verify_retained_chat_policy("chat-2", Some("project-2"), &other_reference)
+            .is_ok());
+        assert!(wb
+            .verify_retained_chat_policy("chat-2", Some("project-1"), &other_reference)
+            .err()
+            .unwrap()
+            .contains("durable owner"));
+        assert_eq!(
+            wb.verify_retained_chat_policy("chat-1", Some("project-1"), &reference)
+                .unwrap()
+                .protocol_ref(),
+            &reference
+        );
+        assert!(wb
+            .verify_retained_chat_policy("chat-2", Some("project-1"), &reference)
+            .is_err());
+        assert!(wb
+            .verify_retained_chat_policy("unknown", Some("project-1"), &reference)
+            .is_err());
+        for changed in [
+            {
+                let mut changed = reference.clone();
+                changed.epoch += 1;
+                changed
+            },
+            {
+                let mut changed = reference.clone();
+                changed.envelope_hash = "0".repeat(64);
+                changed
+            },
+            {
+                let mut changed = reference.clone();
+                changed.signer = wb.authority().as_str().into();
+                changed
+            },
+            {
+                let mut changed = reference.clone();
+                changed.key_id = Some(wb.governance_public_key().as_str().into());
+                changed
+            },
+        ] {
+            assert!(wb
+                .verify_retained_chat_policy("chat-1", Some("project-1"), &changed)
+                .is_err());
+        }
+        let original = latest_epoch(&wb, "chat-1").unwrap().unwrap();
+        wb.store_mut()
+            .append_record(
+                "chat-1",
+                POLICY_RECORD_KIND,
+                &serde_json::to_string(&original).unwrap(),
+            )
+            .unwrap();
+        assert!(wb
+            .verify_retained_chat_policy("chat-1", Some("project-1"), &reference)
+            .err()
+            .unwrap()
+            .contains("ambiguous"));
+    }
+
+    #[test]
+    fn retained_chat_policy_reader_preserves_legacy_and_project_history_without_private_custody() {
+        let root = tempfile::tempdir().unwrap();
+        let mut wb = persistent_project_workbench(root.path());
+        let legacy = legacy_epoch(&mut wb, 7);
+        let legacy_root =
+            GovernanceRootVerifier::new(wb.authority().clone(), wb.governance_public_key());
+        let legacy_ref = gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(7).unwrap(),
+            &legacy.signed_envelope,
+            &legacy_root,
+        )
+        .unwrap()
+        .protocol_ref()
+        .clone();
+        let mut changed = input();
+        changed.model = "new-model".into();
+        let project = wb.compile_whipple_policy(changed).unwrap();
+        assert_eq!(project.epoch, 8);
+        let project_ref = gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(project.epoch).unwrap(),
+            &project.signed_envelope,
+            &project.policy_root,
+        )
+        .unwrap()
+        .protocol_ref()
+        .clone();
+        let before = wb
+            .store_ref()
+            .records("chat-1", POLICY_RECORD_KIND)
+            .unwrap();
+        std::fs::remove_file(
+            root.path()
+                .join("content-keys/projects")
+                .join(format!("{}.key", crate::org::sha256_hex("project-1"))),
+        )
+        .unwrap();
+        for reference in [legacy_ref, project_ref] {
+            assert_eq!(
+                wb.verify_retained_chat_policy("chat-1", Some("project-1"), &reference)
+                    .unwrap()
+                    .protocol_ref(),
+                &reference
+            );
+        }
+        assert_eq!(
+            wb.store_ref()
+                .records("chat-1", POLICY_RECORD_KIND)
+                .unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn retained_chat_policy_reader_refuses_a_late_real_history_append() {
+        // Failure injection uses the actual product writer and original signed
+        // publication; it supplies neither an alternate policy nor a verifier.
+        struct LateAppend {
+            path: String,
+            body: String,
+            reads: std::sync::atomic::AtomicUsize,
+        }
+        impl gaugedesk_store::ContentCodec for LateAppend {
+            fn encode(&self, _: &str, _: &str, payload: &str) -> Result<String, String> {
+                Ok(payload.into())
+            }
+            fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String> {
+                if scope == "chat-1"
+                    && kind == POLICY_RECORD_KIND
+                    && self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1
+                {
+                    let mut writer = Store::open(&self.path).expect("real concurrent writer");
+                    writer
+                        .append_record(scope, kind, &self.body)
+                        .expect("real late history append");
+                }
+                Some(payload.into())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut wb = persistent_project_workbench(root.path());
+        let policy = wb.compile_whipple_policy(input()).unwrap();
+        let reference = gaugedesk_whip_runtime::AdmittedPolicyEpoch::verify_with(
+            gaugedesk_whip_runtime::PolicyEpoch::new(policy.epoch).unwrap(),
+            &policy.signed_envelope,
+            &policy.policy_root,
+        )
+        .unwrap()
+        .protocol_ref()
+        .clone();
+        let original = latest_epoch(&wb, "chat-1").unwrap().unwrap();
+        let path = wb.store_ref().path().to_owned();
+        wb.store = Store::open(&path)
+            .unwrap()
+            .with_codec(std::sync::Arc::new(LateAppend {
+                path,
+                body: serde_json::to_string(&original).unwrap(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }));
+        assert!(wb
+            .verify_retained_chat_policy("chat-1", Some("project-1"), &reference)
+            .err()
+            .unwrap()
+            .contains("basis changed"));
+        assert_eq!(
+            wb.store_ref()
+                .records("chat-1", POLICY_RECORD_KIND)
+                .unwrap()
+                .len(),
+            2,
+            "the writer really appended while the original record was being read"
+        );
+    }
+
+    #[test]
+    fn compiler_refuses_unknown_chat_and_project_substitution_before_key_creation() {
+        let mut wb = Workbench::new(Store::open_in_memory().unwrap());
+        assert!(wb.compile_whipple_policy(input()).is_err());
+        assert!(wb
+            .store_ref()
+            .project_authority_key("project-1")
+            .unwrap()
+            .is_none());
+        project_chat(&mut wb, "project-1", "chat-1");
+        let mut substituted = input();
+        substituted.project_id = Some("project-2".into());
+        assert!(wb
+            .compile_whipple_policy(substituted)
+            .unwrap_err()
+            .contains("durable owner"));
+        assert!(wb
+            .store_ref()
+            .project_authority_key("project-2")
+            .unwrap()
+            .is_none());
+        let mut missing = input();
+        missing.project_id = None;
+        assert!(
+            wb.compile_whipple_policy(missing).is_err(),
+            "missing project cannot become authoring"
+        );
+        assert!(wb
+            .store_ref()
+            .records("chat-1", POLICY_RECORD_KIND)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unchanged_legacy_policy_reuses_exact_identity_without_project_signing_custody() {
+        let mut wb = project_workbench();
+        let previous = legacy_epoch(&mut wb, 5);
+        let before = wb.store_ref().events("chat-1").unwrap();
+        let reused = wb.compile_whipple_policy(input()).unwrap();
+        assert_eq!(reused.epoch, 5);
+        assert_eq!(reused.signed_envelope, previous.signed_envelope);
+        assert_eq!(reused.policy_root.expected_signer(), wb.authority());
+        assert_eq!(wb.store_ref().events("chat-1").unwrap(), before);
+        assert!(wb
+            .store_ref()
+            .project_authority_key("project-1")
+            .unwrap()
+            .is_none());
+        let mut changed = input();
+        changed.model = "next-model".into();
+        let next = wb.compile_whipple_policy(changed).unwrap();
+        assert_eq!(next.epoch, 6);
+        assert_ne!(
+            next.policy_root.expected_signer(),
+            reused.policy_root.expected_signer()
+        );
+        assert_eq!(
+            wb.store_ref()
+                .records("chat-1", POLICY_RECORD_KIND)
+                .unwrap()[0],
+            serde_json::to_string(&previous).unwrap()
+        );
+    }
+
+    #[test]
+    fn equivalent_legacy_json_reuses_the_exact_original_epoch_and_envelope() {
+        let mut wb = project_workbench();
+        let mut previous = legacy_epoch(&mut wb, 5);
+        previous.unsigned_policy = serde_json::to_string_pretty(
+            &serde_json::from_str::<serde_json::Value>(&previous.unsigned_policy).unwrap(),
+        )
+        .unwrap();
+        wb.store_mut()
+            .append_record(
+                "chat-1",
+                POLICY_RECORD_KIND,
+                &serde_json::to_string(&previous).unwrap(),
+            )
+            .unwrap();
+        let before = wb.store_ref().events("chat-1").unwrap();
+        let reused = wb.compile_whipple_policy(input()).unwrap();
+        assert_eq!(reused.epoch, previous.epoch);
+        assert_eq!(reused.signed_envelope, previous.signed_envelope);
+        assert_eq!(reused.policy_root.expected_signer(), wb.authority());
+        assert_eq!(wb.store_ref().events("chat-1").unwrap(), before);
+        assert!(wb
+            .store_ref()
+            .project_authority_key("project-1")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn retained_project_policy_replays_without_custody_but_new_epoch_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let mut wb = persistent_project_workbench(root.path());
+        let first = wb.compile_whipple_policy(input()).unwrap();
+        let key_path = root
+            .path()
+            .join("content-keys/projects")
+            .join(format!("{}.key", crate::org::sha256_hex("project-1")));
+        std::fs::remove_file(&key_path).unwrap();
+        let before = wb.store_ref().events("chat-1").unwrap();
+        let same = wb.compile_whipple_policy(input()).unwrap();
+        assert_eq!(first, same);
+        assert_eq!(wb.store_ref().events("chat-1").unwrap(), before);
+        let mut changed = input();
+        changed.model = "next-model".into();
+        assert!(wb.compile_whipple_policy(changed).is_err());
+        assert!(!key_path.exists());
+        assert_eq!(wb.store_ref().events("chat-1").unwrap(), before);
+    }
+
+    #[test]
+    fn exhausted_epoch_never_saturates_or_publishes_a_different_document() {
+        let mut wb = project_workbench();
+        legacy_epoch(&mut wb, u64::MAX);
+        let before = wb.store_ref().events("chat-1").unwrap();
+        let mut changed = input();
+        changed.model = "next-model".into();
+        assert!(wb
+            .compile_whipple_policy(changed)
+            .unwrap_err()
+            .contains("overflowed"));
+        assert_eq!(wb.store_ref().events("chat-1").unwrap(), before);
+        assert!(wb
+            .store_ref()
+            .project_authority_key("project-1")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn changed_chat_basis_refuses_publication_without_adding_policy_facts() {
+        let mut wb = project_workbench();
+        wb.initialize_project_authority("project-1").unwrap();
+        let (_, basis) = wb.chat_policy_basis("chat-1", Some("project-1")).unwrap();
+        wb.store_mut()
+            .append_record("chat-1", "intervening", "{}")
+            .unwrap();
+        let before = wb.store_ref().events("chat-1").unwrap();
+        let input = input();
+        let unsigned = compile_policy(&input).unwrap().to_json().unwrap();
+        assert!(wb
+            .publish_chat_policy(input, unsigned, false, 1, &basis)
+            .is_err());
+        assert_eq!(wb.store_ref().events("chat-1").unwrap(), before);
+    }
+
+    #[test]
+    fn tampered_legacy_signature_cannot_be_reused_or_superseded_by_a_new_epoch() {
+        let mut wb = project_workbench();
+        let mut old = legacy_epoch(&mut wb, 5);
+        old.signed_envelope = old.signed_envelope.replace("openai", "altered");
+        wb.store_mut()
+            .append_record(
+                "chat-1",
+                POLICY_RECORD_KIND,
+                &serde_json::to_string(&old).unwrap(),
+            )
+            .unwrap();
+        let before = wb.store_ref().events("chat-1").unwrap();
+        assert!(wb.compile_whipple_policy(input()).is_err());
+        let mut changed = input();
+        changed.model = "next-model".into();
+        assert!(wb.compile_whipple_policy(changed).is_err());
+        assert_eq!(wb.store_ref().events("chat-1").unwrap(), before);
+    }
+
     #[test]
     fn unchanged_facts_reuse_epoch_and_changed_facts_publish_the_next_epoch() {
-        let mut wb = Workbench::new(Store::open_in_memory().expect("store"));
+        let mut wb = project_workbench();
         let first = wb.compile_whipple_policy(input()).expect("first epoch");
         let same = wb.compile_whipple_policy(input()).expect("same epoch");
         assert_eq!(same.epoch, first.epoch);
@@ -971,11 +1866,204 @@ mod tests {
         assert_eq!(next.epoch, first.epoch + 1);
         assert_ne!(next.signed_envelope, first.signed_envelope);
         assert!(!next.signed_envelope.contains("sk-secret"));
+        let before = wb.store.records("chat-1", POLICY_RECORD_KIND).unwrap();
+        assert_eq!(
+            recorded_policy_envelope(&wb.store, "chat-1", first.epoch).unwrap(),
+            first.signed_envelope
+        );
+        assert_eq!(
+            wb.store.records("chat-1", POLICY_RECORD_KIND).unwrap(),
+            before
+        );
+        assert!(recorded_policy_envelope(&wb.store, "chat-1", 0).is_err());
+        assert!(recorded_policy_envelope(&wb.store, "chat-1", next.epoch + 1).is_err());
+        assert!(recorded_policy_envelope(&wb.store, "other-chat", first.epoch).is_err());
         assert_eq!(
             wb.latest_whipple_policy("chat-1")
                 .expect("latest")
                 .map(|(epoch, _)| epoch),
             Some(next.epoch)
         );
+    }
+    #[test]
+    fn recorded_policy_refuses_duplicate_missing_or_ineligible_original_rows() {
+        for case in [
+            "duplicate",
+            "missing",
+            "tombstone",
+            "wrong-id",
+            "empty-signature",
+            "malformed",
+        ] {
+            let mut wb = project_workbench();
+            let original = wb.compile_whipple_policy(input()).unwrap();
+            let rows = wb.store.records("chat-1", POLICY_RECORD_KIND).unwrap();
+            let mut record: PolicyEpochRecord = serde_json::from_str(&rows[0]).unwrap();
+            let mut observed = Store::open_in_memory().unwrap();
+            if case == "duplicate" {
+                observed
+                    .append_record("chat-1", POLICY_RECORD_KIND, &rows[0])
+                    .unwrap();
+            }
+            match case {
+                "missing" => {}
+                "malformed" => {
+                    observed
+                        .append_record("chat-1", POLICY_RECORD_KIND, "malformed")
+                        .unwrap();
+                }
+                _ => {
+                    match case {
+                        "tombstone" => record.op = RecordOp::Tombstone,
+                        "wrong-id" => record.id = "replacement".into(),
+                        "empty-signature" => record.signed_envelope.clear(),
+                        "duplicate" => {}
+                        _ => unreachable!(),
+                    }
+                    observed
+                        .append_record(
+                            "chat-1",
+                            POLICY_RECORD_KIND,
+                            &serde_json::to_string(&record).unwrap(),
+                        )
+                        .unwrap();
+                }
+            }
+            let before = observed.records("chat-1", POLICY_RECORD_KIND);
+            assert!(
+                recorded_policy_envelope(&observed, "chat-1", original.epoch).is_err(),
+                "{case}"
+            );
+            assert_eq!(
+                observed.records("chat-1", POLICY_RECORD_KIND).unwrap(),
+                before.unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn tombstoning_the_active_policy_never_reuses_a_published_epoch() {
+        let mut wb = project_workbench();
+        let first = wb.compile_whipple_policy(input()).unwrap();
+        let mut removed = latest_epoch(&wb, "chat-1").unwrap().unwrap();
+        removed.op = RecordOp::Tombstone;
+        wb.store_mut()
+            .append_record(
+                "chat-1",
+                POLICY_RECORD_KIND,
+                &serde_json::to_string(&removed).unwrap(),
+            )
+            .unwrap();
+        assert!(wb.latest_whipple_policy("chat-1").unwrap().is_none());
+
+        let next = wb.compile_whipple_policy(input()).unwrap();
+        assert_eq!(next.epoch, first.epoch + 1);
+        assert_eq!(wb.compile_whipple_policy(input()).unwrap(), next);
+        assert_eq!(
+            wb.store_ref()
+                .records("chat-1", POLICY_RECORD_KIND)
+                .unwrap()
+                .len(),
+            3,
+        );
+    }
+
+    #[test]
+    fn a_valid_project_signature_without_its_publication_receipt_is_refused() {
+        let mut wb = project_workbench();
+        wb.initialize_project_authority("project-1").unwrap();
+        let (issuer, _) = wb.project_authority_identity("project-1").unwrap();
+        let key = wb.project_signing_key("project-1").unwrap();
+        let unsigned_policy = compile_policy(&input()).unwrap().to_json().unwrap();
+        let record = PolicyEpochRecord {
+            id: POLICY_RECORD_ID.into(),
+            op: RecordOp::Upsert,
+            epoch: 1,
+            signed_envelope: sign_hosted_policy_envelope(&unsigned_policy, &issuer, &key, 1)
+                .unwrap(),
+            unsigned_policy,
+            issuer: Some(issuer.as_str().into()),
+        };
+        wb.store_mut()
+            .append_record(
+                "chat-1",
+                POLICY_RECORD_KIND,
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .unwrap();
+        let before = wb.store_ref().events("chat-1").unwrap();
+        assert!(wb
+            .compile_whipple_policy(input())
+            .unwrap_err()
+            .contains("publication receipt"));
+        let mut changed = input();
+        changed.model = "next-model".into();
+        assert!(wb.compile_whipple_policy(changed).is_err());
+        assert_eq!(wb.store_ref().events("chat-1").unwrap(), before);
+    }
+
+    #[test]
+    fn harness_cache_changes_only_after_successful_new_epoch_publication() {
+        fn cached() -> crate::workbench_state::SharedHarness {
+            std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(
+                gaugedesk_harness::testing::ScriptedHarness::new(Vec::new()),
+            )
+                as Box<dyn gaugedesk_harness::Harness>)))
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut wb = persistent_project_workbench(root.path());
+        wb.compile_whipple_policy(input()).unwrap();
+        let original = cached();
+        wb.sessions.insert("chat-1".into(), original.clone());
+        wb.compile_whipple_policy(input()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&wb.sessions["chat-1"], &original));
+
+        let mut changed = input();
+        changed.model = "next-model".into();
+        wb.compile_whipple_policy(changed.clone()).unwrap();
+        assert!(!wb.sessions.contains_key("chat-1"));
+        let retained = cached();
+        wb.sessions.insert("chat-1".into(), retained.clone());
+        let key_path = root
+            .path()
+            .join("content-keys/projects")
+            .join(format!("{}.key", crate::org::sha256_hex("project-1"),));
+        std::fs::remove_file(key_path).unwrap();
+        changed.model = "another-model".into();
+        assert!(wb.compile_whipple_policy(changed).is_err());
+        assert!(std::sync::Arc::ptr_eq(&wb.sessions["chat-1"], &retained));
+    }
+
+    #[test]
+    fn product_factory_binding_selects_the_original_root_and_preserves_transport() {
+        let mut wb = project_workbench();
+        let policy = wb.compile_whipple_policy(input()).unwrap();
+        let original = wb.whip_harness_factory().unwrap();
+        assert!(original
+            .verify_policy(policy.epoch, &policy.signed_envelope)
+            .is_err());
+        for factory in [
+            original.clone(),
+            original.with_do_host(
+                gaugedesk_whip_runtime::DoHostConfig::new(
+                    "https://host.example.invalid",
+                    "fixture-control-token",
+                    "fixture-tenant",
+                )
+                .unwrap(),
+            ),
+        ] {
+            use gaugedesk_harness::HarnessFactory;
+            let kind = factory.kind();
+            let selected = crate::harness_select::TurnHarnessFactory::from(factory)
+                .bind_policy_root(policy.policy_root.clone());
+            assert_eq!(selected.kind(), kind);
+            let crate::harness_select::TurnHarnessFactory::Whip(bound) = selected else {
+                panic!("the real adapter must remain configurable");
+            };
+            bound
+                .verify_policy(policy.epoch, &policy.signed_envelope)
+                .unwrap();
+        }
     }
 }

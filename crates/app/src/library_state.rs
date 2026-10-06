@@ -6997,6 +6997,7 @@ impl Workbench {
                 ..existing
             });
         }
+        self.crypto_erase_content(&crate::agent_question::question_scope(chat_id));
         self.crypto_erase_content(chat_id);
     }
 
@@ -7397,9 +7398,24 @@ impl Workbench {
             signed_policy_envelope: source_policy.map(|(_, envelope)| envelope),
             source_position: None,
         };
-        let continuity = self
-            .whip_harness_factory()
-            .and_then(|factory| factory.clone_continuity(&source_continuity, &target_continuity));
+        let continuity = (|| {
+            let mut factory = self.whip_harness_factory()?;
+            let binding = self
+                .whipple_policy_binding(id)
+                .map_err(std::io::Error::other)?;
+            if let Some((root, basis)) = binding {
+                factory = factory.with_policy_root(root);
+                if gaugedesk_harness::HarnessFactory::kind(&factory) == "whip" {
+                    return self
+                        .store_mut()
+                        .with_dispatch_basis(&basis, || {
+                            factory.clone_continuity(&source_continuity, &target_continuity)
+                        })
+                        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+                }
+            }
+            factory.clone_continuity(&source_continuity, &target_continuity)
+        })();
         if let Err(error) = continuity {
             drop(new_eng);
             self.compensate_failed_chat_fork(&storage_id, &new_id, &target_continuity);
@@ -7674,6 +7690,7 @@ impl Workbench {
             .cloned()
             .collect();
         for scope in erasable {
+            self.crypto_erase_content(&crate::agent_question::question_scope(&scope));
             self.crypto_erase_content(&scope);
         }
     }

@@ -230,6 +230,11 @@ impl Workbench {
     /// OIDC. Both yield the same durable account/authority type; neither
     /// credential becomes the identity.
     pub fn authenticate_bearer(&self, token: &str) -> Option<gaugedesk_core::ids::AuthorityId> {
+        if self.has_office_staff_source(token) {
+            return self
+                .office_staff_lease(token)
+                .map(|lease| gaugedesk_core::ids::AuthorityId::new(lease.account()));
+        }
         if let Some((account_id, _)) = self.resolve_account_session(token) {
             return Some(gaugedesk_core::ids::AuthorityId::new(account_id));
         }
@@ -337,6 +342,11 @@ impl Workbench {
         token: &str,
     ) -> Option<crate::identity::AuthenticatedActionContext> {
         use crate::identity::AuthenticatedActionContext;
+        // Native office identity alone cannot construct work authority. Its
+        // exact source-bound Home token is checked by the Home request boundary.
+        if self.has_office_staff_source(token) {
+            return None;
+        }
         if let Some((account, _)) = self.resolve_account_session(token) {
             return Some(AuthenticatedActionContext::account_session(
                 gaugedesk_core::ids::AuthorityId::new(account),
@@ -810,6 +820,15 @@ impl Workbench {
         client: crate::client_admission::ClientBuild,
         enforce_software: bool,
     ) -> Result<String, (StatusCode, &'static str)> {
+        if let Some(token) = bearer.filter(|token| self.has_office_staff_source(token)) {
+            return self.admit_office_staff_identity(
+                token,
+                project,
+                org_scope,
+                client,
+                enforce_software,
+            );
+        }
         // A durable account session is independently verifiable after restart.
         // The optional IdP's absence must not replace that actor with the local
         // operator, or Home admission and action attribution disagree.
@@ -835,6 +854,12 @@ impl Workbench {
         let org = org::Org::rebuild_in(self.store_ref(), org_scope)
             .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "directory unavailable"))?;
         let authority = bearer.and_then(|t| self.authenticate_bearer(t));
+        // A desktop's own directory admits any signed-in account as itself:
+        // a role there is not standing, and what the account reaches is
+        // decided per project (DR-0268, DR-0328). Every other check below —
+        // revocation, session lifetime, software policy — still applies. An
+        // organization's tenant directory keeps its membership rules.
+        let desktop_account = self.desktop_account_mode() && org_scope == org::ORG_SCOPE;
         let provisioned = org
             .members
             .values()
@@ -861,7 +886,7 @@ impl Workbench {
         if !provisioned && self.hosted_home_mode() {
             return Err((StatusCode::FORBIDDEN, "Home has no active owner"));
         }
-        if !provisioned {
+        if !provisioned && !desktop_account {
             // bootstrap: directory not yet provisioned — actor resolved best-effort.
             return Ok(authority
                 .map(|a| a.as_str().to_string())
@@ -888,7 +913,7 @@ impl Workbench {
                 "this organization requires corporate sign-in",
             ));
         }
-        if org.role_of(authority.as_str()).is_none() {
+        if !desktop_account && org.role_of(authority.as_str()).is_none() {
             return Err((StatusCode::FORBIDDEN, "not an active member"));
         }
         // SEC-2: enforce the org session lifetime / idle-timeout policy, keyed by a hash of
@@ -1073,24 +1098,15 @@ impl Workbench {
             );
         }
         // A desktop's signed-in account sees what it owns or was granted, and
-        // no role widens that (DR-0268 §1, §6). The computer's owner or admin
-        // is a whole account. Anyone else stays a member limited to those
-        // projects, so routes naming no project stay closed to them (WS-580)
-        // until those routes answer per account (WS-655).
+        // no role widens that (DR-0268 §1, §6). Every account there is a whole
+        // account; a role in the directory neither widens nor narrows it.
         if self.desktop_account_mode() {
             let Some(account) = bearer.and_then(|t| self.authenticate_bearer(t)) else {
                 return ProjectVisibility::Only(BTreeSet::new());
             };
-            let projects = self.account_project_ids(account.as_str(), &org);
-            return match org.role_of(account.as_str()) {
-                Some(role)
-                    if role == gaugedesk_core::abac::Role::owner()
-                        || role == gaugedesk_core::abac::Role::admin() =>
-                {
-                    ProjectVisibility::Account(self.desktop_account_visible(account.as_str(), &org))
-                }
-                _ => ProjectVisibility::Only(projects),
-            };
+            return ProjectVisibility::Account(
+                self.desktop_account_visible(account.as_str(), &org),
+            );
         }
         let provisioned = org
             .members
@@ -1624,8 +1640,16 @@ mod provider_neutral_identity_tests {
                 .as_str(),
             "member"
         );
+        // A desktop admits any signed-in account as itself (DR-0328); a project
+        // it does not own stays closed to it.
         assert_eq!(
-            wb.admit_data_request(Some(&outsider), None).unwrap_err().0,
+            wb.admit_data_request(Some(&outsider), None).unwrap(),
+            "outsider"
+        );
+        assert_eq!(
+            wb.admit_data_request(Some(&outsider), Some(crate::DEFAULT_PROJECT))
+                .unwrap_err()
+                .0,
             StatusCode::FORBIDDEN
         );
         assert!(wb.revoke_account_session(&token));
@@ -2628,13 +2652,15 @@ mod staff_project_visibility_tests {
             wb.project_visibility(Some(&owner)),
             ProjectVisibility::Account(BTreeSet::new())
         );
+        // Every desktop account is a whole account, reaching what it owns or
+        // was granted; a role neither widens nor narrows it (DR-0328).
         assert_eq!(
             wb.project_visibility(Some(&staff)),
-            ProjectVisibility::Only(BTreeSet::from(["allowed".into()]))
+            ProjectVisibility::Account(BTreeSet::from(["allowed".into()]))
         );
         assert_eq!(
             wb.project_visibility(Some(&outsider)),
-            ProjectVisibility::Only(BTreeSet::new())
+            ProjectVisibility::Account(BTreeSet::new())
         );
         assert_eq!(
             wb.project_visibility(Some("unverified")),
@@ -2650,7 +2676,7 @@ mod staff_project_visibility_tests {
             .unwrap();
         assert_eq!(
             wb.project_visibility(Some(&staff)),
-            ProjectVisibility::Only(BTreeSet::new())
+            ProjectVisibility::Account(BTreeSet::new())
         );
         wb.account_sessions().insert_loaded(
             &crate::account_session::session_id(&staff),

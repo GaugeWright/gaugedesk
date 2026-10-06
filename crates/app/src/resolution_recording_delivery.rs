@@ -116,6 +116,8 @@ impl Workbench {
             return Err(refused());
         }
         let home = self.home_id().clone();
+        let owners = self.project_owner_resolver();
+        let account_scopes = crate::identity::account_authority_scopes(context)?;
         let scope = command.instance_ref().map_err(|_| refused())?;
         let identity = ActionPolicyIdentity {
             issuer: command.issuer.clone(),
@@ -130,6 +132,8 @@ impl Workbench {
         let handoff_scope = crate::federation::handoff_scope(&project);
         let root = roots.original_root(self.store_ref(), command)?;
         let mut scopes = vec![
+            &account_scopes[0],
+            &account_scopes[1],
             LIBRARY_SCOPE,
             ORG_SCOPE,
             crate::account_auth::ACCOUNT_AUTH_SCOPE,
@@ -158,6 +162,7 @@ impl Workbench {
                 let authority = current_target_authority_with_source(
                     store,
                     &home,
+                    &owners,
                     context,
                     &NativeTargetIntent {
                         chat_id: &chat,
@@ -180,7 +185,7 @@ impl Workbench {
             })
             .map_err(|error| format!("current correction authority refused: {error:?}"))?;
         let basis = authority
-            .bind_deadline(basis)
+            .bind_deadline(self.store_ref(), basis)
             .map_err(|error| format!("correction authority deadline refused: {error:?}"))?;
         let (key, basis) =
             self.native_project_signer_access(&authority.project_id, basis, access)?;
@@ -222,6 +227,9 @@ impl Workbench {
         let envelope =
             ifc::VerifiedEnvelope::verify_signed_text_with(policy.signed_envelope(), &root)?;
         crate::resolution_recording_policy::validate_resolution_recording_flows(&envelope)?;
+        let basis = authority
+            .bind_deadline(self.store_ref(), basis)
+            .map_err(|error| format!("correction authority deadline refused: {error:?}"))?;
         Ok(NativeCorrectionPreparation {
             scope,
             key,

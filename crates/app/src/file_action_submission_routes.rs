@@ -99,7 +99,9 @@ fn submit(
     }
     if !matches!(
         context.authentication(),
-        ActorAuthentication::AccountSession { .. } | ActorAuthentication::MachineController { .. }
+        ActorAuthentication::AccountSession { .. }
+            | ActorAuthentication::MachineController { .. }
+            | ActorAuthentication::OfficeStaff { .. }
     ) {
         return refusal(
             StatusCode::FORBIDDEN,
@@ -144,7 +146,7 @@ fn submit(
             )
         }
     };
-    let admitted = match wb.admit_editor_file_save(
+    let mut admitted = match wb.admit_editor_file_save(
         &context,
         storage.inputs(),
         &intent.identity,
@@ -166,12 +168,16 @@ fn submit(
     };
     // A refusal here can follow committed command admission. Keep that fact
     // visible, and never mint a replacement grant key or dispatch directly.
-    let dispatch = match wb.authorize_editor_file_save_dispatch(
-        &context,
-        storage.inputs(),
-        &admitted.command,
-        &intent.dispatch_request_id,
-    ) {
+    let dispatch = match wb
+        .record_editor_user_activity(&context, storage.inputs(), &mut admitted)
+        .and_then(|current| {
+            wb.authorize_editor_file_save_dispatch(
+                &current,
+                storage.inputs(),
+                &admitted.command,
+                &intent.dispatch_request_id,
+            )
+        }) {
         Ok(grant) => json!({"state": "authorized", "grant_ref": grant.grant_ref,
             "replayed": grant.replayed}),
         Err(_) => json!({"state": "unavailable"}),

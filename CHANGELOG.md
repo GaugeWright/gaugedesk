@@ -19,11 +19,79 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Office result publication records its exact original events and output facts
+  for later verification. The additive store update requires schema 11 support.
+
+- Concurrent local Home startup preserves one content-encryption key, preventing
+  another initializer from replacing it and making earlier data unreadable.
+
+- Content storage supports an explicitly selected format that authenticates each
+  protected record’s scope and kind. Strict reading refuses legacy records;
+  clinical enrollment and migration remain required before enabling that mode.
+
+- Office task results retain their original staff authorization when advancing a shared Home, including recovery after interrupted result publication.
+
+- Native upload publication retains every file in its complete resource binding
+  and refuses files outside the chat selected view, even when recorded in its
+  cut. Buffered handler integration remains in progress.
+
+- Buffered HTTP handlers can finish the exact command claimed by their
+  middleware. A refused response preserves a receipt already committed by the
+  handler; work without a receipt keeps its ordinary failure status.
+
+- Office staff streamed uploads use the original session at guarded file and
+  native history commits. Only the uploaded file enters its attributed cut;
+  native bytes stay retained through the atomic resource and original receipt
+  commit. A failed resource publication creates no partial access grant.
+  Completion events and responses recheck the original staff session; denied
+  delivery cannot turn an already committed upload into a rejected command.
+
+- GaugeDesk now pins the WhippleScript runtime with current-access checks and
+  guarded native imports. Office upload integration remains in progress; this
+  dependency update does not enable the office network listener.
+
+- Native upload adapters support original-authority checks at file placement
+  boundaries. Cross-device copies stay provisional until a final checked swap;
+  refusal preserves the previous file. Staff responses also recheck the captured
+  authority before returning from their product writer fence. Native work and
+  resource publication can share one transaction; a refused native check stays
+  terminal for that admission even if its process flag is restored.
+
+- Streamed uploads publish resource metadata, the complete file binding, access
+  events and the original command receipt together. Office staff publication
+  rechecks the captured session; a failed publication leaves no partial grant.
+- New chat policies use their project's signing authority. Existing policy
+  epochs keep their original signer and verification root, including on hosted
+  operation retries. Missing project signing custody refuses a new policy;
+  it cannot substitute the host's key. Hosted servers must support the matching
+  project admission protocol before this path is enabled.
+
+- A provider linked on a desktop while you are signed in belongs to your
+  account and reaches your other desktops: each of your trusted devices gets
+  its own sealed copy, and the Hub keeps only copies it cannot open. A Codex
+  or Grok sign-in refreshed on one desktop is refreshed once, and the others
+  take the result. Unlinking it on one desktop unlinks it on all of them. This
+  starts working once the Hub holds account provider links; until then a
+  desktop keeps its links as before.
+
 - On a desktop, an Agent's, project's or Panel's settings chat runs on the
   same OpenAI or Codex access as that account's chats there. Before, it looked
   for model access where nothing a desktop links is kept, and refused every
   message with "link OpenAI or Codex model access in Account Settings" while
   chats worked.
+
+- Running project workflows, saving files, and reading their history require
+  owning the project or holding an explicit project grant. Tracker access and
+  assignment recipients require current project standing as well as any tracker
+  permissions. Organization owner/admin roles alone grant none of this access;
+  ownership and grant changes take effect without restarting the Home. An
+  account owner needs no organization membership; legacy organization-issued
+  project grants still require an active directory recipient. Source and
+  resource policies continue to apply.
+
+- Prepared native workflow, tracker and file-correction operations using an
+  account session are refused after that session or its device is revoked.
+  Unattended workflow authority remains scoped to its retained launch.
 
 - A project you own can be shared with anyone by email: Project settings →
   People & sharing makes an invitation link for an address, and only an

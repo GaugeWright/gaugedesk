@@ -75,6 +75,167 @@ pub fn personal_project_id(account: &str) -> String {
     format!("personal-{}", hex::encode(&digest[..16]))
 }
 
+/// Immutable local ownership posture, with no cached ownership or grants.
+/// Admission folds the caller's store under its own product read basis.
+#[derive(Clone)]
+pub(crate) struct ProjectOwnerResolver {
+    local_account: String,
+    legacy_agents: bool,
+}
+
+impl ProjectOwnerResolver {
+    pub(crate) fn legacy_owner(&self, store: &gaugedesk_store::Store) -> String {
+        // DR-0309 names the earlier explicit claim, never an organization
+        // role. home_owner_account also recognizes a sole directory owner,
+        // which is host-era compatibility and cannot establish project data
+        // ownership. Unreadable or ambiguous claim evidence supplies no owner.
+        let Ok(claims) = store.records(crate::org::ORG_SCOPE, crate::home_owner::CLAIM_KIND) else {
+            return String::new();
+        };
+        match claims.as_slice() {
+            [] => self.local_account.clone(),
+            [claim] => match serde_json::from_str::<crate::home_owner::HomeOwnerClaim>(claim) {
+                Ok(claim) => claim.account.unwrap_or_else(|| self.local_account.clone()),
+                Err(_) => String::new(),
+            },
+            _ => String::new(),
+        }
+    }
+
+    pub(crate) fn owner_in(
+        &self,
+        library: &crate::library::Library,
+        project: &ProjectRecord,
+        legacy: &str,
+    ) -> ProjectOwner {
+        if let Some(owner) = recorded_owner(project) {
+            return ProjectOwner::Account(owner.to_owned());
+        }
+        if let Some(organization) = project
+            .extra
+            .get("organization")
+            .and_then(serde_json::Value::as_str)
+        {
+            return ProjectOwner::Organization(organization.to_owned());
+        }
+        if crate::shipped_tutorials::is_tutorial_project(project) {
+            if let Some(learner) = project
+                .extra
+                .get("product")
+                .and_then(|product| product.get("learner"))
+                .and_then(serde_json::Value::as_str)
+            {
+                return ProjectOwner::Account(learner.to_owned());
+            }
+        }
+        // A Panel agent's preview project is hidden plumbing: it belongs to
+        // whoever owns what it previews.
+        if let Some(marker) = crate::panel_preview::preview_marker(project) {
+            let previewed = marker
+                .placement_id
+                .as_deref()
+                .and_then(|placement| library.project_of_instance(placement))
+                .and_then(|id| library.projects.get(id))
+                .filter(|previewed| !crate::panel_preview::is_panel_preview_project(previewed));
+            if let Some(previewed) = previewed {
+                return self.owner_in(library, previewed, legacy);
+            }
+            if let Some(author) = self.agent_owner_in(library, &marker.agent_id, legacy) {
+                return ProjectOwner::Account(author);
+            }
+        }
+        ProjectOwner::Account(legacy.to_owned())
+    }
+
+    pub(crate) fn agent_owner_in(
+        &self,
+        library: &crate::library::Library,
+        id: &str,
+        legacy: &str,
+    ) -> Option<String> {
+        let agent = library.agents.get(id)?;
+        agent
+            .authoring_owner
+            .clone()
+            .or_else(|| {
+                agent
+                    .versions
+                    .get(&agent.current_version)
+                    .and_then(|version| version.source_owner_authority.clone())
+            })
+            .or_else(|| {
+                self.legacy_agents.then(|| {
+                    if crate::app_support::is_builtin_agent(id) {
+                        self.local_account.clone()
+                    } else {
+                        legacy.to_owned()
+                    }
+                })
+            })
+            .filter(|owner| !owner.is_empty() && owner != "anonymous")
+    }
+
+    pub(crate) fn account_project_ids(
+        &self,
+        store: &gaugedesk_store::Store,
+        account: &str,
+        org: &Org,
+    ) -> BTreeSet<String> {
+        // Unreadable ownership evidence grants no project visibility.
+        let Ok(library) = crate::library::Library::rebuild(store) else {
+            return BTreeSet::new();
+        };
+        self.account_project_ids_in(&library, &self.legacy_owner(store), account, org)
+    }
+
+    pub(crate) fn account_project_ids_in(
+        &self,
+        library: &crate::library::Library,
+        legacy: &str,
+        account: &str,
+        org: &Org,
+    ) -> BTreeSet<String> {
+        let mut ids: BTreeSet<String> = library
+            .projects
+            .values()
+            .filter(|project| {
+                self.owner_in(library, project, legacy) == ProjectOwner::Account(account.to_owned())
+            })
+            .map(|project| project.id.clone())
+            .collect();
+        ids.extend(org.granted_project_ids(account));
+        ids
+    }
+
+    /// Current project members, read from this exact product basis. An account
+    /// owns its project independently of organization membership. Legacy
+    /// organization-issued grants require an active directory recipient.
+    pub(crate) fn members_in(
+        &self,
+        library: &crate::library::Library,
+        legacy: &str,
+        project: &ProjectRecord,
+        org: &Org,
+    ) -> BTreeSet<String> {
+        let mut members: BTreeSet<String> = org
+            .members
+            .values()
+            .filter(|member| org.role_of(&member.authority).is_some())
+            .filter(|member| {
+                org.granted_project_ids(&member.authority)
+                    .contains(&project.id)
+            })
+            .map(|member| member.authority.clone())
+            .collect();
+        if let ProjectOwner::Account(owner) = self.owner_in(library, project, legacy) {
+            if !owner.is_empty() && owner != "anonymous" {
+                members.insert(owner);
+            }
+        }
+        members
+    }
+}
+
 impl Workbench {
     /// A project that arrived as this computer's local account's passes to the
     /// signed-in account that accepted it (DR-0328 §4). An account's project,
@@ -95,6 +256,41 @@ impl Workbench {
             record_owner(&mut record.extra, &account);
             self.write_project_record(record);
         }
+    }
+
+    /// Whether a workspace change event names something the subscriber can
+    /// see. Off a desktop every subscriber hears every change, as before.
+    pub(crate) fn workspace_event_visible(
+        &self,
+        bearer: Option<&str>,
+        event: &crate::stream::ServerEvent,
+    ) -> bool {
+        let crate::stream::ServerEvent::WorkspaceChanged { record, id, .. } = event else {
+            return true;
+        };
+        if !self.desktop_account_mode() {
+            return true;
+        }
+        let visibility = self.project_visibility(bearer);
+        let project = match record.as_str() {
+            "project" => self.library.projects.contains_key(id).then(|| id.clone()),
+            "chat" => self.library.project_of_chat(id).map(str::to_owned),
+            "instance" | "placement" => self.library.project_of_instance(id).map(str::to_owned),
+            "agent" => {
+                let actor = match bearer {
+                    Some(token) => self
+                        .resolve_account_session(token)
+                        .map(|(account, _)| account),
+                    None => Some(self.authority().as_str().to_owned()),
+                };
+                return crate::app_support::is_builtin_agent(id)
+                    || !self.library.agents.contains_key(id)
+                    || actor.is_some_and(|actor| self.agent_authoring_visible(id, Some(&actor)));
+            }
+            _ => None,
+        };
+        // A removed record no longer resolves; its id alone is all that crosses.
+        project.is_none_or(|project| visibility.allows(&project))
     }
 
     /// The account a desktop request acts as for host-level records such as
@@ -128,26 +324,7 @@ impl Workbench {
     /// The owner of a project with no recorded one: the account that claimed
     /// this computer, else the computer's local account.
     pub(crate) fn legacy_project_owner(&self) -> String {
-        // DR-0309 names the earlier explicit claim, never an organization
-        // role. home_owner_account also recognizes a sole directory owner,
-        // which is host-era compatibility and cannot establish project data
-        // ownership. Unreadable or ambiguous claim evidence supplies no owner.
-        let Ok(claims) = self
-            .store_ref()
-            .records(crate::org::ORG_SCOPE, crate::home_owner::CLAIM_KIND)
-        else {
-            return String::new();
-        };
-        match claims.as_slice() {
-            [] => self.authority().as_str().to_owned(),
-            [claim] => match serde_json::from_str::<crate::home_owner::HomeOwnerClaim>(claim) {
-                Ok(claim) => claim
-                    .account
-                    .unwrap_or_else(|| self.authority().as_str().to_owned()),
-                Err(_) => String::new(),
-            },
-            _ => String::new(),
-        }
+        self.project_owner_resolver().legacy_owner(self.store_ref())
     }
 
     /// The account a single valid claim names, if this computer was claimed.
@@ -252,43 +429,8 @@ impl Workbench {
         project: &ProjectRecord,
         legacy: &str,
     ) -> ProjectOwner {
-        if let Some(owner) = recorded_owner(project) {
-            return ProjectOwner::Account(owner.to_owned());
-        }
-        if let Some(organization) = project
-            .extra
-            .get("organization")
-            .and_then(serde_json::Value::as_str)
-        {
-            return ProjectOwner::Organization(organization.to_owned());
-        }
-        if crate::shipped_tutorials::is_tutorial_project(project) {
-            if let Some(learner) = project
-                .extra
-                .get("product")
-                .and_then(|product| product.get("learner"))
-                .and_then(serde_json::Value::as_str)
-            {
-                return ProjectOwner::Account(learner.to_owned());
-            }
-        }
-        // A Panel agent's preview project is hidden plumbing: it belongs to
-        // whoever owns what it previews.
-        if let Some(marker) = crate::panel_preview::preview_marker(project) {
-            let previewed = marker
-                .placement_id
-                .as_deref()
-                .and_then(|placement| library.project_of_instance(placement))
-                .and_then(|id| library.projects.get(id))
-                .filter(|previewed| !crate::panel_preview::is_panel_preview_project(previewed));
-            if let Some(previewed) = previewed {
-                return self.project_owner_in(library, previewed, legacy);
-            }
-            if let Some(author) = self.agent_authoring_owner_in(library, &marker.agent_id) {
-                return ProjectOwner::Account(author);
-            }
-        }
-        ProjectOwner::Account(legacy.to_owned())
+        self.project_owner_resolver()
+            .owner_in(library, project, legacy)
     }
 
     /// The owner of the project `id`, if it exists.
@@ -441,24 +583,15 @@ impl Workbench {
     /// The projects `account` reaches as itself: those it owns and those it
     /// holds a grant to in `org`.
     pub(crate) fn account_project_ids(&self, account: &str, org: &Org) -> BTreeSet<String> {
-        // Admission consumes durable ownership, including a preview's source,
-        // rather than a Workbench projection that another writer may have left
-        // stale. Unreadable ownership evidence grants no project visibility.
-        let Ok(library) = crate::library::Library::rebuild(self.store_ref()) else {
-            return BTreeSet::new();
-        };
-        let legacy = self.legacy_project_owner();
-        let mut ids: BTreeSet<String> = library
-            .projects
-            .values()
-            .filter(|project| {
-                self.project_owner_in(&library, project, &legacy)
-                    == ProjectOwner::Account(account.to_owned())
-            })
-            .map(|project| project.id.clone())
-            .collect();
-        ids.extend(org.granted_project_ids(account));
-        ids
+        self.project_owner_resolver()
+            .account_project_ids(self.store_ref(), account, org)
+    }
+
+    pub(crate) fn project_owner_resolver(&self) -> ProjectOwnerResolver {
+        ProjectOwnerResolver {
+            local_account: self.authority().as_str().to_owned(),
+            legacy_agents: !self.hosted_home_mode() && !crate::workbench_auth::web_account_mode(),
+        }
     }
 }
 

@@ -51,6 +51,7 @@ impl Workbench {
         request_id: &str,
     ) -> Result<EditorFileSaveRequestIdentity, String> {
         let home = self.home_id().clone();
+        let owners = self.project_owner_resolver();
         let account_scopes = account_authority_scopes(context)?;
         let (authority, basis) = self
             .store_ref()
@@ -67,6 +68,7 @@ impl Workbench {
                     current_target_authority(
                         store,
                         &home,
+                        &owners,
                         context,
                         &NativeTargetIntent {
                             chat_id,
@@ -84,7 +86,7 @@ impl Workbench {
         )
         .map_err(|e| format!("file request preparation paused: {e:?}"))?;
         let basis = authority
-            .bind_deadline(basis)
+            .bind_deadline(self.store_ref(), basis)
             .map_err(|error| format!("file request deadline refused: {error:?}"))?;
         let (key, basis) = self.native_project_signer(&authority.project_id, basis)?;
         let issuer = crate::project_authority::authority(&key.public_key());
@@ -95,6 +97,9 @@ impl Workbench {
             chat_id,
             request_id,
         )?;
+        let basis = authority
+            .bind_deadline(self.store_ref(), basis)
+            .map_err(|error| format!("file request deadline refused: {error:?}"))?;
         self.store_mut()
             .with_dispatch_basis(&basis, || original)
             .map_err(|error| format!("file request authority changed: {error:?}"))

@@ -266,11 +266,10 @@ pub(crate) fn workflow_delegation_id(launch: &str) -> String {
 impl Workbench {
     /// Hold `project` for the session running this code, lingering after it:
     /// for a request whose path names no project but whose work uses one,
-    /// such as starting a tutorial (WS-740).
-    pub(crate) fn hold_for_session(
-        &self,
-        project: &str,
-    ) -> Option<crate::content_vault::SessionHold> {
+    /// such as starting a tutorial (WS-740). Public so a composition's own
+    /// handler, and its tests, can hold a project the way this crate's
+    /// handlers do; it is never a way to act with nobody present.
+    pub fn hold_for_session(&self, project: &str) -> Option<crate::content_vault::SessionHold> {
         let hold = self.content_vault.as_ref()?.hold(project);
         hold.linger();
         Some(hold)

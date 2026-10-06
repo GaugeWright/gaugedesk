@@ -43,6 +43,7 @@ fn scope(
 }
 fn current(paths: &[&str], policy: HostGovernancePolicy, clearances: &[&str]) -> FileAuthority {
     FileAuthority {
+        office_authority: None,
         target_id: "target".into(),
         project_id: "project".into(),
         workspace_path: "notes/item".into(),

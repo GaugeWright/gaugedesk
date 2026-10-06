@@ -10,16 +10,55 @@ use std::sync::Arc;
 
 use gaugedesk_harness::testing::{ScriptedHarness, ScriptedToolCall, ScriptedTurn};
 use gaugedesk_harness::{CredentialProbe, Harness, HarnessFactory, HarnessSpec, Observation};
-use gaugedesk_whip_runtime::WhipHarnessFactory;
+use gaugedesk_whip_runtime::{GovernanceRootVerifier, WhipHarnessFactory};
+
+/// Product orchestration retains the concrete WhippleScript adapter until its
+/// policy is compiled. The neutral driver receives only `HarnessFactory`.
+pub enum TurnHarnessFactory {
+    Whip(Box<WhipHarnessFactory>),
+    Custom(Arc<dyn HarnessFactory>),
+}
+
+impl TurnHarnessFactory {
+    pub(crate) fn bind_policy_root(self, root: GovernanceRootVerifier) -> Self {
+        match self {
+            Self::Whip(factory) => Self::Whip(Box::new((*factory).with_policy_root(root))),
+            Self::Custom(_) => self,
+        }
+    }
+}
+
+impl From<WhipHarnessFactory> for TurnHarnessFactory {
+    fn from(factory: WhipHarnessFactory) -> Self {
+        Self::Whip(Box::new(factory))
+    }
+}
+
+impl std::ops::Deref for TurnHarnessFactory {
+    type Target = dyn HarnessFactory;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Whip(factory) => factory.as_ref(),
+            Self::Custom(factory) => factory.as_ref(),
+        }
+    }
+}
+
+impl AsRef<dyn HarnessFactory> for TurnHarnessFactory {
+    fn as_ref(&self) -> &(dyn HarnessFactory + 'static) {
+        &**self
+    }
+}
 
 /// Select the factory for ONE turn. Consulted per turn, never cached at
 /// startup: tests flip `GAUGEDESK_FAKE_AGENT` against a live workbench. The
 /// fake stays deterministic; every real local turn targets WhippleScript.
-pub fn factory_for_turn(whip: WhipHarnessFactory) -> Arc<dyn HarnessFactory> {
+pub fn factory_for_turn(whip: WhipHarnessFactory) -> TurnHarnessFactory {
     if gaugedesk_env::var("FAKE_AGENT").is_some() {
-        Arc::new(ScriptedFakeFactory)
+        TurnHarnessFactory::Custom(Arc::new(ScriptedFakeFactory))
     } else {
-        Arc::new(whip)
+        TurnHarnessFactory::Whip(Box::new(whip))
     }
 }
 

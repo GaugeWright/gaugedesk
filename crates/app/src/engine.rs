@@ -269,6 +269,7 @@ use gaugedesk_boundary::{definition, AgentConfig, AuthoringMode, Decision, Effec
 use tokio::sync::broadcast;
 
 use crate::harness_select::ScriptedFakeFactory;
+pub use crate::harness_select::TurnHarnessFactory;
 use crate::library::ChatMode;
 use crate::policy_compiler::PolicyCompilationInput;
 use crate::stream::ServerEvent;
@@ -305,7 +306,7 @@ impl Workbench {
         harness: Box<dyn gaugedesk_harness::Harness>,
     ) {
         self.sessions
-            .insert(chat_id.into(), Arc::new(Mutex::new(harness)));
+            .insert(chat_id.into(), Arc::new(Mutex::new(Some(harness))));
     }
 
     #[cfg(test)]
@@ -972,8 +973,22 @@ pub fn run_task_streaming<G: EgressGate>(
 ) -> Result<TaskResult, EngineError> {
     run_task_streaming_billed(
         store, engagement, scope, harness, gate, task, images, sink, None, None, "", None, None,
+        None, None,
     )
 }
+
+#[path = "office_turn_answers.rs"]
+pub(crate) mod office_turn_answers;
+#[path = "office_turn_choice.rs"]
+pub(crate) mod office_turn_choice;
+#[path = "office_turn_filing.rs"]
+pub(crate) mod office_turn_filing;
+#[path = "office_turn_payload.rs"]
+pub(crate) mod office_turn_payload;
+#[path = "office_turn_result.rs"]
+pub(crate) mod office_turn_result;
+#[path = "office_turn_startup.rs"]
+pub(crate) mod office_turn_startup;
 
 #[allow(clippy::too_many_arguments)]
 fn run_task_streaming_billed<G: EgressGate>(
@@ -995,66 +1010,110 @@ fn run_task_streaming_billed<G: EgressGate>(
     // (DR-0201 §3). Checked on this turn's own store connection, since the
     // Workbench lock is not held while the model runs.
     pause_project: Option<&str>,
+    office: Option<office_turn_startup::OfficeTurnContext<'_>>,
+    office_startup: Option<office_turn_startup::OfficeTurnStartup>,
 ) -> Result<TaskResult, EngineError> {
+    if office.is_some() && (managed_billing_scope.is_some() || managed_funding_ref.is_some()) {
+        return Err(EngineError::Message(
+            "office turn cannot reserve hosted inference".into(),
+        ));
+    }
     // Observability span (RF-A8): scope + task size only — never the task text or
     // any content (those are protected; the span is operational metadata). The
     // span covers the whole turn; a completion event records the outcome below.
     let _span = tracing::info_span!("engine.turn", scope, task_len = task.len()).entered();
-    // 1. Admit the run into durable truth. Each task is a fresh run (ADR 0026):
-    //    a fresh engagement begins from Init (requestRun); a subsequent turn
-    //    re-enters from the prior run's terminal state (retryRun). Either way the
-    //    run must be re-admitted before it can start (INV-11).
-    let initial_phase = store.fold::<RunState>(scope)?.phase;
-    match initial_phase {
-        RunPhase::Init => {
-            store.admit::<RunState>(scope, RunCommand::RequestRun)?;
-            store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
-            store.admit::<RunState>(scope, RunCommand::StartRun)?;
-        }
-        RunPhase::Requested => {
-            store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
-            store.admit::<RunState>(scope, RunCommand::StartRun)?;
-        }
-        RunPhase::Admitted => {
-            store.admit::<RunState>(scope, RunCommand::StartRun)?;
-        }
-        // Reachable only for a run whose process died mid-turn: a live turn holds
-        // this chat's claim, so a concurrent one is refused before it gets here
-        // (ADR 0138 §6). `Running` with nothing executing is therefore a crashed
-        // run, and re-entering it is the recovery — which is why this stays a
-        // pass-through rather than becoming the refusal. Refusing on the durable
-        // phase alone would strand that chat forever.
-        RunPhase::Running => {}
-        RunPhase::Completed | RunPhase::Failed | RunPhase::Canceled => {
-            store.admit::<RunState>(scope, RunCommand::RetryRun)?;
-            store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
-            store.admit::<RunState>(scope, RunCommand::StartRun)?;
-        }
+    // Keep the captured native base for this invocation's result admission.
+    // Office startup publishes only recorded history and exact original intent.
+    let office_startup = match office_startup {
+        Some(startup) => Some(startup),
+        None => office
+            .as_ref()
+            .map(|office| {
+                office_turn_startup::admit_startup(
+                    office,
+                    engagement,
+                    scope,
+                    task,
+                    &mut fork_snapshot,
+                )
+            })
+            .transpose()?,
+    };
+    // Recovered startup evidence cannot authorize a second model execution.
+    // The original saved-runtime recovery path must qualify before resuming.
+    if office_startup
+        .as_ref()
+        .is_some_and(|startup| startup.recovered)
+    {
+        return Err(EngineError::Message(
+            "office startup recovery requires qualified original saved runtime evidence".into(),
+        ));
     }
+    let (before_workspace_cut, reads_before, user_entry_id) = if let Some(startup) = &office_startup
+    {
+        (
+            gaugedesk_workspace::RevisionId(startup.native_base.base_cut().to_owned()),
+            startup.reads_before.clone(),
+            startup.user_entry_id,
+        )
+    } else {
+        // 1. Admit the run into durable truth. Each task is a fresh run (ADR 0026):
+        //    a fresh engagement begins from Init (requestRun); a subsequent turn
+        //    re-enters from the prior run's terminal state (retryRun). Either way the
+        //    run must be re-admitted before it can start (INV-11).
+        let initial_phase = store.fold::<RunState>(scope)?.phase;
+        match initial_phase {
+            RunPhase::Init => {
+                store.admit::<RunState>(scope, RunCommand::RequestRun)?;
+                store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
+                store.admit::<RunState>(scope, RunCommand::StartRun)?;
+            }
+            RunPhase::Requested => {
+                store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
+                store.admit::<RunState>(scope, RunCommand::StartRun)?;
+            }
+            RunPhase::Admitted => {
+                store.admit::<RunState>(scope, RunCommand::StartRun)?;
+            }
+            // Reachable only for a run whose process died mid-turn: a live turn holds
+            // this chat's claim, so a concurrent one is refused before it gets here
+            // (ADR 0138 §6). `Running` with nothing executing is therefore a crashed
+            // run, and re-entering it is the recovery — which is why this stays a
+            // pass-through rather than becoming the refusal. Refusing on the durable
+            // phase alone would strand that chat forever.
+            RunPhase::Running => {}
+            RunPhase::Completed | RunPhase::Failed | RunPhase::Canceled => {
+                store.admit::<RunState>(scope, RunCommand::RetryRun)?;
+                store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
+                store.admit::<RunState>(scope, RunCommand::StartRun)?;
+            }
+        }
 
-    let before_workspace_cut = engagement.boundary_cut()?;
-    let reads_before = crate::resource_store::engagement_reads(store, scope)?
-        .items()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+        let before_workspace_cut = engagement.boundary_cut()?;
+        let reads_before = crate::resource_store::engagement_reads(store, scope)?
+            .items()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
 
-    // Admit the user message as durable transcript evidence (turn-boundary). The
-    // transcript records the **raw** task; mode framing is invisible context the
-    // model receives, not something the user typed.
-    let user_entry_id = append_transcript(
-        store,
-        scope,
-        &ServerEvent::User {
-            text: task.to_string(),
-        },
-    )?;
-    crate::target_change_set::admit_turn_process_declaration(
-        store,
-        scope,
-        user_entry_id,
-        &mut fork_snapshot,
-    )?;
+        // Admit the user message as durable transcript evidence (turn-boundary). The
+        // transcript records the **raw** task; mode framing is invisible context the
+        // model receives, not something the user typed.
+        let user_entry_id = append_transcript(
+            store,
+            scope,
+            &ServerEvent::User {
+                text: task.to_string(),
+            },
+        )?;
+        crate::target_change_set::admit_turn_process_declaration(
+            store,
+            scope,
+            user_entry_id,
+            &mut fork_snapshot,
+        )?;
+        (before_workspace_cut, reads_before, user_entry_id)
+    };
     debug_assert_eq!(
         managed_billing_scope.is_some(),
         managed_funding_ref.is_some()
@@ -1085,9 +1144,38 @@ fn run_task_streaming_billed<G: EgressGate>(
     } else {
         format!("{prompt_prefix}{task}")
     };
+    if let (Some(office), Some(startup)) = (&office, &office_startup) {
+        let preparation = harness
+            .prepare_runtime_turn(&prompt, images)
+            .map_err(EngineError::Harness)?;
+        office_turn_startup::retain_runtime(office, startup, fork_snapshot.as_ref(), preparation)?;
+        harness
+            .bind_workspace_payload_retention(Some(office_turn_payload::callback(
+                office,
+                startup,
+                fork_snapshot.as_ref(),
+            )))
+            .map_err(EngineError::Harness)?;
+    } else {
+        harness
+            .bind_workspace_payload_retention(None)
+            .map_err(EngineError::Harness)?;
+    }
     let outcome: TurnOutcome = match harness.run_turn(gate, &prompt, images, sink) {
         Ok(outcome) => outcome,
         Err(error) => {
+            if let Some(office) = &office {
+                let startup = office_startup.as_ref().ok_or_else(|| {
+                    EngineError::Message("office failure has no original startup".into())
+                })?;
+                office_turn_startup::admit_failed_attempt(
+                    office,
+                    startup,
+                    scope,
+                    &error.to_string(),
+                )?;
+                return Err(EngineError::Harness(error));
+            }
             // A transport death is still a settled attempt. Keep the run and
             // task projections repairable instead of stranding `Running` with
             // no durable failure fact.
@@ -1126,6 +1214,18 @@ fn run_task_streaming_billed<G: EgressGate>(
             return Err(EngineError::Harness(error));
         }
     };
+
+    if let Some(office) = &office {
+        return office_turn_result::admit_result(
+            office,
+            office_startup.ok_or_else(|| {
+                EngineError::Message("office result has no original startup".into())
+            })?,
+            scope,
+            outcome,
+            fork_snapshot,
+        );
+    }
 
     // 3a. Admit the runtime's execution evidence into the run (INV-4): each tool
     //     decision the membrane ruled on is an observation that becomes standing
@@ -1690,6 +1790,8 @@ pub struct EngagementTurnInput<'a> {
     pub authenticated_actor: Option<&'a gaugedesk_core::ids::AuthorityId>,
     /// Verified request authority, rechecked when a tracker tool executes.
     pub authenticated_context: Option<&'a crate::identity::AuthenticatedActionContext>,
+    /// Original HTTP software declaration; office turns require it.
+    pub client_build: Option<&'a crate::client_admission::ClientBuild>,
     /// Set only by the desktop operator listener, never a relay or federation run.
     pub local_operator: bool,
     /// Authority that drove this turn for workstream contribution attribution.
@@ -1706,12 +1808,16 @@ pub struct EngagementTurnInput<'a> {
     /// never a provider credential or durable runtime input.
     pub account_bearer: Option<&'a str>,
     /// Stable Home-admitted command identity for unattended execution. A retry
-    /// reuses this exact WhippleScript command/receipt. Foreground turns omit it.
+    /// reuses this exact WhippleScript command/receipt. Foreground HTTP turns
+    /// instead derive it from their original middleware claim below.
     pub runtime_command_id: Option<&'a str>,
+    /// Exact middleware-owned HTTP claim retained across background execution.
+    /// It is original intent, with no authentication or execution authority.
+    pub original_http_command: Option<&'a crate::command_idempotency::ClaimedHttpCommand>,
     /// An admitted execution shell may supply the same WhippleScript factory
     /// with a command-scoped transport (for example a Home-signed private
     /// Durable workflow). Foreground turns use the workbench default.
-    pub harness_factory: Option<Arc<dyn HarnessFactory>>,
+    pub harness_factory: Option<TurnHarnessFactory>,
 }
 
 /// Non-secret, immutable inputs a managed Isolated-workspace scheduler must
@@ -1914,14 +2020,30 @@ fn run_claimed_engagement_turn(
         mode,
         authenticated_actor,
         authenticated_context,
+        client_build,
         local_operator,
         contribution_by,
         account_scope,
         tenant_scope,
         account_bearer,
         runtime_command_id,
-        harness_factory,
+        original_http_command,
+        mut harness_factory,
     } = input;
+    let runtime_command_id = match original_http_command {
+        Some(original) => {
+            original.verify_pending(wb.lock_unpoisoned().store_ref())?;
+            if runtime_command_id.is_some_and(|id| id != original.command_id()) {
+                return Err(EngineError::Admit(AdmitError::Rejected(
+                    gaugedesk_core::Rejection {
+                        reason: "runtime command differs from original HTTP task",
+                    },
+                )));
+            }
+            Some(original.command_id())
+        }
+        None => runtime_command_id,
+    };
     let task_action_context = authenticated_context
         .cloned()
         .or_else(|| {
@@ -1940,6 +2062,77 @@ fn run_claimed_engagement_turn(
             let project = g.library_project_of_chat(id)?;
             g.local_personal_tracker_context(&project)
         });
+    let office_authority = office_authority::OfficeTaskAuthority::for_turn(
+        wb,
+        id,
+        task_action_context.as_ref(),
+        client_build,
+        authenticated_actor,
+        account_bearer,
+    )?;
+    task_checkpoint(wb, id, office_authority.as_ref())?;
+    // Recover the original turn before any package, policy, provider, credential,
+    // catalogue or ordinary runtime construction. Absence never falls back to work.
+    if let Some(authority) = office_authority.as_ref() {
+        let original = original_http_command
+            .ok_or_else(|| EngineError::Message("office task has no original HTTP claim".into()))?;
+        let office = office_turn_startup::OfficeTurnContext {
+            wb,
+            authority,
+            original,
+        };
+        if office_turn_startup::recorded_startup(&office, task)? {
+            let engagement = {
+                let g = wb.lock_unpoisoned();
+                if g.chat_project_moving(id) {
+                    return Err(EngineError::Message(
+                        crate::federation::PAUSED_FOR_MOVE.into(),
+                    ));
+                }
+                g.engagements
+                    .get(id)
+                    .ok_or_else(|| EngineError::Message("engagement gone".into()))?
+                    .boxed_clone()
+            };
+            let mut fork = None;
+            let startup = office_turn_startup::admit_retained_startup(
+                &office,
+                engagement.as_ref(),
+                id,
+                task,
+                &mut fork,
+            )?;
+            let preparation =
+                office_turn_startup::recorded_runtime(&office, &startup, fork.as_ref())?;
+            let factory: TurnHarnessFactory = match harness_factory.take() {
+                Some(factory) => factory,
+                None => TurnHarnessFactory::from(
+                    wb.lock_unpoisoned()
+                        .recorded_whip_harness_factory()
+                        .map_err(EngineError::Harness)?,
+                ),
+            };
+            let epoch = factory
+                .recorded_policy_epoch(&preparation)
+                .map_err(EngineError::Harness)?;
+            let (signed_policy, original_root) =
+                office_turn_startup::recorded_policy(&office, &startup, epoch)?;
+            let factory = factory.bind_policy_root(original_root);
+            let access = office.recorded_access();
+            let outcome = factory
+                .observe_recorded_runtime(&gaugedesk_harness::RecordedRuntimeSpec {
+                    chat_id: id,
+                    command_id: original.command_id(),
+                    policy_epoch: epoch,
+                    signed_policy_envelope: &signed_policy,
+                    preparation: &preparation,
+                    images,
+                    access: &access,
+                })
+                .map_err(EngineError::Harness)?;
+            return office_turn_result::admit_result(&office, startup, id, outcome, fork);
+        }
+    }
     bind_turn_image_submitter(
         id,
         authenticated_actor.or_else(|| task_action_context.as_ref().map(|context| context.actor())),
@@ -1984,7 +2177,7 @@ fn run_claimed_engagement_turn(
                     })
                 })
     };
-    stop_checkpoint(id)?;
+    task_checkpoint(wb, id, office_authority.as_ref())?;
     let gate = MembraneGate::new(&config, default_external_tools()).with_mode(mode);
 
     // GaugeDesk keeps credential custody. The selected provider material is
@@ -2043,7 +2236,7 @@ fn run_claimed_engagement_turn(
         ChatMode::Use => None,
     };
 
-    stop_checkpoint(id)?;
+    task_checkpoint(wb, id, office_authority.as_ref())?;
 
     // Resolve an organization-funded project selection before choosing the
     // real runtime factory. A selected connection never falls through to a
@@ -2159,7 +2352,7 @@ fn run_claimed_engagement_turn(
     // The one harness decision point (SUB-0): which adapter drives this turn.
     // Consulted per turn — tests flip `GAUGEDESK_FAKE_AGENT` against a live
     // workbench, so the selection must never be cached at startup.
-    let factory =
+    let mut factory =
         harness_factory.unwrap_or_else(|| crate::harness_select::factory_for_turn(whip_factory));
 
     // Mock-LLM mode: no WhippleScript runtime, no model call. The scripted fake drives the
@@ -2181,7 +2374,7 @@ fn run_claimed_engagement_turn(
         // deliberately: the wait is before the bind, so a Stop pressed during
         // it has nothing to fire and must be honoured by a checkpoint.
         ScriptedFakeFactory::startup_window(task);
-        stop_checkpoint(id)?;
+        task_checkpoint(wb, id, office_authority.as_ref())?;
         bind_turn_interrupt(id, std::sync::Arc::new(move || releases.stop()));
         // The fake writes to disk directly rather than through the agent's
         // named view (DR-0248), so it is handed the stored roots it may write.
@@ -2253,7 +2446,9 @@ fn run_claimed_engagement_turn(
             None,
             None,
             runtime_command_id,
+            original_http_command,
             process_declaration,
+            office_authority.as_ref(),
             None,
             None,
         )?
@@ -2310,7 +2505,7 @@ fn run_claimed_engagement_turn(
         }
         // The credential legs are the widest part of startup — two provider
         // round trips before anything interruptible exists.
-        stop_checkpoint(id)?;
+        task_checkpoint(wb, id, office_authority.as_ref())?;
         let credential_ref = organization_selection.as_ref().map_or_else(
             || {
                 let guard = wb.lock_unpoisoned();
@@ -2399,7 +2594,7 @@ fn run_claimed_engagement_turn(
                 effective_execution_class,
             )
         };
-        stop_checkpoint(id)?;
+        task_checkpoint(wb, id, office_authority.as_ref())?;
         // A provider with no shipped catalog runs the operator's first declared
         // model when the chat pins none — the same id the picker names as default.
         let model = organization_selection.as_ref().map_or_else(
@@ -2707,6 +2902,7 @@ fn run_claimed_engagement_turn(
             }
             compiled
         };
+        factory = factory.bind_policy_root(policy_epoch.policy_root.clone());
         if let Some(process) = process_declaration.as_mut() {
             process.bind_governance(policy_epoch.epoch, &policy_epoch.signed_envelope);
         }
@@ -2781,7 +2977,9 @@ fn run_claimed_engagement_turn(
                 .as_ref()
                 .map(|_| resolved_funding_ref.as_str()),
             runtime_command_id,
+            original_http_command,
             process_declaration,
+            office_authority.as_ref(),
             task_action_context.as_ref(),
             task_tracker_project.as_deref(),
         );
@@ -2817,6 +3015,14 @@ fn run_claimed_engagement_turn(
             other => other?,
         }
     };
+
+    // Office result admission is qualified, but the legacy proposal/auto-sync,
+    // title and settlement paths below carry no original office writer. Until
+    // their own governed integration is qualified, the result's durable gap
+    // records this unfinished settlement; never promote mutable working files.
+    if office_authority.is_some() {
+        return Ok(result);
+    }
 
     // A completed candidate is a `propose` act, independent from any later
     // apply/publish/release authority. Record its exact basis, candidate cut,
@@ -3214,6 +3420,8 @@ struct CurrentProjectTaskFiler {
     chat_id: String,
     project_id: String,
     turn_id: String,
+    office: Option<office_authority::OfficeTaskAuthority>,
+    original: Option<crate::command_idempotency::ClaimedHttpCommand>,
 }
 
 impl TaskFiler for CurrentProjectTaskFiler {
@@ -3223,6 +3431,25 @@ impl TaskFiler for CurrentProjectTaskFiler {
         content: &str,
         assigned_to: Option<&str>,
     ) -> Result<String, String> {
+        if let Some(authority) = &self.office {
+            let original = self
+                .original
+                .as_ref()
+                .ok_or("office task has no original HTTP claim")?;
+            if self.chat_id != authority.chat() || self.project_id != authority.project() {
+                return Err("office task differs from its original project".into());
+            }
+            return office_turn_filing::file(
+                &office_turn_startup::OfficeTurnContext {
+                    wb: &self.wb,
+                    authority,
+                    original,
+                },
+                call_id,
+                content,
+                assigned_to,
+            );
+        }
         if call_id.trim().is_empty() {
             return Err("task tool call has no identity".to_owned());
         }
@@ -3242,6 +3469,19 @@ impl TaskFiler for CurrentProjectTaskFiler {
     }
 
     fn assignable_recipients(&self) -> Vec<(String, String)> {
+        if let Some(authority) = &self.office {
+            let Some(original) = &self.original else {
+                return Vec::new();
+            };
+            if self.chat_id != authority.chat() || self.project_id != authority.project() {
+                return Vec::new();
+            }
+            return office_turn_filing::recipients(&office_turn_startup::OfficeTurnContext {
+                wb: &self.wb,
+                authority,
+                original,
+            });
+        }
         let g = self.wb.lock_unpoisoned();
         if g.library_project_of_chat(&self.chat_id).as_deref() != Some(self.project_id.as_str()) {
             return Vec::new();
@@ -3255,6 +3495,60 @@ impl TaskFiler for CurrentProjectTaskFiler {
         };
         choices.into_iter().collect()
     }
+}
+
+/// Reserve a singleton cache entry without invoking the runtime factory.
+fn reserve_turn_harness(wb: &mut Workbench, id: &str, persistent: bool) -> SharedHarness {
+    if persistent {
+        Arc::clone(
+            wb.sessions
+                .entry(id.to_owned())
+                .or_insert_with(|| Arc::new(Mutex::new(None))),
+        )
+    } else {
+        Arc::new(Mutex::new(None))
+    }
+}
+
+/// Initialize under this chat's lock, with the Workbench free for Home authority
+/// callbacks. Removed reservations cannot publish over a policy/placement change.
+fn initialize_turn_harness(
+    wb: &SharedWorkbench,
+    id: &str,
+    harness: &SharedHarness,
+    persistent: bool,
+    create: impl FnOnce() -> Result<Box<dyn Harness>, String>,
+) -> Result<(), EngineError> {
+    let initialized = {
+        let mut slot = harness.lock_unpoisoned();
+        if slot.is_none() {
+            create().map(|created| *slot = Some(created))
+        } else {
+            Ok(())
+        }
+    };
+    let current = {
+        let mut wb = wb.lock_unpoisoned();
+        let current = !persistent
+            || wb
+                .sessions
+                .get(id)
+                .is_some_and(|cached| Arc::ptr_eq(cached, harness));
+        if persistent && current && initialized.is_err() {
+            wb.sessions.remove(id);
+        }
+        current
+    };
+    if !current {
+        let obsolete = harness.lock_unpoisoned().take();
+        if let Some(obsolete) = obsolete {
+            let _ = obsolete.shutdown();
+        }
+        return Err(EngineError::Harness(std::io::Error::other(
+            "chat harness reservation changed during startup",
+        )));
+    }
+    initialized.map_err(|error| EngineError::Harness(std::io::Error::other(error)))
 }
 
 /// Drive one turn over the engagement's session, constructed by `factory` from
@@ -3286,21 +3580,80 @@ fn drive_persistent_turn(
     managed_billing_scope: Option<&str>,
     managed_funding_ref: Option<&str>,
     runtime_command_id: Option<&str>,
+    original_http_command: Option<&crate::command_idempotency::ClaimedHttpCommand>,
     process_declaration: Option<crate::target_change_set::TurnProcessDeclaration>,
+    office_authority: Option<&office_authority::OfficeTaskAuthority>,
     task_action_context: Option<&crate::identity::AuthenticatedActionContext>,
     task_tracker_project: Option<&str>,
 ) -> Result<TaskResult, EngineError> {
+    // Observe original office startup before any factory can open/fork an
+    // instance or refresh a catalogue. Validate recovered startup with the lock
+    // free; fresh startup still follows successful office harness binding.
+    let mut prepared_office_fork = None;
+    let prepared_office_startup = if let Some(authority) = office_authority {
+        if managed_billing_scope.is_some() || managed_funding_ref.is_some() {
+            return Err(EngineError::Message(
+                "office turn cannot reserve hosted inference".into(),
+            ));
+        }
+        let original = original_http_command
+            .ok_or_else(|| EngineError::Message("office task has no original HTTP claim".into()))?;
+        let recorded = office_turn_startup::recorded_startup(
+            &office_turn_startup::OfficeTurnContext {
+                wb,
+                authority,
+                original,
+            },
+            task,
+        )?;
+        if !recorded {
+            None
+        } else {
+            let (engagement, mut fork) = {
+                let g = wb.lock_unpoisoned();
+                if g.chat_project_moving(id) {
+                    return Err(EngineError::Message(
+                        crate::federation::PAUSED_FOR_MOVE.into(),
+                    ));
+                }
+                let engagement = g
+                    .engagements
+                    .get(id)
+                    .ok_or_else(|| "engagement gone".to_string())?
+                    .boxed_clone();
+                let fork = g.turn_fork_snapshot(
+                    id,
+                    spec.policy_epoch,
+                    spec.signed_policy_envelope.as_deref(),
+                    process_declaration.clone(),
+                )?;
+                (engagement, fork)
+            };
+            let startup = office_turn_startup::admit_retained_startup(
+                &office_turn_startup::OfficeTurnContext {
+                    wb,
+                    authority,
+                    original,
+                },
+                engagement.as_ref(),
+                id,
+                task,
+                &mut fork,
+            )?;
+            if startup.recovered {
+                return Err(EngineError::Message(
+                    "office startup recovery requires qualified original saved runtime evidence"
+                        .into(),
+                ));
+            }
+            prepared_office_fork = Some(fork);
+            Some(startup)
+        }
+    } else {
+        None
+    };
     // 1. Check out this turn's resources under a brief lock, then drop it.
-    let (
-        mut store,
-        engagement,
-        harness,
-        persistent,
-        answers,
-        answer_sources,
-        fork_snapshot,
-        pause_project,
-    ) = {
+    let (mut store, engagement, harness, persistent, fork_snapshot, pause_project) = {
         let mut g = wb.lock_unpoisoned();
         if g.chat_project_moving(id) {
             return Err(EngineError::Admit(AdmitError::Rejected(
@@ -3323,66 +3676,94 @@ fn drive_persistent_turn(
         // per turn (the scripted fake's one-shot transport — caching it would
         // fail turn 2 with "stream ended"), dropped when the turn ends.
         let persistent = factory.reuse_across_turns();
-        let harness = if persistent {
-            match g.sessions.get(id) {
-                Some(existing) => Arc::clone(existing),
-                None => {
-                    let harness = factory
-                        .create(spec)
-                        .map_err(|e| format!("spawn {}: {e}", factory.kind()))?;
-                    let harness: SharedHarness = Arc::new(Mutex::new(harness));
-                    g.sessions.insert(id.to_string(), Arc::clone(&harness));
-                    harness
-                }
-            }
-        } else {
-            let harness = factory
-                .create(spec)
-                .map_err(|e| format!("spawn {}: {e}", factory.kind()))?;
-            Arc::new(Mutex::new(harness))
+        let harness = reserve_turn_harness(&mut g, id, persistent);
+        let fork_snapshot = match prepared_office_fork {
+            Some(fork) => fork,
+            None => g.turn_fork_snapshot(
+                id,
+                spec.policy_epoch,
+                spec.signed_policy_envelope.as_deref(),
+                process_declaration,
+            )?,
         };
-        // Answers that arrived since this chat's last turn ride this turn's prompt
-        // (ADR 0113 §1). Taken under the same brief lock, and marked delivered as
-        // they are taken, so the agent is told each answer exactly once.
-        let delivered_answers = g.take_undelivered_answers(id);
-        let answer_sources = delivered_answers
-            .iter()
-            .map(crate::agent_question::answer_source_handle)
-            .collect::<Option<Vec<_>>>();
-        let answers = crate::agent_question::answers_context(&delivered_answers);
-        let fork_snapshot = g.turn_fork_snapshot(
-            id,
-            spec.policy_epoch,
-            spec.signed_policy_envelope.as_deref(),
-            process_declaration,
-        )?;
         (
             store,
             engagement,
             harness,
             persistent,
-            answers,
-            answer_sources,
             fork_snapshot,
             pause_project,
         )
+    };
+
+    initialize_turn_harness(wb, id, &harness, persistent, || {
+        factory
+            .create(spec)
+            .map_err(|error| format!("spawn {}: {error}", factory.kind()))
+    })?;
+
+    // Do not consume answered questions until startup succeeds. A refused
+    // transport must leave their delivery owed to the next successful turn.
+    let (answers, answer_sources) = {
+        let mut g = wb.lock_unpoisoned();
+        let delivered = if office_authority.is_some() {
+            Vec::new()
+        } else {
+            g.take_undelivered_answers(id)
+        };
+        let sources = delivered
+            .iter()
+            .map(crate::agent_question::answer_source_handle)
+            .collect::<Option<Vec<_>>>();
+        (crate::agent_question::answers_context(&delivered), sources)
     };
 
     // 2. Run the turn holding only this chat's harness. A second turn on the same
     //    chat waits here; a turn on any *other* chat is unaffected.
     let result = {
         let mut guard = harness.lock_unpoisoned();
-        let harness: &mut dyn Harness = guard.as_mut();
+        let harness: &mut dyn Harness = guard
+            .as_deref_mut()
+            .expect("this turn initialized its harness");
         // Refresh on every request: a persistent chat may be answered by a
         // different authenticated member than the one who created its harness.
         harness.bind_authenticated_actor(actor_ref);
         harness.bind_runtime_command_id(runtime_command_id);
+        let runtime_access = office_authority
+            .map(|authority| {
+                let parent = original_http_command.ok_or_else(|| {
+                    EngineError::Message("office runtime has no original HTTP claim".into())
+                })?;
+                Ok::<_, EngineError>(authority.runtime_access(wb, parent))
+            })
+            .transpose()?;
+        harness
+            .bind_turn_access(runtime_access)
+            .map_err(EngineError::Harness)?;
+        // Do not consume answer context for a harness that cannot enforce the
+        // original office access. The guarded phase commits before release.
+        let (answers, answer_sources) = if let Some(authority) = office_authority {
+            let original = original_http_command.ok_or_else(|| {
+                EngineError::Message("office answers have no original HTTP claim".into())
+            })?;
+            let delivered =
+                office_turn_answers::take(&mut wb.lock_unpoisoned(), authority, original)?;
+            let sources = delivered
+                .iter()
+                .map(crate::agent_question::answer_source_handle)
+                .collect::<Option<Vec<_>>>();
+            (crate::agent_question::answers_context(&delivered), sources)
+        } else {
+            (answers, answer_sources)
+        };
         harness.bind_user_context_provenance(answer_sources.as_deref());
         let task_filer: Option<Arc<dyn TaskFiler>> =
             match (task_action_context, task_tracker_project) {
                 (Some(context), Some(project)) => Some(Arc::new(CurrentProjectTaskFiler {
                     wb: Arc::clone(wb),
                     context: context.clone(),
+                    office: office_authority.cloned(),
+                    original: original_http_command.cloned(),
                     chat_id: id.to_owned(),
                     project_id: project.to_owned(),
                     turn_id: runtime_command_id
@@ -3408,6 +3789,8 @@ fn drive_persistent_turn(
         let external_tool_handler = if spec.mode == gaugedesk_harness::ChatMode::Use {
             let workbench = Arc::clone(wb);
             let conversation_id = id.to_owned();
+            let office = office_authority.cloned();
+            let original = original_http_command.cloned();
             Some(Arc::new(
                 move |call_key: &str, name: &str, arguments: &serde_json::Value| {
                     if name != "ask_choices" {
@@ -3416,6 +3799,22 @@ fn drive_persistent_turn(
                     let request: crate::choice_prompt::ChoiceRequest =
                         serde_json::from_value(arguments.clone())
                             .map_err(|error| error.to_string())?;
+                    if let Some(authority) = &office {
+                        let original = original.as_ref().ok_or_else(|| {
+                            "office question has no original HTTP command".to_owned()
+                        })?;
+                        let card = office_turn_choice::ask(
+                            &office_turn_startup::OfficeTurnContext {
+                                wb: &workbench,
+                                authority,
+                                original,
+                            },
+                            &conversation_id,
+                            call_key,
+                            &request,
+                        )?;
+                        return Ok(serde_json::json!({"asked": true, "card_id": card.id, "note": "The answer will arrive in a later turn."}).to_string());
+                    }
                     let mut workbench = workbench.lock_unpoisoned();
                     let recipient = match request.to.as_deref() {
                         None => workbench.default_addressee(&conversation_id),
@@ -3456,7 +3855,10 @@ fn drive_persistent_turn(
         // The last checkpoint, and the only one past the bind: a turn stopped
         // while it waited for another turn's harness lock must not now go and
         // call a model. Past this line the handle carries it.
-        stop_checkpoint(id)?;
+        task_checkpoint(wb, id, office_authority)?;
+        if let Some(original) = original_http_command {
+            original.verify_pending(wb.lock_unpoisoned().store_ref())?;
+        }
         let mut sink = live_sink(sender);
         let result = run_task_streaming_billed(
             &mut store,
@@ -3472,6 +3874,19 @@ fn drive_persistent_turn(
             &answers,
             fork_snapshot,
             pause_project.as_deref(),
+            office_authority
+                .map(|authority| {
+                    let original = original_http_command.ok_or_else(|| {
+                        EngineError::Message("office task has no original HTTP claim".into())
+                    })?;
+                    Ok::<_, EngineError>(office_turn_startup::OfficeTurnContext {
+                        wb,
+                        authority,
+                        original,
+                    })
+                })
+                .transpose()?,
+            prepared_office_startup,
         );
         // The claim is released by its guard when the turn returns, not here: the
         // bookkeeping below is still part of this turn, and freeing the chat before
@@ -3489,7 +3904,12 @@ fn drive_persistent_turn(
         .as_ref()
         .map(|r| r.run_phase == RunPhase::Failed)
         .unwrap_or(true);
-    if persistent && stream_died {
+    if persistent
+        && stream_died
+        && g.sessions
+            .get(id)
+            .is_some_and(|cached| Arc::ptr_eq(cached, &harness))
+    {
         if let Some(dead) = g.sessions.remove(id) {
             drop(harness);
             crate::workbench_state::shutdown_shared_harness(dead);
@@ -4443,6 +4863,8 @@ mod tests {
             "",
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -4558,12 +4980,14 @@ mod tests {
                 mode: ChatMode::Use,
                 authenticated_actor: None,
                 authenticated_context: None,
+                client_build: None,
                 local_operator: false,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
                 account_bearer: None,
                 runtime_command_id: None,
+                original_http_command: None,
                 harness_factory: None,
             },
         )
@@ -4630,12 +5054,14 @@ mod tests {
                 mode: ChatMode::Use,
                 authenticated_actor: None,
                 authenticated_context: None,
+                client_build: None,
                 local_operator: false,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
                 account_bearer: None,
                 runtime_command_id: None,
+                original_http_command: None,
                 harness_factory: None,
             },
         )
@@ -4704,12 +5130,14 @@ mod tests {
                 mode: ChatMode::Use,
                 authenticated_actor: None,
                 authenticated_context: None,
+                client_build: None,
                 local_operator: false,
                 contribution_by: None,
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
                 account_bearer: None,
                 runtime_command_id: None,
+                original_http_command: None,
                 harness_factory: None,
             },
         )
@@ -5074,6 +5502,222 @@ mod tests {
         );
     }
 
+    struct StartupFactory {
+        wb: SharedWorkbench,
+        persistent: bool,
+        creations: Arc<std::sync::atomic::AtomicUsize>,
+        fail_once: AtomicBool,
+    }
+
+    impl HarnessFactory for StartupFactory {
+        fn kind(&self) -> &'static str {
+            ScriptedFakeFactory::KIND
+        }
+
+        fn create(&self, _spec: &HarnessSpec) -> io::Result<Box<dyn Harness>> {
+            let _authority = self.wb.try_lock().map_err(|_| {
+                io::Error::other("hosted authority callback cannot acquire the Workbench")
+            })?;
+            if self.fail_once.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::other("transport refused startup"));
+            }
+            self.creations.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(ScriptedHarness::new(vec![
+                TurnOutcome::default(),
+                TurnOutcome::default(),
+            ])))
+        }
+
+        fn reuse_across_turns(&self) -> bool {
+            self.persistent
+        }
+
+        fn credential_status(
+            &self,
+            _provider: &str,
+            _capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
+        ) -> CredentialProbe {
+            CredentialProbe::Ready
+        }
+    }
+
+    #[test]
+    fn harness_startup_callbacks_can_read_the_workbench_for_both_cache_modes() {
+        let _fake = fake_agent_env();
+        for persistent in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+            let chat = format!("startup-callback-{persistent}");
+            let eng = inst.create_engagement(&chat).unwrap();
+            let worktree = eng.path().to_path_buf();
+            let wb = Arc::new(Mutex::new(Workbench::with_target(
+                "inst-test",
+                inst,
+                Store::open_in_memory().unwrap(),
+            )));
+            wb.lock_unpoisoned()
+                .register_engagement(&chat, "inst-test", Box::new(eng));
+            let creations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let factory = Arc::new(StartupFactory {
+                wb: Arc::clone(&wb),
+                persistent,
+                creations: Arc::clone(&creations),
+                fail_once: AtomicBool::new(true),
+            });
+            {
+                let mut guard = wb.lock_unpoisoned();
+                let question = guard
+                    .ask_question(&chat, "Which region?", &[], None, false)
+                    .unwrap();
+                guard
+                    .answer_question(&chat, &question, "east", "alice")
+                    .unwrap();
+            }
+            let (sender, _) = broadcast::channel(16);
+            for succeeds in [false, true, true] {
+                let result = run_engagement_turn(
+                    &wb,
+                    &chat,
+                    &worktree,
+                    &sender,
+                    EngagementTurnInput {
+                        task: "go",
+                        images: &[],
+                        mode: ChatMode::Use,
+                        authenticated_actor: None,
+                        authenticated_context: None,
+                        local_operator: false,
+                        contribution_by: None,
+                        account_scope: crate::account::ACCOUNT_SCOPE,
+                        tenant_scope: crate::org::ORG_SCOPE,
+                        account_bearer: None,
+                        runtime_command_id: None,
+                        client_build: None,
+                        original_http_command: None,
+                        harness_factory: Some(TurnHarnessFactory::Custom(factory.clone())),
+                    },
+                );
+                if succeeds {
+                    result.expect("startup callback can read authority without deadlocking");
+                } else {
+                    assert!(result.is_err(), "the first transport refusal propagates");
+                }
+                let answered = wb.lock_unpoisoned().answered_questions(&chat);
+                assert_eq!(answered.len(), 1);
+                assert_eq!(
+                    answered[0].answer_delivered, succeeds,
+                    "startup refusal must preserve the undelivered answer"
+                );
+            }
+            assert_eq!(
+                creations.load(Ordering::SeqCst),
+                if persistent { 1 } else { 2 }
+            );
+            assert_eq!(
+                wb.lock_unpoisoned().sessions.contains_key(&chat),
+                persistent
+            );
+        }
+    }
+
+    struct StartupShutdownProbe {
+        wb: SharedWorkbench,
+        shutdowns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Harness for StartupShutdownProbe {
+        fn run_turn(
+            &mut self,
+            _gate: &dyn EgressGate,
+            _prompt: &str,
+            _images: &[ImageContent],
+            _sink: &mut dyn FnMut(&gaugedesk_harness::Observation),
+        ) -> io::Result<TurnOutcome> {
+            panic!("an invalidated startup must never execute")
+        }
+
+        fn shutdown(self: Box<Self>) -> io::Result<()> {
+            assert!(
+                self.wb.try_lock().is_ok(),
+                "cleanup holds no Workbench lock"
+            );
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn harness_startup_invalidation_refuses_and_preserves_a_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let wb = Arc::new(Mutex::new(Workbench::with_target(
+            "inst-test",
+            inst,
+            Store::open_in_memory().unwrap(),
+        )));
+        for replace in [false, true] {
+            let chat = "startup-invalidated";
+            let reserved = reserve_turn_harness(&mut wb.lock_unpoisoned(), chat, true);
+            let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let replacement: SharedHarness = Arc::new(Mutex::new(None));
+            let result = initialize_turn_harness(&wb, chat, &reserved, true, || {
+                let removed = wb.lock_unpoisoned().sessions.remove(chat).unwrap();
+                crate::workbench_state::shutdown_shared_harness(removed);
+                if replace {
+                    wb.lock_unpoisoned()
+                        .sessions
+                        .insert(chat.into(), replacement.clone());
+                }
+                Ok(Box::new(StartupShutdownProbe {
+                    wb: wb.clone(),
+                    shutdowns: shutdowns.clone(),
+                }))
+            });
+            assert!(matches!(result, Err(EngineError::Harness(ref reason))
+                if reason.to_string() == "chat harness reservation changed during startup"));
+            assert!(reserved.lock_unpoisoned().is_none());
+            assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+            if replace {
+                assert!(Arc::ptr_eq(
+                    &wb.lock_unpoisoned().sessions[chat],
+                    &replacement
+                ));
+                wb.lock_unpoisoned().sessions.remove(chat);
+            } else {
+                assert!(!wb.lock_unpoisoned().sessions.contains_key(chat));
+            }
+        }
+    }
+
+    #[test]
+    fn harness_startup_failure_releases_only_its_reservation_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let wb = Arc::new(Mutex::new(Workbench::with_target(
+            "inst-test",
+            inst,
+            Store::open_in_memory().unwrap(),
+        )));
+        let chat = "startup-retry";
+        let reserved = reserve_turn_harness(&mut wb.lock_unpoisoned(), chat, true);
+        assert!(initialize_turn_harness(&wb, chat, &reserved, true, || {
+            Err("transport refused startup".into())
+        })
+        .is_err());
+        assert!(!wb.lock_unpoisoned().sessions.contains_key(chat));
+        let retry = reserve_turn_harness(&mut wb.lock_unpoisoned(), chat, true);
+        assert!(!Arc::ptr_eq(&reserved, &retry));
+        initialize_turn_harness(&wb, chat, &retry, true, || {
+            Ok(Box::new(ScriptedHarness::new(vec![])))
+        })
+        .unwrap();
+        initialize_turn_harness(&wb, chat, &retry, true, || {
+            panic!("an initialized slot must reuse its harness")
+        })
+        .unwrap();
+        assert!(retry.lock_unpoisoned().is_some());
+    }
+
     /// The per-chat serialization unit is the **harness**, not the workbench.
     ///
     /// A turn needs exclusive access to one chat's agent for as long as the model
@@ -5143,4 +5787,19 @@ mod tests {
 
         let _ = Arc::new(Mutex::new(wb)); // exercises the SharedWorkbench shape
     }
+}
+
+#[path = "office_task_authority.rs"]
+pub(crate) mod office_authority;
+
+fn task_checkpoint(
+    wb: &SharedWorkbench,
+    id: &str,
+    office: Option<&office_authority::OfficeTaskAuthority>,
+) -> Result<(), EngineError> {
+    stop_checkpoint(id)?;
+    if let Some(office) = office {
+        office.checkpoint(wb)?;
+    }
+    Ok(())
 }

@@ -286,8 +286,8 @@ impl ContentVault {
         }
     }
 
-    /// Preserve the legacy empty-AAD format while retaining its key through
-    /// encryption/decryption. Native publication uses PreparedScopeKey::retain.
+    /// Retain a per-scope key through codec encryption/decryption (legacy or
+    /// context-authenticated format). Native publication uses PreparedScopeKey::retain.
     pub(super) fn with_legacy_key<T>(
         &self,
         scope: &str,

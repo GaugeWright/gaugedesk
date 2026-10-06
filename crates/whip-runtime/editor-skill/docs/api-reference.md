@@ -93,6 +93,13 @@ located blockers. It uses `WHIPPLESCRIPT_BRANCH_STORE`,
 and native runtime configuration. The request supplies no policy or coverage
 assertion. Missing stores refuse; the query creates and repairs no database.
 
+The optional host configuration `WHIPPLESCRIPT_SOURCE_REVIEW_STORE` selects an
+existing immutable review-record database, opened read-only. With it, the query
+loads the original revision and repeats the owning VCS's prefix/content proof.
+A missing or inaccessible configured file refuses without creating it. Without
+an installed review reader, `source/review-record` remains a located blocker
+and `source_verification` is absent. Review verification grants no Home coverage.
+
 A successful exit means the query returned a judgment. Read its `blockers`
 before treating it as actionable. The command runs no checks, files no tracker
 work and advances no ref. Home population authority is currently an explicit
@@ -1719,6 +1726,17 @@ an invocation with `--spend-cap` stops instead of continuing under an
 incomplete total. Its `campaign.spend` event names the failed evaluation and
 the unaccounted runs.
 
+Failed prompt/coerce gauge judges also retain reported use, including a
+completed response whose verdict cannot be read. The gauge remains unscored.
+Their failed-turn spend events identify the gauge; unknown cost stops a
+capped campaign before more proposals are generated.
+
+Both campaign arms use the baseline gauge instruments. For a `judge via
+coerce`, this includes the baseline coerce's prompt and output schema. An edit
+to the grading coerce is recorded as a source change, but cannot improve its
+score merely by changing the evaluator. Candidate workflow execution uses
+the candidate program.
+
 A campaign that crosses its cap **parks**. The record then has a
 `campaign.parked` event, and the report has `"parked": true`. The
 `whip improve --resume <campaign-id>` command continues the campaign under a new
@@ -1742,6 +1760,21 @@ baseline. A configured global context directory or
 `WHIPPLESCRIPT_NO_CONTEXT_FILES` refuses the campaign because it would change
 which instructions the evaluated agent sees. With no `--context-root`, improve
 retains its source-only behavior.
+
+The admitted snapshot is also the boundary for project-instruction discovery:
+evaluations load its root `AGENTS.md`, without walking temporary ancestors.
+Ordinary `whip run` retains hierarchical discovery. A standalone comparison
+must account for that difference; putting a transfer workspace beneath a
+repository `AGENTS.md` adds instructions absent from the campaign snapshot.
+
+For small changes to a large file, the native proposer can return
+`context_patches` with `path`, `find`, and `replace` strings. Each nonempty
+`find` must match exactly once in the admitted baseline file at that point;
+patches to one file run in order. A path cannot have both patches and a full
+replacement in one proposal. The runtime materializes full `context_edits`
+before evaluation and recording, so a patch receives the same snapshot,
+containment, critic, and adoption checks as a replacement. Additions and
+deletions use `context_edits`.
 
 If the workflow uses content-pinned `std.script` capabilities, set
 `WHIPPLESCRIPT_SCRIPT_MANIFEST` for `whip improve` as for `whip run`. Baseline
@@ -1838,6 +1871,20 @@ do not run a native critic turn.
 
 The terminal state is one card of evidence for each candidate. The command
 proposes. The command does not apply.
+
+A failed native proposal stops the campaign and preserves its prior evidence.
+When the provider reports an output token limit, the diagnostic names that
+limit; increase `WHIPPLESCRIPT_COERCE_MAX_TOKENS` or reduce the requested edit
+before a new attempt. Known response-shape failures receive a specific
+diagnostic without exposing returned model text. Reported usage from a failed
+proposal is retained as a `campaign.spend` event with `what` equal to
+`proposer turn (failed)` and is priced when a matching price table exists.
+Failed critic and revision turns likewise record reported usage. Their spend
+events use `shortcut critic turn (failed)`, `scope refinement turn (failed)`,
+or `shortcut generalization turn (failed)`. When the failed turn's cost is
+unknown, `unaccounted: true` records the gap. A campaign with `--spend-cap`
+then stops; an uncapped campaign may continue with an unassessed critic or
+the original candidate.
 
 ### `campaigns` / `campaign`
 

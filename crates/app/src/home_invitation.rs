@@ -251,10 +251,22 @@ async fn create_invitation(
     let authority = body.authority.trim().to_owned();
     let organization = {
         let wb = shared.lock_unpoisoned();
-        if let Err((status, message)) =
-            wb.authorize(net_http::bearer(&headers), Some(Capability::ManageMembers))
-        {
-            return json_error(status, message);
+        // On a desktop the project's owner invites into it; a role in the
+        // computer's directory is not needed (DR-0268 §1, DR-0328 §4).
+        let owner_invites = wb.desktop_account_mode()
+            && net_http::bearer(&headers).is_some()
+            && wb.owns_project(&body.project)
+            && wb.project_owner_refusal(&headers, &body.project).is_none()
+            && wb.pairing_actor(&headers).is_some_and(|actor| {
+                wb.project_owner(&body.project)
+                    == Some(crate::project_owner::ProjectOwner::Account(actor))
+            });
+        if !owner_invites {
+            if let Err((status, message)) =
+                wb.authorize(net_http::bearer(&headers), Some(Capability::ManageMembers))
+            {
+                return json_error(status, message);
+            }
         }
         if !wb.owns_project(&body.project) {
             return json_error(StatusCode::NOT_FOUND, "project is not on this Home");

@@ -26,23 +26,25 @@ fn now_ms() -> i64 {
     i64::try_from(crate::account::session_now_ms()).unwrap_or(i64::MAX)
 }
 
-/// Which held session: the UI's own, or the one relay crossings are served
-/// under. Two slots, so rotating one never revokes the other's token.
+/// Which held session: the UI's own, or the one an account's relay
+/// crossings are served under. One slot per account, so rotating one never
+/// revokes another's token, and any account signed in here may cross
+/// (DR-0328 §6).
 #[derive(Clone, Copy)]
-enum Slot {
+enum Slot<'a> {
     Ui,
-    Relay,
+    Relay(&'a str),
 }
 
-fn slot(guard: &mut crate::Workbench, which: Slot) -> &mut Option<DesktopUiSession> {
+fn slot<'w>(guard: &'w mut crate::Workbench, which: Slot<'_>) -> &'w mut Option<DesktopUiSession> {
     match which {
         Slot::Ui => &mut guard.desktop_ui_session,
-        Slot::Relay => &mut guard.relay_owner_session,
+        Slot::Relay(account) => guard.relay_sessions.entry(account.to_owned()).or_default(),
     }
 }
 
 /// Revoke whatever this process last handed from one slot.
-fn revoke_held(wb: &SharedWorkbench, which: Slot) {
+fn revoke_held(wb: &SharedWorkbench, which: Slot<'_>) {
     let mut guard = wb.lock_unpoisoned();
     if let Some(held) = slot(&mut guard, which).take() {
         guard.revoke_account_session(&held.token);
@@ -64,10 +66,10 @@ pub fn home_session(wb: &SharedWorkbench) -> Option<String> {
 /// Without that account's retained sign-in or Home membership it is `None`,
 /// and the crossing is refused. Signing that account out ends its remote access.
 pub(crate) fn relay_session(wb: &SharedWorkbench, account: &str) -> Option<String> {
-    session_for(wb, Slot::Relay, Some(account))
+    session_for(wb, Slot::Relay(account), Some(account))
 }
 
-fn session_for(wb: &SharedWorkbench, which: Slot, account: Option<&str>) -> Option<String> {
+fn session_for(wb: &SharedWorkbench, which: Slot<'_>, account: Option<&str>) -> Option<String> {
     // Read before the guard: this locks the workbench itself.
     let hub = match account {
         Some(person) => crate::account_signin::hub_standing_for(wb, person),
@@ -81,9 +83,16 @@ fn session_for(wb: &SharedWorkbench, which: Slot, account: Option<&str>) -> Opti
         revoke_held(wb, which);
         return None;
     };
-    let standing = Org::rebuild(wb.lock_unpoisoned().store_ref())
-        .ok()
-        .is_some_and(|org| org.role_of(&hub.person).is_some());
+    // Any account signed in on this computer works here as itself; a role in
+    // its directory is not standing (DR-0268, DR-0328). What it reaches is
+    // decided per project. Off a desktop a role is still required.
+    let standing = {
+        let guard = wb.lock_unpoisoned();
+        guard.desktop_account_mode()
+            || Org::rebuild(guard.store_ref())
+                .ok()
+                .is_some_and(|org| org.role_of(&hub.person).is_some())
+    };
     if !standing {
         revoke_held(wb, which);
         return None;
@@ -125,7 +134,15 @@ fn session_for(wb: &SharedWorkbench, which: Slot, account: Option<&str>) -> Opti
 /// read: the UI's, and the one remote crossings were being served under.
 pub fn revoke(wb: &SharedWorkbench) {
     revoke_held(wb, Slot::Ui);
-    revoke_held(wb, Slot::Relay);
+    let accounts: Vec<String> = wb
+        .lock_unpoisoned()
+        .relay_sessions
+        .keys()
+        .cloned()
+        .collect();
+    for account in accounts {
+        revoke_held(wb, Slot::Relay(&account));
+    }
 }
 
 #[cfg(test)]

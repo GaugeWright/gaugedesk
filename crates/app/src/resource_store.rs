@@ -41,7 +41,8 @@ use gaugedesk_core::resource_access::{AccessCommand, AccessPhase, AccessState};
 use gaugedesk_core::resource_export::{ExportCommand, ExportPhase, ExportState};
 use gaugedesk_core::review::{ReviewCommand, ReviewPhase, ReviewState};
 use gaugedesk_core::taint::EngagementReads;
-use gaugedesk_store::{AdmitError, Store};
+use gaugedesk_core::Lifecycle;
+use gaugedesk_store::{command_dispatch::DispatchReadBasis, AdmitError, CommandRecordFact, Store};
 use serde::Deserialize;
 
 use crate::boundary_keeper::SealedKeyReleaseService;
@@ -297,17 +298,8 @@ pub fn mint_context_with(
     commit: &str,
     attributes: ResourceAttributes,
 ) -> Result<ResourceRecord, AdmitError> {
-    let id = context_id(path);
-    let res = Resource::input(id.clone(), ResourceKind::context(), Authority::from(owner));
-    let rec = ResourceRecord::new(
-        res,
-        ContentLocator::Workspace {
-            path: path.to_string(),
-            commit: commit.to_string(),
-        },
-        |_| Authority::from(owner),
-    )
-    .with_attributes(attributes);
+    let rec = new_context_record(owner, path, commit, attributes);
+    let id = rec.resource.id.clone();
     begin_context_import(store, engagement, id.as_str())?;
     put(store, engagement, &rec)?;
 
@@ -321,6 +313,117 @@ pub fn mint_context_with(
         store.admit::<AccessState>(&scope, AccessCommand::Approve(Authority::from(owner)))?;
     }
     Ok(rec)
+}
+
+fn new_context_record(
+    owner: &str,
+    path: &str,
+    commit: &str,
+    attributes: ResourceAttributes,
+) -> ResourceRecord {
+    let id = context_id(path);
+    let res = Resource::input(id.clone(), ResourceKind::context(), Authority::from(owner));
+    ResourceRecord::new(
+        res,
+        ContentLocator::Workspace {
+            path: path.to_string(),
+            commit: commit.to_string(),
+        },
+        |_| Authority::from(owner),
+    )
+    .with_attributes(attributes)
+}
+
+struct StreamUploadReceipt<'a> {
+    command_id: &'a str,
+    scope: &'a str,
+    key: &'a str,
+    snapshot: &'a str,
+    office: Option<&'a crate::engine::office_authority::OfficeTaskAuthority>,
+}
+
+/// Prepare the existing resource/access reducer semantics against exact heads,
+/// then publish metadata, the complete binding, access events and the original
+/// claimed command receipt in one transaction. This is the product publication
+/// fence; it does not authorize the preceding native file or history effects.
+fn prepare_streamed_context(
+    store: &Store,
+    chat: &str,
+    rec: &ResourceRecord,
+    files: BTreeMap<String, String>,
+    authority_basis: Option<DispatchReadBasis>,
+) -> Result<(Vec<CommandRecordFact>, DispatchReadBasis), AdmitError> {
+    let access = access_scope(chat, &rec.resource.id);
+    let (facts, basis) = store.read_for_dispatch(&[chat, &access], |reader| {
+        reader.retained_events(chat)?;
+        reader.retained_events(&access)?;
+        let revision = current_context_import(reader, chat, rec.resource.id.as_str())?
+            .map_or(1, |previous| previous.revision.saturating_add(1));
+        let import = ContextImport {
+            resource_id: rec.resource.id.as_str().into(),
+            revision,
+            complete: true,
+            files,
+        };
+        let mut facts = vec![
+            CommandRecordFact {
+                scope_id: chat.into(),
+                kind: RESOURCE_KIND.into(),
+                payload: serde_json::to_string(rec)?,
+            },
+            CommandRecordFact {
+                scope_id: chat.into(),
+                kind: CONTEXT_IMPORT_KIND.into(),
+                payload: serde_json::to_string(&import)?,
+            },
+        ];
+        let mut state = reader.fold::<AccessState>(&access)?;
+        if state.phase == AccessPhase::Init {
+            let owner = rec.resource.owner.clone();
+            for command in [
+                AccessCommand::RequestAccess {
+                    required: BTreeSet::from([owner.clone()]),
+                },
+                AccessCommand::Approve(owner),
+            ] {
+                for event in AccessState::decide(&state, command).map_err(AdmitError::Rejected)? {
+                    facts.push(CommandRecordFact {
+                        scope_id: access.clone(),
+                        kind: AccessState::KIND.into(),
+                        payload: serde_json::to_string(&event)?,
+                    });
+                    state = AccessState::evolve(&state, event);
+                }
+            }
+        }
+        Ok(facts)
+    })?;
+    let basis = match authority_basis {
+        Some(authority) => authority.combine(basis)?,
+        None => basis,
+    };
+    Ok((facts, basis))
+}
+
+fn publish_streamed_context(
+    store: &mut Store,
+    chat: &str,
+    rec: &ResourceRecord,
+    files: BTreeMap<String, String>,
+    receipt: &StreamUploadReceipt<'_>,
+    authority_basis: Option<DispatchReadBasis>,
+) -> Result<(), AdmitError> {
+    let (facts, basis) = prepare_streamed_context(store, chat, rec, files, authority_basis)?;
+    store.with_dispatch_record_admission(&basis, |writer| {
+        writer.commit_claimed(
+            receipt.command_id,
+            receipt.scope,
+            receipt.key,
+            receipt.snapshot,
+            &facts,
+        )
+    })??;
+    Ok(())
 }
 
 /// The current access phase of a resource, folded from its access scope.
@@ -433,6 +536,114 @@ pub fn record_reads(
         store.append_record(engagement, READ_KIND, id.as_str())?;
     }
     Ok(())
+}
+
+/// Prepare result records from one fenced product snapshot. Historical reads
+/// remain dependencies after revocation or tombstoning; preparation grants no
+/// resource access and performs no publication. The original result writer
+/// commits these facts together with typed completion and its task receipt.
+pub(crate) struct PreparedOfficeOutput {
+    scope: String,
+    facts: Vec<CommandRecordFact>,
+    output: ResourceRecord,
+    pub(crate) reads: Vec<ResourceId>,
+    pub(crate) reads_after: Vec<String>,
+}
+
+impl PreparedOfficeOutput {
+    pub(crate) fn facts_at(&self, cut: &str) -> Result<Vec<CommandRecordFact>, AdmitError> {
+        let mut output = self.output.clone();
+        output.locator = ContentLocator::Workspace {
+            path: String::new(),
+            commit: cut.into(),
+        };
+        let mut facts = self.facts.clone();
+        facts.push(CommandRecordFact {
+            scope_id: self.scope.clone(),
+            kind: RESOURCE_KIND.into(),
+            payload: serde_json::to_string(&output)?,
+        });
+        Ok(facts)
+    }
+}
+
+pub(crate) fn prepare_office_output(
+    store: &Store,
+    engagement: &str,
+    owner: &str,
+    signature: &[gaugedesk_harness::OutputFieldFlow],
+) -> Result<PreparedOfficeOutput, AdmitError> {
+    let records = list(store, engagement)?;
+    let contexts: BTreeSet<_> = records
+        .iter()
+        .filter(|record| record.resource.kind == ResourceKind::context())
+        .map(|record| record.resource.id.clone())
+        .collect();
+    let mut current = BTreeSet::new();
+    if signature.is_empty() {
+        current.extend(contexts.iter().cloned());
+    }
+    for handle in signature.iter().flat_map(|field| &field.read_handles) {
+        match handle.as_str() {
+            "project" => current.extend(contexts.iter().cloned()),
+            "command" | "human" | "turn_images" => {}
+            handle if handle.starts_with("resource:") => {
+                current.insert(ResourceId::new(handle.trim_start_matches("resource:")));
+            }
+            handle => {
+                current.extend(contexts.iter().cloned());
+                // Preserve an unresolved dependency as well as known context.
+                current.insert(ResourceId::new(handle));
+            }
+        }
+    }
+    let mut reads = engagement_reads(store, engagement)?;
+    let mut facts = Vec::new();
+    for id in &current {
+        reads.read(id.as_str());
+        facts.push(CommandRecordFact {
+            scope_id: engagement.into(),
+            kind: READ_KIND.into(),
+            payload: id.as_str().into(),
+        });
+    }
+    let owners: BTreeMap<_, _> = records
+        .into_iter()
+        .map(|record| {
+            (
+                record.resource.id.as_str().to_owned(),
+                record.resource.owner,
+            )
+        })
+        .collect();
+    let stakeholders = reads
+        .taint(|id| {
+            owners
+                .get(id)
+                .map(|owner| owner.as_str().to_owned())
+                .unwrap_or_else(|| "<unresolved>".into())
+        })
+        .into_iter()
+        .map(Authority::from)
+        .collect();
+    let provenance = reads.items().iter().cloned().map(ResourceId::new).collect();
+    let record = ResourceRecord {
+        resource: Resource::derived(output_id(engagement), Authority::from(owner), provenance),
+        stakeholders,
+        locator: ContentLocator::Workspace {
+            path: String::new(),
+            commit: String::new(),
+        },
+        tombstoned: false,
+        attributes: ResourceAttributes::default(),
+    };
+    Ok(PreparedOfficeOutput {
+        scope: engagement.into(),
+        facts,
+        output: record,
+        reads: current.into_iter().collect(),
+        reads_after: reads.items().iter().cloned().collect(),
+    })
 }
 
 /// The engagement's accumulated read-set, folded into the verified
@@ -1038,8 +1249,25 @@ pub(crate) async fn post_context_upload(
     Path(id): Path<String>,
     headers: HeaderMap,
     actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
+    context: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
+    intent: Option<axum::extract::Extension<crate::command_idempotency::ClaimedHttpCommand>>,
     Json(body): Json<ContextUploadBody>,
 ) -> impl IntoResponse {
+    let client = crate::client_admission::ClientBuild::from_headers(&headers);
+    let office = match crate::engine::office_authority::OfficeTaskAuthority::for_turn(
+        &wb,
+        &id,
+        context.as_ref().map(|context| &context.0),
+        Some(&client),
+        actor.as_ref().map(|actor| &actor.0 .0),
+        net_http::bearer(&headers),
+    ) {
+        Ok(office) => office,
+        Err(_) => return office_upload_refused(),
+    };
+    if office.is_some() && intent.is_none() {
+        return office_upload_refused();
+    }
     if body.files.is_empty() {
         return (StatusCode::BAD_REQUEST, "no files uploaded").into_response();
     }
@@ -1062,6 +1290,17 @@ pub(crate) async fn post_context_upload(
                 .into_response();
         }
         files.push((file.name, bytes));
+    }
+    if let Some(office) = office {
+        return admit_office_buffered_upload(
+            &wb,
+            &id,
+            &files,
+            body.target_id.as_deref(),
+            context_attributes(body.classification.as_deref(), body.region.as_deref()),
+            &intent.expect("office command checked above").0,
+            &office,
+        );
     }
     let mut wb = wb.lock_unpoisoned();
     let verified_owner = if crate::method_access::account_backed_chat(&wb, &id, &headers) {
@@ -1114,6 +1353,161 @@ pub(crate) async fn post_context_upload(
         Json(serde_json::json!({ "ingested": n, "resource": handle })),
     )
         .into_response()
+}
+
+/// Complete buffered office admission under the original product writer.
+/// Each native cut records only its uploaded file and the same original HTTP
+/// intent. The final cut's complete binding stays retained through publication.
+fn admit_office_buffered_upload(
+    shared: &SharedWorkbench,
+    id: &str,
+    files: &[(String, Vec<u8>)],
+    target_id: Option<&str>,
+    attributes: ResourceAttributes,
+    intent: &crate::command_idempotency::ClaimedHttpCommand,
+    authority: &crate::engine::office_authority::OfficeTaskAuthority,
+) -> axum::response::Response {
+    use sha2::Digest;
+    use std::io::Write;
+    let mut wb = shared.lock_unpoisoned();
+    let admitted = (|| -> Result<ResourceRecord, ()> {
+        if wb.chat_project_moving(id) {
+            return Err(());
+        }
+        let basis = authority.prepare_basis(&wb).map_err(|_| ())?;
+        let prefix = wb
+            .engagement_context_target_root(id, target_id)
+            .map_err(|_| ())?;
+        let engagement = wb.engagements.get(id).ok_or(())?;
+        let actor = format!("human:{}", authority.actor());
+        let mut prepared = Vec::with_capacity(files.len());
+        let mut binding = BTreeMap::new();
+        let mut basenames = BTreeSet::new();
+        let mut final_cut = None;
+        for (name, bytes) in files {
+            let base = std::path::Path::new(name)
+                .file_name()
+                .ok_or(())?
+                .to_str()
+                .ok_or(())?;
+            // A complete binding cannot silently collapse two files onto one
+            // native destination, including ordinary case-insensitive hosts.
+            if !basenames.insert(base.to_lowercase()) {
+                return Err(());
+            }
+            let relative = prefix
+                .as_ref()
+                .map_or_else(|| base.to_string(), |prefix| format!("{prefix}/{base}"));
+            let target = engagement
+                .streamed_upload_target(&relative)
+                .map_err(|_| ())?;
+            let digest = hex::encode(sha2::Sha256::digest(bytes));
+            let cut = target
+                .planned_cut(&digest, bytes.len() as u64, &actor, intent.command_id())
+                .map_err(|_| ())?;
+            binding.insert(relative, digest[..32].to_string());
+            final_cut = Some(cut);
+            prepared.push((target, digest, bytes));
+        }
+        let cut = final_cut.ok_or(())?;
+        let record = new_context_record(
+            authority.actor(),
+            &format!("uploaded: {} file(s)", files.len()),
+            &cut,
+            attributes,
+        );
+        let (facts, basis) =
+            prepare_streamed_context(wb.store_ref(), id, &record, binding.clone(), Some(basis))
+                .map_err(|_| ())?;
+        let staging = wb.staging_uploads_dir();
+        wb.store_mut()
+            .with_dispatch_record_admission(&basis, |writer| {
+                let native = writer
+                    .with_native_check(|check| {
+                        let mut original = || {
+                            check
+                                .check_current()
+                                .map_err(|_| gaugedesk_workspace::WorkspaceError {
+                                    message: "original upload authority ended".into(),
+                                })
+                        };
+                        original()?;
+                        std::fs::create_dir_all(&staging).map_err(|_| {
+                            gaugedesk_workspace::WorkspaceError {
+                                message: "office upload staging unavailable".into(),
+                            }
+                        })?;
+                        let mut last = None;
+                        for (target, digest, bytes) in prepared {
+                            original()?;
+                            let mut staged = tempfile::Builder::new()
+                                .prefix("buffered-")
+                                .suffix(".part")
+                                .tempfile_in(&staging)
+                                .map_err(|_| gaugedesk_workspace::WorkspaceError {
+                                    message: "office upload staging unavailable".into(),
+                                })?;
+                            for window in bytes.chunks(64 * 1024) {
+                                original()?;
+                                staged.write_all(window).map_err(|_| {
+                                    gaugedesk_workspace::WorkspaceError {
+                                        message: "office upload staging failed".into(),
+                                    }
+                                })?;
+                            }
+                            staged.as_file().sync_all().map_err(|_| {
+                                gaugedesk_workspace::WorkspaceError {
+                                    message: "office upload staging failed".into(),
+                                }
+                            })?;
+                            original()?;
+                            // Close before native rename so Windows can move the file.
+                            // TempPath owns cleanup until placement consumes this path.
+                            let staged = staged.into_temp_path();
+                            target.place_guarded(&staged, &mut original)?;
+                            last = Some(target.import_placed_file_guarded(
+                                &digest,
+                                bytes.len() as u64,
+                                &actor,
+                                intent.command_id(),
+                                &mut original,
+                            )?);
+                        }
+                        last.ok_or_else(|| gaugedesk_workspace::WorkspaceError {
+                            message: "office upload result unavailable".into(),
+                        })
+                    })
+                    .map_err(|_| ())?
+                    .map_err(|_| ())?;
+                if native.cut() != cut {
+                    return Err(());
+                }
+                native
+                    .publish_retained_files(&binding, || {
+                        writer
+                            .commit_claimed(
+                                intent.command_id(),
+                                intent.scope(),
+                                intent.key(),
+                                intent.snapshot(),
+                                &facts,
+                            )
+                            .map_err(|_| {
+                                whipplescript_store::StoreError::Conflict(
+                                    "original upload publication refused".into(),
+                                )
+                            })
+                    })
+                    .map_err(|_| ())?;
+                Ok(())
+            })
+            .map_err(|_| ())??;
+        Ok(record)
+    })();
+    match admitted {
+        Ok(record) => finish_office_upload_response(&mut wb, id, &record, authority, files.len()),
+        Err(()) => office_upload_refused(),
+    }
 }
 
 /// The largest single streamed upload.
@@ -1224,6 +1618,86 @@ fn sweep_staged_uploads(dir: &std::path::Path) {
     }
 }
 
+// Original office transfer authority never becomes serialized resume data.
+// Loss of this process-local proof refuses an existing prefix; a new request
+// or verified session cannot manufacture it from the filename or caller hash.
+struct OfficeUploadStanding {
+    authority: std::sync::Arc<crate::engine::office_authority::OfficeTaskAuthority>,
+    name: String,
+    target: Option<String>,
+    classification: Option<String>,
+    region: Option<String>,
+    created: std::time::Instant,
+}
+static OFFICE_UPLOADS: std::sync::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, std::sync::Arc<OfficeUploadStanding>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn original_office_upload(
+    wb: &SharedWorkbench,
+    path: &std::path::Path,
+    query: &StreamUploadQuery,
+    current: Option<crate::engine::office_authority::OfficeTaskAuthority>,
+    create: bool,
+) -> Result<Option<std::sync::Arc<crate::engine::office_authority::OfficeTaskAuthority>>, ()> {
+    let existing = {
+        let mut uploads = OFFICE_UPLOADS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        uploads.retain(|_, standing| standing.created.elapsed() < STAGED_UPLOAD_TTL);
+        uploads.get(path).cloned()
+    };
+    let Some(current) = current else {
+        return if existing.is_some() {
+            Err(())
+        } else {
+            Ok(None)
+        };
+    };
+    if let Some(existing) = existing {
+        if !existing.authority.same_parent(&current)
+            || existing.name != query.name
+            || existing.target != query.target_id
+            || existing.classification != query.classification
+            || existing.region != query.region
+            || existing.authority.checkpoint(wb).is_err()
+            || current.checkpoint(wb).is_err()
+        {
+            return Err(());
+        }
+        return Ok(Some(existing.authority.clone()));
+    }
+    // Even an empty file is an old transfer, not proof that a new authority
+    // may replace its parent. Offset reads never create a resume grant.
+    if path.exists() {
+        return Err(());
+    }
+    let authority = std::sync::Arc::new(current);
+    if create {
+        let standing = std::sync::Arc::new(OfficeUploadStanding {
+            authority: authority.clone(),
+            name: query.name.clone(),
+            target: query.target_id.clone(),
+            classification: query.classification.clone(),
+            region: query.region.clone(),
+            created: std::time::Instant::now(),
+        });
+        OFFICE_UPLOADS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(path.to_owned(), standing);
+    }
+    Ok(Some(authority))
+}
+
+#[cfg(test)]
+pub(crate) fn forget_office_upload_for_test(path: &std::path::Path) {
+    OFFICE_UPLOADS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(path);
+}
+
 /// The uploads currently receiving bytes.
 ///
 /// One upload, one writer. Two attempts that overlap — a client that retried
@@ -1328,6 +1802,7 @@ pub(crate) async fn post_context_stream(
     Query(query): Query<StreamUploadQuery>,
     headers: HeaderMap,
     actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
+    context: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
     body: axum::body::Body,
 ) -> impl IntoResponse {
     use futures::StreamExt as _;
@@ -1337,7 +1812,26 @@ pub(crate) async fn post_context_stream(
         Ok(key) => key,
         Err(response) => return response,
     };
-    let owner = {
+    // Body reception may outlive the request middleware. Preserve this
+    // request's exact observation; a later source check cannot renew it.
+    let client = crate::client_admission::ClientBuild::from_headers(&headers);
+    let office = match crate::engine::office_authority::OfficeTaskAuthority::for_turn(
+        &wb,
+        &id,
+        context.as_ref().map(|context| &context.0),
+        Some(&client),
+        actor.as_ref().map(|actor| &actor.0 .0),
+        net_http::bearer(&headers),
+    ) {
+        Ok(office) => office,
+        Err(_) => return office_upload_refused(),
+    };
+    let owner = if office.is_some() {
+        let Some(context) = context.as_ref() else {
+            return office_upload_refused();
+        };
+        context.0.actor().as_str().to_owned()
+    } else {
         let guard = wb.lock_unpoisoned();
         if crate::method_access::account_backed_chat(&guard, &id, &headers) {
             match crate::method_access::chat_reader(&guard, &id, &headers) {
@@ -1374,18 +1868,32 @@ pub(crate) async fn post_context_stream(
             .into_response();
     };
 
+    // Receiving excludes a concurrent replacement of this original standing.
+    let office = match original_office_upload(&wb, &path, &query, office, true) {
+        Ok(office) => office,
+        Err(()) => return office_upload_refused(),
+    };
+
     // The claim is held, so the length cannot move under the answer.
     let held = staged_upload_length(&path);
     let offset = query.offset.unwrap_or(0);
     if offset != held {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "offset-does-not-match-what-is-held",
-                "received": held,
-            })),
-        )
-            .into_response();
+        let respond = || {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "offset-does-not-match-what-is-held",
+                    "received": held,
+                })),
+            )
+                .into_response()
+        };
+        return match &office {
+            Some(office) => office
+                .with_current(&wb, respond)
+                .unwrap_or_else(|_| office_upload_refused()),
+            None => respond(),
+        };
     }
 
     let file = if offset == 0 {
@@ -1412,7 +1920,30 @@ pub(crate) async fn post_context_stream(
     let mut writer = tokio::io::BufWriter::new(file);
     let mut written: u64 = offset;
     let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
+    let mut checks = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        let next = tokio::select! {
+            next = stream.next() => next,
+            _ = checks.tick(), if office.is_some() => {
+                if office.as_ref().is_some_and(|authority| authority.checkpoint(&wb).is_err()) {
+                    // Unflushed bytes have never been published. End reception
+                    // before removing the partial, including on Windows.
+                    drop(writer);
+                    let _ = std::fs::remove_file(&path);
+                    return office_upload_refused();
+                }
+                continue;
+            }
+        };
+        let Some(chunk) = next else { break };
+        if office
+            .as_ref()
+            .is_some_and(|authority| authority.checkpoint(&wb).is_err())
+        {
+            drop(writer);
+            let _ = std::fs::remove_file(&path);
+            return office_upload_refused();
+        }
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
@@ -1451,6 +1982,14 @@ pub(crate) async fn post_context_stream(
                 .into_response();
         }
     }
+    if office
+        .as_ref()
+        .is_some_and(|authority| authority.checkpoint(&wb).is_err())
+    {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        return office_upload_refused();
+    }
     if let Err(error) = writer.flush().await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1478,12 +2017,34 @@ pub(crate) async fn post_context_stream(
         }
     };
 
+    // Recheck the original observation after asynchronous local hashing,
+    // before preparing a receipt. Native publication needs its own fence.
+    if office
+        .as_ref()
+        .is_some_and(|authority| authority.checkpoint(&wb).is_err())
+    {
+        drop(writer);
+        let _ = std::fs::remove_file(&path);
+        return office_upload_refused();
+    }
+
     let method = axum::http::Method::POST;
     let route = format!("/chats/{id}/context/stream");
+    // Transport offsets do not change the intended upload. All resource
+    // meaning does: one caller key cannot redirect identical bytes to another
+    // target or silently change their declared classification.
+    let meaning = serde_json::json!({
+        "route": route,
+        "name": query.name,
+        "target": query.target_id,
+        "classification": query.classification,
+        "region": query.region,
+    })
+    .to_string();
     let snapshot = crate::command_idempotency::command_snapshot(
         &method,
         &route,
-        &route,
+        &meaning,
         &caller,
         &body_sha256,
     );
@@ -1491,11 +2052,15 @@ pub(crate) async fn post_context_stream(
         crate::command_idempotency::command_identity(&method, &route, &caller, &key);
 
     let outcome = {
-        let mut guard = wb.lock_unpoisoned();
-        match guard
-            .store_mut()
-            .claim_command(&command_id, &scope, &key, &snapshot)
-        {
+        let claimed = match &office {
+            Some(office) => office.claim_upload_command(&wb, &command_id, &scope, &key, &snapshot),
+            None => {
+                wb.lock_unpoisoned()
+                    .store_mut()
+                    .claim_command(&command_id, &scope, &key, &snapshot)
+            }
+        };
+        match claimed {
             Ok((receipt, claimed)) => {
                 if receipt.snapshot_json != snapshot {
                     Err((StatusCode::CONFLICT, "key-reused-with-different-input"))
@@ -1506,7 +2071,11 @@ pub(crate) async fn post_context_stream(
                 }
             }
             Err(error) => {
+                drop(writer);
                 let _ = std::fs::remove_file(&path);
+                if office.is_some() {
+                    return office_upload_refused();
+                }
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("command receipt: {error:?}"),
@@ -1521,7 +2090,23 @@ pub(crate) async fn post_context_stream(
         return (status, message).into_response();
     }
 
-    let response = admit_streamed_upload(&wb, &id, &query, &path, &owner);
+    let receipt = StreamUploadReceipt {
+        command_id: &command_id,
+        scope: &scope,
+        key: &key,
+        snapshot: &snapshot,
+        office: office.as_deref(),
+    };
+    let response = admit_streamed_upload(
+        &wb,
+        &id,
+        &query,
+        &path,
+        &owner,
+        &body_sha256,
+        written,
+        &receipt,
+    );
     let status = if response.status().is_success() {
         "applied"
     } else if response.status().is_client_error() {
@@ -1529,11 +2114,17 @@ pub(crate) async fn post_context_stream(
     } else {
         "expired"
     };
-    let _ = wb
-        .lock_unpoisoned()
-        .store_mut()
-        .set_command_status(&command_id, status);
+    if !response.status().is_success() {
+        let _ = wb
+            .lock_unpoisoned()
+            .store_mut()
+            .set_unreceipted_command_failure(&command_id, status);
+    }
     response
+}
+
+fn office_upload_refused() -> axum::response::Response {
+    (StatusCode::FORBIDDEN, "office upload authority ended").into_response()
 }
 
 /// `GET /chats/:id/context/stream?name=…` — how much of this upload the server
@@ -1553,43 +2144,78 @@ pub(crate) async fn get_context_stream(
     Path(id): Path<String>,
     Query(query): Query<StreamUploadQuery>,
     headers: HeaderMap,
+    actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
+    context: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
 ) -> impl IntoResponse {
     let key = match crate::command_idempotency::caller_idempotency_key(&headers) {
         Ok(key) => key,
         Err(response) => return response,
     };
+    let client = crate::client_admission::ClientBuild::from_headers(&headers);
+    let office = match crate::engine::office_authority::OfficeTaskAuthority::for_turn(
+        &wb,
+        &id,
+        context.as_ref().map(|context| &context.0),
+        Some(&client),
+        actor.as_ref().map(|actor| &actor.0 .0),
+        net_http::bearer(&headers),
+    ) {
+        Ok(office) => office,
+        Err(_) => return office_upload_refused(),
+    };
     let caller = crate::command_idempotency::caller_hash(&headers);
     let staging_dir = wb.lock_unpoisoned().staging_uploads_dir();
     let path = staged_upload_path(&staging_dir, &id, &caller, &key, &query.name);
+    let office = match original_office_upload(&wb, &path, &query, office, false) {
+        Ok(office) => office,
+        Err(()) => return office_upload_refused(),
+    };
     // A transfer that is mid-flight has a length that is already stale by the
     // time it is read, and resuming from it would write a hole. Say so instead.
     //
     // One can still start between this answer and the client acting on it, and
     // that is fine: the upload's own offset check is what actually refuses a
     // stale resumption, and it answers with the real number.
-    if Receiving::in_flight(&path) {
-        return (
-            StatusCode::CONFLICT,
-            "this upload is already receiving bytes",
+    let respond = || {
+        if Receiving::in_flight(&path) {
+            return (
+                StatusCode::CONFLICT,
+                "this upload is already receiving bytes",
+            )
+                .into_response();
+        }
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "received": staged_upload_length(&path) })),
         )
-            .into_response();
+            .into_response()
+    };
+    match office {
+        Some(authority) => authority
+            .with_current(&wb, respond)
+            .unwrap_or_else(|_| office_upload_refused()),
+        None => respond(),
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "received": staged_upload_length(&path) })),
-    )
-        .into_response()
 }
 
 /// Everything after the bytes land, which is the buffered route's path exactly.
+#[allow(clippy::too_many_arguments)] // Exact completed upload digest and length accompany custody.
 fn admit_streamed_upload(
     wb: &SharedWorkbench,
     id: &str,
     query: &StreamUploadQuery,
     source: &std::path::Path,
     owner: &str,
+    sha256: &str,
+    byte_len: u64,
+    receipt: &StreamUploadReceipt<'_>,
 ) -> axum::response::Response {
     let mut wb = wb.lock_unpoisoned();
+    if let Some(authority) = receipt.office {
+        return admit_office_streamed_upload(
+            &mut wb, id, query, source, owner, sha256, byte_len, receipt, authority,
+        );
+    }
     let (n, commit) = match wb.ingest_streamed_file_into_engagement(
         id,
         &query.name,
@@ -1606,22 +2232,53 @@ fn admit_streamed_upload(
             return (StatusCode::BAD_REQUEST, e).into_response();
         }
     };
+    let prefix = match wb.engagement_context_target_root(id, query.target_id.as_deref()) {
+        Ok(prefix) => prefix,
+        Err(_) => return (StatusCode::BAD_REQUEST, "upload target is unavailable").into_response(),
+    };
+    let Some(base) = std::path::Path::new(&query.name).file_name() else {
+        return (StatusCode::BAD_REQUEST, "upload name is unavailable").into_response();
+    };
+    let base = base.to_string_lossy();
+    let relative = prefix.map_or_else(|| base.to_string(), |prefix| format!("{prefix}/{base}"));
+    let hash = match wb.engagements.get(id).and_then(|engagement| {
+        engagement
+            .recorded_streamed_file_hash(&relative, &commit, sha256, byte_len)
+            .ok()
+            .flatten()
+    }) {
+        Some(hash) => hash,
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                "uploaded bytes have no exact committed witness",
+            )
+                .into_response()
+        }
+    };
     let attributes = context_attributes(query.classification.as_deref(), query.region.as_deref());
     let label = format!("uploaded: {n} file(s)");
-    let rec = match wb.mint_resource_context(id, owner, &label, &commit, attributes) {
-        Ok(r) => r,
-        Err(e) => return err_response(e),
-    };
-    let submitted = std::fs::metadata(source)
-        .ok()
-        .filter(|metadata| metadata.len() <= 8 * 1024 * 1024)
-        .and_then(|_| std::fs::read(source).ok())
-        .map(|bytes| vec![(query.name.clone(), bytes)])
-        .unwrap_or_else(|| vec![(query.name.clone(), Vec::new())]);
-    if let Err(error) =
-        wb.bind_uploaded_context(id, &rec.resource.id, &submitted, query.target_id.as_deref())
+    let rec = new_context_record(owner, &label, &commit, attributes);
+    let basis = match receipt
+        .office
+        .map(|authority| authority.prepare_basis(&wb))
+        .transpose()
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+        Ok(basis) => basis,
+        Err(_) => return office_upload_refused(),
+    };
+    if let Err(error) = publish_streamed_context(
+        wb.store_mut(),
+        id,
+        &rec,
+        BTreeMap::from([(relative, hash)]),
+        receipt,
+        basis,
+    ) {
+        if receipt.office.is_some() {
+            return office_upload_refused();
+        }
+        return err_response(error);
     }
     let handle = rec.resource.id.as_str().to_string();
     wb.publish(
@@ -1636,6 +2293,153 @@ fn admit_streamed_upload(
         Json(serde_json::json!({ "ingested": n, "resource": handle })),
     )
         .into_response()
+}
+
+/// The original staff authority fences every native effect and the final
+/// resource/receipt commit. Workbench resolution finishes before the product
+/// writer is held; native checks never reacquire either lock.
+#[allow(clippy::too_many_arguments)]
+fn admit_office_streamed_upload(
+    wb: &mut Workbench,
+    id: &str,
+    query: &StreamUploadQuery,
+    source: &std::path::Path,
+    owner: &str,
+    sha256: &str,
+    byte_len: u64,
+    receipt: &StreamUploadReceipt<'_>,
+    authority: &crate::engine::office_authority::OfficeTaskAuthority,
+) -> axum::response::Response {
+    let admission = (|| -> Result<ResourceRecord, ()> {
+        if owner != authority.actor() || wb.chat_project_moving(id) {
+            return Err(());
+        }
+        let basis = authority.prepare_basis(wb).map_err(|_| ())?;
+        let prefix = wb
+            .engagement_context_target_root(id, query.target_id.as_deref())
+            .map_err(|_| ())?;
+        let base = std::path::Path::new(&query.name)
+            .file_name()
+            .ok_or(())?
+            .to_string_lossy();
+        let relative = prefix.map_or_else(|| base.to_string(), |prefix| format!("{prefix}/{base}"));
+        let target = wb
+            .engagements
+            .get(id)
+            .ok_or(())?
+            .streamed_upload_target(&relative)
+            .map_err(|_| ())?;
+        let actor = format!("human:{}", authority.actor());
+        let cut = target
+            .planned_cut(sha256, byte_len, &actor, receipt.command_id)
+            .map_err(|_| ())?;
+        let record = new_context_record(
+            owner,
+            "uploaded: 1 file(s)",
+            &cut,
+            context_attributes(query.classification.as_deref(), query.region.as_deref()),
+        );
+        let (facts, basis) = prepare_streamed_context(
+            wb.store_ref(),
+            id,
+            &record,
+            BTreeMap::from([(relative, sha256[..32].into())]),
+            Some(basis),
+        )
+        .map_err(|_| ())?;
+        wb.store_mut()
+            .with_dispatch_record_admission(&basis, |writer| {
+                let native = writer
+                    .with_native_check(|check| {
+                        let mut original = || {
+                            check
+                                .check_current()
+                                .map_err(|_| gaugedesk_workspace::WorkspaceError {
+                                    message: "original upload authority ended".into(),
+                                })
+                        };
+                        target.place_guarded(source, &mut original)?;
+                        target.import_placed_file_guarded(
+                            sha256,
+                            byte_len,
+                            &actor,
+                            receipt.command_id,
+                            &mut original,
+                        )
+                    })
+                    .map_err(|_| ())?
+                    .map_err(|_| ())?;
+                if native.cut() != cut || native.hash() != &sha256[..32] {
+                    return Err(());
+                }
+                // Keep the actual content owner's writer exclusion through this
+                // exact original HTTP receipt, metadata and access commit.
+                native
+                    .publish_retained(|| {
+                        writer
+                            .commit_claimed(
+                                receipt.command_id,
+                                receipt.scope,
+                                receipt.key,
+                                receipt.snapshot,
+                                &facts,
+                            )
+                            .map_err(|_| {
+                                whipplescript_store::StoreError::Conflict(
+                                    "original upload publication refused".into(),
+                                )
+                            })
+                    })
+                    .map_err(|_| ())?;
+                Ok(())
+            })
+            .map_err(|_| ())??;
+        Ok(record)
+    })();
+    let record = match admission {
+        Ok(record) => record,
+        Err(()) => {
+            let _ = std::fs::remove_file(source);
+            return office_upload_refused();
+        }
+    };
+    finish_office_upload_response(wb, id, &record, authority, 1)
+}
+
+/// A committed upload remains a fact when response delivery loses authority.
+/// Rebuild standing from the original capture, never from a fresh session.
+pub(crate) fn finish_office_upload_response(
+    wb: &mut Workbench,
+    id: &str,
+    record: &ResourceRecord,
+    authority: &crate::engine::office_authority::OfficeTaskAuthority,
+    count: usize,
+) -> axum::response::Response {
+    let basis = match authority.prepare_basis(wb) {
+        Ok(basis) => basis,
+        Err(_) => return office_upload_refused(),
+    };
+    let sender = wb.sender(id);
+    let handle = record.resource.id.as_str().to_string();
+    let response = wb.store_mut().with_checked_dispatch_basis(&basis, |check| {
+        check.check_current()?;
+        let _ = sender.send(ServerEvent::Admitted {
+            kind: "context".into(),
+            text: format!("uploaded {count} file(s) -> {handle}"),
+        });
+        check.check_current()?;
+        Ok::<_, AdmitError>(
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ingested": count, "resource": handle})),
+            )
+                .into_response(),
+        )
+    });
+    match response {
+        Ok(Ok(response)) => response,
+        _ => office_upload_refused(),
+    }
 }
 
 /// The context list / output catalog projection (`data.md`): the engagement's
@@ -2508,6 +3312,173 @@ mod tests {
     use gaugedesk_core::resource::{
         ContentLocator, Resource, ResourceId, ResourceKind, ResourceRecord,
     };
+
+    fn upload_receipt() -> StreamUploadReceipt<'static> {
+        StreamUploadReceipt {
+            command_id: "stream-command",
+            scope: "stream-scope",
+            key: "stream-key",
+            snapshot: "exact-body-and-meaning",
+            office: None,
+        }
+    }
+
+    #[test]
+    fn streamed_context_publication_is_atomic_receipted_and_does_not_revive_access() {
+        let mut store = Store::open_in_memory().unwrap();
+        let receipt = upload_receipt();
+        store
+            .claim_command(
+                receipt.command_id,
+                receipt.scope,
+                receipt.key,
+                receipt.snapshot,
+            )
+            .unwrap();
+        let rec = new_context_record(
+            "doctor",
+            "uploaded: 1 file(s)",
+            "cut-one",
+            ResourceAttributes::default(),
+        );
+        let files = BTreeMap::from([("take.wav".into(), "exact-native-hash".into())]);
+        publish_streamed_context(&mut store, "chat", &rec, files.clone(), &receipt, None).unwrap();
+        assert_eq!(
+            store
+                .command_for_key(receipt.scope, receipt.key)
+                .unwrap()
+                .unwrap()
+                .status,
+            "applied"
+        );
+        assert_eq!(store.records("chat", RESOURCE_KIND).unwrap().len(), 1);
+        assert_eq!(store.records("chat", CONTEXT_IMPORT_KIND).unwrap().len(), 1);
+        let import = current_context_import(&store, "chat", rec.resource.id.as_str())
+            .unwrap()
+            .unwrap();
+        assert!(import.complete);
+        assert_eq!(import.files, files);
+        assert_eq!(
+            access_phase(&store, "chat", &rec.resource.id).unwrap(),
+            AccessPhase::Granted
+        );
+        // Lost publication response: the exact claimed command replays no facts.
+        publish_streamed_context(&mut store, "chat", &rec, files.clone(), &receipt, None).unwrap();
+        assert_eq!(store.records("chat", RESOURCE_KIND).unwrap().len(), 1);
+        store
+            .admit::<AccessState>(
+                &access_scope("chat", &rec.resource.id),
+                AccessCommand::Revoke,
+            )
+            .unwrap();
+        let receipt = StreamUploadReceipt {
+            command_id: "stream-command-two",
+            key: "stream-key-two",
+            ..receipt
+        };
+        store
+            .claim_command(
+                receipt.command_id,
+                receipt.scope,
+                receipt.key,
+                receipt.snapshot,
+            )
+            .unwrap();
+        publish_streamed_context(&mut store, "chat", &rec, files, &receipt, None).unwrap();
+        assert_eq!(
+            access_phase(&store, "chat", &rec.resource.id).unwrap(),
+            AccessPhase::Revoked
+        );
+        assert_eq!(
+            current_context_import(&store, "chat", rec.resource.id.as_str())
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+    }
+
+    struct PublicationFault {
+        fail_kind: Option<&'static str>,
+        current: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl gaugedesk_store::ContentCodec for PublicationFault {
+        fn encode(&self, _: &str, kind: &str, payload: &str) -> Result<String, String> {
+            if self.fail_kind == Some(kind) {
+                return Err("publication encoding unavailable".into());
+            }
+            if self.fail_kind.is_none() && kind == AccessState::KIND {
+                self.current
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(payload.into())
+        }
+        fn decode(&self, _: &str, _: &str, payload: &str) -> Option<String> {
+            Some(payload.into())
+        }
+    }
+
+    #[test]
+    fn streamed_context_publication_rolls_back_on_record_failure_or_final_authority_loss() {
+        for fail_kind in [
+            Some(RESOURCE_KIND),
+            Some(CONTEXT_IMPORT_KIND),
+            Some(AccessState::KIND),
+            None,
+        ] {
+            let current = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let mut store = Store::open_in_memory()
+                .unwrap()
+                .with_codec(std::sync::Arc::new(PublicationFault {
+                    fail_kind,
+                    current: current.clone(),
+                }));
+            let receipt = upload_receipt();
+            store
+                .claim_command(
+                    receipt.command_id,
+                    receipt.scope,
+                    receipt.key,
+                    receipt.snapshot,
+                )
+                .unwrap();
+            let rec = new_context_record(
+                "doctor",
+                "uploaded: 1 file(s)",
+                "cut-one",
+                ResourceAttributes::default(),
+            );
+            let (_, basis) = store.read_for_dispatch(&["authority"], |_| Ok(())).unwrap();
+            let basis =
+                basis.with_process_guard(move || current.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(publish_streamed_context(
+                &mut store,
+                "chat",
+                &rec,
+                BTreeMap::from([("take.wav".into(), "hash".into())]),
+                &receipt,
+                Some(basis)
+            )
+            .is_err());
+            assert!(store.records("chat", RESOURCE_KIND).unwrap().is_empty());
+            assert!(store
+                .records("chat", CONTEXT_IMPORT_KIND)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                access_phase(&store, "chat", &rec.resource.id).unwrap(),
+                AccessPhase::Init
+            );
+            assert_eq!(
+                store
+                    .command_for_key(receipt.scope, receipt.key)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "processing"
+            );
+        }
+    }
 
     fn ctx_record(id: &str, owner: &str, commit: &str) -> ResourceRecord {
         let res = Resource::input(ResourceId::new(id), ResourceKind::context(), owner.into());

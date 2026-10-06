@@ -21,6 +21,53 @@ use crate::{LockUnpoisoned, SharedWorkbench};
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
 const MAX_COMMAND_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// The exact command claimed by this middleware. This is immutable intent,
+/// never an authentication or execution grant. Only this module constructs it;
+/// handlers independently check current authority and finish its durable receipt.
+#[derive(Clone)]
+pub struct ClaimedHttpCommand {
+    command_id: String,
+    scope: String,
+    key: String,
+    snapshot: String,
+}
+
+impl ClaimedHttpCommand {
+    /// Verify the exact middleware claim still awaits this invocation. A copied
+    /// locator never authorizes a different request or re-executes a settled one.
+    pub(crate) fn verify_pending(
+        &self,
+        store: &gaugedesk_store::Store,
+    ) -> Result<(), gaugedesk_store::AdmitError> {
+        if !store.pending_command_matches(
+            &self.command_id,
+            &self.scope,
+            &self.key,
+            &self.snapshot,
+        )? {
+            return Err(gaugedesk_store::AdmitError::Rejected(
+                gaugedesk_core::Rejection {
+                    reason: "task has no matching pending original HTTP command",
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn command_id(&self) -> &str {
+        &self.command_id
+    }
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
+    }
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+    pub(crate) fn snapshot(&self) -> &str {
+        &self.snapshot
+    }
+}
+
 // Axum handlers consume `Response` directly on the error path; boxing it here
 // would only push allocation/unboxing through every command route.
 #[allow(clippy::result_large_err)]
@@ -259,7 +306,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
     };
     let uri = request.uri().to_string();
     let caller_hash = caller_hash(request.headers());
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let bytes = match to_bytes(body, MAX_COMMAND_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -278,24 +325,31 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         &digest(&bytes),
     );
     let (scope, command_id) = command_identity(&method, parts.uri.path(), &caller_hash, &key);
+    let intent = ClaimedHttpCommand {
+        command_id: command_id.clone(),
+        scope,
+        key,
+        snapshot,
+    };
 
     {
         let mut guard = wb.lock_unpoisoned();
-        let (receipt, claimed) =
-            match guard
-                .store_mut()
-                .claim_command(&command_id, &scope, &key, &snapshot)
-            {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({ "error": format!("command receipt: {error:?}") })),
-                    )
-                        .into_response()
-                }
-            };
-        if receipt.snapshot_json != snapshot {
+        let (receipt, claimed) = match guard.store_mut().claim_command(
+            intent.command_id(),
+            intent.scope(),
+            intent.key(),
+            intent.snapshot(),
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("command receipt: {error:?}") })),
+                )
+                    .into_response()
+            }
+        };
+        if receipt.snapshot_json != intent.snapshot() {
             return status_response(
                 StatusCode::CONFLICT,
                 &command_id,
@@ -307,6 +361,9 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         }
     }
 
+    // Replace any pre-existing extension. Its provenance is this exact claim,
+    // not a value carried by another layer or submitted as request data.
+    parts.extensions.insert(intent);
     let request = Request::from_parts(parts, Body::from(bytes));
     let response = next.run(request).await;
     let command_status = if response.status().is_success() || response.status().is_redirection() {
@@ -316,16 +373,342 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
     } else {
         "expired"
     };
-    let _ = wb
-        .lock_unpoisoned()
-        .store_mut()
-        .set_command_status(&command_id, command_status);
+    if command_status == "applied" {
+        let _ = wb
+            .lock_unpoisoned()
+            .store_mut()
+            .set_command_status(&command_id, command_status);
+    } else {
+        // A handler may have committed its exact receipt before delivery lost
+        // authority. A refused response cannot rewrite that durable outcome.
+        let _ = wb
+            .lock_unpoisoned()
+            .store_mut()
+            .set_unreceipted_command_failure(&command_id, command_status);
+    }
     response
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_http_task_locator_requires_original_claim_and_refuses_receipted_status_lag() {
+        use axum::{middleware, routing::post, Extension, Router};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let output = captured.clone();
+        let app = Router::new()
+            .route(
+                "/chats/synthetic/task",
+                post(
+                    move |Extension(intent): Extension<ClaimedHttpCommand>| async move {
+                        *output.lock().unwrap() = Some(intent);
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .layer(middleware::from_fn_with_state(wb.clone(), guard))
+            .with_state(wb.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chats/synthetic/task")
+                    .header("idempotency-key", "original-key")
+                    .body(Body::from("synthetic task input"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let original: ClaimedHttpCommand = captured.lock().unwrap().take().unwrap();
+        let mut wb = wb.lock_unpoisoned();
+        // Applied without a result receipt is still not a pending task.
+        assert!(original.verify_pending(wb.store_ref()).is_err());
+        wb.store_mut()
+            .set_command_status(original.command_id(), "processing")
+            .unwrap();
+        original.verify_pending(wb.store_ref()).unwrap();
+        for changed in ["id", "scope", "key", "snapshot"] {
+            let mut substituted = original.clone();
+            match changed {
+                "id" => substituted.command_id.push_str("changed"),
+                "scope" => substituted.scope.push_str("changed"),
+                "key" => substituted.key.push_str("changed"),
+                "snapshot" => substituted.snapshot.push_str("changed"),
+                _ => unreachable!(),
+            }
+            assert!(
+                substituted.verify_pending(wb.store_ref()).is_err(),
+                "{changed}"
+            );
+        }
+        wb.store_mut()
+            .with_record_admission(|writer| {
+                writer.commit_claimed(
+                    original.command_id(),
+                    original.scope(),
+                    original.key(),
+                    original.snapshot(),
+                    &[],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        wb.store_mut()
+            .set_command_status(original.command_id(), "processing")
+            .unwrap();
+        assert!(original.verify_pending(wb.store_ref()).is_err());
+    }
+
+    #[tokio::test]
+    async fn claimed_http_intent_is_exact_and_response_refusal_preserves_its_receipt() {
+        use axum::{middleware, routing::post, Extension, Router};
+        use tower::ServiceExt;
+        async fn handler(
+            State(wb): State<SharedWorkbench>,
+            Extension(intent): Extension<ClaimedHttpCommand>,
+        ) -> Response {
+            let fact = gaugedesk_store::CommandRecordFact {
+                scope_id: "synthetic-result".into(),
+                kind: "exact".into(),
+                payload: intent.command_id().into(),
+            };
+            wb.lock_unpoisoned()
+                .store_mut()
+                .with_record_admission(|writer| {
+                    writer.commit_claimed(
+                        intent.command_id(),
+                        intent.scope(),
+                        intent.key(),
+                        intent.snapshot(),
+                        &[fact],
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            // Actual reference publication can succeed before delivery refuses.
+            StatusCode::FORBIDDEN.into_response()
+        }
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let app = Router::new()
+            .route("/buffered", post(handler))
+            .layer(middleware::from_fn_with_state(wb.clone(), guard))
+            .with_state(wb.clone());
+        let request = || {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/buffered?target=exact")
+                .header("idempotency-key", "original-key")
+                .body(Body::from("synthetic exact body"))
+                .unwrap();
+            request.extensions_mut().insert(ClaimedHttpCommand {
+                command_id: "substituted".into(),
+                scope: "foreign".into(),
+                key: "other".into(),
+                snapshot: "different".into(),
+            });
+            request
+        };
+        let submitted = request();
+        let caller = caller_hash(submitted.headers());
+        let (scope, command_id) =
+            command_identity(&Method::POST, "/buffered", &caller, "original-key");
+        let snapshot = command_snapshot(
+            &Method::POST,
+            "/buffered?target=exact",
+            "/buffered",
+            &caller,
+            &digest(b"synthetic exact body"),
+        );
+        assert_eq!(
+            app.clone().oneshot(submitted).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        {
+            let wb = wb.lock_unpoisoned();
+            let command = wb
+                .store_ref()
+                .command_for_key(&scope, "original-key")
+                .unwrap()
+                .unwrap();
+            assert_eq!(command.command_id, command_id);
+            assert_eq!(command.snapshot_json, snapshot);
+            assert_eq!(command.status, "applied");
+            assert_eq!(
+                wb.store_ref().records("synthetic-result", "exact").unwrap(),
+                [command_id]
+            );
+            assert!(wb.store_ref().command("substituted").unwrap().is_none());
+        }
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            wb.lock_unpoisoned()
+                .store_ref()
+                .records("synthetic-result", "exact")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_http_task_retries_refuse_pending_and_terminal_commands_before_dispatch() {
+        use axum::{middleware, routing::post, Extension, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tower::ServiceExt;
+
+        for (outcome, terminal) in [
+            (StatusCode::OK, "applied"),
+            (StatusCode::FORBIDDEN, "rejected"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "expired"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let wb = crate::open_workbench(root.path()).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let (captured, mut original) = tokio::sync::mpsc::unbounded_channel();
+            let handler_calls = calls.clone();
+            let handler_release = release.clone();
+            let app = Router::new()
+                .route(
+                    "/chats/synthetic/task",
+                    post(move |Extension(intent): Extension<ClaimedHttpCommand>| {
+                        let captured = captured.clone();
+                        let calls = handler_calls.clone();
+                        let release = handler_release.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            captured.send(intent).unwrap();
+                            release.acquire().await.unwrap().forget();
+                            outcome
+                        }
+                    }),
+                )
+                .layer(middleware::from_fn_with_state(wb.clone(), guard))
+                .with_state(wb.clone());
+            let request = |body: &'static str| {
+                Request::builder()
+                    .method("POST")
+                    .uri("/chats/synthetic/task")
+                    .header("idempotency-key", "original-task")
+                    .body(Body::from(body))
+                    .unwrap()
+            };
+            let first = tokio::spawn(app.clone().oneshot(request("synthetic original input")));
+            let intent = tokio::time::timeout(std::time::Duration::from_secs(5), original.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            intent
+                .verify_pending(wb.lock_unpoisoned().store_ref())
+                .unwrap();
+
+            for (body, expected) in [
+                ("synthetic original input", "processing"),
+                ("changed synthetic input", "key-reused-with-different-input"),
+            ] {
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    app.clone().oneshot(request(body)),
+                )
+                .await
+                .expect("duplicate task entered the blocked handler")
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                        .unwrap();
+                assert_eq!(payload["command_id"], intent.command_id());
+                assert_eq!(payload["command_status"], expected);
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "pending retry dispatched");
+                intent
+                    .verify_pending(wb.lock_unpoisoned().store_ref())
+                    .unwrap();
+            }
+
+            release.add_permits(1);
+            assert_eq!(first.await.unwrap().unwrap().status(), outcome);
+            assert!(intent
+                .verify_pending(wb.lock_unpoisoned().store_ref())
+                .is_err());
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.oneshot(request("synthetic original input")),
+            )
+            .await
+            .expect("terminal task entered the handler")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let payload: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(payload["command_id"], intent.command_id());
+            assert_eq!(payload["command_status"], terminal);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "{terminal} retry dispatched"
+            );
+            let guard = wb.lock_unpoisoned();
+            let retained = guard
+                .store_ref()
+                .command_for_key(intent.scope(), intent.key())
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.command_id, intent.command_id());
+            assert_eq!(retained.snapshot_json, intent.snapshot());
+            assert_eq!(retained.status, terminal);
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_unreceipted_http_work_keeps_its_failure_status() {
+        use axum::{middleware, routing::post, Router};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let app = Router::new()
+            .route("/buffered", post(|| async { StatusCode::FORBIDDEN }))
+            .layer(middleware::from_fn_with_state(wb.clone(), guard))
+            .with_state(wb.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/buffered")
+            .header("idempotency-key", "original-key")
+            .body(Body::empty())
+            .unwrap();
+        let (scope, _) = command_identity(
+            &Method::POST,
+            "/buffered",
+            &caller_hash(request.headers()),
+            "original-key",
+        );
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            wb.lock_unpoisoned()
+                .store_ref()
+                .command_for_key(&scope, "original-key")
+                .unwrap()
+                .unwrap()
+                .status,
+            "rejected"
+        );
+    }
 
     #[test]
     fn only_the_exact_workflow_launch_post_uses_its_own_idempotency() {
