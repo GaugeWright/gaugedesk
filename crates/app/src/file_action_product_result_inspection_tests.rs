@@ -296,6 +296,7 @@ fn saved_product_observation_checks_bound_metadata_even_when_receipt_and_fact_ag
 struct ReadCodec {
     path: String,
     reads: Arc<AtomicUsize>,
+    fenced_reads: Arc<AtomicUsize>,
     unavailable: bool,
     inner: Option<Arc<dyn gaugedesk_store::ContentCodec>>,
 }
@@ -308,17 +309,19 @@ impl gaugedesk_store::ContentCodec for ReadCodec {
     }
     fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String> {
         if kind == KIND {
-            let prior = self.reads.fetch_add(1, Ordering::SeqCst);
+            self.reads.fetch_add(1, Ordering::SeqCst);
             if self.unavailable {
                 return None;
             }
-            if prior > 0 {
-                let contender = rusqlite::Connection::open(&self.path).unwrap();
-                contender.busy_timeout(std::time::Duration::ZERO).unwrap();
-                assert!(
-                    contender.execute_batch("BEGIN IMMEDIATE").is_err(),
-                    "product result read lost its current authority fence"
-                );
+            // Complete typed folds may also authenticate this scope during
+            // preparation. Identify retained observation by actual writer
+            // exclusion, rather than treating the second decode as a fence.
+            let contender = rusqlite::Connection::open(&self.path).unwrap();
+            contender.busy_timeout(std::time::Duration::ZERO).unwrap();
+            if contender.execute_batch("BEGIN IMMEDIATE").is_err() {
+                self.fenced_reads.fetch_add(1, Ordering::SeqCst);
+            } else {
+                contender.execute_batch("ROLLBACK").unwrap();
             }
         }
         match &self.inner {
@@ -336,6 +339,7 @@ fn saved_product_observation_fences_reads_and_refuses_unavailable_history() {
         let mut wb = fixture.shared.lock_unpoisoned();
         let (context, _) = reader(&mut wb);
         let reads = Arc::new(AtomicUsize::new(0));
+        let fenced_reads = Arc::new(AtomicUsize::new(0));
         wb.store = wb
             .store_ref()
             .sibling()
@@ -343,6 +347,7 @@ fn saved_product_observation_fences_reads_and_refuses_unavailable_history() {
             .with_codec(Arc::new(ReadCodec {
                 path: wb.store_ref().path().into(),
                 reads: reads.clone(),
+                fenced_reads: fenced_reads.clone(),
                 unavailable,
                 inner: wb
                     .content_vault
@@ -355,6 +360,10 @@ fn saved_product_observation_fences_reads_and_refuses_unavailable_history() {
         } else {
             assert_eq!(read.unwrap().results().len(), 1);
             assert!(reads.load(Ordering::SeqCst) >= 2);
+            assert!(
+                fenced_reads.load(Ordering::SeqCst) >= 2,
+                "saved snapshot and facts were not observed under the product writer"
+            );
         }
     }
 }

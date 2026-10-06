@@ -211,7 +211,7 @@ impl DispatchRecordAdmission<'_> {
     {
         let prepared = PreparedDispatch::<L>::new(scope_id, idempotency_key, command, dispatch)?;
         check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
-        commit_dispatch::<L>(self.tx, prepared, || {
+        commit_dispatch::<L>(self.tx, self.codec.as_ref(), prepared, || {
             check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)
         })
     }
@@ -234,7 +234,7 @@ impl DispatchRecordAdmission<'_> {
         let prepared = PreparedDispatch::<L>::new(scope_id, idempotency_key, command, dispatch)?;
         check_dispatch_basis(&self.tx, &self.store_path, basis)?;
         check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
-        commit_dispatch::<L>(self.tx, prepared, || {
+        commit_dispatch::<L>(self.tx, self.codec.as_ref(), prepared, || {
             check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
             check_validity(basis.deadline, &basis.process_guards)
         })
@@ -866,13 +866,10 @@ impl Store {
         };
         let mut matches = 0;
         {
-            let mut statement = tx.prepare_cached(
-                "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-            )?;
-            for row in statement.query_map(params![scope_id, DISPATCH_KIND], |row| {
-                row.get::<_, String>(0)
-            })? {
-                let recorded: DispatchIntent = serde_json::from_str(&row?)?;
+            for plain in
+                crate::retained_kind_payloads(&tx, self.codec.as_ref(), scope_id, DISPATCH_KIND)?
+            {
+                let recorded: DispatchIntent = serde_json::from_str(&plain)?;
                 if recorded.command_id == command_id {
                     if recorded != intent {
                         return Err(AdmitError::Rejected(Rejection {
@@ -941,7 +938,7 @@ impl Store {
         if let Some(basis) = basis {
             check_dispatch_basis(&tx, &self.path, basis)?;
         }
-        commit_dispatch::<L>(tx, prepared, || match basis {
+        commit_dispatch::<L>(tx, self.codec.as_ref(), prepared, || match basis {
             Some(basis) => check_validity(basis.deadline, &basis.process_guards),
             None => Ok(()),
         })
@@ -1006,6 +1003,7 @@ where
 
 fn commit_dispatch<L: Lifecycle>(
     tx: rusqlite::Transaction<'_>,
+    codec: Option<&std::sync::Arc<dyn crate::ContentCodec>>,
     prepared: PreparedDispatch<'_, L>,
     final_check: impl FnOnce() -> Result<(), AdmitError>,
 ) -> Result<MaterializedAdmission<L::State>, AdmitError>
@@ -1044,14 +1042,9 @@ where
     if replayed {
         // A legacy receipt without an original snapshot/outbox cannot be
         // upgraded into a successful dispatch admission on a retry.
-        let mut statement = tx.prepare_cached(
-            "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-        )?;
         let mut matches = 0;
-        for row in statement.query_map(params![scope_id, DISPATCH_KIND], |row| {
-            row.get::<_, String>(0)
-        })? {
-            let recorded: DispatchIntent = serde_json::from_str(&row?)?;
+        for plain in crate::retained_kind_payloads(&tx, codec, scope_id, DISPATCH_KIND)? {
+            let recorded: DispatchIntent = serde_json::from_str(&plain)?;
             if recorded.command_id == command_id {
                 if recorded != intent {
                     return Err(AdmitError::Rejected(Rejection {
@@ -1072,15 +1065,7 @@ where
             reason: "existing command has no replayable dispatch admission",
         }));
     }
-    let mut state = L::State::default();
-    {
-        let mut statement = tx.prepare_cached(
-            "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-        )?;
-        for row in statement.query_map(params![scope_id, L::KIND], |row| row.get::<_, String>(0))? {
-            state = L::evolve(&state, serde_json::from_str(&row?)?);
-        }
-    }
+    let mut state = crate::fold_retained::<L>(&tx, codec, scope_id)?;
     if !replayed {
         let events = L::decide(&state, command).map_err(AdmitError::Rejected)?;
         let base: i64 = tx
@@ -1097,7 +1082,7 @@ where
                 scope_id,
                 base + offset as i64,
                 L::KIND,
-                serde_json::to_string(&event)?
+                crate::encode_payload(codec, scope_id, L::KIND, &serde_json::to_string(&event)?)?
             ])?;
             state = L::evolve(&state, event);
         }
@@ -1108,7 +1093,12 @@ where
             scope_id,
             dispatch_position,
             DISPATCH_KIND,
-            serde_json::to_string(&intent)?
+            crate::encode_payload(
+                codec,
+                scope_id,
+                DISPATCH_KIND,
+                &serde_json::to_string(&intent)?
+            )?
         ])?;
         tx.prepare_cached(
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",

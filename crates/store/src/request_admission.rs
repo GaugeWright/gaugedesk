@@ -80,17 +80,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut state = L::State::default();
-        {
-            let mut statement = tx.prepare_cached(
-                "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-            )?;
-            let rows =
-                statement.query_map(params![scope, L::KIND], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                state = L::evolve(&state, serde_json::from_str(&row?)?);
-            }
-        }
+        let mut state = fold_retained::<L>(&tx, self.codec.as_ref(), scope)?;
         authorize(&state).map_err(AdmitError::Rejected)?;
 
         let previous = tx
@@ -185,7 +175,12 @@ impl Store {
                 scope,
                 base + offset as i64,
                 L::KIND,
-                serde_json::to_string(&event)?
+                encode_payload(
+                    self.codec.as_ref(),
+                    scope,
+                    L::KIND,
+                    &serde_json::to_string(&event)?
+                )?
             ])?;
             state = L::evolve(&state, event);
         }

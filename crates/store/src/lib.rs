@@ -36,12 +36,13 @@ mod record_admission_prefix;
 #[cfg(test)]
 mod record_claim_tests;
 mod request_admission;
+#[cfg(test)]
+mod typed_codec_tests;
 
 /// A transparent at-rest transform applied to record payloads of designated
 /// **content** kinds (`SECAUD-9`/`SECAUD-6`). The store crate stays crypto-free: this
 /// is the seam an app-side content vault implements to encrypt sensitive content
-/// (e.g. `transcript`) under per-scope keys, leaving lifecycle/metadata records
-/// untouched. `None` on the [`Store`] = plaintext (the default; zero behavior change).
+/// (e.g. `transcript`) under per-scope keys, including designated lifecycle events; other kinds pass through. `None` on the [`Store`] = plaintext (the default; zero behavior change).
 pub trait ContentCodec: Send + Sync {
     /// Transform a payload for storage. Must be reversible by [`decode`](Self::decode).
     /// A non-content `kind` returns the payload unchanged (pass-through).
@@ -49,9 +50,10 @@ pub trait ContentCodec: Send + Sync {
     /// content must never be replaced with a lossy placeholder or plaintext.
     fn encode(&self, scope: &str, kind: &str, payload: &str) -> Result<String, String>;
     /// Reverse [`encode`](Self::encode). Returns `None` when the payload is
-    /// **unrecoverable** — its per-scope key was crypto-erased — so the caller drops
-    /// the row (the content is gone, history intact). Non-content kinds and legacy
-    /// plaintext return `Some(payload)`.
+    /// unavailable, for example after key erasure or failed authentication.
+    /// Informational content views may omit it; authority and typed lifecycle
+    /// folds must refuse. Pass-through and legacy plaintext depend on the codec's
+    /// policy; a strict deployment need not accept legacy plaintext.
     fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String>;
 }
 
@@ -732,6 +734,61 @@ fn tx_chain_head(
     })
 }
 
+/// Authenticate complete retained history before projecting a kind. Unavailable
+/// protected facts must not disappear from a lifecycle or receipt check.
+fn retained_kind_payloads(
+    conn: &Connection,
+    codec: Option<&Arc<dyn ContentCodec>>,
+    scope: &str,
+    selected: &str,
+) -> Result<Vec<String>, AdmitError> {
+    let mut statement = conn
+        .prepare_cached("SELECT kind, payload FROM events WHERE scope_id = ?1 ORDER BY position")?;
+    let rows = statement.query_map([scope], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut selected_rows = Vec::new();
+    for row in rows {
+        let (kind, raw) = row?;
+        let plain = match codec {
+            Some(codec) => codec.decode(scope, &kind, &raw).ok_or_else(|| {
+                AdmitError::Codec("authority history contains an unavailable record".into())
+            })?,
+            None => raw,
+        };
+        if kind == selected {
+            selected_rows.push(plain);
+        }
+    }
+    Ok(selected_rows)
+}
+
+fn fold_retained<L: Lifecycle>(
+    conn: &Connection,
+    codec: Option<&Arc<dyn ContentCodec>>,
+    scope: &str,
+) -> Result<L::State, AdmitError> {
+    let mut state = L::State::default();
+    for plain in retained_kind_payloads(conn, codec, scope, L::KIND)? {
+        state = L::evolve(&state, serde_json::from_str(&plain)?);
+    }
+    Ok(state)
+}
+
+fn encode_payload(
+    codec: Option<&Arc<dyn ContentCodec>>,
+    scope: &str,
+    kind: &str,
+    payload: &str,
+) -> Result<String, AdmitError> {
+    match codec {
+        Some(codec) => codec
+            .encode(scope, kind, payload)
+            .map_err(AdmitError::Codec),
+        None => Ok(payload.to_owned()),
+    }
+}
+
 /// Process-unique suffixes for the scratch databases [`Store::open_in_memory`] mints.
 static SCRATCH_STORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1233,9 +1290,10 @@ impl Store {
         if replayed {
             // Repair a command row whose receipt committed just before a process
             // interruption prevented its final status update.
+            let state = self.fold::<L>(scope_id)?;
             self.set_command_status(&command_id, "applied")?;
             return Ok(MaterializedAdmission {
-                state: self.fold::<L>(scope_id)?,
+                state,
                 replayed: true,
             });
         }
@@ -1869,16 +1927,7 @@ impl Store {
     /// state is the fold). Events are filtered by `L::KIND` so distinct
     /// lifecycles (a run, its review, its export) can coexist in one scope.
     pub fn fold<L: Lifecycle>(&self, scope_id: &str) -> Result<L::State, AdmitError> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-        )?;
-        let rows = stmt.query_map(params![scope_id, L::KIND], |r| r.get::<_, String>(0))?;
-        let mut state = L::State::default();
-        for row in rows {
-            let event: L::Event = serde_json::from_str(&row?)?;
-            state = L::evolve(&state, event);
-        }
-        Ok(state)
+        fold_retained::<L>(&self.conn, self.codec.as_ref(), scope_id)
     }
 
     /// Append a durable **record** (non-lifecycle admitted evidence — e.g. a
@@ -2241,18 +2290,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         // Fold the scope's current state from *committed* events, inside the lock.
-        let state = {
-            let mut stmt = tx.prepare_cached(
-                "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-            )?;
-            let rows = stmt.query_map(params![scope_id, L::KIND], |r| r.get::<_, String>(0))?;
-            let mut s = L::State::default();
-            for row in rows {
-                let event: L::Event = serde_json::from_str(&row?)?;
-                s = L::evolve(&s, event);
-            }
-            s
-        };
+        let state = fold_retained::<L>(&tx, self.codec.as_ref(), scope_id)?;
         let events = L::decide(&state, command).map_err(AdmitError::Rejected)?;
 
         // Next position is global per scope so the per-scope order is total
@@ -2265,7 +2303,12 @@ impl Store {
         let mut new_state = state;
         for (offset, event) in events.into_iter().enumerate() {
             let position = base + offset as i64;
-            let payload = serde_json::to_string(&event)?;
+            let payload = encode_payload(
+                self.codec.as_ref(),
+                scope_id,
+                L::KIND,
+                &serde_json::to_string(&event)?,
+            )?;
             tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
             )?
@@ -2298,18 +2341,8 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         // Fold inside the lock (same serializability as `admit`, RF-C12).
-        let fold = |tx: &rusqlite::Transaction| -> Result<L::State, AdmitError> {
-            let mut stmt = tx.prepare_cached(
-                "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-            )?;
-            let rows = stmt.query_map(params![scope_id, L::KIND], |r| r.get::<_, String>(0))?;
-            let mut s = L::State::default();
-            for row in rows {
-                let event: L::Event = serde_json::from_str(&row?)?;
-                s = L::evolve(&s, event);
-            }
-            Ok(s)
-        };
+        let fold =
+            |tx: &rusqlite::Transaction| fold_retained::<L>(tx, self.codec.as_ref(), scope_id);
 
         // Already applied this key? Idempotent no-op: return current state.
         let seen: bool = tx
@@ -2335,7 +2368,12 @@ impl Store {
         let mut new_state = state;
         for (offset, event) in events.into_iter().enumerate() {
             let position = base + offset as i64;
-            let payload = serde_json::to_string(&event)?;
+            let payload = encode_payload(
+                self.codec.as_ref(),
+                scope_id,
+                L::KIND,
+                &serde_json::to_string(&event)?,
+            )?;
             tx.prepare_cached(
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
             )?

@@ -115,6 +115,7 @@ pub(crate) fn commit_lifecycle<L: Lifecycle>(
             reason: "invalid claimed lifecycle batch",
         }));
     }
+    let phase_codec = codec.clone();
     commit_staged(
         tx,
         codec,
@@ -124,7 +125,7 @@ pub(crate) fn commit_lifecycle<L: Lifecycle>(
         stored,
         None,
         Some(command_id),
-        |tx| stage_lifecycle::<L>(tx, batch),
+        |tx| stage_lifecycle::<L>(tx, phase_codec.as_ref(), batch),
         final_check,
     )
 }
@@ -164,8 +165,8 @@ pub(crate) fn commit_lifecycle_pair<L: Lifecycle, M: Lifecycle>(
         Some(command_id),
         |tx| {
             let scope = first.scope.clone();
-            let mut positions = stage_lifecycle::<L>(tx, first)?;
-            positions.extend(stage_lifecycle::<M>(tx, second)?);
+            let mut positions = stage_lifecycle::<L>(tx, phase_codec.as_ref(), first)?;
+            positions.extend(stage_lifecycle::<M>(tx, phase_codec.as_ref(), second)?);
             let next = tx
                 .prepare_cached(
                     "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id=?1",
@@ -190,15 +191,10 @@ pub(crate) fn commit_lifecycle_pair<L: Lifecycle, M: Lifecycle>(
 
 pub(crate) fn stage_lifecycle<L: Lifecycle>(
     tx: &rusqlite::Transaction<'_>,
+    codec: Option<&Arc<dyn ContentCodec>>,
     batch: crate::command_dispatch::LifecycleBatch<L>,
 ) -> Result<Vec<i64>, AdmitError> {
-    let mut state = L::State::default();
-    let mut statement = tx.prepare_cached(
-        "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-    )?;
-    for row in statement.query_map(params![batch.scope, L::KIND], |row| row.get::<_, String>(0))? {
-        state = L::evolve(&state, serde_json::from_str(&row?)?);
-    }
+    let mut state = fold_retained::<L>(tx, codec, &batch.scope)?;
     let mut position: i64 = tx
         .prepare_cached("SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1")?
         .query_row(params![batch.scope], |row| row.get(0))?;
@@ -213,7 +209,12 @@ pub(crate) fn stage_lifecycle<L: Lifecycle>(
                 batch.scope,
                 position,
                 L::KIND,
-                serde_json::to_string(&event)?
+                encode_payload(
+                    codec,
+                    &batch.scope,
+                    L::KIND,
+                    &serde_json::to_string(&event)?
+                )?
             ])?;
             state = L::evolve(&state, event);
             positions.push(position);

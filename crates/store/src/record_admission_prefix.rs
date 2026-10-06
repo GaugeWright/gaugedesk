@@ -182,8 +182,10 @@ where
     let recovered = if let Some(marker) = markers.first() {
         let body = decode(codec, &scope, KIND, marker)?;
         let result: PrefixResult = serde_json::from_str(&body)?;
-        if result.revision != "claimed-lifecycle-prefix/v1"
-            || result.meaning_sha256 != meaning
+        if !matches!(
+            result.revision.as_str(),
+            "claimed-lifecycle-prefix/v1" | "claimed-lifecycle-prefix/v2"
+        ) || result.meaning_sha256 != meaning
             || result.events.len() < facts.len()
         {
             return Err(refused());
@@ -193,7 +195,10 @@ where
             return Err(refused());
         }
         for event in &result.events[..typed_count] {
-            if event.scope != batch.scope || event.kind != L::KIND || event.encoded {
+            if event.scope != batch.scope
+                || event.kind != L::KIND
+                || event.encoded != (result.revision == "claimed-lifecycle-prefix/v2")
+            {
                 return Err(refused());
             }
         }
@@ -217,11 +222,7 @@ where
                 })
                 .optional()?;
             let (kind, body) = row.ok_or_else(refused)?;
-            let body = if event.encoded {
-                decode(codec, &event.scope, &kind, &body)?
-            } else {
-                body
-            };
+            let body = decode(codec, &event.scope, &kind, &body)?;
             if kind != event.kind || digest(body) != event.sha256 {
                 return Err(refused());
             }
@@ -358,7 +359,8 @@ where
         None,
         |tx| {
             let target = batch.scope.clone();
-            let mut positions = crate::record_admission::stage_lifecycle::<L>(tx, batch)?;
+            let mut positions =
+                crate::record_admission::stage_lifecycle::<L>(tx, phase_codec.as_ref(), batch)?;
             let mut events = Vec::with_capacity(positions.len() + facts.len());
             for position in &positions {
                 let payload: String = tx
@@ -368,8 +370,8 @@ where
                     scope: target.clone(),
                     position: *position,
                     kind: L::KIND.into(),
-                    sha256: digest(payload),
-                    encoded: false,
+                    sha256: digest(decode(phase_codec.as_ref(), &target, L::KIND, &payload)?),
+                    encoded: true,
                 });
             }
             let fact_positions = crate::record_admission::append_facts(tx, &stored)?;
@@ -387,7 +389,7 @@ where
                 scope_id: phase_scope,
                 kind: KIND.into(),
                 payload: serde_json::to_string(&PrefixResult {
-                    revision: "claimed-lifecycle-prefix/v1".into(),
+                    revision: "claimed-lifecycle-prefix/v2".into(),
                     meaning_sha256: phase_meaning,
                     events,
                 })?,

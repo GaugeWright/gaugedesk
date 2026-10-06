@@ -19,6 +19,10 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Update the browser build dependency to reject malformed source maps that can stall processing.
+
+- Apply configured content encryption to typed lifecycle events and refuse unreadable protected history during approval and receipt checks.
+
 - Office result publication records its exact original events and output facts
   for later verification. The additive store update requires schema 11 support.
 

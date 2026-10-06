@@ -201,11 +201,7 @@ pub(crate) fn verify<L: Lifecycle, M: Lifecycle>(
         if kind != row.kind {
             return Err(refused());
         }
-        let body = if row.class == "fact" {
-            decode(codec, result_scope, &kind, &raw)?
-        } else {
-            raw
-        };
+        let body = decode(codec, result_scope, &kind, &raw)?;
         if digest(&body) != row.digest {
             return Err(refused());
         }
@@ -316,8 +312,10 @@ where
         None,
         Some(command),
         |tx| {
-            let first_positions = crate::record_admission::stage_lifecycle::<L>(tx, first)?;
-            let second_positions = crate::record_admission::stage_lifecycle::<M>(tx, second)?;
+            let first_positions =
+                crate::record_admission::stage_lifecycle::<L>(tx, phase_codec.as_ref(), first)?;
+            let second_positions =
+                crate::record_admission::stage_lifecycle::<M>(tx, phase_codec.as_ref(), second)?;
             if first_positions.is_empty() || second_positions.is_empty() {
                 return Err(refused());
             }
@@ -349,8 +347,8 @@ where
                     rows.push(Row {
                         position: *position,
                         class: class.into(),
+                        digest: digest(decode(phase_codec.as_ref(), &scope, &kind, &body)?),
                         kind,
-                        digest: digest(body),
                     });
                 }
             }

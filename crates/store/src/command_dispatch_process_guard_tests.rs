@@ -132,7 +132,7 @@ fn final_dispatch_refusal_rolls_back_lifecycle_outbox_and_receipt_repair() {
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
-    assert!(commit_dispatch::<RunState>(tx, prepared, refuse).is_err());
+    assert!(commit_dispatch::<RunState>(tx, None, prepared, refuse).is_err());
     assert!(store.retained_events("scope").unwrap().is_empty());
     assert!(store.command_for_key("scope", "key").unwrap().is_none());
     store
@@ -150,7 +150,7 @@ fn final_dispatch_refusal_rolls_back_lifecycle_outbox_and_receipt_repair() {
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .unwrap();
-    assert!(commit_dispatch::<RunState>(tx, prepared, refuse).is_err());
+    assert!(commit_dispatch::<RunState>(tx, None, prepared, refuse).is_err());
     assert_eq!(
         store
             .command_for_key("scope", "key")
