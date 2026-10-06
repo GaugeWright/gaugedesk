@@ -3754,7 +3754,12 @@ impl Workbench {
         let Some(vault) = &self.content_vault else {
             return 0;
         };
-        let mut scopes: Vec<String> = self.library.chat_lineage.keys().cloned().collect();
+        let mut scopes: Vec<String> = self
+            .library
+            .chat_lineage
+            .keys()
+            .flat_map(|chat| [chat.clone(), crate::agent_question::question_scope(chat)])
+            .collect();
         for project in self.library.projects.keys() {
             scopes.push(format!("project::{project}"));
             if let Ok(workflow) = crate::project_workflow::content_scope(project) {

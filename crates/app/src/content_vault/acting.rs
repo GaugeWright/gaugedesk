@@ -55,33 +55,38 @@ pub fn act_for<T>(
 }
 
 impl ContentVault {
-    /// Refuse `scope` to background work whose delegation does not name it,
-    /// and, outside background work, to a session that does not hold its
-    /// project (WS-740). Every path that hands out a scope's data key asks
-    /// this first.
     pub(super) fn delegated(&self, scope: &str) -> std::io::Result<()> {
-        ACTING.with(|slot| {
-            let slot = slot.borrow();
-            let Some(acting) = slot.as_ref() else {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|duration| duration.as_millis() as u64)
-                    .unwrap_or_default();
-                return self.session_admits(scope, now);
-            };
-            let Some(project) = self.scope_projects.project_of(scope) else {
-                return Ok(());
-            };
-            if project == acting.project && acting.scopes.contains(scope) {
-                return Ok(());
-            }
-            acting.refused.borrow_mut().insert(scope.to_owned());
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "outside the keys this work was delegated",
-            ))
-        })
+        delegated(&self.scope_projects, &self.holds, scope)
     }
+}
+
+/// Check current work metadata without retaining a vault or decrypted keys.
+pub(super) fn delegated(
+    index: &ScopeProjectIndex,
+    holds: &holds::Holds,
+    scope: &str,
+) -> std::io::Result<()> {
+    ACTING.with(|slot| {
+        let slot = slot.borrow();
+        let Some(acting) = slot.as_ref() else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_default();
+            return holds.session_admits(index, scope, now);
+        };
+        let Some(project) = index.project_of(scope) else {
+            return Ok(());
+        };
+        if project == acting.project && acting.scopes.contains(scope) {
+            return Ok(());
+        }
+        acting.refused.borrow_mut().insert(scope.to_owned());
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "outside the keys this work was delegated",
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -103,6 +108,67 @@ mod tests {
 
     fn declared(scopes: &[&str]) -> BTreeSet<String> {
         scopes.iter().map(|scope| scope.to_string()).collect()
+    }
+
+    #[test]
+    fn background_question_history_requires_exact_declaration_even_with_cached_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = crate::agent_question::question_scope("chat-a");
+        let sibling = crate::agent_question::question_scope("chat-a2");
+        let other = crate::agent_question::question_scope("chat-b");
+        let v = Arc::new(vault(dir.path()).require_authenticated_records());
+        let kind = crate::agent_question::QUESTION_KIND;
+        let own = v.encode(&q, kind, "synthetic declared question").unwrap();
+        let same_project = v
+            .encode(&sibling, kind, "synthetic sibling question")
+            .unwrap();
+        let other_project = v
+            .encode(&other, kind, "synthetic other project question")
+            .unwrap();
+        v.enforce_session_holds();
+        let unrelated_hold = v.hold("proj-b");
+        let ((read, write), refused) = act_for("proj-a", &declared(&["chat-a"]), || {
+            (
+                v.decode(&q, kind, &own),
+                v.encode(&q, kind, "undeclared question write"),
+            )
+        });
+        assert!(read.is_none());
+        assert!(write.is_err());
+        assert_eq!(refused, declared(&[&q]));
+        let ((own_read, sibling_read, other_read, write), refused) =
+            act_for("proj-a", &declared(&[&q, &other]), || {
+                (
+                    v.decode(&q, kind, &own),
+                    v.decode(&sibling, kind, &same_project),
+                    v.decode(&other, kind, &other_project),
+                    v.encode(&q, kind, "synthetic new declared question"),
+                )
+            });
+        assert_eq!(own_read.as_deref(), Some("synthetic declared question"));
+        assert!(sibling_read.is_none());
+        assert!(
+            other_read.is_none(),
+            "an unrelated live session or explicit foreign scope bypassed project standing"
+        );
+        assert!(write.unwrap().starts_with("gwenc:2:"));
+        assert_eq!(refused, declared(&[&sibling, &other]));
+        v.release_unless_held("proj-a");
+        assert!(
+            !v.opened_projects().contains("proj-a"),
+            "ended work retained cached question keys"
+        );
+        assert!(
+            v.decode(&q, kind, &own).is_none(),
+            "ended work became an attended project session"
+        );
+        assert_eq!(
+            v.decode(&other, kind, &other_project).as_deref(),
+            Some("synthetic other project question")
+        );
+        drop(unrelated_hold);
+        assert!(v.opened_projects().is_empty());
+        assert!(v.decode(&other, kind, &other_project).is_none());
     }
 
     #[test]

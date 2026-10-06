@@ -511,6 +511,14 @@ mod tests {
             let chat = guard
                 .create_default_engagement("answer-provenance-chat".into(), "Answer".into())
                 .unwrap_or_else(|_| panic!("create chat"));
+            assert!(
+                guard
+                    .ask_question(&chat.id, "Which region?", &[], None, false)
+                    .is_err(),
+                "question content opened a project without a session"
+            );
+            let project = guard.library_project_of_chat(&chat.id).unwrap();
+            guard.hold_session_for_tests(&project);
             let question_id = guard
                 .ask_question(&chat.id, "Which region?", &[], None, false)
                 .unwrap();

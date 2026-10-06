@@ -311,10 +311,12 @@ pub struct ContentVault {
     dir: PathBuf,
     /// The KEK seam (`SEC-4`) wrapping each per-scope DEK.
     wrap: Box<dyn KeyWrap>,
-    /// The record kinds treated as content. Other kinds pass ordinary plaintext;
+    /// The content-kind catalogue outside completely protected scopes.
     /// encrypted envelopes cannot be reclassified as unprotected metadata.
     kinds: BTreeSet<String>,
     record_protection: RecordProtection,
+    /// Complete strict payload coverage selected by trusted Home composition.
+    authenticated_scopes: BTreeSet<String>,
     /// Synchronized live-key cache and permanent write fences. Keeping both under one
     /// lock makes crypto-erasure linearizable with a concurrent writer: either the
     /// writer finishes first and erasure destroys its key, or it observes the fence
@@ -331,16 +333,22 @@ pub struct ContentVault {
     /// Unwrapped project keys, by key id.
     project_keys: scope_key::ProjectKeyCache,
     /// Which projects a session holds now (WS-740).
-    holds: holds::Holds,
+    holds: Arc<holds::Holds>,
 }
 
 #[derive(Default)]
 struct VaultKeyState {
-    /// Scope → 32-byte DEK, so the KEK is touched once per live scope.
-    cache: HashMap<String, [u8; 32]>,
+    /// Scope → key and its exact stored custody fingerprint.
+    cache: HashMap<String, CachedScopeKey>,
     /// Hashed key identifiers declared erased in this process or by the durable
     /// ledger. Raw scope names never enter the erasure ledger.
     erased_key_ids: BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct CachedScopeKey {
+    key: [u8; 32],
+    wrapped_fingerprint: Vec<u8>,
 }
 
 impl ContentVault {
@@ -355,11 +363,12 @@ impl ContentVault {
                 .map(|s| s.to_string())
                 .collect(),
             record_protection: RecordProtection::Legacy,
+            authenticated_scopes: BTreeSet::new(),
             key_state: Mutex::new(VaultKeyState::default()),
             ledger: None,
             scope_projects: Arc::default(),
             project_keys: scope_key::ProjectKeyCache::default(),
-            holds: holds::Holds::default(),
+            holds: Arc::default(),
         }
     }
 
@@ -376,6 +385,30 @@ impl ContentVault {
     pub fn require_authenticated_records(mut self) -> Self {
         self.record_protection = RecordProtection::Required;
         self
+    }
+
+    /// Require exact authenticated storage for every payload in selected scopes.
+    /// Scope selection is additive and grants no access or clinical enrollment.
+    pub fn require_authenticated_scopes<I, S>(mut self, scopes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.authenticated_scopes
+            .extend(scopes.into_iter().map(Into::into));
+        self
+    }
+
+    fn record_mode(&self, scope: &str) -> RecordProtection {
+        if self.authenticated_scopes.contains(scope) {
+            RecordProtection::Required
+        } else {
+            self.record_protection
+        }
+    }
+
+    fn protects_record(&self, scope: &str, kind: &str) -> bool {
+        self.authenticated_scopes.contains(scope) || self.is_content(kind)
     }
 
     /// Override which record kinds are treated as content (builder).
@@ -589,10 +622,10 @@ struct OrganizationSecretEnvelope {
 
 impl ContentCodec for ContentVault {
     fn encode(&self, scope: &str, kind: &str, payload: &str) -> Result<String, String> {
-        if !self.is_content(kind) {
+        if !self.protects_record(scope, kind) {
             return Ok(payload.to_string());
         }
-        let bound = !matches!(self.record_protection, RecordProtection::Legacy);
+        let bound = !matches!(self.record_mode(scope), RecordProtection::Legacy);
         let aad = if bound {
             record_binding(scope, kind)
         } else {
@@ -615,20 +648,20 @@ impl ContentCodec for ContentVault {
     }
 
     fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String> {
-        if !self.is_content(kind) {
+        if !self.protects_record(scope, kind) {
             return (!payload.starts_with(ENCRYPTED_PREFIX)).then(|| payload.to_string());
         }
         let (hexct, aad) = if let Some(ct) = payload.strip_prefix(BOUND_MARKER) {
             (ct, record_binding(scope, kind))
         } else if let Some(ct) = payload.strip_prefix(MARKER) {
-            if matches!(self.record_protection, RecordProtection::Required) {
+            if matches!(self.record_mode(scope), RecordProtection::Required) {
                 return None;
             }
             (ct, Vec::new())
         } else {
             // Unknown encrypted formats never fall through as plaintext.
             return (!payload.starts_with(ENCRYPTED_PREFIX)
-                && !matches!(self.record_protection, RecordProtection::Required))
+                && !matches!(self.record_mode(scope), RecordProtection::Required))
             .then(|| payload.to_string());
         };
         let ct = hex::decode(hexct).ok()?;
@@ -957,6 +990,154 @@ mod tests {
         ContentVault::new(dir, Box::new(LoopbackKeyWrap::new([7u8; 32]))).with_ledger(Box::new(
             LocalFileErasureLedger::new(dir.join("erased.ledger")),
         ))
+    }
+
+    #[test]
+    fn complete_scope_protection_is_additive_and_cannot_be_weakened_by_kind_options() {
+        let root = tempfile::tempdir().unwrap();
+        let v = vault(root.path())
+            .require_authenticated_scopes(["chat:a"])
+            .require_authenticated_scopes(["chat:b"])
+            .with_kinds(Vec::<String>::new())
+            .with_authenticated_record_writes();
+        let body = "synthetic private patient extension";
+        for scope in ["chat:a", "chat:b"] {
+            let sealed = v.encode(scope, "new-unlisted-kind", body).unwrap();
+            assert!(sealed.starts_with(BOUND_MARKER));
+            assert_eq!(
+                v.decode(scope, "new-unlisted-kind", &sealed).as_deref(),
+                Some(body)
+            );
+            assert_eq!(v.decode(scope, "different-unlisted-kind", &sealed), None);
+            assert_eq!(v.decode(scope, "new-unlisted-kind", body), None);
+            assert_eq!(v.decode(scope, "new-unlisted-kind", "gwenc:1:00"), None);
+            assert_eq!(v.decode(scope, "new-unlisted-kind", "gwenc:99:00"), None);
+        }
+        let sealed = v.encode("chat:a", "new-unlisted-kind", body).unwrap();
+        let wrapped = std::fs::read(v.key_path("chat:a")).unwrap();
+        std::fs::write(v.key_path("chat:c"), wrapped).unwrap();
+        let other = vault(root.path()).require_authenticated_scopes(["chat:c"]);
+        assert_eq!(other.decode("chat:c", "new-unlisted-kind", &sealed), None);
+        assert_eq!(
+            v.encode("ordinary", "new-unlisted-kind", body).unwrap(),
+            body
+        );
+        assert_eq!(
+            v.decode("ordinary", "new-unlisted-kind", body).as_deref(),
+            Some(body)
+        );
+    }
+
+    #[test]
+    fn complete_scope_rows_are_sealed_and_refuse_tampering_erasure_and_cold_recreation() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("scope.sqlite");
+        let key_dir = root.path().join("keys");
+        let vault = Arc::new(vault_with_ledger(&key_dir).require_authenticated_scopes(["chat:a"]));
+        vault.initialize_scope_key("chat:a").unwrap();
+        let mut store = Store::open(database.to_str().unwrap())
+            .unwrap()
+            .with_codec(vault.clone());
+        let body = "synthetic private patient extension";
+        store
+            .append_record("chat:a", "new-unlisted-kind", body)
+            .unwrap();
+        let raw = rusqlite::Connection::open(&database).unwrap();
+        let sealed: String = raw
+            .query_row(
+                "SELECT payload FROM events WHERE scope_id='chat:a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sealed.starts_with(BOUND_MARKER));
+        assert!(!sealed.contains(body));
+        assert_eq!(store.retained_events("chat:a").unwrap()[0].2, body);
+        raw.execute(
+            "UPDATE events SET kind='another-unlisted-kind' WHERE scope_id='chat:a'",
+            [],
+        )
+        .unwrap();
+        assert!(store.retained_events("chat:a").is_err());
+        raw.execute(
+            "UPDATE events SET kind='new-unlisted-kind', payload=?1 WHERE scope_id='chat:a'",
+            [body],
+        )
+        .unwrap();
+        assert!(store.retained_events("chat:a").is_err());
+        raw.execute(
+            "UPDATE events SET payload=?1 WHERE scope_id='chat:a'",
+            [&sealed],
+        )
+        .unwrap();
+        assert_eq!(store.retained_events("chat:a").unwrap()[0].2, body);
+        assert!(vault.crypto_erase("chat:a"));
+        assert!(store.retained_events("chat:a").is_err());
+        assert!(store
+            .append_record("chat:a", "another-unlisted-kind", body)
+            .is_err());
+        drop(store);
+        drop(vault);
+        let reopened =
+            Arc::new(vault_with_ledger(&key_dir).require_authenticated_scopes(["chat:a"]));
+        reopened.reerase_recorded();
+        let mut store = Store::open(database.to_str().unwrap())
+            .unwrap()
+            .with_codec(reopened.clone());
+        assert!(store.retained_events("chat:a").is_err());
+        assert!(store
+            .append_record("chat:a", "another-unlisted-kind", body)
+            .is_err());
+        assert!(!reopened.key_path("chat:a").exists());
+        let count: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE scope_id='chat:a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn complete_scope_typed_admission_and_fold_use_the_same_authenticated_codec() {
+        use gaugedesk_core::{
+            run::{RunCommand, RunState},
+            Lifecycle,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("typed-scope.sqlite");
+        let vault = Arc::new(
+            vault_with_ledger(root.path().join("keys").as_path())
+                .with_kinds(Vec::<String>::new())
+                .require_authenticated_scopes(["chat:a"]),
+        );
+        vault.initialize_scope_key("chat:a").unwrap();
+        let mut store = Store::open(database.to_str().unwrap())
+            .unwrap()
+            .with_codec(vault);
+        store
+            .admit::<RunState>("chat:a", RunCommand::RequestRun)
+            .unwrap();
+        store
+            .admit::<RunState>("chat:a", RunCommand::AdmitRun)
+            .unwrap();
+        let admitted = store
+            .admit::<RunState>("chat:a", RunCommand::StartRun)
+            .unwrap();
+        assert_eq!(store.fold::<RunState>("chat:a").unwrap(), admitted);
+        let raw = rusqlite::Connection::open(&database).unwrap();
+        let payloads: Vec<String> = raw
+            .prepare("SELECT payload FROM events WHERE scope_id='chat:a' AND kind=?1")
+            .unwrap()
+            .query_map([RunState::KIND], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!payloads.is_empty());
+        assert!(payloads
+            .iter()
+            .all(|payload| payload.starts_with(BOUND_MARKER)));
     }
 
     #[test]

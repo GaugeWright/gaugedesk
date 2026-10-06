@@ -87,8 +87,8 @@ debug = "line-tables-only"
 # source revision to the published contract revision and digest; no project
 # workstream feature may compile against the older crates.io release.
 [patch.crates-io]
-whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "3756c47ce5af4b7909f5f9162bc44294595a1959" }
-whipplescript-core = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "3756c47ce5af4b7909f5f9162bc44294595a1959" }
-whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "3756c47ce5af4b7909f5f9162bc44294595a1959" }
-whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "3756c47ce5af4b7909f5f9162bc44294595a1959" }
-whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "3756c47ce5af4b7909f5f9162bc44294595a1959" }
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
+whipplescript-core = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }

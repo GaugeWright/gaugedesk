@@ -131,14 +131,19 @@ impl ScopeProjectIndex {
     }
 
     /// The project `scope` belongs to: `project::<id>` and everything under it,
-    /// or a chat through its placement. `None` for any other scope.
+    /// or a chat and its question history through the actual placement.
+    /// A question namespace alone supplies no custody without its known chat.
     pub fn project_of(&self, scope: &str) -> Option<String> {
         if let Some(rest) = scope.strip_prefix("project::") {
             let id = rest.split("::").next().unwrap_or_default();
             return (!id.is_empty()).then(|| id.to_owned());
         }
         let maps = self.maps.read().ok()?;
-        let instance = maps.chat_instance.get(scope)?;
+        let instance = maps.chat_instance.get(scope).or_else(|| {
+            scope
+                .strip_prefix("questions::")
+                .and_then(|chat| maps.chat_instance.get(chat))
+        })?;
         maps.instance_project.get(instance).cloned()
     }
 }
@@ -286,6 +291,23 @@ impl ContentVault {
         Ok(encode_dek(&DekCustody::Project(key_id), &wrapped))
     }
 
+    /// Stored project custody must agree with the scope's current placement.
+    pub(crate) fn require_scope_custody(&self, scope: &str, stored: &[u8]) -> std::io::Result<()> {
+        if let DekCustody::Project(key_id) = decode_dek(stored)?.0 {
+            let expected = self
+                .scope_projects
+                .project_of(scope)
+                .map(|project| crate::org::sha256_hex(&project));
+            if expected.as_deref() != Some(key_id.as_str()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "scope project does not match stored key custody",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Unwrap a stored data key with whichever key its header names.
     pub(crate) fn unwrap_dek(&self, stored: &[u8]) -> std::io::Result<[u8; 32]> {
         let (custody, wrapped) = decode_dek(stored)?;
@@ -330,6 +352,7 @@ impl ContentVault {
         let dek = self.unwrap_dek(&stored)?;
         let rewrapped = self.wrap_dek_for_project(&project, &dek)?;
         replace_durably(&root, &path, &rewrapped)?;
+        self.key_state.lock().unwrap().cache.remove(scope);
         Ok(true)
     }
 }
@@ -369,6 +392,89 @@ mod tests {
     }
 
     #[test]
+    fn question_keys_follow_known_chat_custody_and_current_project_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = vault(dir.path());
+        let scope = crate::agent_question::question_scope("chat-a");
+        let sealed = legacy
+            .encode(
+                &scope,
+                crate::agent_question::QUESTION_KIND,
+                "synthetic clinical question",
+            )
+            .unwrap();
+        assert_eq!(custody_of(dir.path(), &scope), DekCustody::Install);
+        let v = Arc::new(vault(dir.path()));
+        place(&v, "chat-a", "place-a", Some("proj-a"));
+        place(&v, "chat-b", "place-b", Some("proj-b"));
+        place(&v, "edit-chat", "authoring-root", None);
+        assert_eq!(
+            v.scope_index().project_of(&scope).as_deref(),
+            Some("proj-a")
+        );
+        assert_eq!(v.scope_index().project_of("questions::unknown"), None);
+        assert_eq!(v.scope_index().project_of("questions::edit-chat"), None);
+        v.enforce_session_holds();
+        assert!(v
+            .decode(&scope, crate::agent_question::QUESTION_KIND, &sealed)
+            .is_none());
+        let unrelated = v.hold("proj-b");
+        assert!(v
+            .encode(
+                &scope,
+                crate::agent_question::QUESTION_KIND,
+                "other project write"
+            )
+            .is_err());
+        let hold = v.hold("proj-a");
+        assert!(v.adopt_project_custody(&scope).unwrap());
+        assert_eq!(
+            custody_of(dir.path(), &scope),
+            DekCustody::Project(project_key_id("proj-a"))
+        );
+        assert_eq!(
+            v.decode(&scope, crate::agent_question::QUESTION_KIND, &sealed)
+                .as_deref(),
+            Some("synthetic clinical question")
+        );
+        let chat = v
+            .encode("chat-a", "transcript", "separate chat content")
+            .unwrap();
+        let other = crate::agent_question::question_scope("chat-b");
+        v.encode(
+            &other,
+            crate::agent_question::QUESTION_KIND,
+            "other project question",
+        )
+        .unwrap();
+        assert_eq!(
+            custody_of(dir.path(), &other),
+            DekCustody::Project(project_key_id("proj-b"))
+        );
+        drop(hold);
+        assert!(v
+            .decode(&scope, crate::agent_question::QUESTION_KIND, &sealed)
+            .is_none());
+        assert!(v
+            .encode(
+                &scope,
+                crate::agent_question::QUESTION_KIND,
+                "after session"
+            )
+            .is_err());
+        let _hold = v.hold("proj-a");
+        assert!(v.crypto_erase(&scope));
+        assert!(v
+            .decode(&scope, crate::agent_question::QUESTION_KIND, &sealed)
+            .is_none());
+        assert_eq!(
+            v.decode("chat-a", "transcript", &chat).as_deref(),
+            Some("separate chat content")
+        );
+        drop(unrelated);
+    }
+
+    #[test]
     fn each_project_keys_its_own_chats_under_its_own_key() {
         let dir = tempfile::tempdir().unwrap();
         let v = vault(dir.path());
@@ -403,9 +509,45 @@ mod tests {
 
         // A fresh vault holding nothing in memory opens it through the project key.
         let reopened = vault(dir.path());
+        assert!(
+            reopened.decode("chat-a", "transcript", &sealed).is_none(),
+            "cold reader needs the original project placement"
+        );
+        place(&reopened, "chat-a", "place-a", Some("proj-a"));
         assert_eq!(
             reopened.decode("chat-a", "transcript", &sealed).as_deref(),
             Some("alpha")
+        );
+    }
+
+    #[test]
+    fn cached_scope_key_refuses_substituted_project_custody_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = vault(dir.path());
+        place(&v, "chat-a", "place-a", Some("proj-a"));
+        let sealed = v
+            .encode("chat-a", "transcript", "original cached content")
+            .unwrap();
+        let path = dek_file(dir.path(), "chat-a");
+        let original = std::fs::read(&path).unwrap();
+        let (_, wrapped) = decode_dek(&original).unwrap();
+        place(&v, "chat-a", "place-b", Some("proj-b"));
+        let substituted = encode_dek(&DekCustody::Project(project_key_id("proj-b")), wrapped);
+        std::fs::write(&path, &substituted).unwrap();
+        assert!(v.key_state.lock().unwrap().cache.contains_key("chat-a"));
+        assert!(
+            v.decode("chat-a", "transcript", &sealed).is_none(),
+            "substituted custody bytes reused a cached original key"
+        );
+        assert!(v
+            .encode("chat-a", "transcript", "replacement content")
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), substituted);
+        std::fs::write(&path, original).unwrap();
+        place(&v, "chat-a", "place-a", Some("proj-a"));
+        assert_eq!(
+            v.decode("chat-a", "transcript", &sealed).as_deref(),
+            Some("original cached content")
         );
     }
 
@@ -447,10 +589,11 @@ mod tests {
             !v.adopt_project_custody("chat-a").unwrap(),
             "adopting again moves nothing"
         );
+        let reopened = vault(dir.path());
+        assert!(reopened.decode("chat-a", "transcript", &sealed).is_none());
+        place(&reopened, "chat-a", "place-a", Some("proj-a"));
         assert_eq!(
-            vault(dir.path())
-                .decode("chat-a", "transcript", &sealed)
-                .as_deref(),
+            reopened.decode("chat-a", "transcript", &sealed).as_deref(),
             Some("written long ago"),
             "the data key did not change, so old content still opens"
         );

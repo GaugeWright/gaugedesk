@@ -58,11 +58,13 @@ impl ContentVault {
         scope: &str,
         recipient: &PublicKey,
     ) -> std::io::Result<PreparedScopeTransfer> {
+        self.delegated(scope)?;
         let key_id = self.confirmed_scope(scope)?;
         let root = std::fs::canonicalize(&self.dir)?;
         let _lease = shared(&root, &key_id)?;
         available(&root, &key_id)?;
         let wrapped = std::fs::read(key_path(&root, &key_id))?;
+        self.require_scope_custody(scope, &wrapped)?;
         let data_key = self.unwrap_dek(&wrapped)?;
         let payload = KeyPayload {
             protocol: PROTOCOL.into(),
@@ -79,6 +81,9 @@ impl ContentVault {
                 key_id,
                 wrapped_fingerprint: fingerprint(&wrapped),
                 cipher: LocalAeadEncryptor::new(data_key),
+                scope_projects: self.scope_projects.clone(),
+                holds: self.holds.clone(),
+                original_project: self.scope_projects.project_of(scope),
             }),
             capsule: ScopeKeyCapsule {
                 protocol: PROTOCOL.into(),
@@ -108,6 +113,7 @@ impl ContentVault {
         {
             return Err(invalid_transfer());
         }
+        self.delegated(expected_scope)?;
         let key_id = self.confirmed_scope(expected_scope)?;
         let bytes = open_sealed(recipient, &capsule.sealed).ok_or_else(invalid_transfer)?;
         let payload: KeyPayload = serde_json::from_slice(&bytes).map_err(|_| invalid_transfer())?;
@@ -124,6 +130,7 @@ impl ContentVault {
         let path = key_path(&root, &key_id);
         let wrapped = match std::fs::read(&path) {
             Ok(wrapped) => {
+                self.require_scope_custody(expected_scope, &wrapped)?;
                 if self.unwrap_dek(&wrapped)? != payload.data_key {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
@@ -157,6 +164,9 @@ impl ContentVault {
             key_id,
             wrapped_fingerprint: fingerprint(&wrapped),
             cipher: LocalAeadEncryptor::new(payload.data_key),
+            scope_projects: self.scope_projects.clone(),
+            holds: self.holds.clone(),
+            original_project: self.scope_projects.project_of(expected_scope),
         })
     }
 }

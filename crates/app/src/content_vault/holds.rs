@@ -110,10 +110,6 @@ impl ContentVault {
         self.holds.enforced.store(true, Ordering::Relaxed);
     }
 
-    pub(super) fn session_holds_enforced(&self) -> bool {
-        self.holds.enforced.load(Ordering::Relaxed)
-    }
-
     /// Hold `project` for a session until the returned hold is dropped.
     pub fn hold(self: &Arc<Self>, project: &str) -> SessionHold {
         self.holds
@@ -246,23 +242,31 @@ impl ContentVault {
             .retain(|scope, _| self.scope_projects.project_of(scope).as_deref() != Some(project));
         self.project_keys.forget(project);
     }
+}
 
-    /// Whether the session gate admits `scope` at `now` outside an unattended
-    /// step: a scope of no project always, a project scope while a session
-    /// holds its project.
-    pub(super) fn session_admits(&self, scope: &str, now: u64) -> std::io::Result<()> {
-        if !self.session_holds_enforced() {
+impl Holds {
+    /// Current session standing shared with prepared keys; no key lives here.
+    pub(super) fn session_admits(
+        &self,
+        index: &ScopeProjectIndex,
+        scope: &str,
+        now: u64,
+    ) -> std::io::Result<()> {
+        if !self.enforced.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let Some(project) = self.scope_projects.project_of(scope) else {
+        let Some(project) = index.project_of(scope) else {
             return Ok(());
         };
-        if self.held(&project, now) {
+        let held = self
+            .projects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&project)
+            .is_some_and(|hold| hold.guards > 0 || hold.linger_until_ms > now);
+        if held {
             return Ok(());
         }
-        // Every path that serves a member holds what it reads, so a refusal
-        // here is a path missing its hold — and it reads as missing content,
-        // because the store omits what it cannot open.
         tracing::warn!(%project, "content vault: refused a project scope no session holds");
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -339,6 +343,142 @@ mod tests {
             v.decode("chat-a", "transcript", &a),
             None,
             "dropped when it ends"
+        );
+    }
+
+    #[test]
+    fn prepared_key_cannot_outlive_current_work_or_widen_a_background_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ContentVault::new(dir.path(), Box::new(LoopbackKeyWrap::new([5u8; 32])))
+            .with_ledger(Box::new(LocalFileErasureLedger::new(
+                dir.path().join("erasure.ledger"),
+            )));
+        vault
+            .scope_index()
+            .record_instance("place-a", Some("proj-a"));
+        vault.scope_index().record_chat("chat-a", "place-a");
+        vault.enforce_session_holds();
+        let v = Arc::new(vault);
+        let hold = v.hold("proj-a");
+        let key = v.initialize_scope_key("chat-a").unwrap();
+        let ciphertext = key
+            .seal(b"synthetic binding", b"synthetic protected result")
+            .unwrap();
+        assert_eq!(
+            key.open(b"synthetic binding", &ciphertext).unwrap(),
+            b"synthetic protected result"
+        );
+        drop(hold);
+        assert!(
+            key.open(b"synthetic binding", &ciphertext).is_err(),
+            "prepared key retained standing after the session ended"
+        );
+        assert!(key.seal(b"synthetic binding", b"later output").is_err());
+        let mut called = false;
+        let result: std::io::Result<()> = key.retain(|| {
+            called = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!called, "ended work reached retained publication");
+        let hold = v.hold("proj-a");
+        let omitted = BTreeSet::from(["chat-a2".to_owned()]);
+        let (read, refused) = super::super::act_for("proj-a", &omitted, || {
+            key.open(b"synthetic binding", &ciphertext)
+        });
+        assert!(
+            read.is_err(),
+            "an active session widened unrelated background work"
+        );
+        assert_eq!(refused, BTreeSet::from(["chat-a".to_owned()]));
+        drop(hold);
+        let declared = BTreeSet::from(["chat-a".to_owned()]);
+        let (read, refused) = super::super::act_for("proj-a", &declared, || {
+            key.open(b"synthetic binding", &ciphertext)
+        });
+        assert_eq!(read.unwrap(), b"synthetic protected result");
+        assert!(refused.is_empty());
+        let (read, refused) = super::super::act_for("proj-b", &declared, || {
+            key.open(b"synthetic binding", &ciphertext)
+        });
+        assert!(
+            read.is_err(),
+            "a foreign project borrowed the prepared cipher"
+        );
+        assert_eq!(refused, declared);
+        assert!(key.open(b"synthetic binding", &ciphertext).is_err());
+    }
+
+    #[test]
+    fn prepared_key_refuses_a_changed_or_removed_original_project_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ContentVault::new(dir.path(), Box::new(LoopbackKeyWrap::new([5u8; 32])))
+            .with_ledger(Box::new(LocalFileErasureLedger::new(
+                dir.path().join("erasure.ledger"),
+            )));
+        vault
+            .scope_index()
+            .record_instance("place-a", Some("proj-a"));
+        vault.scope_index().record_chat("chat-a", "place-a");
+        vault.enforce_session_holds();
+        let v = Arc::new(vault);
+        let original_hold = v.hold("proj-a");
+        let key = v.initialize_scope_key("chat-a").unwrap();
+        let ciphertext = key
+            .seal(b"synthetic binding", b"original project result")
+            .unwrap();
+        let content = v
+            .encode("chat-a", "transcript", "cached original project result")
+            .unwrap();
+        let recipient = gaugedesk_core::signature::SigningKey::from_seed(&[7u8; 32]).unwrap();
+        let foreign_hold = v.hold("proj-b");
+        for project in [Some("proj-b"), None] {
+            v.scope_index().record_instance("place-a", project);
+            assert!(
+                key.open(b"synthetic binding", &ciphertext).is_err(),
+                "changed placement reclassified the original project key"
+            );
+            assert!(key.seal(b"synthetic binding", b"new output").is_err());
+            assert!(v
+                .prepare_scope_transfer("chat-a", &recipient.public_key())
+                .is_err());
+            assert!(
+                v.key_state.lock().unwrap().cache.contains_key("chat-a"),
+                "qualification lost its cached-key case"
+            );
+            assert!(
+                v.prepare_scope_key("chat-a").is_err(),
+                "fresh preparation crossed stored project custody"
+            );
+            assert!(
+                v.decode("chat-a", "transcript", &content).is_none(),
+                "cached key crossed stored project custody"
+            );
+            assert!(v
+                .encode("chat-a", "transcript", "replacement output")
+                .is_err());
+            let mut called = false;
+            let result: std::io::Result<()> = key.retain(|| {
+                called = true;
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert!(!called);
+        }
+        drop(foreign_hold);
+        v.scope_index().record_instance("place-a", Some("proj-a"));
+        drop(original_hold);
+        let _current_original_hold = v.hold("proj-a");
+        assert_eq!(
+            key.open(b"synthetic binding", &ciphertext).unwrap(),
+            b"original project result"
+        );
+        assert_eq!(
+            v.prepare_scope_key("chat-a")
+                .unwrap()
+                .open(b"synthetic binding", &ciphertext)
+                .unwrap(),
+            b"original project result"
         );
     }
 

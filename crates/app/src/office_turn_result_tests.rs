@@ -67,6 +67,68 @@ fn office_output_preparation_preserves_unresolved_dependencies_without_publishin
         .stakeholders
         .contains(&gaugedesk_core::boundary::Authority::from("input-owner")));
 }
+#[test]
+fn office_startup_adopts_legacy_question_key_with_original_ciphertext_intact() {
+    use gaugedesk_store::ContentCodec;
+    let root = tempfile::tempdir().unwrap();
+    let (wb, _, _, _) = fixture(root.path());
+    let chat = chat(&wb);
+    let scope = crate::agent_question::question_scope(&chat);
+    // Write an existing install-wrapped question key as an older Home did.
+    // This vault has no project index, unlike the actual serving workbench.
+    let legacy = crate::content_vault::ContentVault::new(
+        root.path().join("content-keys"),
+        crate::at_rest::local_content_keywrap(root.path()).unwrap(),
+    );
+    let payload = legacy
+        .encode(
+            &scope,
+            crate::agent_question::QUESTION_KIND,
+            "synthetic legacy private question",
+        )
+        .unwrap();
+    let key_path = root
+        .path()
+        .join("content-keys")
+        .join(format!("{}.dek", crate::org::sha256_hex(&scope)));
+    let before_key = std::fs::read(&key_path).unwrap();
+    assert!(before_key.starts_with(b"gaugedesk.dek.v2\n\0"));
+    let held = wb.lock_unpoisoned();
+    let raw = rusqlite::Connection::open(held.store_ref().path()).unwrap();
+    raw.execute(
+        "INSERT INTO events(scope_id,position,kind,payload) VALUES(?1,1,?2,?3)",
+        rusqlite::params![scope, crate::agent_question::QUESTION_KIND, payload],
+    )
+    .unwrap();
+    let migrated = held.adopt_project_content_custody();
+    assert!(migrated >= 1);
+    let after_key = std::fs::read(&key_path).unwrap();
+    assert!(after_key.starts_with(b"gaugedesk.dek.v2\n\x01"));
+    assert!(after_key[b"gaugedesk.dek.v2\n\x01".len()..]
+        .starts_with(crate::org::sha256_hex("shared").as_bytes()));
+    let stored: String = raw
+        .query_row(
+            "SELECT payload FROM events WHERE scope_id=?1",
+            [&scope],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, payload, "custody adoption rewrote the question");
+    assert_eq!(
+        held.content_vault
+            .as_ref()
+            .unwrap()
+            .decode(&scope, crate::agent_question::QUESTION_KIND, &stored)
+            .as_deref(),
+        Some("synthetic legacy private question")
+    );
+    assert_eq!(
+        held.adopt_project_content_custody(),
+        0,
+        "second adoption replaced custody again"
+    );
+}
+
 use whipplescript_kernel::host_protocol::{
     EventPosition, PolicyEpochRef, RuntimeEvidencePointer, TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };

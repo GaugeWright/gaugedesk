@@ -143,6 +143,9 @@ pub struct PreparedScopeKey {
     key_id: String,
     wrapped_fingerprint: Vec<u8>,
     cipher: LocalAeadEncryptor,
+    scope_projects: Arc<ScopeProjectIndex>,
+    holds: Arc<holds::Holds>,
+    original_project: Option<String>,
 }
 
 impl PreparedScopeKey {
@@ -156,6 +159,14 @@ impl PreparedScopeKey {
         &self,
         publish: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
+        acting::delegated(&self.scope_projects, &self.holds, &self.scope)?;
+        if self.scope_projects.project_of(&self.scope) != self.original_project {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "scope project changed after key preparation",
+            )
+            .into());
+        }
         let _lease = shared(&self.root, &self.key_id)?;
         available(&self.root, &self.key_id)?;
         let wrapped = std::fs::read(key_path(&self.root, &self.key_id))?;
@@ -229,12 +240,16 @@ impl ContentVault {
         key_id: String,
         wrapped: &[u8],
     ) -> std::io::Result<PreparedScopeKey> {
+        self.require_scope_custody(scope, wrapped)?;
         Ok(PreparedScopeKey {
             root,
             scope: scope.to_owned(),
             key_id,
             wrapped_fingerprint: fingerprint(wrapped),
             cipher: LocalAeadEncryptor::new(self.unwrap_dek(wrapped)?),
+            scope_projects: self.scope_projects.clone(),
+            holds: self.holds.clone(),
+            original_project: self.scope_projects.project_of(scope),
         })
     }
 
@@ -302,12 +317,6 @@ impl ContentVault {
         let key_id = crate::org::sha256_hex(scope);
         let lease = shared(&root, &key_id).ok()?;
         available(&root, &key_id).ok()?;
-        if key_path(&root, &key_id).is_file() {
-            let cached = self.key_state.lock().unwrap().cache.get(scope).copied();
-            if let Some(key) = cached {
-                return use_key(key);
-            }
-        }
         let wrapped = match self.existing_or_new_key(&root, scope, &key_id, false) {
             Ok(wrapped) => wrapped,
             Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
@@ -315,6 +324,7 @@ impl ContentVault {
                 let _exclusive = exclusive(&root, &key_id).ok()?;
                 available(&root, &key_id).ok()?;
                 let wrapped = self.existing_or_new_key(&root, scope, &key_id, true).ok()?;
+                self.require_scope_custody(scope, &wrapped).ok()?;
                 let key = self.unwrap_dek(&wrapped).ok()?;
                 {
                     // The fence and the cache share a lock so a writer either
@@ -324,19 +334,39 @@ impl ContentVault {
                     if state.erased_key_ids.contains(&key_id) {
                         return None;
                     }
-                    state.cache.insert(scope.to_owned(), key);
+                    state.cache.insert(
+                        scope.to_owned(),
+                        CachedScopeKey {
+                            key,
+                            wrapped_fingerprint: fingerprint(&wrapped),
+                        },
+                    );
                 }
                 return use_key(key);
             }
             Err(_) => return None,
         };
+        self.require_scope_custody(scope, &wrapped).ok()?;
+        let cached = self.key_state.lock().unwrap().cache.get(scope).cloned();
+        if let Some(cached) = cached {
+            if cached.wrapped_fingerprint != fingerprint(&wrapped) {
+                return None;
+            }
+            return use_key(cached.key);
+        }
         let key = self.unwrap_dek(&wrapped).ok()?;
         {
             let mut state = self.key_state.lock().unwrap();
             if state.erased_key_ids.contains(&key_id) {
                 return None;
             }
-            state.cache.insert(scope.to_owned(), key);
+            state.cache.insert(
+                scope.to_owned(),
+                CachedScopeKey {
+                    key,
+                    wrapped_fingerprint: fingerprint(&wrapped),
+                },
+            );
         }
         use_key(key)
     }

@@ -7668,6 +7668,9 @@ async fn the_task_bar_shows_each_person_only_their_own_work() {
         );
         assert_eq!(guard.library.chats["anonymous"].owner, None);
         for chat in ["theirs", "anonymous"] {
+            // This fixture models the agent writing within an open project.
+            let project = guard.library_project_of_chat(chat).unwrap();
+            guard.hold_session_for_tests(&project);
             guard
                 .ask_question(chat, "Which environment?", &[], None, false)
                 .expect("the agent asks");
