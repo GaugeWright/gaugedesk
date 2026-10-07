@@ -1778,6 +1778,7 @@ fn gaugeapp_agent_instructions(session: &GaugeAppSession) -> String {
 You can list and read the pages this session admits, submit the commands those pages declare, and ask the person a question. You have no other access: no files, shell, browser, or other scopes.
 
 - Read the current page before you answer about it or change it. Pages change, so don't rely on an earlier read.
+- The person speaks in the words the page shows them. Each page's model has a `guide`: what the page is, what each of its controls is called and which field it sets, and for each command what it does, which control it stands for, and an example payload. Use it to match what the person asks for to a field or command, and build payloads in the example's shape. If nothing in any page's guide matches, say what the pages do offer rather than guessing.
 - A command either applies immediately or becomes a proposal the person reviews. Say which happened. Report success only after the tool returns an applied receipt, and never approve your own proposal.
 - Ask before making a change the person did not clearly request, and when required information is missing.
 - Never ask for, show, guess, or put a secret in a command: passwords, keys, tokens, codes. Passkeys, secret entry, device approval and provider sign-in are done by the person in the page's own controls; point them there.
@@ -2313,6 +2314,39 @@ fn assistant_text(output: &[Value]) -> String {
 pub type DirectAction<'a> =
     &'a mut dyn FnMut(&GaugeAppAgentProposal, &str) -> Result<Value, GaugeAppAgentError>;
 
+/// The idempotency key of one immediate command an agent message applies:
+/// the message's key and the command itself. A message is the unit a client
+/// retries, and a retry runs the model again, which may issue its commands in
+/// another order; keyed by content, each command a retry repeats is applied
+/// once and each different one applies. Keyed by the message alone, only one
+/// command could be applied per message, so "do these three things" did one.
+fn direct_command_key(message_key: &str, proposal: &GaugeAppAgentProposal) -> String {
+    let command = serde_json::to_vec(&json!({
+        "page": proposal.page_id,
+        "command": proposal.command_id,
+        "payload": proposal.payload,
+    }))
+    .expect("a proposal serializes");
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let key = format!("{message_key}:{}", hex(&Sha256::digest(&command)[..12]));
+    // Command stores refuse a key over 200 bytes; a long message key is
+    // shortened to its own digest rather than truncated into a collision.
+    if key.len() <= 200 {
+        key
+    } else {
+        format!(
+            "{}:{}",
+            hex(&Sha256::digest(message_key.as_bytes())[..16]),
+            hex(&Sha256::digest(&command)[..12])
+        )
+    }
+}
+
 // Keep the live grant, opening grant, and direct-action state explicit at the
 // untrusted provider boundary so none is silently reused as another.
 #[allow(clippy::too_many_arguments)]
@@ -2327,7 +2361,6 @@ fn tool_result(
     validate_proposal: &mut dyn FnMut(&GaugeAppAgentProposal) -> Result<(), GaugeAppAgentError>,
     direct_action: &mut Option<DirectAction<'_>>,
     direct_key: &str,
-    direct_used: &mut bool,
 ) -> Result<Value, GaugeAppAgentError> {
     let tool = canonical_tool(name).unwrap_or(name);
     let request = GaugeAppAgentToolRequest {
@@ -2409,19 +2442,14 @@ fn tool_result(
                 .is_some_and(|command| command.review == ReviewPolicy::Immediate);
             if immediate {
                 if let Some(apply) = direct_action.as_mut() {
-                    if *direct_used {
-                        return Ok(
-                            json!({ "applied": false, "error": "Only one immediate action can be applied in one message. Send another message for the next action." }),
-                        );
-                    }
-                    let result = match apply(&proposal, direct_key) {
+                    let key = direct_command_key(direct_key, &proposal);
+                    let result = match apply(&proposal, &key) {
                         Ok(result) => result,
                         Err(GaugeAppAgentError::InvalidOutput(reason)) => {
                             return Ok(json!({ "applied": false, "error": reason }));
                         }
                         Err(error) => return Err(error),
                     };
-                    *direct_used = true;
                     return Ok(json!({ "applied": true, "result": result }));
                 }
             }
@@ -2738,7 +2766,6 @@ where
         message,
     )?;
     let mut proposals = Vec::new();
-    let mut direct_used = false;
     for _ in 0..MAX_TOOL_ROUNDS {
         let body = json!({
             "model": gaugedesk_env::var("MANAGEMENT_AGENT_MODEL").unwrap_or_else(|| "gpt-5.6-terra".into()),
@@ -2821,7 +2848,6 @@ where
                 &mut |proposal| validate_proposal(&current, proposal),
                 &mut direct_action,
                 direct_key,
-                &mut direct_used,
             )?;
             emit(GaugeAppAgentLiveEvent::ToolResult {
                 call_id: call_id.to_owned(),
@@ -3286,6 +3312,41 @@ mod tests {
     }
 
     #[test]
+    fn each_immediate_command_in_a_message_has_its_own_stable_key() {
+        let proposal = |command: &str, payload: Value| GaugeAppAgentProposal {
+            page_id: "panel-profile".into(),
+            command_id: command.into(),
+            expected_basis: "basis-1".into(),
+            payload,
+        };
+        let files = proposal(
+            "agent.panel-profile.set",
+            json!({ "profile": { "panels": 1 } }),
+        );
+        let tasks = proposal(
+            "agent.abilities.set",
+            json!({ "abilities": ["tracker.file"] }),
+        );
+        let first = direct_command_key("agent:message-1", &files);
+        // A retry of the message repeats the command under the same key, so
+        // it applies once; another command in the message has its own.
+        assert_eq!(first, direct_command_key("agent:message-1", &files));
+        assert_ne!(first, direct_command_key("agent:message-1", &tasks));
+        assert_ne!(first, direct_command_key("agent:message-2", &files));
+        // The basis it was read at is not the command: a retry that re-read
+        // the page after its first attempt applied still finds that receipt.
+        let reread = GaugeAppAgentProposal {
+            expected_basis: "basis-2".into(),
+            ..files.clone()
+        };
+        assert_eq!(first, direct_command_key("agent:message-1", &reread));
+        let long = "k".repeat(200);
+        let shortened = direct_command_key(&long, &files);
+        assert!(shortened.len() <= 200);
+        assert_ne!(shortened, direct_command_key(&"j".repeat(200), &files));
+    }
+
+    #[test]
     fn action_kinds_keep_direct_commands_and_human_ceremonies_distinct() {
         let grant = |id: &str, review| GaugeAppCommandGrant {
             id: id.into(),
@@ -3520,7 +3581,6 @@ mod tests {
                 &mut |_| Ok(()),
                 &mut None,
                 "",
-                &mut false,
             ),
             Err(GaugeAppAgentError::Rejected(
                 GaugeAppAgentRejection::SessionMismatch
@@ -3579,7 +3639,6 @@ mod tests {
             &mut |_| Err(GaugeAppAgentError::InvalidOutput("name is empty".into())),
             &mut None,
             "",
-            &mut false,
         )
         .unwrap();
         assert_eq!(
@@ -3604,53 +3663,44 @@ mod tests {
             actions: vec![],
         };
         let mut proposals = Vec::new();
-        let mut used = false;
-        let mut applied = 0;
+        let mut keys = Vec::new();
         let mut apply = |proposal: &GaugeAppAgentProposal, key: &str| {
-            applied += 1;
             assert_eq!(proposal.command_id, "organization.display-name.set");
-            assert_eq!(key, "message-key");
+            keys.push(key.to_owned());
             Ok(json!({ "receipt": "saved" }))
         };
-        let args = json!({
-            "page_id": page.id,
-            "command_id": "organization.display-name.set",
-            "payload": { "display_name": "Example" }
-        });
-        let first = tool_result(
-            &session,
-            &agent_session,
-            &agent_session,
-            std::slice::from_ref(&page),
-            "gaugeapp_proposals_prepare",
-            args.clone(),
-            &mut proposals,
-            &mut |_| Ok(()),
-            &mut Some(&mut apply),
-            "message-key",
-            &mut used,
-        )
-        .unwrap();
+        let mut submit = |name: &str| {
+            tool_result(
+                &session,
+                &agent_session,
+                &agent_session,
+                std::slice::from_ref(&page),
+                "gaugeapp_proposals_prepare",
+                json!({
+                    "page_id": page.id,
+                    "command_id": "organization.display-name.set",
+                    "payload": { "display_name": name }
+                }),
+                &mut proposals,
+                &mut |_| Ok(()),
+                &mut Some(&mut apply),
+                "message-key",
+            )
+            .unwrap()
+        };
+        let first = submit("Example");
         assert_eq!(
             first,
             json!({ "applied": true, "result": { "receipt": "saved" } })
         );
-        let second = tool_result(
-            &session,
-            &agent_session,
-            &agent_session,
-            std::slice::from_ref(&page),
-            "gaugeapp_proposals_prepare",
-            args,
-            &mut proposals,
-            &mut |_| Ok(()),
-            &mut Some(&mut apply),
-            "message-key",
-            &mut used,
-        )
-        .unwrap();
-        assert_eq!(second["applied"], false);
-        assert_eq!(applied, 1);
+        // One message may apply several commands. The same command again is
+        // sent under the same key, which the owning store answers once.
+        assert_eq!(submit("Example")["applied"], true);
+        assert_eq!(submit("Other")["applied"], true);
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[2]);
+        assert!(keys.iter().all(|key| key.starts_with("message-key:")));
         assert!(proposals.is_empty());
     }
 

@@ -1,8 +1,8 @@
 import {
-    accountHomeRoutes,
     accountTenants,
     browserRouteJson,
     parseOpaqueHomeRoutes,
+    resolveHomeRoutes,
     HomePool,
     type AccountTenant,
     type HomeConnection,
@@ -42,36 +42,52 @@ export class MobileHomePool extends HomePool<MobileControlPlane> {
     }
 }
 
+export interface LoadMobileHomeRoutesOptions {
+    /** The signed-in account. It namespaces the root-key pin (ADR 0132 §5);
+     * when empty, the subject the hub names for this session is used. */
+    readonly subject?: string;
+    /** Where the root-key pin lives. Without it the key is read fresh and used
+     * from memory, so a relay-only Home is still reached; what is lost is
+     * noticing a root that changed between launches (ADR 0133 §6). */
+    readonly storage?: Pick<Storage, "getItem" | "setItem">;
+    readonly fetchJson?: (url: string) => Promise<string | null>;
+    readonly onDegraded?: (reason: string) => void;
+    readonly onRootKeyConflict?: (error: Error) => void;
+}
+
+/**
+ * Project→Home routes for the native app, across both channels (WS-746,
+ * ADR 0133 §3 and §5).
+ *
+ * A serving Home publishes its routes, relay locators included, only into the
+ * root-signed directory record; nothing writes a relay route into the hub's
+ * table, and the table may not carry one anyway (ADR 0131). So mobile reads the
+ * signed record exactly as the browser does — project, pin, verify — and takes
+ * the hub's table at its true `unsigned` provenance for everything the record
+ * does not cover. That retires the carve-out this function used to keep, which
+ * read the hub table as `signed`: it honoured a pin anyone holding the person's
+ * session could write, and it still never saw a relay-only Home, because no
+ * such route ever arrived there.
+ *
+ * Every failure on the signed path — no verifier in this build, no projected
+ * root, a directory outage, a record that does not verify — degrades to the
+ * hub's endpoints rather than failing, which is what this read returned for a
+ * directly addressable Home before.
+ */
 export async function loadMobileHomeRoutes(
     accountBase: string,
     bearer: () => string | null,
+    options: LoadMobileHomeRoutesOptions = {},
 ): Promise<OpaqueHomeRoute[]> {
-    const json = browserRouteJson(accountBase, { bearer });
-    // Keep parsing at the shared transport boundary even though
-    // accountHomeRoutes already returns the branded shape.
-    // The carve-out ADR 0133 §5 sequences: mobile does not read the signed
-    // record yet, so declaring the truth here would strip every relay locator
-    // and take its relay-only Machines offline. Removing it is this client's
-    // half of DESK-5g, not a default to flip.
-    const routes = await accountHomeRoutes(json, "signed");
-    return parseOpaqueHomeRoutes({
-        routes: routes.map((route) => ({
-            project: route.project,
-            home_id: route.homeId,
-            endpoint: route.endpoint,
-            relay: route.relay
-                ? {
-                    endpoint: route.relay.endpoint,
-                    handle: route.relay.handle,
-                    proof: route.relay.proof,
-                    route_epoch: route.relay.routeEpoch,
-                    home_fingerprint: route.relay.homeFingerprint,
-                }
-                : undefined,
-        })),
-    // Same provenance the hub read already used: re-parsing at a lower trust
-    // would silently drop every relay locator and take relay-only Homes offline.
-    }, "signed");
+    const resolved = await resolveHomeRoutes({
+        json: browserRouteJson(accountBase, { bearer }),
+        subject: options.subject ?? "",
+        ...(options.storage ? { storage: options.storage } : {}),
+        ...(options.fetchJson ? { fetchJson: options.fetchJson } : {}),
+        ...(options.onDegraded ? { onDegraded: options.onDegraded } : {}),
+        ...(options.onRootKeyConflict ? { onRootKeyConflict: options.onRootKeyConflict } : {}),
+    });
+    return resolved.routes;
 }
 
 export async function loadMobileMemberships(

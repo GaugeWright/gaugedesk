@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { reduce, empty, type StreamEvent } from "./transcript";
 import {
     displayAgentName,
+    friendlyLine,
     lineRendersMarkdown,
     settledLabel,
     turnForkPoint,
@@ -61,5 +62,17 @@ describe("a settled turn's foot", () => {
         expect(earlier).toMatch(/Sep/);
         expect(earlier).not.toMatch(/2026/);
         expect(lastYear).toMatch(/2026/);
+    });
+});
+
+describe("operational sync lines (WS-H)", () => {
+    it("say what arrived without ref vocabulary or a private-draft model", () => {
+        const pulled = friendlyLine("sync", "pulled in the latest from the shared line");
+        expect(pulled).toBe("Pulled in the latest");
+        expect(friendlyLine("sync", "pulled in 2 changes")).toBe("Pulled in the latest (2 changes)");
+        const reverted = friendlyLine("revert", "reverted to main — engagement work discarded");
+        for (const text of [pulled, reverted]) {
+            expect(text).not.toMatch(/\bmain\b|engagement|draft/i);
+        }
     });
 });

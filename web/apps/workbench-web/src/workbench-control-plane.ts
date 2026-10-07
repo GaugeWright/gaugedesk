@@ -78,6 +78,7 @@ import {
     type RouteRequest,
 } from "@gaugewright/control-plane-client";
 import type { ControlPlane } from "@gaugewright/control-plane-client";
+import { EventStreamGate } from "./event-stream-gate";
 
 export { controlPlaneBase };
 
@@ -233,6 +234,8 @@ export class WorkbenchControlPlane implements ControlPlane {
     private pool: HomePool<workbenchClient.WorkbenchTransport> | null = null;
     private currentProject: ProjectId | null = null;
     private readonly restartWorkStreams = new Set<() => void>();
+    /** Every event stream this control plane opens, Home or local (WS-581). */
+    private readonly streamGate = new EventStreamGate();
     private readonly taskHomeActors = new Map<string, object>();
 
     constructor(
@@ -251,7 +254,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         };
         this.route = browserRouteJson(this.base, auth);
         this.request = browserRouteRequest(this.base, auth);
-        const eventSource = browserRouteEventStream(this.base, auth);
+        const eventSource = this.streamGate.wrap(browserRouteEventStream(this.base, auth));
         this.localTaskEventSource = eventSource;
         this.events = reconnectingRouteEventStream(() => eventSource, {
             beforeReconnect: async (reason) => {
@@ -359,7 +362,25 @@ export class WorkbenchControlPlane implements ControlPlane {
         return true;
     }
 
+    /** Release every event stream's connection and hold new ones, before an
+     * account change sends its first request. A desktop shell's streams share
+     * one origin with its account routes, and enough of them leave a sign-out
+     * request queued in the web view, never reaching the control plane
+     * (WS-581). Idempotent; `resumeEventStreams` undoes it. */
+    suspendEventStreams(): void {
+        this.streamGate.suspend();
+    }
+
+    /** For an account change that failed: every held stream resolves its
+     * route again under whatever account is now current. */
+    resumeEventStreams(): void {
+        this.streamGate.resume();
+    }
+
     async closeAccountConnections(): Promise<void> {
+        // The admission revocation below is itself a request on the streams'
+        // origin, so it must not queue behind them either.
+        this.streamGate.suspend();
         this.credentialGeneration++;
         this.homeTransport = null;
         this.selectedDirectHome = null;
@@ -712,7 +733,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                             base: context.endpoint,
                             json: context.routeJson,
                             request: browserRouteRequest(context.endpoint, admission),
-                            events: browserRouteEventStream(context.endpoint, admission),
+                            events: this.streamGate.wrap(browserRouteEventStream(context.endpoint, admission)),
                         };
                     }
                     const auth = {
@@ -755,13 +776,13 @@ export class WorkbenchControlPlane implements ControlPlane {
                         });
                         streams.get(context.route.homeId)?.closeAll();
                         streams.set(context.route.homeId, events);
-                        return { base: "", json: context.routeJson, request, events };
+                        return { base: "", json: context.routeJson, request, events: this.streamGate.wrap(events) };
                     }
                     return {
                         base: context.endpoint,
                         json: context.routeJson,
                         request: browserRouteRequest(context.endpoint, auth),
-                        events: browserRouteEventStream(context.endpoint, auth),
+                        events: this.streamGate.wrap(browserRouteEventStream(context.endpoint, auth)),
                     };
                 },
                 // A Home rotates its locator on a schedule, which invalidates
@@ -812,7 +833,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                 base: endpoint,
                 json,
                 request: browserRouteRequest(endpoint, auth),
-                events: browserRouteEventStream(endpoint, auth),
+                events: this.streamGate.wrap(browserRouteEventStream(endpoint, auth)),
             };
         }
         const state = await accountClient.accountHomes(this.route);
@@ -856,7 +877,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                 base: endpoint,
                 json,
                 request: browserRouteRequest(endpoint, auth),
-                events: browserRouteEventStream(endpoint, auth),
+                events: this.streamGate.wrap(browserRouteEventStream(endpoint, auth)),
             };
         })().catch((error) => {
             if (this.selectedDirectHome?.key === key) this.selectedDirectHome = null;
@@ -1555,13 +1576,16 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async publishDeployment(input: PublicDeploymentInput): Promise<PublicDeploymentOutcome> {
-        let admitted = { ...input, dictation_entitlement: await this.dictationEntitlement() };
+        // Entitlements name the key this publication will be signed with,
+        // which is the deployment's or its project owner's rather than
+        // necessarily the caller's (DR-0328 §5, WS-749).
+        const publicKey = await workbenchClient.publicPublisherKey(this.workbenchTransport(), input);
+        let admitted = { ...input, dictation_entitlement: await this.dictationEntitlement(publicKey) };
         if (
             this.usesRemoteHome()
             && input.funding.kind === "managed"
             && !input.funding.entitlement
         ) {
-            const publicKey = await workbenchClient.publicPublisherKey(this.workbenchTransport());
             const entitlement = await accountClient.mintManagedEntitlement(
                 this.route,
                 input.funding.tenant_id,
@@ -1592,8 +1616,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.previewAgent(this.workbenchTransport(), archetypeId, placementId);
     }
 
-    private async dictationEntitlement(): Promise<string | undefined> {
-        const publicKey = await workbenchClient.publicPublisherKey(this.workbenchTransport());
+    private async dictationEntitlement(publicKey: string): Promise<string | undefined> {
         try {
             const claim = await this.route("POST", "/account/dictation/entitlement", { publisher_key: publicKey });
             return JSON.stringify(claim);

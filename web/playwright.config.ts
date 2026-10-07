@@ -138,6 +138,8 @@ export default defineConfig({
             timeout: 30_000,
             env: {
                 ENTERPRISE_PORT: String(ports.enterprise),
+                // Native account admission uses this run's hermetic Hub.
+                GAUGEDESK_ACCOUNT_HUB_URL: `http://127.0.0.1:${ports.hub}`,
                 GAUGEDESK_E2E_STATE: enterpriseState,
                 GAUGEDESK_ACCOUNT_RP_ID: "localhost",
                 GAUGEDESK_ACCOUNT_ORIGIN: new URL(enterpriseAppURL).origin.replace(

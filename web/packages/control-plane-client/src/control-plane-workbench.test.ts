@@ -6,6 +6,7 @@ import {
     exportResourceToDisk,
     forkProject,
     projectUpstream,
+    publicPublisherKey,
     pullProjectUpstream,
     getPlacementDistribution,
     getPlacementDistributionAudit,
@@ -252,5 +253,35 @@ describe("run projection carriage (UX-13)", () => {
         expect(carriage.value.phase).toBe("Running");
         expect(carriage.freshness.marker).toBe("partial");
         expect(carriage.freshness.repairHint).toBe("refresh run for chat-1");
+    });
+});
+
+describe("publisher authority", () => {
+    const key = `04${"a".repeat(128)}`;
+
+    it("asks for the key a named publication signs with, not the caller's", async () => {
+        const json = vi.fn().mockResolvedValue({ public_key: key });
+        const transport = { base: "", json } as WorkbenchTransport;
+        await expect(publicPublisherKey(transport, {
+            placement_id: "placement-1" as PlacementId,
+            edge_origin: "https://edge.example.test",
+            deployment_id: "dep 1",
+        })).resolves.toBe(key);
+        expect(json).toHaveBeenCalledExactlyOnceWith(
+            "GET",
+            "/public-deployments/publisher-authority?placement_id=placement-1&edge_origin=https%3A%2F%2Fedge.example.test&deployment_id=dep+1",
+        );
+    });
+
+    it("asks for the caller's own key when no publication is named", async () => {
+        const json = vi.fn().mockResolvedValue({ public_key: key });
+        const transport = { base: "", json } as WorkbenchTransport;
+        await publicPublisherKey(transport);
+        expect(json).toHaveBeenCalledExactlyOnceWith("GET", "/public-deployments/publisher-authority");
+    });
+
+    it("fails closed on a malformed key", async () => {
+        const transport = { base: "", json: vi.fn().mockResolvedValue({ public_key: "nope" }) } as WorkbenchTransport;
+        await expect(publicPublisherKey(transport)).rejects.toThrow(/malformed/);
     });
 });

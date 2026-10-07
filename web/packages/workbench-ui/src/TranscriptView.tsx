@@ -89,14 +89,17 @@ export function friendlyLine(kind: string, text: string): string {
     // ("synced from main", "main", "engagement"). Match on the line *kind* only — the
     // old `/\bmain\b/i` text catch-all was too greedy and relabeled a `revert`
     // ("reverted to main — engagement work discarded") as "Pulled in the latest"
-    // (WS-H).
+    // (WS-H). The server writes a sync line only when the line's advance actually
+    // arrived; a no-op sync writes nothing, so the "up to date" reading below is
+    // left for lines recorded before that rule.
     if (kind === "sync") {
         const t = text.toLowerCase();
         if (/no(thing)?\b|up.to.date|already/.test(t)) return "Already up to date — nothing new to pull in";
         const n = text.match(/(\d+)/)?.[1];
         return n ? `Pulled in the latest (${n} change${n === "1" ? "" : "s"})` : "Pulled in the latest";
     }
-    if (kind === "revert") return "Discarded the draft — restored to the shared copy";
+    // A chat has no private draft (`run-chat.md`), so the line names what went.
+    if (kind === "revert") return "Discarded this chat's changes — restored to the shared copy";
     if (kind === "error") return `Turn failed — ${text}`;
     return text;
 }

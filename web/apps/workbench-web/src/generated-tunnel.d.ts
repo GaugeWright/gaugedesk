@@ -56,11 +56,6 @@ declare module "@gaugewright/control-plane-client/generated/tunnel.js" {
     }
 }
 
-/**
- * The generated directory verifier (DESK-5g). Declared for the same reason as
- * the tunnel above: gitignored, so a fresh checkout has nothing to infer from.
- */
-declare module "@gaugewright/control-plane-client/generated/directory.js" {
-    export default function init(input?: unknown): Promise<unknown>;
-    export function verify_signed_put_json(json: string): boolean;
-}
+
+// The generated directory verifier is declared beside its loader, in
+// control-plane-client, because mobile registers it too (WS-746).

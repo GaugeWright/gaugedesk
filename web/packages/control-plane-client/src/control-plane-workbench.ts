@@ -807,14 +807,25 @@ export async function publishDeployment(
     return response.deployment;
 }
 
-/** Public half of the Home's isolated deployment-publisher key. The Hub binds
- * managed-funding entitlements to it; the private half remains in the Home. */
+/** Public half of a deployment-publisher key held by the Home. The Hub binds
+ * managed-funding and dictation entitlements to it; the private half remains
+ * in the Home. Named a publication, it is the key that publication will be
+ * signed with — an existing deployment's own, else its project owner's — which
+ * need not be the caller's (DR-0328 §5); unnamed, it is the caller's. */
 export async function publicPublisherKey(
     transport: WorkbenchTransport,
+    publication?: Pick<PublicDeploymentInput, "placement_id" | "edge_origin" | "deployment_id">,
 ): Promise<string> {
+    const query = publication
+        ? `?${new URLSearchParams({
+            placement_id: publication.placement_id,
+            edge_origin: publication.edge_origin,
+            deployment_id: publication.deployment_id,
+        })}`
+        : "";
     const response = await transport.json(
         "GET",
-        "/public-deployments/publisher-authority",
+        `/public-deployments/publisher-authority${query}`,
     ) as { public_key?: unknown };
     if (typeof response.public_key !== "string" || !/^04[0-9a-f]{128}$/.test(response.public_key)) {
         throw new Error("deployment publisher authority response is malformed");

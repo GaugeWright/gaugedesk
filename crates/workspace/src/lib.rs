@@ -242,6 +242,29 @@ pub enum MergeOutcome {
     Conflict,
 }
 
+/// What folding a chat's line into its worktree did. `MergeOutcome::Clean`
+/// covers both a sync that moved the chat and one that found nothing to fold;
+/// the chat surface tells them apart because only a sync that lands is worth a
+/// line in the transcript (`run-chat.md`: a no-op sync says nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineSync {
+    /// The line had advanced and its work is now in this chat's worktree.
+    Pulled,
+    /// The chat was already at its line; nothing moved.
+    UpToDate,
+    /// The line's advance conflicts with this chat's work.
+    Conflict,
+}
+
+impl LineSync {
+    pub fn merge_outcome(self) -> MergeOutcome {
+        match self {
+            LineSync::Pulled | LineSync::UpToDate => MergeOutcome::Clean,
+            LineSync::Conflict => MergeOutcome::Conflict,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkstreamPromotionOutcome {
     Promoted {
@@ -2079,6 +2102,12 @@ impl Engagement {
     /// Fold the target's advance into this line (whip's rebase-down
     /// reconcile at quiescence), then refresh the worktree.
     pub fn sync_from_main(&self) -> Result<MergeOutcome> {
+        self.pull_from_line().map(LineSync::merge_outcome)
+    }
+
+    /// `sync_from_main`, saying whether the line's advance actually moved this
+    /// chat or there was nothing to fold.
+    pub fn pull_from_line(&self) -> Result<LineSync> {
         // Rebasing this line reads the target's head and swaps this one's, so
         // it holds both for the same reason a fold does.
         let writers = self.line_writers(&[]);
@@ -2086,11 +2115,15 @@ impl Engagement {
         let mut vcs = self.store()?;
         let sides = self.import_sides_under_writer(&mut vcs)?;
         match vcs.reconcile_branch(&self.branch, true, &fresh_cut_id("sync"), &now_at())? {
-            ReconcileOutcome::Rebased { .. } | ReconcileOutcome::UpToDate => {
+            ReconcileOutcome::Rebased { .. } => {
                 self.project_branch_observing(&mut vcs, Some(&sides.branch))?;
-                Ok(MergeOutcome::Clean)
+                Ok(LineSync::Pulled)
             }
-            ReconcileOutcome::Conflicts { .. } => Ok(MergeOutcome::Conflict),
+            ReconcileOutcome::UpToDate => {
+                self.project_branch_observing(&mut vcs, Some(&sides.branch))?;
+                Ok(LineSync::UpToDate)
+            }
+            ReconcileOutcome::Conflicts { .. } => Ok(LineSync::Conflict),
             other => Err(WorkspaceError::msg(format!("sync refused: {other:?}"))),
         }
     }
@@ -3551,6 +3584,15 @@ pub trait ChatWorkspace: Send {
         ))
     }
     fn sync_from_main(&self) -> Result<MergeOutcome>;
+    /// `sync_from_main`, saying whether anything moved. An adapter that cannot
+    /// tell reports a clean sync as `UpToDate`, so the chat stays quiet rather
+    /// than claiming work arrived.
+    fn pull_from_line(&self) -> Result<LineSync> {
+        Ok(match self.sync_from_main()? {
+            MergeOutcome::Clean => LineSync::UpToDate,
+            MergeOutcome::Conflict => LineSync::Conflict,
+        })
+    }
     fn merge_probe(&self) -> Result<MergeOutcome>;
     fn merge_into_main(&self) -> Result<MergeOutcome>;
     fn ingest(&self, source: &Path) -> Result<usize>;
@@ -3961,6 +4003,9 @@ impl ChatWorkspace for Engagement {
     }
     fn sync_from_main(&self) -> Result<MergeOutcome> {
         self.sync_from_main()
+    }
+    fn pull_from_line(&self) -> Result<LineSync> {
+        self.pull_from_line()
     }
     fn merge_probe(&self) -> Result<MergeOutcome> {
         self.merge_probe()
@@ -5427,6 +5472,23 @@ mod tests {
         assert_eq!(a.merge_into_main().expect("promote"), MergeOutcome::Clean);
         assert_eq!(b.sync_from_main().expect("sync"), MergeOutcome::Clean);
         assert_eq!(b.read_file("shared.txt").expect("materialized"), "from a");
+    }
+
+    #[test]
+    fn pulling_a_line_says_whether_anything_arrived() {
+        let (_directory, instance) = instance();
+        let mut a = instance.create_engagement("a").expect("a");
+        let mut b = instance.create_engagement("b").expect("b");
+        instance.create_workstream("team").expect("workstream");
+        a.set_target("workstream/team/main").expect("home a");
+        b.set_target("workstream/team/main").expect("home b");
+        assert_eq!(b.pull_from_line().expect("idle pull"), LineSync::UpToDate);
+        a.write_file("shared.txt", "from a").expect("write");
+        a.commit_turn("turn").expect("cut");
+        assert_eq!(a.merge_into_main().expect("promote"), MergeOutcome::Clean);
+        assert_eq!(b.pull_from_line().expect("pull"), LineSync::Pulled);
+        assert_eq!(b.read_file("shared.txt").expect("materialized"), "from a");
+        assert_eq!(b.pull_from_line().expect("again"), LineSync::UpToDate);
     }
 
     #[test]

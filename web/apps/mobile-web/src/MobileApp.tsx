@@ -97,6 +97,8 @@ import {
     navigatorScope,
     projectInScope,
 } from "@gaugewright/workbench-ui";
+// Registers the directory verifier the signed route read needs (WS-746).
+import "./mobile-wasm-modules";
 import { createMobileSession } from "./mobile-session";
 import { MobileControlPlane } from "./mobile-control-plane";
 import {
@@ -727,6 +729,21 @@ function MobileAccountShell(props: {
                 const live = await loadMobileHomeRoutes(
                     MOBILE_ACCOUNT_BASE,
                     () => props.token,
+                    {
+                        subject: owner,
+                        ...(deviceStorage ? { storage: deviceStorage } : {}),
+                        // A phone that cannot use the signed record still
+                        // reaches every addressable Home, but no relay-only
+                        // one, so the reason is said rather than swallowed.
+                        onDegraded: (reason) => {
+                            console.warn("[account] no signed Home routes: %s", reason);
+                        },
+                        // The substitution the pin exists to catch (ADR 0132
+                        // §2): reported, never adopted, and the endpoints stay.
+                        onRootKeyConflict: (error) => {
+                            console.error("[account] %s", error.message);
+                        },
+                    },
                 );
                 routeCache.save(live);
                 return live;

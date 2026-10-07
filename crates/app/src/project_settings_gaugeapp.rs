@@ -56,6 +56,17 @@ impl GaugeAppDefinition for ProjectSettings {
                     "is_personal": project.is_default,
                     "run_purpose": project.run_purpose,
                     "home_id": project.home_id,
+                    "guide": {
+                        "page": "Overview: the project's name, whether it is the person's Personal project, and whether its Agents may use the network.",
+                        "controls": {
+                            "Name": "name; the person renames the project from the navigator or here",
+                            "Network access: Isolate / Allow network": "network_isolated",
+                        },
+                        "commands": {
+                            NAME_SET: { "does": "Renames the project.", "control": "Name", "payload": { "name": "Theo Studio" } },
+                            ISOLATION_SET: isolation_guide(),
+                        },
+                    },
                 }),
                 &[NAME_SET, ISOLATION_SET],
             ),
@@ -64,6 +75,11 @@ impl GaugeAppDefinition for ProjectSettings {
                 json!({
                     "project": id,
                     "participants": crate::federation::participants_of(wb.store_ref(), id),
+                    "guide": {
+                        "page": "People & sharing: who has access to the project, and invitations waiting to be accepted. Inviting, revoking and handing off are done in the page's own controls; not here.",
+                        "controls": { "People with access": "participants", "Invite to this project": "the person's own invitation flow" },
+                        "commands": {},
+                    },
                 }),
                 &[],
             ),
@@ -77,6 +93,21 @@ impl GaugeAppDefinition for ProjectSettings {
                         .filter(|target| matches!(&target.owner, WorkTargetOwner::Project { project_id } if project_id == id))
                         .map(|target| json!({ "id": target.id, "name": target.name, "kind": target.kind, "status": target.status }))
                         .collect::<Vec<_>>(),
+                    "guide": {
+                        "page": "Work & data: the project's work targets (the repositories and folders its Agents work in) and its network access.",
+                        "controls": {
+                            "Work targets: Rename": "a target's name",
+                            "Network access: Isolate / Allow network": "network_isolated",
+                        },
+                        "commands": {
+                            TARGET_NAME_SET: {
+                                "does": "Renames one work target. Chats working on it follow the new name.",
+                                "control": "Work targets: Rename",
+                                "payload": { "target_id": "target-1", "name": "website" },
+                            },
+                            ISOLATION_SET: isolation_guide(),
+                        },
+                    },
                 }),
                 &[ISOLATION_SET, TARGET_NAME_SET],
             ),
@@ -93,15 +124,22 @@ impl GaugeAppDefinition for ProjectSettings {
                             "admission": placement.admission,
                         }))
                         .collect::<Vec<_>>(),
+                    "guide": {
+                        "page": "Agents & placements: each Agent placed in this project, its version and whether it is admitted. Placing an Agent from the Workshop and upgrading a placement are done in the page's own controls; not here.",
+                        "controls": { "Placed Agents": "placements", "Add from Workshop": "the person's own placement flow" },
+                        "commands": {},
+                    },
                 }),
                 &[],
             ),
             page(
                 "model-access",
                 match crate::project_model_selection::current_selection(wb, id) {
-                    Ok(selection) => json!({ "project": id, "organization_selection": selection }),
+                    Ok(selection) => {
+                        json!({ "project": id, "organization_selection": selection, "guide": model_access_guide() })
+                    }
                     Err(_) => {
-                        json!({ "project": id, "unavailable": "Model selection could not be read" })
+                        json!({ "project": id, "unavailable": "Model selection could not be read", "guide": model_access_guide() })
                     }
                 },
                 &[],
@@ -174,6 +212,24 @@ impl GaugeAppDefinition for ProjectSettings {
 /// Admit a person to one project at its authoritative Home, and say whether
 /// they may change it. Every project-scoped GaugeApp admits through this, so a
 /// placement's settings never admit more than its project's do.
+/// The isolation command appears on two pages; one description serves both.
+/// Labels are `ProjectSettings.tsx`'s own.
+fn isolation_guide() -> Value {
+    json!({
+        "does": "Isolates the project (true: its Agents cannot make network requests) or allows the network again (false). It applies to every Agent run in the project.",
+        "control": "Network access: Isolate / Allow network",
+        "payload": { "isolated": true },
+    })
+}
+
+fn model_access_guide() -> Value {
+    json!({
+        "page": "Model access: which personal or shared connection this project's work may use, any project override, and the effective cap and policy. You can explain it; changing it is done in the page's own controls, not by a command here.",
+        "controls": {},
+        "commands": {},
+    })
+}
+
 pub(crate) fn admit_project(
     wb: &Workbench,
     headers: &HeaderMap,
@@ -411,6 +467,21 @@ mod tests {
         wb.write_project_record(newest);
         apply(&mut wb, &headers, &project, &newer_envelope).unwrap();
         assert_eq!(wb.library.projects[&project].name, "Newest");
+    }
+
+    #[test]
+    fn every_page_guides_the_settings_assistant() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        let project = crate::library_routes::create_named_project(&mut wb, "proj-guided", "Site")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        crate::gaugeapp_host::assert_pages_are_guided::<ProjectSettings>(&ProjectSettings::pages(
+            &wb, &project,
+        ));
     }
 
     #[test]

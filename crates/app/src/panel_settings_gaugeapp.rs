@@ -76,8 +76,11 @@ impl GaugeAppDefinition for PanelSettings {
                 "pending": items.iter().filter(|item| item.status == ItemStatus::Pending).count(),
                 "items": items.iter().map(index_entry).collect::<Vec<_>>(),
                 "kept_items": "A kept item is a file under inbound/ in the project's own folder, which the project's work chats can read.",
+                "guide": inbox_guide(),
             }),
-            Err(reason) => json!({ "placement": id, "project": project, "unavailable": reason }),
+            Err(reason) => {
+                json!({ "placement": id, "project": project, "unavailable": reason, "guide": inbox_guide() })
+            }
         };
         vec![
             page(
@@ -93,6 +96,15 @@ impl GaugeAppDefinition for PanelSettings {
                     "admission": placement.admission,
                     "collects": placement.collection_recipient.is_some(),
                     "profile": profile,
+                    "guide": {
+                        "page": "Overview: which Agent and version this Panel placement pins, whether a newer version is available, whether it collects results into the project Inbox, and the pinned public contract. The contract is changed by editing the Agent in the Workshop and publishing a new version, then upgrading this placement; not here.",
+                        "controls": {
+                            "Deployments": "opens the deployments page",
+                            "Inbox": "opens the inbox page; pending is how many items await review",
+                            "Deploy… / Manage deployments…": "opens the deploy flow, which the person completes in its own controls",
+                        },
+                        "commands": {},
+                    },
                 }),
                 &[],
             ),
@@ -117,6 +129,11 @@ impl GaugeAppDefinition for PanelSettings {
                             "retention_absolute_ttl_seconds": binding.operational.retention_absolute_ttl_seconds,
                         }))
                         .collect::<Vec<_>>(),
+                    "guide": {
+                        "page": "Deployments: where this Panel placement runs on the web, which release each serves, its allowed origins, audience, funding, limits and retention. Deploying and changing a deployment are done in the deploy flow the page opens; not here.",
+                        "controls": {},
+                        "commands": {},
+                    },
                 }),
                 &[],
             ),
@@ -194,6 +211,31 @@ impl GaugeAppDefinition for PanelSettings {
             }),
         })
     }
+}
+
+/// What the settings assistant needs to act on the Inbox page; labels are
+/// `PanelSettings.tsx`'s own.
+fn inbox_guide() -> Value {
+    json!({
+        "page": "Inbox: what this Panel's deployments returned, listed by index only. You never see an item's content. Each pending item waits for the project's gate: screening asks the gate for its first pass, and keeping or flagging is the person's decision.",
+        "controls": {
+            "keep": "the person keeps the item: it lands under inbound/ in the project's folder",
+            "flag": "the person flags the item: it is not kept",
+            "refresh": "reads the Inbox again",
+        },
+        "commands": {
+            SCREEN: {
+                "does": "Asks the project's gate to screen one pending item. The gate may rule, or park it for the person.",
+                "control": "none: the page screens on its own; offer this when an item is waiting unscreened",
+                "payload": { "item_id": "item-1" },
+            },
+            REVIEW: {
+                "does": "Records the person's keep or flag for one pending item. Submit only the verdict the person stated; it is theirs to make.",
+                "control": "keep / flag",
+                "payload": { "item_id": "item-1", "verdict": "keep" },
+            },
+        },
+    })
 }
 
 /// An active Panel placement, refusing anything else by the same answer so a
@@ -399,6 +441,15 @@ mod tests {
 
     /// A Home with two Panel placements in Personal, each with one deployment
     /// and one item it returned.
+    #[test]
+    fn every_page_guides_the_settings_assistant() {
+        let (_root, shared) = home();
+        let wb = shared.lock_unpoisoned();
+        crate::gaugeapp_host::assert_pages_are_guided::<PanelSettings>(&PanelSettings::pages(
+            &wb, PLACEMENT,
+        ));
+    }
+
     fn home() -> (tempfile::TempDir, crate::SharedWorkbench) {
         let root = tempfile::tempdir().unwrap();
         let shared = crate::open_workbench(root.path()).unwrap();

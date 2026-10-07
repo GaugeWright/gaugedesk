@@ -156,6 +156,46 @@ fn narrow_abilities(package_root: &Path, public_abilities: &[String]) -> Result<
     .map_err(|error| error.to_string())
 }
 
+/// The one managed target a Panel preview's agent works in, which a work chat
+/// shows as a folder of this name.
+const PREVIEW_TARGET: &str = "workspace";
+
+/// Tell a Panel preview's agent where a visitor's folders are.
+///
+/// A deployed session keeps `artifacts/`, `work/` and `outbox/` at its root,
+/// and a Panel agent's instructions name them so (DR-0310). Preview runs as a
+/// work chat, which shows its one target as the folder `workspace/`, so a
+/// write to `outbox/survey.json` was refused as outside every folder and the
+/// author's test failed on instructions that are right for a visitor. The note
+/// goes into the preview's own copy of the instructions, never the Agent's.
+fn note_preview_folders(package_root: &Path) -> Result<(), String> {
+    let manifest_path = package_root.join("package.json");
+    let text = std::fs::read_to_string(&manifest_path).map_err(|error| error.to_string())?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    let context = match manifest
+        .get("project_context")
+        .and_then(|value| value.as_str())
+    {
+        Some(context) => context.to_owned(),
+        None => {
+            manifest["project_context"] = serde_json::Value::from("AGENTS.md");
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            "AGENTS.md".to_owned()
+        }
+    };
+    let path = package_root.join(&context);
+    let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+    body.push_str(&format!(
+        "\n\n## This is the owner's preview\n\nIn a visitor's session the folders `artifacts/`, `work/` and `outbox/` are at the top level. In this preview they are inside `{PREVIEW_TARGET}/`: wherever these instructions name a path such as `outbox/survey.json`, use `{PREVIEW_TARGET}/outbox/survey.json`. Behave otherwise exactly as you would for a visitor.\n"
+    ));
+    std::fs::write(&path, body).map_err(|error| error.to_string())
+}
+
 impl Workbench {
     /// Every live preview of the Agent or Panel agent `agent_id`.
     pub(crate) fn panel_previews_of(&self, agent_id: &str) -> Vec<LivePanelPreview> {
@@ -480,7 +520,8 @@ impl Workbench {
             match profile {
                 Some(profile) => {
                     let public = profile.public_abilities.iter().cloned().collect::<Vec<_>>();
-                    narrow_abilities(&package_staging, &public)
+                    narrow_abilities(&package_staging, &public)?;
+                    note_preview_folders(&package_staging)
                 }
                 None => Ok(()),
             }
@@ -644,13 +685,41 @@ impl Workbench {
             })?;
             seeds.push((path, body));
         }
-        self.create_managed_project_target_seeded(project_id, "workspace".to_owned(), &seeds)
+        self.create_managed_project_target_seeded(project_id, PREVIEW_TARGET.to_owned(), &seeds)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_preview_tells_its_agent_where_the_visitor_folders_are() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"project_context":"AGENTS.md"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Write `outbox/survey.json`.").unwrap();
+        note_preview_folders(dir.path()).unwrap();
+        let body = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(body.starts_with("Write `outbox/survey.json`."), "{body}");
+        assert!(body.contains("`workspace/outbox/survey.json`"), "{body}");
+
+        // A package with no project instructions gets them.
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::write(bare.path().join("package.json"), "{}").unwrap();
+        note_preview_folders(bare.path()).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bare.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["project_context"], "AGENTS.md");
+        assert!(std::fs::read_to_string(bare.path().join("AGENTS.md"))
+            .unwrap()
+            .contains("workspace/"));
+    }
 
     #[test]
     fn narrowing_replaces_the_package_abilities_with_the_public_ones() {

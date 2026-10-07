@@ -62,7 +62,7 @@ impl GaugeAppDefinition for AgentSettings {
         let mut pages = vec![
             page(
                 "overview",
-                json!({ "agent": id, "name": agent.name, "kind": agent.agent_kind, "model": model }),
+                json!({ "agent": id, "name": agent.name, "kind": agent.agent_kind, "model": model, "guide": overview_guide() }),
                 &[MODEL_SET],
             ),
             page(
@@ -73,8 +73,11 @@ impl GaugeAppDefinition for AgentSettings {
                         "abilities": abilities,
                         "presets": ABILITY_PRESETS,
                         "optional": ["tracker.file", "question.ask"],
+                        "guide": abilities_guide(),
                     }),
-                    Err(reason) => json!({ "agent": id, "unavailable": reason }),
+                    Err(reason) => {
+                        json!({ "agent": id, "unavailable": reason, "guide": abilities_guide() })
+                    }
                 },
                 &[ABILITIES_SET],
             ),
@@ -83,8 +86,8 @@ impl GaugeAppDefinition for AgentSettings {
             pages.push(page(
                 "panel-profile",
                 match wb.panel_profile(id) {
-                    Ok(profile) => json!({ "agent": id, "profile": profile }),
-                    Err(reason) => json!({ "agent": id, "unavailable": reason }),
+                    Ok(profile) => json!({ "agent": id, "profile": profile, "guide": panel_profile_guide() }),
+                    Err(reason) => json!({ "agent": id, "unavailable": reason, "guide": panel_profile_guide() }),
                 },
                 &[PANEL_PROFILE_SET],
             ));
@@ -128,6 +131,89 @@ impl GaugeAppDefinition for AgentSettings {
         }
         Ok(Applied::done())
     }
+}
+
+/// What the settings assistant needs to act on what the person sees, page by
+/// page (`gaugeapp_host` says why every page carries one). The labels are the
+/// Agent Settings form's own (`AgentSettings.tsx`, `PanelContractEditor.tsx`,
+/// `panel-agent-presentation.ts`); change them together.
+fn overview_guide() -> Value {
+    json!({
+        "page": "The Agent's name, kind (work or panel) and the model its own chats prefer. On the form this is \"Preferred model\", under \"The agent itself\" for a Panel agent.",
+        "controls": { "Preferred model": "model: the model this Agent's chats use; null means the person's work-chat default" },
+        "commands": {
+            MODEL_SET: {
+                "does": "Sets the Agent's preferred model, or returns it to the default with null.",
+                "control": "Preferred model",
+                "payload": { "model": "openai/gpt-6-luna" },
+            },
+        },
+    })
+}
+
+fn abilities_guide() -> Value {
+    json!({
+        "page": "What the Agent itself may do in its chats. On the form this is \"Abilities\": one preset plus the \"File project tasks\" checkbox. For a Panel agent, what visitors' sessions may do is the panel-profile page instead, and it can never exceed these: raise these first when visitors need more.",
+        "controls": {
+            "Chat only": "abilities: []",
+            "Read workspace": "abilities: [\"workspace.read\"]",
+            "Create artifacts": "abilities: [\"workspace.read\", \"workspace.write\"]",
+            "Run workspace commands": "abilities: [\"command.run\", \"workspace.read\", \"workspace.write\"]",
+            "File project tasks": "adds \"tracker.file\" to whichever preset is chosen",
+        },
+        "commands": {
+            ABILITIES_SET: {
+                "does": "Replaces the Agent's abilities with exactly this list: a preset's abilities plus any optional ones to keep.",
+                "control": "Abilities",
+                "payload": { "abilities": ["workspace.read", "workspace.write", "tracker.file"] },
+            },
+        },
+    })
+}
+
+/// Asked to "turn on collect results", the assistant found no field of that
+/// name in the profile's wire form and guessed at an ability instead.
+fn panel_profile_guide() -> Value {
+    json!({
+        "page": "A Panel agent's public contract: what visitors to its deployments see and may do, its model, how long their conversations are kept, and what is sent to the project Inbox. It is frozen into each version the owner publishes.",
+        "controls": {
+            "What visitors see": "panels.components, any of gw-chat (Chat), gw-viewer (Viewer), gw-files (Files: what the agent puts in artifacts/), gw-chats (Conversations)",
+            "What the agent can do for visitors": "public_abilities: Chat only [], Read workspace [workspace.read], Create artifacts [workspace.read, workspace.write], Run workspace commands [command.run, workspace.read, workspace.write]. Each must also be one of the Agent's own abilities (the abilities page); the form greys out the rest. To give visitors more, raise the Agent's own abilities first, then the profile. Writing to artifacts/ or outbox/, including anything Collect results collects, needs workspace.write.",
+            "Ask questions": "adds question.ask to public_abilities",
+            "Model": "model.pinned; absent means Default, the publisher's work-chat default",
+            "Resumable for": "retention.idle_ttl_seconds",
+            "Deleted after at most": "retention.absolute_ttl_seconds",
+            "Keep the transcript": "retention.transcript_retained",
+            "Keep the visitor's files": "retention.workspace_retained",
+            "Collect results": "collection: null is off; on is the collection object in this command's example payload",
+            "Files to collect": "collection.exportable_paths: paths under outbox/, which visitors never see",
+            "Largest file": "collection.max_artifact_bytes, in bytes, at most 8 MB",
+            "Include the conversation transcript": "collection.transcript_eligible",
+            "Result format (Advanced)": "collection.schema_ref: a label for the file's format, never checked against its contents",
+            "Recipient class (Advanced)": "collection.recipient_class",
+        },
+        "commands": {
+            PANEL_PROFILE_SET: {
+                "does": "Replaces the whole Panel profile of the Agent's draft. Read the current profile, change the field the person asked about, and submit all of it. It does not change what visitors get yet: say that it reaches them only once a new version is published (the Agent's 'publish a new version') and each deployment is updated (its placement's Manage deployments, then Save changes).",
+                "control": "Save",
+                "payload": { "profile": example_panel_profile() },
+            },
+        },
+    })
+}
+
+/// A whole profile the command admits: the new-agent default with collection
+/// on, as ticking Collect results writes it.
+fn example_panel_profile() -> Value {
+    let mut profile = serde_json::to_value(PanelPublicProfile::default()).unwrap_or(Value::Null);
+    profile["collection"] = json!({
+        "exportable_paths": ["outbox/*"],
+        "transcript_eligible": false,
+        "schema_ref": "gaugewright.panel-output/v1",
+        "recipient_class": "project",
+        "max_artifact_bytes": 1_048_576,
+    });
+    profile
 }
 
 /// The ability presets `set_archetype_abilities` admits, named the way the
@@ -324,6 +410,43 @@ mod tests {
         let wb = shared.lock_unpoisoned();
         let profile = page_model(&wb, &id, "panel-profile");
         assert!(profile["profile"]["panels"].is_object(), "{profile}");
+    }
+
+    #[test]
+    fn every_page_guides_the_settings_assistant() {
+        for kind in [AgentKind::Work, AgentKind::Panel] {
+            let (_root, shared, id) = home(kind);
+            let wb = shared.lock_unpoisoned();
+            crate::gaugeapp_host::assert_pages_are_guided::<AgentSettings>(&AgentSettings::pages(
+                &wb, &id,
+            ));
+        }
+    }
+
+    #[test]
+    fn turning_on_collect_results_as_the_form_says_is_admitted() {
+        let (_root, shared, id) = home(AgentKind::Panel);
+        let mut wb = shared.lock_unpoisoned();
+        let page = page_model(&wb, &id, "panel-profile");
+        let example = &page["guide"]["commands"][PANEL_PROFILE_SET]["payload"]["profile"];
+        let mut profile = page["profile"].clone();
+        assert_eq!(profile["collection"], Value::Null);
+        profile["collection"] = example["collection"].clone();
+        let set = envelope(
+            &session(&wb, &id),
+            "panel-profile",
+            PANEL_PROFILE_SET,
+            "collect-1",
+            json!({ "profile": profile }),
+        );
+        let receipt =
+            apply_command::<AgentSettings>(&mut wb, &HeaderMap::new(), &id, &set).unwrap();
+        assert_eq!(receipt["receipt"]["status"], "applied");
+        let after = page_model(&wb, &id, "panel-profile");
+        assert_eq!(
+            after["profile"]["collection"]["exportable_paths"],
+            json!(["outbox/*"])
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-gaugedesk-device-identity"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 rust-version = "1.77.2"
 authors = ["GaugeWright <support@gaugewright.com>"]

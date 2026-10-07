@@ -1478,6 +1478,76 @@ async fn the_publisher_authority_answers_for_its_caller() {
     assert_eq!(read(Some(other)).await, own);
 }
 
+/// Named a publication, the read answers with the key that publication signs
+/// with, so an entitlement a remote Home's client mints for it matches the
+/// key the edge sees, even when that is not the caller's own (WS-749).
+#[tokio::test]
+async fn the_publisher_authority_answers_for_a_named_publication() {
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    // Published by the claimant before per-account publishing.
+    bind_deployment(&wb, "dep-legacy", "p-other", None);
+    let app = gated(&wb);
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+    let (install, own, placement) = {
+        let mut guard = wb.lock_unpoisoned();
+        let personal = guard.ensure_account_personal(OTHER).unwrap();
+        (
+            guard.public_publisher_key().unwrap(),
+            guard.publisher_credential_for(OTHER).unwrap().public_key(),
+            guard
+                .personal_placement_of(&personal)
+                .expect("a Personal has a placement"),
+        )
+    };
+    let edge = "https%3A%2F%2Fedge.example.test";
+    let read = |bearer: &str, query: String| {
+        let app = app.clone();
+        let bearer = bearer.to_owned();
+        async move {
+            send(
+                &app,
+                "GET",
+                &format!("/public-deployments/publisher-authority?{query}"),
+                Some(&bearer),
+                None,
+            )
+            .await
+        }
+    };
+    let publication = |deployment: &str| {
+        format!("placement_id={placement}&edge_origin={edge}&deployment_id={deployment}")
+    };
+
+    let (status, body) = read(&other, publication("dep-legacy")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["public_key"], install,
+        "a republish of a claimant's deployment signs with the install's key"
+    );
+    let (status, body) = read(&other, publication("dep-new")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["public_key"], own,
+        "a new deployment signs with the owner's"
+    );
+
+    // Reading a publication's key is its placement owner's, as publishing is.
+    let (status, body) = read(&claimant, publication("dep-new")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // A publication is named whole or not at all.
+    let (status, body) = read(&other, format!("placement_id={placement}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = read(
+        &other,
+        format!("placement_id={placement}&edge_origin=ftp%3A%2F%2Fx&deployment_id=dep-new"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
 #[test]
 fn off_a_desktop_there_is_only_the_installs_publisher() {
     let (_root, wb) = open();

@@ -167,6 +167,7 @@ impl HomeReferenceJournal {
                 codec: None,
                 path,
                 scratch: None,
+                home_product: None,
             },
             binding,
         }

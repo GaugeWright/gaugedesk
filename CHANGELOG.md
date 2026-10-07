@@ -19,6 +19,13 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-10-07
+
+- The mobile app now finds a Machine that is reachable only through the relay.
+  It reads the routes your desktop publishes to its signed account directory,
+  as GaugeDesk in a browser already did, instead of only the Hub's route list,
+  which never carried them. A route that reaches the phone only through the Hub
+  keeps its address but no longer brings a relay pin.
 - A Panel agent whose visitors may read or create files, or answer questions,
   now replies to visitors. Every such visitor message was refused before the
   model ran ("ungoverned handle `workspace.read`"), because the published
@@ -35,6 +42,10 @@ Releases up to and including 0.4.30 are recorded on the
   chats and previews in Workshop, instead of collapsed Projects.
 - A collection's result format is documented as a label: it names the
   collected file's format and is not checked against its contents.
+- Typing a first message into the empty chat pane runs it again. Since 0.8.0
+  the new chat opened but its first turn could be refused with "couldn't run
+  that turn — Task project selection changed", because the turn started before
+  the chat's project was selected.
 
 ## [0.8.0] — 2026-10-06
 
@@ -62,6 +73,11 @@ Releases up to and including 0.4.30 are recorded on the
   which signs the hand-over so browsers that trusted it follow. Publishing an
   account's root to the Hub now carries proof from one of the account's own
   devices.
+- The storage layer can initialize and reopen a dedicated product database for
+  an exact project Home, with independently retained identity and missing-file
+  refusal. Existing projects still use the explicit migration path; this does
+  not activate new Home storage. The product schema moves to version 13, which
+  older builds refuse.
 
 - A provider key you allow for Home use now reaches every GaugeWright-hosted
   Home you work in — your own and your organizations' — without linking it

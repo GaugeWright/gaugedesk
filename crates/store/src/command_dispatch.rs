@@ -14,6 +14,7 @@ use crate::{AdmitError, MaterializedAdmission, Store};
 /// authorization. Other storage planes need their own publication guards.
 pub struct DispatchReadBasis {
     store_path: String,
+    home_product: Option<crate::home_product::HomeProductBinding>,
     heads: std::collections::BTreeMap<String, Option<i64>>,
     deadline: Option<std::time::SystemTime>,
     process_guards: Vec<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -43,6 +44,7 @@ impl DispatchReadBasis {
     /// checked again under the final writer transaction. This grants no access.
     pub fn combine(mut self, other: Self) -> Result<Self, AdmitError> {
         if self.store_path != other.store_path
+            || self.home_product != other.home_product
             || other.heads.iter().any(|(scope, head)| {
                 self.heads
                     .get(scope)
@@ -718,7 +720,8 @@ pub(super) fn check_dispatch_basis(
     basis: &DispatchReadBasis,
 ) -> Result<(), AdmitError> {
     check_validity(basis.deadline, &basis.process_guards)?;
-    if basis.store_path != store_path {
+    if basis.store_path != store_path || basis.home_product != crate::home_product::binding_in(tx)?
+    {
         return Err(AdmitError::Rejected(Rejection {
             reason: "dispatch authorization came from another store",
         }));
@@ -890,6 +893,7 @@ impl Store {
             value,
             DispatchReadBasis {
                 store_path: self.path.clone(),
+                home_product: self.home_product.clone(),
                 heads,
                 deadline: None,
                 process_guards: Vec::new(),

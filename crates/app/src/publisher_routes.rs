@@ -150,16 +150,68 @@ fn publisher_account(
         .map(|(account, _)| account)
 }
 
-/// Public half of the caller's publisher key, which signs the commands it
-/// publishes with. Hosted account planes use this to mint an entitlement
-/// before the Home publishes; no private key or bearer crosses this route.
+/// Names the publication a key is asked for: the placement it is published
+/// from and the deployment on the edge it updates or creates.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct PublisherAuthorityQuery {
+    placement_id: Option<String>,
+    edge_origin: Option<String>,
+    deployment_id: Option<String>,
+}
+
+/// Public half of a publisher key, which signs the commands it publishes
+/// with. Hosted account planes use this to mint an entitlement before the
+/// Home publishes; no private key or bearer crosses this route.
+///
+/// Named a publication (`placement_id`, `edge_origin`, `deployment_id`), it
+/// answers with the key that publication will be signed with — the existing
+/// deployment's, else the project owner's (DR-0328 §5) — which is the key an
+/// entitlement minted for it must name. Reading it is the placement owner's,
+/// as publishing is. Unnamed, it answers with the caller's own key.
 pub async fn publisher_authority(
     State(workbench): State<SharedWorkbench>,
     headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<PublisherAuthorityQuery>,
 ) -> Response {
     let workbench = workbench.lock_unpoisoned();
-    let account = publisher_account(&workbench, &headers);
-    match workbench.public_publisher_key_as(account.as_deref()) {
+    let key = match (query.placement_id, query.edge_origin, query.deployment_id) {
+        (None, None, None) => {
+            let account = publisher_account(&workbench, &headers);
+            workbench.public_publisher_key_as(account.as_deref())
+        }
+        (Some(placement), Some(edge), Some(deployment))
+            if !placement.trim().is_empty() && !deployment.trim().is_empty() =>
+        {
+            if let Some(refusal) = workbench.placement_owner_refusal(&headers, &placement) {
+                return refusal;
+            }
+            match workbench.publication_publisher_key(&placement, &edge, &deployment) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+                    ) =>
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": error.to_string() })),
+                    )
+                        .into_response()
+                }
+                answer => answer,
+            }
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "a publication is named by placement_id, edge_origin and deployment_id together"
+                })),
+            )
+                .into_response()
+        }
+    };
+    match key {
         Ok(public_key) => {
             (StatusCode::OK, Json(json!({ "public_key": public_key }))).into_response()
         }

@@ -97,3 +97,16 @@ another checkout holds that port the run is refused. Set
 2. Reuse a step in `steps/steps.ts`, or add a new one (drive the UI by visible
    label or `data-testid`; assert on rendered text/projections).
 3. `npm run e2e`.
+
+The Administration stories admit the enterprise owner twice, as production
+does: the seeded `gw_session` cookie admits the tenant, and a sealed account
+handoff through the run's hermetic Hub (`/account/hub-session/start` and
+`/callback`) admits the same person, `e2e-account-root`, to Account Settings.
+Neither substitutes for the other. The reset that seeds a withheld context
+source writes it only for an authenticated current owner of a live project,
+under that project's session hold.
+
+The desktop-updater story is not yet qualified by this fixture: its browser
+IPC stand-in answers `null` for every call, so the client has neither a scoped
+Home session nor an admitted selected remote Home, and never requests the
+software policy.

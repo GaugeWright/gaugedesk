@@ -25,11 +25,11 @@ const generatedWrongIdentities = [
     `wrong-${"x".repeat(192)}`,
 ] as const;
 
-async function resetAuthenticatedEnterprise(request: APIRequestContext): Promise<void> {
+async function resetAuthenticatedEnterprise(request: APIRequestContext, administrationAccount = false): Promise<void> {
     issuedScimToken = null;
     advertisedIntegration = null;
     desktopSoftwarePolicy = null;
-    const res = await request.post(`${enterpriseCP}/test/reset`, { headers: mutationHeaders() });
+    const res = await request.post(`${enterpriseCP}/test/reset${administrationAccount ? "?administration_account=true" : ""}`, { headers: mutationHeaders() });
     if (!res.ok()) {
         throw new Error(`enterprise control-plane reset failed: ${res.status()} ${await res.text()}`);
     }
@@ -39,7 +39,21 @@ Given("the enterprise workbench is open for an administered tenant", async ({ pa
     // ADMIN-ENV-2: provision the local enterprise operator as an active owner. A
     // configured `?cp=` is intentionally insufficient; the Home's capability route
     // must admit this actor before the deep link can open Administration.
-    await resetAuthenticatedEnterprise(request);
+    await resetAuthenticatedEnterprise(request, true);
+    // The owner cookie admits the tenant; the independently sealed account
+    // handoff admits the same person to Account Settings. Neither substitutes
+    // for the other. Use production custody rather than seeding an opaque token.
+    const start = await request.post(`${enterpriseCP}/account/hub-session/start`, {
+        headers: mutationHeaders({ authorization: `Bearer ${ownerToken}` }),
+        data: {},
+    });
+    expect(start.status()).toBe(200);
+    const returned = await request.post(`${enterpriseCP}/account/hub-session/callback`, {
+        headers: mutationHeaders({ authorization: `Bearer ${ownerToken}` }),
+        data: { code: "e2e-handoff-code" },
+    });
+    expect(returned.status()).toBe(200);
+    expect(await returned.json()).toMatchObject({ linked: true, person: "e2e-account-root" });
     await page.context().addCookies([{
         name: "gw_session",
         value: ownerToken,
@@ -49,6 +63,11 @@ Given("the enterprise workbench is open for an administered tenant", async ({ pa
     }]);
     await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}&gaugeapp=administration&page=people&tenant=org`);
     await expect(page.locator('[data-gaugeapp-page="people"]')).toBeVisible();
+    // Management pages may open with their agent pane collapsed. Establish
+    // the administered workspace through its shipped pane control.
+    if (!await page.getByPlaceholder("ask administration…").isVisible()) {
+        await page.getByRole("button", { name: /Administration agent/ }).click();
+    }
 });
 
 Given("the authenticated enterprise tenant is reset", async ({ page, request }) => {
@@ -57,8 +76,18 @@ Given("the authenticated enterprise tenant is reset", async ({ page, request }) 
 });
 
 Given("the authenticated enterprise workbench has a withheld context source", async ({ page, request }) => {
-    const reset = await request.post(`${enterpriseCP}/test/reset?withheld_resource=true`, {
+    // Failed fixture setup must remain a refusal and retain a root for retry.
+    // These use the actual reset/session path, with no scoped crypto hold.
+    const anonymous = await request.post(`${enterpriseCP}/test/reset?withheld_resource=true`, {
         headers: mutationHeaders(),
+    });
+    expect(anonymous.status()).toBe(401);
+    const wrongOwner = await request.post(`${enterpriseCP}/test/reset?withheld_resource=true`, {
+        headers: mutationHeaders({ authorization: `Bearer ${memberToken}` }),
+    });
+    expect(wrongOwner.status()).toBe(403);
+    const reset = await request.post(`${enterpriseCP}/test/reset?withheld_resource=true`, {
+        headers: mutationHeaders({ authorization: `Bearer ${ownerToken}` }),
     });
     if (!reset.ok()) {
         throw new Error(`enterprise access seed failed: ${reset.status()} ${await reset.text()}`);
@@ -73,7 +102,8 @@ Given("the authenticated enterprise workbench has a withheld context source", as
     await page.goto(
         `${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}&chat=access-contract`,
     );
-    await page.locator("[data-open-sources]").click();
+    await page.locator("[data-chat-options-trigger]").click();
+    await page.getByRole("menuitem", { name: "Context sources", exact: true }).click();
     await expect(page.locator('[data-context-source="withheld-context"]')).toHaveAttribute(
         "data-availability",
         "pending",
@@ -327,7 +357,7 @@ When("I open the enterprise workbench without identity", async ({ page }) => {
 
 When("I return to work", async ({ page }) => {
     await page.locator(".organization-trigger").click();
-    await page.locator(".organization-popover").getByRole("button", { name: "Work", exact: true }).click();
+    await page.locator(".organization-popover").getByRole("button", { name: "Back to work", exact: true }).click();
 });
 
 Then("ordinary project work is shown", async ({ page }) => {

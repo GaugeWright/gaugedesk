@@ -167,10 +167,27 @@ async function pickFirstMethod(page: import("@playwright/test").Page) {
 
 // ADR 0112: projects open in the flat `chats` lens. Placement structure is
 // shown by the Projects filter's global grouping control.
-async function ensureArchetypeLens(page: Page, _name: string) {
+async function ensureArchetypeLens(page: Page, name: string) {
     await page.getByRole("button", { name: "Filter projects" }).click();
     await page.getByRole("menuitem", { name: /Group by/ }).click();
     await page.getByRole("menuitemradio", { name: "Agent view" }).click();
+    await expandProject(page, name);
+}
+
+// Project groups start collapsed (experience/navigation.md). Choosing a lens
+// or creating a child does not disclose its project; use the same chevron a
+// person uses, rather than assuming creation makes the tree expand itself.
+async function expandProject(page: Page, name: string): Promise<Locator> {
+    const group = page.locator(".tree-group[data-project]", {
+        has: page.locator(".tree-node.project .node-label", { hasText: new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`) }),
+    });
+    const projectRow = group.locator(".tree-node.project");
+    await expect(projectRow).toBeVisible();
+    if (await projectRow.getAttribute("aria-expanded") === "false") {
+        await group.getByRole("button", { name: `Expand ${name}`, exact: true }).click();
+    }
+    await expect(projectRow).toHaveAttribute("aria-expanded", "true");
+    return group;
 }
 
 // ---- navigation / setup ----
@@ -531,6 +548,16 @@ Given("a new engagement", async ({ page }) => {
     // wait for the live SSE stream to connect before any task — the fake agent is
     // faster than the connection, so an early task would stream into the void.
     await expect(page.getByTestId("stream-ready")).toBeAttached();
+    const placement = group.locator(".tree-subgroup[data-placement]").first();
+    const placementRow = placement.locator(".tree-node.placement");
+    // A newly populated Agent group also starts collapsed. Wait for its chat
+    // projection before disclosing it, so the click cannot start a second chat.
+    await expect(placementRow).toHaveAttribute("aria-label", / — open its chats$/);
+    if (await placementRow.getAttribute("aria-expanded") === "false") {
+        await placementRow.locator(".node-icon").first().click();
+    }
+    await expect(placement.locator('[data-chat][data-kind="work"]')).toHaveCount(1);
+    await expect(placement.locator('[data-chat].active[data-kind="work"]')).toBeVisible();
 });
 
 // ---- tasking the agent ----
@@ -740,8 +767,11 @@ Then("I see the project {string}", async ({ page }, name: string) => {
 When("I create an archetype named {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Workshop" }).click();
     await page.getByText("+ agent", { exact: true }).click();
-    await page.locator(".inline-edit").fill(name);
-    await page.locator(".inline-edit").press("Enter");
+    const dialog = page.getByRole("dialog", { name: "Create an agent", exact: true });
+    await dialog.getByRole("button", { name: "Agent Works with you in project chats", exact: true }).click();
+    await dialog.getByRole("textbox", { name: "Name", exact: true }).fill(name);
+    await dialog.getByRole("button", { name: "Create agent", exact: true }).click();
+    await expect(dialog).toHaveCount(0);
     await expect(
         page.locator("[data-archetype] .node-label", { hasText: new RegExp(`^${name}$`) }),
     ).toBeVisible();
@@ -806,12 +836,6 @@ When("I place the Panel agent {string} on project {string}", async ({ page }, ag
     await page.locator(".menu-item-label", { hasText: /^add an Agent$/ }).click();
     await page.locator("[data-picker-archetype]", { hasText: agent }).click();
 });
-
-// Projects open folded in the tree; a step about a placement row unfolds its project.
-async function expandProject(page: import("@playwright/test").Page, project: string) {
-    const expand = page.locator("[data-project]", { hasText: project }).getByRole("button", { name: `Expand ${project}`, exact: true });
-    if (await expand.count()) await expand.first().click();
-}
 
 Then("project {string} has a Panel-agent placement without a new-chat action", async ({ page }, project: string) => {
     await expandProject(page, project);
@@ -924,9 +948,10 @@ When("I add a chat under the placement", async ({ page }) => {
 // Personal is the explicit zero-setup project (ADR 0097). Its chat action roots
 // the new work chat on Personal's default placement.
 When("I start a new chat in Personal", async ({ page }) => {
-    const chats = page.locator(".chat-item");
+    const personal = await expandProject(page, "Personal");
+    const chats = personal.locator(".chat-item");
     const before = await chats.count();
-    await page.locator("[data-create='new-project-chat']").first().click();
+    await personal.getByRole("button", { name: "new chat in Personal", exact: true }).click();
     // `stream-ready` may already belong to the previously selected chat. Wait for
     // the standing workspace projection to contain the newly-created row before a
     // following step addresses "latest"; otherwise it can right-click the old row
@@ -937,12 +962,14 @@ When("I start a new chat in Personal", async ({ page }) => {
 
 // The just-created chat (active), rooted on a placement ⇒ a work chat (ADR 0035).
 Then("the active chat is a work chat", async ({ page }) => {
-    await expect(page.locator('[data-chat].active[data-kind="work"]')).toBeVisible();
+    const personal = await expandProject(page, "Personal");
+    await expect(personal.locator('[data-chat].active[data-kind="work"]')).toBeVisible();
 });
 
 Then("I see a chat in Personal", async ({ page }) => {
     await expect(page.locator(".facet.active", { hasText: "Projects" })).toBeVisible();
-    await expect(page.locator("[data-project]", { hasText: "Personal" }).locator(".chat-item").first()).toBeVisible();
+    const personal = await expandProject(page, "Personal");
+    await expect(personal.locator(".chat-item").first()).toBeVisible();
 });
 
 // WS-H: start a workstream from a chat row. Right-click the chat → "new workstream" →
@@ -1264,14 +1291,17 @@ Then("the fork point marker is visible", async ({ page }) => {
 // An edit chat is created under an archetype, via its context menu.
 When("I create an edit chat under the archetype {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Workshop" }).click();
-    await page
-        .locator("[data-archetype]", { hasText: name })
-        .locator(".tree-node.archetype")
-        .click({ button: "right" });
+    const row = page.getByRole("treeitem", { name: `Agent ${name}`, exact: true });
+    const group = page.locator(".tree-group[data-archetype]", { has: row });
+    await row.click({ button: "right" });
     await page.locator(".menu-item-label", { hasText: "new authoring chat" }).click();
-    // Creation navigates asynchronously. Do not let the next step operate on the
-    // quick-start composer that was visible before the new edit chat was selected.
-    await expect(page.locator('[data-chat].active[data-kind="edit"]')).toBeVisible();
+    // A new edit chat unfolds its Agent so it is in view (DR-0324). Creation is
+    // asynchronous, so do not click the caret here: a click racing that unfold
+    // folds the Agent again. Assert the unfold and the exact selected edit chat
+    // before addressing the composer.
+    await expect(row).toHaveAttribute("aria-expanded", "true");
+    await expect(group.locator('[data-chat].active[data-kind="edit"]')).toHaveCount(1);
+    await expect(group.locator('[data-chat].active[data-kind="edit"]')).toBeVisible();
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 

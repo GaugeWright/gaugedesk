@@ -3543,9 +3543,7 @@ impl Workbench {
             .map(|(cid, _)| cid.clone())
             .collect();
         for sib in siblings {
-            if let Some(se) = engagements.get(&sib) {
-                let _ = se.sync_from_main();
-            }
+            let _ = self.pull_line_into_chat(&sib);
         }
         // This advanced a collaboration line only. Native target settlement is
         // a separate receipt-driven lifecycle and must never be inferred here.

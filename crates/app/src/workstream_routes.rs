@@ -271,6 +271,26 @@ impl Workbench {
     /// reconciliation, existing Main chat worktrees keep their old cut and make a
     /// successful promotion look like a no-op in the workbench.
     pub(crate) fn sync_mainline_members(&self, storage_id: &str) -> Vec<String> {
+        let members = self.mainline_members(storage_id);
+        for chat_id in &members {
+            if let Some(engagement) = self.engagements.get(chat_id) {
+                let _ = engagement.sync_from_main();
+            }
+        }
+        members
+    }
+
+    /// `sync_mainline_members` after a workstream's promotion lands: the work
+    /// arriving on Main is worth a line in each member that received it.
+    pub(crate) fn pull_mainline_members(&mut self, storage_id: &str) -> Vec<String> {
+        let members = self.mainline_members(storage_id);
+        for chat_id in &members {
+            let _ = self.pull_line_into_chat(chat_id);
+        }
+        members
+    }
+
+    fn mainline_members(&self, storage_id: &str) -> Vec<String> {
         let Some(mainline) = self
             .workspace_by_storage_id(storage_id)
             .map(|workspace| workspace.mainline())
@@ -283,10 +303,7 @@ impl Workbench {
                 self.engagement_target_id(chat_id) == Some(storage_id)
                     && engagement.target() == mainline
             })
-            .map(|(chat_id, engagement)| {
-                let _ = engagement.sync_from_main();
-                chat_id.clone()
-            })
+            .map(|(chat_id, _)| chat_id.clone())
             .collect()
     }
 }
@@ -876,7 +893,7 @@ pub async fn promote_workstream(
         "workstream_promotion_receipt",
         &serde_json::to_string(&receipt).unwrap_or_default(),
     );
-    let mainline_chats = wb.sync_mainline_members(&root.workspace_id);
+    let mainline_chats = wb.pull_mainline_members(&root.workspace_id);
     for chat_id in mainline_chats {
         wb.notify_library_changed("chat", &chat_id, "upsert");
     }

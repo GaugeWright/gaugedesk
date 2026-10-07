@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+    setDirectoryModuleLoader,
     type HomeId,
     type OpaqueHomeRoute,
     type ProjectId,
@@ -7,6 +8,7 @@ import {
 } from "@gaugewright/control-plane-client";
 import {
     accountTokenExpiresWithin,
+    loadMobileHomeRoutes,
     MobileHomePool,
     MobileRouteCache,
 } from "./mobile-home-pool";
@@ -249,5 +251,131 @@ describe("MobileRouteCache", () => {
         expect(new MobileRouteCache("account:one", storage).load()).toEqual(routes);
         expect(new MobileRouteCache("account:two", storage).load()).toEqual([]);
         expect([...values.values()].join(" ")).not.toContain("secret");
+    });
+});
+
+describe("loadMobileHomeRoutes (WS-746)", () => {
+    const ROOT = "ed25519:root";
+    const locator = {
+        endpoint: "wss://relay.example",
+        handle: "A".repeat(43),
+        proof: `${"B".repeat(42)}A`,
+        route_epoch: 1,
+        home_fingerprint: "ab".repeat(32),
+    };
+    const relayOnly = { project: "proj-relay", home_id: "home:relay", endpoint: "", relay: locator };
+    const addressable = { project: "proj-direct", home_id: "home:direct", endpoint: "https://d.example" };
+
+    function memoryStorage() {
+        const held = new Map<string, string>();
+        return {
+            held,
+            getItem: (key: string) => held.get(key) ?? null,
+            setItem: (key: string, value: string) => void held.set(key, value),
+        };
+    }
+
+    /** The Hub's account plane as the native app reaches it over fetch. */
+    function hub({ hubRoutes, directory }: { hubRoutes: unknown[]; directory: unknown }) {
+        const seen: string[] = [];
+        vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = new URL(String(input));
+            seen.push(`${init?.method ?? "GET"} ${url.pathname}`);
+            if (url.pathname === "/account/home-routes") {
+                return new Response(JSON.stringify({ routes: hubRoutes }), { status: 200 });
+            }
+            if (url.pathname === "/account/directory") {
+                return directory
+                    ? new Response(JSON.stringify(directory), { status: 200 })
+                    : new Response("not found", { status: 404 });
+            }
+            return new Response("unexpected", { status: 500 });
+        });
+        return seen;
+    }
+
+    const signedRecord = (routes: unknown[]) =>
+        JSON.stringify({ entry: { directory: { root_pubkey: ROOT, home_routes: routes } } });
+    const beforeEntries = (body: string) => async (url: string) =>
+        url.endsWith("/entries") ? null : body;
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        setDirectoryModuleLoader(null);
+    });
+
+    it("reaches a relay-only Home the desktop published only to the signed directory", async () => {
+        // The case the issue names: the desktop authors its relay route into the
+        // root-signed record and never into the Hub table, so a phone reading
+        // only the table never saw the Home at all.
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        const storage = memoryStorage();
+        const seen = hub({
+            hubRoutes: [addressable],
+            directory: { root_pubkey: ROOT, origin: "https://dir.example" },
+        });
+        const routes = await loadMobileHomeRoutes("https://hub.example", () => "token", {
+            subject: "account:one",
+            storage,
+            fetchJson: beforeEntries(signedRecord([relayOnly])),
+        });
+        expect(seen).toEqual(["GET /account/home-routes", "GET /account/directory"]);
+        const relay = routes.find((route) => route.project === "proj-relay");
+        expect(relay?.relay?.homeFingerprint).toBe("ab".repeat(32));
+        expect(relay?.relay?.endpoint).toBe("wss://relay.example");
+        // The Hub still answers for what the record does not mention.
+        expect(routes.find((route) => route.project === "proj-direct")?.endpoint)
+            .toBe("https://d.example");
+        // Pinned under the account the device partitions by.
+        expect(storage.getItem("gw.root.account:one")).toBe(ROOT);
+    });
+
+    it("no longer honours a relay pin that arrives only through the Hub table", async () => {
+        // The retired carve-out read this table as signed. Anyone holding the
+        // session can write it, so its certificate pin is never trusted.
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        hub({ hubRoutes: [relayOnly, addressable], directory: null });
+        const reasons: string[] = [];
+        const routes = await loadMobileHomeRoutes("https://hub.example", () => "token", {
+            subject: "account:one",
+            storage: memoryStorage(),
+            onDegraded: (reason) => reasons.push(reason),
+        });
+        expect(routes.some((route) => route.relay)).toBe(false);
+        expect(routes.map((route) => route.project)).toEqual(["proj-direct"]);
+        expect(reasons).toEqual(["the account has published no directory root"]);
+    });
+
+    it("degrades to the Hub's endpoints when the build registered no verifier", async () => {
+        hub({
+            hubRoutes: [addressable],
+            directory: { root_pubkey: ROOT, origin: "https://dir.example" },
+        });
+        const reasons: string[] = [];
+        const routes = await loadMobileHomeRoutes("https://hub.example", () => "token", {
+            onDegraded: (reason) => reasons.push(reason),
+        });
+        expect(routes.map((route) => route.endpoint)).toEqual(["https://d.example"]);
+        expect(reasons).toEqual(["this build registered no verifier"]);
+    });
+
+    it("keeps the endpoints and reports a root key that changed", async () => {
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        const storage = memoryStorage();
+        storage.setItem("gw.root.account:one", "ed25519:earlier");
+        hub({
+            hubRoutes: [addressable],
+            directory: { root_pubkey: ROOT, origin: "https://dir.example" },
+        });
+        const conflicts: string[] = [];
+        const routes = await loadMobileHomeRoutes("https://hub.example", () => "token", {
+            subject: "account:one",
+            storage,
+            fetchJson: beforeEntries(signedRecord([relayOnly])),
+            onRootKeyConflict: (error) => conflicts.push(error.message),
+        });
+        expect(conflicts).toHaveLength(1);
+        expect(routes.map((route) => route.project)).toEqual(["proj-direct"]);
+        expect(storage.getItem("gw.root.account:one")).toBe("ed25519:earlier");
     });
 });

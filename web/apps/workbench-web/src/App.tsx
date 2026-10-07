@@ -25,7 +25,7 @@ import { accountSelectionSync } from "./account-selection-sync";
 import { accountMenuIdentity } from "./account-menu-identity";
 import { followDesktopHomeSession } from "./desktop-home-session";
 import { claimWithoutAsking } from "./desktop-home-default";
-import { createEffect, createMemo, createResource, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack, type Accessor, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createRoot, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack, type Accessor, type JSX } from "solid-js";
 import {
     authority,
     bearer,
@@ -405,9 +405,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         // page's cookie jar. Both logout routes are idempotent: clear that
         // sealed custody as well as any hosted browser session before the
         // shell is rebuilt signed out.
-        if (hubSession()?.linked === true) await api.hubSessionSignOut();
-        await api.closeAccountConnections();
-        await endSession(controlPlaneBase());
+        //
+        // Release the event streams first. In the desktop shell they share the
+        // control plane's origin with these logout routes, and enough of them
+        // leave the first logout request queued in the web view forever, with
+        // the account menu stuck on "Signing out" (WS-581).
+        api.suspendEventStreams();
+        try {
+            if (hubSession()?.linked === true) await api.hubSessionSignOut();
+            await api.closeAccountConnections();
+            await endSession(controlPlaneBase());
+        } catch (error) {
+            api.resumeEventStreams();
+            throw error;
+        }
         browserSelectionSync?.publish(null);
         await props.gaugeApps?.onNativeAccountSessionChanged?.(false);
         // A reload drops every memory-only Home admission and authenticated projection along
@@ -712,6 +723,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // the previous account before opening the selected one's Home.
             window.location.replace("/");
         } catch (error) {
+            // `closeAccountConnections` held the streams; the account did not
+            // change, so let them resolve their routes again.
+            api.resumeEventStreams();
             setAccountSwitchError(error instanceof Error ? error.message : String(error));
             setSwitchingAccount(false);
         }
@@ -2008,7 +2022,28 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             });
     }
 
-    async function finishNewChat(id: EngagementId, prompt?: string, images: ImageRef[] = []) {
+    // A task captures the open project when it starts and refuses to run if the
+    // selection moves under it (WS-459). A chat created from the empty composer
+    // is selected before the workspace projection names its project, so its
+    // first turn waits for the task route to reach that project rather than
+    // starting on the route it replaces and being refused as "Task project
+    // selection changed". Bounded: past the limit the turn runs and reports
+    // whatever it meets, as it did before.
+    function whenTaskRoute(project: ProjectId, limitMs = 10_000): Promise<void> {
+        return new Promise((resolve) => {
+            createRoot((dispose) => {
+                const timer = setTimeout(() => { dispose(); resolve(); }, limitMs);
+                createEffect(() => {
+                    if (taskRouteProject() !== project) return;
+                    clearTimeout(timer);
+                    dispose();
+                    resolve();
+                });
+            });
+        });
+    }
+
+    async function finishNewChat(id: EngagementId, prompt?: string, images: ImageRef[] = [], project?: ProjectId) {
         // The quick-start composer's model/effort choices were held as pending
         // pins (no chat existed to own them); write them into the new chat's
         // config before its first turn so the first message runs with them.
@@ -2033,7 +2068,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         if (prompt) {
             // Let the selected-chat effect subscribe before the first turn starts;
             // otherwise an eager turn can race the fresh transcript reset.
-            queueMicrotask(() => void runPrompt(id, prompt, images).catch((e) => {
+            const route = project ? whenTaskRoute(project) : Promise.resolve();
+            queueMicrotask(() => void route.then(() => runPrompt(id, prompt, images)).catch((e) => {
                 // No composer row owns this first turn, so nothing else reports it.
                 if (!turnStopped(e) && selected() === id) {
                     reportFailure("chat", e instanceof Rejected
@@ -2078,7 +2114,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }
             if (project && placementId && targets.length === 1) {
                 const id = await api.createChatUnderPlacement(project.id, placementId, "new chat", [targets[0].id]);
-                await finishNewChat(id, prompt, images);
+                await finishNewChat(id, prompt, images, project.id);
                 return;
             }
             if (scope) {
@@ -2142,7 +2178,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             return;
         }
         // The chat exists now, so the message is its first turn and does not go back.
-        await finishNewChat(id, choice.prompt, choice.images)
+        await finishNewChat(id, choice.prompt, choice.images, choice.projectId)
             .catch((error) => reportFailure("chat", `couldn't open the new chat — ${failureReason(error)}`));
     }
 

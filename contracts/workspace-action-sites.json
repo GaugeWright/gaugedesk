@@ -225,6 +225,14 @@
     },
     {
       "declaration": {
+        "name": "pull_from_line",
+        "owner": "ChatWorkspace",
+        "signature": "fn pull_from_line (& self) -> Result < LineSync >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
         "name": "standing_revision",
         "owner": "ChatWorkspace",
         "signature": "fn standing_revision (& self) -> Result < RevisionId >"
@@ -1036,16 +1044,6 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::apply_engagement_merge_action",
-        "capability": "sync_from_main",
-        "count": 1,
-        "expression": "sibling . sync_from_main ()",
-        "file": "crates/app/src/engagement_routes.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Workbench::candidate_within_target_scope",
         "capability": "diff_against_main",
         "count": 1,
@@ -1256,7 +1254,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::sync_engagement_from_main",
+        "callable": "impl inherent for Workbench::pull_line_into_chat",
         "capability": "publish",
         "count": 1,
         "expression": "self . publish (id , ev)",
@@ -1266,10 +1264,10 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::sync_engagement_from_main",
-        "capability": "sync_from_main",
+        "callable": "impl inherent for Workbench::pull_line_into_chat",
+        "capability": "pull_from_line",
         "count": 1,
-        "expression": "eng . sync_from_main ()",
+        "expression": "self . engagements . get (id) ? . pull_from_line ()",
         "file": "crates/app/src/engagement_routes.rs"
       },
       "profile": "editor-and-import"
@@ -1340,16 +1338,6 @@
         "capability": "merge_into_main",
         "count": 1,
         "expression": "e . merge_into_main ()",
-        "file": "crates/app/src/engine.rs"
-      },
-      "profile": "agent-turn"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::greedy_autosync",
-        "capability": "sync_from_main",
-        "count": 1,
-        "expression": "se . sync_from_main ()",
         "file": "crates/app/src/engine.rs"
       },
       "profile": "agent-turn"
@@ -4206,6 +4194,16 @@
     },
     {
       "site": {
+        "callable": "impl ChatWorkspace for Engagement::pull_from_line",
+        "capability": "pull_from_line",
+        "count": 1,
+        "expression": "self . pull_from_line ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "impl ChatWorkspace for Engagement::sync_from_main",
         "capability": "sync_from_main",
         "count": 1,
@@ -4676,6 +4674,16 @@
     },
     {
       "site": {
+        "callable": "impl inherent for Engagement::sync_from_main",
+        "capability": "pull_from_line",
+        "count": 1,
+        "expression": "self . pull_from_line ()",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
         "callable": "impl inherent for Engagement::write_file",
         "capability": "write_file_bytes",
         "count": 1,
@@ -4790,6 +4798,16 @@
         "capability": "ingest_upload",
         "count": 1,
         "expression": "self . ingest_upload (files)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "trait ChatWorkspace::pull_from_line",
+        "capability": "sync_from_main",
+        "count": 1,
+        "expression": "self . sync_from_main ()",
         "file": "crates/workspace/src/lib.rs"
       },
       "profile": "native-workspace-adapter"

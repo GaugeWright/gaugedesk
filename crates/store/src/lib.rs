@@ -25,9 +25,11 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 pub mod command_dispatch;
 pub mod command_scope_archive;
 mod durable_registry;
+pub mod home_product;
 mod home_reference_catalog;
 pub mod home_reference_journal;
 mod home_reference_storage;
+pub mod migration_inventory;
 pub mod project_authority;
 mod record_admission;
 mod record_admission_pair;
@@ -69,6 +71,8 @@ pub struct Store {
     /// Set only for an ephemeral store ([`Store::open_in_memory`]): the temporary
     /// directory removed once every connection to it has dropped.
     scratch: Option<Arc<ScratchHome>>,
+    /// Independently retained coordinates for a dedicated Home product store.
+    home_product: Option<home_product::HomeProductBinding>,
 }
 
 /// An additional exact-input identity claimed atomically with record facts.
@@ -252,7 +256,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 12;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 13;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -674,6 +678,11 @@ const MIGRATIONS: &[Migration] = &[
                  PRIMARY KEY (scope_id, kind, lifecycle, codec_version, reducer_build)
              );",
     },
+    Migration {
+        version: 13,
+        name: "home-product-bindings",
+        sql: home_product::CATALOG_SCHEMA,
+    },
 ];
 
 /// The fail-closed downgrade-guard refusal (DR-0054 Phase B): diagnosable — it
@@ -856,7 +865,13 @@ impl Store {
     /// serialization is the store's own job (immediate transactions + WAL +
     /// `busy_timeout`, see [`open`](Self::open)), not the caller's.
     pub fn sibling(&self) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(&self.path)?;
+        if let Some(binding) = &self.home_product {
+            return home_product::reopen(self, binding, false)
+                .map_err(home_product::as_database_error);
+        }
+        let conn =
+            Connection::open_with_flags(&self.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        home_product::refuse_unbound_open(&conn)?;
         conn.busy_timeout(Duration::from_secs(30))?;
         // The original connection already established the database journal mode
         // and schema. Re-running `PRAGMA journal_mode` and `CREATE TABLE IF NOT
@@ -874,6 +889,7 @@ impl Store {
             // Share the scratch directory's lifetime: an ephemeral database
             // outlives whichever connection drops first.
             scratch: self.scratch.clone(),
+            home_product: None,
         })
     }
 
@@ -881,14 +897,20 @@ impl Store {
     /// lifetime. Opening this connection neither creates nor migrates storage;
     /// SQLite refuses mutation through it. This supplies no authority fence.
     pub fn read_only_sibling(&self) -> Result<Self, rusqlite::Error> {
+        if let Some(binding) = &self.home_product {
+            return home_product::reopen(self, binding, true)
+                .map_err(home_product::as_database_error);
+        }
         let conn =
             Connection::open_with_flags(&self.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        home_product::refuse_unbound_open(&conn)?;
         conn.busy_timeout(Duration::from_secs(30))?;
         Ok(Self {
             conn,
             codec: self.codec.clone(),
             path: self.path.clone(),
             scratch: self.scratch.clone(),
+            home_product: None,
         })
     }
 
@@ -899,6 +921,7 @@ impl Store {
 
     pub fn open(path: &str) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        home_product::refuse_unbound_open(&conn)?;
         // Install the busy timeout before changing journal state, so two
         // connections racing through initialization wait instead of failing
         // SQLITE_BUSY. WAL remains the local-disk default; an explicitly
@@ -1973,6 +1996,7 @@ impl Store {
             codec: None,
             path,
             scratch: None,
+            home_product: None,
         })
     }
 

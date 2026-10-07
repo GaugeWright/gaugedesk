@@ -113,13 +113,11 @@ export async function accountUnregisterHome(json: RouteJson, home: HomeId): Prom
  * source that rule is about — any holder of the person's session can write into
  * it, `home_fingerprint` included.
  *
- * Provenance is a parameter rather than a constant because the two client
- * families are at different points of the same migration (ADR 0133 §5). The
- * browser reads the signed record and so tells the truth here — `resolve-home-routes.ts`
- * passes `unsigned`. Native mobile does not verify yet, and flipping it there
- * first would strip the locators its relay-only Homes depend on and take working
- * Machines offline. It is spelled out at each call site so neither reading can be
- * mistaken for the intended end state, which is `unsigned` everywhere.
+ * Provenance is still a parameter, so each call site says what it is reading,
+ * but every client now reads this table as `unsigned` (ADR 0133 §5). The browser
+ * did first; native mobile followed once it read the signed record too
+ * (WS-746), and both take the table through `resolve-home-routes.ts`, which
+ * keeps a relay locator only when the root-signed record carries it.
  */
 export async function accountHomeRoutes(
     json: RouteJson,

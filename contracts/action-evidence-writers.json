@@ -10,7 +10,7 @@
   "classifications": {
     "seam": "Admits command/effect evidence only inside a fence on current product standing (a dispatch read basis, a claimed command, or a receipt-protected lifecycle transaction); calling it anywhere is the ACTION seam itself.",
     "ledger": "Writes the command ledger, command-record facts, imported command history or operational observations directly, without a current-standing fence; only a declared seam owner may call it, and every other call is a listed bypass.",
-    "product-fact": "Writes product records, events, scopes or derived projection metadata; not command/effect evidence, though the lifecycle that calls it may still owe an admitted command under ACTION-3 to ACTION-6.",
+    "product-fact": "Writes product records, events, scopes, Home product-store registration and readiness, or derived projection metadata; not command/effect evidence, though the lifecycle that calls it may still owe an admitted command under ACTION-3 to ACTION-6.",
     "reference-journal": "Writes the Home reference journal, a separate authority with its own operation, refusal and seal records; its admission is governed by its own lifecycle rather than this ledger.",
     "configuration": "Configures a handle (codec, deadline, process guard, basis combination) and persists nothing by itself."
   },
@@ -426,6 +426,14 @@
     {
       "declaration": {
         "owner": "Store",
+        "name": "initialize_home_product",
+        "signature": "fn initialize_home_product (& mut self , root : & Path , project : & str , home : & str ,) -> Result < Store , HomeProductError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
         "name": "put_content_metadata",
         "signature": "fn put_content_metadata (& mut self , content : & ContentMetadata) -> Result < () , AdmitError >"
       },
@@ -494,6 +502,14 @@
         "signature": "fn register_home_journal (& mut self , project_id : & str , home_id : & str ,) -> Result < HomeJournalRegistration , JournalError >"
       },
       "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "register_home_product",
+        "signature": "fn register_home_product (& mut self , project : & str , home : & str ,) -> Result < HomeProductRegistration , HomeProductError >"
+      },
+      "classification": "product-fact"
     },
     {
       "declaration": {

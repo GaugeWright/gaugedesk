@@ -7332,6 +7332,66 @@ async fn workstream_sync_route_is_clean_with_nothing_to_pull() {
     let (s, body) = send(&app, "POST", &format!("/chats/{chat}/sync"), None).await;
     assert_eq!(s, StatusCode::OK, "got {body}");
     assert!(body.contains("\"conflict\":false"), "got {body}");
+    // ...and a no-op sync says nothing in the chat (`run-chat.md`, WS-H).
+    let (s, body) = send(&app, "GET", &format!("/chats/{chat}/transcript"), None).await;
+    assert_eq!(s, StatusCode::OK, "got {body}");
+    assert!(
+        !body.contains("\"sync\""),
+        "a no-op sync wrote a line: {body}"
+    );
+}
+
+/// WS-H: work arriving from a chat's line reads as one plain operational line
+/// in the receiving chat, and pulling again with nothing new says nothing.
+#[tokio::test]
+async fn pulled_line_work_reads_as_one_operational_line() {
+    let (_directory, wb) = lean_workbench();
+    let app = open_control_plane(wb.clone());
+    let mut chats = Vec::new();
+    for _ in 0..2 {
+        let (status, body) = send(&app, "POST", "/chats", Some("{}")).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        chats.push(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let (author, receiver) = (&chats[0], &chats[1]);
+    {
+        let guard = wb.lock_unpoisoned();
+        let engagement = guard.engagements.get(author).unwrap();
+        let target_id = &guard.library.chat_targets[author].target_id;
+        let root = library::target_id_path_v1(target_id).unwrap();
+        engagement
+            .write_file(&format!("targets/{root}/shared.txt"), "from the author")
+            .unwrap();
+        engagement.commit_turn("turn").unwrap().unwrap();
+        assert_eq!(
+            engagement.merge_into_main().unwrap(),
+            gaugedesk_workspace::MergeOutcome::Clean
+        );
+    }
+    let sync_lines = |body: &str| {
+        serde_json::from_str::<Vec<serde_json::Value>>(body)
+            .unwrap()
+            .into_iter()
+            .filter(|line| line["kind"] == "sync")
+            .count()
+    };
+    for expected in [1, 1] {
+        let (status, body) = send(&app, "POST", &format!("/chats/{receiver}/sync"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) =
+            send(&app, "GET", &format!("/chats/{receiver}/transcript"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(sync_lines(&body), expected, "{body}");
+        assert!(
+            !body.contains("main"),
+            "a sync line leaked ref vocabulary: {body}"
+        );
+    }
 }
 
 #[tokio::test]

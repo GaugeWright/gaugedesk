@@ -18,7 +18,7 @@ use gaugedesk_core::merge::{MergeCommand, MergeState};
 #[cfg(debug_assertions)]
 use gaugedesk_store::Store;
 use gaugedesk_workspace::{
-    ChatWorkspace, FileEntry, MergeOutcome, MergePreview, RegionResolution, SaveBase,
+    ChatWorkspace, FileEntry, LineSync, MergeOutcome, MergePreview, RegionResolution, SaveBase,
     SaveFileOutcome, WorkspaceError,
 };
 use serde::Deserialize;
@@ -1395,13 +1395,19 @@ impl Workbench {
                             }
                             let target = self.engagements.get(id).unwrap().target().to_string();
                             let target_id = self.engagement_index.get(id).cloned();
-                            for (sibling_id, sibling) in &self.engagements {
-                                if sibling_id != id
-                                    && sibling.target() == target
-                                    && self.engagement_index.get(sibling_id) == target_id.as_ref()
-                                {
-                                    let _ = sibling.sync_from_main();
-                                }
+                            let siblings: Vec<String> = self
+                                .engagements
+                                .iter()
+                                .filter(|(sibling_id, sibling)| {
+                                    sibling_id.as_str() != id
+                                        && sibling.target() == target
+                                        && self.engagement_index.get(sibling_id.as_str())
+                                            == target_id.as_ref()
+                                })
+                                .map(|(sibling_id, _)| sibling_id.clone())
+                                .collect();
+                            for sibling_id in siblings {
+                                let _ = self.pull_line_into_chat(&sibling_id);
                             }
                             Ok(state)
                         }
@@ -1505,12 +1511,23 @@ impl Workbench {
         if self.chat_project_moving(id) {
             return Some(Err(crate::federation::paused_for_move()));
         }
-        let eng = self.engagements.get(id)?;
-        let result = eng.sync_from_main();
-        if matches!(result, Ok(MergeOutcome::Clean)) {
+        Some(self.pull_line_into_chat(id)?.map(LineSync::merge_outcome))
+    }
+
+    /// Fold a chat's collaboration line into it. When the line's advance
+    /// actually arrives, the chat's transcript gains one plain operational line;
+    /// a sync that found nothing to fold says nothing, and a conflict is shown
+    /// by the chat's navigation row and Changes view rather than here
+    /// (`run-chat.md`, shared line & auto-sync; WS-H).
+    pub(crate) fn pull_line_into_chat(
+        &mut self,
+        id: &str,
+    ) -> Option<Result<LineSync, WorkspaceError>> {
+        let result = self.engagements.get(id)?.pull_from_line();
+        if matches!(result, Ok(LineSync::Pulled)) {
             let ev = ServerEvent::Admitted {
                 kind: "sync".into(),
-                text: "synced from main".into(),
+                text: "pulled in the latest from the shared line".into(),
             };
             let _ = self
                 .store_mut()
@@ -4576,6 +4593,10 @@ pub(crate) async fn post_stop(
 #[cfg(debug_assertions)]
 #[derive(Default, serde::Deserialize)]
 pub(crate) struct TestResetQuery {
+    /// Match the synthetic account Hub only for Administration admission.
+    /// The ordinary local-user fixture remains the default.
+    #[serde(default)]
+    administration_account: bool,
     /// Seed a real project chat with one context handle whose payload access is
     /// still Init, for production-client request/approval journeys.
     #[serde(default)]
@@ -4603,9 +4624,17 @@ pub(crate) struct TestResetQuery {
 pub(crate) async fn post_test_reset(
     State(wb): State<SharedWorkbench>,
     Query(query): Query<TestResetQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     if gaugedesk_env::var("TEST_RESET").is_none() {
         return (StatusCode::FORBIDDEN, "reset is disabled").into_response();
+    }
+    if query.administration_account && gaugedesk_env::var("TEST_IDENTITY_TOKEN").is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Administration account fixture requires test identity",
+        )
+            .into_response();
     }
     let mut guard = wb.lock_unpoisoned();
     let root = guard.root_path();
@@ -4617,7 +4646,13 @@ pub(crate) async fn post_test_reset(
     // Drop the old workbench — closing the sqlite store and releasing the instance
     // worktrees — by swapping in a throwaway in-memory one, so the files unlink.
     match Store::open_in_memory() {
-        Ok(scratch) => drop(std::mem::replace(&mut *guard, Workbench::new(scratch))),
+        Ok(scratch) => {
+            let mut recovery = Workbench::new(scratch);
+            // A failed debug reset must keep its recovery root so the next
+            // guarded request can retry; this is never a successful reset.
+            recovery.root = root.clone();
+            drop(std::mem::replace(&mut *guard, recovery));
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4626,11 +4661,24 @@ pub(crate) async fn post_test_reset(
                 .into_response()
         }
     }
-    let _ = std::fs::remove_dir_all(&root);
+    if let Err(error) = std::fs::remove_dir_all(&root) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reset wipe: {error}"),
+            )
+                .into_response();
+        }
+    }
     // Clear any armed test-only conflict injection (UX-7) so it can't leak across scenarios.
     engine::set_force_merge_conflict(false);
     match build_workbench(&root) {
-        Ok(mut fresh) => {
+        Ok(fresh) => {
+            // Keep the rebuilt root on every fixture error. The mutex excludes
+            // observers while seeding; refusal stays failure, never reset success
+            // or an old-state rollback claim, and the next reset can retry.
+            *guard = fresh;
+            let fresh = &mut *guard;
             // The enterprise browser composition uses the same reset hook. Seed
             // its controlled identities and memberships here, behind the
             // test-only gate, rather than retaining a production `/admin/*`
@@ -4638,22 +4686,33 @@ pub(crate) async fn post_test_reset(
             // credentials, the production enterprise middleware and cookie /
             // bearer parser remain active; absence and invalid credentials fail
             // closed exactly as they do outside the harness.
+            let owner_authority = if query.administration_account {
+                "e2e-account-root"
+            } else {
+                "local-user"
+            };
             let owner = crate::org::MembershipRecord {
-                id: "local-user".to_owned(),
+                id: owner_authority.to_owned(),
                 op: crate::org::RecordOp::Upsert,
                 org_id: crate::org::ORG_ID.to_owned(),
-                authority: "local-user".to_owned(),
+                authority: owner_authority.to_owned(),
                 email: String::new(),
                 role: "owner".to_owned(),
                 status: crate::org::MembershipStatus::Active,
                 managed_by_scim: false,
                 team: None,
             };
-            let _ = fresh.store_mut().append_record(
+            if let Err(error) = fresh.store_mut().append_record(
                 crate::org::ORG_SCOPE,
                 "membership",
                 &serde_json::to_string(&owner).expect("test owner serializes"),
-            );
+            ) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("test owner: {error:?}"),
+                )
+                    .into_response();
+            }
             if let Some(owner_token) = gaugedesk_env::var("TEST_IDENTITY_TOKEN") {
                 use std::sync::Arc;
 
@@ -4673,15 +4732,21 @@ pub(crate) async fn post_test_reset(
                     managed_by_scim: false,
                     team: None,
                 };
-                let _ = fresh.store_mut().append_record(
+                if let Err(error) = fresh.store_mut().append_record(
                     crate::org::ORG_SCOPE,
                     "membership",
                     &serde_json::to_string(&member).expect("test member serializes"),
-                );
+                ) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("test member: {error:?}"),
+                    )
+                        .into_response();
+                }
                 let idp = crate::identity::LoopbackIdentityProvider::new()
                     .enroll(
                         owner_token,
-                        AuthorityId::new("local-user"),
+                        AuthorityId::new(owner_authority),
                         AuthorityAttributes::default(),
                     )
                     .enroll(
@@ -4713,7 +4778,7 @@ pub(crate) async fn post_test_reset(
                 };
 
                 let now = crate::account_session::unix_now();
-                let (account_id, root) = match create_custodied_account_root(&fresh, now) {
+                let (account_id, root) = match create_custodied_account_root(fresh, now) {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -4814,6 +4879,20 @@ pub(crate) async fn post_test_reset(
                     )
                         .into_response();
                 }
+                let project = match fresh.library.project_of_chat(chat) {
+                    Some(project) => project.to_owned(),
+                    None => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "test access project missing",
+                        )
+                            .into_response()
+                    }
+                };
+                let _session = match reset_fixture_session(fresh, &headers, &project) {
+                    Ok(session) => session,
+                    Err(error) => return error.into_response(),
+                };
                 let owner = Authority::from(fresh.authority().as_str());
                 let record = ResourceRecord::new(
                     Resource::input(
@@ -4899,10 +4978,184 @@ pub(crate) async fn post_test_reset(
                     }
                 }
             }
-            *guard = fresh;
             (StatusCode::OK, Json(serde_json::json!({ "reset": true }))).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("rebuild: {e}")).into_response(),
+    }
+}
+
+/// Fixture content is written only for the proven resource owner while that
+/// request holds its admitted project, exactly as other non-project-path
+/// request handlers use `hold_for_session`. No unattended/test key grant.
+///
+/// A local Project Host without an identity provider admits its
+/// credential-free channel as the computer's own account, as its composition
+/// does for every other request; anywhere else the caller must present a
+/// credential that names the current owner.
+#[cfg(debug_assertions)]
+fn reset_fixture_session(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    project: &str,
+) -> Result<crate::content_vault::SessionHold, (StatusCode, &'static str)> {
+    let live = wb
+        .library
+        .projects
+        .get(project)
+        .is_some_and(|record| record.op == RecordOp::Upsert);
+    let Some(bearer) = crate::net_http::bearer(headers) else {
+        if !wb.desktop_account_mode() {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "authenticate the fixture resource owner",
+            ));
+        }
+        if !live || !wb.project_visibility(None).allows(project) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "fixture caller does not own this project",
+            ));
+        }
+        return wb.hold_for_session(project).ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fixture project custody unavailable",
+        ));
+    };
+    let context = wb.authenticate_action_context(bearer).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "authenticate the fixture resource owner",
+    ))?;
+    crate::identity::revalidate_workflow_context(wb.store_ref(), wb.home_id(), &context)
+        .map_err(|_| (StatusCode::FORBIDDEN, "fixture owner standing unavailable"))?;
+    let org = crate::org::Org::rebuild(wb.store_ref())
+        .map_err(|_| (StatusCode::FORBIDDEN, "fixture owner standing unavailable"))?;
+    if context.actor() != wb.authority()
+        || org.role_of(context.actor().as_str()) != Some(gaugedesk_core::abac::Role::new("owner"))
+        || !live
+        || !wb.project_visibility(Some(bearer)).allows(project)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "fixture caller does not own this project",
+        ));
+    }
+    wb.hold_for_session(project).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "fixture project custody unavailable",
+    ))
+}
+
+#[cfg(test)]
+mod reset_fixture_session_tests {
+    use super::*;
+    use gaugedesk_core::abac::AuthorityAttributes;
+    use gaugedesk_core::ids::AuthorityId;
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("test bearer"),
+        );
+        headers
+    }
+
+    #[test]
+    fn fixture_session_requires_current_resource_owner_and_live_project() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let shared = crate::open_workbench(root.path()).expect("open fixture workbench");
+        let mut wb = shared.lock_unpoisoned();
+        let owner = wb.authority().clone();
+        let idp = crate::identity::LoopbackIdentityProvider::new()
+            .enroll("owner-token", owner.clone(), AuthorityAttributes::default())
+            .enroll(
+                "other-token",
+                AuthorityId::new("other"),
+                AuthorityAttributes::default(),
+            );
+        wb.set_identity_provider(Some(std::sync::Arc::new(idp)));
+        let project = crate::DEFAULT_PROJECT;
+        assert_eq!(
+            reset_fixture_session(&wb, &HeaderMap::new(), project)
+                .map(|_| ())
+                .expect_err("anonymous refusal")
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            reset_fixture_session(&wb, &bearer("unknown"), project)
+                .map(|_| ())
+                .expect_err("unknown bearer refusal")
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            reset_fixture_session(&wb, &bearer("other-token"), project)
+                .map(|_| ())
+                .expect_err("wrong owner refusal")
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            reset_fixture_session(&wb, &bearer("owner-token"), project)
+                .map(|_| ())
+                .expect_err("missing active standing refusal")
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let member = crate::org::MembershipRecord {
+            id: owner.to_string(),
+            op: crate::org::RecordOp::Upsert,
+            org_id: crate::org::ORG_ID.to_owned(),
+            authority: owner.to_string(),
+            email: String::new(),
+            role: "owner".to_owned(),
+            status: crate::org::MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        wb.store_mut()
+            .append_record(
+                crate::org::ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&member).expect("owner record"),
+            )
+            .expect("admit fixture owner");
+        assert_eq!(
+            reset_fixture_session(&wb, &bearer("owner-token"), "missing-project")
+                .map(|_| ())
+                .expect_err("missing project refusal")
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let session = reset_fixture_session(&wb, &bearer("owner-token"), project)
+            .expect("current owner project session");
+        drop(session);
+    }
+
+    #[test]
+    fn local_channel_holds_only_its_own_live_project() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let shared = crate::open_workbench(root.path()).expect("open fixture workbench");
+        let wb = shared.lock_unpoisoned();
+        assert!(wb.desktop_account_mode(), "fixture is a local Project Host");
+        assert_eq!(
+            reset_fixture_session(&wb, &HeaderMap::new(), "missing-project")
+                .map(|_| ())
+                .expect_err("missing project refusal")
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            reset_fixture_session(&wb, &bearer("unknown"), crate::DEFAULT_PROJECT)
+                .map(|_| ())
+                .expect_err("a presented credential is never the local channel")
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let session = reset_fixture_session(&wb, &HeaderMap::new(), crate::DEFAULT_PROJECT)
+            .expect("local operator project session");
+        drop(session);
     }
 }
 

@@ -1734,3 +1734,72 @@ describe("scoped task stream lifetime", () => {
         } finally { close?.(); vi.useRealTimers(); }
     });
 });
+
+describe("account change releases event stream connections (WS-581)", () => {
+    // A desktop shell's streams share one origin with its logout routes, and
+    // WebKit opens at most six connections to an origin. Six held streams left
+    // the sign-out POST queued forever with the account menu stuck busy.
+    function streamingFetch() {
+        const live: AbortSignal[] = [];
+        const requests: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = new URL(String(input));
+            requests.push(`${init?.method ?? "GET"} ${url.pathname}`);
+            if (url.pathname === "/workspace/events") {
+                const signal = init?.signal;
+                if (signal) live.push(signal);
+                const body = new ReadableStream<Uint8Array>({ start(controller) {
+                    signal?.addEventListener("abort", () => {
+                        try { controller.error(new DOMException("aborted", "AbortError")); } catch { /* Already closed. */ }
+                    });
+                } });
+                return new Response(body, { headers: { "content-type": "text/event-stream" } });
+            }
+            throw new Error(`unexpected fetch ${url.pathname}`);
+        }));
+        return { live: () => live.filter((signal) => !signal.aborted), requests };
+    }
+    const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+
+    it("closes every stream before an account change and holds reconnects until resumed", async () => {
+        vi.useFakeTimers();
+        const { live, requests } = streamingFetch();
+        const stops: (() => void)[] = [];
+        try {
+            const api = new WorkbenchControlPlane("https://local.example", { splitHomes: false });
+            for (let i = 0; i < 6; i++) stops.push(api.subscribeWorkspace(() => undefined));
+            await flush();
+            expect(live()).toHaveLength(6);
+
+            api.suspendEventStreams();
+            expect(live()).toHaveLength(0);
+            // Neither a reconnect loop nor a new subscriber reopens one under
+            // the account change.
+            stops.push(api.subscribeWorkspace(() => undefined));
+            await vi.advanceTimersByTimeAsync(10_000); await flush();
+            expect(live()).toHaveLength(0);
+            expect(requests.filter((request) => request === "GET /workspace/events")).toHaveLength(6);
+
+            // A failed sign-out hands them back: each resolves its route again.
+            api.resumeEventStreams();
+            await flush(); await vi.advanceTimersByTimeAsync(251); await flush();
+            expect(live()).toHaveLength(7);
+        } finally {
+            for (const stop of stops) stop();
+            vi.useRealTimers();
+        }
+    });
+
+    it("releases the streams when account connections close", async () => {
+        const { live } = streamingFetch();
+        const api = new WorkbenchControlPlane("https://local.example", { splitHomes: false });
+        const stops = [api.subscribeWorkspace(() => undefined), api.subscribeWorkspace(() => undefined)];
+        try {
+            await vi.waitFor(() => expect(live()).toHaveLength(2));
+            await api.closeAccountConnections();
+            expect(live()).toHaveLength(0);
+        } finally {
+            for (const stop of stops) stop();
+        }
+    });
+});

@@ -491,6 +491,38 @@ export function FacetBrowser(props: {
             return next;
         });
     const expand = (id: string) => setExpanded((s) => (s.has(id) ? s : new Set(s).add(id)));
+    // The open chat is revealed: the facet that holds it is shown and the groups
+    // above it are expanded, once per chat. A narrow window unmounts this browser
+    // whenever another pane is shown, so without this, coming back to Browse
+    // landed on collapsed Projects with the open chat's row hidden — an Agent's
+    // edit chat in particular, which lives in Workshop. Recent already lists
+    // every chat flat, so it is left alone. A caret the person closes afterwards
+    // stays closed until another chat is opened.
+    let revealedChat: EngagementId | null = null;
+    createEffect(() => {
+        const id = props.selected;
+        const t = tree();
+        if (!id || !t || id === revealedChat) return;
+        // An Agent's previews and tests are listed under it in Workshop too.
+        const agent = t.archetypes.find((a) =>
+            a.chats.some((chat) => chat.id === id)
+            || a.previews.some((preview) => preview.chat.id === id));
+        if (agent) {
+            revealedChat = id;
+            if (untrack(facet) !== "recent") setFacet("library");
+            expand(agent.id);
+            return;
+        }
+        for (const project of t.projects) {
+            const placement = project.placements.find((pl) => pl.chats.some((chat) => chat.id === id));
+            if (!placement) continue;
+            revealedChat = id;
+            if (untrack(facet) !== "recent") setFacet("projects");
+            expand(project.id);
+            expand(placement.placementId);
+            return;
+        }
+    });
     // inline editor: creating or renaming a named tree node.
     const [editing, setEditing] = createSignal<
         | { kind: "new-project" }

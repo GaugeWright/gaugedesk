@@ -655,9 +655,10 @@ struct PackageManifestPaths {
     project_context: Option<String>,
     capabilities: Vec<String>,
     agent_abilities: Vec<String>,
-    // The runtime validates authored tools; the publisher reads only package paths.
-    #[serde(default, rename = "external_tools")]
-    _external_tools: Vec<serde_json::Value>,
+    // The runtime validates authored tools; the publisher reads each one's
+    // capability, which the public session governs as a turn handle.
+    #[serde(default)]
+    external_tools: Vec<serde_json::Value>,
     max_steps: usize,
 }
 
@@ -1229,6 +1230,19 @@ impl Workbench {
             ));
         }
         let required = spec.public_abilities.clone();
+        // The public runtime gives a turn one `external_tool` resource per
+        // authored tool whose capability visitors hold, with the capability as
+        // its handle, and refuses a turn whose handles the signed envelope does
+        // not govern. Unbound, a Panel agent whose visitors may read files or
+        // ask questions (offer_download, ask_choices) had every visitor turn
+        // rejected: "ungoverned handle `workspace.read`".
+        let tool_capabilities = manifest
+            .external_tools
+            .iter()
+            .filter_map(|tool| tool.get("capability").and_then(serde_json::Value::as_str))
+            .filter(|capability| spec.public_abilities.contains(*capability))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
         let signing_key = &publisher.signing_key;
         let signer = gaugedesk_core::ids::AuthorityId::new(publisher.account.clone());
         let policy_principal = gaugedesk_whip_runtime::ResourcePolicy {
@@ -1261,8 +1275,19 @@ impl Workbench {
                     "provider:public-session".to_owned(),
                     policy_principal.clone(),
                 ),
-                ("placement:public-do".to_owned(), policy_principal),
-            ]),
+                ("placement:public-do".to_owned(), policy_principal.clone()),
+            ])
+            .into_iter()
+            .chain(tool_capabilities.iter().map(|capability| {
+                (
+                    public_tool_resource(capability),
+                    gaugedesk_whip_runtime::ResourcePolicy {
+                        principal: false,
+                        ..policy_principal.clone()
+                    },
+                )
+            }))
+            .collect(),
             bindings: BTreeMap::from([
                 (
                     "project".to_owned(),
@@ -1279,7 +1304,14 @@ impl Workbench {
                 ("model".to_owned(), "provider:public-session".to_owned()),
                 ("owned".to_owned(), "provider:public-session".to_owned()),
                 ("public-do".to_owned(), "placement:public-do".to_owned()),
-            ]),
+            ])
+            .into_iter()
+            .chain(
+                tool_capabilities
+                    .iter()
+                    .map(|capability| (capability.clone(), public_tool_resource(capability))),
+            )
+            .collect(),
             parties: BTreeMap::from([("audience".to_owned(), "audience".to_owned())]),
             // WhippleScript validates the authored package against the complete
             // package registry carried by the governance epoch. The release's
@@ -2926,6 +2958,12 @@ pub fn edge_rejection_status(status: u16) -> u16 {
     }
 }
 
+/// The governed resource behind an authored tool's capability handle in a
+/// public session.
+fn public_tool_resource(capability: &str) -> String {
+    format!("tool:public-session:{capability}")
+}
+
 pub fn normalized_edge(value: &str) -> io::Result<String> {
     let edge = value.trim().trim_end_matches('/');
     if (!edge.starts_with("https://")
@@ -3117,6 +3155,52 @@ mod publisher_tests {
         guard
             .set_panel_profile("inst-artifact-paths-agent", profile)
             .unwrap();
+    }
+
+    #[test]
+    fn envelope_governs_the_handle_of_each_tool_visitors_may_use() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        // A new Panel agent's package declares ask_choices under
+        // `question.ask`, which "Ask questions" grants visitors.
+        let profile = crate::library::PanelPublicProfile {
+            public_abilities: ["question.ask".to_owned()].into_iter().collect(),
+            model: crate::library::PanelModelPolicy {
+                pinned: Some("gpt-5.6-terra".to_owned()),
+                ..Default::default()
+            },
+            ..crate::library::PanelPublicProfile::default()
+        };
+        guard
+            .seed_panel_placement("inst-envelope-tools", profile)
+            .unwrap();
+        let profile = guard.panel_profile("inst-envelope-tools-agent").unwrap();
+        let release = guard
+            .build_agent_release(
+                "inst-envelope-tools",
+                release_spec(
+                    &profile,
+                    release_provider(&profile.model, None, ReleaseFunding::Managed).unwrap(),
+                    1_800_000_000_000,
+                ),
+            )
+            .unwrap();
+        let policy: serde_json::Value =
+            serde_json::from_str(&release.payload.host_policy.signed_envelope).unwrap();
+        assert_eq!(
+            policy["bindings"]["question.ask"], "tool:public-session:question.ask",
+            "the public runtime refuses a turn whose ask_choices handle is ungoverned: {policy}"
+        );
+        assert!(
+            policy["resources"]["tool:public-session:question.ask"].is_object(),
+            "{policy}"
+        );
+        // A capability visitors do not hold is not governed.
+        assert!(
+            policy["bindings"].get("workspace.read").is_none(),
+            "{policy}"
+        );
     }
 
     #[test]

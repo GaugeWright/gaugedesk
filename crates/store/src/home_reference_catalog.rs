@@ -203,6 +203,7 @@ impl Store {
             ));
         }
         durable_catalog_write(&mut self.conn, |tx| {
+            crate::home_product::check_product_identity(tx, project_id, home_id)?;
             if let Some(found) = registration(tx, project_id)? {
                 if found.binding.home_id != home_id {
                     return Err(JournalError::Conflict(
