@@ -19,6 +19,18 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-10-07
+
+- Reaching a desktop Home through the relay no longer stalls. A Home keeps six
+  connections waiting at the relay instead of one, so several windows or
+  requests opening it at once are each answered in a few hundred milliseconds
+  rather than one after another; a waiting connection that died when the
+  computer slept or changed network is noticed within seconds instead of
+  leaving the next visitor on "Finding your Home…" until it gave up; and desk
+  no longer runs every request to such a Home behind whichever is slowest.
+  Each stage of reaching a Home, and of accepting a handoff invitation, is now
+  in the app's log with how long it took.
+
 ## [0.8.4] — 2026-10-07
 
 - The desktop publishes this computer's directory entry for an account with a

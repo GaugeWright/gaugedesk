@@ -27,6 +27,11 @@ serde_json = "1"
 # wasm32 build links none of this.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 gaugedesk-env = { path = "../env" }
+# Each relay stage — a Home leg dialled, parked, paired, a crossing's TLS — is
+# logged with its elapsed time, so an installed app's log says where a slow
+# reach went. The desktop shell writes `tracing` to its log file; stderr, which
+# an installed app discards, was where these used to go.
+tracing = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

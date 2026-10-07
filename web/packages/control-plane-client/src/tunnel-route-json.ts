@@ -105,12 +105,40 @@ export interface TunnelRouteOptions {
      * `HomePool` hands one to every transport it builds; a tunnel that dropped
      * it could be admitted to a Home and then refused by it. */
     readonly homeAdmission?: () => string | null;
+    /** How many sessions the calls may hold open to the Home at once
+     * ([`TUNNEL_CALL_SESSIONS`] unless given). */
+    readonly sessions?: number;
 }
+
+/**
+ * How many pinned sessions a route's calls may hold open at once.
+ *
+ * One session answers one call at a time, so a route with one session ran every
+ * call behind whichever was in front of it: a turn, a slow handler, or simply a
+ * page's dozen calls on opening a project, each a relay round trip, one after
+ * another. A browser gives a site six connections for the same reason. Each
+ * session is a crossing the Home holds until it idles out, so this stays small,
+ * and a second is opened only when every open one is busy — a page making one
+ * call at a time uses one, exactly as before.
+ */
+export const TUNNEL_CALL_SESSIONS = 4;
 
 type TunnelCredentials = Pick<TunnelRouteOptions, "bearer" | "homeAdmission">;
 
 export class HomeTunnelError extends Error {}
 class TunnelClosed extends HomeTunnelError {}
+/** The relay paired the session and the Home never finished the TLS handshake:
+ * a leg that died before the relay noticed. Nothing of the request reached the
+ * Home, so it is safe to send again on a fresh session. */
+class TunnelSilent extends HomeTunnelError {}
+
+/** How long a paired session may take to finish its TLS handshake. A live Home
+ * answers within a round trip or two; past this the leg it was paired with is
+ * gone, and another dial is served by one of the Home's other parked legs. */
+export const TUNNEL_HANDSHAKE_TIMEOUT_MS = 4_000;
+
+/** How many sessions a call tries when the Home never answers the handshake. */
+const TUNNEL_HANDSHAKE_ATTEMPTS = 3;
 
 /**
  * A tunnel's `RouteJson`, plus the handle needed to hang it up.
@@ -228,6 +256,39 @@ function tunnelCarrier<F extends { receiveFrame(frame: Uint8Array): void; takeCr
     };
 }
 
+/**
+ * Several carriers to one Home, each running one exchange at a time, so a call
+ * never waits behind another unless every session is busy.
+ *
+ * An exchange goes to the first idle carrier, so calls made one at a time all
+ * use the first and nothing else is opened. When every open carrier is busy a
+ * new one is opened, up to `limit`; past that, the call queues on the carrier
+ * with the least ahead of it.
+ */
+function carrierPool<F>(make: () => Carrier<F>, limit: number): Carrier<F> {
+    const carriers: Array<{ carrier: Carrier<F>; busy: number }> = [];
+    let hungUp = false;
+    return {
+        run<T>(exchange: (session: CarrierSession<F>) => Promise<T>): Promise<T> {
+            // Hung up for good: no new carrier may be opened behind the caller.
+            if (hungUp) return Promise.reject(new TunnelClosed("the Home tunnel closed"));
+            let chosen = carriers.find((entry) => entry.busy === 0);
+            if (!chosen && carriers.length < limit) {
+                chosen = { carrier: make(), busy: 0 };
+                carriers.push(chosen);
+            }
+            chosen ??= carriers.reduce((least, entry) => (entry.busy < least.busy ? entry : least));
+            const entry = chosen;
+            entry.busy += 1;
+            return entry.carrier.run(exchange).finally(() => { entry.busy -= 1; });
+        },
+        close() {
+            hungUp = true;
+            for (const entry of carriers) entry.carrier.close();
+        },
+    };
+}
+
 /** Hand the socket every frame the tunnel has ready, holding back while the
  * socket already has `limit` bytes waiting. */
 function flushFrames(tunnel: { takeOutgoing(): Uint8Array }, socket: TunnelSocket,
@@ -242,16 +303,20 @@ function flushFrames(tunnel: { takeOutgoing(): Uint8Array }, socket: TunnelSocke
 /**
  * Build a `RouteJson` that carries each call over the pinned tunnel.
  *
- * Requests are serialized: the wire is one request/response at a time, so a
- * second caller waits rather than interleaving frames into the same session.
+ * Each session carries one request/response at a time, so a second caller
+ * never interleaves frames into a session in use: it takes an idle session, or
+ * opens another (up to [`TUNNEL_CALL_SESSIONS`]), or waits for the least busy.
  */
 export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const now = options.now ?? Date.now;
     const tick = options.tick ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
-    const carrier = tunnelCarrier(options.open, now);
+    const carrier = carrierPool(
+        () => tunnelCarrier(options.open, now),
+        Math.max(1, options.sessions ?? TUNNEL_CALL_SESSIONS),
+    );
 
-    const route: TunnelRoute = Object.assign((
+    const exchange = (
         method: string,
         path: string,
         body?: unknown,
@@ -264,12 +329,20 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
             headersFor(options, method, routeOptions),
         );
         const deadline = now() + timeoutMs;
+        let pairedAt: number | undefined;
         for (;;) {
             // Not before the relay has spliced this leg. Ciphertext written
             // into an unpaired route has no other end, and relying on the
             // relay to hold it is relying on a component whose whole design
             // is to be dumb. It accumulates in the session either way.
-            if (tunnel.isPaired()) flushFrames(tunnel, socket);
+            if (tunnel.isPaired()) {
+                pairedAt ??= now();
+                flushFrames(tunnel, socket);
+                if (tunnel.isHandshaking() && now() - pairedAt > TUNNEL_HANDSHAKE_TIMEOUT_MS) {
+                    session.drop();
+                    throw new TunnelSilent(`${method} ${path}: the Home did not answer the tunnel`);
+                }
+            }
             const status = tunnel.pollStatus();
             if (status !== undefined) {
                 const text = tunnel.takeBody();
@@ -297,7 +370,25 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
             }
             await tick();
         }
-    }), { close: () => carrier.close() });
+    });
+    const route: TunnelRoute = Object.assign((
+        method: string,
+        path: string,
+        body?: unknown,
+        routeOptions?: RouteOptions,
+    ) => {
+        // One key for both attempts, so a retried mutation is the same
+        // command. The credentials are still read when each attempt runs.
+        const mutating = method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
+        const key = routeOptions?.idempotencyKey ?? (mutating ? newIdempotencyKey() : undefined);
+        const keyed = key ? { ...routeOptions, idempotencyKey: key } : routeOptions;
+        const attempt = (left: number): Promise<unknown> =>
+            exchange(method, path, body, keyed).catch((error: unknown) => {
+                if (error instanceof TunnelSilent && left > 1) return attempt(left - 1);
+                throw error;
+            });
+        return attempt(TUNNEL_HANDSHAKE_ATTEMPTS);
+    }, { close: () => carrier.close() });
     return route;
 }
 

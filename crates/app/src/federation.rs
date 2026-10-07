@@ -5075,9 +5075,16 @@ pub async fn run_invite_receiver(wb: SharedWorkbench, invite_id: String) {
         if !still_pending {
             return;
         }
-        if let Err(e) = invite_receive_once(&wb, &broker, &identity, &token).await {
-            tracing::debug!("invite receiver {invite_id}: {e}; retrying");
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        match invite_receive_once(&wb, &broker, &identity, &token).await {
+            Ok(()) => {}
+            // Nobody accepted during this wait: the ordinary life of an open
+            // invite. Park again at once — a pause here is a window in which
+            // the acceptance finds no receiver and has to wait for one.
+            Err(e) if gaugedesk_relay_transport::is_relay_wait_expired(&e) => {}
+            Err(e) => {
+                tracing::debug!("invite receiver {invite_id}: {e}; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
     }
 }
@@ -5089,12 +5096,26 @@ async fn invite_receive_once(
     token: &str,
 ) -> std::io::Result<()> {
     let tcp = park_relay(broker, token).await?;
+    // From the moment an acceptance paired with this leg, so the origin's half
+    // of a slow acceptance is in its own log.
+    let paired = std::time::Instant::now();
+    tracing::info!(
+        invite = token.strip_prefix("gaugewright-invite::").unwrap_or("?"),
+        "invite receiver paired with an acceptance"
+    );
     let mut tls = tls_accept(tcp, identity).await?;
     let bytes = read_frame(&mut tls).await?;
+    let received = paired.elapsed();
     let wire: InviteAcceptWire = serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let verdict = admit_invite_accept(wb, &wire);
     write_frame(&mut tls, verdict.to_string().as_bytes()).await?;
+    tracing::info!(
+        invite = %wire.invite_id,
+        received_ms = received.as_millis() as u64,
+        answered_ms = paired.elapsed().as_millis() as u64,
+        "invite acceptance answered"
+    );
     let _ = tls.shutdown().await;
     // Apply the disposition *after* responding, now that the target is pinned, if accepted.
     if verdict.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -5317,30 +5338,68 @@ pub async fn post_invite_accept(
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     // Send the acceptance to the origin's invite-response receiver.
     let token = invite_inbox_token(&invite.invite_id);
+    // Which step the acceptance reached, and when, so a timeout says whether
+    // the origin never answered the rendezvous, never completed TLS, or never
+    // answered the acceptance — three different faults that all read "invite
+    // expired or already used" to the person (2026-10-07).
+    let started = std::time::Instant::now();
+    let phase = std::sync::Mutex::new(("rendezvous", std::time::Duration::ZERO));
+    let invite_id = invite.invite_id.as_str();
+    let reached = |step: &'static str| {
+        tracing::info!(
+            invite = invite_id,
+            next = step,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "invite accept stage"
+        );
+        if let Ok(mut phase) = phase.lock() {
+            *phase = (step, started.elapsed());
+        }
+    };
+    reached("rendezvous");
     let send = async {
         let tcp = join_relay(&broker, &token).await?;
+        reached("tls");
         let mut tls = tls_connect(tcp, &origin, pins).await?;
+        reached("verdict");
         let bytes = serde_json::to_vec(&accept_wire)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         write_frame(&mut tls, &bytes).await?;
         let vbytes = read_frame(&mut tls).await?;
+        reached("answered");
         let _ = tls.shutdown().await;
         serde_json::from_slice::<serde_json::Value>(&vbytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     };
     // Bound the wait: a stale/consumed invite has no parked receiver, so the rendezvous
     // would otherwise hang forever. Time out into a clean error instead (INV-23 flavour).
-    let sent =
-        match tokio::time::timeout(std::time::Duration::from_secs(15), send).await {
-            Ok(r) => r,
-            Err(_) => return (
+    let sent = match tokio::time::timeout(std::time::Duration::from_secs(15), send).await {
+        Ok(r) => r,
+        Err(_) => {
+            let (step, at) = phase.lock().map(|phase| *phase).unwrap_or_default();
+            tracing::warn!(
+                invite = %invite.invite_id,
+                waiting_on = step,
+                since_ms = at.as_millis() as u64,
+                "invite accept timed out after 15s"
+            );
+            return (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(
                     serde_json::json!({ "ok": false, "reason": "invite expired or already used" }),
                 ),
             )
-                .into_response(),
-        };
+                .into_response();
+        }
+    };
+    let (step, at) = phase.lock().map(|phase| *phase).unwrap_or_default();
+    tracing::info!(
+        invite = %invite.invite_id,
+        reached = step,
+        at_ms = at.as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "invite accept crossed"
+    );
     match sent {
         Ok(v) if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) => {
             // The origin relocates only after it answers, so "the origin

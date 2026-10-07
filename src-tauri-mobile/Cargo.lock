@@ -1284,11 +1284,11 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-env"
-version = "0.8.4"
+version = "0.8.5"
 
 [[package]]
 name = "gaugedesk-mobile"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "base64 0.22.1",
  "gaugedesk-relay-transport",
@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "gaugedesk-relay-transport"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
@@ -1324,6 +1324,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
+ "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -3946,7 +3947,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-gaugedesk-device-identity"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "serde",
  "tauri",

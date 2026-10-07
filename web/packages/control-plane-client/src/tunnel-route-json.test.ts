@@ -9,6 +9,8 @@ import {
     tunnelRouteEventStream,
     tunnelRouteJson,
     tunnelRouteRequest,
+    TUNNEL_CALL_SESSIONS,
+    TUNNEL_HANDSHAKE_TIMEOUT_MS,
     type RawTunnelFacade,
     type EventTunnelFacade,
     type TunnelFacade,
@@ -237,16 +239,101 @@ describe("routeJson over the tunnel (DESK-7)", () => {
         await expect(build(tunnel, socket)("POST", "/home/admissions")).rejects.toThrow(/403/);
     });
 
-    it("serializes requests, because one stream cannot interleave two", async () => {
+    it("serializes requests on one session, because one stream cannot interleave two", async () => {
         const tunnel = fakeTunnel([
             { status: 200, body: '{"n":1}' },
             { status: 200, body: '{"n":2}' },
         ]);
         const { socket } = fakeSocket();
-        const json = build(tunnel, socket);
+        const json = tunnelRouteJson({
+            open: async () => ({ tunnel, socket }),
+            tick: async () => undefined,
+            sessions: 1,
+        });
         const [first, second] = await Promise.all([json("GET", "/a"), json("GET", "/b")]);
         expect([first, second]).toEqual([{ n: 1 }, { n: 2 }]);
         expect(tunnel.sent).toEqual(["GET /a", "GET /b"]);
+    });
+
+    /** Opens a fresh fake tunnel and socket per session, each answering after
+     * `afterPumps` pumps, and remembers them. */
+    function sessions(afterPumps: (index: number) => number, limit?: number) {
+        const opened: Array<ReturnType<typeof fakeTunnel>> = [];
+        const json = tunnelRouteJson({
+            open: async () => {
+                const index = opened.length;
+                const tunnel = fakeTunnel(
+                    Array.from({ length: 8 }, () => ({ status: 200, body: `{"session":${index}}` })),
+                    afterPumps(index),
+                );
+                opened.push(tunnel);
+                return { tunnel, socket: fakeSocket().socket };
+            },
+            tick: async () => undefined,
+            ...(limit === undefined ? {} : { sessions: limit }),
+        });
+        return { json, opened };
+    }
+
+    it("answers concurrent calls on sessions of their own, so a slow call holds no other", async () => {
+        // The first session's call is a turn that takes its time; the call made
+        // beside it must not wait for it, as every call did on one session.
+        const { json, opened } = sessions((index) => (index === 0 ? 10_000 : 2));
+        const slow = json("POST", "/chats/c/task", { prompt: "go" });
+        await expect(json("GET", "/workspace")).resolves.toEqual({ session: 1 });
+        await expect(slow).resolves.toEqual({ session: 0 });
+        expect(opened.map((tunnel) => tunnel.sent)).toEqual([
+            ['POST /chats/c/task {"prompt":"go"}'],
+            ["GET /workspace"],
+        ]);
+    });
+
+    it("redials when the Home never finishes the handshake, keeping the call's key", async () => {
+        // A Home leg that died before the relay noticed is paired like a live
+        // one; its session never leaves the handshake. Nothing reached the
+        // Home, so the call goes again on a fresh session.
+        let clock = 0;
+        const opened: Array<ReturnType<typeof fakeTunnel>> = [];
+        const json = tunnelRouteJson({
+            open: async () => {
+                const tunnel = fakeTunnel([{ status: 200, body: '{"ok":true}' }], opened.length === 0 ? 1e9 : 2);
+                if (opened.length === 0) tunnel.isHandshaking = () => true;
+                opened.push(tunnel);
+                return { tunnel, socket: fakeSocket().socket };
+            },
+            tick: async () => { clock += 100; },
+            now: () => clock,
+        });
+        await expect(json("POST", "/home/admissions")).resolves.toEqual({ ok: true });
+        expect(opened).toHaveLength(2);
+        expect(opened[1]!.headers[0]?.["idempotency-key"]).toBe(opened[0]!.headers[0]?.["idempotency-key"]);
+        expect(clock).toBeLessThan(TUNNEL_HANDSHAKE_TIMEOUT_MS + 1_000);
+    });
+
+    it("opens no second session for calls made one at a time", async () => {
+        const { json, opened } = sessions(() => 2);
+        await json("GET", "/a");
+        await json("GET", "/b");
+        await json("GET", "/c");
+        expect(opened).toHaveLength(1);
+        expect(opened[0]!.sent).toEqual(["GET /a", "GET /b", "GET /c"]);
+    });
+
+    it("holds no more sessions than its bound, and queues the rest on the least busy", async () => {
+        const { json, opened } = sessions(() => 3);
+        const calls = Array.from({ length: TUNNEL_CALL_SESSIONS * 2 }, (_, n) => json("GET", `/n${n}`));
+        await Promise.all(calls);
+        expect(opened).toHaveLength(TUNNEL_CALL_SESSIONS);
+        for (const tunnel of opened) expect(tunnel.sent).toHaveLength(2);
+    });
+
+    it("refuses every session for good once hung up", async () => {
+        const { json, opened } = sessions((index) => (index === 0 ? 10_000 : 2));
+        void json("GET", "/held").catch(() => undefined);
+        await json("GET", "/a");
+        json.close();
+        await expect(json("GET", "/b")).rejects.toThrow(/closed/);
+        expect(opened).toHaveLength(2);
     });
 
     it("fails the call when the tunnel stops answering", async () => {

@@ -184,7 +184,7 @@ pub(crate) async fn serve_relay_crossings(
         )
         .await;
         if let Err(error) = served {
-            eprintln!("[home-relay] the relay router stopped: {error}");
+            tracing::warn!("[home-relay] the relay router stopped: {error}");
         }
     });
     Ok(address)
@@ -290,7 +290,7 @@ pub(crate) async fn supervise_home_reachability(
         // An already claimed computer may need its reachability attachment
         // reconciled from state. An unclaimed computer remains local-only.
         match crate::first_home::attach_if_never_offered(&wb, &root) {
-            Ok(true) => eprintln!(
+            Ok(true) => tracing::info!(
                 "[first-home] library sync attached; this computer is now publishing its reachability"
             ),
             Ok(false) => {}
@@ -326,7 +326,7 @@ pub(crate) async fn supervise_home_reachability(
                 Ok(leg) => parked = Some(leg),
                 // Said, not swallowed: a Home that cannot park is unreachable,
                 // and the person asked for the opposite.
-                Err(error) => eprintln!("[home-relay] could not park a leg: {error}"),
+                Err(error) => tracing::warn!("[home-relay] could not park a leg: {error}"),
             },
             (false, true) => {
                 if let Some(leg) = parked.take() {
@@ -340,7 +340,7 @@ pub(crate) async fn supervise_home_reachability(
                 let retracted = wb
                     .lock_unpoisoned()
                     .author_home_routes(&crate::home_reachability::HomeReachability::default());
-                eprintln!("[home-relay] publishing off — {retracted} route(s) retracted");
+                tracing::info!("[home-relay] publishing off — {retracted} route(s) retracted");
             }
             _ => {}
         }
@@ -388,7 +388,7 @@ fn start_home_relay(
     let directory = root.join("relay");
     let identity = gaugedesk_relay_transport::TlsIdentity::load_or_generate(&directory)?;
     let config = gaugedesk_relay_transport::HomeRelayConfig::load_or_mint(&directory, endpoint)?;
-    eprintln!(
+    tracing::info!(
         "[home-relay] supervised endpoint={} epoch={} tls_pin={}",
         config.endpoint,
         config.route_epoch,
@@ -412,7 +412,7 @@ fn start_home_relay(
             let rotated = match current.rotate(&rotation_directory) {
                 Ok(rotated) => rotated,
                 Err(error) => {
-                    eprintln!("[home-relay] rotation failed: {error}");
+                    tracing::warn!("[home-relay] rotation failed: {error}");
                     continue;
                 }
             };
@@ -431,7 +431,7 @@ fn start_home_relay(
                     }
                     current = rotated;
                 }
-                Err(error) => eprintln!("[home-relay] rotated route invalid: {error}"),
+                Err(error) => tracing::warn!("[home-relay] rotated route invalid: {error}"),
             }
         }
     });
@@ -446,10 +446,10 @@ fn start_home_relay(
             crossings,
             identity,
             |leg| match leg {
-                Ok(epoch) => eprintln!(
+                Ok(epoch) => tracing::info!(
                     "[home-relay] leg parked at epoch {epoch} — this computer is reachable again"
                 ),
-                Err((epoch, error)) => eprintln!(
+                Err((epoch, error)) => tracing::warn!(
                     "[home-relay] cannot park a leg at epoch {epoch}, so desk cannot open this \
                      computer; retrying: {error}"
                 ),
@@ -457,7 +457,7 @@ fn start_home_relay(
         )
         .await;
         if let Err(error) = outcome {
-            eprintln!("[home-relay] availability loop stopped: {error}");
+            tracing::warn!("[home-relay] availability loop stopped: {error}");
         }
     });
     Ok(ParkedLeg {

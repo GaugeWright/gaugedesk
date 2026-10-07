@@ -272,7 +272,9 @@ fn publish_directory(wb: &SharedWorkbench, s: &Standing) -> Result<bool, String>
     crate::directory_sync::publish_current(wb, &base, &s.root_pubkey)
         .map(|published| {
             if let Some(reason) = published.declined {
-                eprintln!("[first-home] published without reconciling against the head: {reason}");
+                tracing::warn!(
+                    "[first-home] published without reconciling against the head: {reason}"
+                );
             }
             true
         })
@@ -298,12 +300,12 @@ pub fn reconcile(wb: &SharedWorkbench, route: &gaugedesk_relay_transport::RelayR
     // look broken. `post_library_sync_publish` has always said so; this path was
     // announcing first.
     match publish_directory(wb, &s) {
-        Ok(true) => eprintln!(
+        Ok(true) => tracing::info!(
             "[first-home] published this Home's project routes to the directory at epoch {}",
             s.locator.route_epoch,
         ),
         Ok(false) => {}
-        Err(error) => eprintln!("[first-home] {error}"),
+        Err(error) => tracing::warn!("[first-home] {error}"),
     }
     // An account that holds its own root has announced that one, with the
     // install key's hand-over to it (DR-0361 §3); the install key is not put
@@ -318,17 +320,18 @@ pub fn reconcile(wb: &SharedWorkbench, route: &gaugedesk_relay_transport::RelayR
     } else {
         publish_root(&http, &s)
     } {
-        Ok(true) => eprintln!("[first-home] published the account root key for desk to pin"),
+        Ok(true) => tracing::info!("[first-home] published the account root key for desk to pin"),
         Ok(false) => {}
-        Err(error) => eprintln!("[first-home] {error}"),
+        Err(error) => tracing::warn!("[first-home] {error}"),
     }
     match register_home(&http, &s) {
-        Ok(true) => eprintln!(
+        Ok(true) => tracing::info!(
             "[first-home] registered {} at epoch {} — desk can open this computer now",
-            s.home_id, s.locator.route_epoch,
+            s.home_id,
+            s.locator.route_epoch,
         ),
         Ok(false) => {}
-        Err(error) => eprintln!("[first-home] {error}"),
+        Err(error) => tracing::warn!("[first-home] {error}"),
     }
 }
 

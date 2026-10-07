@@ -49,16 +49,37 @@ struct Route {
     epoch: u64,
     proof_hash: [u8; 32],
     family: Family,
-    pending: Option<Pending>,
+    /// Legs waiting for a partner, oldest first. A one-shot route holds one; a
+    /// durable route holds several Homes and many clients, as the edge does.
+    pending: Vec<Pending>,
 }
 
-#[derive(Default)]
+/// The edge's `MAX_WAITING_HOMES` and `MAX_WAITING_CLIENTS`.
+const WAITING_HOMES: usize = 8;
+const WAITING_CLIENTS: usize = 64;
+
 struct RelayState {
     next_id: u64,
     routes: HashMap<String, Route>,
     /// While set, one-shot legs are refused and any already-parked one-shot leg
     /// is evicted. See [`TestRelay::disrupt_one_shot`].
     disrupt_one_shot: bool,
+    /// How many Home legs one durable route may hold waiting.
+    waiting_homes: usize,
+    /// Every Home leg admitted to wait, counted, so a test can see a pool.
+    homes_parked: u64,
+}
+
+impl Default for RelayState {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            routes: HashMap::new(),
+            disrupt_one_shot: false,
+            waiting_homes: WAITING_HOMES,
+            homes_parked: 0,
+        }
+    }
 }
 
 /// A loopback-only WSS relay. Dropping it aborts the listener task.
@@ -70,10 +91,19 @@ pub struct TestRelay {
 
 impl TestRelay {
     pub async fn bind() -> std::io::Result<Self> {
+        Self::bind_holding(WAITING_HOMES).await
+    }
+
+    /// A relay that lets one durable route hold only `homes` waiting Home
+    /// legs — `1` is the edge before Homes parked a pool.
+    pub async fn bind_holding(homes: usize) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let endpoint = format!("ws://{address}");
-        let state = Arc::new(Mutex::new(RelayState::default()));
+        let state = Arc::new(Mutex::new(RelayState {
+            waiting_homes: homes,
+            ..RelayState::default()
+        }));
         let served = Arc::clone(&state);
         let task = tokio::spawn(async move {
             let _ = serve_with(listener, served).await;
@@ -104,12 +134,12 @@ impl TestRelay {
         let parked: Vec<String> = guard
             .routes
             .iter()
-            .filter(|(_, route)| route.family == Family::OneShot && route.pending.is_some())
+            .filter(|(_, route)| route.family == Family::OneShot && !route.pending.is_empty())
             .map(|(handle, _)| handle.clone())
             .collect();
         for handle in parked {
             if let Some(route) = guard.routes.get_mut(&handle) {
-                if let Some(mut pending) = route.pending.take() {
+                for mut pending in std::mem::take(&mut route.pending) {
                     let _ = refuse(&mut pending.socket, "relay one-shot legs are disrupted").await;
                 }
             }
@@ -123,6 +153,27 @@ impl TestRelay {
 
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// How many Home legs are waiting on the route `handle` right now.
+    pub async fn waiting_homes(&self, handle: &str) -> usize {
+        self.state
+            .lock()
+            .await
+            .routes
+            .get(handle)
+            .map_or(0, |route| {
+                route
+                    .pending
+                    .iter()
+                    .filter(|pending| pending.role == WebSocketRelayRole::Home)
+                    .count()
+            })
+    }
+
+    /// How many Home legs this relay has admitted to wait, ever.
+    pub async fn homes_parked(&self) -> u64 {
+        self.state.lock().await.homes_parked
     }
 }
 
@@ -195,17 +246,40 @@ async fn accept_leg(stream: TcpStream, state: Arc<Mutex<RelayState>>) -> std::io
         }
         let id = guard.next_id;
         guard.next_id = guard.next_id.wrapping_add(1);
+        let waiting_homes = guard.waiting_homes;
         match admit(&mut guard.routes, handle, handshake) {
             Ok(route) => {
-                if let Some(pending) = route.pending.take() {
-                    if !complementary(pending.role, handshake.role) {
-                        route.pending = Some(pending);
+                if let Some(index) = route
+                    .pending
+                    .iter()
+                    .position(|pending| complementary(pending.role, handshake.role))
+                {
+                    let pending = route.pending.remove(index);
+                    Some((pending.socket, socket))
+                } else {
+                    let same = route
+                        .pending
+                        .iter()
+                        .filter(|pending| pending.role == handshake.role)
+                        .count();
+                    if route.family == Family::OneShot && same > 0 {
                         drop(guard);
                         return refuse(&mut socket, "relay roles are not complementary").await;
                     }
-                    Some((pending.socket, socket))
-                } else {
-                    route.pending = Some(Pending {
+                    let limit = match handshake.role {
+                        WebSocketRelayRole::Home => waiting_homes,
+                        WebSocketRelayRole::Client => WAITING_CLIENTS,
+                        _ => 1,
+                    };
+                    if same >= limit {
+                        drop(guard);
+                        return refuse(&mut socket, "relay waiting capacity reached").await;
+                    }
+                    if handshake.role == WebSocketRelayRole::Home {
+                        guard.homes_parked += 1;
+                    }
+                    let route = guard.routes.get_mut(handle).expect("route admitted above");
+                    route.pending.push(Pending {
                         id,
                         role: handshake.role,
                         socket,
@@ -217,9 +291,9 @@ async fn accept_leg(stream: TcpStream, state: Arc<Mutex<RelayState>>) -> std::io
                         let stale = {
                             let mut guard = state.lock().await;
                             guard.routes.get_mut(&handle).and_then(|route| {
-                                (route.pending.as_ref().map(|pending| pending.id) == Some(id))
-                                    .then(|| route.pending.take())
-                                    .flatten()
+                                let index =
+                                    route.pending.iter().position(|pending| pending.id == id)?;
+                                Some(route.pending.remove(index))
                             })
                         };
                         if let Some(mut pending) = stale {
@@ -261,7 +335,7 @@ fn admit<'a>(
                 epoch: handshake.epoch,
                 proof_hash: handshake.proof_hash,
                 family,
-                pending: None,
+                pending: Vec::new(),
             },
         );
         return Ok(routes.get_mut(handle).expect("inserted route"));
@@ -297,7 +371,7 @@ fn admit<'a>(
     }
     route.epoch = handshake.epoch;
     route.proof_hash = handshake.proof_hash;
-    route.pending = None;
+    route.pending.clear();
     Ok(route)
 }
 
@@ -386,12 +460,22 @@ async fn relay_pair(mut left: WebSocketStream<TcpStream>, mut right: WebSocketSt
     loop {
         tokio::select! {
             message = left.next() => {
+                if is_keepalive(&message) {
+                    if answer_keepalive(&mut left).await { continue; }
+                    let _ = right.close(None).await;
+                    return;
+                }
                 if !forward(message, &mut right).await {
                     let _ = right.close(None).await;
                     return;
                 }
             }
             message = right.next() => {
+                if is_keepalive(&message) {
+                    if answer_keepalive(&mut right).await { continue; }
+                    let _ = left.close(None).await;
+                    return;
+                }
                 if !forward(message, &mut left).await {
                     let _ = left.close(None).await;
                     return;
@@ -399,6 +483,20 @@ async fn relay_pair(mut left: WebSocketStream<TcpStream>, mut right: WebSocketSt
             }
         }
     }
+}
+
+/// A leg's keepalive, which the edge answers itself and never forwards. A leg
+/// pings while it is parked too; those wait here until the leg is paired, and
+/// are answered then.
+fn is_keepalive(message: &Option<Result<Message, tokio_tungstenite::tungstenite::Error>>) -> bool {
+    matches!(message, Some(Ok(Message::Text(text))) if text.as_str() == crate::wire::WSS_KEEPALIVE_REQUEST)
+}
+
+async fn answer_keepalive(socket: &mut WebSocketStream<TcpStream>) -> bool {
+    socket
+        .send(Message::Text(crate::wire::WSS_KEEPALIVE_RESPONSE.into()))
+        .await
+        .is_ok()
 }
 
 async fn forward(

@@ -143,7 +143,7 @@ pub fn republish(workbench: &SharedWorkbench, route: &RelayRoute) {
     let written = guard.author_home_routes(&reach);
     drop(guard);
     if written > 0 {
-        eprintln!(
+        tracing::info!(
             "[home-relay] re-authored {written} project route(s) at epoch {}",
             route.epoch
         );

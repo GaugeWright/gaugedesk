@@ -68,6 +68,98 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// fifteen seconds, and an HTTP client drops a pooled idle connection at ninety.
 const HOME_CROSSING_IDLE: Duration = Duration::from_secs(150);
 
+/// How often a leg that waits to be paired — a Home's, or a one-shot
+/// initializer's — tells the relay it is alive.
+///
+/// The relay answers from its auto-response without waking, and a relay that
+/// has seen a waiting leg ping judges it on its silence: it neither pairs nor
+/// keeps a leg that has stopped (`PARKED_SILENCE_MILLIS`, 9 s at the edge).
+/// Before this a parked leg said nothing for its whole wait, so a Home whose
+/// computer slept or changed network left a leg the relay still counted as
+/// waiting, and the next client was paired with a socket nobody answered.
+const PARKED_PING: Duration = Duration::from_secs(3);
+
+/// How long a parked leg may hear nothing from a relay that has answered its
+/// pings before the leg is taken for dead and dialled again. The same three
+/// missed pings the relay allows.
+const PARKED_SILENCE: Duration = Duration::from_secs(9);
+
+/// How long a leg waits for its partner when the relay has not shown that it
+/// answers pings: a little past the relay's thirty-second wait, as before.
+const UNPROVEN_WAIT: Duration = Duration::from_secs(35);
+
+/// How long a leg the relay answers may wait: past the relay's own ten-minute
+/// backstop for a leg that keeps pinging (`PARKED_WAIT_MILLIS`), so it is the
+/// relay that ends the wait, with a close the leg reads as an expiry.
+const PROVEN_WAIT: Duration = Duration::from_secs(11 * 60);
+
+/// One relay leg's stages, logged as they happen with the time each took.
+///
+/// The log is the only evidence an installed app keeps of why reaching a Home
+/// was slow: the relay sees no names and the Home sees only its own side. So
+/// each leg gets a number, and every line it writes carries the number, its
+/// role and its route epoch — never a handle, proof or token.
+#[derive(Clone, Debug)]
+pub struct LegLog {
+    id: u64,
+    role: WebSocketRelayRole,
+    epoch: Option<u64>,
+    started: std::time::Instant,
+    paired: Option<std::time::Instant>,
+}
+
+impl LegLog {
+    fn new(role: WebSocketRelayRole, epoch: Option<u64>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            role,
+            epoch,
+            started: std::time::Instant::now(),
+            paired: None,
+        }
+    }
+
+    fn role(&self) -> &'static str {
+        match self.role {
+            WebSocketRelayRole::Home => "home",
+            WebSocketRelayRole::Client => "client",
+            WebSocketRelayRole::Source => "source",
+            WebSocketRelayRole::Target => "target",
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Milliseconds since `READY`, or since the dial if there was none.
+    fn since_paired_ms(&self) -> u64 {
+        self.paired.unwrap_or(self.started).elapsed().as_millis() as u64
+    }
+
+    fn stage(&self, stage: &str) {
+        tracing::info!(
+            leg = self.id,
+            role = self.role(),
+            epoch = self.epoch,
+            elapsed_ms = self.elapsed_ms(),
+            "relay leg {stage}"
+        );
+    }
+
+    fn failed(&self, stage: &str, error: &dyn std::fmt::Display) {
+        tracing::warn!(
+            leg = self.id,
+            role = self.role(),
+            epoch = self.epoch,
+            elapsed_ms = self.elapsed_ms(),
+            %error,
+            "relay leg {stage}"
+        );
+    }
+}
+
 /// Ordered byte stream backed by bounded binary WebSocket frames. Closing or
 /// dropping it terminates the pump; no reconnect can silently join two TLS
 /// streams. Callers retry by establishing a fresh pinned-TLS session.
@@ -94,11 +186,18 @@ pub struct WebSocketByteStream {
     // tell a crossing it closed on purpose from one that failed. Both end the
     // same way at the byte level: the application side reads EOF.
     went_idle: Arc<AtomicBool>,
+    // The leg's stage log, so what is done with the stream after `READY` — the
+    // inner TLS, the first byte — is logged against the same leg.
+    log: LegLog,
 }
 
 impl WebSocketByteStream {
     fn went_idle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.went_idle)
+    }
+
+    fn log(&self) -> LegLog {
+        self.log.clone()
     }
 }
 
@@ -178,6 +277,41 @@ fn is_wait_expired(error: &std::io::Error) -> bool {
         .is_some_and(|inner| inner.is::<WaitExpired>())
 }
 
+/// Whether `error` is the relay closing a leg that waited its whole wait with
+/// no partner — for a receiver that parks again, the ordinary end of a wait
+/// rather than a failure.
+pub fn is_relay_wait_expired(error: &std::io::Error) -> bool {
+    is_wait_expired(error)
+}
+
+/// What the relay says when a route already holds as many waiting legs of this
+/// role as it allows.
+const RELAY_WAITING_CAPACITY: &str = "relay waiting capacity reached";
+
+/// The relay admitted the leg's proof and refused it only because the route
+/// already holds as many waiting legs of its role as the relay allows.
+///
+/// For a Home that parks a pool of legs this is not an outage — it is the
+/// relay saying how many it will hold. A relay that predates the pool holds
+/// one, and the Home keeps fewer rather than backing off and reporting a
+/// computer that is perfectly reachable through the legs already parked.
+#[derive(Debug)]
+struct WaitingCapacity;
+
+impl std::fmt::Display for WaitingCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "relay refused pairing: {RELAY_WAITING_CAPACITY}")
+    }
+}
+
+impl std::error::Error for WaitingCapacity {}
+
+fn is_waiting_capacity(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<WaitingCapacity>())
+}
+
 /// A dial that failed, and whether waiting could change the answer.
 struct DialRefusal {
     error: std::io::Error,
@@ -222,9 +356,18 @@ async fn dial_leg(
         error,
         transient: false,
     })?;
+    let one_shot = matches!(
+        role,
+        WebSocketRelayRole::Source | WebSocketRelayRole::Target
+    );
+    // A one-shot route's epoch is fixed and says nothing; a durable one's is
+    // the rotation the leg dialled.
+    let log = LegLog::new(role, (!one_shot).then_some(route.epoch));
+    log.stage("dialing");
     let (socket, _) = match tokio_tungstenite::connect_async(url).await {
         Ok(connected) => connected,
         Err(error) => {
+            log.failed("could not connect", &error);
             // Read the status from the typed response rather than the rendered
             // message. Matching "409" in the text would also match a route
             // handle or a port that happened to contain those digits, and the
@@ -241,7 +384,8 @@ async fn dial_leg(
             });
         }
     };
-    websocket_stream_from_socket(socket, handshake, role)
+    log.stage("connected");
+    websocket_stream_from_socket(socket, handshake, role, log)
         .await
         .map_err(|error| {
             // Pairing refusals arrive as close frames once the socket is up.
@@ -301,6 +445,7 @@ async fn websocket_stream_from_socket<S>(
     mut socket: tokio_tungstenite::WebSocketStream<S>,
     handshake: [u8; WSS_HANDSHAKE_LEN],
     role: WebSocketRelayRole,
+    mut log: LegLog,
 ) -> std::io::Result<WebSocketByteStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -314,25 +459,47 @@ where
         .send(Message::Binary(handshake.to_vec().into()))
         .await
         .map_err(|error| other(format!("send relay handshake: {error}")))?;
-    let ready = timeout(Duration::from_secs(35), socket.next())
-        .await
-        .map_err(|_| other("relay pairing timed out".to_owned()))?
-        .ok_or_else(|| other("relay closed before pairing".to_owned()))?
-        .map_err(|error| other(format!("read relay pairing: {error}")))?;
+    log.stage("waiting for its partner");
+    let ready = match await_pairing(&mut socket, role.is_initializer()).await {
+        Ok(ready) => ready,
+        Err(error) => {
+            log.failed("lost while parked", &error);
+            return Err(error);
+        }
+    };
     match ready {
-        Message::Binary(bytes) if bytes.as_ref() == WSS_READY => {}
+        Message::Binary(bytes) if bytes.as_ref() == WSS_READY => {
+            log.paired = Some(std::time::Instant::now());
+            log.stage("paired (READY)");
+        }
         Message::Close(Some(frame))
             if frame.code == CloseCode::Policy && frame.reason == RELAY_WAIT_EXPIRED =>
         {
+            log.stage("wait expired");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 WaitExpired,
             ));
         }
-        Message::Close(Some(frame)) => {
-            return Err(other(format!("relay refused pairing: {}", frame.reason)));
+        Message::Close(Some(frame))
+            if frame.code == CloseCode::Policy && frame.reason == RELAY_WAITING_CAPACITY =>
+        {
+            log.stage("refused: waiting capacity reached");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                WaitingCapacity,
+            ));
         }
-        _ => return Err(invalid_data("relay returned an invalid pairing response")),
+        Message::Close(Some(frame)) => {
+            let error = other(format!("relay refused pairing: {}", frame.reason));
+            log.failed("refused", &error);
+            return Err(error);
+        }
+        _ => {
+            let error = invalid_data("relay returned an invalid pairing response");
+            log.failed("refused", &error);
+            return Err(error);
+        }
     }
 
     let (application, mut pump_side) = tokio::io::duplex(WSS_STREAM_BUFFER_BYTES);
@@ -488,7 +655,72 @@ where
         stream: application,
         pump: Some(pump),
         went_idle,
+        log,
     })
+}
+
+/// Wait for the relay to pair this leg, and — for a leg that parks — keep
+/// proving it is alive while it waits.
+///
+/// A parked leg pings every [`PARKED_PING`]. Once the relay has answered one,
+/// it is known to judge waiting legs on silence, so the leg may wait as long as
+/// the relay holds it, and a relay that then goes quiet for [`PARKED_SILENCE`]
+/// means the socket is dead — a computer that slept, a network that changed —
+/// and the leg is dialled again rather than waited on. A relay that never
+/// answers keeps the old bound, so nothing here depends on the relay being new.
+async fn await_pairing<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    parks: bool,
+) -> std::io::Result<Message>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let started = tokio::time::Instant::now();
+    let mut answered = false;
+    let mut heard = started;
+    // Not at once: a leg paired within its first interval — most of them —
+    // never pings, so nothing reaches a relay that would not answer it.
+    let mut ping_at = started + PARKED_PING;
+    loop {
+        let limit = if answered { PROVEN_WAIT } else { UNPROVEN_WAIT };
+        let ping = async {
+            if parks {
+                tokio::time::sleep_until(ping_at).await
+            } else {
+                std::future::pending().await
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep_until(started + limit) => {
+                return Err(other("relay pairing timed out".to_owned()));
+            }
+            () = ping => {
+                if answered && heard.elapsed() > PARKED_SILENCE {
+                    return Err(other(format!(
+                        "relay leg went silent while parked ({} ms without an answer)",
+                        heard.elapsed().as_millis()
+                    )));
+                }
+                socket
+                    .send(Message::Text(WSS_KEEPALIVE_REQUEST.into()))
+                    .await
+                    .map_err(|error| other(format!("ping relay while parked: {error}")))?;
+                ping_at = tokio::time::Instant::now() + PARKED_PING;
+            }
+            message = socket.next() => match message {
+                Some(Ok(Message::Text(text))) if text.as_str() == WSS_KEEPALIVE_RESPONSE => {
+                    answered = true;
+                    heard = tokio::time::Instant::now();
+                }
+                // A peer's ping forwarded by a relay that does not answer one.
+                Some(Ok(Message::Text(text))) if text.as_str() == WSS_KEEPALIVE_REQUEST => {}
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(message)) => return Ok(message),
+                Some(Err(error)) => return Err(other(format!("read relay pairing: {error}"))),
+                None => return Err(other("relay closed before pairing".to_owned())),
+            },
+        }
+    }
 }
 
 /// A complementary leg may win the network race before its initializer has
@@ -760,6 +992,9 @@ async fn connect_home_stream(route: &RelayRoute) -> std::io::Result<WebSocketByt
         // nothing for the previous one to fix — dialling it would only park a
         // second leg for another whole wait before the caller heard anything.
         (Err(error), _) if is_wait_expired(&error) => Err(error),
+        // Likewise: the proof was taken, and the route is simply full of this
+        // Home's own waiting legs.
+        (Err(error), _) if is_waiting_capacity(&error) => Err(error),
         (Err(_), Some(_)) => {
             connect_websocket_stream(&websocket_route(route, true), WebSocketRelayRole::Home).await
         }
@@ -923,8 +1158,23 @@ async fn carry_home_leg(
     acceptor: TlsAcceptor,
 ) -> std::io::Result<()> {
     let went_idle = broker.went_idle();
+    let log = broker.log();
     let crossing = async {
-        let tunnel = acceptor.accept(broker).await?;
+        let tunnel = match acceptor.accept(broker).await {
+            Ok(tunnel) => tunnel,
+            Err(error) => {
+                log.failed("crossing TLS accept failed", &error);
+                return Err(error);
+            }
+        };
+        tracing::info!(
+            leg = log.id,
+            role = log.role(),
+            epoch = log.epoch,
+            since_ready_ms = log.since_paired_ms(),
+            mux = tunnel.get_ref().1.alpn_protocol() == Some(crate::mux::MUX_ALPN),
+            "relay leg crossing TLS accepted"
+        );
         // A client that asked to multiplex carries all of its connections in
         // this one crossing; anything else is a single connection, as before.
         if tunnel.get_ref().1.alpn_protocol() == Some(crate::mux::MUX_ALPN) {
@@ -956,21 +1206,46 @@ pub async fn serve_home_forever(
     serve_home_supervised(receiver, local_control_plane, identity, |_| {}).await
 }
 
+/// How many idle legs a Home keeps parked at its relay at once.
+///
+/// One leg used to be all a Home held, and it parked the next only once a
+/// client had taken it. Every crossing therefore waited for the one before it
+/// to pair *and* for the Home's next dial to reach the relay: measured from a
+/// desktop Home on 2026-10-07, about 110 ms a crossing, so of sixteen opened
+/// together the last waited 1.9 s, and a page opening its calls, its raw
+/// requests and its event streams at once was served one dial at a time. With a
+/// few parked, each of those finds a leg already waiting, and a leg taken is
+/// replaced while the others serve. A parked leg is a hibernated socket at the
+/// relay and an idle task here, so the pool costs nothing until it is used.
+///
+/// The relay bounds it too (`MAX_WAITING_HOMES`, eight). One that predates the
+/// pool holds one, and the supervisor keeps fewer when told so.
+pub const HOME_PARKED_LEGS: usize = 6;
+
+/// How long a Home keeps a smaller pool after the relay refused it one more
+/// waiting leg, before trying again. A relay upgraded under a running Home is
+/// noticed within this, without the Home asking on every leg.
+const HOME_POOL_RETRY: Duration = Duration::from_secs(5 * 60);
+
 /// The availability loop over a **rotatable** locator (DESK-5b).
 ///
 /// Rotation is initializer-only and one step, and it takes effect at the relay
 /// the moment the new proof is installed — so the loop must pick the new route
 /// up rather than keep parking legs on a dead epoch. Each attempt reads the
-/// latest route, and a rotation while a leg is parked interrupts that leg so the
-/// next attempt uses the new proof. Republishing the rotated locator is the
+/// latest route, and a rotation while legs are parked interrupts them so the
+/// next attempts use the new proof. Republishing the rotated locator is the
 /// caller's job, because only the caller knows the account it publishes under.
+///
+/// It keeps [`HOME_PARKED_LEGS`] legs parked at once and replaces each the
+/// moment it pairs or its wait runs out, so a client — or several at once —
+/// never waits on this Home's next dial.
 ///
 /// `report` is how the outage stops being silent. A leg that cannot park makes
 /// this Home unreachable, and the loop retries that forever, so neither
 /// swallowing the error nor printing it on every attempt is any use: the first
 /// says nothing, the second says it every ten seconds and teaches the reader to
 /// scroll past it. The reporter is therefore called on *transitions* only — the
-/// first failure after the leg was parked, again whenever the reason text
+/// first failure after a leg was parked, again whenever the reason text
 /// changes under an outage that is still running, and once when a leg parks
 /// again — so one outage costs one line in and one line out (DR-0184). A wait
 /// the relay ended because nobody came is none of these: it is how an idle Home
@@ -979,45 +1254,92 @@ pub async fn serve_home_forever(
 /// It is a callback rather than a log line because this crate also builds for
 /// `wasm32` and carries no logging facade; the caller owns the words.
 pub async fn serve_home_supervised(
+    routes: tokio::sync::watch::Receiver<RelayRoute>,
+    local_control_plane: SocketAddr,
+    identity: TlsIdentity,
+    report: impl FnMut(Result<u64, (u64, std::io::Error)>),
+) -> std::io::Result<()> {
+    serve_home_pool(
+        routes,
+        local_control_plane,
+        identity,
+        HOME_PARKED_LEGS,
+        report,
+    )
+    .await
+}
+
+/// [`serve_home_supervised`] with an explicit pool size, so a test can hold a
+/// Home to one leg — the shape a relay that predates the pool allows.
+pub async fn serve_home_pool(
     mut routes: tokio::sync::watch::Receiver<RelayRoute>,
     local_control_plane: SocketAddr,
     identity: TlsIdentity,
+    legs: usize,
     mut report: impl FnMut(Result<u64, (u64, std::io::Error)>),
 ) -> std::io::Result<()> {
     // As many as the relay pairs on one route (DR-0302). An idle crossing is a
     // parked task and a loopback connection; a stranger's is hung up once
     // refused, so this bounds a misbehaving relay, not a person.
     const MAX_CROSSINGS: usize = 1024;
+    let legs = legs.max(1);
     let acceptor = TlsAcceptor::from(Arc::new(identity.home_leg_server_config()?));
     let mut crossings = tokio::task::JoinSet::new();
+    // Each parked leg is a task that ends when the relay pairs it, expires its
+    // wait, or refuses it; the loop below replaces it at once.
+    let mut parking: tokio::task::JoinSet<(u64, std::io::Result<WebSocketByteStream>)> =
+        tokio::task::JoinSet::new();
+    let mut route = routes.borrow_and_update().clone();
+    // How many legs to hold now: fewer than `legs` after the relay said it
+    // will hold no more, until `HOME_POOL_RETRY` has passed.
+    let mut target = legs;
+    let mut narrowed_at: Option<tokio::time::Instant> = None;
     let mut delay = Duration::from_millis(100);
+    // Set while an outage runs. A leg dialled then waits out the backoff
+    // first, so a relay that is down is not asked `legs` times as often.
+    let mut backoff: Option<Duration> = None;
     let mut reported: Option<String> = None;
     loop {
-        // Finished clients do not determine whether the availability leg is up.
+        // Finished clients do not determine whether the availability legs are up.
         while crossings.try_join_next().is_some() {}
-        if crossings.len() >= MAX_CROSSINGS {
-            tokio::select! {
-                _ = crossings.join_next() => {},
-                changed = routes.changed() => {
-                    crossings.abort_all();
-                    while crossings.join_next().await.is_some() {}
-                    if changed.is_err() { return Ok(()); }
-                }
-            }
-            continue;
+        if target < legs && narrowed_at.is_some_and(|at| at.elapsed() >= HOME_POOL_RETRY) {
+            target += 1;
+            narrowed_at = Some(tokio::time::Instant::now());
+            tracing::info!(legs = target, "home relay pool widening again");
         }
-        let route = routes.borrow_and_update().clone();
-        let epoch = route.epoch;
-        let result = tokio::select! {
-            ready = connect_home_stream(&route) => ready,
+        while parking.len() < target && crossings.len() + parking.len() < MAX_CROSSINGS {
+            let route = route.clone();
+            let wait = backoff;
+            parking.spawn(async move {
+                if let Some(wait) = wait {
+                    sleep(wait).await;
+                }
+                let epoch = route.epoch;
+                (epoch, connect_home_stream(&route).await)
+            });
+        }
+        let joined = tokio::select! {
             changed = routes.changed() => {
-                // Rotation revokes every old crossing, not merely the waiter.
+                // Rotation revokes every old crossing and every parked leg.
+                parking.abort_all();
                 crossings.abort_all();
+                while parking.join_next().await.is_some() {}
                 while crossings.join_next().await.is_some() {}
                 if changed.is_err() { return Ok(()); }
+                route = routes.borrow_and_update().clone();
                 delay = Duration::from_millis(100);
+                backoff = None;
+                target = legs;
+                narrowed_at = None;
                 continue;
             }
+            Some(joined) = parking.join_next() => joined,
+            // At `MAX_CROSSINGS` nothing is parking: wait for a crossing to end.
+            Some(_) = crossings.join_next(), if parking.is_empty() => continue,
+        };
+        // A leg task that panicked or was aborted is simply replaced.
+        let Ok((epoch, result)) = joined else {
+            continue;
         };
         match result {
             Ok(broker) => {
@@ -1025,16 +1347,31 @@ pub async fn serve_home_supervised(
                     report(Ok(epoch));
                 }
                 delay = Duration::from_millis(100);
+                backoff = None;
                 let acceptor = acceptor.clone();
                 crossings.spawn(carry_home_leg(broker, local_control_plane, acceptor));
-                // READY has selected this client's partner. Park another Home
-                // immediately, while TLS/admission/work proceed independently.
+                // READY has selected this client's partner. The loop parks a
+                // replacement at once, while TLS/admission/work proceed here.
             }
             Err(error) if is_wait_expired(&error) => {
                 if reported.take().is_some() {
                     report(Ok(epoch));
                 }
                 delay = Duration::from_millis(100);
+                backoff = None;
+            }
+            // The relay holds as many of this Home's legs as it will: the ones
+            // already parked are serving, so hold one fewer, quietly. A pool
+            // already down to one leg is refused for some other leg of this
+            // route, which is an outage like any other.
+            Err(error) if is_waiting_capacity(&error) && target > 1 => {
+                target -= 1;
+                narrowed_at = Some(tokio::time::Instant::now());
+                tracing::info!(
+                    epoch,
+                    legs = target,
+                    "home relay pool narrowed: the relay holds no more waiting legs"
+                );
             }
             Err(error) => {
                 let reason = error.to_string();
@@ -1042,14 +1379,7 @@ pub async fn serve_home_supervised(
                     report(Err((epoch, error)));
                     reported = Some(reason);
                 }
-                tokio::select! {
-                    () = sleep(delay) => {},
-                    changed = routes.changed() => {
-                        crossings.abort_all();
-                        while crossings.join_next().await.is_some() {}
-                        if changed.is_err() { return Ok(()); }
-                    }
-                }
+                backoff = Some(delay);
                 delay = (delay * 2).min(Duration::from_secs(10));
             }
         }
@@ -1069,8 +1399,56 @@ async fn connect_client_offering(
     route: &RelayRoute,
     protocols: &[&[u8]],
 ) -> std::io::Result<tokio_rustls::client::TlsStream<WebSocketByteStream>> {
+    // A Home leg that died in the moment before the relay noticed is paired
+    // like a live one, and its `READY` is followed by a TLS handshake nobody
+    // answers. Waiting on that was the client's whole wait. A fresh dial is
+    // served by another parked leg, or — once the relay has dropped the dead
+    // ones — by the leg the Home parks when it notices.
+    let mut attempt = 1;
+    loop {
+        match pinned_client_crossing(route, protocols).await {
+            Err(error) if is_crossing_silent(&error) && attempt < CROSSING_ATTEMPTS => {
+                attempt += 1;
+            }
+            crossing => return crossing,
+        }
+    }
+}
+
+/// How many times a client dials a Home whose paired leg never answered.
+const CROSSING_ATTEMPTS: usize = 3;
+
+/// The relay paired this client, and the Home never answered its TLS
+/// handshake. Distinct from an expired wait — no Home at all — which another
+/// dial would only repeat.
+#[derive(Debug)]
+struct CrossingSilent;
+
+impl std::fmt::Display for CrossingSilent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the Home did not answer the tunnel's TLS handshake")
+    }
+}
+
+impl std::error::Error for CrossingSilent {}
+
+fn is_crossing_silent(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<CrossingSilent>())
+}
+
+/// How long a client gives the Home to answer the inner TLS handshake once the
+/// relay has paired them. A live Home answers within a round trip or two.
+const CROSSING_TLS_TIMEOUT: Duration = Duration::from_secs(4);
+
+async fn pinned_client_crossing(
+    route: &RelayRoute,
+    protocols: &[&[u8]],
+) -> std::io::Result<tokio_rustls::client::TlsStream<WebSocketByteStream>> {
     let broker =
         connect_relay_leg(&websocket_route(route, false), WebSocketRelayRole::Client).await?;
+    let log = broker.log();
     // The pin and the configuration are the portable half; only the provider is
     // this carrier's choice (ADR 0130 §4 — `ring` here, pure-Rust on wasm32).
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
@@ -1078,15 +1456,105 @@ async fn connect_client_offering(
     config.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
     let name = tokio_rustls::rustls::pki_types::ServerName::try_from(PIN_SNI)
         .map_err(|error| other(format!("relay TLS server name: {error}")))?;
-    TlsConnector::from(Arc::new(config))
-        .connect(name, broker)
-        .await
+    let connected = timeout(
+        CROSSING_TLS_TIMEOUT,
+        TlsConnector::from(Arc::new(config)).connect(name, broker),
+    )
+    .await;
+    match connected {
+        Ok(Ok(tunnel)) => {
+            tracing::info!(
+                leg = log.id,
+                role = log.role(),
+                epoch = log.epoch,
+                since_ready_ms = log.since_paired_ms(),
+                elapsed_ms = log.elapsed_ms(),
+                "relay leg crossing TLS connected"
+            );
+            Ok(tunnel)
+        }
+        Ok(Err(error)) => {
+            log.failed("crossing TLS failed", &error);
+            Err(error)
+        }
+        Err(_) => {
+            let error = std::io::Error::new(std::io::ErrorKind::TimedOut, CrossingSilent);
+            log.failed("crossing TLS timed out", &error);
+            Err(error)
+        }
+    }
+}
+
+/// A crossing's first bytes from the far end, logged once against its leg —
+/// the last stage of reaching a Home.
+struct FirstByte<S> {
+    inner: S,
+    log: Option<LegLog>,
+}
+
+impl<S> FirstByte<S> {
+    fn new(inner: S, log: LegLog) -> Self {
+        Self {
+            inner,
+            log: Some(log),
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for FirstByte<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buffer);
+        if buffer.filled().len() > before {
+            if let Some(log) = self.log.take() {
+                tracing::info!(
+                    leg = log.id,
+                    role = log.role(),
+                    epoch = log.epoch,
+                    since_ready_ms = log.since_paired_ms(),
+                    elapsed_ms = log.elapsed_ms(),
+                    "relay leg first byte from the Home"
+                );
+            }
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for FirstByte<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Carry one accepted loopback HTTP/SSE connection through the pinned Home
 /// tunnel. Home admission still occurs in the carried HTTP protocol.
 pub async fn serve_client_once(route: &RelayRoute, mut loopback: TcpStream) -> std::io::Result<()> {
-    let mut tunnel = connect_client(route).await?;
+    let tunnel = connect_client(route).await?;
+    let log = tunnel.get_ref().0.log();
+    let mut tunnel = FirstByte::new(tunnel, log);
     tokio::io::copy_bidirectional(&mut loopback, &mut tunnel).await?;
     Ok(())
 }
@@ -1157,8 +1625,11 @@ async fn carry_loopback(
             Carrier::Mux(mux) if !mux.is_closed() => Some(mux.clone()),
             Carrier::PerConnection => None,
             Carrier::Mux(_) | Carrier::Unopened => {
-                let mut tunnel = connect_client_offering(route, &[crate::mux::MUX_ALPN]).await?;
-                if tunnel.get_ref().1.alpn_protocol() == Some(crate::mux::MUX_ALPN) {
+                let tunnel = connect_client_offering(route, &[crate::mux::MUX_ALPN]).await?;
+                let multiplexed = tunnel.get_ref().1.alpn_protocol() == Some(crate::mux::MUX_ALPN);
+                let log = tunnel.get_ref().0.log();
+                let mut tunnel = FirstByte::new(tunnel, log);
+                if multiplexed {
                     let mux = crate::mux::MuxClient::start(tunnel);
                     *current = Carrier::Mux(mux.clone());
                     Some(mux)
@@ -1448,18 +1919,26 @@ mod tests {
         let websocket_url = format!("ws://{address}/v1/relay/{}", route.handle);
         let home_connect = async {
             let (socket, _) = connect_async(&websocket_url).await.unwrap();
-            let stream =
-                websocket_stream_from_socket(socket, home_handshake, WebSocketRelayRole::Home)
-                    .await
-                    .unwrap();
+            let stream = websocket_stream_from_socket(
+                socket,
+                home_handshake,
+                WebSocketRelayRole::Home,
+                LegLog::new(WebSocketRelayRole::Home, Some(1)),
+            )
+            .await
+            .unwrap();
             stream
         };
         let client_connect = async {
             let (socket, _) = connect_async(&websocket_url).await.unwrap();
-            let stream =
-                websocket_stream_from_socket(socket, client_handshake, WebSocketRelayRole::Client)
-                    .await
-                    .unwrap();
+            let stream = websocket_stream_from_socket(
+                socket,
+                client_handshake,
+                WebSocketRelayRole::Client,
+                LegLog::new(WebSocketRelayRole::Client, Some(1)),
+            )
+            .await
+            .unwrap();
             stream
         };
         let (home_stream, client_stream) = tokio::join!(home_connect, client_connect);
@@ -2770,5 +3249,275 @@ mod tests {
         .await;
         assert!(reported.is_ok(), "the client never reported what it took");
         home.abort();
+    }
+
+    /// Wait until the relay holds `count` of this route's Home legs waiting.
+    async fn parked_homes(relay: &crate::test_relay::TestRelay, handle: &str, count: usize) {
+        timeout(Duration::from_secs(5), async {
+            while relay.waiting_homes(handle).await != count {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the Home did not hold {count} legs parked"));
+    }
+
+    /// Send one call over a pinned crossing and read the whole answer.
+    async fn ping_over(mut tunnel: tokio_rustls::client::TlsStream<WebSocketByteStream>) -> String {
+        tunnel
+            .write_all(b"GET /ping HTTP/1.1\r\nhost: home\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = timeout(Duration::from_secs(5), tunnel.read_to_end(&mut response)).await;
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// A Home keeps a pool of legs parked, so clients arriving together are
+    /// each served by a leg already waiting, and the pool is refilled at once.
+    ///
+    /// The bug this pins: a Home parked one leg and the next only after a
+    /// client had taken it, so concurrent crossings were served one Home dial
+    /// at a time — about 110 ms each against the managed relay on 2026-10-07,
+    /// 1.9 s for the last of sixteen — and a page opening its calls and event
+    /// streams together waited on all of them.
+    #[tokio::test]
+    async fn a_home_keeps_a_pool_of_legs_parked_and_refills_it_at_once() {
+        let relay = crate::test_relay::TestRelay::bind().await.unwrap();
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = local.local_addr().unwrap();
+        tokio::spawn(stream_and_ping(local));
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(relay.endpoint().to_owned(), identity.fingerprint());
+        let handle = route.handle.clone();
+        let home = tokio::spawn(serve_home_forever(route.clone(), address, identity));
+        parked_homes(&relay, &handle, HOME_PARKED_LEGS).await;
+
+        // As many clients as there are parked legs, at once: every one pairs
+        // with a leg that was already waiting.
+        let before = relay.homes_parked().await;
+        let clients: Vec<_> = (0..HOME_PARKED_LEGS)
+            .map(|_| {
+                let route = route.clone();
+                tokio::spawn(async move { connect_client(&route).await })
+            })
+            .collect();
+        let mut tunnels = Vec::new();
+        for client in clients {
+            tunnels.push(
+                timeout(Duration::from_secs(5), client)
+                    .await
+                    .expect("a client waited on a Home dial")
+                    .unwrap()
+                    .expect("a client was refused"),
+            );
+        }
+        for tunnel in tunnels {
+            assert!(ping_over(tunnel).await.ends_with("pong"));
+        }
+        // Each leg taken was replaced, and the pool never grew past its size.
+        parked_homes(&relay, &handle, HOME_PARKED_LEGS).await;
+        assert!(
+            relay.homes_parked().await >= before + HOME_PARKED_LEGS as u64,
+            "the legs clients took were not replaced",
+        );
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(relay.waiting_homes(&handle).await, HOME_PARKED_LEGS);
+        home.abort();
+    }
+
+    /// Twice as many clients as parked legs, at once, are all served: the
+    /// pool is replenished while the first ones cross.
+    #[tokio::test]
+    async fn a_burst_larger_than_the_pool_is_still_served() {
+        let relay = crate::test_relay::TestRelay::bind().await.unwrap();
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = local.local_addr().unwrap();
+        tokio::spawn(stream_and_ping(local));
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(relay.endpoint().to_owned(), identity.fingerprint());
+        let home = tokio::spawn(serve_home_forever(route.clone(), address, identity));
+        parked_homes(&relay, &route.handle, HOME_PARKED_LEGS).await;
+        let clients: Vec<_> = (0..HOME_PARKED_LEGS * 4)
+            .map(|_| {
+                let route = route.clone();
+                tokio::spawn(async move {
+                    let tunnel = connect_client(&route).await?;
+                    std::io::Result::Ok(ping_over(tunnel).await)
+                })
+            })
+            .collect();
+        for client in clients {
+            let answer = timeout(Duration::from_secs(10), client)
+                .await
+                .expect("a client of the burst was never served")
+                .unwrap()
+                .unwrap();
+            assert!(answer.ends_with("pong"));
+        }
+        home.abort();
+    }
+
+    /// A relay from before the pool holds one waiting Home leg and refuses the
+    /// rest. That is the relay's capacity, not an outage: the Home keeps the
+    /// one leg it may, says nothing, and serves every client through it.
+    #[tokio::test]
+    async fn a_relay_that_holds_one_leg_is_served_by_one_without_an_outage() {
+        let relay = crate::test_relay::TestRelay::bind_holding(1).await.unwrap();
+        let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = local.local_addr().unwrap();
+        tokio::spawn(stream_and_ping(local));
+        let identity = TlsIdentity::generate().unwrap();
+        let route = durable_test_route(relay.endpoint().to_owned(), identity.fingerprint());
+        let (_routes, route_reader) = tokio::sync::watch::channel(route.clone());
+        let (reports, mut report_reader) = tokio::sync::mpsc::unbounded_channel();
+        let home = tokio::spawn(async move {
+            serve_home_supervised(route_reader, address, identity, move |leg| {
+                let _ = reports.send(leg.map_err(|(epoch, error)| (epoch, error.to_string())));
+            })
+            .await
+        });
+        parked_homes(&relay, &route.handle, 1).await;
+        for _ in 0..3 {
+            let tunnel = timeout(Duration::from_secs(5), connect_client(&route))
+                .await
+                .expect("a client waited on the Home")
+                .unwrap();
+            assert!(ping_over(tunnel).await.ends_with("pong"));
+        }
+        parked_homes(&relay, &route.handle, 1).await;
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            report_reader.try_recv().is_err(),
+            "a relay's waiting capacity was reported as an outage",
+        );
+        home.abort();
+    }
+
+    /// A relay over memory, for the parked-leg clock: what the leg sends, and
+    /// a way to answer it. The leg's half is returned ready to hand to
+    /// `websocket_stream_from_socket`.
+    async fn memory_relay() -> (
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        let (leg, relay) = tokio::io::duplex(64 * 1024);
+        let (leg, relay) = tokio::join!(
+            tokio_tungstenite::client_async("ws://relay.test/v1/relay/x", leg),
+            accept_async(relay),
+        );
+        (leg.unwrap().0, relay.unwrap())
+    }
+
+    /// Answer the leg's pings for `answers` of them, then fall silent while
+    /// keeping the socket open — a relay the leg can no longer reach.
+    async fn answer_pings_then_fall_silent(
+        mut relay: tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+        answers: usize,
+    ) {
+        let _handshake = relay.next().await;
+        let mut answered = 0;
+        while let Some(Ok(message)) = relay.next().await {
+            if matches!(&message, Message::Text(text) if text.as_str() == WSS_KEEPALIVE_REQUEST)
+                && answered < answers
+            {
+                answered += 1;
+                let _ = relay
+                    .send(Message::Text(WSS_KEEPALIVE_RESPONSE.into()))
+                    .await;
+            }
+        }
+    }
+
+    /// A parked leg whose relay stops answering is dialled again within the
+    /// silence bound, rather than waited on until a client is paired with it.
+    ///
+    /// The bug this pins: a parked leg said nothing for its whole wait, so a
+    /// Home whose computer slept or changed network kept a leg the relay still
+    /// counted as waiting; the next client was paired with it and waited on a
+    /// TLS handshake nobody answered — the 10–60 s "Finding your Home…" of
+    /// 2026-10-07.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_leg_whose_relay_falls_silent_is_given_up_within_the_bound() {
+        let (leg, relay) = memory_relay().await;
+        tokio::spawn(answer_pings_then_fall_silent(relay, 2));
+        let started = tokio::time::Instant::now();
+        let route = wss_test_route(1);
+        let handshake = websocket_handshake(&route, WebSocketRelayRole::Home).unwrap();
+        let error = websocket_stream_from_socket(
+            leg,
+            handshake,
+            WebSocketRelayRole::Home,
+            LegLog::new(WebSocketRelayRole::Home, Some(1)),
+        )
+        .await
+        .err()
+        .expect("a parked leg on a silent relay was kept");
+        assert!(error.to_string().contains("went silent"), "{error}");
+        // Two pings answered (5 s, 10 s); silence is noticed by the ping after
+        // the bound, so well before the old 35 s wait.
+        let waited = started.elapsed();
+        assert!(waited >= PARKED_SILENCE, "gave up after {waited:?}");
+        assert!(
+            waited <= Duration::from_secs(10) + PARKED_SILENCE + PARKED_PING,
+            "{waited:?}"
+        );
+    }
+
+    /// A relay that answers a parked leg's pings may hold it past the old
+    /// thirty-five seconds: the leg is alive, and the relay decides.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_leg_the_relay_answers_waits_for_its_partner() {
+        let (leg, mut relay) = memory_relay().await;
+        tokio::spawn(async move {
+            let _handshake = relay.next().await;
+            let ready_at = tokio::time::Instant::now() + Duration::from_secs(90);
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep_until(ready_at) => {
+                        relay.send(Message::Binary(WSS_READY.to_vec().into())).await.unwrap();
+                        std::future::pending::<()>().await;
+                    }
+                    message = relay.next() => match message {
+                        Some(Ok(Message::Text(text))) if text.as_str() == WSS_KEEPALIVE_REQUEST => {
+                            relay.send(Message::Text(WSS_KEEPALIVE_RESPONSE.into())).await.unwrap();
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        });
+        let route = wss_test_route(1);
+        let handshake = websocket_handshake(&route, WebSocketRelayRole::Home).unwrap();
+        websocket_stream_from_socket(
+            leg,
+            handshake,
+            WebSocketRelayRole::Home,
+            LegLog::new(WebSocketRelayRole::Home, Some(1)),
+        )
+        .await
+        .expect("a leg the relay kept answering was abandoned before its partner came");
+    }
+
+    /// A relay that never answers a ping keeps the old bound, so a parked leg
+    /// depends on nothing a relay before this did not do.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_leg_on_a_relay_that_never_answers_keeps_the_old_wait() {
+        let (leg, relay) = memory_relay().await;
+        tokio::spawn(answer_pings_then_fall_silent(relay, 0));
+        let started = tokio::time::Instant::now();
+        let route = wss_test_route(1);
+        let handshake = websocket_handshake(&route, WebSocketRelayRole::Home).unwrap();
+        let error = websocket_stream_from_socket(
+            leg,
+            handshake,
+            WebSocketRelayRole::Home,
+            LegLog::new(WebSocketRelayRole::Home, Some(1)),
+        )
+        .await
+        .err()
+        .expect("an unpaired leg waited forever");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert_eq!(started.elapsed(), UNPROVEN_WAIT);
     }
 }

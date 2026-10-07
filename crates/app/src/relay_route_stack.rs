@@ -108,9 +108,43 @@ impl BearerAccounts for HubBearerAccounts {
             let mut remembered = self.remembered.lock_unpoisoned();
             remembered.retain(|_, (_, at)| at.elapsed() < REMEMBER_FOR);
             if let Some((account, _)) = remembered.get(&key) {
+                tracing::info!(
+                    cache = "hit",
+                    "relay caller identity from the account service"
+                );
                 return Ok(Some(account.clone()));
             }
         }
+        let asked = Instant::now();
+        let answer = self.ask_hub(bearer);
+        // Never the bearer or the account: only how the lookup went and how long
+        // the account service took, which is a reach's first network wait.
+        tracing::info!(
+            cache = "miss",
+            hub_ms = asked.elapsed().as_millis() as u64,
+            outcome = match &answer {
+                Ok(Some(_)) => "named",
+                Ok(None) => "refused",
+                Err(_) => "unreachable",
+            },
+            "relay caller identity from the account service"
+        );
+        let account = match answer? {
+            Some(account) => account,
+            None => return Ok(None),
+        };
+        let mut remembered = self.remembered.lock_unpoisoned();
+        if remembered.len() >= REMEMBER_AT_MOST {
+            remembered.clear();
+        }
+        remembered.insert(key, (account.clone(), Instant::now()));
+        Ok(Some(account))
+    }
+}
+
+impl HubBearerAccounts {
+    /// `GET /account/identity` for this bearer, uncached.
+    fn ask_hub(&self, bearer: &str) -> Result<Option<String>, String> {
         let hub = self
             .hub
             .as_deref()
@@ -139,11 +173,6 @@ impl BearerAccounts for HubBearerAccounts {
         let Some(account) = body["account"].as_str().filter(|a| !a.is_empty()) else {
             return Err("the account service named no account".to_owned());
         };
-        let mut remembered = self.remembered.lock_unpoisoned();
-        if remembered.len() >= REMEMBER_AT_MOST {
-            remembered.clear();
-        }
-        remembered.insert(key, (account.to_owned(), Instant::now()));
         Ok(Some(account.to_owned()))
     }
 }
@@ -268,8 +297,10 @@ async fn admit_relay_caller(
     };
 
     // Off the async runtime: this may be a network call to the Hub.
+    let started = Instant::now();
     let accounts = relay.accounts.clone();
     let answered = tokio::task::spawn_blocking(move || accounts.account_for(&bearer)).await;
+    let identified = started.elapsed();
     let account = match answered {
         Ok(Ok(Some(account))) => account,
         Ok(Ok(None)) => {
@@ -328,6 +359,7 @@ async fn admit_relay_caller(
     // named. The ordinary handler would bind it to whoever its own judgement
     // produced, which on a desktop is the local operator.
     if path == "/home/admissions" {
+        admitted_after(&method, &path, identified, started.elapsed());
         let mut guard = relay.wb.lock_unpoisoned();
         return match method {
             Method::POST => {
@@ -386,7 +418,26 @@ async fn admit_relay_caller(
         headers.remove(*name);
     }
     headers.insert(axum::http::header::AUTHORIZATION, authorization);
+    admitted_after(&method, &path, identified, started.elapsed());
     next.run(request).await
+}
+
+/// How long judging a relay caller may take before it is a warning. The
+/// whole relay round trip is about 150 ms, so a second spent here is a Home
+/// that a person reaching it through desk is waiting on (2026-10-07).
+const SLOW_ADMISSION: Duration = Duration::from_millis(500);
+
+/// Log that a relay caller was admitted, and how long judging it took — the
+/// Hub naming the bearer's account, the computer's sign-in and the relay
+/// session — which is latency everyone reaching this Home sees.
+fn admitted_after(method: &Method, path: &str, identified: Duration, total: Duration) {
+    let identity_ms = identified.as_millis() as u64;
+    let total_ms = total.as_millis() as u64;
+    if total >= SLOW_ADMISSION {
+        tracing::warn!(%method, path, identity_ms, total_ms, "relay caller admitted slowly");
+    } else {
+        tracing::info!(%method, path, identity_ms, total_ms, "relay caller admitted");
+    }
 }
 
 #[cfg(test)]
