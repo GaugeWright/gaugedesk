@@ -327,3 +327,58 @@ async fn native_home_broker_is_on_the_desktop_operator_plane() {
         "the local broker asks for the selected sealed session before dialing"
     );
 }
+
+/// GaugeDesk 0.8.2 retained a sign-in for an account named by a 130-character
+/// id but could never mint that account's keys — `<keys>/accounts/<hex>` was
+/// past the file-name limit — and 0.8.4 mints them under a hashed folder name
+/// (#1293). Neither the update nor the keys it then mints may drop the
+/// retained sign-in: the window must open signed in (2026-10-07).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sign_in_retained_under_the_0_8_2_layout_opens_after_an_update() {
+    let root = tempfile::tempdir().unwrap();
+    // The length of an account named by its P-256 public key.
+    let account = format!("04{}", "d9".repeat(64));
+    {
+        let wb = crate::open_workbench(root.path()).unwrap();
+        crate::account_signin::store_session_as_for_test(&wb, &account);
+        assert!(
+            wb.lock_unpoisoned()
+                .account_key_store()
+                .held(&account, 0)
+                .unwrap()
+                .is_none(),
+            "0.8.2 held no keys for this account"
+        );
+    }
+
+    // The update: the new version's process opens the same root.
+    let wb = crate::open_runtime::open_prepare(root.path()).unwrap();
+    assert_eq!(
+        crate::account_signin::signed_in_accounts(&wb),
+        vec![account.clone()]
+    );
+    let token = home_session(&wb).expect("the retained sign-in opens after the update");
+    assert_eq!(actor(&wb, &token).as_deref(), Some(account.as_str()));
+
+    // Its first publish mints the account's keys, under the hashed name.
+    wb.lock_unpoisoned()
+        .account_key_store()
+        .mint(&account, 0)
+        .unwrap();
+    let folders: Vec<String> = std::fs::read_dir(root.path().join("keys").join("accounts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(folders.len(), 1);
+    assert!(folders[0].starts_with("sha256-"), "{folders:?}");
+    assert_eq!(
+        home_session(&wb).as_deref(),
+        Some(token.as_str()),
+        "minting the account's keys leaves the sign-in open"
+    );
+
+    drop(wb);
+    let wb = crate::open_workbench(root.path()).unwrap();
+    assert!(crate::account_signin::hub_standing_for(&wb, &account).is_some());
+    assert!(home_session(&wb).is_some(), "and so does the next restart");
+}

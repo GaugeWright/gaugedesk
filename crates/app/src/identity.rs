@@ -369,7 +369,20 @@ pub trait IdentityProvider {
     /// Authenticate a presented `credential` (an opaque bearer token / signed
     /// assertion the adapter verifies) to the authority it speaks for, or `None` if
     /// it cannot be authenticated.
+    ///
+    /// Callers hold the workbench lock, so an implementation must never touch
+    /// the network here. One that might need to — a verifier missing the key a
+    /// token was signed with — does that work in [`prepare`](Self::prepare) or
+    /// in the background, and refuses this call meanwhile.
     fn authenticate(&self, credential: &str) -> Option<AuthorityId>;
+
+    /// Do whatever network work would let a later [`authenticate`](Self::authenticate)
+    /// of `credential` succeed without any: a verifier fetching a signing key
+    /// it has not seen yet. A caller that has just obtained a credential from
+    /// its issuer — off the workbench lock and off the async runtime — calls
+    /// this before handing the credential to the client that will present it.
+    /// May block. The default does nothing.
+    fn prepare(&self, _credential: &str) {}
 
     /// The attribute claims for `authority`, materialized from IdP claims. An
     /// unknown authority gets [`AuthorityAttributes::default`] — fail-closed (no

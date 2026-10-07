@@ -3666,7 +3666,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                 It is for {email()}: accept it signed in to the account that has verified that address.
                             </span>}
                         </Show>
-                        <small>{invite().endpoint}</small>
+                        <small>{invite().endpoint || "On the owner’s computer, reached through its relay"}</small>
                         <button type="button" class="homegate-link" disabled={homeBusy()} onClick={dismissHomeInvite}>
                             Not now
                         </button>

@@ -7,18 +7,27 @@
 //! leg is published in the account's directory record, which anyone may read,
 //! so everything the operator could do was open to anyone holding it.
 //!
-//! This is the relay leg's alone. It admits any account signed in on this
-//! computer, as itself (DR-0328 §6):
+//! This is the relay leg's alone. It admits any account the Hub names, as
+//! itself, each reaching only the projects it owns or holds a grant to
+//! (DR-0328 §6):
 //!
 //! 1. the Hub says whose account the caller's bearer is
-//!    ([`crate::account_identity`]), and that account must hold a live
-//!    sign-in here — any other is a stranger, answered and hung up on;
-//! 2. `POST /home/admissions` then mints an admission bound to that account,
+//!    ([`crate::account_identity`]). What that account holds here is its
+//!    [`Standing`]: signed in on this computer, a member holding a grant to a
+//!    project this Home serves, or neither;
+//! 2. `POST /home/invitations/accept` is answered for any of them, as the
+//!    account the Hub named, with the caller's own bearer asked about an
+//!    email invitation's address (DR-0332). That is how someone invited to a
+//!    project on this computer becomes a member of it. A stranger is
+//!    answered nothing else, and hung up on;
+//! 3. `POST /home/admissions` then mints an admission bound to that account,
 //!    and every later call must carry it, as on a hosted Home (`HOME-1`);
-//! 3. the call is served by the ordinary router under that account's own
-//!    relay session, so it reaches only the projects that account owns or
-//!    holds a grant to, exactly as at the computer. The computer's own
-//!    account records never cross ([`local_only`]).
+//! 4. the call is served by the ordinary router under a session of this
+//!    Home's own for that account — its relay session when it is signed in
+//!    here, a member session when it is not — so it reaches only the projects
+//!    that account owns or holds a grant to, exactly as at the computer. The
+//!    computer's own account records never cross ([`local_only`]), and a
+//!    member reaches nothing host-wide ([`member_refused`]).
 //!
 //! Anything the caller brought besides is removed before it gets there.
 
@@ -71,6 +80,17 @@ const STRIPPED: &[&str] = &[
 /// does not recognise the bearer; `Err` is not reaching the Hub at all.
 pub trait BearerAccounts: Send + Sync {
     fn account_for(&self, bearer: &str) -> Result<Option<String>, String>;
+
+    /// Whether the account presenting `bearer` holds `email` as a verified
+    /// address, as the Hub says (DR-0332 §5). Without a Hub to ask the answer
+    /// is an error, which refuses the acceptance it was asked for.
+    fn email_standing(
+        &self,
+        _bearer: &str,
+        _email: &str,
+    ) -> Result<crate::account_identity::EmailStanding, String> {
+        Err("no account service is configured".to_owned())
+    }
 }
 
 /// [`BearerAccounts`] answered by the Hub's `GET /account/identity`.
@@ -139,6 +159,18 @@ impl BearerAccounts for HubBearerAccounts {
         }
         remembered.insert(key, (account.clone(), Instant::now()));
         Ok(Some(account))
+    }
+
+    fn email_standing(
+        &self,
+        bearer: &str,
+        email: &str,
+    ) -> Result<crate::account_identity::EmailStanding, String> {
+        let hub = self
+            .hub
+            .as_deref()
+            .ok_or_else(|| "no account service is configured".to_owned())?;
+        crate::account_identity::hub_email_standing(hub, bearer, email)
     }
 }
 
@@ -263,6 +295,113 @@ fn admission(headers: &HeaderMap) -> Option<HomeAdmissionToken> {
         .and_then(HomeAdmissionToken::parse)
 }
 
+/// What the account the Hub named holds on this computer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// Signed in here: it crosses as itself, as at the computer.
+    SignedIn,
+    /// Not signed in here, but an active member holding a grant to a project
+    /// this Home serves: it crosses to those projects alone.
+    Member,
+    /// Neither. It may accept an invitation and do nothing else.
+    Stranger,
+}
+
+impl Standing {
+    fn as_str(self) -> &'static str {
+        match self {
+            Standing::SignedIn => "signed-in",
+            Standing::Member => "member",
+            Standing::Stranger => "stranger",
+        }
+    }
+}
+
+/// Said to an account the Hub named that holds nothing here.
+const STRANGER_REFUSAL: &str = "this account is not signed in on this computer \
+    and holds no project here";
+
+/// Said to a member asking for something that is not one of its projects'.
+const MEMBER_REFUSAL: &str = "only the projects shared with you on this computer \
+    are reached from elsewhere";
+
+/// Said when a member's grant ended between its admission and this call.
+const MEMBER_ENDED: &str = "your access to this computer's projects has ended";
+
+/// The largest invitation acceptance body the relay reads itself.
+const ACCEPT_BODY_LIMIT: usize = 64 * 1024;
+
+/// Whether a route is beyond what a project member reaches here: anything
+/// host-wide rather than about one of its projects (DR-0268 §1, DR-0328 §6).
+///
+/// A member is not signed in on this computer, so it keeps nothing here —
+/// no Personal, no provider credentials or settings, no Agents, no pairings
+/// — and it creates no project, which would be the computer's owner's to
+/// carry. What it reaches inside its projects is decided per project behind
+/// this, by the same gate and handlers as any account here.
+fn member_refused(method: &Method, path: &str) -> bool {
+    const HOST_WIDE: &[&str] = &[
+        "/account/",
+        "/admin/",
+        "/archetypes",
+        "/auth/",
+        "/boundaries/",
+        "/collection-recipients",
+        "/console/",
+        "/directory",
+        "/federation/",
+        "/gaugeapps/",
+        "/home/invitations",
+        "/home/projects/",
+        "/local-projects",
+        "/mobile/",
+        "/organizations/",
+        "/pairing-",
+        "/product-analytics",
+        "/public-deployments",
+        "/roster",
+        "/saml",
+        "/scim",
+        "/test/",
+        "/tutorials/",
+    ];
+    if HOST_WIDE.iter().any(|prefix| path.starts_with(prefix)) {
+        return true;
+    }
+    // Creating a project, a quick chat in a Personal of its own, or a fork
+    // of a project puts something on this computer that is not one of the
+    // member's projects; deleting a project is its owner's.
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    matches!(
+        (method, segments.as_slice()),
+        (
+            &Method::POST,
+            ["projects"] | ["chats"] | ["projects", _, "fork"]
+        ) | (&Method::DELETE, ["projects", _])
+    )
+}
+
+/// Judge what `account` holds here. Off the async runtime: it reads the store.
+async fn standing_of(wb: &SharedWorkbench, account: &str) -> Standing {
+    let wb = wb.clone();
+    let account = account.to_owned();
+    tokio::task::spawn_blocking(move || {
+        if crate::account_signin::hub_standing_for(&wb, &account).is_some() {
+            return Standing::SignedIn;
+        }
+        let guard = wb.lock_unpoisoned();
+        if guard.desktop_account_mode()
+            && !crate::desktop_session::member_projects(&guard, &account).is_empty()
+        {
+            Standing::Member
+        } else {
+            Standing::Stranger
+        }
+    })
+    .await
+    .unwrap_or(Standing::Stranger)
+}
+
 async fn admit_relay_caller(
     State(relay): State<Relay>,
     mut request: Request,
@@ -299,7 +438,8 @@ async fn admit_relay_caller(
     // Off the async runtime: this may be a network call to the Hub.
     let started = Instant::now();
     let accounts = relay.accounts.clone();
-    let answered = tokio::task::spawn_blocking(move || accounts.account_for(&bearer)).await;
+    let asked = bearer.clone();
+    let answered = tokio::task::spawn_blocking(move || accounts.account_for(&asked)).await;
     let identified = started.elapsed();
     let account = match answered {
         Ok(Ok(Some(account))) => account,
@@ -331,35 +471,73 @@ async fn admit_relay_caller(
     };
 
     // Any account the Hub names crosses as itself; what it reaches is decided
-    // per project behind this (DR-0328 §6). Only an account signed in on this
-    // computer is served; any other is a stranger here, answered and hung up
-    // on (DR-0302).
-    let signed_in_here = {
-        let wb = relay.wb.clone();
-        let person = account.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::account_signin::hub_standing_for(&wb, &person).is_some()
-        })
-        .await
-        .unwrap_or(false)
-    };
-    if !signed_in_here {
-        return hang_up(
-            peer,
-            refuse(
-                StatusCode::FORBIDDEN,
-                "this account is not signed in on this computer",
-            ),
-        );
-    }
+    // per project behind this (DR-0328 §6).
+    let standing = standing_of(&relay.wb, &account).await;
+    let judged = started.elapsed();
     let home = relay.wb.lock_unpoisoned().home_id().clone();
     let actor = AuthorityId::new(account.clone());
+
+    // Accepting an invitation is how an account comes to hold a project here,
+    // so it is answered for every account the Hub names. It is answered here,
+    // as that account, with the caller's own bearer asked about an email
+    // invitation's address: the router behind would judge it as the session
+    // it serves under, which on a desktop is never the invitee (DR-0332).
+    if path == "/home/invitations/accept" {
+        if method != Method::POST {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let body = match axum::body::to_bytes(request.into_body(), ACCEPT_BODY_LIMIT).await {
+            Ok(body) => body,
+            Err(_) => {
+                return hang_up(
+                    peer,
+                    refuse(StatusCode::PAYLOAD_TOO_LARGE, "invitation is too large"),
+                )
+            }
+        };
+        let accounts = relay.accounts.clone();
+        let email: crate::home_invitation::EmailCheck =
+            Box::new(move |address: &str| accounts.email_standing(&bearer, address));
+        let answer =
+            crate::home_invitation::accept_over_relay(relay.wb.clone(), actor, email, &body).await;
+        tracing::info!(
+            standing = standing.as_str(),
+            status = answer.status().as_u16(),
+            identity_ms = identified.as_millis() as u64,
+            standing_ms = (judged - identified).as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "relay invitation acceptance answered"
+        );
+        // A stranger whose acceptance failed holds nothing here still.
+        return if standing == Standing::Stranger && !answer.status().is_success() {
+            hang_up(peer, answer)
+        } else {
+            answer
+        };
+    }
+    match standing {
+        Standing::Stranger => {
+            tracing::info!(
+                %method,
+                path,
+                identity_ms = identified.as_millis() as u64,
+                total_ms = started.elapsed().as_millis() as u64,
+                "relay caller holds nothing here"
+            );
+            return hang_up(peer, refuse(StatusCode::FORBIDDEN, STRANGER_REFUSAL));
+        }
+        Standing::Member if member_refused(&method, &path) => {
+            tracing::info!(%method, path, "relay member refused a host-wide route");
+            return refuse(StatusCode::FORBIDDEN, MEMBER_REFUSAL);
+        }
+        Standing::SignedIn | Standing::Member => {}
+    }
 
     // The admission ceremony is answered here, bound to the account the Hub
     // named. The ordinary handler would bind it to whoever its own judgement
     // produced, which on a desktop is the local operator.
     if path == "/home/admissions" {
-        admitted_after(&method, &path, identified, started.elapsed());
+        admitted_after(&method, &path, standing, identified, started.elapsed());
         let mut guard = relay.wb.lock_unpoisoned();
         return match method {
             Method::POST => {
@@ -399,13 +577,20 @@ async fn admit_relay_caller(
     }
 
     let wb = relay.wb.clone();
-    let session =
-        tokio::task::spawn_blocking(move || crate::desktop_session::relay_session(&wb, &account))
-            .await
-            .ok()
-            .flatten();
+    let session = tokio::task::spawn_blocking(move || match standing {
+        Standing::SignedIn => crate::desktop_session::relay_session(&wb, &account),
+        Standing::Member => crate::desktop_session::member_session(&wb, &account),
+        Standing::Stranger => None,
+    })
+    .await
+    .ok()
+    .flatten();
     let Some(session) = session else {
-        return refuse(StatusCode::FORBIDDEN, RELAY_REFUSAL);
+        let refusal = match standing {
+            Standing::Member => MEMBER_ENDED,
+            _ => RELAY_REFUSAL,
+        };
+        return refuse(StatusCode::FORBIDDEN, refusal);
     };
     let Ok(authorization) = HeaderValue::from_str(&format!("Bearer {session}")) else {
         return refuse(
@@ -418,7 +603,7 @@ async fn admit_relay_caller(
         headers.remove(*name);
     }
     headers.insert(axum::http::header::AUTHORIZATION, authorization);
-    admitted_after(&method, &path, identified, started.elapsed());
+    admitted_after(&method, &path, standing, identified, started.elapsed());
     next.run(request).await
 }
 
@@ -428,15 +613,22 @@ async fn admit_relay_caller(
 const SLOW_ADMISSION: Duration = Duration::from_millis(500);
 
 /// Log that a relay caller was admitted, and how long judging it took — the
-/// Hub naming the bearer's account, the computer's sign-in and the relay
-/// session — which is latency everyone reaching this Home sees.
-fn admitted_after(method: &Method, path: &str, identified: Duration, total: Duration) {
+/// Hub naming the bearer's account, its standing here and its session —
+/// which is latency everyone reaching this Home sees.
+fn admitted_after(
+    method: &Method,
+    path: &str,
+    standing: Standing,
+    identified: Duration,
+    total: Duration,
+) {
     let identity_ms = identified.as_millis() as u64;
     let total_ms = total.as_millis() as u64;
+    let standing = standing.as_str();
     if total >= SLOW_ADMISSION {
-        tracing::warn!(%method, path, identity_ms, total_ms, "relay caller admitted slowly");
+        tracing::warn!(%method, path, standing, identity_ms, total_ms, "relay caller admitted slowly");
     } else {
-        tracing::info!(%method, path, identity_ms, total_ms, "relay caller admitted");
+        tracing::info!(%method, path, standing, identity_ms, total_ms, "relay caller admitted");
     }
 }
 

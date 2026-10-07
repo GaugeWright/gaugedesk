@@ -6,6 +6,7 @@
 //! Home's directory and never outliving the sign-in behind it. The shell hands
 //! it to the webview over IPC; it never crosses HTTP.
 
+use crate::retained_signin_log::Outcome;
 use crate::{account_signin::HubStanding, org::Org, LockUnpoisoned, SharedWorkbench};
 
 /// The authentication method recorded on the session.
@@ -76,6 +77,11 @@ fn session_for(wb: &SharedWorkbench, which: Slot<'_>, account: Option<&str>) -> 
         None => crate::account_signin::hub_standing(wb),
     };
     let now = now_ms();
+    // A sign-in that does not open or is not retained was already named in
+    // the log where it was read; an expired one is named here.
+    if let Some(hub) = hub.as_ref().filter(|hub| hub.expires_ms <= now) {
+        crate::retained_signin_log::note(&hub.person, Outcome::Expired);
+    }
     let Some(hub) = hub
         .filter(|hub| hub.expires_ms > now)
         .filter(|hub| account.is_none_or(|account| hub.person == account))
@@ -94,6 +100,7 @@ fn session_for(wb: &SharedWorkbench, which: Slot<'_>, account: Option<&str>) -> 
                 .is_some_and(|org| org.role_of(&hub.person).is_some())
     };
     if !standing {
+        crate::retained_signin_log::note(&hub.person, Outcome::NoHomeSession);
         revoke_held(wb, which);
         return None;
     }
@@ -118,15 +125,95 @@ fn session_for(wb: &SharedWorkbench, which: Slot<'_>, account: Option<&str>) -> 
         guard.revoke_account_session(&held.token);
     }
     let expires_ms = hub.expires_ms.min(now.saturating_add(MAX_LIFETIME_MS));
-    let lifetime_secs = u64::try_from((expires_ms - now) / 1000)
+    let minted = u64::try_from((expires_ms - now) / 1000)
         .ok()
-        .filter(|s| *s > 0)?;
-    let token = guard.mint_account_session(&hub.person, METHOD, lifetime_secs)?;
+        .filter(|s| *s > 0)
+        .and_then(|lifetime_secs| guard.mint_account_session(&hub.person, METHOD, lifetime_secs));
+    let Some(token) = minted else {
+        crate::retained_signin_log::note(&hub.person, Outcome::NoHomeSession);
+        return None;
+    };
+    crate::retained_signin_log::note(&hub.person, Outcome::Opened);
     *slot(&mut guard, which) = Some(DesktopUiSession {
         token: token.clone(),
         hub,
         expires_ms,
     });
+    Some(token)
+}
+
+/// The session a project member's relay crossings are served under: an
+/// account the Hub named that is not signed in on this computer but holds a
+/// grant to a project this Home serves (DR-0328 §6, DR-0332). It is this
+/// Home's own and never leaves it; the relay puts it on each admitted
+/// crossing in place of whatever the caller brought.
+#[derive(Clone, Debug)]
+pub(crate) struct MemberSession {
+    token: String,
+    expires_ms: i64,
+}
+
+/// The authentication method recorded on a member's session.
+pub(crate) const MEMBER_METHOD: &str = "relay-member";
+
+/// Standing is read again on every crossing and the session never leaves this
+/// Home, so its lifetime bounds only how long it outlives a process that
+/// forgot it. The window's own session's ceiling, which also keeps the
+/// durable session facts a member's work writes to two a day.
+const MEMBER_LIFETIME_MS: i64 = MAX_LIFETIME_MS;
+
+/// The projects this Home serves that `account` holds an explicit grant to,
+/// as an active member of its directory. Owning a project does not count:
+/// an owner reaches its projects by being signed in on the computer, and
+/// signing out ends that (DR-0328 §6). Unreadable evidence grants nothing.
+pub(crate) fn member_projects(
+    wb: &crate::Workbench,
+    account: &str,
+) -> std::collections::BTreeSet<String> {
+    let Ok(org) = Org::rebuild(wb.store_ref()) else {
+        return Default::default();
+    };
+    if account.is_empty() || org.role_of(account).is_none() {
+        return Default::default();
+    }
+    org.granted_project_ids(account)
+        .into_iter()
+        .filter(|project| wb.owns_project(project))
+        .collect()
+}
+
+/// The Home session a project member's relay crossing is served under, or
+/// `None` once the account holds no grant here. The session reaches what any
+/// account session for that account reaches on this desktop: its owned and
+/// granted projects (DR-0268), which for a member is its grants alone.
+pub(crate) fn member_session(wb: &SharedWorkbench, account: &str) -> Option<String> {
+    let mut guard = wb.lock_unpoisoned();
+    let standing = guard.desktop_account_mode() && !member_projects(&guard, account).is_empty();
+    let now = now_ms();
+    if standing {
+        if let Some(held) = guard.relay_member_sessions.get(account) {
+            if held.expires_ms - now > MEMBER_LIFETIME_MS / 12
+                && guard.account_sessions().resolve_now(&held.token).is_some()
+            {
+                return Some(held.token.clone());
+            }
+        }
+    }
+    if let Some(held) = guard.relay_member_sessions.remove(account) {
+        guard.revoke_account_session(&held.token);
+    }
+    if !standing {
+        return None;
+    }
+    let lifetime_secs = u64::try_from(MEMBER_LIFETIME_MS / 1000).unwrap_or(12 * 60 * 60);
+    let token = guard.mint_account_session(account, MEMBER_METHOD, lifetime_secs)?;
+    guard.relay_member_sessions.insert(
+        account.to_owned(),
+        MemberSession {
+            token: token.clone(),
+            expires_ms: now.saturating_add(MEMBER_LIFETIME_MS),
+        },
+    );
     Some(token)
 }
 

@@ -19,6 +19,38 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.6] — 2026-10-07
+
+- A project on a desktop can be shared. Inviting someone — by email, or from
+  your organization — now works when that computer is reached only through the
+  relay, which is how most desktops are reached: the invitation carries how to
+  reach the computer, and the person accepts and works in that one project from
+  desk without ever signing in on your computer. They reach nothing else there:
+  not your other projects, Agents, credentials or settings, and they cannot
+  create or delete a project on it. Their chats run on the project's own model
+  credentials. Taking their access away ends it at once. desk remembers how to
+  reach the project in the browser where the invitation was accepted; to work
+  from another browser, open the invitation link there too. A desktop that is
+  not reachable from elsewhere at all still says so instead of minting a link
+  nobody could use.
+- A hosted session refresh no longer re-reads the sign-in provider's discovery
+  document every time: provider metadata is kept for as long as the provider's
+  own `Cache-Control` allows. And the Hub no longer makes every other request
+  wait while it fetches a provider's signing keys — a token signed by a key it
+  has not seen starts that fetch in the background, the refresh leg loads the
+  key before handing desk its token, and a token from a different provider
+  never triggers a fetch at all.
+- GaugeDesk no longer opens signed out after an update. The window could ask
+  its local service whether you were signed in a fraction of a second before
+  that service was listening, take the failed answer as "signed out", and keep
+  it for five minutes — which is what made 0.8.2 and 0.8.5 each ask to sign in
+  again on their first launch. A read sent before the service has started now
+  waits for it (up to 30 seconds, or until the app says why it stopped). Your
+  sign-in itself was never lost. The app's log now says at startup which
+  sign-ins this computer holds and whether each one opens, and names any
+  retained sign-in that does not open, has expired, or that the window could
+  not be given a session for, with the reason.
+
 ## [0.8.5] — 2026-10-07
 
 - Reaching a desktop Home through the relay no longer stalls. A Home keeps six

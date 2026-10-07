@@ -233,6 +233,8 @@ export class WorkbenchControlPlane implements ControlPlane {
      * and a Home that fails degrades only the projects routed to it. */
     private pool: HomePool<workbenchClient.WorkbenchTransport> | null = null;
     private currentProject: ProjectId | null = null;
+    /** Who shared-project pins are kept for, resolved once per credential. */
+    private sharedSubject: { generation: number; subject: Promise<string> } | null = null;
     private readonly restartWorkStreams = new Set<() => void>();
     /** Every event stream this control plane opens, Home or local (WS-581). */
     private readonly streamGate = new EventStreamGate();
@@ -509,6 +511,48 @@ export class WorkbenchControlPlane implements ControlPlane {
      */
     private async homeRoutes(): Promise<OpaqueHomeRoute[]> {
         if (this.nativeRemote) return (await accountClient.hubSessionReach(this.route)).routes;
+        const [own, shared] = await Promise.all([this.ownHomeRoutes(), this.sharedRoutes()]);
+        return accountClient.withSharedRoutes(own, shared);
+    }
+
+    /**
+     * Who this browser keeps shared-project pins for. The bearer's own claims
+     * where it carries them, and otherwise the account the Hub names for this
+     * session, which a browser holding only a cookie and an opaque bearer
+     * needs (see `resolveHomeRoutes`).
+     */
+    private pinSubject(): Promise<string> {
+        const generation = this.credentialGeneration;
+        if (this.sharedSubject?.generation === generation) return this.sharedSubject.subject;
+        const subject = (async () => {
+            const claimed = this.subject();
+            if (claimed) return claimed;
+            const directory = await accountClient.accountDirectory(this.route).catch(() => null);
+            if (directory?.subject) return directory.subject;
+            const identity = await this.route("GET", "/account/identity").catch(() => null) as
+                { account?: unknown } | null;
+            return typeof identity?.account === "string" ? identity.account : "";
+        })();
+        this.sharedSubject = { generation, subject };
+        return subject;
+    }
+
+    /** Routes to projects on someone else's relay-only Home this browser
+     * accepted an invitation to, each held to the project's own key (DR-0370). */
+    private async sharedRoutes(): Promise<OpaqueHomeRoute[]> {
+        // Most browsers hold none, and need not ask who is signed in.
+        if (!accountClient.holdsSharedProjects()) return [];
+        try {
+            const subject = await this.pinSubject();
+            if (!subject) return [];
+            return await accountClient.sharedProjectRoutes({ subject });
+        } catch (error) {
+            console.warn("[account] shared project routes unavailable: %s", String(error));
+            return [];
+        }
+    }
+
+    private async ownHomeRoutes(): Promise<OpaqueHomeRoute[]> {
         const resolved = await accountClient.resolveHomeRoutes({
             json: this.route,
             subject: this.subject(),
@@ -1140,6 +1184,7 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     async acceptHomeInvitation(invite: string): Promise<HomeBootstrapState> {
         if (!this.splitHomes) throw new Error("Home invitations require hosted Home routing");
+        const started = performance.now();
         const accepted = await accountClient.acceptHomeInvitation(invite, {
             bearer: () => this.bearer,
         });
@@ -1148,15 +1193,31 @@ export class WorkbenchControlPlane implements ControlPlane {
             kind: "registered",
             endpoint: accepted.endpoint,
         };
+        // A project on a Home reached only through its relay: pin its key and
+        // route here before anything resolves routes, so the pool reaches it
+        // over the relay like the person's own relay-only Homes (DR-0370).
+        if (accepted.shared) {
+            await accountClient.pinSharedProject({ subject: await this.pinSubject() }, accepted.shared);
+        }
         await accountClient.accountRegisterHome(this.route, home, true);
         await accountClient.accountPublishHomeRoute(this.route, {
             project: accepted.project,
             homeId: accepted.homeId,
             endpoint: accepted.endpoint,
         });
-        this.homeAdmission = accepted.admission;
-        this.homeTransport = Promise.resolve(
-            accountClient.acceptedHomeTransport(accepted, () => this.bearer),
+        if (accepted.shared) {
+            this.pool?.replaceRoutes(await this.homeRoutes());
+            this.homeTransport = null;
+        } else {
+            this.homeAdmission = accepted.admission;
+            this.homeTransport = Promise.resolve(
+                accountClient.acceptedHomeTransport(accepted, () => this.bearer),
+            );
+        }
+        console.info(
+            "[account] project invitation accepted (%s) in %d ms",
+            accepted.shared ? "through the relay" : "direct",
+            Math.round(performance.now() - started),
         );
         return { kind: "connected", home };
     }

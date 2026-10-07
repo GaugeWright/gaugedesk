@@ -98,3 +98,20 @@ export async function placementHolds(route: unknown, trustedProjectKey: string):
     const module = await load();
     return module.placement_verifies_json?.(JSON.stringify(route), trustedProjectKey) ?? true;
 }
+
+/**
+ * Whether a route's placement holds against `trustedProjectKey`, for a route
+ * only its placement vouches for: a project on someone else's Home, which no
+ * root this browser trusts signed (DR-0370 §2). Unlike [`placementHolds`] a
+ * build that cannot check says `false`, because nothing else stands behind
+ * the route's certificate pin.
+ */
+export async function placementVerified(route: unknown, trustedProjectKey: string): Promise<boolean> {
+    if (!directoryVerifierAvailable() || !trustedProjectKey) return false;
+    try {
+        const module = await load();
+        return module.placement_verifies_json?.(JSON.stringify(route), trustedProjectKey) ?? false;
+    } catch {
+        return false;
+    }
+}

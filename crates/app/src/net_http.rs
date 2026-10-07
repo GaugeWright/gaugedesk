@@ -226,9 +226,9 @@ impl HttpClient {
     }
 
     /// A client with an explicit overall timeout. The 20s [`new`](Self::new) default
-    /// suits one-shot setup/login/payment calls; the on-request JWKS self-refresh
-    /// (`ID-3`) uses a shorter bound so an unreachable IdP can't stall an admin request
-    /// (which holds the workbench lock) for long.
+    /// suits one-shot setup/login/payment calls; the verifier's JWKS self-refresh
+    /// (`ID-3`) uses a shorter bound so a refresh against an unreachable IdP gives up
+    /// quickly. That refresh never runs under the workbench lock (WS-855).
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
             agent: ureq::AgentBuilder::new().timeout(timeout).build(),
@@ -259,6 +259,26 @@ impl HttpClient {
     pub fn get_string(&self, url: &str) -> Result<String, String> {
         match self.agent.get(url).call() {
             Ok(resp) => resp.into_string().map_err(|e| format!("read body: {e}")),
+            Err(ureq::Error::Status(code, resp)) => Err(format!(
+                "HTTP {code}: {}",
+                resp.into_string().unwrap_or_default()
+            )),
+            Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
+        }
+    }
+
+    /// [`get_string`](Self::get_string), also returning the response's
+    /// `Cache-Control` header, so a caller caching the document (provider
+    /// metadata, [`crate::oidc_metadata`]) can keep it exactly as long as its
+    /// publisher allows.
+    pub fn get_string_cache_control(&self, url: &str) -> Result<(String, Option<String>), String> {
+        match self.agent.get(url).call() {
+            Ok(resp) => {
+                let cache_control = resp.header("cache-control").map(str::to_owned);
+                resp.into_string()
+                    .map(|body| (body, cache_control))
+                    .map_err(|e| format!("read body: {e}"))
+            }
             Err(ureq::Error::Status(code, resp)) => Err(format!(
                 "HTTP {code}: {}",
                 resp.into_string().unwrap_or_default()

@@ -399,3 +399,43 @@ async fn another_account_signed_in_here_crosses_as_itself() {
         "the computer's accounts stay local"
     );
 }
+
+/// A project member who is not signed in on this computer reaches its
+/// projects' work and nothing host-wide (DR-0328 §6, WS-861).
+#[test]
+fn a_member_reaches_its_projects_work_and_nothing_host_wide() {
+    for (method, path) in [
+        (Method::GET, "/account/credentials"),
+        (Method::PUT, "/account/settings"),
+        (Method::GET, "/admin/members"),
+        (Method::POST, "/archetypes"),
+        (Method::GET, "/archetypes/agent-1/settings/sessions"),
+        (Method::POST, "/federation/invite"),
+        (Method::POST, "/home/invitations"),
+        (Method::GET, "/home/projects/proj-1/invitations"),
+        (Method::POST, "/public-deployments"),
+        (Method::POST, "/tutorials/basics/start"),
+        (Method::GET, "/roster"),
+        (Method::POST, "/projects"),
+        (Method::POST, "/chats"),
+        (Method::POST, "/projects/proj-1/fork"),
+        (Method::DELETE, "/projects/proj-1"),
+        (Method::POST, "/local-projects/transfer"),
+    ] {
+        assert!(member_refused(&method, path), "{method} {path}");
+    }
+    for (method, path) in [
+        (Method::GET, "/workspace"),
+        (Method::GET, "/workspace/events"),
+        (Method::GET, "/projects/proj-1/home"),
+        (Method::POST, "/projects/proj-1/settings/sessions"),
+        (Method::POST, "/projects/proj-1/placements/inst-1/chats"),
+        (Method::POST, "/placements/inst-1/settings/sessions"),
+        (Method::GET, "/chats/chat-1/transcript"),
+        (Method::POST, "/chats/chat-1/task"),
+        (Method::POST, "/chats/chat-1/fork"),
+        (Method::GET, "/tasks"),
+    ] {
+        assert!(!member_refused(&method, path), "{method} {path}");
+    }
+}

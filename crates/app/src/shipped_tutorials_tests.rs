@@ -448,6 +448,9 @@ fn a_governed_home_gives_the_folder_to_its_one_owner() {
 #[test]
 fn a_member_sees_only_their_tutorials_project_under_project_grants() {
     let (_root, wb) = open();
+    // A governed Home's members learn there; a desktop's invited members
+    // work elsewhere (see the next test).
+    wb.lock_unpoisoned().enable_hosted_home_mode();
     add_owner(&wb, "tenant-owner");
     let member = crate::org::MembershipRecord {
         id: "learner".into(),
@@ -477,6 +480,45 @@ fn a_member_sees_only_their_tutorials_project_under_project_grants() {
         tutorial_target_id("learner"),
         tutorial_target_id("tenant-owner")
     );
+}
+
+/// Someone invited to one of a desktop's projects reaches it over the relay
+/// and works elsewhere: the computer makes them no Tutorials, so their grant
+/// stays the one project they were invited to (DR-0328 §6, WS-861).
+#[test]
+fn a_desktops_invited_member_gets_no_tutorials_there() {
+    let (_root, wb) = owned();
+    let member = crate::org::MembershipRecord {
+        id: "invitee".into(),
+        op: RecordOp::Upsert,
+        org_id: crate::org::ORG_ID.into(),
+        authority: "invitee".into(),
+        email: "invitee@example.test".into(),
+        role: "member".into(),
+        status: MembershipStatus::Active,
+        managed_by_scim: false,
+        team: None,
+    };
+    let mut guard = wb.lock_unpoisoned();
+    guard
+        .store_mut()
+        .append_record(
+            ORG_SCOPE,
+            "membership",
+            &serde_json::to_string(&member).unwrap(),
+        )
+        .unwrap();
+    guard.ensure_shipped_tutorials().unwrap();
+    assert!(guard
+        .library
+        .projects
+        .contains_key(&tutorial_project_id("account-root")));
+    assert!(!guard
+        .library
+        .projects
+        .contains_key(&tutorial_project_id("invitee")));
+    let org = Org::rebuild(guard.store_ref()).unwrap();
+    assert!(org.granted_project_ids("invitee").is_empty());
 }
 
 #[test]

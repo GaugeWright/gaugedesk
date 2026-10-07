@@ -136,6 +136,11 @@ pub struct Workbench {
     /// The session each account's relay crossings are served under.
     pub(crate) relay_sessions:
         std::collections::BTreeMap<String, Option<crate::desktop_session::DesktopUiSession>>,
+    /// The session each project member's relay crossings are served under:
+    /// an account not signed in here that holds a grant to a project this
+    /// Home serves (DR-0328 §6). Process memory only.
+    pub(crate) relay_member_sessions:
+        std::collections::BTreeMap<String, crate::desktop_session::MemberSession>,
     /// Where this Home serves the callers its relay leg carries, once it
     /// serves them. The desktop's broker reaches its own Home here rather than
     /// dialing itself through the relay, which never completes.
@@ -483,6 +488,7 @@ impl Workbench {
             idp: None,
             desktop_ui_session: None,
             relay_sessions: Default::default(),
+            relay_member_sessions: Default::default(),
             relay_crossings: None,
             account_sessions: Arc::new(crate::account_session::AccountSessionStore::new()),
             linked_subject_hints: Mutex::default(),

@@ -1487,7 +1487,20 @@ pub(crate) struct HubStanding {
 }
 
 pub(crate) fn hub_standing(wb: &SharedWorkbench) -> Option<HubStanding> {
-    standing_from_record(wb, latest_session(wb)?)
+    let Some(record) = latest_session(wb) else {
+        // A selection that names an account with no retained sign-in leaves
+        // the window signed out; say so rather than presenting nothing.
+        if let Some(person) =
+            selected_person(wb).filter(|person| !person.is_empty() && person != LOCAL_SELECTION)
+        {
+            crate::retained_signin_log::note(
+                &person,
+                crate::retained_signin_log::Outcome::NotRetained,
+            );
+        }
+        return None;
+    };
+    standing_from_record(wb, record)
 }
 
 /// The Home's owner may remain signed in while another account is selected
@@ -1498,7 +1511,7 @@ pub(crate) fn hub_standing_for(wb: &SharedWorkbench, person: &str) -> Option<Hub
 }
 
 fn standing_from_record(wb: &SharedWorkbench, record: SessionRecord) -> Option<HubStanding> {
-    let token = wb.lock_unpoisoned().unseal_account_secret(&record.sealed)?;
+    let token = unseal_record(wb, &record)?;
     Some(HubStanding {
         person: record.person,
         session: crate::account_session::session_id(&token),
@@ -1506,20 +1519,70 @@ fn standing_from_record(wb: &SharedWorkbench, record: SessionRecord) -> Option<H
     })
 }
 
+/// Open a retained session's sealed bearer. One that no longer opens under
+/// this computer's account key is named in the log with that reason instead of
+/// reading as signed out.
+fn unseal_record(wb: &SharedWorkbench, record: &SessionRecord) -> Option<String> {
+    let token = wb.lock_unpoisoned().unseal_account_secret(&record.sealed);
+    if token.is_none() {
+        crate::retained_signin_log::note(
+            &record.person,
+            crate::retained_signin_log::Outcome::Unsealable,
+        );
+    }
+    token
+}
+
 pub(crate) fn hub_session_token_for(wb: &SharedWorkbench, person: &str) -> Option<String> {
     let record = retained_sessions(wb).remove(person)?;
     if record.expires <= now_ms() {
         return None;
     }
-    wb.lock_unpoisoned().unseal_account_secret(&record.sealed)
+    unseal_record(wb, &record)
 }
 
 /// The current account bearer, unsealed — for core callers that present the
 /// person to the Hub (projections, opaque routes). Never crosses HTTP.
 pub fn hub_session_token(wb: &SharedWorkbench) -> Option<String> {
-    let record = latest_session(wb)?;
-    let workbench = wb.lock_unpoisoned();
-    workbench.unseal_account_secret(&record.sealed)
+    unseal_record(wb, &latest_session(wb)?)
+}
+
+/// Write to the log what this computer will present for each retained
+/// sign-in, once, when the Home opens. A window that comes up signed out
+/// after an update is then explained by the log rather than by the person's
+/// memory: every retained account, whether its session opens, and which one
+/// the window will present.
+pub fn log_retained_signins(wb: &SharedWorkbench) {
+    use crate::retained_signin_log::{account_tag, note, Outcome};
+    let retained = retained_sessions(wb);
+    let selected = match selected_person(wb) {
+        None if legacy_session(wb).is_some() => "the single legacy sign-in".to_owned(),
+        None => "none".to_owned(),
+        Some(person) if person.is_empty() => "none (signed out)".to_owned(),
+        Some(person) if person == LOCAL_SELECTION => "this computer, locally".to_owned(),
+        Some(person) => account_tag(&person),
+    };
+    tracing::info!(
+        retained = retained.len(),
+        %selected,
+        "retained sign-ins on this computer"
+    );
+    let now = now_ms();
+    for record in retained.values() {
+        if unseal_record(wb, record).is_none() {
+            continue;
+        }
+        note(
+            &record.person,
+            if record.expires <= now {
+                Outcome::Expired
+            } else {
+                Outcome::Opened
+            },
+        );
+    }
+    // The selection's own outcome, which may be that it names no sign-in.
+    let _ = hub_standing(wb);
 }
 
 /// Seed a stored Hub session, so a test in another module can start from a

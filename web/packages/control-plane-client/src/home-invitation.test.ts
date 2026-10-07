@@ -6,8 +6,6 @@ import {
     emailHomeInvitation,
     listPendingHomeInvitations,
     parseHomeInvitation,
-    RELAY_ONLY_INVITATION,
-    RelayOnlyHomeInvitationError,
     resendHomeInvitation,
 } from "./home-invitation";
 
@@ -26,6 +24,38 @@ function invitation(overrides: Record<string, unknown> = {}): string {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+const LOCATOR = {
+    endpoint: "wss://relay.example.test",
+    handle: "a".repeat(43),
+    proof: "b".repeat(43),
+    route_epoch: 3,
+    home_fingerprint: "c".repeat(64),
+};
+const PLACEMENT = {
+    project_key: "project-key",
+    host_key: "host-key",
+    placement_signature: "placed",
+    locator_signature: "located",
+};
+
+/** An invitation from a Home reached only through its relay (DR-0370). */
+function relayOnly(overrides: Record<string, unknown> = {}): string {
+    return invitation({
+        invited_authority: "",
+        invited_email: "alex@example.test",
+        endpoint: "",
+        relay: LOCATOR,
+        placement: PLACEMENT,
+        owner_root: "owner-root",
+        ...overrides,
+    });
+}
+
+/** Holds only for the placement the invitation's project key signed. */
+const placementVerified = vi.fn(async (route: unknown, key: string) =>
+    key === "project-key"
+    && (route as { placement?: { placement_signature?: unknown } }).placement?.placement_signature === "placed");
 
 describe("ordinary Home invitations", () => {
     it("returns only safe preview fields and rejects malformed or insecure capabilities", () => {
@@ -92,21 +122,101 @@ describe("ordinary Home invitations", () => {
         }));
     });
 
-    it("refuses before asking when the Home is reached only through the relay", async () => {
-        const route = vi.fn();
-        for (const recipient of [{ authority: "account:invitee" }, { email: "alex@example.test" }]) {
-            await expect(createHomeInvitation(route, {
-                ...recipient,
-                project: "proj-1" as never,
-                endpoint: "",
-            })).rejects.toBeInstanceOf(RelayOnlyHomeInvitationError);
-        }
+    it("asks a Home reached only through the relay, which answers with its route", async () => {
+        const encoded = relayOnly();
+        const route = vi.fn(async () => ({
+            invite: encoded,
+            url: `https://desk.gaugewright.com/invite?d=${encoded}`,
+            expires_at: 123,
+        }));
         await expect(createHomeInvitation(route, {
-            authority: "account:invitee",
+            email: "alex@example.test",
             project: "proj-1" as never,
             endpoint: "   ",
-        })).rejects.toThrow(RELAY_ONLY_INVITATION);
-        expect(route).not.toHaveBeenCalled();
+        })).resolves.toMatchObject({ homeId: "home:owner", endpoint: "" });
+        expect(route).toHaveBeenCalledWith("POST", "/home/invitations", expect.objectContaining({
+            endpoint: "",
+        }));
+        // A Home nobody can reach says so itself, and that is what is shown.
+        const refused = vi.fn(async () => {
+            throw new Error("this computer cannot be reached from elsewhere yet");
+        });
+        await expect(createHomeInvitation(refused, {
+            email: "alex@example.test",
+            project: "proj-1" as never,
+            endpoint: "",
+        })).rejects.toThrow(/cannot be reached from elsewhere/);
+    });
+
+    it("reads a relay-only invitation's route and refuses one that carries none", () => {
+        expect(parseHomeInvitation(relayOnly())).toEqual({
+            authority: "",
+            email: "alex@example.test",
+            project: "proj-1",
+            homeId: "home:owner",
+            endpoint: "",
+        });
+        expect(() => parseHomeInvitation(relayOnly({ relay: undefined }))).toThrow(/requires endpoint/);
+        expect(() => parseHomeInvitation(relayOnly({ placement: undefined }))).toThrow(/requires endpoint/);
+        expect(() => parseHomeInvitation(relayOnly({ relay: { ...LOCATOR, home_fingerprint: "zz" } })))
+            .toThrow(/invalid relay locator/);
+    });
+
+    it("accepts through the relay once the route holds against the project key", async () => {
+        const encoded = relayOnly();
+        const close = vi.fn();
+        const asked: unknown[] = [];
+        const relayJson = vi.fn((route, bearer: () => string | null) => {
+            asked.push(route);
+            const json = vi.fn(async (method: string, path: string, body?: unknown) => {
+                expect([method, path, body, bearer()]).toEqual([
+                    "POST", "/home/invitations/accept", { invite: encoded }, "account-token",
+                ]);
+                return {
+                    home_id: "home:owner",
+                    project: "proj-1",
+                    endpoint: "",
+                    admission: "memory-only-admission",
+                    relay: { ...LOCATOR, route_epoch: 4 },
+                    placement: PLACEMENT,
+                    owner_root: "owner-root",
+                };
+            });
+            return Object.assign(json, { close });
+        });
+        const accepted = await acceptHomeInvitation(encoded, {
+            bearer: () => "account-token",
+            relayJson,
+            placementVerified,
+        });
+        expect(asked).toEqual([expect.objectContaining({
+            project: "proj-1",
+            homeId: "home:owner",
+            endpoint: "",
+            relay: expect.objectContaining({ routeEpoch: 3 }),
+        })]);
+        expect(close).toHaveBeenCalled();
+        expect(accepted).toMatchObject({
+            homeId: "home:owner",
+            endpoint: "",
+            admission: "memory-only-admission",
+            shared: {
+                project: "proj-1",
+                homeId: "home:owner",
+                projectKey: "project-key",
+                ownerRoot: "owner-root",
+                route: { relay: expect.objectContaining({ route_epoch: 4 }) },
+            },
+        });
+    });
+
+    it("dials nothing for a relay-only invitation its project key did not sign", async () => {
+        const relayJson = vi.fn();
+        await expect(acceptHomeInvitation(
+            relayOnly({ placement: { ...PLACEMENT, placement_signature: "forged" } }),
+            { relayJson, placementVerified },
+        )).rejects.toThrow(/not signed by its project's key/);
+        expect(relayJson).not.toHaveBeenCalled();
     });
 
     it("carries an email invitation's address and no account until it is accepted", async () => {

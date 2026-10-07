@@ -94,12 +94,19 @@ impl Workbench {
 
     /// Install or reconcile one product project for each active learner. An
     /// unclaimed Home creates none. Reconcile is idempotent on every wake.
+    ///
+    /// On a desktop, a `member` or `viewer` of its directory is someone
+    /// invited to one of its projects, who reaches it over the relay and
+    /// works elsewhere. The computer keeps no Tutorials of theirs, so their
+    /// grant stays the one project they were invited to (DR-0328 §6).
     pub fn ensure_shipped_tutorials(&mut self) -> Result<ShippedTutorials, String> {
         let org = Org::rebuild(self.store_ref()).map_err(|e| format!("{e:?}"))?;
+        let desktop = self.desktop_account_mode();
         let mut learners = org
             .members
             .values()
             .filter(|member| member.status == MembershipStatus::Active)
+            .filter(|member| !desktop || matches!(member.role.as_str(), "owner" | "admin"))
             .map(|member| member.authority.clone())
             .collect::<Vec<_>>();
         if let Some(owner) = self.home_owner_account() {

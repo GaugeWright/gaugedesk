@@ -51,6 +51,9 @@ pub async fn open_serve(addr: &str, root: &std::path::Path) -> std::io::Result<(
 pub fn open_prepare(root: &std::path::Path) -> std::io::Result<crate::SharedWorkbench> {
     let wb = open_workbench(root)?;
     federation::respawn_restored_receivers(&wb);
+    // Say at startup what this computer will present for each retained
+    // sign-in, so a window that opens signed out is explained by the log.
+    crate::account_signin::log_retained_signins(&wb);
     Ok(wb)
 }
 
@@ -749,7 +752,8 @@ mod reachability_tests {
         (status, text)
     }
 
-    /// The Hub, as the relay router asks it: two bearers it recognises.
+    /// The Hub, as the relay router asks it: the bearers it recognises, and
+    /// the one address the invitee's account holds verified.
     struct FakeHub;
 
     impl crate::relay_route_stack::BearerAccounts for FakeHub {
@@ -757,8 +761,27 @@ mod reachability_tests {
             Ok(match bearer {
                 "owner-bearer" => Some("account-root".to_owned()),
                 "someone-elses-bearer" => Some("someone-else".to_owned()),
+                "invitee-bearer" => Some("invitee-account".to_owned()),
                 _ => None,
             })
+        }
+
+        fn email_standing(
+            &self,
+            bearer: &str,
+            email: &str,
+        ) -> Result<crate::account_identity::EmailStanding, String> {
+            use crate::account_identity::EmailStanding;
+            let Some(account) = self.account_for(bearer)? else {
+                return Ok(EmailStanding::Unrecognised);
+            };
+            Ok(
+                if account == "invitee-account" && email == "invitee@example.test" {
+                    EmailStanding::Holds { account }
+                } else {
+                    EmailStanding::DoesNotHold { account }
+                },
+            )
         }
     }
 
@@ -767,6 +790,18 @@ mod reachability_tests {
     async fn reachable_home() -> (
         TestRelay,
         tempfile::TempDir,
+        std::net::SocketAddr,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let (relay, root, _wb, client, tasks) = reachable_home_and_workbench().await;
+        (relay, root, client, tasks)
+    }
+
+    /// [`reachable_home`], with the Home's workbench.
+    async fn reachable_home_and_workbench() -> (
+        TestRelay,
+        tempfile::TempDir,
+        crate::SharedWorkbench,
         std::net::SocketAddr,
         Vec<tokio::task::JoinHandle<()>>,
     ) {
@@ -796,7 +831,7 @@ mod reachability_tests {
             gaugedesk_relay_transport::bind_client_loopback(published_route(&wb))
                 .await
                 .expect("client loopback");
-        (relay, root, client, vec![supervisor, carrier])
+        (relay, root, wb, client, vec![supervisor, carrier])
     }
 
     /// DR-0206, end to end: a stranger who reads the published record, dials
@@ -951,6 +986,321 @@ mod reachability_tests {
         .await;
         assert_eq!(status, 403, "{body}");
         assert!(body.contains("not signed in on this computer"), "{body}");
+        tasks.iter().for_each(|task| task.abort());
+    }
+
+    /// One JSON request carried over the relay. Each carries its own
+    /// idempotency key, so two alike are two commands.
+    async fn carried_json(
+        address: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        static SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sent = SENT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = body.map(|body| body.to_string()).unwrap_or_default();
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("loopback");
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: home\r\nidempotency-key: carried-{sent}\r\n\
+             content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+            body.len(),
+        );
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(&body);
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("the crossing answered in time")
+        .expect("read");
+        let text = String::from_utf8_lossy(&response).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {text:?}"));
+        let json = text
+            .split_once("\r\n\r\n")
+            .map(|(head, body)| {
+                if head
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked")
+                {
+                    dechunked(body)
+                } else {
+                    body.to_owned()
+                }
+            })
+            .and_then(|body| serde_json::from_str(&body).ok())
+            .unwrap_or_else(|| serde_json::json!({ "raw": text }));
+        (status, json)
+    }
+
+    /// A chunked HTTP/1.1 body, joined.
+    fn dechunked(mut body: &str) -> String {
+        let mut joined = String::new();
+        while let Some((size, rest)) = body.split_once("\r\n") {
+            let Ok(size) = usize::from_str_radix(size.trim(), 16) else {
+                break;
+            };
+            if size == 0 || rest.len() < size {
+                break;
+            }
+            joined.push_str(&rest[..size]);
+            body = rest[size..].trim_start_matches("\r\n");
+        }
+        joined
+    }
+
+    /// Wait until this Home authors a relay route for `project`.
+    async fn routed(wb: &crate::SharedWorkbench, project: &str) -> bool {
+        for _ in 0..200 {
+            let relayed = Account::rebuild(wb.lock_unpoisoned().store_ref())
+                .ok()
+                .and_then(|account| account.home_routes.get(project).cloned())
+                .is_some_and(|route| route.op == RecordOp::Upsert && route.relay.is_some());
+            if relayed {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// WS-861, two accounts end to end. The owner's desktop is reachable only
+    /// through its relay and invites someone by email to one project. That
+    /// person's account has never signed in on the computer. It accepts over
+    /// the relay, then reaches the shared project and the Panel agent placed
+    /// in it, starts a chat there — and reaches nothing else on the computer,
+    /// until the owner takes the grant away.
+    #[tokio::test]
+    async fn an_invited_account_reaches_only_the_shared_project_over_the_relay() {
+        let (_relay, _root, wb, client, tasks) = reachable_home_and_workbench().await;
+        let owner = "account-root";
+        {
+            let mut guard = wb.lock_unpoisoned();
+            for (id, name) in [("proj-shared", "Shared"), ("proj-private", "Private")] {
+                let mut extra = std::collections::BTreeMap::new();
+                crate::project_owner::record_owner(&mut extra, owner);
+                crate::library_routes::create_named_project_with_extra(&mut guard, id, name, extra)
+                    .expect("project");
+            }
+            // The owner's Panel agent, placed in the shared project.
+            guard
+                .seed_panel_placement(
+                    "panel-shared",
+                    crate::library::PanelPublicProfile::default(),
+                )
+                .expect("Panel agent");
+            let mut placement = guard.library.instances["panel-shared"].clone();
+            placement.project_id = Some("proj-shared".to_owned());
+            guard.write_instance_record(placement);
+        }
+        assert!(
+            routed(&wb, "proj-shared").await,
+            "the shared project has a relay route"
+        );
+
+        // The owner invites by email from the computer, as Project Settings does.
+        let owner_session = {
+            let wb = wb.clone();
+            tokio::task::spawn_blocking(move || crate::desktop_session::home_session(&wb))
+                .await
+                .unwrap()
+                .expect("the owner's window session")
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {owner_session}").parse().unwrap(),
+        );
+        let created = crate::home_invitation::post_invitation(
+            axum::extract::State(wb.clone()),
+            headers,
+            axum::Json(
+                serde_json::from_value(serde_json::json!({
+                    "email": "invitee@example.test",
+                    "project": "proj-shared",
+                    "role": "member",
+                    "endpoint": "",
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(created.status(), axum::http::StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let invite = created["invite"].as_str().expect("an invite").to_owned();
+        assert_eq!(
+            created["endpoint"], "",
+            "a relay-only Home names no endpoint"
+        );
+        let invitee = [("authorization", "Bearer invitee-bearer")];
+
+        // Before accepting, the invitee holds nothing here.
+        let (status, body) = carried_json(client, "POST", "/home/admissions", &invitee, None).await;
+        assert_eq!(status, 403, "{body}");
+
+        // Only the account holding the invited address may take it.
+        let accept = serde_json::json!({ "invite": invite });
+        let (status, body) = carried_json(
+            client,
+            "POST",
+            "/home/invitations/accept",
+            &[("authorization", "Bearer someone-elses-bearer")],
+            Some(accept.clone()),
+        )
+        .await;
+        assert_eq!(status, 403, "another account took the invitation: {body}");
+
+        let (status, accepted) = carried_json(
+            client,
+            "POST",
+            "/home/invitations/accept",
+            &invitee,
+            Some(accept),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "the invitee accepts over the relay: {accepted}"
+        );
+        assert_eq!(accepted["project"], "proj-shared");
+        assert!(
+            accepted["relay"]["handle"].is_string()
+                && accepted["placement"]["project_key"].is_string(),
+            "acceptance names the route the invitee keeps reaching this Home by: {accepted}"
+        );
+        {
+            let guard = wb.lock_unpoisoned();
+            let org = crate::org::Org::rebuild(guard.store_ref()).unwrap();
+            assert_eq!(
+                org.granted_project_ids("invitee-account"),
+                ["proj-shared".to_owned()].into(),
+                "the grant is to the one project"
+            );
+        }
+
+        let (status, admitted) =
+            carried_json(client, "POST", "/home/admissions", &invitee, None).await;
+        assert_eq!(status, 201, "the member is admitted: {admitted}");
+        let admission = admitted["admission"].as_str().unwrap().to_owned();
+        let member = [
+            ("authorization", "Bearer invitee-bearer"),
+            ("x-gaugewright-home-admission", admission.as_str()),
+        ];
+
+        let (status, workspace) = carried_json(client, "GET", "/workspace", &member, None).await;
+        assert_eq!(status, 200, "{workspace}");
+        let projects: Vec<&str> = workspace["projects"]
+            .as_array()
+            .expect("projects")
+            .iter()
+            .filter_map(|project| project["id"].as_str())
+            .collect();
+        assert_eq!(projects, ["proj-shared"], "the member sees its one project");
+
+        let (status, body) =
+            carried_json(client, "GET", "/placements/panel-shared", &member, None).await;
+        assert_eq!(
+            status, 200,
+            "the member opens the Panel agent's placement: {body}"
+        );
+        let (status, body) = carried_json(
+            client,
+            "POST",
+            "/placements/panel-shared/settings/sessions",
+            &member,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "the member opens the Panel agent's settings: {body}"
+        );
+
+        // A Panel placement hosts no work chat; the project's own does.
+        let general = crate::library_routes::general_placement_id("proj-shared");
+        let (status, chat) = carried_json(
+            client,
+            "POST",
+            &format!("/projects/proj-shared/placements/{general}/chats"),
+            &member,
+            Some(serde_json::json!({ "title": "From the customer" })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "the member starts a chat in the shared project: {chat}"
+        );
+        let chat = chat["id"].as_str().expect("a chat").to_owned();
+        let (status, body) = carried_json(
+            client,
+            "GET",
+            &format!("/chats/{chat}/transcript"),
+            &member,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "the member reads its chat: {body}");
+
+        // Nothing beyond the shared project.
+        for (method, path, body) in [
+            ("GET", "/projects/proj-private/home", None),
+            ("GET", "/account/credentials", None),
+            ("GET", "/account/hub-sessions", None),
+            (
+                "POST",
+                "/projects",
+                Some(serde_json::json!({ "name": "mine" })),
+            ),
+            ("POST", "/chats", Some(serde_json::json!({}))),
+            ("DELETE", "/projects/proj-shared", None),
+            ("POST", "/home/invitations", Some(serde_json::json!({}))),
+        ] {
+            let (status, answer) = carried_json(client, method, path, &member, body).await;
+            assert_eq!(status, 403, "{method} {path} reached the member: {answer}");
+        }
+
+        // Taking the grant away ends the member's reach at once.
+        {
+            let mut guard = wb.lock_unpoisoned();
+            let revoked = crate::org::MemberGrantRecord {
+                id: crate::org::MemberGrantRecord::make_id("invitee-account", "proj-shared"),
+                op: crate::org::RecordOp::Tombstone,
+                authority: "invitee-account".to_owned(),
+                project_id: "proj-shared".to_owned(),
+            };
+            guard
+                .store_mut()
+                .append_record(
+                    crate::org::ORG_SCOPE,
+                    "member_grant",
+                    &serde_json::to_string(&revoked).unwrap(),
+                )
+                .unwrap();
+        }
+        let (status, body) = carried_json(client, "GET", "/workspace", &member, None).await;
+        assert_eq!(
+            status, 403,
+            "a revoked member reached the workspace: {body}"
+        );
         tasks.iter().for_each(|task| task.abort());
     }
 }

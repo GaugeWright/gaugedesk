@@ -42,8 +42,8 @@ use gaugedesk_core::ids::AuthorityId;
 
 use crate::identity::IdentityProvider;
 use crate::identity_oidc::{
-    authorize_url, discover_endpoints, discover_jwks, exchange_code, refresh_id_token,
-    ClaimMapping, HttpForm, HttpGet, OidcIdentityProvider, Pkce,
+    authorize_url, discover_endpoints, exchange_code, refresh_id_token, ClaimMapping, HttpForm,
+    HttpGet, OidcIdentityProvider, Pkce,
 };
 use crate::net_http::HttpClient;
 use crate::org::{Org, RecordOp, SsoConnectionRecord, SsoProtocol, ORG_SCOPE};
@@ -1277,10 +1277,14 @@ pub fn claim_mapping_for(sso: &SsoConnectionRecord) -> ClaimMapping {
     }
 }
 
-/// JWKS refresh cooldown: at most one discovery fetch per window — so a flood of
+/// JWKS refresh cooldown: at most one key-set refresh per window — so a flood of
 /// unknown-`kid` tokens can't stampede the OP, and a persistent outage is retried
 /// (not hammered). Also the worst-case heal latency after the IdP recovers.
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// How long [`IdentityProvider::prepare`] waits for a key refresh another caller
+/// started: the verifier's two GETs at their 5 s timeout ([`build_oidc_idp`]).
+const PREPARE_WAIT: Duration = Duration::from_secs(10);
 
 /// The mutable half of a [`RefreshingOidcProvider`]: the loaded verifier plus what we
 /// need to decide whether a verification miss warrants a JWKS refresh.
@@ -1291,28 +1295,46 @@ struct RefreshState {
     known_kids: BTreeSet<String>,
     /// Whether any signing key is loaded (the IdP has been reached at least once).
     has_keys: bool,
-    /// When we last *attempted* a refresh (success or failure) — the cooldown anchor.
+    /// When we last *started* an on-request refresh (success or failure) — the
+    /// cooldown anchor.
     last_refresh: Option<Instant>,
+    /// When the loaded key set stops being fresh, per its `Cache-Control`. A
+    /// verification after this starts a background refresh and still answers
+    /// from the loaded keys.
+    keys_fresh_until: Option<Instant>,
 }
 
 /// An [`IdentityProvider`] that verifies OIDC id-tokens and **self-refreshes** its
 /// signing keys from the issuer's JWKS (`ID-3`). Wraps the pure [`OidcIdentityProvider`]
 /// (which deliberately speaks no HTTP) with the discovery seam, so:
 ///
-/// - a verifier that started **cold** (the IdP was unreachable at startup) heals on
-///   the first login once the IdP is back — no restart, no brick; and
+/// - a verifier that started **cold** (the IdP was unreachable at startup) heals
+///   once the IdP is back — no restart, no brick; and
 /// - **key rotation** is handled: a token signed by a newly-published key (an unknown
-///   `kid`) triggers a refresh and then verifies.
+///   `kid`) triggers a refresh, after which it verifies; and the key set is
+///   re-read when its `Cache-Control` lifetime runs out, so a key the issuer
+///   publishes ahead of using it is usually held before any token needs it.
 ///
 /// Refreshes are bounded by [`JWKS_REFRESH_COOLDOWN`] and fire only on a genuine
-/// cache-miss (an unknown `kid`, or no keys at all) — never for a token whose `kid` we
-/// already hold (a bad signature is just rejected), so invalid tokens cannot stampede
-/// the OP. Fail-closed throughout (`INV-20`): until keys load, nothing authenticates.
+/// cache-miss (an unknown `kid`, or no keys at all, on a token this issuer could
+/// have signed) or an expired key set — never for a token whose `kid` we already
+/// hold (a bad signature is just rejected), so invalid tokens cannot stampede the
+/// OP. Fail-closed throughout (`INV-20`): until keys load, nothing authenticates.
 ///
-/// The refresh runs synchronously on the verifying call (which holds the workbench
-/// lock); it is rare (cache-miss only) and uses a short HTTP timeout, so the stall is
-/// bounded. A fully off-lock async refresh is a later refinement.
+/// [`authenticate`](IdentityProvider::authenticate) never touches the network
+/// (WS-855). It runs under the workbench lock, and until 2026-10-07 a key-gap
+/// refresh ran right there: two HTTPS round trips to the OP, with a 5 s timeout
+/// each, during which every other Hub request waited for the lock — and the
+/// Hub's verifier is Google's, so a Microsoft id-token was a key gap every
+/// cooldown window. A miss now starts the refresh on a thread of its own and
+/// refuses this one call; the refresh leg, which obtains the tokens the client
+/// will present, calls [`prepare`](IdentityProvider::prepare) off the lock first,
+/// so a token the Hub minted is verifiable before anyone presents it.
 pub struct RefreshingOidcProvider<H: HttpGet> {
+    inner: Arc<RefreshingInner<H>>,
+}
+
+struct RefreshingInner<H> {
     issuer: String,
     audiences: Vec<String>,
     mapping: ClaimMapping,
@@ -1320,13 +1342,19 @@ pub struct RefreshingOidcProvider<H: HttpGet> {
     /// Minimum spacing between on-request JWKS refreshes ([`JWKS_REFRESH_COOLDOWN`] in
     /// production; tunable so tests can drive the heal path without real time).
     cooldown: Duration,
+    /// Where the discovery document and key set are read through, so neither is
+    /// fetched more often than its publisher allows.
+    metadata: Arc<crate::oidc_metadata::OidcMetadataCache>,
     state: Mutex<RefreshState>,
+    /// Set while a refresh is running, so concurrent misses start one, not many.
+    refreshing: std::sync::atomic::AtomicBool,
 }
 
 impl<H: HttpGet> RefreshingOidcProvider<H> {
     /// Build a verifier for `issuer`, doing a **best-effort** initial JWKS load. If the
     /// IdP is unreachable the verifier is cold (authenticates nothing) but heals on
     /// first use once the IdP is back. `cooldown` bounds on-request refreshes.
+    /// Blocks on that load, so construct it off the async runtime.
     pub fn new(
         issuer: impl Into<String>,
         audiences: Vec<String>,
@@ -1334,98 +1362,233 @@ impl<H: HttpGet> RefreshingOidcProvider<H> {
         http: H,
         cooldown: Duration,
     ) -> Self {
-        let issuer = issuer.into();
-        let me = Self {
-            issuer: issuer.clone(),
-            audiences: audiences.clone(),
-            mapping: mapping.clone(),
+        Self::with_metadata_cache(
+            issuer,
+            audiences,
+            mapping,
             http,
             cooldown,
-            state: Mutex::new(RefreshState {
-                provider: OidcIdentityProvider::new(issuer, audiences).with_mapping(mapping),
-                known_kids: BTreeSet::new(),
-                has_keys: false,
-                last_refresh: None,
+            crate::oidc_metadata::OidcMetadataCache::shared(),
+        )
+    }
+
+    /// [`new`](Self::new), reading provider metadata through `metadata` rather
+    /// than the process-wide cache.
+    pub fn with_metadata_cache(
+        issuer: impl Into<String>,
+        audiences: Vec<String>,
+        mapping: ClaimMapping,
+        http: H,
+        cooldown: Duration,
+        metadata: Arc<crate::oidc_metadata::OidcMetadataCache>,
+    ) -> Self {
+        let issuer = issuer.into();
+        let me = Self {
+            inner: Arc::new(RefreshingInner {
+                issuer: issuer.clone(),
+                audiences: audiences.clone(),
+                mapping: mapping.clone(),
+                http,
+                cooldown,
+                metadata,
+                state: Mutex::new(RefreshState {
+                    provider: OidcIdentityProvider::new(issuer, audiences).with_mapping(mapping),
+                    known_kids: BTreeSet::new(),
+                    has_keys: false,
+                    last_refresh: None,
+                    keys_fresh_until: None,
+                }),
+                refreshing: std::sync::atomic::AtomicBool::new(false),
             }),
         };
-        let _ = me.refresh(); // warm up; cold is fine (heals on first use)
+        let _ = me.inner.refresh(false); // warm up; cold is fine (heals on first use)
         me
     }
 
     /// Whether at least one signing key is loaded (the IdP was reachable). Used by the
     /// activation path to report whether a connection went live or is "saved, pending".
     pub fn is_warm(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .has_keys
+        self.inner.state().has_keys
     }
 
-    /// Re-fetch the issuer's JWKS and rebuild the inner verifier. A failed fetch leaves
-    /// the existing keys intact (a transient outage never *drops* working keys). Does
-    /// not touch the cooldown anchor — the warm-up call must not spend the budget, so
-    /// the first login after the IdP recovers heals immediately; the cooldown is
-    /// anchored by the on-request path in [`authenticate`](Self#impl-IdentityProvider).
-    fn refresh(&self) -> Result<(), String> {
-        let jwks = discover_jwks(&self.issuer, &self.http)?;
+    /// Whether a refresh is running now. For tests that wait on one.
+    #[cfg(test)]
+    fn refreshing(&self) -> bool {
+        self.inner.is_refreshing()
+    }
+}
+
+impl<H: HttpGet> RefreshingInner<H> {
+    fn state(&self) -> MutexGuard<'_, RefreshState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether a verification miss for `credential` means our key set is behind,
+    /// rather than that the token is bad: it names a `kid` we do not hold (or we
+    /// hold no keys at all), and it claims to come from this issuer. A token from
+    /// another issuer could never verify here whatever keys we loaded, so it is
+    /// not a reason to ask our OP for any.
+    fn key_gap(&self, state: &RefreshState, credential: &str) -> bool {
+        if let Some(claimed) = crate::identity_oidc::unverified_issuer(credential) {
+            if !crate::identity_oidc::issuer_matches_tenant_template(&self.issuer, &claimed) {
+                return false;
+            }
+        }
+        match decode_header(credential).ok().and_then(|h| h.kid) {
+            Some(kid) => !state.known_kids.contains(&kid),
+            None => !state.has_keys,
+        }
+    }
+
+    /// Whether an on-request refresh may start now, anchoring the cooldown if
+    /// so. Called with the state lock held, so two callers cannot both pass.
+    fn claim_cooldown(&self, state: &mut RefreshState, now: Instant) -> bool {
+        let cooled = state
+            .last_refresh
+            .is_none_or(|t| now.saturating_duration_since(t) >= self.cooldown);
+        if cooled {
+            state.last_refresh = Some(now);
+        }
+        cooled
+    }
+
+    /// Take the single-flight slot. `false` means a refresh is already running.
+    fn begin_refresh(&self) -> bool {
+        self.refreshing
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn end_refresh(&self) {
+        self.refreshing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_refreshing(&self) -> bool {
+        self.refreshing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Re-read the issuer's JWKS and rebuild the inner verifier. `force` re-reads
+    /// the key set even while the cached copy is fresh — the caller has seen a
+    /// key it lacks. A failed fetch leaves the existing keys intact (a transient
+    /// outage never *drops* working keys). Blocks on the network; never call it
+    /// with the workbench lock held or on the async runtime. Does not touch the
+    /// cooldown anchor — the warm-up call must not spend the budget, so the first
+    /// login after the IdP recovers heals immediately.
+    fn refresh(&self, force: bool) -> Result<(), String> {
+        let discovery = crate::identity_oidc::discovery_url(&self.issuer);
+        let jwks_uri = crate::identity_oidc::jwks_uri_from_discovery(
+            &self.metadata.get(&discovery, &self.http)?,
+        )?;
+        let fetched = if force {
+            self.metadata.refetch(&jwks_uri, &self.http)
+        } else {
+            self.metadata.get(&jwks_uri, &self.http)
+        };
+        let jwks = match fetched {
+            Ok(jwks) => jwks,
+            Err(error) => {
+                // Perhaps the key set moved: re-discover on the next attempt.
+                self.metadata.forget(&discovery);
+                return Err(error);
+            }
+        };
         let provider = OidcIdentityProvider::new(self.issuer.clone(), self.audiences.clone())
             .with_mapping(self.mapping.clone())
             .with_jwks(&jwks)?; // errors unless ≥1 usable signing key
         let kids = jwks_kids(&jwks);
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let keys_fresh_until = self.metadata.fresh_until(&jwks_uri);
+        let mut st = self.state();
         st.provider = provider;
         st.known_kids = kids;
         st.has_keys = true;
+        st.keys_fresh_until = keys_fresh_until;
         Ok(())
     }
 }
 
-impl<H: HttpGet + Send + Sync> IdentityProvider for RefreshingOidcProvider<H> {
+impl<H: HttpGet + Send + Sync + 'static> RefreshingInner<H> {
+    /// Start a refresh on a thread of its own and return at once, so the
+    /// caller — which may hold the workbench lock — never waits on the OP. At
+    /// most one runs at a time; the caller has already passed the cooldown.
+    fn refresh_in_background(self: &Arc<Self>, force: bool) {
+        if !self.begin_refresh() {
+            return;
+        }
+        let inner = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("oidc-key-refresh".into())
+            .spawn(move || {
+                let _ = inner.refresh(force);
+                inner.end_refresh();
+            });
+        if spawned.is_err() {
+            self.end_refresh();
+        }
+    }
+}
+
+impl<H: HttpGet + Send + Sync + 'static> IdentityProvider for RefreshingOidcProvider<H> {
     fn authenticate(&self, credential: &str) -> Option<AuthorityId> {
-        // Fast path: the cached keys verify it (the common case, no network).
-        if let Some(authority) = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .provider
-            .authenticate(credential)
-        {
-            return Some(authority);
-        }
-        // Miss. Refresh only on a genuine key gap (unknown `kid` / no keys), bounded by
-        // the cooldown — a token whose `kid` we already hold is simply invalid.
-        let header_kid = decode_header(credential).ok().and_then(|h| h.kid);
-        {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let key_gap = match header_kid.as_deref() {
-                Some(kid) => !st.known_kids.contains(kid),
-                None => !st.has_keys,
-            };
-            let cooled = st.last_refresh.is_none_or(|t| t.elapsed() >= self.cooldown);
-            if !(key_gap && cooled) {
-                return None;
+        let now = Instant::now();
+        let refresh = {
+            let mut st = self.inner.state();
+            // Fast path: the cached keys verify it (the common case, no network).
+            let verified = st.provider.authenticate(credential);
+            if let Some(authority) = verified {
+                let expired = st.keys_fresh_until.is_some_and(|t| now >= t);
+                if expired && self.inner.claim_cooldown(&mut st, now) {
+                    drop(st);
+                    self.inner.refresh_in_background(false);
+                }
+                return Some(authority);
             }
-            // Anchor the cooldown here (not in the warm-up): so the budget is spent by
-            // on-request refreshes, and a persistent outage can't stampede the OP.
-            st.last_refresh = Some(Instant::now());
-        } // release the lock before the network fetch
-        if self.refresh().is_err() {
-            return None;
+            // Miss. Refresh only on a genuine key gap, bounded by the cooldown — a
+            // token whose `kid` we already hold is simply invalid.
+            self.inner.key_gap(&st, credential) && self.inner.claim_cooldown(&mut st, now)
+        };
+        if refresh {
+            self.inner.refresh_in_background(true);
         }
-        // Retry once against the refreshed keys.
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .provider
-            .authenticate(credential)
+        None
+    }
+
+    fn prepare(&self, credential: &str) {
+        let start = {
+            let mut st = self.inner.state();
+            if !self.inner.key_gap(&st, credential) {
+                return;
+            }
+            // A refresh already running loads the same keys: wait for it below
+            // rather than spend the cooldown on a second.
+            if self.inner.is_refreshing() {
+                false
+            } else if self.inner.claim_cooldown(&mut st, Instant::now()) {
+                true
+            } else {
+                return;
+            }
+        };
+        if start && self.inner.begin_refresh() {
+            let _ = self.inner.refresh(true);
+            self.inner.end_refresh();
+            return;
+        }
+        // Off the lock, so waiting costs only this caller — and the token it is
+        // about to hand out then verifies the first time it is presented.
+        let deadline = Instant::now() + PREPARE_WAIT;
+        while self.inner.is_refreshing() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn claims(&self, authority: &AuthorityId) -> AuthorityAttributes {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .provider
-            .claims(authority)
+        self.inner.state().provider.claims(authority)
     }
 }
 
@@ -2601,7 +2764,9 @@ async fn prepare_oidc_browser_login(
     // Discovery touches the network — run it off the async runtime (ureq is blocking).
     let started = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
-        start_login_with(&sso, &redirect_uri, &scope, mapping, offline, &http)
+        let metadata = crate::oidc_metadata::OidcMetadataCache::shared();
+        let discovery = crate::oidc_metadata::Cached::new(&metadata, &http);
+        start_login_with(&sso, &redirect_uri, &scope, mapping, offline, &discovery)
     })
     .await;
     let (url, state, mut pending) = match started {
@@ -4452,7 +4617,7 @@ pub async fn get_refresh(
     }
     let bearer = crate::net_http::bearer(&headers).map(str::to_string);
     let now_ms = crate::account::session_now_ms();
-    let (person, session_id, refresh_token, session_method) = {
+    let (person, session_id, refresh_token, session_method, verifier) = {
         let g = wb.lock_unpoisoned();
         let person = g.actor(bearer.as_deref());
         if person == "anonymous" {
@@ -4482,7 +4647,7 @@ pub async fn get_refresh(
         // provider's token endpoint (DR-0189).
         let method = g.resolve_account_session(token).map(|(_, method)| method);
         match g.unseal_account_secret(&grant.sealed) {
-            Some(rt) => (person, session_id, rt, method),
+            Some(rt) => (person, session_id, rt, method, g.identity_provider()),
             None => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -4502,18 +4667,31 @@ pub async fn get_refresh(
     let client_id = sso.audiences.first().cloned().unwrap_or_default();
     let client_secret = provider.client_secret().map(|s| s.expose().to_string());
     let issuer = sso.issuer.clone();
-    // Discovery + the refresh grant touch the network — off the async runtime.
+    // Discovery + the refresh grant touch the network — off the async runtime and
+    // off the workbench lock. Discovery is answered from the shared metadata
+    // cache while the provider's own Cache-Control allows (WS-855).
     let refreshed = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
-        let endpoints =
-            discover_endpoints(&issuer, &http).map_err(|e| format!("discovery: {e}"))?;
-        refresh_id_token(
+        let metadata = crate::oidc_metadata::OidcMetadataCache::shared();
+        let endpoints = discover_endpoints(
+            &issuer,
+            &crate::oidc_metadata::Cached::new(&metadata, &http),
+        )
+        .map_err(|e| format!("discovery: {e}"))?;
+        let id_token = refresh_id_token(
             &endpoints.token_endpoint,
             &client_id,
             client_secret.as_deref(),
             &refresh_token,
             &http,
-        )
+        )?;
+        // The browser presents this id-token to the Hub as its bearer next. Have
+        // the verifier hold its signing key now, here, so that request does not
+        // find a key gap it may not fetch for under the workbench lock.
+        if let Some(verifier) = verifier {
+            verifier.prepare(&id_token);
+        }
+        Ok::<_, String>(id_token)
     })
     .await;
     let new_id = match refreshed {
@@ -4601,8 +4779,12 @@ pub async fn post_native_refresh(
     let issuer = sso.issuer.clone();
     let refreshed = tokio::task::spawn_blocking(move || {
         let http = HttpClient::new();
-        let endpoints =
-            discover_endpoints(&issuer, &http).map_err(|error| format!("discovery: {error}"))?;
+        let metadata = crate::oidc_metadata::OidcMetadataCache::shared();
+        let endpoints = discover_endpoints(
+            &issuer,
+            &crate::oidc_metadata::Cached::new(&metadata, &http),
+        )
+        .map_err(|error| format!("discovery: {error}"))?;
         refresh_id_token(
             &endpoints.token_endpoint,
             &client_id,
@@ -6558,6 +6740,22 @@ iqlTEKVISscuchxZtKQJ4k8=
         }
     }
 
+    /// A fresh metadata cache, so one test's provider documents are never
+    /// another's (the process-wide one is keyed by URL, and every test here
+    /// names the same issuer).
+    fn own_cache() -> Arc<crate::oidc_metadata::OidcMetadataCache> {
+        Arc::new(crate::oidc_metadata::OidcMetadataCache::new())
+    }
+
+    /// Wait for a background key refresh to finish.
+    fn settle<H: HttpGet>(idp: &RefreshingOidcProvider<H>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while idp.refreshing() {
+            assert!(Instant::now() < deadline, "the key refresh never finished");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     #[test]
     fn refreshing_provider_heals_after_a_cold_start_when_the_idp_recovers() {
         let online = Arc::new(AtomicBool::new(false));
@@ -6566,12 +6764,13 @@ iqlTEKVISscuchxZtKQJ4k8=
             get_calls: Arc::new(AtomicUsize::new(0)),
         };
         // Cold start (IdP unreachable): fail-closed — nothing authenticates.
-        let idp = RefreshingOidcProvider::new(
+        let idp = RefreshingOidcProvider::with_metadata_cache(
             ISSUER,
             vec![CLIENT_ID.to_string()],
             ClaimMapping::default(),
             op,
             Duration::ZERO, // no cooldown wait in the test
+            own_cache(),
         );
         assert!(!idp.is_warm(), "cold start has no keys");
         assert_eq!(
@@ -6579,16 +6778,21 @@ iqlTEKVISscuchxZtKQJ4k8=
             None,
             "cold ⇒ fail-closed"
         );
+        settle(&idp);
+        assert!(!idp.is_warm(), "the OP is still down");
 
-        // The IdP comes back. The next login triggers a JWKS refresh and verifies — no
-        // restart, no brick.
+        // The IdP comes back. The next login starts a JWKS refresh — off the
+        // caller's thread, so that one call is refused — and the login after it
+        // verifies: no restart, no brick.
         online.store(true, Ordering::SeqCst);
+        assert_eq!(idp.authenticate(&mint_id_token()), None);
+        settle(&idp);
+        assert!(idp.is_warm());
         assert_eq!(
             idp.authenticate(&mint_id_token()),
             Some(AuthorityId::new("alice@example.test")),
-            "self-heals on first use once the IdP is reachable"
+            "self-heals once the IdP is reachable"
         );
-        assert!(idp.is_warm());
     }
 
     #[test]
@@ -6600,12 +6804,13 @@ iqlTEKVISscuchxZtKQJ4k8=
             get_calls: calls.clone(),
         };
         // Warm start loads the keys (discovery + JWKS = 2 GETs).
-        let idp = RefreshingOidcProvider::new(
+        let idp = RefreshingOidcProvider::with_metadata_cache(
             ISSUER,
             vec![CLIENT_ID.to_string()],
             ClaimMapping::default(),
             op,
             Duration::from_secs(3600), // long cooldown
+            own_cache(),
         );
         assert!(idp.is_warm());
         let after_warmup = calls.load(Ordering::SeqCst);
@@ -6630,6 +6835,281 @@ iqlTEKVISscuchxZtKQJ4k8=
             after_warmup,
             "bad signature for a known kid ⇒ no refetch (no stampede)"
         );
+    }
+
+    /// The OP after a key rotation: the same RSA key published under a new
+    /// `kid`, beside the old one. Counts discovery and key-set reads separately,
+    /// and can hold every GET until released — to show who waits for the OP.
+    struct RotatingOp {
+        rotated: AtomicBool,
+        discovery_gets: AtomicUsize,
+        jwks_gets: AtomicUsize,
+        jwks_cache_control: Option<&'static str>,
+        held: Mutex<bool>,
+        release: std::sync::Condvar,
+    }
+
+    const ROTATED_KID: &str = "shell-test-rsa-rotated";
+
+    impl RotatingOp {
+        fn new(jwks_cache_control: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                rotated: AtomicBool::new(false),
+                discovery_gets: AtomicUsize::new(0),
+                jwks_gets: AtomicUsize::new(0),
+                jwks_cache_control,
+                held: Mutex::new(false),
+                release: std::sync::Condvar::new(),
+            })
+        }
+        fn hold(&self) {
+            *self.held.lock().unwrap() = true;
+        }
+        fn let_go(&self) {
+            *self.held.lock().unwrap() = false;
+            self.release.notify_all();
+        }
+        fn jwks_gets(&self) -> usize {
+            self.jwks_gets.load(Ordering::SeqCst)
+        }
+        fn discovery_gets(&self) -> usize {
+            self.discovery_gets.load(Ordering::SeqCst)
+        }
+    }
+
+    impl HttpGet for Arc<RotatingOp> {
+        fn get(&self, url: &str) -> Result<String, String> {
+            self.get_cacheable(url).map(|(body, _)| body)
+        }
+        fn get_cacheable(&self, url: &str) -> Result<(String, Option<String>), String> {
+            let mut held = self.held.lock().unwrap();
+            while *held {
+                held = self.release.wait(held).unwrap();
+            }
+            drop(held);
+            if url.ends_with("/.well-known/openid-configuration") {
+                self.discovery_gets.fetch_add(1, Ordering::SeqCst);
+                return Ok((discovery(), Some("public, max-age=3600".into())));
+            }
+            if url == JWKS_URI {
+                self.jwks_gets.fetch_add(1, Ordering::SeqCst);
+                let n = JWK_N.trim();
+                let mut keys = vec![format!(
+                    r#"{{"kty":"RSA","use":"sig","kid":"{KID}","n":"{n}","e":"AQAB"}}"#
+                )];
+                if self.rotated.load(Ordering::SeqCst) {
+                    keys.push(format!(
+                        r#"{{"kty":"RSA","use":"sig","kid":"{ROTATED_KID}","n":"{n}","e":"AQAB"}}"#
+                    ));
+                }
+                return Ok((
+                    format!(r#"{{"keys":[{}]}}"#, keys.join(",")),
+                    self.jwks_cache_control.map(str::to_owned),
+                ));
+            }
+            Err(format!("404 {url}"))
+        }
+    }
+
+    fn mint_token(kid: &str, issuer: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        let claims = json!({
+            "iss": issuer,
+            "aud": CLIENT_ID,
+            "sub": "alice@example.test",
+            "exp": now() + 3600,
+            "iat": now(),
+        });
+        let key = EncodingKey::from_rsa_pem(RSA_PRIVATE_PEM).expect("test signing key");
+        encode(&header, &claims, &key).expect("encode id-token")
+    }
+
+    fn rotating_provider(
+        op: &Arc<RotatingOp>,
+        cooldown: Duration,
+    ) -> RefreshingOidcProvider<Arc<RotatingOp>> {
+        let idp = RefreshingOidcProvider::with_metadata_cache(
+            ISSUER,
+            vec![CLIENT_ID.to_string()],
+            ClaimMapping::default(),
+            Arc::clone(op),
+            cooldown,
+            own_cache(),
+        );
+        assert!(idp.is_warm());
+        assert_eq!((op.discovery_gets(), op.jwks_gets()), (1, 1), "warm-up");
+        idp
+    }
+
+    /// WS-855. Verification runs under the workbench lock, so a key gap must
+    /// not wait for the OP there: until this held, every Hub request queued
+    /// behind two round trips to the provider.
+    #[test]
+    fn a_key_gap_never_waits_for_the_op_on_the_verifying_thread() {
+        let op = RotatingOp::new(Some("max-age=3600"));
+        let idp = Arc::new(rotating_provider(&op, Duration::ZERO));
+        op.rotated.store(true, Ordering::SeqCst);
+        op.hold(); // the OP stops answering until released
+        let token = mint_token(ROTATED_KID, ISSUER);
+
+        let workbench = Arc::new(Mutex::new(()));
+        let (done, answered) = std::sync::mpsc::channel();
+        let caller = {
+            let (idp, workbench, token) = (Arc::clone(&idp), Arc::clone(&workbench), token.clone());
+            std::thread::spawn(move || {
+                let _lock = workbench.lock().unwrap();
+                done.send(idp.authenticate(&token)).unwrap();
+            })
+        };
+        // Were the fetch on this thread, the answer would wait for the OP, which
+        // is not answering — and so would everyone else wanting the lock.
+        let answer = answered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("authenticate waited for the OP while holding the caller's lock");
+        assert_eq!(answer, None, "an unknown key is refused, not waited for");
+        caller.join().unwrap();
+        assert!(idp.refreshing(), "the refresh is still waiting on the OP");
+
+        // The refresh it started finishes on its own thread once the OP answers.
+        op.let_go();
+        settle(&idp);
+        assert_eq!(
+            idp.authenticate(&token),
+            Some(AuthorityId::new("alice@example.test"))
+        );
+    }
+
+    #[test]
+    fn a_kid_miss_refreshes_the_key_set_once() {
+        let op = RotatingOp::new(Some("max-age=3600"));
+        let idp = Arc::new(rotating_provider(&op, JWKS_REFRESH_COOLDOWN));
+        op.rotated.store(true, Ordering::SeqCst);
+        op.hold();
+        let token = mint_token(ROTATED_KID, ISSUER);
+
+        // A page's worth of requests all present the token at once.
+        let callers: Vec<_> = (0..16)
+            .map(|_| {
+                let (idp, token) = (Arc::clone(&idp), token.clone());
+                std::thread::spawn(move || idp.authenticate(&token))
+            })
+            .collect();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        op.let_go();
+        settle(&idp);
+
+        assert_eq!(op.jwks_gets(), 2, "one refetch of the key set, not sixteen");
+        assert_eq!(
+            op.discovery_gets(),
+            1,
+            "discovery is still fresh in the cache"
+        );
+        assert!(idp.authenticate(&token).is_some());
+        assert_eq!(op.jwks_gets(), 2, "a held key needs no fetch");
+    }
+
+    #[test]
+    fn a_token_from_another_issuer_never_refreshes_the_key_set() {
+        let op = RotatingOp::new(Some("max-age=3600"));
+        let idp = rotating_provider(&op, Duration::ZERO);
+        // A Microsoft id-token shown to the Hub's Google verifier: an unknown
+        // kid, but no key this OP could publish would ever verify it.
+        let foreign = mint_token(
+            "microsoft-key",
+            "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0",
+        );
+        for _ in 0..3 {
+            assert_eq!(idp.authenticate(&foreign), None);
+            idp.prepare(&foreign);
+        }
+        settle(&idp);
+        assert_eq!((op.discovery_gets(), op.jwks_gets()), (1, 1));
+    }
+
+    #[test]
+    fn prepare_loads_a_rotated_key_before_the_token_is_presented() {
+        let op = RotatingOp::new(Some("max-age=3600"));
+        let idp = rotating_provider(&op, JWKS_REFRESH_COOLDOWN);
+        op.rotated.store(true, Ordering::SeqCst);
+        let token = mint_token(ROTATED_KID, ISSUER);
+
+        idp.prepare(&token);
+        assert_eq!(op.jwks_gets(), 2, "prepare fetched the new key set itself");
+        assert_eq!(
+            idp.authenticate(&token),
+            Some(AuthorityId::new("alice@example.test")),
+            "the first presentation verifies"
+        );
+        // A token whose key is held prepares nothing.
+        idp.prepare(&mint_token(KID, ISSUER));
+        idp.prepare(&token);
+        assert_eq!(op.jwks_gets(), 2);
+    }
+
+    #[test]
+    fn prepare_waits_for_a_refresh_already_running() {
+        let op = RotatingOp::new(Some("max-age=3600"));
+        let idp = Arc::new(rotating_provider(&op, JWKS_REFRESH_COOLDOWN));
+        op.rotated.store(true, Ordering::SeqCst);
+        op.hold();
+        let token = mint_token(ROTATED_KID, ISSUER);
+        // A request presented the new key first and started the refresh.
+        assert_eq!(idp.authenticate(&token), None);
+        assert!(idp.refreshing());
+
+        let preparing = {
+            let (idp, token) = (Arc::clone(&idp), token.clone());
+            std::thread::spawn(move || idp.prepare(&token))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !preparing.is_finished(),
+            "prepare waits for the running refresh"
+        );
+        op.let_go();
+        preparing.join().unwrap();
+        assert!(
+            idp.authenticate(&token).is_some(),
+            "verifies as soon as prepare returns"
+        );
+        assert_eq!(op.jwks_gets(), 2, "the two shared one refetch");
+    }
+
+    #[test]
+    fn an_expired_key_set_is_reread_in_the_background_while_it_keeps_verifying() {
+        // A key set its publisher forbids keeping is expired as soon as it loads.
+        let op = RotatingOp::new(Some("no-store"));
+        let idp = rotating_provider(&op, Duration::ZERO);
+        op.hold();
+        assert!(
+            idp.authenticate(&mint_id_token()).is_some(),
+            "the loaded keys still answer while the OP is unanswered"
+        );
+        op.let_go();
+        settle(&idp);
+        assert_eq!(op.jwks_gets(), 2, "the expired key set was re-read once");
+        assert_eq!(op.discovery_gets(), 1);
+    }
+
+    #[test]
+    fn verifiers_sharing_a_cache_read_the_provider_once() {
+        let op = RotatingOp::new(Some("public, max-age=3600"));
+        let cache = own_cache();
+        for _ in 0..3 {
+            let idp = RefreshingOidcProvider::with_metadata_cache(
+                ISSUER,
+                vec![CLIENT_ID.to_string()],
+                ClaimMapping::default(),
+                Arc::clone(&op),
+                JWKS_REFRESH_COOLDOWN,
+                Arc::clone(&cache),
+            );
+            assert!(idp.authenticate(&mint_id_token()).is_some());
+        }
+        assert_eq!((op.discovery_gets(), op.jwks_gets()), (1, 1));
     }
 
     #[test]

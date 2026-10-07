@@ -6,6 +6,14 @@
 //! the Home-local member and project grant, then mints the replaceable Home
 //! admission used by ordinary work routes. The Hub receives only the resulting
 //! opaque `{project, home_id, endpoint}` route from the browser.
+//!
+//! A Home with no endpoint of its own — a desktop reached only through its
+//! relay — invites too. Its invitation carries how to reach it instead: the
+//! relay locator this host signed, under the project's placement, which the
+//! project's own key signed (DR-0370). The invitee checks the one against the
+//! other, crosses the relay, and accepts there, where the relay names the
+//! accepting account from the Hub and passes its own bearer through for the
+//! email check (DR-0332, [`accept_over_relay`]).
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -16,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::account::RecordOp;
+use crate::home::{OpaqueHomeRoute, OpaqueRelayLocator};
 use crate::org::{
     is_valid_role, MemberGrantRecord, MembershipRecord, MembershipStatus, Org, ORG_ID, ORG_SCOPE,
 };
@@ -26,12 +35,12 @@ const INVITATION_VERSION: u32 = 1;
 const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
-/// Said when the inviting Home has no endpoint and is reached only through the
-/// relay. desk's `RELAY_ONLY_INVITATION` says the same before asking, so a
-/// client that checks first and one that does not read alike.
-const RELAY_ONLY_REFUSAL: &str = "this project is on a computer that others reach only \
-    through the relay, which does not yet admit invited people; move the project to a \
-    hosted Home to share it";
+/// Said when the inviting Home has no endpoint and no relay locator either: a
+/// desktop that is not reachable from elsewhere at all, so nobody could reach
+/// it to accept. desk shows the words as they are.
+const RELAY_ONLY_REFUSAL: &str = "this computer cannot be reached from elsewhere yet, so \
+    nobody could accept an invitation to it; turn on reaching it from your other devices, \
+    then invite again";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +82,77 @@ struct InvitationEnvelope {
     secret: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     invited_email: Option<String>,
+    /// How a Home with no endpoint is reached (DR-0370 §2-4): its relay
+    /// locator, which the host key named by `placement` signed, under the
+    /// placement the project's own key signed. The invitee pins the project
+    /// key it names. Absent when the Home has an endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay: Option<OpaqueRelayLocator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    placement: Option<gaugedesk_directory_protocol::SignedPlacement>,
+    /// The owning account's directory root, under which this computer keeps
+    /// publishing the project's route as its locator rotates (DR-0359,
+    /// DR-0370 §1). The invitee reads the route there again; it trusts the
+    /// pinned project key, never this root. Absent for an organization's
+    /// project or an account that has published no root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_root: Option<String>,
+}
+
+/// How an invitee reaches a project on a Home with no endpoint: the route the
+/// Home authors for it now, carrying the project's placement and this host's
+/// signed locator, and where the owner keeps publishing it.
+#[derive(Clone, Debug)]
+pub(crate) struct RelayReach {
+    route: OpaqueHomeRoute,
+    owner_root: Option<String>,
+}
+
+impl crate::Workbench {
+    /// The relay route an invitation to `project` carries, when this Home
+    /// has no endpoint: the locator it currently authors for the project,
+    /// placed under the project's own key (DR-0370). `None` when it parks no
+    /// relay leg, or the project cannot be placed.
+    pub(crate) fn relay_reach(&mut self, project: &str) -> Option<RelayReach> {
+        let home = self.home_id().clone();
+        let authored = crate::account::Account::rebuild(self.store_ref())
+            .ok()?
+            .home_routes
+            .remove(project)
+            .filter(|record| {
+                record.op == RecordOp::Upsert && record.home_id == home && record.relay.is_some()
+            })?;
+        if self.project_signing_key(project).is_err() {
+            if let Err(error) = self.initialize_project_authority(project) {
+                tracing::warn!(%error, "an invited project's authority key could not be made");
+                return None;
+            }
+        }
+        let route = self.placed(authored.into());
+        route.placement.as_ref()?;
+        let owner_root = match self.project_owner(project) {
+            Some(crate::project_owner::ProjectOwner::Account(owner)) => self
+                .account_key_store()
+                .held(&owner, now_secs())
+                .ok()
+                .flatten()
+                .map(|keys| keys.root.public_key().as_str().to_owned()),
+            _ => None,
+        };
+        Some(RelayReach { route, owner_root })
+    }
+}
+
+impl InvitationEnvelope {
+    /// This envelope, carrying how a relay-only Home is reached.
+    fn reached_by(mut self, reach: Option<RelayReach>) -> Self {
+        if let Some(reach) = reach {
+            self.relay = reach.route.relay;
+            self.placement = reach.route.placement;
+            self.owner_root = reach.owner_root;
+        }
+        self
+    }
 }
 
 #[derive(Deserialize)]
@@ -268,16 +348,12 @@ async fn create_invitation(
             "invite either an account or an email address",
         );
     }
-    // A Home with no endpoint of its own is reached only through the relay,
-    // and the relay admits only accounts signed in on its computer (DR-0328
-    // §6), not a project's invited members (DR-0332, WS-587). An invitation
-    // minted here could never be accepted, so say why instead of sending a
-    // link that fails for the person it is for.
-    if body.endpoint.trim().is_empty() {
-        return json_error(StatusCode::CONFLICT, RELAY_ONLY_REFUSAL);
-    }
+    // A Home with no endpoint of its own is reached through its relay, so the
+    // invitation carries that route instead (DR-0370). One that parks no
+    // relay leg either is refused below, once the inviter is known.
+    let relay_only = body.endpoint.trim().is_empty();
     if body.project.trim().is_empty()
-        || !crate::account_routes::secure_home_endpoint(&body.endpoint)
+        || (!relay_only && !crate::account_routes::secure_home_endpoint(&body.endpoint))
         || !is_valid_role(&body.role)
         || matches!(
             body.role.as_str(),
@@ -319,10 +395,24 @@ async fn create_invitation(
     if !wb.owns_project(&body.project) {
         return json_error(StatusCode::NOT_FOUND, "project is not on this Home");
     }
+    let reach = if relay_only {
+        // Nobody could reach this computer to accept, so say why instead of
+        // sending a link that fails for the person it is for.
+        let Some(reach) = wb.relay_reach(&body.project) else {
+            return json_error(StatusCode::CONFLICT, RELAY_ONLY_REFUSAL);
+        };
+        Some(reach)
+    } else {
+        None
+    };
 
     let id = library::gen_id("hinv");
     let secret = hex::encode(crate::session::random_bytes::<32>());
-    let endpoint = body.endpoint.trim_end_matches('/').to_owned();
+    let endpoint = if relay_only {
+        String::new()
+    } else {
+        body.endpoint.trim_end_matches('/').to_owned()
+    };
     let home_id = wb.home_id().as_str().to_owned();
     let record = HomeInvitationRecord {
         id: id.clone(),
@@ -357,11 +447,21 @@ async fn create_invitation(
         endpoint,
         secret,
         invited_email: email,
-    };
+        relay: None,
+        placement: None,
+        owner_root: None,
+    }
+    .reached_by(reach);
     let encoded = match encode_envelope(&envelope) {
         Ok(encoded) => encoded,
         Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "could not encode invite"),
     };
+    tracing::info!(
+        relay_only,
+        by_email = envelope.invited_email.is_some(),
+        size = encoded.len(),
+        "project invitation minted"
+    );
     (
         StatusCode::CREATED,
         Json(json!({
@@ -449,33 +549,112 @@ async fn accept_invitation(
     let Some(envelope) = decode_envelope(&body.invite) else {
         return json_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid Home invitation");
     };
-    let (actor, email_to_confirm) = {
+    let bearer = net_http::bearer(&headers).map(str::to_owned);
+    let actor = match shared
+        .lock_unpoisoned()
+        .authenticate_identity(bearer.as_deref())
+    {
+        Ok(actor) => actor,
+        Err((status, message)) => return json_error(status, message),
+    };
+    accept_as(shared, actor, hub_email_check(hub, bearer), envelope, false).await
+}
+
+/// How acceptance learns whether the accepting account holds an email
+/// invitation's address: the account authority, asked with that account's own
+/// bearer (DR-0332 §5). Run off the async runtime; it is a network call.
+pub(crate) type EmailCheck =
+    Box<dyn FnOnce(&str) -> Result<crate::account_identity::EmailStanding, String> + Send>;
+
+fn hub_email_check(hub: Option<String>, bearer: Option<String>) -> Option<EmailCheck> {
+    let (hub, bearer) = (hub?, bearer?);
+    Some(Box::new(move |email: &str| {
+        crate::account_identity::hub_email_standing(&hub, &bearer, email)
+    }))
+}
+
+/// `POST /home/invitations/accept`, carried by the relay leg (DR-0328 §6).
+///
+/// The relay has already had the Hub name the caller's account; that account
+/// is the one accepting. The caller's own Hub bearer reaches the email check
+/// through `email`, never the router behind the relay, which serves under a
+/// session of this Home's own.
+pub(crate) async fn accept_over_relay(
+    shared: SharedWorkbench,
+    actor: gaugedesk_core::ids::AuthorityId,
+    email: EmailCheck,
+    body: &[u8],
+) -> axum::response::Response {
+    let envelope = serde_json::from_slice::<AcceptInvitationBody>(body)
+        .ok()
+        .and_then(|body| decode_envelope(&body.invite));
+    let Some(envelope) = envelope else {
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid Home invitation");
+    };
+    accept_as(shared, actor, Some(email), envelope, true).await
+}
+
+/// Accept `envelope` as `actor`: validate the exact capability, atomically
+/// activate membership, grant and invitation, and mint the admission. An email
+/// invitation is bound to `actor` only once `email` confirms the address.
+async fn accept_as(
+    shared: SharedWorkbench,
+    actor: gaugedesk_core::ids::AuthorityId,
+    email: Option<EmailCheck>,
+    envelope: InvitationEnvelope,
+    over_relay: bool,
+) -> axum::response::Response {
+    let started = std::time::Instant::now();
+    let refused = |stage: &'static str, response: axum::response::Response| {
+        tracing::info!(
+            stage,
+            over_relay,
+            status = response.status().as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "project invitation refused"
+        );
+        response
+    };
+    let email_to_confirm = {
         let wb = shared.lock_unpoisoned();
-        let actor = match wb.authenticate_identity(net_http::bearer(&headers)) {
-            Ok(actor) => actor,
-            Err((status, message)) => return json_error(status, message),
-        };
         let Some(record) = latest_invitation(wb.store_ref(), &envelope.invitation) else {
-            return json_error(StatusCode::NOT_FOUND, "invitation is unknown");
+            return refused(
+                "record",
+                json_error(StatusCode::NOT_FOUND, "invitation is unknown"),
+            );
         };
         if let Some(refusal) = withdrawn_refusal(&envelope, &record) {
-            return refusal;
+            return refused("record", refusal);
         }
         if !invitation_matches(&wb, &envelope, &record, actor.as_str()) {
-            return json_error(
-                StatusCode::FORBIDDEN,
-                "invitation does not match this identity and Home",
+            return refused(
+                "record",
+                json_error(
+                    StatusCode::FORBIDDEN,
+                    "invitation does not match this identity and Home",
+                ),
             );
         }
         let pending = record.status == InvitationStatus::Pending;
         if pending && record.expires_at <= now_secs() {
-            return json_error(StatusCode::GONE, "invitation has expired");
+            return refused(
+                "record",
+                json_error(StatusCode::GONE, "invitation has expired"),
+            );
         }
-        (actor, record.invited_email.filter(|_| pending))
+        record.invited_email.filter(|_| pending)
     };
-    if let Some(email) = email_to_confirm {
-        if let Some(refusal) = email_refusal(&headers, actor.as_str(), &email, hub).await {
-            return refusal;
+    if let Some(address) = email_to_confirm {
+        let asked = std::time::Instant::now();
+        let refusal = email_refusal(email, actor.as_str(), &address).await;
+        tracing::info!(
+            over_relay,
+            account_service_ms = asked.elapsed().as_millis() as u64,
+            held = refusal.is_none(),
+            "invited address checked with the account service"
+        );
+        if let Some(refusal) = refusal {
+            return refused("email", refusal);
         }
     }
 
@@ -483,21 +662,31 @@ async fn accept_invitation(
     // Read again: another account may have taken an email invitation while
     // the account authority was asked.
     let Some(record) = latest_invitation(wb.store_ref(), &envelope.invitation) else {
-        return json_error(StatusCode::NOT_FOUND, "invitation is unknown");
+        return refused(
+            "record",
+            json_error(StatusCode::NOT_FOUND, "invitation is unknown"),
+        );
     };
     if let Some(refusal) = withdrawn_refusal(&envelope, &record) {
-        return refusal;
+        return refused("record", refusal);
     }
     if !invitation_matches(&wb, &envelope, &record, actor.as_str()) {
-        return json_error(
-            StatusCode::FORBIDDEN,
-            "invitation does not match this identity and Home",
+        return refused(
+            "record",
+            json_error(
+                StatusCode::FORBIDDEN,
+                "invitation does not match this identity and Home",
+            ),
         );
     }
     if record.status == InvitationStatus::Pending && record.expires_at <= now_secs() {
-        return json_error(StatusCode::GONE, "invitation has expired");
+        return refused(
+            "record",
+            json_error(StatusCode::GONE, "invitation has expired"),
+        );
     }
-    if record.status == InvitationStatus::Pending {
+    let first = record.status == InvitationStatus::Pending;
+    if first {
         let mut accepted = record.clone();
         accepted.status = InvitationStatus::Accepted;
         accepted.invited_authority = actor.as_str().to_owned();
@@ -549,39 +738,52 @@ async fn accept_invitation(
             tracing::warn!(%error, "new member's Tutorials project was not reconciled");
         }
     }
+    // The route the invitee reaches this Home by now: a relay-only Home's
+    // locator has likely rotated since the invitation was minted.
+    let reach = if record.endpoint.is_empty() {
+        wb.relay_reach(&record.project)
+    } else {
+        None
+    };
     let home = wb.home_id().clone();
     let admission = wb.home_admissions.open(home.clone(), actor);
-    (
-        StatusCode::OK,
-        Json(json!({
-            "home_id": home.as_str(),
-            "project": record.project,
-            "endpoint": record.endpoint,
-            "admission": admission.encode(),
-        })),
-    )
-        .into_response()
+    tracing::info!(
+        over_relay,
+        first,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "project invitation accepted"
+    );
+    let mut answer = json!({
+        "home_id": home.as_str(),
+        "project": record.project,
+        "endpoint": record.endpoint,
+        "admission": admission.encode(),
+    });
+    if let Some(reach) = reach {
+        answer["relay"] = json!(reach.route.relay);
+        answer["placement"] = json!(reach.route.placement);
+        if let Some(root) = reach.owner_root {
+            answer["owner_root"] = json!(root);
+        }
+    }
+    (StatusCode::OK, Json(answer)).into_response()
 }
 
 /// Refuse to bind an email invitation unless the account authority says the
-/// account presenting this bearer is `actor` and holds `email` verified.
+/// account accepting is `actor` and holds `email` verified.
 async fn email_refusal(
-    headers: &HeaderMap,
+    check: Option<EmailCheck>,
     actor: &str,
     email: &str,
-    hub: Option<String>,
 ) -> Option<axum::response::Response> {
-    let (Some(hub), Some(bearer)) = (hub, net_http::bearer(headers).map(str::to_owned)) else {
+    let Some(check) = check else {
         return Some(json_error(
             StatusCode::UNAUTHORIZED,
             "sign in with your GaugeWright account to accept this invitation",
         ));
     };
     let email = email.to_owned();
-    let standing = tokio::task::spawn_blocking(move || {
-        crate::account_identity::hub_email_standing(&hub, &bearer, &email)
-    })
-    .await;
+    let standing = tokio::task::spawn_blocking(move || check(&email)).await;
     use crate::account_identity::EmailStanding;
     match standing {
         Ok(Ok(EmailStanding::Holds { account })) if account == actor => None,
@@ -721,6 +923,15 @@ pub async fn post_resend_invitation(
         Ok(record) => record,
         Err(refusal) => return *refusal,
     };
+    // A relay-only Home's link carries the locator it reaches by now.
+    let reach = if record.endpoint.is_empty() {
+        let Some(reach) = wb.relay_reach(&record.project) else {
+            return json_error(StatusCode::CONFLICT, RELAY_ONLY_REFUSAL);
+        };
+        Some(reach)
+    } else {
+        None
+    };
     let secret = hex::encode(crate::session::random_bytes::<32>());
     record.token_sha256 = token_hash(&secret);
     record.expires_at = now_secs().saturating_add(DEFAULT_TTL_SECS);
@@ -736,7 +947,11 @@ pub async fn post_resend_invitation(
         endpoint: record.endpoint.clone(),
         secret,
         invited_email: record.invited_email.clone(),
-    };
+        relay: None,
+        placement: None,
+        owner_root: None,
+    }
+    .reached_by(reach);
     let Ok(encoded) = encode_envelope(&envelope) else {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "could not encode invite");
     };
@@ -816,6 +1031,9 @@ mod tests {
             endpoint: "https://home.example".to_owned(),
             secret: "redacted-capability".to_owned(),
             invited_email: None,
+            relay: None,
+            placement: None,
+            owner_root: None,
         };
         let encoded = encode_envelope(&envelope).unwrap();
         let decoded = decode_envelope(&encoded).unwrap();
@@ -1187,10 +1405,89 @@ mod tests {
         }
     }
 
-    /// A desktop Home reached only through its relay sends an empty endpoint.
-    /// The relay does not yet admit invited members (WS-587), so the Home says
-    /// so plainly and mints nothing, rather than a link that cannot be accepted
-    /// or the generic field refusal it used to give.
+    /// A desktop Home reached only through its relay sends an empty endpoint,
+    /// and its invitation carries the route instead: the relay locator this
+    /// host signed, under the placement the project's own key signed
+    /// (DR-0370). The invitee checks one against the other before dialing,
+    /// and acceptance hands back the locator the Home is reached by now.
+    #[tokio::test]
+    async fn a_relay_only_home_invites_with_its_signed_route() {
+        let (_dir, wb) = email_fixture();
+        let (hub, service) = stub_account_authority().await;
+        let locator = OpaqueRelayLocator {
+            endpoint: "wss://relay.example.test".to_owned(),
+            handle: "a".repeat(43),
+            proof: "b".repeat(43),
+            route_epoch: 3,
+            home_fingerprint: "c".repeat(64),
+        };
+        wb.lock_unpoisoned()
+            .author_home_routes(&crate::home_reachability::HomeReachability {
+                endpoint: String::new(),
+                relay: Some(locator.clone()),
+            });
+        let (status, created) = invite(
+            &wb,
+            json!({ "email": "invitee@example.test", "project": "proj-mine", "endpoint": "" }),
+            Some(hub.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let encoded = created["invite"].as_str().unwrap().to_owned();
+        // The account service emails a link only up to this size.
+        assert!(encoded.len() <= 4096, "{} hex characters", encoded.len());
+        let envelope = decode_envelope(&encoded).unwrap();
+        assert_eq!(envelope.endpoint, "");
+        assert_eq!(envelope.relay.as_ref(), Some(&locator));
+        let placement = envelope.placement.clone().expect("the project's placement");
+        let project_key = wb
+            .lock_unpoisoned()
+            .project_authority_identity("proj-mine")
+            .unwrap()
+            .1;
+        assert_eq!(placement.project_key, project_key.as_str());
+        let route = |relay: Option<OpaqueRelayLocator>| OpaqueHomeRoute {
+            project: envelope.project.clone(),
+            home_id: gaugedesk_core::ids::HomeId::new(envelope.home_id.clone()),
+            endpoint: String::new(),
+            relay,
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+            placement: Some(placement.clone()),
+        };
+        assert!(gaugedesk_directory_protocol::placement_verifies(
+            &route(Some(locator.clone())),
+            project_key.as_str()
+        ));
+        // A locator the host did not sign does not hold.
+        let mut forged = locator.clone();
+        forged.home_fingerprint = "d".repeat(64);
+        assert!(!gaugedesk_directory_protocol::placement_verifies(
+            &route(Some(forged)),
+            project_key.as_str()
+        ));
+
+        // The locator rotates; acceptance names the current one.
+        let mut rotated = locator.clone();
+        rotated.route_epoch = 4;
+        rotated.proof = "e".repeat(43);
+        wb.lock_unpoisoned()
+            .author_home_routes(&crate::home_reachability::HomeReachability {
+                endpoint: String::new(),
+                relay: Some(rotated.clone()),
+            });
+        let (accepted, body) = accept(&wb, "invitee-login", &encoded, Some(hub)).await;
+        assert_eq!(accepted, StatusCode::OK, "{body}");
+        assert_eq!(body["endpoint"], "");
+        assert_eq!(body["relay"]["route_epoch"], 4, "{body}");
+        assert_eq!(body["placement"]["project_key"], project_key.as_str());
+        service.abort();
+    }
+
+    /// A desktop that parks no relay leg cannot be reached at all, so the Home
+    /// says so plainly and mints nothing, rather than a link that cannot be
+    /// accepted or the generic field refusal it used to give.
     #[tokio::test]
     async fn a_relay_only_home_refuses_to_mint_an_invitation_it_cannot_honour() {
         let (_dir, wb) = email_fixture();

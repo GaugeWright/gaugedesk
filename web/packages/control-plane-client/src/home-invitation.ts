@@ -7,6 +7,11 @@ import type { HomeId, ProjectId } from "./control-plane-domain";
 import type { RouteJson } from "./control-plane-transport";
 import { isSecureControlPlaneEndpoint } from "./control-plane-transport";
 import type { WorkbenchTransport } from "./control-plane-workbench";
+import { placementVerified } from "./directory-module";
+import { parseOpaqueHomeRoute, type OpaqueHomeRoute } from "./home-routing";
+import type { SharedProjectPin, SharedRouteWire } from "./shared-project-routes";
+import { openTunnel, tunnelAvailable } from "./tunnel-module";
+import { browserTunnelSocket, tunnelRouteJson } from "./tunnel-route-json";
 
 export interface HomeInvitationPreview {
     /** The account it is for; empty for an email invitation still pending. */
@@ -21,10 +26,18 @@ export interface HomeInvitationPreview {
 interface HomeInvitationEnvelope extends HomeInvitationPreview {
     readonly invitation: string;
     readonly secret: string;
+    /** How a Home with no endpoint is reached (DR-0370): its relay locator,
+     * signed by its host key, under the placement the project's key signed. */
+    readonly relayRoute?: SharedRouteWire;
+    /** The owning account's directory root, where that route is read again. */
+    readonly ownerRoot?: string;
 }
 
 export interface AcceptedHomeInvitation extends HomeInvitationPreview {
     readonly admission: string;
+    /** For a project on a Home reached only through its relay: the project key
+     * and route to pin, so this browser keeps reaching it (DR-0370 §2). */
+    readonly shared?: SharedProjectPin;
 }
 
 export interface CreatedHomeInvitation {
@@ -62,10 +75,32 @@ function envelope(encoded: string): HomeInvitationEnvelope {
         throw new Error("Home invitation is malformed");
     }
     if (raw.version !== 1) throw new Error("Home invitation version is unsupported");
-    const endpoint = requiredString(raw.endpoint, "endpoint").replace(/\/+$/, "");
-    if (!isSecureControlPlaneEndpoint(endpoint)) {
-        throw new Error("Home invitation uses an insecure endpoint");
+    const endpoint = (typeof raw.endpoint === "string" ? raw.endpoint.trim() : "").replace(/\/+$/, "");
+    // A Home with no endpoint is reached through its relay, and the invitation
+    // carries that route instead, signed under the project's own key.
+    let relayRoute: SharedRouteWire | undefined;
+    if (endpoint) {
+        if (!isSecureControlPlaneEndpoint(endpoint)) {
+            throw new Error("Home invitation uses an insecure endpoint");
+        }
+    } else {
+        const placement = raw.placement as SharedRouteWire["placement"] | undefined;
+        if (!raw.relay || typeof placement?.project_key !== "string" || !placement.project_key) {
+            throw new Error("Home invitation requires endpoint");
+        }
+        relayRoute = {
+            project: requiredString(raw.project, "project"),
+            home_id: requiredString(raw.home_id, "Home"),
+            endpoint: "",
+            relay: raw.relay,
+            placement,
+        };
+        // The locator's shape, before anything dials it.
+        parseOpaqueHomeRoute(relayRoute, "signed");
     }
+    const ownerRoot = typeof raw.owner_root === "string" && raw.owner_root.trim()
+        ? raw.owner_root.trim()
+        : undefined;
     const email = typeof raw.invited_email === "string" && raw.invited_email.trim()
         ? raw.invited_email
         : undefined;
@@ -79,6 +114,8 @@ function envelope(encoded: string): HomeInvitationEnvelope {
         homeId: requiredString(raw.home_id, "Home") as HomeId,
         endpoint,
         secret: requiredString(raw.secret, "capability"),
+        ...(relayRoute ? { relayRoute } : {}),
+        ...(ownerRoot ? { ownerRoot } : {}),
     };
 }
 
@@ -96,9 +133,10 @@ export function parseHomeInvitation(encoded: string): HomeInvitationPreview {
  * sign-in the invitee usually has to do first (DR-0204). */
 export async function acceptHomeInvitation(
     encoded: string,
-    options: { readonly bearer?: () => string | null } = {},
+    options: AcceptHomeInvitationOptions = {},
 ): Promise<AcceptedHomeInvitation> {
     const expected = envelope(encoded);
+    if (expected.relayRoute) return acceptOverRelay(encoded, expected, expected.relayRoute, options);
     const json = browserRouteJson(expected.endpoint, { bearer: options.bearer });
     const value = (await json("POST", "/home/invitations/accept", { invite: encoded })) as {
         home_id?: unknown;
@@ -119,26 +157,109 @@ export async function acceptHomeInvitation(
     return { ...parseHomeInvitation(encoded), admission: value.admission };
 }
 
-/** What a Home with no endpoint of its own — a desktop reached only through
- * the relay — says when asked to share a project. Its relay admits only the
- * accounts signed in on that computer, not a project's invited members
- * (DR-0332, WS-587), so an invitation it minted could never be accepted. The
- * Home's own refusal carries the same words. */
-export const RELAY_ONLY_INVITATION =
-    "this project is on a computer that others reach only through the relay, which does not "
-    + "yet admit invited people; move the project to a hosted Home to share it";
+export interface AcceptHomeInvitationOptions {
+    readonly bearer?: () => string | null;
+    /** How a call reaches a Home through its relay; the browser tunnel unless
+     * given. Injected by tests and by a native shell with its own carrier. */
+    readonly relayJson?: (route: OpaqueHomeRoute, bearer: () => string | null) => RouteJson & {
+        close?: () => void;
+    };
+    /** Check a route's placement against a project key; the wasm module's,
+     * strictly, unless given. */
+    readonly placementVerified?: (route: unknown, projectKey: string) => Promise<boolean>;
+}
 
-/** Inviting to a project whose Home has no endpoint to give the invitee. */
-export class RelayOnlyHomeInvitationError extends Error {
-    constructor() {
-        super(RELAY_ONLY_INVITATION);
-        this.name = "RelayOnlyHomeInvitationError";
+/** The browser tunnel to a relay-only Home, carrying the account's bearer. */
+function tunnelJson(route: OpaqueHomeRoute, bearer: () => string | null): RouteJson & { close(): void } {
+    const relay = route.relay;
+    if (!relay || !tunnelAvailable()) {
+        throw new Error("this browser cannot reach a computer through the relay");
     }
+    const url = `${relay.endpoint}/v1/relay/${relay.handle}`;
+    return tunnelRouteJson({
+        open: async () => {
+            const { tunnel, handshake } = await openTunnel(relay);
+            return { tunnel, socket: await browserTunnelSocket(url, handshake) };
+        },
+        bearer,
+        // One call; the pool opens the working sessions afterwards.
+        sessions: 1,
+    });
+}
+
+/**
+ * Accept on a Home reached only through its relay (DR-0370, DR-0451).
+ *
+ * The invitation names the project's key and carries a route that key placed;
+ * nothing is dialed until the placement and the locator it vouches for hold
+ * against that key. The Home's relay names the accepting account from the
+ * bearer, and answers with the locator it is reached by now, which is kept
+ * only if it holds against the same key.
+ */
+async function acceptOverRelay(
+    encoded: string,
+    expected: HomeInvitationEnvelope,
+    carried: SharedRouteWire,
+    options: AcceptHomeInvitationOptions,
+): Promise<AcceptedHomeInvitation> {
+    const projectKey = carried.placement?.project_key as string;
+    const verify = options.placementVerified ?? placementVerified;
+    if (!(await verify(carried, projectKey))) {
+        throw new Error("Home invitation's route is not signed by its project's key");
+    }
+    const bearer = options.bearer ?? (() => null);
+    const json = (options.relayJson ?? tunnelJson)(parseOpaqueHomeRoute(carried, "signed"), bearer);
+    let value: Record<string, unknown>;
+    try {
+        value = (await json("POST", "/home/invitations/accept", { invite: encoded })) as Record<string, unknown>;
+    } finally {
+        json.close?.();
+    }
+    const endpoint = typeof value.endpoint === "string" ? value.endpoint : "";
+    if (
+        value.home_id !== expected.homeId ||
+        value.project !== expected.project ||
+        endpoint !== "" ||
+        typeof value.admission !== "string" ||
+        !value.admission
+    ) {
+        throw new Error("Home invitation acceptance did not match the invitation");
+    }
+    const answered: SharedRouteWire | null = value.relay && value.placement
+        ? {
+            project: expected.project,
+            home_id: expected.homeId,
+            endpoint: "",
+            relay: value.relay,
+            placement: value.placement as SharedRouteWire["placement"],
+        }
+        : null;
+    const current = answered
+        && (answered.placement?.project_key === projectKey)
+        && (await verify(answered, projectKey))
+        ? answered
+        : carried;
+    const ownerRoot = typeof value.owner_root === "string" && value.owner_root
+        ? value.owner_root
+        : expected.ownerRoot;
+    return {
+        ...parseHomeInvitation(encoded),
+        admission: value.admission,
+        shared: {
+            project: expected.project,
+            homeId: expected.homeId,
+            projectKey,
+            ...(ownerRoot ? { ownerRoot } : {}),
+            route: current,
+        },
+    };
 }
 
 /** Owner/admin command. This uses the already-admitted Home transport. It
  * names exactly one recipient: an account chosen from the organization, or an
- * email address the accepting account must hold verified (DR-0332). */
+ * email address the accepting account must hold verified (DR-0332). A Home
+ * reached only through its relay is sent no endpoint, and its invitation
+ * carries its relay route instead; a Home nobody can reach says so itself. */
 export async function createHomeInvitation(
     json: RouteJson,
     input: ({ readonly authority: string; readonly email?: undefined }
@@ -148,11 +269,11 @@ export async function createHomeInvitation(
         readonly role?: "member" | "viewer";
     },
 ): Promise<CreatedHomeInvitation> {
-    if (!input.endpoint.trim()) throw new RelayOnlyHomeInvitationError();
+    const endpoint = input.endpoint.trim().replace(/\/+$/, "");
     const value = (await json("POST", "/home/invitations", {
         ...(input.email !== undefined ? { email: input.email } : { authority: input.authority }),
         project: input.project,
-        endpoint: input.endpoint,
+        endpoint,
         role: input.role ?? "member",
     })) as Record<string, unknown>;
     const parsed = parseHomeInvitation(requiredString(value.invite, "invite"));
@@ -163,7 +284,7 @@ export async function createHomeInvitation(
     if (
         !addressed ||
         parsed.project !== input.project ||
-        parsed.endpoint !== input.endpoint.replace(/\/+$/, "") ||
+        parsed.endpoint !== endpoint ||
         typeof value.expires_at !== "number"
     ) {
         throw new Error("created Home invitation response is malformed");

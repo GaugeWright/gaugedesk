@@ -156,7 +156,10 @@ impl Workbench {
     /// `route` with its project's signed placement and this host's signed
     /// locator (DR-0370), when the project has an authority key here. A
     /// project without one keeps the route the account's root alone speaks for.
-    fn placed(&self, route: crate::home::OpaqueHomeRoute) -> crate::home::OpaqueHomeRoute {
+    pub(crate) fn placed(
+        &self,
+        route: crate::home::OpaqueHomeRoute,
+    ) -> crate::home::OpaqueHomeRoute {
         let (Ok(project), Ok(host)) = (
             self.project_signing_key(&route.project),
             self.host_signing_key(),

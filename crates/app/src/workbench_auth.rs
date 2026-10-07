@@ -650,6 +650,13 @@ impl Workbench {
         self.idp.is_some()
     }
 
+    /// The attached identity provider, for a caller that must use it after
+    /// releasing the workbench lock — to [`prepare`](identity::IdentityProvider::prepare)
+    /// a credential it just obtained, which may touch the network.
+    pub fn identity_provider(&self) -> Option<Arc<dyn identity::IdentityProvider + Send + Sync>> {
+        self.idp.clone()
+    }
+
     /// Discover the current actor's administration capabilities in one tenant
     /// scope (`ADMIN-ENV-2`). This is presentation admission only; every route
     /// still gates its own action independently through [`Self::authorize`].

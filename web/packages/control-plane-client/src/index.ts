@@ -27,6 +27,7 @@ export * from "./signed-routes";
 export * from "./resolve-home-routes";
 export * from "./directory-module";
 export * from "./home-invitation";
+export * from "./shared-project-routes";
 export * from "./gaugeapp";
 export * from "./gaugeapp-account-models";
 export * from "./gaugeapp-administration-models";

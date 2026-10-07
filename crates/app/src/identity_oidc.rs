@@ -415,11 +415,24 @@ impl IdentityProvider for OidcIdentityProvider {
 pub trait HttpGet {
     /// Fetch `url`, returning the response body as a string, or an error message.
     fn get(&self, url: &str) -> Result<String, String>;
+
+    /// [`get`](Self::get), also returning the response's `Cache-Control` header
+    /// when the transport can see it. A cache of provider metadata
+    /// ([`crate::oidc_metadata`]) keeps a document for as long as that header
+    /// allows. The default reports no header, which caches for the default
+    /// lifetime; a mock that never overrides this needs nothing more.
+    fn get_cacheable(&self, url: &str) -> Result<(String, Option<String>), String> {
+        self.get(url).map(|body| (body, None))
+    }
 }
 
 impl HttpGet for crate::net_http::HttpClient {
     fn get(&self, url: &str) -> Result<String, String> {
         self.get_string(url)
+    }
+
+    fn get_cacheable(&self, url: &str) -> Result<(String, Option<String>), String> {
+        self.get_string_cache_control(url)
     }
 }
 
@@ -428,18 +441,37 @@ impl HttpGet for crate::net_http::HttpClient {
 /// [`OidcIdentityProvider::with_jwks`] then loads. The follow-on rotation simply
 /// re-runs this and rebuilds the verifier's key set.
 pub fn discover_jwks(issuer: &str, http: &impl HttpGet) -> Result<String, String> {
-    let well_known = format!(
+    let jwks_uri = jwks_uri_from_discovery(&http.get(&discovery_url(issuer))?)?;
+    http.get(&jwks_uri)
+}
+
+/// Where an issuer's discovery document says its signing keys live.
+pub fn jwks_uri_from_discovery(discovery: &str) -> Result<String, String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(discovery).map_err(|e| format!("invalid discovery doc: {e}"))?;
+    doc.get("jwks_uri")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "discovery doc has no jwks_uri".to_string())
+}
+
+/// The well-known discovery URL for `issuer`.
+pub fn discovery_url(issuer: &str) -> String {
+    format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
-    );
-    let discovery = http.get(&well_known)?;
-    let doc: serde_json::Value =
-        serde_json::from_str(&discovery).map_err(|e| format!("invalid discovery doc: {e}"))?;
-    let jwks_uri = doc
-        .get("jwks_uri")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "discovery doc has no jwks_uri".to_string())?;
-    http.get(jwks_uri)
+    )
+}
+
+/// The `iss` a JWT claims, read from its **unverified** payload. Only ever a
+/// hint about which verifier a token was meant for — whether a verifier should
+/// go looking for keys it lacks — never a fact about who sent it.
+pub fn unverified_issuer(credential: &str) -> Option<String> {
+    let payload = credential.split('.').nth(1)?;
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
+    let claims: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+    claims.get("iss")?.as_str().map(str::to_owned)
 }
 
 /// The OP's endpoints from its discovery document (OIDC Discovery / RFC 8414): where to
@@ -459,11 +491,7 @@ pub struct OidcEndpoints {
 
 /// Fetch + parse `{issuer}/.well-known/openid-configuration` into its endpoints.
 pub fn discover_endpoints(issuer: &str, http: &impl HttpGet) -> Result<OidcEndpoints, String> {
-    let well_known = format!(
-        "{}/.well-known/openid-configuration",
-        issuer.trim_end_matches('/')
-    );
-    let doc: serde_json::Value = serde_json::from_str(&http.get(&well_known)?)
+    let doc: serde_json::Value = serde_json::from_str(&http.get(&discovery_url(issuer))?)
         .map_err(|e| format!("invalid discovery doc: {e}"))?;
     let field = |k: &str| {
         doc.get(k)
