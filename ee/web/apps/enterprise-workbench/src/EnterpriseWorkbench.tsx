@@ -138,7 +138,7 @@ export function OrganizationSelector(props: {
     onSelect: (id: string) => void;
     onCreate: (displayName: string) => Promise<void>;
     onOpen: (app: GaugeAppKind, page: string) => void;
-    /** The menu opened: the moment its Administration pages are wanted. */
+    /** The menu opened: the moment its Administration and Commercial Operations pages are wanted. */
     onMenuOpen?: () => void;
     /** True while a GaugeApp or proposal surface is covering ordinary work. */
     surfaceOpen: boolean;
@@ -403,14 +403,22 @@ export function EnterpriseWorkbench(): JSX.Element {
     const providerScope = createMemo<GaugeAppScope | undefined>(() => tenant()
         ? { kind: "provider-tenant", id: tenant()! }
         : undefined);
-    // Administration is admitted when the person reaches for it — its menu, a
-    // link to one of its pages — and not on every page load. Each admission
-    // rebuilds every Administration page on the Hub while it holds the lock
-    // every other request waits on, and one tenant's took a minute (WS-851).
+    // Administration and Commercial Operations are admitted when the person
+    // reaches for them — the organization menu, a link to one of their pages —
+    // and not on every page load. Each admission rebuilds every page of the
+    // App on the Hub, and Administration's and Commercial Operations' read the
+    // tenant's Home; one Administration admission took a minute (WS-851,
+    // WS-860).
     const [administrationWanted, setAdministrationWanted] = createSignal(initialGaugeApp() === "administration");
+    const [commercialWanted, setCommercialWanted] = createSignal(initialGaugeApp() === "commercial-operations");
     createEffect(() => {
         if (activeApp() === "administration") setAdministrationWanted(true);
+        if (activeApp() === "commercial-operations") setCommercialWanted(true);
     });
+    const wantManagement = (app: GaugeAppKind): void => {
+        if (app === "administration") setAdministrationWanted(true);
+        if (app === "commercial-operations") setCommercialWanted(true);
+    };
     let commercial: GaugeAppWorkspaceController;
     const administration = createGaugeAppWorkspace({
         api,
@@ -443,9 +451,10 @@ export function EnterpriseWorkbench(): JSX.Element {
     commercial = createGaugeAppWorkspace({
         api,
         app: "commercial-operations",
-        // Attempt exact-scope admission and let the server decide. A cached
-        // membership label or organization kind is never a capability gate.
-        enabled: () => Boolean(account.session() && tenant()),
+        // Attempt exact-scope admission, once it is wanted, and let the server
+        // decide. A cached membership label or organization kind is never a
+        // capability gate.
+        enabled: () => Boolean(account.session() && tenant() && commercialWanted()),
         actor: () => account.session()?.actor,
         active: () => activeApp() === "commercial-operations",
         scope: providerScope,
@@ -472,10 +481,11 @@ export function EnterpriseWorkbench(): JSX.Element {
     };
     const openGaugeApp = (app: GaugeAppKind, page: string): void => {
         const target = controller(app);
-        if (app === "administration" && target && !target.session() && !target.session.error) {
+        if ((app === "administration" || app === "commercial-operations")
+            && target && !target.session() && !target.session.error) {
             // Not admitted yet: admit, and open the page once its grants say
             // it exists (the activation effect below reads it from the URL).
-            setAdministrationWanted(true);
+            wantManagement(app);
             setProposalAccess(null);
             writeManagementLocation(app, page, tenant());
             setActiveApp(app);
@@ -580,7 +590,10 @@ export function EnterpriseWorkbench(): JSX.Element {
                 void refetchAccountIndex().catch(() => undefined);
             }}
             onOpen={openGaugeApp}
-            onMenuOpen={() => setAdministrationWanted(true)}
+            onMenuOpen={() => {
+                wantManagement("administration");
+                wantManagement("commercial-operations");
+            }}
             surfaceOpen={surfaceOpen()}
             onWork={closeSurface}
         /></Show>,

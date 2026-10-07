@@ -227,6 +227,46 @@ pub trait AdministrationGaugeAppExtension: Send + Sync {
         command: &GaugeAppCommandEnvelope,
     ) -> Result<Option<AdministrationMutationPlan>, AdministrationExtensionError>;
 
+    /// Read, with no lock on the Workbench held, what planning or applying
+    /// `command` needs from outside the Hub's own store: an authority's
+    /// current page, a payment processor's answer (WS-860). The adapter calls
+    /// this for a submitted command or an accepted review, after admitting
+    /// the request for `actor` with `capabilities` and before it takes the
+    /// lock to decide the command. It hands the result to
+    /// [`Self::plan_prefetched`] and [`Self::apply_prefetched`] only for this
+    /// exact command — tenant, actor, page, command, payload and expected
+    /// basis — so a command decided differently under the lock never uses it.
+    ///
+    /// The command is not yet decided here, and may still be refused as stale
+    /// or replayed: only read, or make a request whose result may be thrown
+    /// away and that repeats exactly on retry. An immediate command is applied
+    /// under its idempotency key, `command.idempotency_key`; derive any
+    /// processor idempotency key from it, as [`Self::apply`] would.
+    fn prefetch_command(
+        &self,
+        _tenant_id: &str,
+        _store_scope: &str,
+        _actor: &str,
+        _capabilities: &[Capability],
+        _command: &GaugeAppCommandEnvelope,
+    ) -> Option<AdministrationPrefetch> {
+        None
+    }
+
+    /// [`Self::plan`] given what [`Self::prefetch_command`] read for this
+    /// exact command, when it read anything.
+    fn plan_prefetched(
+        &self,
+        wb: &Workbench,
+        tenant_id: &str,
+        store_scope: &str,
+        actor: &str,
+        command: &GaugeAppCommandEnvelope,
+        _prefetched: Option<&AdministrationPrefetch>,
+    ) -> Result<Option<AdministrationMutationPlan>, AdministrationExtensionError> {
+        self.plan(wb, tenant_id, store_scope, actor, command)
+    }
+
     /// Run an exact idempotent external effect, if this command owns one, and
     /// return the final fact plan committed with the receipt. Implementations
     /// must bind provider/runtime requests to `operation_key` so crash retry
@@ -246,6 +286,31 @@ pub trait AdministrationGaugeAppExtension: Send + Sync {
     ) -> Result<AdministrationMutationPlan, AdministrationExtensionError> {
         Ok(plan)
     }
+
+    /// [`Self::apply`] given what [`Self::prefetch_command`] read for this
+    /// exact command, when it read anything.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_prefetched(
+        &self,
+        wb: &Workbench,
+        tenant_id: &str,
+        store_scope: &str,
+        actor: &str,
+        command: &GaugeAppCommandEnvelope,
+        operation_key: &str,
+        plan: AdministrationMutationPlan,
+        _prefetched: Option<&AdministrationPrefetch>,
+    ) -> Result<AdministrationMutationPlan, AdministrationExtensionError> {
+        self.apply(
+            wb,
+            tenant_id,
+            store_scope,
+            actor,
+            command,
+            operation_key,
+            plan,
+        )
+    }
 }
 
 pub type AdministrationGaugeAppExtensionHandle = Arc<dyn AdministrationGaugeAppExtension>;
@@ -260,6 +325,37 @@ struct PrefetchedAdmission {
     actor: String,
     capabilities: Vec<Capability>,
     data: AdministrationPrefetch,
+}
+
+/// A command's prefetch, and the exact admission and command it was read
+/// for.
+struct PrefetchedCommand {
+    tenant: String,
+    actor: String,
+    page_id: String,
+    command_id: String,
+    payload: Value,
+    expected_basis: String,
+    data: AdministrationPrefetch,
+}
+
+impl PrefetchedCommand {
+    /// What was read, when it was read for `actor` running exactly `command`
+    /// in `tenant`.
+    fn for_command(
+        &self,
+        tenant: &str,
+        actor: &str,
+        command: &GaugeAppCommandEnvelope,
+    ) -> Option<&AdministrationPrefetch> {
+        (self.tenant == tenant
+            && self.actor == actor
+            && self.page_id == command.page_id
+            && self.command_id == command.command_id
+            && self.payload == command.payload
+            && self.expected_basis == command.expected_basis)
+            .then_some(&self.data)
+    }
 }
 
 /// Machine-checkable inventory of every management mutation represented by
@@ -623,6 +719,7 @@ pub struct AdministrationServices {
     extension: Option<AdministrationGaugeAppExtensionHandle>,
     captured: bool,
     prefetched: Option<Arc<PrefetchedAdmission>>,
+    prefetched_command: Option<Arc<PrefetchedCommand>>,
     auth: Option<crate::auth_oidc::AuthShellState>,
     saml_tests: Option<crate::identity_saml::SamlBrowserState>,
 }
@@ -742,7 +839,14 @@ impl GaugeAppDefinition for Administration {
         decide_gaugeapp_command(&context.session, envelope).map_err(|error| {
             GaugeAppAgentError::InvalidOutput(format!("Proposal refused: {error:?}"))
         })?;
-        plan_command(wb, headers, envelope, services.extension.as_ref()).map_err(|_| {
+        plan_command(
+            wb,
+            headers,
+            envelope,
+            services.extension.as_ref(),
+            services.prefetched_command.as_deref(),
+        )
+        .map_err(|_| {
             GaugeAppAgentError::InvalidOutput(format!(
                 "{} has invalid values for this page; read the current page and correct the payload",
                 envelope.command_id
@@ -768,7 +872,7 @@ impl GaugeAppDefinition for Administration {
         decide_gaugeapp_command(&current, envelope).map_err(|error| {
             GaugeAppAgentError::InvalidOutput(format!("Proposal refused: {error:?}"))
         })?;
-        plan_command(wb, headers, envelope, services.extension.as_ref()).map_err(rejected)?;
+        plan_command(wb, headers, envelope, services.extension.as_ref(), None).map_err(rejected)?;
         fact(
             &req_scope(headers),
             GAUGEAPP_CHANGE_KIND,
@@ -811,7 +915,14 @@ impl GaugeAppDefinition for Administration {
         envelope: &GaugeAppCommandEnvelope,
         services: &Self::Services,
     ) -> Result<MutationPlan, Box<Response>> {
-        plan_command(wb, headers, envelope, services.extension.as_ref()).map_err(Box::new)
+        plan_command(
+            wb,
+            headers,
+            envelope,
+            services.extension.as_ref(),
+            services.prefetched_command.as_deref(),
+        )
+        .map_err(Box::new)
     }
 
     fn requires_external_review(command: &str, services: &Self::Services) -> bool {
@@ -842,15 +953,21 @@ impl GaugeAppDefinition for Administration {
             ));
         }
         if let Some(extension) = &services.extension {
+            let tenant = tenant_id(headers);
+            let prefetched = services
+                .prefetched_command
+                .as_deref()
+                .and_then(|prefetched| prefetched.for_command(&tenant, &session.actor, envelope));
             return extension
-                .apply(
+                .apply_prefetched(
                     wb,
-                    &tenant_id(headers),
+                    &tenant,
                     &req_scope(headers),
                     &session.actor,
                     envelope,
                     operation_key,
                     plan,
+                    prefetched,
                 )
                 .map_err(extension_error)
                 .map_err(Box::new);
@@ -896,9 +1013,16 @@ impl GaugeAppDefinition for Administration {
         services: Self::Services,
     ) -> gaugedesk_app::gaugeapp_host::ReviewEvidenceFuture {
         Box::pin(async move {
-            verify_domain_review_evidence(&wb, &headers, &id, &body, services.extension.as_ref())
-                .await
-                .map_err(Box::new)
+            verify_domain_review_evidence(
+                &wb,
+                &headers,
+                &id,
+                &body,
+                services.extension.as_ref(),
+                services.prefetched.as_deref(),
+            )
+            .await
+            .map_err(Box::new)
         })
     }
 
@@ -921,6 +1045,7 @@ impl GaugeAppDefinition for Administration {
         .map(|result| {
             result
                 .map(|job| {
+                    let job = job.with_prefetched(services.prefetched.clone());
                     gaugedesk_app::gaugeapp_host::PendingAuthority::new(move |wb, headers| {
                         external_review::execute(wb, headers, job)
                     })
@@ -953,6 +1078,7 @@ impl GaugeAppDefinition for Administration {
         };
         external_review::begin(wb, headers, session, envelope, key, change, extension, plan)
             .map(|job| {
+                let job = job.with_prefetched(services.prefetched.clone());
                 gaugedesk_app::gaugeapp_host::PendingAuthority::new(move |wb, headers| {
                     external_review::execute(wb, headers, job)
                 })
@@ -1084,6 +1210,7 @@ impl GaugeAppDefinition for Administration {
                 .cloned(),
             captured: true,
             prefetched: None,
+            prefetched_command: None,
             auth: extensions
                 .get::<crate::auth_oidc::AuthShellState>()
                 .cloned(),
@@ -1131,32 +1258,20 @@ impl GaugeAppDefinition for Administration {
     fn prepare(
         wb: &SharedWorkbench,
         headers: &HeaderMap,
-        mut services: Self::Services,
+        services: Self::Services,
     ) -> Self::Services {
-        let Some(extension) = services.extension.clone().filter(|_| services.captured) else {
-            return services;
-        };
-        let admitted = {
-            let guard = wb.lock_unpoisoned();
-            admit_session(&guard, headers)
-        };
-        let Ok(admitted) = admitted else {
-            return services;
-        };
-        if let Some(data) = extension.prefetch(
-            &admitted.tenant,
-            &admitted.store_scope,
-            &admitted.actor,
-            &admitted.capabilities,
-        ) {
-            services.prefetched = Some(Arc::new(PrefetchedAdmission {
-                tenant: admitted.tenant,
-                actor: admitted.actor,
-                capabilities: admitted.capabilities,
-                data,
-            }));
-        }
-        services
+        prefetched_services(wb, headers, services, None)
+    }
+
+    /// [`Self::prepare`], and the composition's read for the command: the
+    /// command rebuilds the session under the lock, then plans and applies.
+    fn prepare_command(
+        wb: &SharedWorkbench,
+        headers: &HeaderMap,
+        envelope: &GaugeAppCommandEnvelope,
+        services: Self::Services,
+    ) -> Self::Services {
+        prefetched_services(wb, headers, services, Some(envelope))
     }
 
     fn opened(context: &GaugeAppAgentContext) -> Value {
@@ -1935,6 +2050,61 @@ fn build_session(
 
 /// Current admission for an Administration request: its capabilities in the
 /// selected tenant, and the actor its organization access is recorded for.
+/// Admit under the lock, release it, and let the composition read its
+/// external page state — and, for a command, what that command needs — before
+/// the locked rebuild. A request that is not admitted reads nothing, so an
+/// anonymous caller cannot make the Hub open a Home or call an authority.
+fn prefetched_services(
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+    mut services: AdministrationServices,
+    command: Option<&GaugeAppCommandEnvelope>,
+) -> AdministrationServices {
+    let Some(extension) = services.extension.clone().filter(|_| services.captured) else {
+        return services;
+    };
+    let admitted = {
+        let guard = wb.lock_unpoisoned();
+        admit_session(&guard, headers)
+    };
+    let Ok(admitted) = admitted else {
+        return services;
+    };
+    if let Some(command) = command {
+        if let Some(data) = extension.prefetch_command(
+            &admitted.tenant,
+            &admitted.store_scope,
+            &admitted.actor,
+            &admitted.capabilities,
+            command,
+        ) {
+            services.prefetched_command = Some(Arc::new(PrefetchedCommand {
+                tenant: admitted.tenant.clone(),
+                actor: admitted.actor.clone(),
+                page_id: command.page_id.clone(),
+                command_id: command.command_id.clone(),
+                payload: command.payload.clone(),
+                expected_basis: command.expected_basis.clone(),
+                data,
+            }));
+        }
+    }
+    if let Some(data) = extension.prefetch(
+        &admitted.tenant,
+        &admitted.store_scope,
+        &admitted.actor,
+        &admitted.capabilities,
+    ) {
+        services.prefetched = Some(Arc::new(PrefetchedAdmission {
+            tenant: admitted.tenant,
+            actor: admitted.actor,
+            capabilities: admitted.capabilities,
+            data,
+        }));
+    }
+    services
+}
+
 fn admit_session(wb: &Workbench, headers: &HeaderMap) -> Result<AdmittedSession, Response> {
     let store_scope = req_scope(headers);
     let mut capabilities = wb
@@ -2579,17 +2749,22 @@ fn plan_command(
     headers: &HeaderMap,
     command: &GaugeAppCommandEnvelope,
     extension: Option<&AdministrationGaugeAppExtensionHandle>,
+    prefetched: Option<&PrefetchedCommand>,
 ) -> Result<MutationPlan, Response> {
     if command_policy(&command.command_id).is_none() {
         if let Some(extension) = extension {
             let actor = wb.actor(bearer(headers));
+            let tenant = tenant_id(headers);
+            let prefetched =
+                prefetched.and_then(|prefetched| prefetched.for_command(&tenant, &actor, command));
             if let Some(plan) = extension
-                .plan(
+                .plan_prefetched(
                     wb,
-                    &tenant_id(headers),
+                    &tenant,
                     &req_scope(headers),
                     &actor,
                     command,
+                    prefetched,
                 )
                 .map_err(extension_error)?
             {
@@ -4093,7 +4268,8 @@ async fn submit_sso_configuration_validation(
             )
                 .into_response();
         }
-        if let Err(response) = plan_command(&guard, &headers, &envelope, extension_ref(&extension))
+        if let Err(response) =
+            plan_command(&guard, &headers, &envelope, extension_ref(&extension), None)
         {
             return response;
         }
@@ -4164,7 +4340,8 @@ async fn submit_sso_configuration_validation(
         )
             .into_response();
     }
-    let mut plan = match plan_command(&guard, &headers, &envelope, extension_ref(&extension)) {
+    let mut plan = match plan_command(&guard, &headers, &envelope, extension_ref(&extension), None)
+    {
         Ok(plan) => plan,
         Err(response) => return response,
     };
@@ -4240,7 +4417,8 @@ async fn submit_sso_browser_test_start(
             )
                 .into_response();
         }
-        if let Err(response) = plan_command(&guard, &headers, &envelope, extension_ref(&extension))
+        if let Err(response) =
+            plan_command(&guard, &headers, &envelope, extension_ref(&extension), None)
         {
             return response;
         }
@@ -4414,7 +4592,8 @@ async fn submit_sso_browser_test_start(
             ("saml", launch.launch_url)
         }
     };
-    let mut plan = match plan_command(&guard, &headers, &envelope, extension_ref(&extension)) {
+    let mut plan = match plan_command(&guard, &headers, &envelope, extension_ref(&extension), None)
+    {
         Ok(plan) => plan,
         Err(response) => return response,
     };
@@ -4680,13 +4859,14 @@ async fn verify_domain_review_evidence(
     id: &str,
     body: &ReviewBody,
     extension: Option<&AdministrationGaugeAppExtensionHandle>,
+    prefetched: Option<&PrefetchedAdmission>,
 ) -> Result<(), Response> {
     if body.decision != "accept" {
         return Ok(());
     }
     let domain = {
         let guard = wb.lock_unpoisoned();
-        let (session, _) = build_session(&guard, headers, extension)?;
+        let (session, _) = build_session_prefetched(&guard, headers, extension, prefetched)?;
         if body.session_id != session.id
             || body.generation != session.generation
             || body.app != GAUGEAPP
@@ -5123,6 +5303,308 @@ mod tests {
         .await;
         assert_ne!(status, StatusCode::OK);
         assert_eq!(prefetches.lock().unwrap().len(), 2);
+    }
+
+    /// `(phase, command, what it was handed)`.
+    type Handed = Arc<Mutex<Vec<(String, String, Option<String>)>>>;
+
+    /// Reads its page, and what each command needs, outside the Workbench
+    /// lock, and records whether the lock was free and what reached the plan
+    /// and the application.
+    struct CommandPrefetchingExtension {
+        hub: SharedWorkbench,
+        /// `(what was read, whether the Hub lock was free)`.
+        reads: Arc<Mutex<Vec<(String, bool)>>>,
+        handed: Handed,
+        /// Projections made with nothing read before the lock.
+        unprefetched: Arc<Mutex<usize>>,
+    }
+
+    impl CommandPrefetchingExtension {
+        fn read(&self, what: String) -> Option<AdministrationPrefetch> {
+            self.reads
+                .lock()
+                .unwrap()
+                .push((what.clone(), self.hub.try_lock().is_ok()));
+            Some(AdministrationPrefetch(Box::new(what)))
+        }
+
+        fn hand(&self, phase: &str, command: &str, prefetched: Option<&AdministrationPrefetch>) {
+            self.handed.lock().unwrap().push((
+                phase.into(),
+                command.into(),
+                prefetched
+                    .and_then(|prefetched| prefetched.0.downcast_ref::<String>())
+                    .cloned(),
+            ));
+        }
+    }
+
+    impl AdministrationGaugeAppExtension for CommandPrefetchingExtension {
+        fn prefetch(
+            &self,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            _capabilities: &[Capability],
+        ) -> Option<AdministrationPrefetch> {
+            self.read("page".into())
+        }
+
+        fn prefetch_command(
+            &self,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            _capabilities: &[Capability],
+            command: &GaugeAppCommandEnvelope,
+        ) -> Option<AdministrationPrefetch> {
+            self.read(format!("command {}", command.command_id))
+        }
+
+        fn requires_external_review(&self, command_id: &str) -> bool {
+            command_id == "backup.external"
+        }
+
+        fn apply_external_review(
+            &self,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _approved: &ApprovedAdministrationChange,
+            plan: AdministrationMutationPlan,
+        ) -> Result<ExternalReviewOutcome, AdministrationExtensionError> {
+            Ok(ExternalReviewOutcome::Applied(plan))
+        }
+
+        fn project(
+            &self,
+            _wb: &Workbench,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            _capabilities: &[Capability],
+        ) -> Result<Vec<AdministrationExtensionPage>, AdministrationExtensionError> {
+            *self.unprefetched.lock().unwrap() += 1;
+            let mut page = prefetch_page(json!({}));
+            page.commands = ["backup.check", "backup.enable", "backup.external"]
+                .into_iter()
+                .map(|id| AdministrationExtensionCommand {
+                    id: id.into(),
+                    capability: Capability::ConfigureSecurity,
+                    review: if id == "backup.check" {
+                        ReviewPolicy::Immediate
+                    } else {
+                        ReviewPolicy::Human
+                    },
+                })
+                .collect();
+            Ok(vec![page])
+        }
+
+        fn project_prefetched(
+            &self,
+            wb: &Workbench,
+            tenant_id: &str,
+            store_scope: &str,
+            actor: &str,
+            capabilities: &[Capability],
+            prefetched: Option<&AdministrationPrefetch>,
+        ) -> Result<Vec<AdministrationExtensionPage>, AdministrationExtensionError> {
+            let pages = self.project(wb, tenant_id, store_scope, actor, capabilities);
+            if prefetched.is_some() {
+                *self.unprefetched.lock().unwrap() -= 1;
+            }
+            pages
+        }
+
+        fn plan(
+            &self,
+            _wb: &Workbench,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            _command: &GaugeAppCommandEnvelope,
+        ) -> Result<Option<AdministrationMutationPlan>, AdministrationExtensionError> {
+            unreachable!("the adapter plans through plan_prefetched")
+        }
+
+        fn plan_prefetched(
+            &self,
+            _wb: &Workbench,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            command: &GaugeAppCommandEnvelope,
+            prefetched: Option<&AdministrationPrefetch>,
+        ) -> Result<Option<AdministrationMutationPlan>, AdministrationExtensionError> {
+            self.hand("plan", &command.command_id, prefetched);
+            Ok(Some(AdministrationMutationPlan {
+                facts: Vec::new(),
+                notices: Vec::new(),
+                audit_action: "backup.command",
+                audit_target: "backup".into(),
+                transient_result: None,
+            }))
+        }
+
+        fn apply_prefetched(
+            &self,
+            _wb: &Workbench,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            command: &GaugeAppCommandEnvelope,
+            _operation_key: &str,
+            mut plan: AdministrationMutationPlan,
+            prefetched: Option<&AdministrationPrefetch>,
+        ) -> Result<AdministrationMutationPlan, AdministrationExtensionError> {
+            self.hand("apply", &command.command_id, prefetched);
+            plan.transient_result = prefetched
+                .and_then(|prefetched| prefetched.0.downcast_ref::<String>())
+                .map(|read| json!({ "read": read }));
+            Ok(plan)
+        }
+    }
+
+    /// WS-860: every Administration request that rebuilds the session reads
+    /// the composition's page state with the Workbench lock free — not only
+    /// opens, pages and polls — and a command, submitted or reviewed, reads
+    /// what it needs before the lock is taken to decide it. The plan and the
+    /// application receive what was read for that exact command.
+    #[tokio::test]
+    async fn every_rebuild_and_command_reads_outside_the_lock() {
+        let (_dir, shared, _app) = test_app();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let unprefetched = Arc::new(Mutex::new(0));
+        let extension: AdministrationGaugeAppExtensionHandle =
+            Arc::new(CommandPrefetchingExtension {
+                hub: shared.clone(),
+                reads: reads.clone(),
+                handed: handed.clone(),
+                unprefetched: unprefetched.clone(),
+            });
+        let app = routes()
+            .layer(Extension(extension))
+            .with_state(shared.clone());
+        let session = open(&app).await;
+        let query = format!(
+            "session={}&generation={}&scope={}",
+            session["id"].as_str().unwrap(),
+            session["generation"].as_str().unwrap(),
+            session["scope"]["id"].as_str().unwrap(),
+        );
+        for uri in [
+            format!("/gaugeapps/administration/agent/messages?{query}"),
+            format!("/gaugeapps/administration/proposals?{query}"),
+        ] {
+            let (status, body) = request(&app, Method::GET, &uri, Value::Null, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
+        let basis = session["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|page| page["id"] == "backups")
+            .unwrap()["resource_basis"]
+            .clone();
+        let envelope = |command: &str, key: &str| {
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "page_id": "backups", "command_id": command,
+                "expected_basis": basis, "idempotency_key": key,
+                "payload": {}, "client": "web",
+            })
+        };
+        let (status, checked) = request(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/commands",
+            envelope("backup.check", "prefetch-check"),
+            Some("prefetch-check"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{checked}");
+        assert_eq!(checked["receipt"]["status"], "applied", "{checked}");
+        assert_eq!(
+            checked["result"]["read"], "command backup.check",
+            "{checked}"
+        );
+        // A reviewed command, and one whose review hands it to an external
+        // authority and rebuilds the session once that answers.
+        for command in ["backup.enable", "backup.external"] {
+            let key = format!("prefetch-{command}");
+            let (status, proposed) = request(
+                &app,
+                Method::POST,
+                "/gaugeapps/administration/commands",
+                envelope(command, &key),
+                Some(&key),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{proposed}");
+            assert_eq!(proposed["receipt"]["status"], "proposed", "{proposed}");
+            let review = json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "decision": "accept", "client": "web",
+            });
+            let (status, applied) = request(
+                &app,
+                Method::POST,
+                &format!(
+                    "/gaugeapps/administration/proposals/{}/review",
+                    proposed["proposal"]["id"].as_str().unwrap()
+                ),
+                review,
+                Some(&format!("{key}-review")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{applied}");
+            assert_eq!(applied["receipt"]["status"], "applied", "{applied}");
+        }
+
+        let reads = reads.lock().unwrap().clone();
+        assert!(
+            reads.iter().all(|(_, unlocked)| *unlocked),
+            "every read ran with the Workbench lock free: {reads:?}"
+        );
+        let pages = reads.iter().filter(|(what, _)| what == "page").count();
+        assert_eq!(
+            pages, 8,
+            "open, messages, proposals and five commands: {reads:?}"
+        );
+        assert_eq!(
+            *unprefetched.lock().unwrap(),
+            0,
+            "no session was rebuilt under the lock without what was read before it"
+        );
+        let commands = reads
+            .iter()
+            .filter(|(what, _)| what.starts_with("command "))
+            .map(|(what, _)| what.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            vec![
+                "command backup.check",
+                "command backup.enable",
+                "command backup.enable",
+                "command backup.external",
+                "command backup.external",
+            ]
+        );
+        let handed = handed.lock().unwrap().clone();
+        assert!(
+            handed
+                .iter()
+                .all(|(_, command, read)| read.as_deref() == Some(&format!("command {command}"))),
+            "the plan and application had the read for their exact command: {handed:?}"
+        );
+        assert!(handed
+            .iter()
+            .any(|(phase, command, _)| phase == "apply" && command == "backup.check"));
     }
 
     struct TestModelProviderExtension(Arc<Mutex<Value>>);

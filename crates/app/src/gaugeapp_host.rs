@@ -164,14 +164,32 @@ pub trait GaugeAppDefinition: 'static {
     /// Work the definition does before its locked [`Self::context`] rebuild,
     /// with no lock on the Workbench held, on a blocking thread: reading state
     /// that lives outside this Workbench's store. What it learns travels in the
-    /// services it returns. Opening a session, reading a page and polling for
-    /// updates prepare; other requests rebuild with the services as captured.
+    /// services it returns. Every request that rebuilds the context prepares
+    /// first — session opens, page reads, update polls, the conversation's
+    /// messages, events, stop and erase, each context an agent turn rebuilds,
+    /// and proposal lists — and commands and reviews through
+    /// [`Self::prepare_command`] (WS-860).
     fn prepare(
         _wb: &SharedWorkbench,
         _headers: &HeaderMap,
         services: Self::Services,
     ) -> Self::Services {
         services
+    }
+
+    /// [`Self::prepare`] for a request that carries a command — a submitted
+    /// command or a reviewed proposal — before the locked rebuild, admission,
+    /// planning and application of `envelope`. A definition whose command
+    /// reads outside state while it plans or applies reads it here instead,
+    /// and must use what it read only for this exact command. The default
+    /// prepares as for any other request.
+    fn prepare_command(
+        wb: &SharedWorkbench,
+        headers: &HeaderMap,
+        _envelope: &GaugeAppCommandEnvelope,
+        services: Self::Services,
+    ) -> Self::Services {
+        Self::prepare(wb, headers, services)
     }
 
     /// Retained transports declare their existing session and cursor encoding.
@@ -861,6 +879,44 @@ async fn prepared<D: GaugeAppDefinition>(
         .unwrap_or(captured)
 }
 
+/// Run [`GaugeAppDefinition::prepare_command`] for `envelope` on a blocking
+/// thread, outside the Workbench lock.
+async fn prepared_command<D: GaugeAppDefinition>(
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+    envelope: &GaugeAppCommandEnvelope,
+    services: D::Services,
+) -> D::Services {
+    if !D::prepares(&services) {
+        return services;
+    }
+    let captured = services.clone();
+    let wb = wb.clone();
+    let headers = headers.clone();
+    let envelope = envelope.clone();
+    tokio::task::spawn_blocking(move || D::prepare_command(&wb, &headers, &envelope, services))
+        .await
+        .unwrap_or(captured)
+}
+
+/// [`prepared`], or for `command` [`prepared_command`], from a thread that
+/// may already block, such as an agent turn.
+fn prepared_now<D: GaugeAppDefinition>(
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+    command: Option<&GaugeAppCommandEnvelope>,
+    services: &D::Services,
+) -> D::Services {
+    if !D::prepares(services) {
+        return services.clone();
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
+        Some(command) => D::prepare_command(wb, headers, command, services.clone()),
+        None => D::prepare(wb, headers, services.clone()),
+    }))
+    .unwrap_or_else(|_| services.clone())
+}
+
 async fn open_session<D: GaugeAppDefinition>(
     State(wb): State<SharedWorkbench>,
     DefinitionServices(services): DefinitionServices<D>,
@@ -915,6 +971,7 @@ async fn messages<D: GaugeAppDefinition>(
     Query(query): Query<MessagesQuery>,
 ) -> Response {
     let id = path.map(|Path(id)| id).unwrap_or_default();
+    let services = prepared::<D>(&wb, &headers, services).await;
     let mut guard = wb.lock_unpoisoned();
     let context = match D::context(&guard, &headers, &id, &services) {
         Ok(value) => value,
@@ -1049,6 +1106,7 @@ async fn events<D: GaugeAppDefinition>(
     Query(query): Query<MessagesQuery>,
 ) -> Response {
     let id = path.map(|Path(id)| id).unwrap_or_default();
+    let services = prepared::<D>(&wb, &headers, services).await;
     let thread_id = {
         let guard = wb.lock_unpoisoned();
         let context = match D::context(&guard, &headers, &id, &services) {
@@ -1089,6 +1147,7 @@ async fn stop<D: GaugeAppDefinition>(
     Json(body): Json<Identity>,
 ) -> Response {
     let id = path.map(|Path(id)| id).unwrap_or_default();
+    let services = prepared::<D>(&wb, &headers, services).await;
     let guard = wb.lock_unpoisoned();
     let context = match D::context(&guard, &headers, &id, &services) {
         Ok(value) => value,
@@ -1109,6 +1168,7 @@ async fn erase<D: GaugeAppDefinition>(
     Json(body): Json<EraseBody>,
 ) -> Response {
     let id = path.map(|Path(id)| id).unwrap_or_default();
+    let services = prepared::<D>(&wb, &headers, services).await;
     let opening = {
         let guard = wb.lock_unpoisoned();
         let context = match D::context(&guard, &headers, &id, &services) {
@@ -1253,6 +1313,7 @@ async fn command<D: GaugeAppDefinition>(
     if D::HUMAN_REVIEW {
         return submit_reviewed_command::<D>(wb, headers, envelope, services).await;
     }
+    let services = prepared_command::<D>(&wb, &headers, &envelope, services).await;
     let mut guard = wb.lock_unpoisoned();
     match apply_command_with_services::<D>(&mut guard, &headers, &id, &envelope, &services) {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
@@ -1281,6 +1342,7 @@ async fn submit_reviewed_command<D: GaugeAppDefinition>(
     {
         return response;
     }
+    let services = prepared_command::<D>(&wb, &headers, &envelope, services).await;
     let mut guard = wb.lock_unpoisoned();
     let session = match D::context(&guard, &headers, "", &services) {
         Ok(value) => value.session,
@@ -1488,6 +1550,7 @@ async fn list_changes<D: GaugeAppDefinition>(
     Query(query): Query<SessionQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let services = prepared::<D>(&wb, &headers, services).await;
     let guard = wb.lock_unpoisoned();
     let session = match D::context(&guard, &headers, "", &services) {
         Ok(context) => context.session,
@@ -1522,6 +1585,18 @@ async fn review_change<D: GaugeAppDefinition>(
         Ok(key) => key,
         Err(response) => return response,
     };
+    // An agent's review is refused below before anything is read.
+    let services = if body.client == GaugeAppClient::Agent {
+        services
+    } else {
+        let accepted = (body.decision == "accept")
+            .then(|| reviewed_command::<D>(&wb, &headers, &id, &body, &key))
+            .flatten();
+        match accepted {
+            Some(envelope) => prepared_command::<D>(&wb, &headers, &envelope, services).await,
+            None => prepared::<D>(&wb, &headers, services).await,
+        }
+    };
     if let Err(response) = D::review_evidence(
         wb.clone(),
         headers.clone(),
@@ -1537,6 +1612,36 @@ async fn review_change<D: GaugeAppDefinition>(
         Ok(response) => response,
         Err(job) => job.execute(wb, headers).await,
     }
+}
+
+/// The command a review of proposal `id` would apply, read under a brief lock
+/// so that it can be prepared before the review takes the lock to decide.
+/// The review re-reads the proposal and decides from that alone.
+fn reviewed_command<D: GaugeAppDefinition>(
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+    id: &str,
+    body: &ReviewBody,
+    key: &str,
+) -> Option<GaugeAppCommandEnvelope> {
+    let change = {
+        let guard = wb.lock_unpoisoned();
+        fold_gaugeapp_changes(guard.store_ref(), &D::record_scope(headers))
+            .ok()?
+            .remove(id)?
+    };
+    Some(GaugeAppCommandEnvelope {
+        session_id: body.session_id.clone(),
+        generation: body.generation.clone(),
+        app: D::APP,
+        scope: change.scope,
+        page_id: change.page_id,
+        command_id: change.command_id,
+        expected_basis: change.expected_basis,
+        idempotency_key: key.to_owned(),
+        payload: change.payload,
+        client: body.client,
+    })
 }
 
 // This synchronous phase never carries a Workbench guard into an await.
@@ -1921,6 +2026,7 @@ async fn message<D: GaugeAppDefinition>(
     if let Err(response) = D::message_idempotency(&headers, &body.idempotency_key) {
         return *response;
     }
+    let services = prepared::<D>(&wb, &headers, services).await;
     let (opened, claim, live) = {
         let mut guard = wb.lock_unpoisoned();
         let opened = match D::context(&guard, &headers, &id, &services) {
@@ -2008,8 +2114,9 @@ async fn message<D: GaugeAppDefinition>(
             opened,
             &user,
             || {
+                let services = prepared_now::<D>(&turn_wb, &turn_headers, None, &turn_services);
                 let guard = turn_wb.lock_unpoisoned();
-                D::context(&guard, &turn_headers, &turn_id, &turn_services).map_err(|_| {
+                D::context(&guard, &turn_headers, &turn_id, &services).map_err(|_| {
                     GaugeAppAgentError::Rejected(GaugeAppAgentRejection::SessionRevoked)
                 })
             },
@@ -2022,9 +2129,11 @@ async fn message<D: GaugeAppDefinition>(
                 }
             },
             |current, proposal| {
-                let guard = turn_wb.lock_unpoisoned();
                 let envelope = agent_envelope::<D>(&current.session, proposal, "agent:validation");
-                D::validate_agent(&guard, &turn_headers, current, &envelope, &turn_services)
+                let services =
+                    prepared_now::<D>(&turn_wb, &turn_headers, Some(&envelope), &turn_services);
+                let guard = turn_wb.lock_unpoisoned();
+                D::validate_agent(&guard, &turn_headers, current, &envelope, &services)
             },
             Some(&mut direct),
             &direct_key,
@@ -2057,6 +2166,8 @@ async fn message<D: GaugeAppDefinition>(
             };
         }
     };
+    // The turn may have run for minutes; what was read before it is stale.
+    let services = prepared::<D>(&wb, &headers, services).await;
     let transcript = append_gaugeapp_agent_exchange_prepared_current(
         &wb,
         &opening,

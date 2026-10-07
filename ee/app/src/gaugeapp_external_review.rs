@@ -108,6 +108,18 @@ pub(super) struct ReviewJob {
     approved: ApprovedAdministrationChange,
     extension: AdministrationGaugeAppExtensionHandle,
     task: ReviewTask,
+    /// What the review read outside the Workbench lock for its admission,
+    /// for the session the job rebuilds before disclosing its outcome.
+    prefetched: Option<Arc<PrefetchedAdmission>>,
+}
+
+impl ReviewJob {
+    /// This job, rebuilding its session from what the review read outside
+    /// the lock rather than reading it again under the lock (WS-860).
+    pub(super) fn with_prefetched(mut self, prefetched: Option<Arc<PrefetchedAdmission>>) -> Self {
+        self.prefetched = prefetched;
+        self
+    }
 }
 
 enum ReviewTask {
@@ -210,6 +222,7 @@ pub(super) fn begin(
         approved,
         extension: extension.clone(),
         task: ReviewTask::Apply(plan),
+        prefetched: None,
     })
 }
 
@@ -280,6 +293,7 @@ fn prepare_recovery(
         approved,
         extension: extension.clone(),
         task: ReviewTask::Recover,
+        prefetched: None,
     })
 }
 
@@ -348,6 +362,7 @@ pub(super) async fn execute(wb: SharedWorkbench, headers: HeaderMap, job: Review
         approved,
         extension,
         task,
+        prefetched,
     } = job;
     let call_approval = approved.clone();
     let tenant = tenant_id(&headers);
@@ -400,10 +415,11 @@ pub(super) async fn execute(wb: SharedWorkbench, headers: HeaderMap, job: Review
     };
     // Confirmation belongs in history even if this viewer lost access while
     // the service was working. Rebuild authorization before disclosing it.
-    let current = match build_session(&guard, &headers, Some(&extension)) {
-        Ok((session, _)) => session,
-        Err(response) => return response,
-    };
+    let current =
+        match build_session_prefetched(&guard, &headers, Some(&extension), prefetched.as_deref()) {
+            Ok((session, _)) => session,
+            Err(response) => return response,
+        };
     if let Err(response) = authorize_observation(&current, &change, &approved) {
         return response;
     }
