@@ -1638,7 +1638,7 @@ test("personal key intake clears immediately and cannot report into the next acc
     expect(JSON.stringify(await calls(page))).not.toContain("synthetic-not-a-key");
 });
 
-test("personal provider connections advance from sealed intake through verification, default selection, rename, and revocation", async ({ page }, info) => {
+test("personal provider connections advance from sealed intake through rename and revocation", async ({ page }, info) => {
     await page.goto("/?app=account-settings&provider-lifecycle=1");
     await expect(page.getByRole("heading", { name: "Provider Connections", exact: true, level: 1 })).toBeVisible();
     await click(page, "Add connection");
@@ -1650,15 +1650,9 @@ test("personal provider connections advance from sealed intake through verificat
     await click(page, "Connect");
 
     const row = page.locator(".gaugeapp-provider-row").filter({ hasText: "Research gateway" });
-    await expect(row).toContainText("unverified");
-    const defaultModelPanel = page.locator(".gaugeapp-panel").filter({
-        has: page.getByRole("heading", { name: "Default model", exact: true }),
-    });
-    const defaultModel = defaultModelPanel.locator("select");
-    await expect(defaultModel.locator("option")).toHaveCount(1);
-    await row.getByRole("button", { name: "Verify", exact: true }).click();
-    await expect(row).toContainText("reachable");
-    await expect(defaultModel.locator("option", { hasText: "research-small · Research gateway" })).toHaveCount(1);
+    await expect(row).toContainText("linked");
+    // A key is checked on the device that uses it, not from this page (DR-0360).
+    await expect(row.getByRole("button", { name: "Verify", exact: true })).toHaveCount(0);
 
     await row.getByRole("button", { name: "Rename", exact: true }).click();
     const renameField = page.getByLabel("Rename Research gateway", { exact: true });
@@ -1666,68 +1660,36 @@ test("personal provider connections advance from sealed intake through verificat
     await renameField.locator("xpath=ancestor::div[contains(@class,'gaugeapp-provider-row')]").getByRole("button", { name: "Save", exact: true }).click();
     const renamed = page.locator(".gaugeapp-provider-row").filter({ hasText: "Research models" });
     await expect(renamed).toBeVisible();
-    await defaultModel.selectOption({ label: "research-large · Research models" });
-    await defaultModelPanel.getByRole("button", { name: "Save", exact: true }).click();
-    await expect.poll(async () => await calls(page)).toEqual(expect.arrayContaining([
-        { command: "provider-connection.default-model.set", scope: "A", payload: { connection_id: "openai-generic", model: "research-large" } },
-    ]));
-    await expect(defaultModel).toHaveValue(JSON.stringify(["openai-generic", "research-large"]));
-    await page.screenshot({ path: info.outputPath("provider-connection-default.png"), scale: "css", fullPage: true });
+    await page.screenshot({ path: info.outputPath("provider-connection-linked.png"), scale: "css", fullPage: true });
 
     await renamed.getByRole("button", { name: "Revoke", exact: true }).click();
     await expect(renamed).toContainText("revoked");
     await expect(renamed.getByRole("button", { name: "Rename", exact: true })).toBeDisabled();
-    await expect(renamed.getByRole("button", { name: "Verify", exact: true })).toBeDisabled();
     await expect(renamed.getByRole("button", { name: "Revoke", exact: true })).toBeDisabled();
-    await expect(defaultModel.locator("option")).toHaveCount(1);
     expect(JSON.stringify(await calls(page))).not.toContain("synthetic-provider-secret");
     expect(await calls(page)).toEqual(expect.arrayContaining([
         { intake: "A", command: "provider-connection.compatible.add", length: 25 },
-        { command: "provider-connection.verify", scope: "A", payload: { id: "openai-generic" } },
         { command: "provider-connection.rename", scope: "A", payload: { id: "openai-generic", label: "Research models" } },
-        { command: "provider-connection.default-model.set", scope: "A", payload: { connection_id: "openai-generic", model: "research-large" } },
         { command: "provider-connection.revoke", scope: "A", payload: { id: "openai-generic" } },
     ]));
 });
 
-test("Grok account sign-in stays server-owned and becomes a verified personal connection", async ({ page }, info) => {
-    await page.addInitScript(() => Object.defineProperty(window, "open", {
-        configurable: true,
-        value: (url: string | URL | undefined) => {
-            document.documentElement.dataset.providerWindow = String(url ?? "");
-            return null;
-        },
-    }));
+test("provider account sign-in points to GaugeDesk on the web (DR-0360)", async ({ page }) => {
     await page.goto("/?app=account-settings&provider-lifecycle=1");
     await expect(page.getByRole("heading", { name: "Provider Connections", exact: true, level: 1 })).toBeVisible();
-    const grok = page.locator(".gaugeapp-provider-account-row").filter({ hasText: "Grok" });
-    await grok.getByRole("button", { name: "Sign in", exact: true }).click();
-    await expect(page.locator("html")).toHaveAttribute("data-provider-window", "https://accounts.x.ai/device");
-    await expect(grok.getByText("GROK-4821", { exact: true })).toBeVisible();
-    await expect(grok.getByRole("link", { name: "Open", exact: true })).toHaveAttribute("href", "https://accounts.x.ai/device");
-    await grok.getByRole("button", { name: "I finished", exact: true }).click();
-    await expect(grok).toContainText("Connected");
-    const connection = page.locator(".gaugeapp-provider-row").filter({ hasText: "Grok" });
-    await expect(connection).toContainText("reachable");
-    const defaultModelPanel = page.locator(".gaugeapp-panel").filter({
-        has: page.getByRole("heading", { name: "Default model", exact: true }),
+    const accounts = page.locator(".gaugeapp-panel").filter({
+        has: page.getByRole("heading", { name: "Provider accounts", exact: true }),
     });
-    await expect(defaultModelPanel.locator("select option", { hasText: "grok-4 · Grok" })).toHaveCount(1);
-    await page.screenshot({ path: info.outputPath("grok-account-connected.png"), scale: "css", fullPage: true });
-    expect(await calls(page)).toEqual(expect.arrayContaining([
-        { command: "provider-connection.subscription.begin", scope: "A", payload: { provider: "xai-grok" } },
-        { command: "provider-connection.subscription.complete", scope: "A", payload: { provider: "xai-grok", action: "status" } },
-    ]));
+    await expect(accounts).toContainText("Open GaugeDesk on your computer and sign in from Settings → Model access.");
+    await expect(accounts.getByRole("button")).toHaveCount(0);
+    expect(JSON.stringify(await calls(page))).not.toContain("provider-connection.subscription");
 });
 
 test("Provider Connections exposes only controls admitted by the current session", async ({ page }) => {
     await page.goto("/?app=account-settings&all-pages=1");
     await click(page, "Provider Connections");
     await expect(page.getByRole("button", { name: "Add connection", exact: true })).toHaveCount(0);
-    await expect(page.locator(".gaugeapp-provider-account-row").getByRole("button", { name: "Sign in", exact: true })).toHaveCount(2);
-    for (const button of await page.locator(".gaugeapp-provider-account-row").getByRole("button", { name: "Sign in", exact: true }).all()) {
-        await expect(button).toBeDisabled();
-    }
+    await expect(page.getByRole("button", { name: "Verify", exact: true })).toHaveCount(0);
 });
 
 test("a retired payment session cannot initialize; a mounted one logs out on departure", async ({ page }) => {

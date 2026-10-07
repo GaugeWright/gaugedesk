@@ -68,6 +68,7 @@ type ProjectLens = "chats" | "archetype";
 type ProjectStatus = "active" | "archived" | "all";
 const GROUPING_KEY = "ui.projectsGrouping";
 const STATUS_KEY = "ui.projectsStatus";
+const EXPANDED_KEY = "ui.navExpanded";
 /** The projects filter menu's width; `.facet-filter-menu` in styles.css. */
 const FILTER_MENU_WIDTH = 236;
 
@@ -77,6 +78,15 @@ function readStoredChoice<T extends string>(key: string, allowed: readonly T[], 
         return allowed.find((choice) => choice === value) ?? fallback;
     } catch {
         return fallback;
+    }
+}
+
+function readStoredExpanded(): Set<string> {
+    try {
+        const value: unknown = JSON.parse(window.localStorage?.getItem(EXPANDED_KEY) ?? "[]");
+        return new Set(Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []);
+    } catch {
+        return new Set();
     }
 }
 
@@ -449,8 +459,12 @@ export function FacetBrowser(props: {
     // projection Recent renders; chats absent from it sink to the end in tree order.
     const recentRank = createMemo(() => new Map((tree()?.recent ?? []).map((c, i) => [c.id, i] as const)));
     // Tree groups start collapsed, including groups arriving after the first load.
-    // Explicit expansions are local UI state, like facet/selection.
-    const [expanded, setExpanded] = createSignal<Set<string>>(new Set());
+    // Expansions in Projects and Workshop persist across reloads, like grouping/status.
+    const [expanded, setExpanded] = createSignal<Set<string>>(readStoredExpanded());
+    createEffect(() => {
+        const ids = [...expanded()];
+        try { window.localStorage?.setItem(EXPANDED_KEY, JSON.stringify(ids)); } catch { /* session-only preference */ }
+    });
     const isCollapsed = (id: string) => !expanded().has(id);
     const toggleCollapse = (id: string) =>
         setExpanded((s) => {

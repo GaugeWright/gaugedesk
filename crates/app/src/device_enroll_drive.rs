@@ -81,6 +81,12 @@ pub struct EnrollmentTicket {
     pub session: String,
     pub account_root: String,
     pub broker: String,
+    /// The account whose own root the holder hands over (DR-0361 §1). A new
+    /// device keeps that root only for the same account, so enrolling while
+    /// signed in as someone else cannot file one account's root under another.
+    /// Absent when the root is the install's own key.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account: String,
 }
 
 /// The runtime phase of one enrollment leg (distinct from the pure reducer's
@@ -283,6 +289,33 @@ impl Workbench {
         Holder::new(root, account_key, session)
     }
 
+    /// The holder for `account` when this computer holds that account's own
+    /// keys: it hands the root over with the account key. `None` leaves the
+    /// install's holder, whose root stays here.
+    pub fn account_enroll_holder(&self, account: &str, session: &str) -> Option<Holder> {
+        let keys = self.account_key_store().held(account, now_secs()).ok()??;
+        Some(Holder::handing_over_root(
+            keys.root,
+            keys.account_key,
+            session,
+        ))
+    }
+
+    /// The signed-in account a desktop enrollment request acts for, from its
+    /// account session. `None` off a desktop or without one.
+    pub fn enrolling_account(&self, bearer: Option<&str>) -> Option<String> {
+        if !self.desktop_account_mode() {
+            return None;
+        }
+        self.resolve_account_session(bearer?)
+            .map(|(account, _)| account)
+    }
+
+    /// This computer's per-account key store (DR-0361 §1).
+    pub fn account_key_store(&self) -> crate::account_keys::AccountKeyStore {
+        crate::account_keys::AccountKeyStore::new(self.root_path().join("keys"))
+    }
+
     /// Record the account key a newly-enrolled device recovered over the handshake, and
     /// **adopt it durably at rest** (ADR 0053 §4): held in memory for the running process
     /// *and* persisted, so a restart of the enrolled device still opens the sealed account
@@ -378,17 +411,33 @@ fn device_id(subkey_pubkey: &str) -> String {
 /// Start the **holder** leg (an existing device authorizing a new one). Returns the
 /// ticket to show out-of-band; the leg runs in the background until the human
 /// confirms (or it times out).
-pub fn start_host(wb: &SharedWorkbench, scope: String) -> Option<EnrollmentTicket> {
+///
+/// `account` is the signed-in account enrolling the new device. When this
+/// computer holds that account's own keys, its root goes to the new device;
+/// otherwise the install's key authorizes and stays here.
+pub fn start_host(
+    wb: &SharedWorkbench,
+    scope: String,
+    account: Option<&str>,
+) -> Option<EnrollmentTicket> {
     let session = fresh_session()?;
     let (drive, broker, holder, ticket) = {
         let wb = wb.lock_unpoisoned();
         let drive = wb.enroll_drive();
         let broker = wb.enroll_broker_addr();
-        let holder = wb.enroll_holder(&session);
+        let own = account.and_then(|account| {
+            wb.account_enroll_holder(account, &session)
+                .map(|holder| (account.to_owned(), holder))
+        });
+        let (account, holder) = match own {
+            Some((account, holder)) => (account, holder),
+            None => (String::new(), wb.enroll_holder(&session)),
+        };
         let ticket = EnrollmentTicket {
             session: session.clone(),
             account_root: holder.account_root().as_str().to_string(),
             broker: broker.clone(),
+            account,
         };
         (drive, broker, holder, ticket)
     };
@@ -402,11 +451,18 @@ pub fn start_host(wb: &SharedWorkbench, scope: String) -> Option<EnrollmentTicke
 /// Start the **new-device** leg from a consumed ticket. Returns the session id the
 /// caller polls; the leg runs in the background until the handshake completes (or
 /// is refused / times out).
+///
+/// `account` is the account signed in here. A ticket handing over an
+/// account's own root is refused unless it names that account.
 pub fn start_join(
     wb: &SharedWorkbench,
     scope: String,
     ticket: EnrollmentTicket,
+    account: Option<&str>,
 ) -> Result<String, &'static str> {
+    if !ticket.account.is_empty() && account != Some(ticket.account.as_str()) {
+        return Err("this enrollment is for a different account than the one signed in here");
+    }
     let subkey = fresh_subkey().ok_or("could not mint a device subkey")?;
     let nd = NewDevice::open(ticket.session.clone(), ticket.account_root.clone(), subkey);
     let drive = wb.lock_unpoisoned().enroll_drive();
@@ -414,7 +470,14 @@ pub fn start_join(
     drive.register_join(&ticket.session, leg.clone());
     let wb_task = wb.clone();
     let session = ticket.session.clone();
-    tokio::spawn(run_join_leg(leg, wb_task, scope, ticket.broker, nd));
+    tokio::spawn(run_join_leg(
+        leg,
+        wb_task,
+        scope,
+        ticket.broker,
+        nd,
+        ticket.account,
+    ));
     Ok(session)
 }
 
@@ -498,10 +561,11 @@ async fn run_join_leg(
     scope: String,
     broker: String,
     nd: NewDevice,
+    account: String,
 ) {
     match tokio::time::timeout(
         ENROLL_SESSION_TIMEOUT,
-        join_handshake(&leg, &wb, &scope, &broker, &nd),
+        join_handshake(&leg, &wb, &scope, &broker, &nd, &account),
     )
     .await
     {
@@ -521,6 +585,7 @@ async fn join_handshake(
     scope: &str,
     broker: &str,
     nd: &NewDevice,
+    account: &str,
 ) -> Result<(), String> {
     let mut s = connect_one_shot(broker, token_bytes(&nd.session), OneShotLeg::Joiner)
         .await
@@ -541,14 +606,31 @@ async fn join_handshake(
     s.shutdown().await.map_err(|e| format!("close leg: {e}"))?;
 
     // Verify the delegation chains to the pinned root + unseal the account key.
-    let key = nd
+    let enrolled = nd
         .complete(&auth, now_secs())
         .map_err(|e| format!("enrollment refused: {e:?}"))?;
 
     let own_subkey = nd.subkey_pubkey().as_str().to_string();
     {
         let mut wb = wb.lock_unpoisoned();
-        wb.set_recovered_account_key(key);
+        match enrolled.root {
+            // An account's own root: this computer now holds it, the account
+            // key, and its own device key with the root's delegation.
+            Some(root) if !account.is_empty() => wb
+                .account_key_store()
+                .adopt(
+                    account,
+                    &crate::account_keys::AccountKeys {
+                        root,
+                        account_key: enrolled.account_key,
+                        device: nd.subkey.clone(),
+                        delegation: auth.delegation.clone(),
+                    },
+                )
+                .map_err(|e| format!("keep the account's keys: {e}"))?,
+            Some(_) => return Err("a handed-over root names no account".to_string()),
+            None => wb.set_recovered_account_key(enrolled.account_key),
+        }
         // This device now records itself as an enrolled, trusted device locally.
         let record = DeviceRecord {
             id: device_id(&own_subkey),
@@ -765,6 +847,88 @@ mod tests {
 
         // Keeping the guard alive through both completed phases proves both
         // handshake messages crossed the same binary-WSS fabric.
+        drop(relay);
+    }
+
+    /// DR-0361 §1: an account's own root goes to the new computer, which keeps
+    /// it with the account key and a device key of its own, under that account
+    /// alone. The install-level recovered key is untouched.
+    #[tokio::test]
+    async fn enrollment_hands_an_accounts_own_root_to_the_new_computer() {
+        let relay = gaugedesk_relay_transport::test_relay::TestRelay::bind()
+            .await
+            .unwrap();
+        let holder_dir = tempfile::tempdir().unwrap();
+        let device_dir = tempfile::tempdir().unwrap();
+        let holder_wb = workbench(holder_dir.path());
+        let device_wb = workbench(device_dir.path());
+        holder_wb
+            .lock_unpoisoned()
+            .set_enroll_broker_addr(relay.endpoint().to_owned());
+        let minted = holder_wb
+            .lock_unpoisoned()
+            .account_key_store()
+            .mint("acct-a", now_secs())
+            .unwrap();
+
+        let ticket = start_host(&holder_wb, account::ACCOUNT_SCOPE.into(), Some("acct-a")).unwrap();
+        assert_eq!(ticket.account, "acct-a");
+        assert_eq!(ticket.account_root, minted.root.public_key().as_str());
+        assert_eq!(
+            start_join(
+                &device_wb,
+                account::ACCOUNT_SCOPE.into(),
+                ticket.clone(),
+                Some("acct-b"),
+            ),
+            Err("this enrollment is for a different account than the one signed in here"),
+        );
+        let session = start_join(
+            &device_wb,
+            account::ACCOUNT_SCOPE.into(),
+            ticket,
+            Some("acct-a"),
+        )
+        .unwrap();
+
+        let holder_app = open_control_plane(holder_wb.clone());
+        let device_app = open_control_plane(device_wb.clone());
+        let host_uri = format!("/account/devices/enroll/host/{session}");
+        let join_uri = format!("/account/devices/enroll/join/{session}");
+        assert_eq!(
+            poll_sas(&holder_app, &host_uri).await,
+            poll_sas(&device_app, &join_uri).await
+        );
+        let (st, _) = send(
+            &holder_app,
+            "POST",
+            "/account/devices/enroll/authorize",
+            Some(serde_json::json!({ "session": session })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        poll_phase(&device_app, &join_uri, "completed").await;
+
+        let device = device_wb.lock_unpoisoned();
+        let held = device
+            .account_key_store()
+            .held("acct-a", now_secs())
+            .unwrap()
+            .expect("the new computer holds the account's keys");
+        assert_eq!(held.root.public_key(), minted.root.public_key());
+        assert_eq!(held.account_key, minted.account_key);
+        assert_ne!(
+            held.device.public_key(),
+            minted.device.public_key(),
+            "each computer has a device key of its own"
+        );
+        assert_eq!(held.delegation.subkey, held.device.public_key());
+        assert!(device
+            .account_key_store()
+            .held("acct-b", now_secs())
+            .unwrap()
+            .is_none());
+        assert_eq!(device.recovered_account_key(), None);
         drop(relay);
     }
 

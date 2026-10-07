@@ -1005,6 +1005,9 @@ fn desktop_account_and_local_turns_bind_the_real_task_filer() {
             tenant_scope: crate::org::ORG_SCOPE,
             account_bearer: Some(&token),
             local_operator: false,
+            client_request_id: None,
+            client_author: None,
+            client_attempt: None,
             runtime_command_id: None,
             original_http_command: None,
             harness_factory: Some(crate::engine::TurnHarnessFactory::Custom(Arc::new(
@@ -1047,6 +1050,9 @@ fn desktop_account_and_local_turns_bind_the_real_task_filer() {
             tenant_scope: crate::org::ORG_SCOPE,
             account_bearer: None,
             local_operator: true,
+            client_request_id: None,
+            client_author: None,
+            client_attempt: None,
             runtime_command_id: None,
             original_http_command: None,
             harness_factory: Some(crate::engine::TurnHarnessFactory::Custom(Arc::new(

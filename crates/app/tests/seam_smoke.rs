@@ -104,6 +104,7 @@ fn full_turn_runs_over_workspace_and_harness_trait_objects() {
         thinking: None,
         system_prompt: None,
         credential_capability: None,
+        office_inference: None,
         sandbox: SandboxPolicy::new(vec![chat.path().to_path_buf()]),
         roster: Vec::new(),
     };

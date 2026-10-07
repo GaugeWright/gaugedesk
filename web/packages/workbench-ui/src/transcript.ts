@@ -62,6 +62,7 @@ export const empty: Transcript = { lines: [], openText: null };
 export function reduce(t: Transcript, ev: StreamEvent): Transcript {
     const seq = t.lines.length;
     switch (ev.type) {
+        case "taskcorrelation": return t;
         case "user": {
             const line: TranscriptLine = {
                 seq, tier: "admitted", kind: "user", text: ev.text,
@@ -280,4 +281,20 @@ export function reconcileSegments(
         }
         return seg;
     });
+}
+
+
+/** Pending intent remains operational until its exact authority supplies correlation. */
+export function withPendingTasks(
+    transcript: Transcript,
+    commands: readonly import("./session-composer-controller").PendingTaskCommand[],
+): Transcript {
+    let lines = [...transcript.lines];
+    let openText = transcript.openText;
+    for (const command of commands) {
+        const at = Math.min(Math.max(0, command.baselineLines), lines.length);
+        lines.splice(at, 0, { seq: at, tier: "operational", kind: "user", text: command.text });
+        if (openText !== null && openText >= at) openText += 1;
+    }
+    return { lines: lines.map((line, seq) => line.seq === seq ? line : { ...line, seq }), openText };
 }

@@ -51,6 +51,8 @@ const enterprise = await resolve("GW_E2E_ENTERPRISE", 7882);
 const enterpriseApp = await resolve("GW_E2E_ENTERPRISE_APP", 4174);
 // The stand-in Hub the desktop account handoff redeems against (LOGIN-5).
 const hub = await resolve("GW_E2E_HUB", 7910);
+// The publisher-protocol fixture a Panel deployment publishes to (PANEL-7).
+const edge = await resolve("GW_E2E_EDGE", 7920);
 
 const env = {
     ...process.env,
@@ -61,6 +63,9 @@ const env = {
     GW_E2E_ENTERPRISE: String(enterprise),
     GW_E2E_ENTERPRISE_APP: String(enterpriseApp),
     GW_E2E_HUB: String(hub),
+    GW_E2E_EDGE: String(edge),
+    // The Deploy dialog's default edge is this run's fixture, never production.
+    VITE_PUBLIC_EDGE_ORIGIN: `http://127.0.0.1:${edge}`,
     // The built client talks to THIS run's control plane (overrides SOLO_CONTROL_PLANE).
     VITE_CP_BASE: `http://127.0.0.1:${alice}`,
 };
@@ -107,7 +112,7 @@ if (accountEntryLane) {
 
 console.log(
     `[e2e] ports → alice:${alice} bob:${bob} broker:${broker} preview:${preview} ` +
-        `enterprise:${enterprise} enterpriseApp:${enterpriseApp}`,
+        `enterprise:${enterprise} enterpriseApp:${enterpriseApp} hub:${hub} edge:${edge}`,
 );
 console.log(
     `[e2e] composition at preview origin → ${enterpriseLane ? "enterprise workbench" : "open workbench"}`,
@@ -186,7 +191,7 @@ const steps = [
 // an interrupted run orphaned the harness servers (the broker + control planes + preview) —
 // and enough orphans starve a later run's control plane. Two moves on a signal:
 //   1. kill the step's process group (the Playwright runner + vite build/bddgen);
-//   2. free THIS run's four resolved ports — Playwright spawns its webServers *detached* (their
+//   2. free THIS run's resolved ports — Playwright spawns its webServers *detached* (their
 //      own process groups), so the only reliable way to reap them is by the ports they hold.
 // Both are scoped to this run alone (its group + its ports) — never a name-based sweep (the
 // landmine `control-plane.sh` carried).
@@ -204,7 +209,7 @@ function killGroup(child, signal) {
 
 /** Free this run's own ports (kills whatever's listening on them) — port-scoped, never by name. */
 function freeOwnPorts() {
-    for (const port of [alice, bob, broker, preview, enterprise, enterpriseApp]) {
+    for (const port of [alice, bob, broker, preview, enterprise, enterpriseApp, hub, edge]) {
         try {
             execSync(
                 `fuser -k ${port}/tcp 2>/dev/null || lsof -ti tcp:${port} 2>/dev/null | xargs -r kill -9`,

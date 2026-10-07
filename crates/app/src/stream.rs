@@ -6,10 +6,21 @@
 //! client reducer consumes it directly. Transport is SSE over the same loopback
 //! control plane; a `tokio::broadcast` per engagement fans events to subscribers
 //! (and drops silently when no one listens — events are also durable in the log).
+//!
+//! **Backpressure (SCALE-4).** Each stream buffers at most
+//! [`LIVE_STREAM_SLOTS`] events per subscriber; the bound is in events, not
+//! bytes. A subscriber that falls further behind than that has lost events it
+//! can never be sent, so its stream is closed rather than continued with a
+//! silent gap ([`until_lagged`]). The client's reconnect then refetches the
+//! authoritative snapshot — the durable transcript, or the workspace — on
+//! reopen, which is the same recovery as any other disconnect. A slow consumer
+//! therefore costs the server at most one stream's slots and never an
+//! unbounded queue, and it never shows a transcript with a hole in it.
 
 use gaugedesk_harness::Observation;
 use serde::Serialize;
 use tokio::sync::broadcast;
+use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt};
 
 use crate::library;
 use crate::workbench_state::Workbench;
@@ -20,7 +31,26 @@ use crate::workbench_state::Workbench;
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerEvent {
     /// A durable user message (the task prompt) — admitted run evidence.
-    User { text: String },
+    /// Optional home_id/actor_id name the verified HTTP requester only.
+    User {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_request_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chat_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        home_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor_id: Option<String>,
+    },
+    /// Addressed task-stage evidence, recorded only after its durable admission.
+    TaskCorrelation {
+        home_id: String,
+        actor_id: String,
+        client_request_id: String,
+        chat_id: String,
+        outcome: TaskCorrelationOutcome,
+    },
     /// A durable assistant message (the turn's final text) — admitted run evidence.
     /// `settled_at_unix_ms` is when the turn it belongs to settled, which every
     /// assistant record of that turn shares; records admitted before it was
@@ -82,6 +112,23 @@ pub enum ServerEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskCorrelationOutcome {
+    Accepted,
+    Settled,
+    Refused,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TaskCorrelation {
+    pub home_id: String,
+    pub actor_id: String,
+    pub client_request_id: String,
+    pub chat_id: String,
+    pub outcome: TaskCorrelationOutcome,
+}
+
 impl ServerEvent {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("serialize ServerEvent")
@@ -127,13 +174,29 @@ impl ServerEvent {
     }
 }
 
+/// The per-stream buffer bound: how many events one engagement's (or the
+/// workspace's) live stream holds for its slowest subscriber before that
+/// subscriber lags. Counted in events, not bytes.
+pub const LIVE_STREAM_SLOTS: usize = 256;
+
+/// A subscriber's events, ending at the first lag. A lagged receiver has
+/// irrecoverably missed events, so the stream closes instead of carrying on
+/// with a gap; the client reconnects and refetches its snapshot.
+pub(crate) fn until_lagged<T: Clone + Send + 'static>(
+    receiver: broadcast::Receiver<T>,
+) -> impl Stream<Item = T> {
+    BroadcastStream::new(receiver)
+        .take_while(|message| message.is_ok())
+        .filter_map(|message| message.ok())
+}
+
 impl Workbench {
     /// The broadcast sender for a private engagement's live stream, created on
-    /// demand.
+    /// demand, bounded at [`LIVE_STREAM_SLOTS`].
     pub fn sender(&mut self, id: &str) -> broadcast::Sender<ServerEvent> {
         self.streams
             .entry(id.to_string())
-            .or_insert_with(|| broadcast::channel(256).0)
+            .or_insert_with(|| broadcast::channel(LIVE_STREAM_SLOTS).0)
             .clone()
     }
 
@@ -161,4 +224,12 @@ impl Workbench {
                 op: op.to_string(),
             });
     }
+}
+
+/// HTTP requester verified by the existing Home work authentication boundary.
+/// This addresses a submission; it is not a runtime, provider, or filing actor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskAuthor {
+    pub home_id: String,
+    pub actor_id: String,
 }

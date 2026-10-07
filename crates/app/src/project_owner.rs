@@ -185,7 +185,23 @@ impl ProjectOwnerResolver {
         let Ok(library) = crate::library::Library::rebuild(store) else {
             return BTreeSet::new();
         };
-        self.account_project_ids_in(&library, &self.legacy_owner(store), account, org)
+        let mut ids =
+            self.account_project_ids_in(&library, &self.legacy_owner(store), account, org);
+        // A Hub holds only the reservation of an organization's shared
+        // project; the project itself is on its Home. The reservation is read
+        // from the organization's own directory scope, and unreadable
+        // reservation evidence adds nothing.
+        for organization in administered_organizations(account, org) {
+            if org.scope != crate::org::tenant_scope(&organization) {
+                continue;
+            }
+            if let Ok(Some(intent)) =
+                crate::tenancy::organization_project_intent(store, &organization)
+            {
+                ids.insert(intent.project_id);
+            }
+        }
+        ids
     }
 
     pub(crate) fn account_project_ids_in(
@@ -195,11 +211,13 @@ impl ProjectOwnerResolver {
         account: &str,
         org: &Org,
     ) -> BTreeSet<String> {
+        let administers = administered_organizations(account, org);
         let mut ids: BTreeSet<String> = library
             .projects
             .values()
-            .filter(|project| {
-                self.owner_in(library, project, legacy) == ProjectOwner::Account(account.to_owned())
+            .filter(|project| match self.owner_in(library, project, legacy) {
+                ProjectOwner::Account(owner) => owner == account,
+                ProjectOwner::Organization(organization) => administers.contains(&organization),
             })
             .map(|project| project.id.clone())
             .collect();
@@ -227,9 +245,22 @@ impl ProjectOwnerResolver {
             })
             .map(|member| member.authority.clone())
             .collect();
-        if let ProjectOwner::Account(owner) = self.owner_in(library, project, legacy) {
-            if !owner.is_empty() && owner != "anonymous" {
-                members.insert(owner);
+        match self.owner_in(library, project, legacy) {
+            ProjectOwner::Account(owner) => {
+                if !owner.is_empty() && owner != "anonymous" {
+                    members.insert(owner);
+                }
+            }
+            ProjectOwner::Organization(organization) => {
+                members.extend(
+                    org.members
+                        .values()
+                        .filter(|member| {
+                            administered_organizations(&member.authority, org)
+                                .contains(&organization)
+                        })
+                        .map(|member| member.authority.clone()),
+                );
             }
         }
         members
@@ -580,8 +611,9 @@ impl Workbench {
             .filter(|placement| self.library.instances.contains_key(placement))
     }
 
-    /// The projects `account` reaches as itself: those it owns and those it
-    /// holds a grant to in `org`.
+    /// The projects `account` reaches as itself: those it owns, those it
+    /// holds a grant to in `org`, and the shared projects of an organization
+    /// it is an owner or admin of in `org` (DR-0374).
     pub(crate) fn account_project_ids(&self, account: &str, org: &Org) -> BTreeSet<String> {
         self.project_owner_resolver()
             .account_project_ids(self.store_ref(), account, org)
@@ -593,6 +625,24 @@ impl Workbench {
             legacy_agents: !self.hosted_home_mode() && !crate::workbench_auth::web_account_mode(),
         }
     }
+}
+
+/// The organizations whose own shared projects `account` reaches through its
+/// role in `org`: an active `owner` or `admin` membership reaches the shared
+/// projects of the organization it names, and no other organization's and no
+/// account's (DR-0374, amending DR-0268 §6). Any other role reaches a shared
+/// project only through an explicit grant.
+pub(crate) fn administered_organizations(account: &str, org: &Org) -> BTreeSet<String> {
+    use gaugedesk_core::abac::Role;
+    org.members
+        .values()
+        .filter(|member| {
+            member.authority == account
+                && member.status == crate::org::MembershipStatus::Active
+                && [Role::owner(), Role::admin()].contains(&Role::new(member.role.as_str()))
+        })
+        .map(|member| member.org_id.clone())
+        .collect()
 }
 
 /// Refuse a request carrying an account session that names a project the

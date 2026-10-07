@@ -1402,6 +1402,16 @@ fn retained_sessions(wb: &SharedWorkbench) -> std::collections::BTreeMap<String,
     sessions
 }
 
+/// The accounts signed in on this computer whose sessions have not lapsed.
+pub(crate) fn signed_in_accounts(wb: &SharedWorkbench) -> Vec<String> {
+    let now = now_ms();
+    retained_sessions(wb)
+        .into_values()
+        .filter(|record| record.expires > now)
+        .map(|record| record.person)
+        .collect()
+}
+
 fn write_session_kind(
     wb: &SharedWorkbench,
     kind: &str,
@@ -1706,8 +1716,20 @@ pub async fn announce_directory_root(wb: &SharedWorkbench) -> bool {
     let Some(bearer) = hub_session_token(wb) else {
         return false;
     };
+    // An account that holds its own root announced it when it moved to it
+    // (DR-0361 §3); the install key is not put back in its place.
+    let person = latest_session(wb)
+        .map(|record| record.person)
+        .unwrap_or_default();
     let root = {
         let workbench = wb.lock_unpoisoned();
+        if workbench
+            .account_key_store()
+            .held(&person, 0)
+            .is_ok_and(|keys| keys.is_some())
+        {
+            return false;
+        }
         workbench.library_sync_root()
     };
     if root.is_empty() {
@@ -1960,8 +1982,22 @@ pub async fn post_signin_callback(
             return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in task panicked").into_response();
         }
     };
+    let superseded = superseded_device(&wb, &session);
     match store_session_with_selection(&wb, &session, Some(selection_revision)) {
         Ok((record, selected)) => {
+            // This desktop signing in to an account again is the same device,
+            // so it retires the trusted device its previous session made.
+            // Otherwise every sign-in leaves one more device in the person's
+            // list, and the account keeps sealing their provider links for
+            // each (DR-0334).
+            if let (Some(device), Some(hub)) = (superseded, hub_base()) {
+                let bearer = session.account_session.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = revoke_superseded_device(&hub, &bearer, &device) {
+                        tracing::warn!("could not retire this desktop's previous device: {error}");
+                    }
+                });
+            }
             // A switch during the browser leg retains the arriving session
             // without replacing the account the person chose in the meantime.
             if selected {
@@ -1971,12 +2007,53 @@ pub async fn post_signin_callback(
             // The account's provider links reach this device now, whichever
             // account the window shows (DR-0334).
             crate::account_links_sync::spawn_reconcile(&wb, &record.person, true);
+            // Signing in makes this computer reachable for the account, with
+            // nothing further to choose (DR-0359 §3).
+            crate::account_publish::spawn_publish(&wb, &record.person);
             Json(status_json(Some(&record), true)).into_response()
         }
         Err(message) => {
             tracing::warn!("hub-session seal failed: {message}");
             (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
         }
+    }
+}
+
+/// The trusted device this desktop's previous session for the same account
+/// was bound to, when a new sign-in replaces it with another.
+fn superseded_device(wb: &SharedWorkbench, session: &RedeemedHubSession) -> Option<String> {
+    retained_sessions(wb)
+        .remove(&session.person)
+        .map(|previous| previous.device)
+        .filter(|device| !device.trim().is_empty() && *device != session.device)
+}
+
+/// Revoke `device` at the Hub with the new session's bearer: the person
+/// retiring their own device, as Trusted Devices would. Revocation there also
+/// deletes the device's copies of the account's provider links.
+fn revoke_superseded_device(hub: &str, bearer: &str, device: &str) -> Result<(), String> {
+    let path = format!(
+        "/account/devices/{}/revoke",
+        url::form_urlencoded::byte_serialize(device.as_bytes()).collect::<String>()
+    );
+    let headers = [
+        ("authorization".to_string(), format!("Bearer {bearer}")),
+        (
+            "idempotency-key".to_string(),
+            format!("retire-device-{}", crate::org::sha256_hex(device)),
+        ),
+    ];
+    let (status, body) = HttpClient::with_timeout_no_redirects(Duration::from_secs(15))
+        .post_json_headers(
+            &format!("{}{path}", hub.trim_end_matches('/')),
+            &headers,
+            "{}",
+        )?;
+    // Already gone is what was wanted.
+    if (200..300).contains(&status) || status == 404 {
+        Ok(())
+    } else {
+        Err(format!("the Hub answered {status}: {body}"))
     }
 }
 
@@ -2247,8 +2324,15 @@ struct PinnedDirectoryRoot {
 
 /// The Hub identifies the root at first sight. Retain that public key by
 /// account so a later Hub response cannot substitute a different certificate
-/// pin inside an otherwise valid self-signed directory record.
-fn pin_directory_root(wb: &SharedWorkbench, person: &str, root: &str) -> Result<(), String> {
+/// pin inside an otherwise valid self-signed directory record. A different
+/// root is accepted only when `chain` carries signed hand-overs from the
+/// pinned one to it (DR-0361), and is then pinned in its place.
+fn pin_directory_root(
+    wb: &SharedWorkbench,
+    person: &str,
+    root: &str,
+    chain: &[gaugedesk_directory_protocol::RootTransition],
+) -> Result<(), String> {
     let mut guard = wb.lock_unpoisoned();
     let pinned = guard
         .store_ref()
@@ -2259,11 +2343,12 @@ fn pin_directory_root(wb: &SharedWorkbench, person: &str, root: &str) -> Result<
         .filter_map(|value| serde_json::from_str::<PinnedDirectoryRoot>(&value).ok())
         .find(|pin| pin.id == person);
     if let Some(pin) = pinned {
-        return if pin.root_pubkey == root {
-            Ok(())
-        } else {
-            Err("the selected account's pinned directory root changed".to_string())
-        };
+        if pin.root_pubkey == root {
+            return Ok(());
+        }
+        if !gaugedesk_directory_protocol::root_chain_reaches(&pin.root_pubkey, root, chain) {
+            return Err("the selected account's pinned directory root changed".to_string());
+        }
     }
     let pin = serde_json::to_string(&PinnedDirectoryRoot {
         id: person.to_string(),
@@ -2371,7 +2456,14 @@ fn selected_signed_routes_uncached(
     {
         return Err("the selected account's directory projection mismatched".to_string());
     }
-    pin_directory_root(wb, person, root)?;
+    let chain: Vec<gaugedesk_directory_protocol::RootTransition> = projection
+        .get("transitions")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| "the selected account's root transitions are malformed".to_string())?
+        .unwrap_or_default();
+    pin_directory_root(wb, person, root, &chain)?;
     let origin = projection
         .get("origin")
         .and_then(Value::as_str)
@@ -2387,25 +2479,40 @@ fn selected_signed_routes_uncached(
     {
         return Err("invalid directory origin".to_string());
     }
-    let Some(record) = crate::directory_sync::fetch(&http, origin, root)? else {
-        return Ok(Vec::new());
-    };
-    if record.entry.retracted {
-        return Ok(Vec::new());
+    signed_routes_of(
+        crate::directory_sync::fetch_live_entries(&http, origin, root)?,
+        root,
+    )
+}
+
+/// The routes every computer's entry under `root` signs (DR-0359 §2), a newer
+/// entry's route for a project replacing an older one's. Any entry the root did
+/// not sign refuses them all: nothing but the root writes under it.
+fn signed_routes_of(
+    records: Vec<crate::directory_sync::FetchedRecord>,
+    root: &str,
+) -> Result<Vec<crate::home::OpaqueHomeRoute>, String> {
+    let mut routes: Vec<crate::home::OpaqueHomeRoute> = Vec::new();
+    for record in records {
+        if let Some(declined) = crate::directory_sync::route_trust(&record, root).declined() {
+            return Err(declined.to_string());
+        }
+        for route in record.entry.directory.home_routes {
+            if route.endpoint.is_empty() && route.relay.is_none() {
+                continue;
+            }
+            // A route carrying its project's placement is held to it, against
+            // the project key the account's root-signed entry names (DR-0370).
+            if route.placement.as_ref().is_some_and(|placement| {
+                !gaugedesk_directory_protocol::placement_verifies(&route, &placement.project_key)
+            }) {
+                continue;
+            }
+            routes.retain(|held| held.project != route.project);
+            routes.push(route);
+        }
     }
-    match crate::directory_sync::route_trust(&record, root) {
-        crate::directory_sync::RouteTrust::Signed => Ok(record
-            .entry
-            .directory
-            .home_routes
-            .into_iter()
-            .filter(|route| !route.endpoint.is_empty() || route.relay.is_some())
-            .collect()),
-        declined => Err(declined
-            .declined()
-            .unwrap_or("directory route declined")
-            .to_string()),
-    }
+    Ok(routes)
 }
 
 /// Select a registered Home on the selected Hub account, rather than in the
@@ -2488,6 +2595,9 @@ pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoR
     let Some(active) = latest_session(&wb) else {
         return StatusCode::NO_CONTENT.into_response();
     };
+    // Signing out withdraws this computer's entry for the account, and leaves
+    // its other computers' standing (DR-0359 §3).
+    crate::account_publish::spawn_withdraw(&wb, &active.person);
     let cleared = SessionRecord {
         id: active.id.clone(),
         sealed: String::new(),
@@ -3073,15 +3183,125 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         {
             let wb = crate::open_workbench(root.path()).unwrap();
-            pin_directory_root(&wb, "alice", "root-a").unwrap();
-            pin_directory_root(&wb, "bob", "root-b").unwrap();
+            pin_directory_root(&wb, "alice", "root-a", &[]).unwrap();
+            pin_directory_root(&wb, "bob", "root-b", &[]).unwrap();
         }
         let wb = crate::open_workbench(root.path()).unwrap();
-        pin_directory_root(&wb, "alice", "root-a").unwrap();
-        pin_directory_root(&wb, "bob", "root-b").unwrap();
-        assert!(pin_directory_root(&wb, "alice", "root-b")
+        pin_directory_root(&wb, "alice", "root-a", &[]).unwrap();
+        pin_directory_root(&wb, "bob", "root-b", &[]).unwrap();
+        assert!(pin_directory_root(&wb, "alice", "root-b", &[])
             .unwrap_err()
             .contains("changed"));
+    }
+
+    #[test]
+    fn a_pinned_directory_root_moves_only_along_a_signed_hand_over() {
+        use gaugedesk_directory_protocol::sign_root_transition;
+        let key = |seed: u8| gaugedesk_core::signature::SigningKey::from_seed(&[seed; 32]).unwrap();
+        let (a, b, c) = (key(11), key(12), key(13));
+        let public = |k: &gaugedesk_core::signature::SigningKey| k.public_key().as_str().to_owned();
+        let (ka, kb, kc) = (public(&a), public(&b), public(&c));
+        let ab = sign_root_transition(&kb, 1, &a).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        pin_directory_root(&wb, "alice", &ka, &[]).unwrap();
+
+        // A hand-over the pinned root did not sign moves nothing.
+        let forged = sign_root_transition(&kc, 1, &b).unwrap();
+        assert!(pin_directory_root(&wb, "alice", &kc, &[forged]).is_err());
+
+        pin_directory_root(&wb, "alice", &kb, std::slice::from_ref(&ab)).unwrap();
+        // The new root is pinned now, so it stands without the chain, and the
+        // outgoing one is no longer accepted.
+        pin_directory_root(&wb, "alice", &kb, &[]).unwrap();
+        assert!(pin_directory_root(&wb, "alice", &ka, &[ab]).is_err());
+    }
+
+    #[test]
+    fn every_computers_entry_under_the_root_contributes_its_routes() {
+        let signer = gaugedesk_core::signature::SigningKey::from_seed(&[7u8; 32]).unwrap();
+        let route = |project: &str, endpoint: &str| crate::home::OpaqueHomeRoute {
+            project: project.to_string(),
+            home_id: gaugedesk_core::ids::HomeId::new("home:x"),
+            endpoint: endpoint.to_string(),
+            relay: None,
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+            placement: None,
+        };
+        let record = |device: &str, routes, key: &gaugedesk_core::signature::SigningKey| {
+            let mut entry = crate::directory_sync::signed_put(
+                key,
+                [3u8; 32],
+                &crate::account::Account::default(),
+                1,
+                Vec::new(),
+                routes,
+            )
+            .unwrap()
+            .entry;
+            entry.device = device.to_string();
+            let put = gaugedesk_directory_protocol::sign_entry(entry, key).unwrap();
+            crate::directory_sync::FetchedRecord {
+                entry: put.entry,
+                signature: Some(put.signature),
+            }
+        };
+        let root = signer.public_key().as_str().to_owned();
+        let laptop = record(
+            "laptop",
+            vec![
+                route("p-1", "https://laptop.example"),
+                route("p-2", "https://laptop.example"),
+            ],
+            &signer,
+        );
+        let desktop = record(
+            "desktop",
+            vec![route("p-2", "https://desktop.example"), route("p-3", "")],
+            &signer,
+        );
+        let routes = signed_routes_of(vec![laptop.clone(), desktop], &root).unwrap();
+        let by_project: Vec<_> = routes
+            .iter()
+            .map(|route| (route.project.as_str(), route.endpoint.as_str()))
+            .collect();
+        assert_eq!(
+            by_project,
+            [
+                ("p-1", "https://laptop.example"),
+                ("p-2", "https://desktop.example"),
+            ],
+            "the newer computer's route for a project stands; an unreachable one is dropped"
+        );
+
+        // A route whose placement does not hold is dropped, and the rest kept.
+        let project_key = gaugedesk_core::signature::SigningKey::from_seed(&[5u8; 32]).unwrap();
+        let host_key = gaugedesk_core::signature::SigningKey::from_seed(&[6u8; 32]).unwrap();
+        let placed = gaugedesk_directory_protocol::sign_placement(
+            route("p-4", "https://placed.example"),
+            &project_key,
+            &host_key,
+        )
+        .unwrap();
+        let mut misplaced = placed.clone();
+        misplaced.project = "p-5".into();
+        let checked = record("placed", vec![placed, misplaced], &signer);
+        let kept: Vec<_> = signed_routes_of(vec![checked], &root)
+            .unwrap()
+            .into_iter()
+            .map(|route| route.project)
+            .collect();
+        assert_eq!(kept, ["p-4"]);
+
+        let stranger = gaugedesk_core::signature::SigningKey::from_seed(&[9u8; 32]).unwrap();
+        let foreign = record(
+            "intruder",
+            vec![route("p-1", "https://evil.example")],
+            &stranger,
+        );
+        assert!(signed_routes_of(vec![laptop, foreign], &root).is_err());
     }
 
     #[tokio::test]
@@ -3103,6 +3323,7 @@ mod tests {
             author_authority: String::new(),
             author_root_pubkey: String::new(),
             author_signature: None,
+            placement: None,
         };
         let signed = crate::directory_sync::signed_put(
             &signer,
@@ -3691,6 +3912,80 @@ mod tests {
         .unwrap();
         assert!(selected);
         assert_eq!(hub_session_actor(&wb).as_deref(), Some("dana"));
+    }
+
+    #[test]
+    fn signing_in_again_supersedes_only_this_desktops_previous_device() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let redeemed = |person: &str, device: &str| RedeemedHubSession {
+            account_session: format!("{person}-token"),
+            person: person.to_string(),
+            label: person.to_string(),
+            expires: 4_102_444_800_000,
+            refresh_after: 0,
+            device: device.to_string(),
+        };
+        assert_eq!(superseded_device(&wb, &redeemed("alice", "native-1")), None);
+        store_session_with_selection(&wb, &redeemed("alice", "native-1"), None).unwrap();
+        assert_eq!(
+            superseded_device(&wb, &redeemed("alice", "native-2")).as_deref(),
+            Some("native-1")
+        );
+        assert_eq!(
+            superseded_device(&wb, &redeemed("alice", "native-1")),
+            None,
+            "the same device is not retired"
+        );
+        assert_eq!(
+            superseded_device(&wb, &redeemed("bob", "native-3")),
+            None,
+            "another account's device is not this account's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_device_is_revoked_at_the_hub_with_the_new_session() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let record = seen.clone();
+        let app = axum::Router::new().route(
+            "/account/devices/{id}/revoke",
+            post(
+                move |Path(id): Path<String>, headers: HeaderMap| async move {
+                    let bearer = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    record.lock().unwrap().push((id.clone(), bearer));
+                    if id == "gone" {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::OK
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::task::spawn_blocking({
+            let hub = hub.clone();
+            move || {
+                (
+                    revoke_superseded_device(&hub, "new-token", "native-1"),
+                    revoke_superseded_device(&hub, "new-token", "gone"),
+                )
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, (Ok(()), Ok(())));
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            ("native-1".to_string(), "Bearer new-token".to_string())
+        );
     }
 
     #[test]

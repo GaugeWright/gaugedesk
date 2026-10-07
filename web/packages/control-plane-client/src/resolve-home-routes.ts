@@ -13,7 +13,8 @@
  *   1. Read the account's directory projection — without the root key there is
  *      no path to fetch, because the directory is addressed by that key.
  *   2. Pin it (ADR 0132). First sight records; a *different* key for the same
- *      subject is refused as an alarm rather than adopted.
+ *      subject is refused as an alarm rather than adopted, unless the pinned
+ *      key signed a hand-over to it (DR-0361), when the pin moves.
  *   3. Fetch and verify the record. The signature proves only that whoever
  *      signed holds the key the record names, so it is compared against the pin
  *      — that comparison, not the signature, is what binds the record to this
@@ -31,9 +32,15 @@
 
 import { accountDirectory } from "./control-plane-account";
 import type { RouteJson } from "./control-plane-transport";
-import { directoryVerifierAvailable, verifySignedPut } from "./directory-module";
+import {
+    directoryVerifierAvailable,
+    rootChainReaches,
+    verifySignedPut,
+} from "./directory-module";
 import { parseOpaqueHomeRoutes, type OpaqueHomeRoute } from "./home-routing";
 import {
+    advancePinnedRootKey,
+    pinnedRootKey,
     pinRootKey,
     RootKeyConflict,
     signedHomeRoutes,
@@ -75,6 +82,24 @@ async function hubRoutes(json: RouteJson): Promise<OpaqueHomeRoute[]> {
     return parseOpaqueHomeRoutes(await json("GET", "/account/home-routes"), "unsigned");
 }
 
+/** Move the pin when the pinned root signed its way to `current`. A verifier
+ * that cannot load follows nothing, so the change stays an alarm. */
+async function handedOver(
+    seam: Parameters<typeof pinnedRootKey>[0],
+    current: string,
+    chain: readonly unknown[],
+): Promise<boolean> {
+    const pinned = pinnedRootKey(seam);
+    if (!pinned || chain.length === 0) return false;
+    try {
+        if (!(await rootChainReaches(pinned, current, chain))) return false;
+    } catch {
+        return false;
+    }
+    advancePinnedRootKey(seam, current);
+    return true;
+}
+
 export async function resolveHomeRoutes(
     options: ResolveHomeRoutesOptions,
 ): Promise<ResolvedHomeRoutes> {
@@ -113,7 +138,10 @@ export async function resolveHomeRoutes(
         ...(options.fetchJson ? { fetchJson: options.fetchJson } : {}),
     };
 
-    if (pinRootKey(seam, projection.rootPubkey) === "conflict") {
+    if (
+        pinRootKey(seam, projection.rootPubkey) === "conflict"
+        && !(await handedOver(seam, projection.rootPubkey, projection.transitions))
+    ) {
         options.onRootKeyConflict?.(
             new RootKeyConflict("the account root key changed since this browser first saw it"),
         );

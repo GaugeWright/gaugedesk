@@ -160,6 +160,83 @@ export async function createHomeInvitation(
     };
 }
 
+/** Ask the account service to email an email invitation's link to the
+ * address it is for, naming the inviter by their verified address (DR-0332).
+ * Resolves to the address it was sent to. */
+export async function emailHomeInvitation(json: RouteJson, invite: string): Promise<string> {
+    const value = (await json("POST", "/account/project-invitations/email", { invite })) as {
+        sent_to?: unknown;
+    };
+    return requiredString(value?.sent_to, "the address it was sent to");
+}
+
+/** An invitation still waiting to be accepted. It names whom it is for and
+ * never carries its link, which the Home does not keep (DR-0332). */
+export interface PendingHomeInvitation {
+    readonly id: string;
+    /** The account an invitation chosen from the organization is for. */
+    readonly authority: string;
+    /** The address an email invitation is for. */
+    readonly email: string | null;
+    readonly role: string;
+    readonly expiresAt: number;
+}
+
+/** The project's pending invitations, for whoever may invite to it. */
+export async function listPendingHomeInvitations(
+    json: RouteJson,
+    project: ProjectId,
+): Promise<PendingHomeInvitation[]> {
+    const value = (await json(
+        "GET",
+        `/home/projects/${encodeURIComponent(project)}/invitations`,
+    )) as { invitations?: unknown };
+    if (!Array.isArray(value?.invitations)) return [];
+    return value.invitations.flatMap((raw): PendingHomeInvitation[] => {
+        const row = (raw ?? {}) as Record<string, unknown>;
+        if (typeof row.id !== "string" || !row.id || typeof row.expires_at !== "number") return [];
+        const email = typeof row.email === "string" && row.email ? row.email : null;
+        const authority = typeof row.authority === "string" ? row.authority : "";
+        if (!email && !authority) return [];
+        return [{
+            id: row.id,
+            authority,
+            email,
+            role: typeof row.role === "string" ? row.role : "member",
+            expiresAt: row.expires_at,
+        }];
+    });
+}
+
+/** Withdraw a pending invitation; its link then admits no one. */
+export async function cancelHomeInvitation(json: RouteJson, id: string): Promise<void> {
+    await json("POST", `/home/invitations/${encodeURIComponent(id)}/cancel`, {});
+}
+
+/** A fresh link for a pending invitation. The earlier link stops working. */
+export async function resendHomeInvitation(
+    json: RouteJson,
+    id: string,
+): Promise<CreatedHomeInvitation> {
+    const value = (await json(
+        "POST",
+        `/home/invitations/${encodeURIComponent(id)}/resend`,
+        {},
+    )) as Record<string, unknown>;
+    const parsed = parseHomeInvitation(requiredString(value.invite, "invite"));
+    if (typeof value.expires_at !== "number") {
+        throw new Error("resent Home invitation response is malformed");
+    }
+    return {
+        invite: value.invite as string,
+        url: requiredString(value.url, "URL"),
+        homeId: parsed.homeId,
+        project: parsed.project,
+        endpoint: parsed.endpoint,
+        expiresAt: value.expires_at,
+    };
+}
+
 /** Construct an admitted target transport from a just-accepted invitation. */
 export function acceptedHomeTransport(
     accepted: AcceptedHomeInvitation,

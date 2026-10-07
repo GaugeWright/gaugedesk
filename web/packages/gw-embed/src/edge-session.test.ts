@@ -305,7 +305,7 @@ describe("EdgeSessionApi", () => {
         api.subscribeTurnActivity((activity) => activities.push(activity));
         const turn = api.runEmbedTurn("ignored" as EngagementId, "hello", [
             { mimeType: "image/png", data: "aGVsbG8=" },
-        ]);
+        ], "composed-turn");
         await vi.waitFor(() => expect(sockets[0]!.sent).toHaveLength(1));
         const sent = JSON.parse(sockets[0]!.sent[0]!) as {
             request_id: string;
@@ -315,6 +315,7 @@ describe("EdgeSessionApi", () => {
         };
         expect(sent).toMatchObject({
             type: "send_message",
+            request_id: "composed-turn",
             text: "hello",
             images: [{ media_type: "image/png", data_base64: "aGVsbG8=" }],
         });
@@ -505,9 +506,10 @@ describe("EdgeSessionApi", () => {
                 body: { outcome: "interrupted" },
             }),
         });
-        await expect(turn).resolves.toEqual({ outcome: "interrupted" });
+        await expect(turn).resolves.toEqual({ outcome: "interrupted", correlation: { client_request_id: sent.request_id, chat_id: "sess_0123456789abcdef0123456789abcdef", outcome: "settled" } });
         expect(observedQueues).toEqual([[], ["and then summarize"]]);
         expect(deltas).toEqual([
+            { type: "taskcorrelation", client_request_id: sent.request_id, chat_id: "sess_0123456789abcdef0123456789abcdef", outcome: "accepted" },
             { type: "text", delta: "hi" },
             {
                 type: "tool",
@@ -524,10 +526,11 @@ describe("EdgeSessionApi", () => {
                 result: "contents",
             },
             { type: "text", delta: " after stop request" },
+            { type: "taskcorrelation", client_request_id: sent.request_id, chat_id: "sess_0123456789abcdef0123456789abcdef", outcome: "settled" },
         ]);
         expect(await api.getTranscript("ignored" as EngagementId)).toEqual([
             { type: "assistant", text: "ready" },
-            { type: "user", text: "hello" },
+            { type: "user", text: "hello", client_request_id: sent.request_id, chat_id: "sess_0123456789abcdef0123456789abcdef" },
             { type: "assistant", text: "hi after stop request" },
         ]);
         expect(await api.getTree("ignored" as EngagementId)).toEqual([
@@ -648,7 +651,7 @@ describe("EdgeSessionApi", () => {
                 body: { outcome: "terminal" },
             }),
         });
-        await expect(turn).resolves.toEqual({ outcome: "terminal" });
+        await expect(turn).resolves.toEqual({ outcome: "terminal", correlation: { client_request_id: sent.request_id, chat_id: "sess_0123456789abcdef0123456789abcdef", outcome: "settled" } });
     });
 
     it("retries an interrupted turn with the same request id after reconnect", async () => {
@@ -729,7 +732,7 @@ describe("EdgeSessionApi", () => {
                 body: { outcome: "completed" },
             }),
         });
-        await expect(turn).resolves.toEqual({ outcome: "completed" });
+        await expect(turn).resolves.toEqual({ outcome: "completed", correlation: { client_request_id: first.request_id, chat_id: "sess_0123456789abcdef0123456789abcdef", outcome: "settled" } });
         api.dispose();
         vi.useRealTimers();
     });

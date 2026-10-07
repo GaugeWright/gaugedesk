@@ -90,6 +90,10 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
             "/account/directory",
             get(get_account_directory).post(post_account_directory),
         )
+        .route(
+            "/account/directory/challenge",
+            post(post_account_directory_challenge),
+        )
         .merge(managed_inference_routes())
 }
 
@@ -474,6 +478,7 @@ pub async fn get_account_directory(
                 StatusCode::OK,
                 Json(json!({
                     "root_pubkey": record.root_pubkey,
+                    "transitions": record.transitions,
                     "subject": subject,
                     "origin": if record.origin.is_empty() {
                         crate::directory_sync::DIRECTORY_URL.to_owned()
@@ -498,6 +503,53 @@ pub struct AccountDirectoryBody {
     root_pubkey: String,
     #[serde(default)]
     origin: String,
+    /// The outgoing root's signed hand-over, when this replaces the projected
+    /// root (ADR 0133 §3).
+    #[serde(default)]
+    transition: Option<gaugedesk_directory_protocol::RootTransition>,
+    /// That an enrolled device of this account publishes the root, over a
+    /// challenge from [`post_account_directory_challenge`] (ADR 0133 §2).
+    #[serde(default)]
+    proof: Option<crate::root_publication::PublicationProof>,
+}
+
+/// `POST /account/directory/challenge` — a single-use challenge a device
+/// signs to publish the account's root (ADR 0133 §2).
+pub async fn post_account_directory_challenge(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let account = wb.lock_unpoisoned().actor(net_http::bearer(&headers));
+    match crate::root_publication::issue_challenge(&account) {
+        Some(challenge) => {
+            (StatusCode::OK, Json(json!({ "challenge": challenge }))).into_response()
+        }
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not issue a challenge",
+        )
+            .into_response(),
+    }
+}
+
+/// The device record the bearer's session is bound to, if any.
+fn session_device(
+    wb: &crate::Workbench,
+    bearer: Option<&str>,
+    scope: &str,
+) -> Option<crate::account::DeviceRecord> {
+    let session = crate::account_session::session_id(bearer?);
+    let device_id = crate::account_auth::AccountAuth::rebuild(wb.store_ref())
+        .ok()?
+        .sessions
+        .get(&session)
+        .map(|record| record.device_id.clone())
+        .filter(|id| !id.is_empty())?;
+    crate::account::Account::rebuild_in(wb.store_ref(), scope)
+        .ok()?
+        .devices
+        .get(&device_id)
+        .cloned()
 }
 
 /// `POST /account/directory` — publish the account root's public half.
@@ -518,14 +570,97 @@ pub async fn post_account_directory(
     if root.is_empty() {
         return (StatusCode::BAD_REQUEST, "root_pubkey is required").into_response();
     }
+    let mut wb = wb.lock_unpoisoned();
+    let bearer = net_http::bearer(&headers);
+    let scope = wb.account_scope_for(bearer);
+    let projected = crate::account::Account::rebuild_in(wb.store_ref(), &scope)
+        .ok()
+        .and_then(|account| account.directory);
+    // A publication may carry ADR 0133 §2's proof. One that does is held to
+    // it; one that does not is still taken, as before, until every released
+    // desktop sends one.
+    let mut prove_device = None;
+    if let Some(proof) = &body.proof {
+        let continues = match projected.as_ref() {
+            None => true,
+            Some(record) if record.root_pubkey == root => true,
+            Some(record) => body.transition.as_ref().is_some_and(|transition| {
+                transition.from == record.root_pubkey
+                    && transition.to == root
+                    && gaugedesk_directory_protocol::root_transition_verifies(transition)
+            }),
+        };
+        let device = session_device(&wb, bearer, &scope);
+        let carried = device
+            .as_ref()
+            .map(|device| device.subkey_pubkey.clone())
+            .unwrap_or_default();
+        match crate::root_publication::verify(
+            proof,
+            &wb.actor(bearer),
+            &root,
+            &carried,
+            continues,
+            crate::account::device_enrolled_at_now(),
+        ) {
+            Ok(subkey) => {
+                prove_device =
+                    device
+                        .filter(|device| device.subkey_pubkey.is_empty())
+                        .map(|device| crate::account::DeviceRecord {
+                            subkey_pubkey: subkey.as_str().to_owned(),
+                            ..device
+                        });
+            }
+            Err(refusal) => return (StatusCode::FORBIDDEN, refusal.reason()).into_response(),
+        }
+    } else {
+        tracing::warn!("account root published without a device's proof");
+    }
+    // The chain of signed hand-overs is kept across every write. A replacement
+    // that carries the outgoing root's statement extends it; one that does not
+    // is still taken, as before, until an account can recover its root
+    // (DR-0361 §3) — clients then raise the changed-root alarm, as today.
+    let mut transitions = projected
+        .as_ref()
+        .map(|record| record.transitions.clone())
+        .unwrap_or_default();
+    if let Some(previous) = projected
+        .as_ref()
+        .filter(|record| record.root_pubkey != root)
+    {
+        match body.transition {
+            Some(transition)
+                if transition.from == previous.root_pubkey
+                    && transition.to == root
+                    && gaugedesk_directory_protocol::root_transition_verifies(&transition) =>
+            {
+                transitions.push(transition);
+            }
+            Some(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "the root transition is not the projected root's signed hand-over to this one",
+                )
+                    .into_response();
+            }
+            None => tracing::warn!("account root replaced without a signed transition"),
+        }
+    }
     let record = crate::account::AccountDirectoryRecord {
         id: crate::account::DIRECTORY_RECORD_ID.to_owned(),
         op: RecordOp::Upsert,
         root_pubkey: root,
         origin: body.origin.trim().trim_end_matches('/').to_owned(),
+        transitions,
     };
-    let mut wb = wb.lock_unpoisoned();
-    let scope = wb.account_scope_for(net_http::bearer(&headers));
+    // The proving device's record takes its subkey on this first write; every
+    // later publication must come from that subkey.
+    if let Some(device) = prove_device {
+        if let Err(error) = wb.upsert_account_device_in(&scope, &device) {
+            return err_response(error);
+        }
+    }
     match wb.write_account_record_in(
         &scope,
         crate::account::DIRECTORY_RECORD_KIND,
@@ -1281,6 +1416,141 @@ mod home_directory_tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// DR-0361 §1: a replacement carrying the outgoing root's signed hand-over
+    /// extends the chain a client follows; a statement that is not that
+    /// ADR 0133 §2: a publication carrying a device's proof is held to it.
+    #[tokio::test]
+    async fn a_root_published_with_a_proof_is_held_to_it() {
+        use gaugedesk_core::delegation::DeviceDelegation;
+        use gaugedesk_core::signature::SigningKey;
+        let dir = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(dir.path()).unwrap();
+        let app = routes().with_state(wb);
+        let root = SigningKey::from_seed(&[1; 32]).unwrap();
+        let subkey = SigningKey::from_seed(&[2; 32]).unwrap();
+        let root_key = root.public_key().as_str().to_owned();
+        let delegation = DeviceDelegation::issue(
+            &root,
+            subkey.public_key(),
+            crate::account::device_enrolled_at_now() + 600,
+        );
+        let challenge = || async {
+            let (status, body) =
+                call(&app, "POST", "/account/directory/challenge", Some("{}")).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["challenge"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let post = |proof: crate::root_publication::PublicationProof| {
+            serde_json::json!({ "root_pubkey": root_key, "proof": proof }).to_string()
+        };
+
+        // Signed by a key the root never delegated to.
+        let stray = SigningKey::from_seed(&[3; 32]).unwrap();
+        let forged =
+            crate::root_publication::prove(&challenge().await, &root_key, &stray, &delegation);
+        let (status, _) = call(&app, "POST", "/account/directory", Some(&post(forged))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let proof =
+            crate::root_publication::prove(&challenge().await, &root_key, &subkey, &delegation);
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/directory",
+            Some(&post(proof.clone())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = call(&app, "POST", "/account/directory", Some(&post(proof))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a challenge answers once");
+    }
+
+    /// hand-over is refused, and the chain survives every later write.
+    #[tokio::test]
+    async fn a_signed_root_hand_over_is_kept_and_served() {
+        use gaugedesk_core::signature::SigningKey;
+        let dir = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(dir.path()).unwrap();
+        let app = routes().with_state(wb);
+        let old = SigningKey::from_seed(&[1; 32]).unwrap();
+        let new = SigningKey::from_seed(&[2; 32]).unwrap();
+        let other = SigningKey::from_seed(&[3; 32]).unwrap();
+        let (old_key, new_key) = (
+            old.public_key().as_str().to_owned(),
+            new.public_key().as_str().to_owned(),
+        );
+        let post = |root: &str, transition: Option<serde_json::Value>| {
+            let mut body = serde_json::json!({ "root_pubkey": root });
+            if let Some(transition) = transition {
+                body["transition"] = transition;
+            }
+            body.to_string()
+        };
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/directory",
+            Some(&post(&old_key, None)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "the first root is taken on first use"
+        );
+
+        let forged =
+            gaugedesk_directory_protocol::sign_root_transition(&new_key, 5, &other).unwrap();
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/directory",
+            Some(&post(
+                &new_key,
+                Some(serde_json::to_value(&forged).unwrap()),
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "not the projected root's statement"
+        );
+
+        let signed = gaugedesk_directory_protocol::sign_root_transition(&new_key, 5, &old).unwrap();
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/directory",
+            Some(&post(
+                &new_key,
+                Some(serde_json::to_value(&signed).unwrap()),
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        // Republishing the same root keeps the chain.
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/directory",
+            Some(&post(&new_key, None)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, body) = call(&app, "GET", "/account/directory", None).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["root_pubkey"], new_key);
+        let chain: Vec<gaugedesk_directory_protocol::RootTransition> =
+            serde_json::from_value(value["transitions"].clone()).unwrap();
+        assert!(gaugedesk_directory_protocol::root_chain_reaches(
+            &old_key, &new_key, &chain
+        ));
+    }
+
     /// Latest wins, because an account has one root. A rotated key must replace
     /// rather than accumulate, or a reader would have to choose between two.
     #[tokio::test]
@@ -1547,10 +1817,12 @@ pub async fn post_enroll_host(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let scope = wb
-        .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
-    match crate::device_enroll_drive::start_host(&wb, scope) {
+    let (scope, account) = {
+        let wb = wb.lock_unpoisoned();
+        let bearer = net_http::bearer(&headers);
+        (wb.account_scope_for(bearer), wb.enrolling_account(bearer))
+    };
+    match crate::device_enroll_drive::start_host(&wb, scope, account.as_deref()) {
         Some(ticket) => (StatusCode::OK, Json(json!({ "ticket": ticket }))).into_response(),
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1599,10 +1871,12 @@ pub async fn post_enroll_join(
     headers: HeaderMap,
     Json(body): Json<EnrollJoinBody>,
 ) -> impl IntoResponse {
-    let scope = wb
-        .lock_unpoisoned()
-        .account_scope_for(net_http::bearer(&headers));
-    match crate::device_enroll_drive::start_join(&wb, scope, body.ticket) {
+    let (scope, account) = {
+        let wb = wb.lock_unpoisoned();
+        let bearer = net_http::bearer(&headers);
+        (wb.account_scope_for(bearer), wb.enrolling_account(bearer))
+    };
+    match crate::device_enroll_drive::start_join(&wb, scope, body.ticket, account.as_deref()) {
         Ok(session) => (StatusCode::OK, Json(json!({ "session": session }))).into_response(),
         Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, e).into_response(),
     }

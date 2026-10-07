@@ -7,14 +7,16 @@ import { createMobileSession, MOBILE_COMPOSER_CAPABILITIES } from "./mobile-sess
 
 const CHAT = "chat-1" as EngagementId;
 
-function harness(overrides: { runTask?: () => Promise<unknown> } = {}) {
+function harness(overrides: { runTask?: () => Promise<unknown>; taskIdentity?: () => Promise<{ home_id: string; actor_id: string }> } = {}) {
     const api = {
+        ...(overrides.taskIdentity ? { taskIdentity: overrides.taskIdentity } : {}),
         runTask: vi.fn(overrides.runTask ?? (async () => undefined)),
         stopTurn: vi.fn(async () => ({ stopped: true })),
         getTree: vi.fn(async () => []),
         getFile: vi.fn(async () => ""),
     };
     const [engagementId, setEngagement] = createSignal<EngagementId | null>(CHAT);
+    const [project, setProject] = createSignal<string | null>("project:a");
     const [transcript, setTranscript] = createSignal(emptyTranscript);
     const [connection, setConnection] = createSignal<ConnectionStatus>("active");
     const onSettled = vi.fn();
@@ -25,6 +27,7 @@ function harness(overrides: { runTask?: () => Promise<unknown> } = {}) {
         return createMobileSession({
             api,
             engagementId,
+            project,
             transcript,
             connection,
             selectedFile: () => null,
@@ -35,10 +38,68 @@ function harness(overrides: { runTask?: () => Promise<unknown> } = {}) {
             onStatus: () => undefined,
         });
     });
-    return { session, api, setEngagement, setTranscript, setConnection, onSettled, onSendFailed, dispose };
+    return { session, api, setProject, setEngagement, setTranscript, setConnection, onSettled, onSendFailed, dispose };
 }
 
 describe("createMobileSession", () => {
+    it("keeps the original project while initial requester proof is pending", async () => {
+        let release!: (value: { home_id: string; actor_id: string }) => void;
+        const h = harness({ taskIdentity: () => new Promise((resolve) => { release = resolve; }) });
+        const pending = h.session.send("original project", [], "request-1");
+        h.setProject("project:b");
+        release({ home_id: "home:a", actor_id: "person:a" });
+        await expect(pending).rejects.toThrow("Task mobile selection changed");
+        expect(h.api.runTask).not.toHaveBeenCalled();
+        expect(h.session.busy()).toBe(false);
+        h.dispose();
+    });
+
+    it("checks selection again after async requester verification before submission", async () => {
+        let release!: (value: { home_id: string; actor_id: string }) => void;
+        let reads = 0;
+        const proof = { home_id: "home:a", actor_id: "person:a" };
+        const h = harness({ taskIdentity: () => ++reads === 2
+            ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(proof) });
+        const pending = h.session.send("original chat", [], "request-2");
+        await vi.waitFor(() => expect(reads).toBe(2));
+        h.setEngagement("chat-2" as EngagementId);
+        release(proof);
+        await expect(pending).rejects.toThrow("Task mobile selection changed");
+        expect(h.api.runTask).not.toHaveBeenCalled();
+        expect(h.session.busy()).toBe(false);
+        h.dispose();
+    });
+
+    it("does not submit an unbound legacy task after selection changes during persistence", async () => {
+        const h = harness();
+        let release!: () => void;
+        const pending = h.session.send("legacy original", [], "request-3", async () => new Promise<void>((resolve) => { release = resolve; }));
+        h.setProject("project:b");
+        release();
+        await expect(pending).rejects.toThrow("Task mobile selection changed");
+        expect(h.api.runTask).not.toHaveBeenCalled();
+        expect(h.session.busy()).toBe(false);
+        h.dispose();
+    });
+
+    it("does not retire an actual response after project changes during post-response proof", async () => {
+        let release!: (value: { home_id: string; actor_id: string }) => void;
+        let reads = 0;
+        const proof = { home_id: "home:a", actor_id: "person:a" };
+        const h = harness({ taskIdentity: () => ++reads === 3
+            ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(proof),
+            runTask: async () => ({ correlation: { ...proof, chat_id: CHAT, client_request_id: "request-4", outcome: "settled" } }) });
+        const pending = h.session.send("original response", [], "request-4");
+        await vi.waitFor(() => expect(reads).toBe(3));
+        h.setProject("project:b");
+        release(proof);
+        await expect(pending).rejects.toThrow("Task mobile selection changed");
+        expect(h.api.runTask).toHaveBeenCalledTimes(1);
+        expect(h.session.taskCommands!.pending()).toHaveLength(1);
+        expect(h.session.taskCommands!.pending()[0].uncertain).toBe(true);
+        h.dispose();
+    });
+
     it("declares only what the mobile control plane can actually serve", () => {
         // A capability the transport has no route for is how a control becomes
         // silently dead, so neither shared default is usable here.
@@ -69,11 +130,29 @@ describe("createMobileSession", () => {
         h.dispose();
     });
 
-    it("gives a failed send's text back rather than dropping it", async () => {
-        const h = harness({ runTask: async () => { throw new Error("relay dropped"); } });
-        await expect(h.session.send("typed with thumbs", [])).rejects.toThrow("relay dropped");
-        expect(h.onSendFailed).toHaveBeenCalledWith("typed with thumbs");
-        // And the Session settles: a failure must not leave the composer busy.
+    it("keeps an unknown failure under its original identity without restoring a fresh draft", async () => {
+        const failure = new Error("relay dropped");
+        const h = harness({ runTask: async () => { throw failure; } });
+        await expect(h.session.send("typed with thumbs", [], "original-request")).rejects.toBe(failure);
+        expect(h.onSendFailed).not.toHaveBeenCalled();
+        expect(h.session.taskCommands!.pending()).toMatchObject([{ id: "original-request", text: "typed with thumbs", uncertain: true }]);
+        expect(h.api.runTask).toHaveBeenCalledTimes(1);
+        expect(h.session.busy()).toBe(false);
+        h.dispose();
+    });
+
+    it("preserves addressed refusal and its exception without implicitly creating a fresh-ID draft", async () => {
+        const proof = { home_id: "home:a", actor_id: "person:a" };
+        const refusal = Object.assign(new Error("turn already running"), { correlation: {
+            ...proof, chat_id: CHAT, client_request_id: "refused-request", outcome: "refused" } });
+        const h = harness({ taskIdentity: async () => proof, runTask: async () => { throw refusal; } });
+        let captured: import("@gaugewright/workbench-ui/session-composer-controller").TaskCommandAttempt | undefined;
+        await expect(h.session.send("not admitted", [], "refused-request", async (attempt) => { captured = attempt; })).rejects.toBe(refusal);
+        expect(captured!.id).toBe("refused-request");
+        expect(captured!.outcome()).toBe("refused");
+        expect(h.onSendFailed).not.toHaveBeenCalled();
+        expect(h.session.taskCommands!.pending()).toHaveLength(0);
+        expect(h.api.runTask).toHaveBeenCalledTimes(1);
         expect(h.session.busy()).toBe(false);
         h.dispose();
     });

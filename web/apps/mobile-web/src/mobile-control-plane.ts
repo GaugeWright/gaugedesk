@@ -17,6 +17,7 @@ import type {
     WorkspaceDelta,
     ProjectionCarriage,
     CreatedHomeInvitation,
+    PendingHomeInvitation,
     FederationPeer,
     HandoffStatus,
     LinkedProvider,
@@ -67,6 +68,9 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     handoffRelocate: "command",
     handoffRevoke: "command",
     createHomeInvitation: "command",
+    pendingHomeInvitations: "projection",
+    cancelHomeInvitation: "command",
+    resendHomeInvitation: "command",
     setProjectNetworkIsolated: "command",
     projectCredentials: "projection",
     linkProjectCredential: "command",
@@ -98,6 +102,7 @@ export const MOBILE_CONTROL_PLANE_INVENTORY = {
     abandonTargetSettlement: "command",
     cancelTargetSettlement: "command",
     archiveWorkstream: "command",
+    taskIdentity: "projection",
     runTask: "command",
     stopTurn: "command",
     getTranscript: "projection",
@@ -325,6 +330,18 @@ export class MobileControlPlane implements FacetBrowserApi {
         });
     }
 
+    pendingHomeInvitations(project: ProjectId): Promise<PendingHomeInvitation[]> {
+        return workbenchClient.listPendingHomeInvitations(this.routeJson(), project);
+    }
+
+    cancelHomeInvitation(id: string): Promise<void> {
+        return workbenchClient.cancelHomeInvitation(this.routeJson(), id);
+    }
+
+    resendHomeInvitation(id: string): Promise<CreatedHomeInvitation> {
+        return workbenchClient.resendHomeInvitation(this.routeJson(), id);
+    }
+
     setProjectNetworkIsolated(project: ProjectId, isolated: boolean): Promise<void> {
         return workbenchClient.setProjectNetworkIsolated(
             this.workbenchTransport(),
@@ -485,12 +502,21 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.archiveWorkstream(this.workbenchTransport(), ws);
     }
 
+    async taskIdentity(): Promise<{ home_id: string; actor_id: string }> {
+        const identity = await this.route("GET", "/file-actions/actor") as { home?: unknown; actor?: unknown };
+        if (typeof identity.home !== "string" || !identity.home || typeof identity.actor !== "string" || !identity.actor) {
+            throw new Error("Task Home actor proof is unavailable");
+        }
+        return { home_id: identity.home, actor_id: identity.actor };
+    }
+
     runTask(
         id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
+        composedId?: string,
     ): Promise<unknown> {
-        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images);
+        return workbenchClient.runTask(this.workbenchTransport(), id, prompt, images, composedId);
     }
 
     stopTurn(id: EngagementId): Promise<{ stopped: boolean }> {

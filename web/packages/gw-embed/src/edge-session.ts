@@ -125,6 +125,8 @@ export function describeTurnFailure(status: number, reason: string | undefined):
 const RESTORED_EXTERNAL_TOOLS: ReadonlySet<string> = new Set(["ask_choices", "offer_download"]);
 
 export class EdgeSessionApi implements EmbedSessionApi {
+    readonly appliesComposedIdOnce = true;
+    readonly publicSessionCorrelation = true;
     private socket: WebSocket | null = null;
     private openPromise: Promise<WebSocket> | null = null;
     private readonly listeners = new Set<(event: StreamEvent) => void>();
@@ -519,9 +521,12 @@ export class EdgeSessionApi implements EmbedSessionApi {
                     ...this.snapshot,
                     transcript: [
                         ...this.snapshot.transcript,
-                        { type: "user", text: message.text },
+                        { type: "user", text: message.text, ...(typeof message.request_id === "string" ? { client_request_id: message.request_id, chat_id: String(this.sessionId) } : {}) },
                     ],
                 };
+            }
+            if (typeof message.request_id === "string") {
+                for (const listener of this.listeners) listener({ type: "taskcorrelation", client_request_id: message.request_id, chat_id: String(this.sessionId), outcome: "accepted" });
             }
             if (typeof message.parent_request_id === "string") {
                 for (const listener of this.listeners) {
@@ -687,6 +692,12 @@ export class EdgeSessionApi implements EmbedSessionApi {
                 request_id: message.request_id,
                 ...(Number.isSafeInteger(sequence) ? { sequence } : {}),
             });
+            // Only the host's observed terminal proves settlement. A generic error
+            // may have refused the command before admission, or be a transport fault.
+            const correlation = message.type === "turn_terminal"
+                ? { client_request_id: message.request_id, chat_id: String(this.sessionId), outcome: "settled" as const }
+                : undefined;
+            if (correlation) for (const listener of this.listeners) listener({ type: "taskcorrelation", ...correlation });
             this.pendingTurns.delete(message.request_id);
             const status = Number(message.status);
             const assistant = this.assistantText.get(message.request_id) ?? "";
@@ -701,7 +712,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
                         ],
                     };
                 }
-                pending.resolve(message.body);
+                pending.resolve({ ...(message.body as object ?? {}), correlation });
             } else {
                 // The runtime says why in the terminal body — a policy
                 // refusal, a provider failure, a missing credential. A bare
@@ -713,7 +724,7 @@ export class EdgeSessionApi implements EmbedSessionApi {
                     body && typeof body.error === "string" && body.error.trim()
                         ? body.error.trim()
                         : undefined;
-                pending.reject(new Error(describeTurnFailure(status, reason)));
+                pending.reject(Object.assign(new Error(describeTurnFailure(status, reason)), { correlation }));
             }
         }
         return typeof message.type === "string" ? message.type : null;
@@ -973,8 +984,9 @@ export class EdgeSessionApi implements EmbedSessionApi {
         _id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
+        composedId?: string,
     ): Promise<unknown> {
-        const requestId = newIdempotencyKey().replaceAll("-", "_");
+        const requestId = composedId ?? newIdempotencyKey().replaceAll("-", "_");
         this.observeLatency("prompt_submitted", { request_id: requestId });
         const socket = await this.connect();
         const result = new Promise<unknown>((resolve, reject) => {
@@ -1003,8 +1015,9 @@ export class EdgeSessionApi implements EmbedSessionApi {
         id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
+        composedId?: string,
     ): Promise<unknown> {
-        return this.runEmbedTurn(id, prompt, images);
+        return this.runEmbedTurn(id, prompt, images, composedId);
     }
 
     async getTree(_id: EngagementId): Promise<FileEntry[]> {

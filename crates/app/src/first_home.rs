@@ -110,6 +110,8 @@ pub fn attach_if_never_offered(
 
 /// What the authority should be told about this Home, as of now.
 struct Standing {
+    /// The account the computer's Home is registered under.
+    owner: String,
     hub: String,
     bearer: String,
     home_id: String,
@@ -131,6 +133,7 @@ fn standing(
     let bearer = crate::account_signin::hub_session_token_for(wb, &owner)?;
     let guard = wb.lock_unpoisoned();
     Some(Standing {
+        owner,
         hub,
         bearer,
         home_id: guard.home_id().as_str().to_owned(),
@@ -302,7 +305,19 @@ pub fn reconcile(wb: &SharedWorkbench, route: &gaugedesk_relay_transport::RelayR
         Ok(false) => {}
         Err(error) => eprintln!("[first-home] {error}"),
     }
-    match publish_root(&http, &s) {
+    // An account that holds its own root has announced that one, with the
+    // install key's hand-over to it (DR-0361 §3); the install key is not put
+    // back in its place.
+    let own_root = wb
+        .lock_unpoisoned()
+        .account_key_store()
+        .held(&s.owner, 0)
+        .is_ok_and(|keys| keys.is_some());
+    match if own_root {
+        Ok(false)
+    } else {
+        publish_root(&http, &s)
+    } {
         Ok(true) => eprintln!("[first-home] published the account root key for desk to pin"),
         Ok(false) => {}
         Err(error) => eprintln!("[first-home] {error}"),

@@ -120,12 +120,21 @@ function fixtureApi(): EmbedSessionApi {
         },
         engagementDiff: async () => "",
         getMerge: async () => emptyMerge,
-        runEmbedTurn: (_id, prompt, images = []) => {
+        // The runtime's durable User projection names the admitted request and
+        // its Session (WS-459), which is the only fact that confirms a composed
+        // message. A fixture whose User carried text alone would leave every
+        // message it ran held as unconfirmed, as an older runtime still does.
+        publicSessionCorrelation: true,
+        runEmbedTurn: (id, prompt, images = [], composedId) => {
             document.body.dataset.fixtureTurn = JSON.stringify({ prompt, images });
             const turns = JSON.parse(document.body.dataset.fixtureTurns ?? "[]") as unknown[];
             turns.push({ prompt, images });
             document.body.dataset.fixtureTurns = JSON.stringify(turns);
-            durable.push({ type: "user", text: prompt } as StreamEvent);
+            durable.push({
+                type: "user",
+                text: prompt,
+                ...(composedId ? { client_request_id: composedId, chat_id: String(id) } : {}),
+            } as StreamEvent);
             setObservation({ state: "awaiting_model" });
             return new Promise<void>((resolve) => {
                 const turn = { resolve, timers: [] as ReturnType<typeof setTimeout>[] };

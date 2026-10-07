@@ -77,7 +77,10 @@ async function openEngagement(page: Page, projectName: string): Promise<void> {
     await page
         .locator(".tree-node.project", { hasText: projectName })
         .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "share & hand off" }).click();
+    // The Engagement pane opens from project settings' People & sharing page.
+    await page.locator(".menu-item", { hasText: "project settings…" }).click();
+    await page.locator(".project-settings-overview-grid button", { hasText: "People & sharing" }).click();
+    await page.locator("[data-project-engagement]").click();
     await expect(page.locator("[data-engagement-pane]")).toBeVisible();
 }
 
@@ -151,17 +154,29 @@ Given("the two federated workbenches are open", async ({ page, request }) => {
     const invitedProject = page.locator("[data-project]", { hasText: "Invite Engagement" });
     await invitedProject.locator("[data-create='new-project-chat']").click();
     await page.locator(".facet", { hasText: "Projects" }).click();
+    // Projects open folded in the tree; unfold this one to reach its chat.
+    const unfold = invitedProject.getByRole("button", {
+        name: "Expand Invite Engagement",
+        exact: true,
+    });
+    if (await unfold.count()) await unfold.first().click();
     const invitedChat = invitedProject.locator("[data-project-home] .chat-item").first();
     await expect(invitedChat).toBeVisible();
     await invitedChat.click({ button: "right" });
     await page.locator(".menu-item", { hasText: "new workstream" }).click();
     await page.locator(".inline-edit").fill("Federated line");
     await page.locator(".inline-edit").press("Enter");
-    const lens = invitedProject.locator(".tree-node.project .lens-sort");
-    if ((await lens.getAttribute("data-lens")) === "chats") {
-        await lens.click();
-        await page.getByRole("menuitemradio", { name: "Agent view" }).click();
-    }
+    // Grouping is the Projects filter's global control (ADR 0112); a line's
+    // members are shown under it in Agent view.
+    await page.getByRole("button", { name: "Filter projects" }).click();
+    await page.getByRole("menuitem", { name: /Group by/ }).click();
+    await page.getByRole("menuitemradio", { name: "Agent view" }).click();
+    await page.keyboard.press("Escape");
+    // The Default placement that holds the chat opens folded in Agent view.
+    const defaultPlacement = page.getByRole("treeitem", {
+        name: /^Agent Default on Invite Engagement — open its chats$/,
+    });
+    if (await defaultPlacement.count()) await defaultPlacement.first().click();
     await expect(
         invitedProject.locator(".ws-group", {
             has: page.locator(".ws-label-name", { hasText: "Federated line" }),

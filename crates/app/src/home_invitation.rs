@@ -7,7 +7,7 @@
 //! admission used by ordinary work routes. The Hub receives only the resulting
 //! opaque `{project, home_id, endpoint}` route from the browser.
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -31,6 +31,8 @@ const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 enum InvitationStatus {
     Pending,
     Accepted,
+    /// Withdrawn by whoever may invite to its project; it admits no one.
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,7 +115,7 @@ fn decode_envelope(encoded: &str) -> Option<InvitationEnvelope> {
     (envelope.version == INVITATION_VERSION).then_some(envelope)
 }
 
-fn invitation_url(encoded: &str) -> String {
+pub(crate) fn invitation_url(encoded: &str) -> String {
     let console = gaugedesk_env::var("CONSOLE_URL")
         .filter(|url| !url.trim().is_empty())
         .unwrap_or_else(|| "https://desk.gaugewright.com".to_owned());
@@ -131,6 +133,38 @@ fn latest_invitation(store: &gaugedesk_store::Store, id: &str) -> Option<HomeInv
 
 fn json_error(status: StatusCode, message: &'static str) -> axum::response::Response {
     (status, Json(json!({ "error": message }))).into_response()
+}
+
+/// Refuse anyone who may not invite to `project` on this Home, which is also
+/// who may see, cancel and send again its pending invitations.
+fn inviter_refusal(
+    wb: &crate::Workbench,
+    headers: &HeaderMap,
+    project: &str,
+) -> Option<axum::response::Response> {
+    // On a desktop the project's owner invites into it; a role in the
+    // computer's directory is not needed (DR-0268 §1, DR-0328 §4).
+    let owner_invites = wb.desktop_account_mode()
+        && net_http::bearer(headers).is_some()
+        && wb.owns_project(project)
+        && wb.project_owner_refusal(headers, project).is_none()
+        && wb.pairing_actor(headers).is_some_and(|actor| {
+            wb.project_owner(project) == Some(crate::project_owner::ProjectOwner::Account(actor))
+        });
+    if !owner_invites {
+        if let Err((status, message)) =
+            wb.authorize(net_http::bearer(headers), Some(Capability::ManageMembers))
+        {
+            return Some(json_error(status, message));
+        }
+    }
+    if !wb.owns_project(project) {
+        return Some(json_error(
+            StatusCode::NOT_FOUND,
+            "project is not on this Home",
+        ));
+    }
+    wb.project_owner_refusal(headers, project)
 }
 
 /// For an email invitation, the organization whose policy decides it, or
@@ -251,27 +285,7 @@ async fn create_invitation(
     let authority = body.authority.trim().to_owned();
     let organization = {
         let wb = shared.lock_unpoisoned();
-        // On a desktop the project's owner invites into it; a role in the
-        // computer's directory is not needed (DR-0268 §1, DR-0328 §4).
-        let owner_invites = wb.desktop_account_mode()
-            && net_http::bearer(&headers).is_some()
-            && wb.owns_project(&body.project)
-            && wb.project_owner_refusal(&headers, &body.project).is_none()
-            && wb.pairing_actor(&headers).is_some_and(|actor| {
-                wb.project_owner(&body.project)
-                    == Some(crate::project_owner::ProjectOwner::Account(actor))
-            });
-        if !owner_invites {
-            if let Err((status, message)) =
-                wb.authorize(net_http::bearer(&headers), Some(Capability::ManageMembers))
-            {
-                return json_error(status, message);
-            }
-        }
-        if !wb.owns_project(&body.project) {
-            return json_error(StatusCode::NOT_FOUND, "project is not on this Home");
-        }
-        if let Some(refusal) = wb.project_owner_refusal(&headers, &body.project) {
+        if let Some(refusal) = inviter_refusal(&wb, &headers, &body.project) {
             return refusal;
         }
         match email_invitation_owner(&wb, &body.project, email.is_some()) {
@@ -388,6 +402,29 @@ fn invitation_matches(
         && envelope.home_id == wb.home_id().as_str()
 }
 
+/// A link that was cancelled, or replaced by sending the invitation again,
+/// says so to whoever holds it rather than reading as someone else's.
+fn withdrawn_refusal(
+    envelope: &InvitationEnvelope,
+    record: &HomeInvitationRecord,
+) -> Option<axum::response::Response> {
+    if record.status == InvitationStatus::Cancelled {
+        return Some(json_error(
+            StatusCode::GONE,
+            "this invitation was cancelled",
+        ));
+    }
+    if record.status == InvitationStatus::Pending
+        && token_hash(&envelope.secret) != record.token_sha256
+    {
+        return Some(json_error(
+            StatusCode::GONE,
+            "this invitation link was replaced by a newer one",
+        ));
+    }
+    None
+}
+
 async fn accept_invitation(
     shared: SharedWorkbench,
     headers: HeaderMap,
@@ -406,6 +443,9 @@ async fn accept_invitation(
         let Some(record) = latest_invitation(wb.store_ref(), &envelope.invitation) else {
             return json_error(StatusCode::NOT_FOUND, "invitation is unknown");
         };
+        if let Some(refusal) = withdrawn_refusal(&envelope, &record) {
+            return refusal;
+        }
         if !invitation_matches(&wb, &envelope, &record, actor.as_str()) {
             return json_error(
                 StatusCode::FORBIDDEN,
@@ -430,6 +470,9 @@ async fn accept_invitation(
     let Some(record) = latest_invitation(wb.store_ref(), &envelope.invitation) else {
         return json_error(StatusCode::NOT_FOUND, "invitation is unknown");
     };
+    if let Some(refusal) = withdrawn_refusal(&envelope, &record) {
+        return refusal;
+    }
     if !invitation_matches(&wb, &envelope, &record, actor.as_str()) {
         return json_error(
             StatusCode::FORBIDDEN,
@@ -542,6 +585,158 @@ async fn email_refusal(
             "could not confirm your email address; try again",
         )),
     }
+}
+
+/// Every invitation's current record, latest per id.
+fn current_invitations(store: &gaugedesk_store::Store) -> Vec<HomeInvitationRecord> {
+    let mut latest = std::collections::BTreeMap::new();
+    for record in store
+        .records(ORG_SCOPE, INVITATION_KIND)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|payload| serde_json::from_str::<HomeInvitationRecord>(&payload).ok())
+    {
+        latest.insert(record.id.clone(), record);
+    }
+    latest.into_values().collect()
+}
+
+/// `GET /home/projects/{project}/invitations` — the project's invitations
+/// still waiting to be accepted (DR-0332). It names whom each is for, never
+/// its link: the Home keeps only a hash of that.
+pub async fn get_project_invitations(
+    State(wb): State<SharedWorkbench>,
+    Path(project): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let wb = wb.lock_unpoisoned();
+    if let Some(refusal) = inviter_refusal(&wb, &headers, &project) {
+        return refusal;
+    }
+    let now = now_secs();
+    let mut pending: Vec<_> = current_invitations(wb.store_ref())
+        .into_iter()
+        .filter(|record| {
+            record.project == project
+                && record.status == InvitationStatus::Pending
+                && record.expires_at > now
+        })
+        .collect();
+    pending.sort_by_key(|record| record.expires_at);
+    let invitations: Vec<_> = pending
+        .iter()
+        .map(|record| {
+            json!({
+                "id": record.id,
+                "authority": record.invited_authority,
+                "email": record.invited_email,
+                "role": record.role,
+                "expires_at": record.expires_at,
+            })
+        })
+        .collect();
+    Json(json!({ "invitations": invitations })).into_response()
+}
+
+/// The pending invitation `id`, once its inviter is allowed to manage it.
+fn pending_for_inviter(
+    wb: &crate::Workbench,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<HomeInvitationRecord, Box<axum::response::Response>> {
+    // A caller who may not see the project learns nothing about the id.
+    let record = latest_invitation(wb.store_ref(), id)
+        .ok_or_else(|| Box::new(json_error(StatusCode::NOT_FOUND, "invitation is unknown")))?;
+    if let Some(refusal) = inviter_refusal(wb, headers, &record.project) {
+        return Err(Box::new(refusal));
+    }
+    if record.status != InvitationStatus::Pending {
+        return Err(Box::new(json_error(
+            StatusCode::CONFLICT,
+            "this invitation is no longer pending",
+        )));
+    }
+    Ok(record)
+}
+
+fn persist_invitation(
+    wb: &mut crate::Workbench,
+    record: &HomeInvitationRecord,
+) -> Option<axum::response::Response> {
+    let record_json = serde_json::to_string(record).expect("invitation serializes");
+    let error = wb
+        .store_mut()
+        .append_records_atomically(&[(ORG_SCOPE, INVITATION_KIND, &record_json)])
+        .err()?;
+    Some(
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("could not persist invitation: {error:?}") })),
+        )
+            .into_response(),
+    )
+}
+
+/// `POST /home/invitations/{id}/cancel` — withdraw a pending invitation. Its
+/// link then admits no one.
+pub async fn post_cancel_invitation(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let mut wb = wb.lock_unpoisoned();
+    let mut record = match pending_for_inviter(&wb, &headers, &id) {
+        Ok(record) => record,
+        Err(refusal) => return *refusal,
+    };
+    record.status = InvitationStatus::Cancelled;
+    persist_invitation(&mut wb, &record).unwrap_or_else(|| StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /home/invitations/{id}/resend` — a fresh link for the same person,
+/// project and role, with a fresh lifetime. The Home keeps only one hash, so
+/// the earlier link stops working.
+pub async fn post_resend_invitation(
+    State(wb): State<SharedWorkbench>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let mut wb = wb.lock_unpoisoned();
+    let mut record = match pending_for_inviter(&wb, &headers, &id) {
+        Ok(record) => record,
+        Err(refusal) => return *refusal,
+    };
+    let secret = hex::encode(crate::session::random_bytes::<32>());
+    record.token_sha256 = token_hash(&secret);
+    record.expires_at = now_secs().saturating_add(DEFAULT_TTL_SECS);
+    if let Some(refusal) = persist_invitation(&mut wb, &record) {
+        return refusal;
+    }
+    let envelope = InvitationEnvelope {
+        version: INVITATION_VERSION,
+        invitation: record.id.clone(),
+        invited_authority: record.invited_authority.clone(),
+        project: record.project.clone(),
+        home_id: record.home_id.clone(),
+        endpoint: record.endpoint.clone(),
+        secret,
+        invited_email: record.invited_email.clone(),
+    };
+    let Ok(encoded) = encode_envelope(&envelope) else {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "could not encode invite");
+    };
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "invite": encoded,
+            "url": invitation_url(&encoded),
+            "home_id": envelope.home_id,
+            "project": envelope.project,
+            "endpoint": envelope.endpoint,
+            "expires_at": record.expires_at,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -772,6 +967,109 @@ mod tests {
             "role": "member",
             "endpoint": "https://owner-home.example",
         })
+    }
+
+    async fn body_of(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    async fn pending(wb: &SharedWorkbench, login: &str) -> (StatusCode, serde_json::Value) {
+        body_of(
+            get_project_invitations(
+                State(wb.clone()),
+                Path("proj-mine".to_owned()),
+                signed_in(login),
+            )
+            .await,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn pending_invitations_are_listed_cancelled_and_sent_again() {
+        let (_dir, wb) = email_fixture();
+        let (_, by_account) = invite(
+            &wb,
+            json!({ "authority": "invitee", "project": "proj-mine",
+                    "endpoint": "https://owner-home.example" }),
+            None,
+        )
+        .await;
+        let (_, by_address) = invite(&wb, by_email("proj-mine"), None).await;
+        let first_link = by_account["invite"].as_str().unwrap().to_owned();
+        let account_id = decode_envelope(&first_link).unwrap().invitation;
+        let address_id = decode_envelope(by_address["invite"].as_str().unwrap())
+            .unwrap()
+            .invitation;
+
+        let (status, listed) = pending(&wb, "owner-login").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let rows = listed["invitations"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| row["email"] == "invitee@example.test" && row["authority"] == ""));
+        assert!(
+            !listed.to_string().contains("secret") && !listed.to_string().contains("invite?d=")
+        );
+        let (refused, _) = pending(&wb, "other-login").await;
+        assert_eq!(refused, StatusCode::FORBIDDEN);
+
+        // Sending again replaces the link: the old one is refused, the new
+        // one admits.
+        let (status, resent) = body_of(
+            post_resend_invitation(
+                State(wb.clone()),
+                Path(account_id.clone()),
+                signed_in("owner-login"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{resent}");
+        let (replaced, body) = accept(&wb, "invitee-login", &first_link, None).await;
+        assert_eq!(replaced, StatusCode::GONE, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("replaced"));
+        let (accepted, body) = accept(
+            &wb,
+            "invitee-login",
+            resent["invite"].as_str().unwrap(),
+            None,
+        )
+        .await;
+        assert_eq!(accepted, StatusCode::OK, "{body}");
+
+        // Cancelling withdraws it; it cannot be cancelled or sent again twice.
+        let cancel = |login: &'static str| {
+            post_cancel_invitation(
+                State(wb.clone()),
+                Path(address_id.clone()),
+                signed_in(login),
+            )
+        };
+        assert_eq!(cancel("other-login").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(cancel("owner-login").await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(cancel("owner-login").await.status(), StatusCode::CONFLICT);
+        let (cancelled, body) = accept(
+            &wb,
+            "invitee-login",
+            by_address["invite"].as_str().unwrap(),
+            None,
+        )
+        .await;
+        assert_eq!(cancelled, StatusCode::GONE, "{body}");
+        let resend_accepted = post_resend_invitation(
+            State(wb.clone()),
+            Path(account_id),
+            signed_in("owner-login"),
+        )
+        .await;
+        assert_eq!(resend_accepted.status(), StatusCode::CONFLICT);
+
+        let (_, listed) = pending(&wb, "owner-login").await;
+        assert_eq!(listed["invitations"], json!([]));
     }
 
     #[tokio::test]

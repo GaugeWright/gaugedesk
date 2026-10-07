@@ -10,6 +10,15 @@ struct RequestSnapshot {
     kind: String,
     request: serde_json::Value,
     materialized: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<RequestBinding>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RequestBinding {
+    scope: String,
+    key: String,
 }
 
 impl Store {
@@ -30,7 +39,7 @@ impl Store {
             return Ok(None);
         };
         let snapshot: RequestSnapshot = serde_json::from_str(&command.snapshot_json)?;
-        if snapshot.v != 1 {
+        if snapshot.v != 1 || snapshot.binding.is_some() {
             return Err(AdmitError::UnsupportedSchema(
                 "command request snapshot".into(),
             ));
@@ -76,124 +85,197 @@ impl Store {
         L::Command: serde::Serialize,
         I: serde::Serialize,
     {
-        let intent = serde_json::to_value(request)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut state = fold_retained::<L>(&tx, self.codec.as_ref(), scope)?;
-        authorize(&state).map_err(AdmitError::Rejected)?;
+        commit_request::<L, I>(
+            RequestWriter {
+                tx,
+                codec: self.codec.as_ref(),
+                scope,
+                key,
+                protected: false,
+                check: || Ok(()),
+            },
+            request,
+            authorize,
+            materialize,
+        )
+    }
+}
 
-        let previous = tx
-            .prepare_cached(
-                "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
+/// Exact writer, storage policy and current-validity boundary for one request.
+pub(super) struct RequestWriter<'connection, 'input, Check> {
+    pub tx: rusqlite::Transaction<'connection>,
+    pub codec: Option<&'input std::sync::Arc<dyn ContentCodec>>,
+    pub scope: &'input str,
+    pub key: &'input str,
+    pub protected: bool,
+    pub check: Check,
+}
+
+/// Shared admission engine. Protected mode is explicit and never upgrades a
+/// plaintext snapshot. Callers retain prepared key custody outside this writer.
+pub(super) fn commit_request<L, I>(
+    writer: RequestWriter<'_, '_, impl Fn() -> Result<(), AdmitError>>,
+    request: &I,
+    authorize: impl FnOnce(&L::State) -> Result<(), Rejection>,
+    materialize: impl FnOnce(&L::State) -> Result<L::Command, Rejection>,
+) -> Result<MaterializedAdmission<L::State>, AdmitError>
+where
+    L: Lifecycle,
+    L::Command: serde::Serialize,
+    I: serde::Serialize,
+{
+    let RequestWriter {
+        tx,
+        codec,
+        scope,
+        key,
+        protected,
+        check,
+    } = writer;
+    let intent = serde_json::to_value(request)?;
+    check()?;
+    if protected && codec.is_none() {
+        return Err(AdmitError::Codec(
+            "protected request requires a content codec".into(),
+        ));
+    }
+    let mut state = fold_retained::<L>(&tx, codec, scope)?;
+    authorize(&state).map_err(AdmitError::Rejected)?;
+
+    let previous = tx
+        .prepare_cached(
+            "SELECT command_id, scope_id, idempotency_key, status, snapshot_json
              FROM commands WHERE scope_id = ?1 AND idempotency_key = ?2",
-            )?
-            .query_row(params![scope, key], command_record_from_row)
-            .optional()?;
-        let receipt = tx
-            .prepare_cached(
-                "SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2",
-            )?
-            .query_row(params![scope, key], |_| Ok(()))
-            .optional()?
-            .is_some();
-        if let Some(previous) = previous {
-            let snapshot: RequestSnapshot = serde_json::from_str(&previous.snapshot_json)?;
-            if snapshot.v != 1 {
-                return Err(AdmitError::UnsupportedSchema(
-                    "command request snapshot".into(),
-                ));
-            }
-            if snapshot.kind != L::KIND || snapshot.request != intent {
-                return Err(AdmitError::Rejected(Rejection {
-                    reason: "idempotency key reused with different request",
-                }));
-            }
-            if receipt && previous.status == "applied" && snapshot.materialized.is_some() {
-                tx.commit()?;
-                return Ok(MaterializedAdmission {
-                    state,
-                    replayed: true,
-                });
-            }
+        )?
+        .query_row(params![scope, key], command_record_from_row)
+        .optional()?;
+    let receipt = tx
+        .prepare_cached("SELECT 1 FROM command_receipts WHERE scope_id = ?1 AND command_key = ?2")?
+        .query_row(params![scope, key], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if let Some(previous) = previous {
+        let plaintext = if protected {
+            codec
+                .and_then(|codec| codec.decode(scope, L::KIND, &previous.snapshot_json))
+                .ok_or_else(|| AdmitError::Codec("protected request snapshot unavailable".into()))?
+        } else {
+            previous.snapshot_json.clone()
+        };
+        let snapshot: RequestSnapshot = serde_json::from_str(&plaintext)?;
+        let expected_binding = protected.then(|| RequestBinding {
+            scope: scope.into(),
+            key: key.into(),
+        });
+        if snapshot.v != if protected { 2 } else { 1 } || snapshot.binding != expected_binding {
+            return Err(AdmitError::UnsupportedSchema(
+                "command request snapshot".into(),
+            ));
+        }
+        if snapshot.kind != L::KIND || snapshot.request != intent {
             return Err(AdmitError::Rejected(Rejection {
-                reason: "request already rejected or incomplete; submit with a new key",
+                reason: "idempotency key reused with different request",
             }));
         }
-        if receipt {
-            return Err(AdmitError::Rejected(Rejection {
-                reason: "receipt has no exact request binding",
-            }));
+        if receipt && previous.status == "applied" && snapshot.materialized.is_some() {
+            check()?;
+            tx.commit()?;
+            return Ok(MaterializedAdmission {
+                state,
+                replayed: true,
+            });
         }
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "request already rejected or incomplete; submit with a new key",
+        }));
+    }
+    if receipt {
+        return Err(AdmitError::Rejected(Rejection {
+            reason: "receipt has no exact request binding",
+        }));
+    }
 
-        let prepared = materialize(&state);
-        let materialized = prepared
-            .as_ref()
-            .ok()
-            .map(serde_json::to_value)
-            .transpose()?;
-        let decision = prepared.and_then(|command| L::decide(&state, command));
-        let snapshot = serde_json::to_string(&RequestSnapshot {
-            v: 1,
-            kind: L::KIND.into(),
-            request: intent,
-            materialized,
-        })?;
-        let command_id = format!("request-command:{}:{scope}{key}", scope.len());
-        tx.prepare_cached(
-            "INSERT INTO commands (command_id, scope_id, idempotency_key, status, snapshot_json)
+    let prepared = materialize(&state);
+    let materialized = prepared
+        .as_ref()
+        .ok()
+        .map(serde_json::to_value)
+        .transpose()?;
+    let decision = prepared.and_then(|command| L::decide(&state, command));
+    let snapshot = serde_json::to_string(&RequestSnapshot {
+        v: if protected { 2 } else { 1 },
+        binding: protected.then(|| RequestBinding {
+            scope: scope.into(),
+            key: key.into(),
+        }),
+        kind: L::KIND.into(),
+        request: intent,
+        materialized,
+    })?;
+    let snapshot = if protected {
+        let encoded = encode_payload(codec, scope, L::KIND, &snapshot)?;
+        if encoded == snapshot {
+            return Err(AdmitError::Codec(
+                "protected request kind has no content protection".into(),
+            ));
+        }
+        encoded
+    } else {
+        snapshot
+    };
+    let command_id = format!("request-command:{}:{scope}{key}", scope.len());
+    tx.prepare_cached(
+        "INSERT INTO commands (command_id, scope_id, idempotency_key, status, snapshot_json)
              VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?
+    .execute(params![
+        command_id,
+        scope,
+        key,
+        if decision.is_ok() {
+            "applied"
+        } else {
+            "rejected"
+        },
+        snapshot
+    ])?;
+    let events = match decision {
+        Ok(events) => events,
+        Err(rejection) => {
+            check()?;
+            tx.commit()?;
+            return Err(AdmitError::Rejected(rejection));
+        }
+    };
+    let base: i64 = tx
+        .prepare_cached("SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1")?
+        .query_row([scope], |row| row.get(0))?;
+    for (offset, event) in events.into_iter().enumerate() {
+        tx.prepare_cached(
+            "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
         )?
         .execute(params![
-            command_id,
             scope,
-            key,
-            if decision.is_ok() {
-                "applied"
-            } else {
-                "rejected"
-            },
-            snapshot
+            base + offset as i64,
+            L::KIND,
+            encode_payload(codec, scope, L::KIND, &serde_json::to_string(&event)?)?
         ])?;
-        let events = match decision {
-            Ok(events) => events,
-            Err(rejection) => {
-                tx.commit()?;
-                return Err(AdmitError::Rejected(rejection));
-            }
-        };
-        let base: i64 = tx
-            .prepare_cached(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
-            )?
-            .query_row([scope], |row| row.get(0))?;
-        for (offset, event) in events.into_iter().enumerate() {
-            tx.prepare_cached(
-                "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
-            )?
-            .execute(params![
-                scope,
-                base + offset as i64,
-                L::KIND,
-                encode_payload(
-                    self.codec.as_ref(),
-                    scope,
-                    L::KIND,
-                    &serde_json::to_string(&event)?
-                )?
-            ])?;
-            state = L::evolve(&state, event);
-        }
-        tx.prepare_cached(
-            "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
-        )?
-        .execute(params![scope, key, base])?;
-        tx.commit()?;
-        Ok(MaterializedAdmission {
-            state,
-            replayed: false,
-        })
+        state = L::evolve(&state, event);
     }
+    tx.prepare_cached(
+        "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
+    )?
+    .execute(params![scope, key, base])?;
+    crate::snapshot::checkpoint::<L>(&tx, codec, scope, &state)?;
+    check()?;
+    tx.commit()?;
+    Ok(MaterializedAdmission {
+        state,
+        replayed: false,
+    })
 }
 
 #[cfg(test)]

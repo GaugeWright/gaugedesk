@@ -4,6 +4,7 @@ use crate::office_home_admission::source::{HubStaffSource, SourceCheck, Verified
 const BEARER: &str = "synthetic-native-office-bearer";
 
 fn configure(wb: &mut Workbench) {
+    wb.enroll_office_profile_for_test("office-admin");
     wb.configure_office_staff_source(HubStaffSource::at("https://auth.example").unwrap())
         .unwrap();
 }

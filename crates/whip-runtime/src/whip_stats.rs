@@ -149,16 +149,21 @@ pub const REPOSITORY_RATE_CARD: &str = include_str!("../../../contracts/model-to
 
 /// Parse the shipped card.
 ///
-/// **It ships with no rates in it, and that is a decision rather than an
-/// oversight.** A rate is a fact about someone else's price list on a
-/// particular day, and this repository's own history with guessed rates is
-/// specific: `deployment_pricing`'s per-token constants were measured against a
-/// real metered round and found to over-bill a small model by 6.2x. Seeding
-/// this card from memory would repeat that with a wider blast radius and no
-/// measurement to catch it. So the card starts empty, every model a run touches
-/// arrives as a named `NoRate` gap, and the report says exactly which rates an
-/// operator has to supply and for which models. Nothing is ever priced at a
-/// default, because there is no default to price at.
+/// **Every rate in it names a published price list and the day it was read,
+/// and nothing else gets in.** A rate is a fact about someone else's price
+/// list on a particular day, and this repository's own history with guessed
+/// rates is specific: `deployment_pricing`'s per-token constants were measured
+/// against a real metered round and found to over-bill a small model by 6.2x.
+/// So the card rates only models the runtime actually meters by name — today
+/// the screening gate's model — each from its provider's published page, and
+/// every other model a run touches still arrives as a named `NoRate` gap that
+/// says exactly which rate an operator has to supply. Nothing is ever priced
+/// at a default, because there is no default to price at.
+///
+/// A published rate is not yet an invoiced one: the gate calls OpenAI directly
+/// with the project's own linked credential, so its spend lands on the project
+/// owner's OpenAI invoice, and a figure from this card has not yet been
+/// reconciled against an OpenAI invoice for a real gate run.
 pub fn repository_rate_card() -> Result<RateCard, String> {
     serde_json::from_str(REPOSITORY_RATE_CARD)
         .map_err(|error| format!("the shipped rate card does not parse: {error}"))
@@ -363,14 +368,48 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_rate_card_parses_and_rates_nothing_yet() {
+    fn every_shipped_rate_names_its_source_and_day() {
         let card = repository_rate_card().expect("the shipped card parses");
         assert!(
-            card.models.is_empty(),
-            "a rate seeded from memory rather than from a source is the failure this avoids",
+            !card.models.is_empty(),
+            "the card rates the models the runtime meters"
         );
-        // And an empty card is safe rather than free: every model that spent
-        // anything comes back named.
+        for (model, rates) in &card.models {
+            assert!(
+                rates.source.starts_with("https://"),
+                "{model}: a rate names the published page it was read from",
+            );
+            assert!(
+                rates.as_of.len() == 10 && rates.as_of.as_bytes()[4] == b'-',
+                "{model}: a rate names the day it was read",
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_card_prices_the_screening_model_at_its_published_rate() {
+        // gpt-4.1-mini, per the card: $0.40 fresh input, $0.10 cached input,
+        // $1.60 output per million. 1,000 fresh + 4,000 cached + 500 output is
+        // 400 + 400 + 800 micros. Written out rather than read back from the
+        // card, so a changed rate fails here and is looked at.
+        let card = repository_rate_card().expect("the shipped card parses");
+        let rows = vec![MeteredRow {
+            model: Some("gpt-4.1-mini".to_owned()),
+            usage: MeteredUsage {
+                input_uncached: Some(1_000),
+                input_cache_read: Some(4_000),
+                input_cache_write: Some(0),
+                output: Some(500),
+            },
+        }];
+        let priced = card.price(&rows);
+        assert_eq!(priced.gaps(), &[]);
+        assert_eq!(priced.amount().expect("complete").micros, 1_600);
+    }
+
+    #[test]
+    fn a_model_the_shipped_card_does_not_rate_is_a_named_gap_not_free() {
+        let card = repository_rate_card().expect("the shipped card parses");
         let rows = usage_from_report(&report_fixture()).expect("a report");
         let priced = card.price(&rows);
         assert_eq!(priced.amount(), None);

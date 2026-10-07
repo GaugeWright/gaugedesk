@@ -23,7 +23,6 @@ use gaugedesk_workspace::{
 };
 use serde::Deserialize;
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use whipplescript_kernel::harness_model::ModelWire;
 
@@ -3719,6 +3718,9 @@ pub(crate) async fn post_choice_answer(
                 account_scope: &account_scope,
                 tenant_scope: &tenant_scope,
                 account_bearer: account_bearer.as_deref(),
+                client_request_id: None,
+                client_author: None,
+                client_attempt: None,
                 runtime_command_id: Some(&command_id),
                 original_http_command: None,
                 harness_factory: None,
@@ -4245,10 +4247,10 @@ pub(crate) async fn engagement_events(
         }
     }
     let rx = wb.lock_unpoisoned().sender(&id).subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| {
-        msg.ok()
-            .map(|ev: ServerEvent| Ok::<_, Infallible>(Event::default().data(ev.to_json())))
-    });
+    // A lagged subscriber's stream ends; the client reopens and reloads the
+    // durable transcript (SCALE-4).
+    let stream = crate::stream::until_lagged(rx)
+        .map(|ev: ServerEvent| Ok::<_, Infallible>(Event::default().data(ev.to_json())));
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
@@ -4280,15 +4282,15 @@ pub(crate) async fn workspace_events(
     // Each subscriber hears only of what it can see (DR-0268 §5).
     let bearer = crate::net_http::bearer(&headers).map(str::to_owned);
     let shared = wb.clone();
-    let stream = BroadcastStream::new(rx).filter_map(move |msg| {
-        msg.ok()
-            .filter(|ev: &ServerEvent| {
-                shared
-                    .lock_unpoisoned()
-                    .workspace_event_visible(bearer.as_deref(), ev)
-            })
-            .map(|ev: ServerEvent| Ok::<_, Infallible>(Event::default().data(ev.to_json())))
-    });
+    // A lagged subscriber's stream ends; the client reopens and re-reads the
+    // workspace (SCALE-4).
+    let stream = crate::stream::until_lagged(rx)
+        .filter(move |ev: &ServerEvent| {
+            shared
+                .lock_unpoisoned()
+                .workspace_event_visible(bearer.as_deref(), ev)
+        })
+        .map(|ev: ServerEvent| Ok::<_, Infallible>(Event::default().data(ev.to_json())));
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
@@ -4345,6 +4347,7 @@ pub(crate) async fn post_task(
     authenticated: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
     operator: Option<axum::extract::Extension<crate::account_signin::DesktopOperatorPlane>>,
     original: Option<axum::extract::Extension<crate::command_idempotency::ClaimedHttpCommand>>,
+    attempt: Option<axum::extract::Extension<crate::command_idempotency::TaskAttempt>>,
     Json(body): Json<TaskBody>,
 ) -> impl IntoResponse {
     let original = original.map(|axum::extract::Extension(original)| original);
@@ -4361,11 +4364,42 @@ pub(crate) async fn post_task(
         )
             .into_response();
     }
+    let client_request_id = match crate::command_idempotency::caller_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    let author = {
+        let mut guard = wb.lock_unpoisoned();
+        engine::verified_task_author(
+            &mut guard,
+            &headers,
+            &axum::http::Method::POST,
+            &format!("/chats/{id}/task"),
+        )
+    };
+    let attempt = attempt.map(|axum::extract::Extension(attempt)| attempt);
+    let refused = || {
+        author
+            .as_ref()
+            .map(|author| crate::stream::TaskCorrelation {
+                home_id: author.home_id.clone(),
+                actor_id: author.actor_id.clone(),
+                client_request_id: client_request_id.clone(),
+                chat_id: id.clone(),
+                outcome: crate::stream::TaskCorrelationOutcome::Refused,
+            })
+    };
     // Brief lock: confirm the engagement and grab its worktree, live sender, mode.
     let (worktree, sender, mode) = {
         let mut g = wb.lock_unpoisoned();
         let Some(location) = g.engagement_turn_location(&id) else {
-            return (StatusCode::NOT_FOUND, "no such engagement").into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "no such engagement", "correlation": refused(),
+                })),
+            )
+                .into_response();
         };
         location
     };
@@ -4386,6 +4420,9 @@ pub(crate) async fn post_task(
     let authenticated = authenticated.map(|axum::extract::Extension(context)| context);
     let local_operator = operator.is_some();
     let id2 = id.clone();
+    let client_request_id2 = client_request_id.clone();
+    let author2 = author.clone();
+    let attempt2 = attempt.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         engine::run_engagement_turn(
             &wb2,
@@ -4404,6 +4441,9 @@ pub(crate) async fn post_task(
                 account_scope: &account_scope,
                 tenant_scope: &tenant_scope,
                 account_bearer: account_bearer.as_deref(),
+                client_request_id: Some(&client_request_id2),
+                client_author: author2.as_ref(),
+                client_attempt: attempt2.as_ref(),
                 runtime_command_id: None,
                 original_http_command: original.as_ref(),
                 harness_factory: None,
@@ -4412,11 +4452,39 @@ pub(crate) async fn post_task(
     })
     .await;
 
+    let correlation = author
+        .as_ref()
+        .zip(attempt.as_ref())
+        .and_then(|(author, attempt)| {
+            engine::task_correlation(
+                wb.lock_unpoisoned().store_ref(),
+                &id,
+                &client_request_id,
+                author,
+                Some(attempt),
+            )
+        });
     match outcome {
-        Ok(Ok(result)) => (StatusCode::OK, Json(result)).into_response(),
+        Ok(Ok(result)) => {
+            let mut body = serde_json::to_value(result).expect("serialize TaskResult");
+            if let Some(correlation) = correlation {
+                body["correlation"] =
+                    serde_json::to_value(correlation).expect("serialize task correlation");
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
         Ok(Err(e)) => {
             let status = task_failure_status(&e);
             let mut body = serde_json::json!({ "error": e.to_string() });
+            let correlation = if matches!(e, engine::EngineError::AlreadyRunning) {
+                refused()
+            } else {
+                correlation
+            };
+            if let Some(correlation) = correlation {
+                body["correlation"] =
+                    serde_json::to_value(correlation).expect("serialize task correlation");
+            }
             // A 409 is read as a refusal by the browser transport, which looks for
             // `rejected` and reports "unknown" without it. Carrying the reason is
             // the difference between the composer saying why a message is waiting
@@ -5144,5 +5212,124 @@ mod multi_target_edit_authorization_tests {
             .diff_against_main()
             .unwrap()
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod live_stream_backpressure_tests {
+    //! SCALE-4: a subscriber that falls more than `LIVE_STREAM_SLOTS` events
+    //! behind has its stream closed, so the client reconnects and refetches
+    //! its snapshot instead of rendering a transcript with a hole in it.
+    use crate::stream::{ServerEvent, LIVE_STREAM_SLOTS};
+    use crate::{open_workbench, LockUnpoisoned};
+    use axum::{
+        body::Body,
+        extract::{Path, State},
+        http::HeaderMap,
+    };
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+
+    fn user(n: usize) -> ServerEvent {
+        ServerEvent::User {
+            text: format!("event {n}"),
+            client_request_id: None,
+            chat_id: None,
+            home_id: None,
+            actor_id: None,
+        }
+    }
+
+    fn workspace(n: usize) -> ServerEvent {
+        ServerEvent::WorkspaceChanged {
+            record: "chat".into(),
+            id: format!("chat-{n}"),
+            op: "upsert".into(),
+        }
+    }
+
+    /// The next data frame, `None` when the stream has ended, or a panic when
+    /// nothing arrives (an open stream with nothing to say).
+    async fn next(body: &mut Body) -> Option<String> {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(3), body.frame())
+                .await
+                .expect("stream neither delivered nor closed")?;
+            let data = frame.unwrap().into_data().unwrap();
+            let text = String::from_utf8(data.to_vec()).unwrap();
+            if text.contains("data:") {
+                return Some(text);
+            }
+        }
+    }
+
+    async fn still_open(body: &mut Body) -> bool {
+        tokio::time::timeout(Duration::from_millis(200), body.frame())
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn a_slow_engagement_subscriber_is_closed_on_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = open_workbench(root.path()).unwrap();
+        let response = super::engagement_events(
+            State(wb.clone()),
+            Path("chat-slow".to_owned()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        let mut body = response.into_body();
+        let sender = wb.lock_unpoisoned().sender("chat-slow");
+        for n in 0..LIVE_STREAM_SLOTS + 8 {
+            sender.send(user(n)).unwrap();
+        }
+        assert_eq!(
+            next(&mut body).await,
+            None,
+            "an overflowed subscriber must be closed, not continued with a gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_engagement_subscriber_within_the_bound_keeps_its_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = open_workbench(root.path()).unwrap();
+        let response = super::engagement_events(
+            State(wb.clone()),
+            Path("chat-ok".to_owned()),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        let mut body = response.into_body();
+        let sender = wb.lock_unpoisoned().sender("chat-ok");
+        for n in 0..LIVE_STREAM_SLOTS {
+            sender.send(user(n)).unwrap();
+        }
+        for n in 0..LIVE_STREAM_SLOTS {
+            let frame = next(&mut body).await.expect("event delivered");
+            assert!(frame.contains(&format!("event {n}\"")), "{frame}");
+        }
+        assert!(still_open(&mut body).await);
+    }
+
+    #[tokio::test]
+    async fn a_slow_workspace_subscriber_is_closed_on_overflow() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = open_workbench(root.path()).unwrap();
+        let response = super::workspace_events(State(wb.clone()), HeaderMap::new(), None).await;
+        let mut body = response.into_body();
+        let sender = wb.lock_unpoisoned().workspace_sender();
+        sender.send(workspace(0)).unwrap();
+        assert!(next(&mut body)
+            .await
+            .expect("change delivered")
+            .contains("chat-0"));
+        for n in 0..LIVE_STREAM_SLOTS + 8 {
+            sender.send(workspace(n)).unwrap();
+        }
+        assert_eq!(next(&mut body).await, None);
     }
 }

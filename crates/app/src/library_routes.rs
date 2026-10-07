@@ -2878,7 +2878,8 @@ mod tests {
                 &serde_json::to_string(&member).unwrap(),
             )
             .unwrap();
-        let app = open_control_plane(Arc::new(Mutex::new(wb)));
+        let shared = Arc::new(Mutex::new(wb));
+        let app = open_control_plane(shared.clone());
 
         let accept = |bearer: Option<&str>| {
             let mut b = Request::builder()
@@ -2904,6 +2905,10 @@ mod tests {
             StatusCode::OK,
             "a valid member is let through the auth gate"
         );
+        // ITGOV-3(d): admission writes the member's session into the IT roster (ITGOV-2).
+        let roster = shared.lock().unwrap().session_roster();
+        assert_eq!(roster.len(), 1, "the admitted accept is on the roster");
+        assert_eq!(roster[0].authority, "member-auth");
     }
 
     /// Both participants accepting an unattested boundary brings it active — the route
@@ -3267,6 +3272,10 @@ mod search_tests {
             "chat-1",
             ServerEvent::User {
                 text: "please review the deadline for the bridge".into(),
+                client_request_id: None,
+                chat_id: None,
+                home_id: None,
+                actor_id: None,
             },
         )
         .unwrap();
@@ -3437,6 +3446,10 @@ mod search_tests {
             "chat-both",
             ServerEvent::User {
                 text: "please check the SENTINEL".into(),
+                client_request_id: None,
+                chat_id: None,
+                home_id: None,
+                actor_id: None,
             },
         )
         .unwrap();

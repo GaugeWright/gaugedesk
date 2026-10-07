@@ -5,7 +5,7 @@
 //! envelope parser, attestation check, or IFC algebra it asks WhippleScript to
 //! enforce (ADR 0080 / SUB-1).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub mod host_actions;
 use std::fmt;
@@ -27,6 +27,8 @@ use gaugedesk_harness::{
     TaskFiler, ToolInfo, TurnOutcome,
 };
 
+use whipplescript_store::payload_protection::PayloadProtection;
+
 type TargetRenamerSlot = Arc<Mutex<Option<Arc<dyn TargetRenamer>>>>;
 pub use whipplescript::gov::{
     canonicalize, external_signing_bytes, external_signing_bytes_v2, ExternalAttestation,
@@ -46,9 +48,10 @@ pub use whipplescript::host_runtime::{
     native_workspace_tool_specs, native_workspace_tool_specs_with_capabilities,
     native_workspace_tool_specs_with_command, AuthoredAgentPackage, CertifiedOutputFieldFlow,
     GovernedHostRuntime, HostCancellationHandle, HostRuntimeError, LabeledTurnOutput,
-    ModelProvider, NativeWorkspaceResolver, PackageResolver, ProjectedToolCall,
-    RecordedWorkspaceWitness, ResolvedImage, ResolvedPackage, ResolvedProviderBinding,
-    ResourceResolver, SecretResolver, ToolCall, TurnContentSegment, TurnExecution, TurnWitness,
+    ModelProvider, NativeProviderTransport, NativeWorkspaceResolver, PackageResolver,
+    ProjectedToolCall, RecordedWorkspaceWitness, ResolvedImage, ResolvedPackage,
+    ResolvedProviderBinding, ResourceResolver, SecretResolver, ToolCall, TurnContentSegment,
+    TurnExecution, TurnWitness,
 };
 /// WhippleScript's information-flow surface, re-exported so a host can parse and
 /// check the governance envelopes it ships rather than trusting their text.
@@ -1418,6 +1421,7 @@ pub struct WhipHarnessFactory {
     runtime_root: PathBuf,
     hosted: Option<DoHostConfig>,
     organization_model_broker: Option<OrganizationModelBrokerConfig>,
+    native_runtime_protection: Option<BTreeMap<String, PayloadProtection>>,
 }
 
 impl WhipHarnessFactory {
@@ -1434,7 +1438,57 @@ impl WhipHarnessFactory {
             runtime_root: runtime_root.into(),
             hosted: None,
             organization_model_broker: None,
+            native_runtime_protection: None,
         }
+    }
+
+    /// Select exact existing native storage. This creates no key, store or access grant.
+    /// Every selected chat must already have its protected original database.
+    pub fn with_existing_native_runtime_protection(
+        mut self,
+        chat: &str,
+        protection: PayloadProtection,
+    ) -> io::Result<Self> {
+        if chat.trim().is_empty() || self.hosted.is_some() {
+            return Err(invalid_data(
+                "protected native storage requires an exact native chat",
+            ));
+        }
+        let bindings = self
+            .native_runtime_protection
+            .get_or_insert_with(BTreeMap::new);
+        if bindings.contains_key(chat) {
+            return Err(invalid_data(
+                "native runtime protection is already selected for this chat",
+            ));
+        }
+        bindings.insert(chat.into(), protection);
+        Ok(self)
+    }
+
+    fn runtime_protection(&self, chat: &str) -> io::Result<Option<PayloadProtection>> {
+        match &self.native_runtime_protection {
+            None => Ok(None),
+            Some(bindings) if self.hosted.is_none() => {
+                bindings.get(chat).cloned().map(Some).ok_or_else(|| {
+                    invalid_data("native runtime has no selected original protection")
+                })
+            }
+            Some(_) => Err(invalid_data(
+                "protected native runtime cannot use hosted execution",
+            )),
+        }
+    }
+
+    fn existing_catalogue_store(&self, chat: &str) -> io::Result<whipplescript_store::SqliteStore> {
+        let path = chat_runtime_database(&self.runtime_root, chat);
+        match self.runtime_protection(chat)? {
+            Some(protection) => {
+                whipplescript_store::SqliteStore::open_existing_protected(path, protection)
+            }
+            None => whipplescript_store::SqliteStore::open(path),
+        }
+        .map_err(|error| invalid_data(format!("{error:?}")))
     }
 
     pub fn with_do_host(mut self, config: DoHostConfig) -> Self {
@@ -1479,13 +1533,25 @@ impl WhipHarnessFactory {
         // identity. Verify the complete pinned root before touching its store.
         self.verify_policy(epoch, signed_policy)
             .map_err(invalid_data)?;
-        std::fs::create_dir_all(&self.runtime_root)?;
-        GovernedHostRuntime::open_with_verifier(
-            chat_runtime_database(&self.runtime_root, chat_id),
-            epoch,
-            signed_policy,
-            &self.policy_root,
-        )
+        let path = chat_runtime_database(&self.runtime_root, chat_id);
+        match self.runtime_protection(chat_id)? {
+            Some(protection) => GovernedHostRuntime::open_existing_protected_with_verifier(
+                path,
+                epoch,
+                signed_policy,
+                &self.policy_root,
+                protection,
+            ),
+            None => {
+                std::fs::create_dir_all(&self.runtime_root)?;
+                GovernedHostRuntime::open_with_verifier(
+                    path,
+                    epoch,
+                    signed_policy,
+                    &self.policy_root,
+                )
+            }
+        }
         .map_err(invalid_data)
     }
 
@@ -1500,11 +1566,7 @@ impl WhipHarnessFactory {
     }
 
     fn refresh_agent_skill_catalogue(&self, chat_id: &str, worktree: &Path) -> io::Result<()> {
-        let store = whipplescript_store::SqliteStore::open(chat_runtime_database(
-            &self.runtime_root,
-            chat_id,
-        ))
-        .map_err(|error| invalid_data(format!("{error:?}")))?;
+        let store = self.existing_catalogue_store(chat_id)?;
         store
             .remove_unattached_skills_from_source("gaugedesk-agent")
             .map_err(|error| invalid_data(format!("{error:?}")))?;
@@ -1558,12 +1620,8 @@ impl WhipHarnessFactory {
     /// is registered here: its skills are files the editor edits, not
     /// instructions the editor follows.
     fn refresh_editor_skill_catalogue(&self, chat_id: &str, worktree: &Path) -> io::Result<()> {
+        let store = self.existing_catalogue_store(chat_id)?;
         editor_skill::mount(worktree)?;
-        let store = whipplescript_store::SqliteStore::open(chat_runtime_database(
-            &self.runtime_root,
-            chat_id,
-        ))
-        .map_err(|error| invalid_data(format!("{error:?}")))?;
         store
             .remove_unattached_skills_from_source(editor_skill::EDITOR_SKILL_SOURCE)
             .map_err(|error| invalid_data(format!("{error:?}")))?;
@@ -1741,7 +1799,26 @@ impl WhipHarnessFactory {
         }
     }
 
+    /// An office-bound turn reaches only its own pinned endpoint, so a hosted
+    /// runtime (whose model calls leave this machine) and the organization
+    /// model broker (a GaugeWright-routed shared-key path) both refuse it.
+    fn refuse_office_routes(&self, spec: &HarnessSpec) -> io::Result<()> {
+        if spec.office_inference.is_none() {
+            return Ok(());
+        }
+        if self.hosted.is_some() {
+            return Err(office_refusal("a hosted runtime is not office-operated"));
+        }
+        if self.organization_model_broker.is_some() {
+            return Err(office_refusal(
+                "the organization model broker is not office-operated",
+            ));
+        }
+        Ok(())
+    }
+
     fn create_harness(&self, spec: &HarnessSpec) -> io::Result<WhipHarness> {
+        self.refuse_office_routes(spec)?;
         let provider = ProviderConfig::from_spec(spec)?;
         let package = Self::package_for(
             spec.mode,
@@ -1890,6 +1967,7 @@ impl WhipHarnessFactory {
             pursuing_cancel: Arc::new(AtomicBool::new(false)),
             organization_model_broker: self.organization_model_broker.clone(),
             native_model_context: Arc::new(Mutex::new(NativeModelContext::default())),
+            managed_call_meter: None,
         })
     }
 }
@@ -1904,6 +1982,8 @@ impl HarnessFactory for WhipHarnessFactory {
     }
 
     fn create(&self, spec: &HarnessSpec) -> io::Result<Box<dyn Harness>> {
+        self.runtime_protection(&spec.chat_id)?;
+        self.refuse_office_routes(spec)?;
         if let Some(config) = &self.hosted {
             return hosted::create_harness(self, config, spec);
         }
@@ -1927,6 +2007,39 @@ impl HarnessFactory for WhipHarnessFactory {
                 "original runtime observation requires a native Home",
             ));
         }
+        RecordedResources {
+            access: &|| spec.access.check_current(),
+        }
+        .check_live_access()
+        .map_err(invalid_data)?;
+        // Pending product recovery still proves the exact submitted inputs.
+        let command: StartTurnCommand =
+            serde_json::from_str(&spec.preparation.command_json).map_err(invalid_data)?;
+        command.validate().map_err(invalid_data)?;
+        if spec.preparation.input_digest
+            != gaugedesk_harness::runtime_input_digest(&command.input.text, spec.images)
+        {
+            return Err(invalid_data("original runtime preparation changed"));
+        }
+        self.observe_completed_product_runtime(&gaugedesk_harness::CompletedProductRuntimeSpec {
+            chat_id: spec.chat_id,
+            command_id: spec.command_id,
+            policy_epoch: spec.policy_epoch,
+            signed_policy_envelope: spec.signed_policy_envelope,
+            preparation: spec.preparation,
+            access: &|| spec.access.check_current(),
+        })
+    }
+
+    fn observe_completed_product_runtime(
+        &self,
+        spec: &gaugedesk_harness::CompletedProductRuntimeSpec<'_>,
+    ) -> io::Result<TurnOutcome> {
+        if self.hosted.is_some() {
+            return Err(invalid_data(
+                "original runtime observation requires a native Home",
+            ));
+        }
         let access = RecordedResources {
             access: spec.access,
         };
@@ -1937,18 +2050,28 @@ impl HarnessFactory for WhipHarnessFactory {
         if command.command_id != spec.command_id
             || command.policy.epoch != spec.policy_epoch
             || command.instance_ref != spec.preparation.start_position.instance_ref
-            || spec.preparation.input_digest
-                != gaugedesk_harness::runtime_input_digest(&command.input.text, spec.images)
+            || spec.preparation.input_digest.is_empty()
         {
             return Err(invalid_data("original runtime preparation changed"));
         }
-        let runtime = whipplescript::host_runtime::RecordedHostRuntime::open_with_verifier(
-            chat_runtime_database(&self.runtime_root, spec.chat_id),
-            spec.policy_epoch,
-            spec.signed_policy_envelope,
-            &self.policy_root,
-            &access,
-        )
+        let path = chat_runtime_database(&self.runtime_root, spec.chat_id);
+        let runtime = match self.runtime_protection(spec.chat_id)? {
+            Some(protection) => whipplescript::host_runtime::RecordedHostRuntime::open_existing_protected_with_verifier(
+                path,
+                spec.policy_epoch,
+                spec.signed_policy_envelope,
+                &self.policy_root,
+                &access,
+                protection,
+            ),
+            None => whipplescript::host_runtime::RecordedHostRuntime::open_with_verifier(
+                path,
+                spec.policy_epoch,
+                spec.signed_policy_envelope,
+                &self.policy_root,
+                &access,
+            ),
+        }
         .map_err(turn_failure)?;
         let start = whipplescript::host_protocol::PinnedPosition {
             instance_ref: spec.preparation.start_position.instance_ref.clone(),
@@ -2022,7 +2145,7 @@ impl HarnessFactory for WhipHarnessFactory {
         // runtime for each turn so none of those ephemeral inputs becomes a
         // cached authorization fact; the SQLite WhippleScript instance still
         // supplies transcript continuity.
-        if self.organization_model_broker.is_some() {
+        if self.organization_model_broker.is_some() || self.native_runtime_protection.is_some() {
             return false;
         }
         self.hosted
@@ -2036,6 +2159,8 @@ impl HarnessFactory for WhipHarnessFactory {
         source: &HarnessContinuitySpec,
         target: &HarnessContinuitySpec,
     ) -> io::Result<()> {
+        self.runtime_protection(&source.chat_id)?;
+        self.runtime_protection(&target.chat_id)?;
         if let Some(config) = &self.hosted {
             return hosted::clone_continuity(self, config, source, target);
         }
@@ -2218,6 +2343,7 @@ struct WhipHarness {
     pursuing_cancel: Arc<AtomicBool>,
     organization_model_broker: Option<OrganizationModelBrokerConfig>,
     native_model_context: Arc<Mutex<NativeModelContext>>,
+    managed_call_meter: Option<Arc<dyn gaugedesk_harness::ManagedCallMeter>>,
 }
 
 const NATIVE_MODEL_CONTEXT_LIMIT: usize = 8 * 1024 * 1024;
@@ -2446,6 +2572,22 @@ impl Harness for WhipHarness {
         Ok(())
     }
 
+    fn bind_managed_call_meter(
+        &mut self,
+        meter: Option<Arc<dyn gaugedesk_harness::ManagedCallMeter>>,
+    ) -> io::Result<()> {
+        // The organization broker performs its own final fetch, outside the
+        // native send this meter wraps; a meter there would hold nothing.
+        if meter.is_some() && self.organization_model_broker.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an organization-brokered turn cannot be credit funded",
+            ));
+        }
+        self.managed_call_meter = meter;
+        Ok(())
+    }
+
     fn run_turn(
         &mut self,
         _legacy_gate: &dyn EgressGate,
@@ -2460,6 +2602,7 @@ impl Harness for WhipHarness {
             ended: AtomicBool::new(false),
         };
         let retention = self.payload_retention.take();
+        let managed_call_meter = self.managed_call_meter.take();
         turn_access.current()?;
         if turn_access.inner.is_some() && retention.is_none() {
             return Err(io::Error::new(
@@ -2510,6 +2653,8 @@ impl Harness for WhipHarness {
             command_id: command.command_id.clone(),
             live: std::cell::RefCell::new(&mut guarded_sink),
             streamed: std::cell::Cell::new(false),
+            office_request_url: self.provider.office_request_url.clone(),
+            managed_call_meter: managed_call_meter.as_deref(),
         };
         // ADR 0111: a question settles the turn. There is no suspended epoch to
         // resume into, because WhippleScript 0.2.2 removed the host-facing
@@ -2588,11 +2733,27 @@ impl Harness for WhipHarness {
             .as_ref()
             .map(|usage| usage.last_input_tokens)
             .filter(|tokens| *tokens > 0);
+        // A credit-funded turn settles from the runtime's own meter: every
+        // model call it made, summed. Only a metered turn publishes it, so a
+        // personal-key turn is never mistaken for one to bill.
+        let metered_usage = managed_call_meter
+            .as_ref()
+            .and(execution.usage.as_ref())
+            .map(|usage| gaugedesk_harness::ModelUsage {
+                usage_ref: usage.usage_ref.clone(),
+                provider: provider_wire_name(self.provider.provider).to_owned(),
+                model: self.provider.model.clone(),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            });
         let streamed = resources.streamed.get();
         let sink = resources.live.into_inner();
         let mut outcome =
             project_turn_execution(execution, evidence_pointers, &command, sink, !streamed)?;
         outcome.runtime_workspace_witness = workspace_witness;
+        if metered_usage.is_some() {
+            outcome.managed_usage = metered_usage;
+        }
         if outcome.error.is_some() {
             if let Some(reason) = self
                 .runtime
@@ -3447,6 +3608,73 @@ struct ProviderConfig {
     codex_session_id: Option<String>,
     credential_ref: String,
     credential_capability: Arc<dyn CredentialCapability>,
+    /// The pinned transport of an office-approved inference endpoint (HIPAA-2).
+    /// When present, every model request of the turn connects only through it.
+    office_transport: Option<NativeProviderTransport>,
+    /// The approved Chat Completions URL of that endpoint, fixed at admission.
+    office_request_url: Option<String>,
+}
+
+/// The one provider an office-approved inference endpoint may be reached as:
+/// an OpenAI-compatible endpoint the office itself operates. Every fixed-host
+/// provider is a cloud provider, and so is never an office endpoint.
+const OFFICE_INFERENCE_PROVIDER: &str = "openai-generic";
+
+fn office_refusal(reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("office inference endpoint refused: {reason}"),
+    )
+}
+
+/// Admit an office-bound turn's provider selection against its approved
+/// endpoint, and build the transport that alone may carry its requests.
+///
+/// Every difference refuses rather than falls back: another provider, a model
+/// or base URL other than the approved one (a host or chat override), egress
+/// to any host but the endpoint's own (a tool, shell or web path), and an
+/// address set or TLS identity the pinned transport cannot honor.
+fn office_transport(
+    spec: &HarnessSpec,
+    office: &gaugedesk_harness::OfficeInferenceEndpoint,
+    descriptor: &NativeProviderDescriptor,
+) -> io::Result<NativeProviderTransport> {
+    if descriptor.provider_name != OFFICE_INFERENCE_PROVIDER {
+        return Err(office_refusal(&format!(
+            "provider `{}` is not the office-operated endpoint",
+            descriptor.provider_name
+        )));
+    }
+    if descriptor.base_url != office.base_url {
+        return Err(office_refusal("the endpoint is not the approved base URL"));
+    }
+    if descriptor.model != office.model {
+        return Err(office_refusal("the model is not the approved model"));
+    }
+    match spec.sandbox.network {
+        Network::Allow => {
+            return Err(office_refusal("unfiltered egress is not reviewed"));
+        }
+        Network::Deny | Network::Filtered => {}
+    }
+    if spec
+        .sandbox
+        .allowed_hosts
+        .iter()
+        .any(|host| host != &descriptor.endpoint_host)
+    {
+        return Err(office_refusal("egress to another host is not reviewed"));
+    }
+    let transport = match &office.tls {
+        None => NativeProviderTransport::loopback_http(&office.base_url, office.addresses.clone()),
+        Some(tls) => NativeProviderTransport::pinned_https(
+            &office.base_url,
+            office.addresses.clone(),
+            tls.trust_roots_der.clone(),
+            tls.certificate_sha256.clone(),
+        ),
+    };
+    transport.map_err(|_| office_refusal("the approved address set or TLS identity is invalid"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3683,6 +3911,11 @@ impl ProviderConfig {
                 ),
             ));
         }
+        let office_transport = spec
+            .office_inference
+            .as_ref()
+            .map(|office| office_transport(spec, office, &descriptor))
+            .transpose()?;
         let credential_ref = spec.credential_ref.clone().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "credential ref is required")
         })?;
@@ -3698,6 +3931,12 @@ impl ProviderConfig {
                 "credential capability does not match the policy reference",
             ));
         }
+        let office_request_url = office_transport.as_ref().map(|_| {
+            format!(
+                "{}/chat/completions",
+                descriptor.base_url.trim_end_matches('/')
+            )
+        });
         Ok(Self {
             provider,
             model: descriptor.model,
@@ -3706,6 +3945,8 @@ impl ProviderConfig {
                 .then(|| format!("gaugedesk-{}", hex::encode(spec.chat_id.as_bytes()))),
             credential_ref,
             credential_capability,
+            office_request_url,
+            office_transport,
         })
     }
 }
@@ -3739,18 +3980,22 @@ impl SecretResolver for ProviderConfig {
                 self.codex_session_id.clone().unwrap_or_default(),
                 self.model.clone(),
                 self.base_url.clone(),
-                8_192,
+                NATIVE_MODEL_OUTPUT_LIMIT,
                 Duration::from_secs(120),
             ));
         }
-        Ok(ResolvedProviderBinding::new(
+        let binding = ResolvedProviderBinding::new(
             self.provider,
             material.secret().to_owned(),
             self.model.clone(),
             self.base_url.clone(),
-            8_192,
+            NATIVE_MODEL_OUTPUT_LIMIT,
             Duration::from_secs(120),
-        ))
+        );
+        Ok(match &self.office_transport {
+            Some(transport) => binding.with_admitted_transport(transport.clone()),
+            None => binding,
+        })
     }
 }
 
@@ -3794,13 +4039,11 @@ impl CurrentTurnAccess {
 /// Only current original authority is available to the recorded owner. Any
 /// accidental resource/effect request refuses rather than reaching a live tool.
 struct RecordedResources<'a> {
-    access: &'a dyn gaugedesk_harness::TurnAccess,
+    access: &'a dyn Fn() -> Result<(), String>,
 }
 impl ResourceResolver for RecordedResources<'_> {
     fn check_live_access(&self) -> Result<(), String> {
-        self.access
-            .check_current()
-            .map_err(|_| "original turn access ended".into())
+        (self.access)().map_err(|_| "original turn access ended".into())
     }
     fn resolve_image(&self, _: &ResourceRef) -> Result<ResolvedImage, String> {
         Err("saved runtime observation cannot resolve images".into())
@@ -3829,6 +4072,36 @@ struct TurnResources<'a> {
     /// Whether any answer delta streamed, so the settled projection does not
     /// sink the full text a second time (mirrors the hosted `streamed_text`).
     streamed: std::cell::Cell<bool>,
+    /// The one request URL an office-bound turn may send to, fixed when its
+    /// binding was admitted (HIPAA-2). `None` for an ordinary turn.
+    office_request_url: Option<String>,
+    /// Holds credit before each provider call of a credit-funded turn
+    /// (GaugeWright DR-0203). A refusal sends nothing for that call.
+    managed_call_meter: Option<&'a dyn gaugedesk_harness::ManagedCallMeter>,
+}
+
+/// The most output tokens a native provider call asks for. Credit holds are
+/// sized from it, so it is named once here rather than repeated at each
+/// binding.
+pub const NATIVE_MODEL_OUTPUT_LIMIT: u64 = 8_192;
+
+/// Hold credit for one prepared call before the runtime may send it. With no
+/// meter the send proceeds exactly as WhippleScript would have made it.
+fn admit_metered_call(
+    meter: Option<&dyn gaugedesk_harness::ManagedCallMeter>,
+    request: &whipplescript::host_runtime::NativeProviderRequest<'_>,
+    send: &mut dyn FnMut(Duration) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(meter) = meter {
+        meter.admit_call(&gaugedesk_harness::ManagedModelCall {
+            command_id: &request.command.command_id,
+            ordinal: request.ordinal,
+            url: request.url,
+            body: request.body,
+            output_limit: NATIVE_MODEL_OUTPUT_LIMIT,
+        })?;
+    }
+    send(request.configured_timeout)
 }
 
 impl ResourceResolver for TurnResources<'_> {
@@ -3844,6 +4117,28 @@ impl ResourceResolver for TurnResources<'_> {
 
     fn check_live_access(&self) -> Result<(), String> {
         self.access.map_or(Ok(()), |access| access.check_current())
+    }
+
+    /// An office-bound turn sends only on the admitted pinned transport, to
+    /// the approved request URL. Anything else — an unpinned driver, a changed
+    /// endpoint — is refused before a connection is made. A credit-funded call
+    /// then holds its credit before it is sent.
+    fn with_native_provider_request(
+        &self,
+        request: &whipplescript::host_runtime::NativeProviderRequest<'_>,
+        send: &mut dyn FnMut(Duration) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if let Some(approved) = &self.office_request_url {
+            if !request.transport_pinned || request.url != approved {
+                return Err(
+                    "office inference endpoint refused: the request is not on its pinned transport"
+                        .to_owned(),
+                );
+            }
+        }
+        // A credit-funded call holds its credit only once its endpoint is
+        // admitted, so a refused office endpoint never holds anything.
+        admit_metered_call(self.managed_call_meter, request, send)
     }
 
     fn model_visible_environment(&self) -> whipplescript_kernel::world_state::EnvironmentState {
@@ -4406,6 +4701,310 @@ mod tests {
     }
 
     #[test]
+    fn protected_factory_preserves_encrypted_turns_across_reopen_and_root_rebinding() {
+        use ring::{
+            aead,
+            rand::{SecureRandom, SystemRandom},
+        };
+        use whipplescript_store::{payload_protection::PayloadCodec, StoreError, StoreResult};
+        struct Codec(u8);
+        impl Codec {
+            fn key(&self) -> aead::LessSafeKey {
+                aead::LessSafeKey::new(
+                    aead::UnboundKey::new(&aead::AES_256_GCM, &[self.0; 32]).unwrap(),
+                )
+            }
+        }
+        impl PayloadCodec for Codec {
+            fn seal(&self, aad: &[u8], plain: &[u8]) -> StoreResult<Vec<u8>> {
+                let mut nonce = [0; 12];
+                SystemRandom::new().fill(&mut nonce).unwrap();
+                let mut body = plain.to_vec();
+                self.key()
+                    .seal_in_place_append_tag(
+                        aead::Nonce::assume_unique_for_key(nonce),
+                        aead::Aad::from(aad),
+                        &mut body,
+                    )
+                    .map_err(|_| StoreError::fault("synthetic codec", "seal failed"))?;
+                Ok([nonce.to_vec(), body].concat())
+            }
+            fn open(&self, aad: &[u8], sealed: &[u8]) -> StoreResult<Vec<u8>> {
+                let nonce = sealed
+                    .get(..12)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| StoreError::fault("synthetic codec", "short envelope"))?;
+                let mut body = sealed[12..].to_vec();
+                let plain = self
+                    .key()
+                    .open_in_place(
+                        aead::Nonce::assume_unique_for_key(nonce),
+                        aead::Aad::from(aad),
+                        &mut body,
+                    )
+                    .map_err(|_| StoreError::fault("synthetic codec", "authentication failed"))?;
+                Ok(plain.to_vec())
+            }
+            fn retain(&self, publish: &mut dyn FnMut() -> StoreResult<()>) -> StoreResult<()> {
+                // This fixture's immutable key has no concurrent erasure operation.
+                publish()
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let (origin, calls, server) = recording_provider(2);
+        let spec = continuity_spec(
+            worktree.path(),
+            &origin,
+            gaugedesk_harness::ChatMode::Edit,
+            None,
+            Some("SYNTHETIC PRIVATE PERSONA"),
+        );
+        let selected =
+            |domain: &str, key| PayloadProtection::new(domain, Arc::new(Codec(key))).unwrap();
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            harness_policy_root(),
+            root.path(),
+        )
+        .with_existing_native_runtime_protection(
+            &spec.chat_id,
+            selected("synthetic-original-chat", 7),
+        )
+        .unwrap();
+        let database = chat_runtime_database(root.path(), &spec.chat_id);
+        let signed = spec.signed_policy_envelope.as_ref().unwrap();
+        // Enrollment is an explicit owner operation, never a factory fallback.
+        drop(
+            GovernedHostRuntime::create_protected_with_verifier(
+                &database,
+                1,
+                signed,
+                &harness_policy_root(),
+                selected("synthetic-original-chat", 7),
+            )
+            .unwrap(),
+        );
+        let mut harness = factory.create_harness(&spec).unwrap();
+        harness.provider.base_url = origin.clone();
+        harness.bind_runtime_command_id(Some("synthetic-original-command"));
+        let preparation = harness
+            .prepare_runtime_turn("SYNTHETIC PRIVATE FIRST REQUEST", &[])
+            .unwrap();
+        let original = harness
+            .run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "SYNTHETIC PRIVATE FIRST REQUEST",
+                &[],
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(original.error.is_none(), "{:?}", original.error);
+        let first = harness.instance_ref.clone();
+        drop(harness);
+        let rebound = factory.clone().with_policy_root(harness_policy_root());
+        let second = continuity_turn(&rebound, &spec, &origin, "SYNTHETIC PRIVATE SECOND REQUEST");
+        assert_eq!(first, second);
+        server.join().unwrap();
+        assert!(calls.lock().unwrap()[1]
+            .to_string()
+            .contains("SYNTHETIC PRIVATE FIRST REQUEST"));
+        for path in [database.clone(), database.with_extension("sqlite-wal")] {
+            if let Ok(bytes) = std::fs::read(path) {
+                for private in [
+                    "SYNTHETIC PRIVATE FIRST REQUEST",
+                    "SYNTHETIC PRIVATE SECOND REQUEST",
+                    "SYNTHETIC PRIVATE PERSONA",
+                ] {
+                    assert!(!bytes
+                        .windows(private.len())
+                        .any(|window| window == private.as_bytes()));
+                }
+            }
+        }
+        let allowed = std::cell::Cell::new(true);
+        let checks = std::cell::Cell::new(0usize);
+        let current = || {
+            checks.set(checks.get() + 1);
+            if allowed.get() {
+                Ok(())
+            } else {
+                Err("synthetic current read refused".into())
+            }
+        };
+        let completed = gaugedesk_harness::CompletedProductRuntimeSpec {
+            chat_id: &spec.chat_id,
+            command_id: "synthetic-original-command",
+            policy_epoch: 1,
+            signed_policy_envelope: signed,
+            preparation: &preparation,
+            access: &current,
+        };
+        let observed = rebound
+            .observe_completed_product_runtime(&completed)
+            .unwrap();
+        assert_eq!(observed.assistant_text, original.assistant_text);
+        assert_eq!(
+            observed.runtime_start_position,
+            original.runtime_start_position
+        );
+        assert_eq!(
+            observed.runtime_terminal_position,
+            original.runtime_terminal_position
+        );
+        assert_eq!(
+            observed.runtime_workspace_witness,
+            original.runtime_workspace_witness
+        );
+        assert!(checks.get() > 0);
+        struct Allowed;
+        impl gaugedesk_harness::TurnAccess for Allowed {
+            fn check_current(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let wrong_images = [gaugedesk_harness::ImageContent {
+            kind: gaugedesk_harness::ImageKind::Image,
+            data: "AA==".into(),
+            mime_type: "image/png".into(),
+        }];
+        let mut pending = gaugedesk_harness::RecordedRuntimeSpec {
+            chat_id: &spec.chat_id,
+            command_id: "synthetic-original-command",
+            policy_epoch: 1,
+            signed_policy_envelope: signed,
+            preparation: &preparation,
+            images: &wrong_images,
+            access: &Allowed,
+        };
+        assert!(rebound.observe_recorded_runtime(&pending).is_err());
+        pending.images = &[];
+        let recovered = rebound.observe_recorded_runtime(&pending).unwrap();
+        assert_eq!(
+            recovered.runtime_workspace_witness,
+            original.runtime_workspace_witness
+        );
+        let before = std::fs::read(&database).unwrap();
+        allowed.set(false);
+        assert!(rebound
+            .observe_completed_product_runtime(&completed)
+            .is_err());
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        // The synchronous caller's non-Send Cell proves no task capability is retained.
+        // It supplies current authority; this primitive does not grant a product reader.
+
+        let plain = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            harness_policy_root(),
+            root.path(),
+        );
+        assert!(plain.runtime_for_chat(&spec.chat_id, 1, signed).is_err());
+        let wrong_domain = plain
+            .clone()
+            .with_existing_native_runtime_protection(
+                &spec.chat_id,
+                selected("synthetic-foreign-chat", 7),
+            )
+            .unwrap();
+        assert!(wrong_domain
+            .runtime_for_chat(&spec.chat_id, 1, signed)
+            .is_err());
+        let wrong_key = plain
+            .with_existing_native_runtime_protection(
+                &spec.chat_id,
+                selected("synthetic-original-chat", 8),
+            )
+            .unwrap();
+        assert!(wrong_key
+            .runtime_for_chat(&spec.chat_id, 1, signed)
+            .and_then(|runtime| runtime.newest_recorded_instance().map_err(invalid_data))
+            .is_err());
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert!(rebound
+            .runtime_for_chat(&spec.chat_id, 1, signed)
+            .unwrap()
+            .newest_recorded_instance()
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn selected_native_protection_never_initializes_missing_or_unbound_storage() {
+        use super::*;
+        use whipplescript_store::payload_protection::PayloadCodec;
+        struct UnreachableCodec;
+        impl PayloadCodec for UnreachableCodec {
+            fn seal(&self, _: &[u8], _: &[u8]) -> whipplescript_store::StoreResult<Vec<u8>> {
+                panic!("missing storage must refuse before sealing")
+            }
+            fn open(&self, _: &[u8], _: &[u8]) -> whipplescript_store::StoreResult<Vec<u8>> {
+                panic!("missing storage has no payload to open")
+            }
+            fn retain(
+                &self,
+                _: &mut dyn FnMut() -> whipplescript_store::StoreResult<()>,
+            ) -> whipplescript_store::StoreResult<()> {
+                panic!("missing storage must refuse before retaining")
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let runtime_root = root.path().join("missing-runtime");
+        let protection =
+            PayloadProtection::new("synthetic-missing-chat", Arc::new(UnreachableCodec)).unwrap();
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("transport:owner"),
+            harness_policy_root(),
+            &runtime_root,
+        )
+        .with_existing_native_runtime_protection("bound", protection.clone())
+        .unwrap();
+        assert!(factory
+            .clone()
+            .with_existing_native_runtime_protection("bound", protection.clone())
+            .is_err());
+        assert!(factory
+            .clone()
+            .with_existing_native_runtime_protection(" ", protection)
+            .is_err());
+        assert!(factory.runtime_protection("unbound").is_err());
+        assert!(!gaugedesk_harness::HarnessFactory::reuse_across_turns(
+            &factory
+        ));
+        let hosted = factory.clone().with_do_host(
+            DoHostConfig::new(
+                "https://synthetic.invalid",
+                "synthetic-token",
+                "synthetic-office",
+            )
+            .unwrap(),
+        );
+        assert!(hosted.runtime_protection("bound").is_err());
+        assert!(hosted.existing_catalogue_store("bound").is_err());
+        assert!(hosted
+            .with_existing_native_runtime_protection(
+                "second",
+                PayloadProtection::new("synthetic-second", Arc::new(UnreachableCodec)).unwrap()
+            )
+            .is_err());
+        let key = SigningKey::from_seed(&[7u8; 32]).unwrap();
+        let signed = sign_hosted_policy_envelope(
+            &harness_policy_at("https://api.openai.com"),
+            &AuthorityId::new("authority:owner"),
+            &key,
+            1,
+        )
+        .unwrap();
+        for chat in ["bound", "unbound"] {
+            assert!(factory.runtime_for_chat(chat, 1, &signed).is_err());
+            assert!(factory.existing_catalogue_store(chat).is_err());
+        }
+        assert!(
+            !runtime_root.exists(),
+            "selection cannot create or adopt storage"
+        );
+    }
+
+    #[test]
     fn native_agent_skill_catalogue_tracks_the_mounted_version() {
         use super::*;
         let root = tempfile::tempdir().unwrap();
@@ -4467,6 +5066,8 @@ mod tests {
             command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
+            office_request_url: None,
+            managed_call_meter: None,
         };
         assert!(
             resources
@@ -4610,6 +5211,8 @@ mod tests {
             command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
+            office_request_url: None,
+            managed_call_meter: None,
         };
         let project = super::ResourceRef {
             handle: "project".into(),
@@ -4692,6 +5295,8 @@ mod tests {
             command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
+            office_request_url: None,
+            managed_call_meter: None,
         };
         let call = super::ToolCall {
             id: "call-1".into(),
@@ -4800,6 +5405,8 @@ mod tests {
             command_id: "original-command".into(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
+            office_request_url: None,
+            managed_call_meter: None,
         };
         let admitted = [
             ResourceRef {
@@ -4901,6 +5508,8 @@ mod tests {
             command_id: "test-turn".to_owned(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
+            office_request_url: None,
+            managed_call_meter: None,
         };
         let admitted = [super::ResourceRef {
             handle: "target:t-one".into(),
@@ -5168,6 +5777,8 @@ mod tests {
             command_id: "first-turn".into(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
+            office_request_url: None,
+            managed_call_meter: None,
         };
         let environment = resources.model_visible_environment();
         assert_eq!(environment.cwd.as_deref(), Some("."));
@@ -5280,6 +5891,8 @@ mod tests {
                 command_id: "test-turn".to_owned(),
                 live: std::cell::RefCell::new(&mut sink),
                 streamed: std::cell::Cell::new(false),
+                office_request_url: None,
+                managed_call_meter: None,
             };
             resources.observe_text_delta("Gauge");
             resources.observe_text_delta("");
@@ -5875,6 +6488,10 @@ mod tests {
     }
 
     pub(super) fn harness_policy_at(base_url: &str) -> String {
+        harness_policy_for("openai", "gpt-test", base_url, "openai-responses")
+    }
+
+    fn harness_policy_for(provider: &str, model: &str, base_url: &str, wire: &str) -> String {
         let principal = ResourcePolicy {
             principal: true,
             ..ResourcePolicy::default()
@@ -5918,12 +6535,12 @@ mod tests {
             provider_bindings: std::collections::BTreeMap::from([(
                 "model".to_owned(),
                 ProviderBindingPolicy {
-                    provider: "openai".to_owned(),
-                    model: "gpt-test".to_owned(),
+                    provider: provider.to_owned(),
+                    model: model.to_owned(),
                     base_url: base_url.to_owned(),
                     credential_ref: "credential:gaugedesk/account/616c696365/6f70656e6169/v1"
                         .to_owned(),
-                    wire: Some("openai-responses".to_owned()),
+                    wire: Some(wire.to_owned()),
                 },
             )]),
             placements: std::collections::BTreeMap::from([(
@@ -6084,6 +6701,95 @@ mod tests {
         let tampered = signed.replace("file:/workspace", "file:/elsewhere");
         assert_ne!(tampered, signed);
         assert!(AdmittedPolicyEpoch::verify(epoch, &tampered).is_err());
+    }
+
+    /// A metered call is held before the runtime may send it, with the call's
+    /// exact identity and the native output limit; a refusal sends nothing.
+    #[test]
+    fn a_metered_native_call_is_admitted_before_it_is_sent() {
+        struct Recording(Mutex<Vec<(String, u64, u64)>>, bool);
+        impl gaugedesk_harness::ManagedCallMeter for Recording {
+            fn admit_call(
+                &self,
+                call: &gaugedesk_harness::ManagedModelCall<'_>,
+            ) -> Result<(), String> {
+                self.0.lock().unwrap().push((
+                    call.command_id.to_owned(),
+                    call.ordinal,
+                    call.output_limit,
+                ));
+                if self.1 {
+                    Ok(())
+                } else {
+                    Err("credits exhausted".to_owned())
+                }
+            }
+        }
+        let admitted =
+            AdmittedPolicyEpoch::verify(PolicyEpoch::new(9).expect("epoch"), &signed_envelope())
+                .expect("policy");
+        let command = StartTurnCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            command_id: "turn-command-9".to_owned(),
+            run_ref: "gaugedesk:run:9".to_owned(),
+            instance_ref: "whip:instance:9".to_owned(),
+            package_version_ref: "whip:package-version:9".to_owned(),
+            policy: admitted.protocol_ref().clone(),
+            actor_ref: "authority:owner".to_owned(),
+            input: TurnInput {
+                text: "inspect the project".to_owned(),
+                images: Vec::new(),
+            },
+            resources: Vec::new(),
+            provider_binding: ProviderBindingRef {
+                binding_id: "gaugedesk:provider:primary".to_owned(),
+                credential: CredentialRef {
+                    credential_id: "credential:gaugedesk/account/616c696365/6f70656e6169/v1"
+                        .to_owned(),
+                },
+            },
+            placement_ceiling_ref: "gaugedesk:placement:local".to_owned(),
+        };
+        let body = serde_json::json!({ "model": "m" });
+        let request = whipplescript::host_runtime::NativeProviderRequest {
+            command: &command,
+            ordinal: 2,
+            url: "https://gateway.test/v1/responses",
+            body: &body,
+            provenance: None,
+            transport_pinned: false,
+            configured_timeout: Duration::from_secs(5),
+        };
+
+        let allow = Recording(Mutex::new(Vec::new()), true);
+        let mut sent = Vec::new();
+        admit_metered_call(Some(&allow), &request, &mut |timeout| {
+            sent.push(timeout);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sent, vec![Duration::from_secs(5)]);
+        assert_eq!(
+            allow.0.lock().unwrap().as_slice(),
+            [("turn-command-9".to_owned(), 2, NATIVE_MODEL_OUTPUT_LIMIT)]
+        );
+
+        let refuse = Recording(Mutex::new(Vec::new()), false);
+        let mut sent = 0;
+        assert!(admit_metered_call(Some(&refuse), &request, &mut |_| {
+            sent += 1;
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(sent, 0, "a refused call is never sent");
+
+        let mut sent = 0;
+        admit_metered_call(None, &request, &mut |_| {
+            sent += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(sent, 1, "an unmetered call sends as before");
     }
 
     #[test]
@@ -6370,6 +7076,7 @@ workflow Method {
             thinking: None,
             system_prompt: None,
             credential_capability: Some(test_credential_capability()),
+            office_inference: None,
             sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree
                 .path()
                 .to_path_buf()])
@@ -6662,6 +7369,7 @@ workflow Method {
             thinking: None,
             system_prompt: system_prompt.map(str::to_owned),
             credential_capability: Some(test_credential_capability()),
+            office_inference: None,
             sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree.to_path_buf()])
                 .read_only(vec![worktree.join(".whipple")])
                 .filter_egress(vec!["api.openai.com".to_owned(), "127.0.0.1".to_owned()]),
@@ -6861,6 +7569,7 @@ workflow Method {
             thinking: None,
             system_prompt: None,
             credential_capability: Some(test_credential_capability()),
+            office_inference: None,
             sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree
                 .path()
                 .to_path_buf()])
@@ -7233,6 +7942,8 @@ workflow Method {
             command_id: command.command_id.clone(),
             live: std::cell::RefCell::new(&mut sink),
             streamed: std::cell::Cell::new(false),
+            office_request_url: None,
+            managed_call_meter: None,
         };
         let driver = WitnessDriver(std::cell::RefCell::new(std::collections::VecDeque::from([
             serde_json::json!({ "output": [{ "type":"function_call", "call_id":"write-one", "name":"write", "arguments":"{\"path\":\"result.txt\",\"content\":\"synthetic result\"}" }], "usage":{"input_tokens":10,"output_tokens":2} }),
@@ -7740,6 +8451,506 @@ workflow Method {
             factory.credential_status("openai-codex", Some(test_credential_capability().as_ref())),
             CredentialProbe::Ready
         );
+    }
+
+    /// HIPAA-2: a turn bound to an office-approved inference endpoint.
+    mod office_inference {
+        use super::*;
+        use gaugedesk_harness::{OfficeInferenceEndpoint, OfficeTlsIdentity};
+        use std::io::Write as _;
+        use std::net::{SocketAddr, TcpListener};
+
+        const MODEL: &str = "office-llm";
+
+        /// One request a loopback listener received: request line, lowercase
+        /// headers and body.
+        struct Received {
+            line: String,
+            headers: String,
+            body: serde_json::Value,
+        }
+
+        /// Accept up to `turns` connections within the deadline, answer each
+        /// with `respond`, and return what arrived. A listener nobody calls
+        /// returns an empty list rather than hanging the test.
+        fn listener(
+            turns: usize,
+            respond: fn(&Received, &mut std::net::TcpStream),
+        ) -> (SocketAddr, std::thread::JoinHandle<Vec<Received>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut received = Vec::new();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while received.len() < turns {
+                    let mut socket = match listener.accept() {
+                        Ok((socket, _)) => socket,
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0; 4096];
+                    let start = loop {
+                        let count = socket.read(&mut chunk).unwrap_or(0);
+                        if count == 0 {
+                            break None;
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(index + 4);
+                        }
+                    };
+                    // A connection that sends no request (a test waking the
+                    // listener) is counted as an empty arrival.
+                    let Some(start) = start else {
+                        received.push(Received {
+                            line: String::new(),
+                            headers: String::new(),
+                            body: serde_json::Value::Null,
+                        });
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&bytes[..start]).to_string();
+                    let (line, headers) = head.split_once("\r\n").unwrap();
+                    let headers = headers.to_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    while bytes.len() < start + length {
+                        let count = socket.read(&mut chunk).unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = Received {
+                        line: line.to_owned(),
+                        headers,
+                        body: serde_json::from_slice(&bytes[start..start + length])
+                            .unwrap_or(serde_json::Value::Null),
+                    };
+                    respond(&request, &mut socket);
+                    received.push(request);
+                }
+                received
+            });
+            (address, server)
+        }
+
+        fn answer(request: &Received, socket: &mut std::net::TcpStream) {
+            let usage = serde_json::json!({"prompt_tokens": 1, "completion_tokens": 1});
+            let (content_type, wire) = if request.headers.contains("text/event-stream") {
+                (
+                    "text/event-stream",
+                    format!(
+                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        serde_json::json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"Done."}}]}),
+                        serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":usage}),
+                    ),
+                )
+            } else {
+                (
+                    "application/json",
+                    serde_json::json!({
+                        "choices":[{"index":0,"message":{"role":"assistant","content":"Done."},"finish_reason":"stop"}],
+                        "usage":usage,
+                    })
+                    .to_string(),
+                )
+            };
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{wire}",
+                wire.len()
+            )
+            .unwrap();
+        }
+
+        fn office(base_url: &str, addresses: Vec<SocketAddr>) -> OfficeInferenceEndpoint {
+            OfficeInferenceEndpoint {
+                base_url: base_url.to_owned(),
+                model: MODEL.to_owned(),
+                addresses,
+                tls: None,
+            }
+        }
+
+        /// The spec an office enrollment would hand the runtime: the approved
+        /// endpoint as an `openai-generic` provider, signed into the policy,
+        /// with egress admitted to the endpoint host alone.
+        fn office_spec(
+            worktree: &Path,
+            base_url: &str,
+            office: OfficeInferenceEndpoint,
+        ) -> HarnessSpec {
+            let host = openai_generic_endpoint_host(base_url).unwrap();
+            let authority = AuthorityId::new("authority:owner");
+            let key = SigningKey::from_seed(&[7u8; 32]).expect("key");
+            let policy =
+                harness_policy_for("openai-generic", MODEL, base_url, "openai-chat-compat");
+            HarnessSpec {
+                chat_id: "chat-office".to_owned(),
+                worktree: worktree.to_path_buf(),
+                mode: gaugedesk_harness::ChatMode::Edit,
+                package_root: None,
+                package_version_ref: None,
+                policy_epoch: Some(1),
+                signed_policy_envelope: Some(
+                    sign_policy_envelope(&policy, &authority, &key).expect("signed policy"),
+                ),
+                provider_binding_ref: Some("model".to_owned()),
+                credential_ref: Some(
+                    "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),
+                ),
+                placement_ceiling_ref: Some("local".to_owned()),
+                workspace_targets: Vec::new(),
+                runtime_placement_id: Some("placement-office".to_owned()),
+                provider: Some("openai-generic".to_owned()),
+                model: Some(MODEL.to_owned()),
+                base_url: Some(base_url.to_owned()),
+                thinking: None,
+                system_prompt: Some("You are the office assistant.".to_owned()),
+                credential_capability: Some(test_credential_capability()),
+                office_inference: Some(office),
+                sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![
+                    worktree.to_path_buf()
+                ])
+                .read_only(vec![worktree.join(".whipple")])
+                .filter_egress(vec![host]),
+                roster: Vec::new(),
+            }
+        }
+
+        fn factory(root: &Path) -> WhipHarnessFactory {
+            WhipHarnessFactory::new(
+                AuthorityId::new("authority:owner"),
+                harness_policy_root(),
+                root,
+            )
+        }
+
+        fn refused(spec: &HarnessSpec) -> String {
+            let error = ProviderConfig::from_spec(spec)
+                .err()
+                .expect("the office binding must refuse");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+            error.to_string()
+        }
+
+        /// The real journey: a whole governed turn reaches the approved
+        /// loopback endpoint through the pinned transport, with the linked
+        /// credential and the approved model, and nowhere else.
+        #[test]
+        fn an_office_turn_reaches_the_approved_loopback_endpoint() {
+            let root = tempfile::tempdir().unwrap();
+            let worktree = tempfile::tempdir().unwrap();
+            let (address, server) = listener(1, answer);
+            let base_url = format!("http://{address}/v1");
+            let spec = office_spec(worktree.path(), &base_url, office(&base_url, vec![address]));
+
+            let mut harness = factory(root.path())
+                .create_harness(&spec)
+                .expect("office harness");
+            let outcome = harness
+                .run_turn(
+                    &gaugedesk_harness::AllowAllGate,
+                    "OFFICE-PROMPT",
+                    &[],
+                    &mut |_| {},
+                )
+                .expect("office turn");
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+            let received = server.join().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].line, "POST /v1/chat/completions HTTP/1.1");
+            assert!(received[0]
+                .headers
+                .contains("authorization: bearer test-key"));
+            assert_eq!(received[0].body["model"], MODEL);
+            assert!(received[0].body.to_string().contains("OFFICE-PROMPT"));
+        }
+
+        /// The pinned transport, not admission alone, carries the request: an
+        /// endpoint changed after admission (as a later host override would)
+        /// is refused at send, and the other listener never sees the prompt.
+        #[test]
+        fn an_endpoint_changed_after_admission_is_refused_at_send() {
+            let root = tempfile::tempdir().unwrap();
+            let worktree = tempfile::tempdir().unwrap();
+            let (address, server) = listener(1, answer);
+            let (other, other_server) = listener(1, answer);
+            let base_url = format!("http://{address}/v1");
+            let spec = office_spec(worktree.path(), &base_url, office(&base_url, vec![address]));
+
+            let mut harness = factory(root.path()).create_harness(&spec).unwrap();
+            harness.provider.base_url = format!("http://{other}/v1");
+            let failed = match harness.run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "CHANGED-PROMPT",
+                &[],
+                &mut |_| {},
+            ) {
+                Ok(outcome) => outcome.error.is_some(),
+                Err(_) => true,
+            };
+            assert!(failed, "a changed endpoint must stop the turn");
+            for (wake, server) in [(address, server), (other, other_server)] {
+                let _ = std::net::TcpStream::connect(wake);
+                assert!(server
+                    .join()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.line.is_empty()));
+            }
+        }
+
+        /// Restart: a fresh factory over the same runtime root, as after a
+        /// process restart, admits the same binding again and reaches only the
+        /// approved endpoint — and refuses it again when the selection drifted.
+        #[test]
+        fn a_restarted_runtime_re_admits_the_binding_and_nothing_wider() {
+            let root = tempfile::tempdir().unwrap();
+            let worktree = tempfile::tempdir().unwrap();
+            let (address, server) = listener(2, answer);
+            let base_url = format!("http://{address}/v1");
+            let spec = office_spec(worktree.path(), &base_url, office(&base_url, vec![address]));
+            for prompt in ["BEFORE-RESTART", "AFTER-RESTART"] {
+                let mut harness = factory(root.path()).create_harness(&spec).unwrap();
+                let outcome = harness
+                    .run_turn(&gaugedesk_harness::AllowAllGate, prompt, &[], &mut |_| {})
+                    .unwrap();
+                assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            }
+            assert_eq!(server.join().unwrap().len(), 2);
+
+            let mut drifted = spec;
+            drifted.model = Some("cloud-model".to_owned());
+            assert!(factory(root.path()).create_harness(&drifted).is_err());
+        }
+
+        /// Outage: the approved endpoint is down. The turn stops with an error
+        /// and no request reaches any other address; there is no fallback.
+        #[test]
+        fn an_office_outage_stops_the_turn_without_fallback() {
+            let root = tempfile::tempdir().unwrap();
+            let worktree = tempfile::tempdir().unwrap();
+            let down = TcpListener::bind("127.0.0.1:0").unwrap();
+            let down_address = down.local_addr().unwrap();
+            drop(down);
+            let (decoy, decoy_server) = listener(1, answer);
+            let base_url = format!("http://{down_address}/v1");
+            let spec = office_spec(
+                worktree.path(),
+                &base_url,
+                office(&base_url, vec![down_address]),
+            );
+
+            let mut harness = factory(root.path()).create_harness(&spec).unwrap();
+            let failed = match harness.run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "OUTAGE-PROMPT",
+                &[],
+                &mut |_| {},
+            ) {
+                Ok(outcome) => outcome.error.is_some(),
+                Err(_) => true,
+            };
+            assert!(failed, "an unreachable office endpoint must stop the turn");
+            // Wake the decoy so its thread ends; it must have seen nothing but this.
+            let _ = std::net::TcpStream::connect(decoy);
+            let seen = decoy_server.join().unwrap();
+            assert!(seen.iter().all(|request| request.line.is_empty()));
+        }
+
+        /// Redirect: the approved endpoint answers with a redirect to another
+        /// listener. The pinned transport follows nothing; the second listener
+        /// never sees the prompt.
+        #[test]
+        fn an_office_endpoint_redirect_is_never_followed() {
+            static DECOY: OnceLock<SocketAddr> = OnceLock::new();
+            fn redirect(_: &Received, socket: &mut std::net::TcpStream) {
+                write!(
+                    socket,
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/v1/chat/completions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    DECOY.get().unwrap()
+                )
+                .unwrap();
+            }
+            let (decoy, decoy_server) = listener(1, answer);
+            DECOY.set(decoy).unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let worktree = tempfile::tempdir().unwrap();
+            let (address, server) = listener(1, redirect);
+            let base_url = format!("http://{address}/v1");
+            let spec = office_spec(worktree.path(), &base_url, office(&base_url, vec![address]));
+            let mut harness = factory(root.path()).create_harness(&spec).unwrap();
+            let failed = match harness.run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "REDIRECT-PROMPT",
+                &[],
+                &mut |_| {},
+            ) {
+                Ok(outcome) => outcome.error.is_some(),
+                Err(_) => true,
+            };
+            assert!(failed, "a redirected office request must stop the turn");
+            let received = server.join().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].line, "POST /v1/chat/completions HTTP/1.1");
+            // Wake the decoy; the only arrival it may have is this empty one.
+            let _ = std::net::TcpStream::connect(decoy);
+            let seen = decoy_server.join().unwrap();
+            assert!(seen.iter().all(|request| request.line.is_empty()));
+        }
+
+        /// A host, chat or credential override of provider, model or endpoint
+        /// is refused rather than reached.
+        #[test]
+        fn an_office_binding_refuses_every_override() {
+            let worktree = tempfile::tempdir().unwrap();
+            let address: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+            let base_url = format!("http://{address}/v1");
+            let spec = office_spec(worktree.path(), &base_url, office(&base_url, vec![address]));
+            assert!(ProviderConfig::from_spec(&spec).is_ok());
+
+            // A cloud provider in place of the office endpoint.
+            let mut cloud = spec.clone();
+            cloud.provider = Some("openai".to_owned());
+            cloud.base_url = None;
+            cloud.sandbox.allowed_hosts = vec!["api.openai.com".to_owned()];
+            assert!(refused(&cloud).contains("not the office-operated endpoint"));
+
+            // The same provider at another endpoint (a linked credential's URL).
+            let mut elsewhere = spec.clone();
+            elsewhere.base_url = Some("https://llm.example.com/v1".to_owned());
+            elsewhere.sandbox.allowed_hosts = vec!["llm.example.com".to_owned()];
+            assert!(refused(&elsewhere).contains("approved base URL"));
+
+            // Another model at the approved endpoint.
+            let mut model = spec.clone();
+            model.model = Some("other-model".to_owned());
+            assert!(refused(&model).contains("approved model"));
+        }
+
+        /// Tool, shell and web egress beyond the endpoint is unreviewed.
+        #[test]
+        fn an_office_binding_refuses_unreviewed_egress() {
+            let worktree = tempfile::tempdir().unwrap();
+            let address: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+            let base_url = format!("http://{address}/v1");
+            let spec = office_spec(worktree.path(), &base_url, office(&base_url, vec![address]));
+
+            let mut wider = spec.clone();
+            wider
+                .sandbox
+                .allowed_hosts
+                .push("search.example.com".to_owned());
+            assert!(refused(&wider).contains("another host"));
+
+            let mut unfiltered = spec.clone();
+            unfiltered.sandbox.network = Network::Allow;
+            assert!(refused(&unfiltered).contains("unfiltered egress"));
+        }
+
+        /// The address set is the destination: no DNS name stands in for an
+        /// address, no address may differ from the URL's, and cleartext is
+        /// limited to literal loopback.
+        #[test]
+        fn an_office_binding_pins_the_destination_without_dns() {
+            let worktree = tempfile::tempdir().unwrap();
+            let address: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+
+            // `localhost` would be resolved; only a literal address is a pin.
+            let named = "http://localhost:18080/v1";
+            let spec = office_spec(worktree.path(), named, office(named, vec![address]));
+            assert!(refused(&spec).contains("address set or TLS identity"));
+
+            // An address on another port, or another address, than the URL's.
+            let base_url = format!("http://{address}/v1");
+            for other in ["127.0.0.1:18081", "127.0.0.2:18080"] {
+                let other: SocketAddr = other.parse().unwrap();
+                let spec = office_spec(worktree.path(), &base_url, office(&base_url, vec![other]));
+                assert!(refused(&spec).contains("address set or TLS identity"));
+            }
+
+            // An empty address set.
+            let spec = office_spec(worktree.path(), &base_url, office(&base_url, Vec::new()));
+            assert!(refused(&spec).contains("address set or TLS identity"));
+
+            // A LAN endpoint without a pinned TLS identity.
+            let lan = "https://office-llm.lan/v1";
+            let lan_address: SocketAddr = "192.168.10.20:443".parse().unwrap();
+            let spec = office_spec(worktree.path(), lan, office(lan, vec![lan_address]));
+            assert!(refused(&spec).contains("address set or TLS identity"));
+
+            // A LAN endpoint with an empty TLS identity.
+            let mut empty_tls = office(lan, vec![lan_address]);
+            empty_tls.tls = Some(OfficeTlsIdentity {
+                trust_roots_der: Vec::new(),
+                certificate_sha256: Vec::new(),
+            });
+            let spec = office_spec(worktree.path(), lan, empty_tls);
+            assert!(refused(&spec).contains("address set or TLS identity"));
+        }
+
+        /// A hosted runtime and the organization model broker route a turn's
+        /// model calls off this office's systems, so both refuse the binding.
+        #[test]
+        fn an_office_binding_refuses_hosted_and_broker_routes() {
+            let root = tempfile::tempdir().unwrap();
+            let worktree = tempfile::tempdir().unwrap();
+            let address: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+            let base_url = format!("http://{address}/v1");
+            let spec = office_spec(worktree.path(), &base_url, office(&base_url, vec![address]));
+
+            let broker = OrganizationModelBrokerConfig::new(
+                "https://hub.example.com",
+                "account-session",
+                "organization:acme",
+                "project:one",
+                "chat-office",
+                AuthorityBinding {
+                    authority: AuthorityId::new("authority:model"),
+                    organization: gaugedesk_core::ids::ScopeId::new("organization:acme"),
+                    environment: "test".to_owned(),
+                },
+            )
+            .unwrap();
+            let brokered = factory(root.path())
+                .with_organization_model_broker(broker)
+                .unwrap();
+            let error = brokered
+                .create_harness(&spec)
+                .err()
+                .expect("broker refuses");
+            assert!(
+                error.to_string().contains("organization model broker"),
+                "{error}"
+            );
+            let error = HarnessFactory::create(&brokered, &spec)
+                .err()
+                .expect("broker refuses through the seam too");
+            assert!(
+                error
+                    .to_string()
+                    .contains("office inference endpoint refused"),
+                "{error}"
+            );
+        }
     }
 }
 

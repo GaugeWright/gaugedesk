@@ -1900,6 +1900,15 @@ input {
     color: var(--bg); }
 .create-agent-actions .create-agent-submit:hover:not(:disabled) { filter: brightness(1.1); }
 .create-agent-actions button:disabled { cursor: not-allowed; opacity: 0.5; }
+/* Moving signed-out projects names each one with its own tick (DR-0328 §7). */
+.local-project-transfer-list { display: flex; flex-direction: column; gap: 2px; margin: 0;
+    padding: 6px; border: 1px solid var(--edge); border-radius: 8px;
+    max-height: 260px; overflow-y: auto; }
+.local-project-transfer-list legend { padding: 0 4px; color: var(--muted); font-size: var(--fs-label); }
+.local-project-transfer-list label { display: flex; align-items: center; gap: 10px;
+    padding: 7px 8px; border-radius: 6px; color: var(--ink); font-size: var(--fs-body); cursor: pointer; }
+.local-project-transfer-list label:hover { background: color-mix(in srgb, var(--accent) 6%, var(--bg)); }
+.local-project-transfer-list input { margin: 0; flex: none; }
 @media (max-width: 480px) {
     .create-agent-dialog { padding: 18px; }
     .create-agent-kinds { grid-template-columns: 1fr; }

@@ -252,7 +252,7 @@ export { TopBar } from "./TopBar";
 export type { TopBarProps } from "./TopBar";
 export { contextHeader, dotState, dotView, nextTaskBadge, topBarView } from "./top-bar";
 export type { ContextHeader, DotState, DotView, NextTaskBadge, TopBarInputs, TopBarView } from "./top-bar";
-export { empty as emptyTranscript, fromSnapshot, groupTurns, pendingUserAfterSnapshot, reduce as reduceTranscript } from "./transcript";
+export { empty as emptyTranscript, fromSnapshot, groupTurns, pendingUserAfterSnapshot, withPendingTasks, reduce as reduceTranscript } from "./transcript";
 export type { StreamEvent, Tier, ToolLine, Transcript, TranscriptLine, TranscriptSegment } from "./transcript";
 export { TranscriptFilterMenu } from "./TranscriptFilterMenu";
 export { chatIdFromSearch, fileFromSearch, searchWithChat, searchWithFile } from "./chat-url";

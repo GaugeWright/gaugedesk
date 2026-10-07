@@ -20,6 +20,14 @@
 export interface DirectoryModule {
     /** `gaugedesk_directory_protocol::verify_signed_put_json`. */
     verify_signed_put_json(json: string): boolean;
+    /** `gaugedesk_directory_protocol::root_chain_reaches_json` (DR-0361).
+     * Optional so a module built before it existed still verifies records; it
+     * then follows no hand-over, and a changed root stays an alarm. */
+    root_chain_reaches_json?(pinned: string, current: string, chainJson: string): boolean;
+    /** `gaugedesk_directory_protocol::placement_verifies_json` (DR-0370). Optional
+     *  so a module built before it still verifies records; a route's placement is
+     *  then left to the root signature over the record that carries it. */
+    placement_verifies_json?(routeJson: string, trustedProjectKey: string): boolean;
 }
 
 let loader: (() => Promise<DirectoryModule>) | null = null;
@@ -65,4 +73,28 @@ async function load(): Promise<DirectoryModule> {
  */
 export async function verifySignedPut(json: string): Promise<boolean> {
     return (await load()).verify_signed_put_json(json);
+}
+
+/**
+ * Whether signed hand-overs in `chain` lead from the `pinned` root to `current`
+ * (DR-0361). `false` from a module too old to say, so an unfollowed change
+ * stays the alarm it always was.
+ */
+export async function rootChainReaches(
+    pinned: string,
+    current: string,
+    chain: readonly unknown[],
+): Promise<boolean> {
+    const module = await load();
+    return module.root_chain_reaches_json?.(pinned, current, JSON.stringify(chain)) ?? false;
+}
+
+/**
+ * Whether a route's placement holds against the project key the reader trusts
+ * (DR-0370). `true` from a module too old to check, since the root signature
+ * over the record carrying the route already vouches for it.
+ */
+export async function placementHolds(route: unknown, trustedProjectKey: string): Promise<boolean> {
+    const module = await load();
+    return module.placement_verifies_json?.(JSON.stringify(route), trustedProjectKey) ?? true;
 }

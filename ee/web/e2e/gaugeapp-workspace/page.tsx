@@ -263,6 +263,10 @@ function Harness() {
     const homePolicyMode = query.get("home-policy");
     const deviceLinkMode = query.get("device-link") === "1";
     const providerLifecycleMode = query.get("provider-lifecycle") === "1";
+    // DR-0334: a person none of whose devices can hold a key yet, and a new
+    // connection still waiting for one of their devices to be sealed for.
+    const noLinkRecipients = query.get("link-recipients") === "none";
+    const waitingDevice = query.get("waiting") === "1";
     const accountLifecycleMode = query.get("account-lifecycle") === "1";
     const accountErasureMode = query.get("account-erasure") === "1";
     const accountErasureBlocked = query.get("erasure-blocked") === "1";
@@ -481,6 +485,8 @@ function Harness() {
         };}
         if (id === "provider-connections") return {
             connections: providerLifecycleMode ? fixtureProviderConnections() : [],
+            // One trusted device holding a recipient key, so a key can be sealed (DR-0334).
+            account_links: { account: "acct-fixture", recipients: noLinkRecipients ? [] : [{ device_id: "device:fixture-desktop", public_key: "043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d" }] },
             default_model: providerLifecycleMode ? fixtureDefaultModel() : null,
             subscription_sign_ins: { codex: { provider: "openai-codex", linked: false, expires: null, expired: false, login: null }, grok: providerLifecycleMode ? fixtureGrokSignIn() : { provider: "xai-grok", linked: false, expires: null, expired: false, login: null } },
             managed_inference: { plan: null, usage: { runs: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0, included_tokens: 0, overage_tokens: 0, unattributed_runs: 0, unattributed_tokens: 0 }, billing: { customer_linked: false, subscription: null, freshness: "processor-reconciled", processor_mode: "test", verification: "unlinked", configured_plan: { name: "Managed", included_tokens: 0, checkout_available: false }, management: { plan_change: false, seats: false, cancellation: false }, documents: { invoices: [], estimate: null, refreshed_at: null, history_complete: false, freshness: "not-refreshed" } } },
@@ -1026,7 +1032,7 @@ function Harness() {
                     setFixtureProviderConnections((connections) => connections.some((connection) => connection.id === "xai-grok") ? connections : [...connections, {
                         id: "xai-grok", provider: "xai-grok", name: "Grok", kind: "o-auth", endpoint_class: "provider-hosted", base_url: null,
                         linked: true, status: "active", version: 1, execution_classes: ["private-home"], models: ["grok-4"],
-                        linked_at_ms: Date.now(), last_verified_at_ms: Date.now(), verification: "reachable",
+                        linked_at_ms: Date.now(), last_verified_at_ms: Date.now(), verification: "reachable", waiting: [],
                     }]);
                 }
                 setServerRevision((value) => value + 1);
@@ -1307,7 +1313,7 @@ function Harness() {
             }
             return delayed(response({ token: `SCIM-${admitted.scope.id}` }));
         },
-        submitAccountProviderSecret: async (request: { scope: GaugeAppScope; command_id?: string; payload?: unknown }, secret: string) => {
+        submitAccountProviderLink: async (request: { scope: GaugeAppScope; command_id?: string; payload?: unknown }, secret: string) => {
             record({ intake: request.scope.id, command: request.command_id, length: secret.length });
             requireActionAuthority();
             if (providerLifecycleMode) {
@@ -1328,6 +1334,7 @@ function Harness() {
                     linked_at_ms: Date.now(),
                     last_verified_at_ms: null,
                     verification: "unverified",
+                    waiting: waitingDevice ? ["device:fixture-phone"] : [],
                 }]);
                 setServerRevision((value) => value + 1);
             }

@@ -41,6 +41,7 @@ pub mod mobile_wake;
 pub mod model_connection;
 pub mod package_distribution;
 pub mod pinned_tls;
+pub mod plan;
 pub mod project_home_handoff;
 pub mod project_host_export;
 pub mod project_host_registration;
@@ -86,6 +87,70 @@ pub trait Lifecycle {
 
     fn decide(state: &Self::State, command: Self::Command) -> Result<Vec<Self::Event>, Rejection>;
     fn evolve(state: &Self::State, event: Self::Event) -> Self::State;
+
+    /// How the store may checkpoint this lifecycle's folded state (SCALE-1).
+    ///
+    /// `None` — the default — keeps the lifecycle a pure full replay. A
+    /// lifecycle whose state round-trips through serde may return
+    /// [`SnapshotCodec::serde`], and the store then folds from its newest
+    /// checkpoint plus the events after it. Events stay the authority: a
+    /// checkpoint is derived, rebuildable data, and any doubt about one is a
+    /// full replay.
+    fn snapshot_codec() -> Option<SnapshotCodec<Self::State>> {
+        None
+    }
+}
+
+/// A persistent encoding of a lifecycle's folded state (SCALE-1).
+///
+/// `version` names the meaning of a stored checkpoint: raise it whenever
+/// `evolve`, the state's shape, or its serialized form changes, so a checkpoint
+/// folded under the old reducer is never resumed by the new one. The store keys
+/// checkpoints on `(scope, kind, lifecycle, version)`, so a raised version
+/// simply finds none and replays the full history.
+pub struct SnapshotCodec<S> {
+    /// Stable identity of the reducer, distinct from its log `KIND` because two
+    /// reducers may fold one kind.
+    pub lifecycle: &'static str,
+    pub version: u32,
+    /// Checkpoint once this many of the lifecycle's events follow the last one.
+    pub every: u32,
+    pub encode: fn(&S) -> Option<String>,
+    pub decode: fn(&str) -> Option<S>,
+}
+
+/// The reducer build a checkpoint was folded by. The store keys checkpoints on
+/// it beside [`SnapshotCodec::version`], so every release replays each scope
+/// once rather than trusting that no reducer changed without a version raise.
+pub const SNAPSHOT_REDUCER_BUILD: &str = env!("CARGO_PKG_VERSION");
+
+/// Events folded between checkpoints unless a lifecycle chooses otherwise.
+pub const DEFAULT_SNAPSHOT_INTERVAL: u32 = 64;
+
+impl<S: serde::Serialize + serde::de::DeserializeOwned> SnapshotCodec<S> {
+    /// The serde codec (hex-encoded CBOR, the core's own wire format),
+    /// available only to a state that is fully serde.
+    pub fn serde(lifecycle: &'static str, version: u32) -> Self {
+        Self {
+            lifecycle,
+            version,
+            every: DEFAULT_SNAPSHOT_INTERVAL,
+            encode: |state| {
+                let mut bytes = Vec::new();
+                ciborium::into_writer(state, &mut bytes).ok()?;
+                Some(hex::encode(bytes))
+            },
+            decode: |text| ciborium::from_reader(hex::decode(text).ok()?.as_slice()).ok(),
+        }
+    }
+}
+
+impl<S> SnapshotCodec<S> {
+    /// Checkpoint after `every` events instead of the default interval.
+    pub fn every(mut self, every: u32) -> Self {
+        self.every = every.max(1);
+        self
+    }
 }
 
 /// Resolve which authority owns a scope, by convention from the scope string.

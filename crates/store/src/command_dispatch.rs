@@ -147,6 +147,81 @@ impl DispatchRecordAdmission<'_> {
         Ok(result)
     }
 
+    /// Validate bounded local domain facts under the same retained writer.
+    /// A decoder/validation refusal ends this handle even if the caller catches
+    /// it. This callback grants no authority and must perform no network work,
+    /// acquire credentials, refresh standing or reenter an application lock.
+    pub fn with_retained_observation<T>(
+        &self,
+        observe: impl FnOnce() -> Result<T, AdmitError>,
+    ) -> Result<T, AdmitError> {
+        let result = (|| {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            let result = observe()?;
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            Ok(result)
+        })();
+        if result.is_err() {
+            self.native_ended.set(true);
+        }
+        result
+    }
+
+    /// Strict positioned observation inside this current reader writer. Rows
+    /// grant no permission; callers still bind exact subjects and verify owners.
+    /// Unavailable content is refusal, never an omitted revocation or version.
+    /// Any error ends this handle, including after a caller restores a key/flag.
+    pub fn read_retained_records(
+        &self,
+        scope: &str,
+        kind: &str,
+    ) -> Result<Vec<(i64, String)>, AdmitError> {
+        Ok(self
+            .read_retained_events(scope)?
+            .into_iter()
+            .filter(|(_, record_kind, _)| record_kind == kind)
+            .map(|(position, _, payload)| (position, payload))
+            .collect())
+    }
+
+    /// Authenticate the complete retained scope before any kind projection.
+    /// A reclassified/unavailable record must not hide a prior withdrawal.
+    pub fn read_retained_events(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<(i64, String, String)>, AdmitError> {
+        let result = (|| {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            let mut statement = self.tx.prepare_cached(
+                "SELECT position, kind, payload FROM events WHERE scope_id = ?1 ORDER BY position",
+            )?;
+            let rows = statement.query_map(params![scope], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut observed = Vec::new();
+            for row in rows {
+                let (position, kind, payload) = row?;
+                let plain = match &self.codec {
+                    Some(codec) => codec.decode(scope, &kind, &payload).ok_or_else(|| {
+                        AdmitError::Codec("reader history contains an unavailable record".into())
+                    })?,
+                    None => payload,
+                };
+                observed.push((position, kind, plain));
+            }
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            Ok(observed)
+        })();
+        if result.is_err() {
+            self.native_ended.set(true);
+        }
+        result
+    }
+
     /// Require the exact original pending intent under the held writer before
     /// any native effect. A refusal ends this handle even if a caller attempts
     /// to repair intent inside it. This check grants no later execution right.
@@ -194,6 +269,41 @@ impl DispatchRecordAdmission<'_> {
     ) -> Result<Self, AdmitError> {
         crate::command_scope_archive::import_into(&self.tx, self.codec.as_ref(), archive, allowed)?;
         Ok(self)
+    }
+
+    /// Commit an exact caller request, materialization, typed events and receipt
+    /// through the configured content codec under this retained current writer.
+    /// The protected v2 snapshot binds scope/key inside its decoded payload.
+    /// Authorization runs on every retry; a committed retry never materializes
+    /// or decides again. No credential/key acquisition or network belongs here.
+    pub fn commit_protected_request<L, I>(
+        self,
+        scope: &str,
+        key: &str,
+        request: &I,
+        authorize: impl FnOnce(&L::State) -> Result<(), Rejection>,
+        materialize: impl FnOnce(&L::State) -> Result<L::Command, Rejection>,
+    ) -> Result<MaterializedAdmission<L::State>, AdmitError>
+    where
+        L: Lifecycle,
+        L::Command: serde::Serialize,
+        I: serde::Serialize,
+    {
+        crate::request_admission::commit_request::<L, I>(
+            crate::request_admission::RequestWriter {
+                tx: self.tx,
+                codec: self.codec.as_ref(),
+                scope,
+                key,
+                protected: true,
+                check: || {
+                    check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)
+                },
+            },
+            request,
+            authorize,
+            materialize,
+        )
     }
 
     /// Commit a lifecycle command and its runtime outbox while external input
@@ -1104,6 +1214,7 @@ where
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
         )?
         .execute(params![scope_id, idempotency_key, base])?;
+        crate::snapshot::checkpoint::<L>(&tx, codec, scope_id, &state)?;
     }
     tx.prepare_cached(
         "UPDATE commands SET status = 'applied', updated_at = CURRENT_TIMESTAMP

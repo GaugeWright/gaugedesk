@@ -33,6 +33,7 @@ import {
     publicKeyRequestOptions,
     registrationCredentialJSON,
     RouteHttpError,
+    type AccountLinkRecipients,
     type GaugeAppCommandResult,
     type GaugeAppKind,
     type GaugeAppAgentLiveFrame,
@@ -91,9 +92,10 @@ import {
 import type { ConnectElementTagName } from "@stripe/connect-js";
 import { StripeEmbeddedComponent, type StripeAccountSession } from "./StripeEmbeddedComponent";
 import { gaugeAppReviewControls, summarizeGaugeAppChange } from "./gaugeapp-review";
-import { managedInferencePresentation, subscriptionPresentation } from "./account-page-presentation";
+import { managedInferencePresentation, revokedDeviceNotice, subscriptionPresentation } from "./account-page-presentation";
 import { type PriceDraft, freshPrice, priceDrafts, pricePayloads, validPriceDraft, priceSummary, commercialMoney, commercialAmountInput, commercialAmountStep, commercialMinorAmount, engagementPresentation, agentChoice, initialLibraryAgent, paymentRefundRows, paymentModeDescription, paymentReadinessLabel, paymentInvoiceRows, paymentPayoutRows } from "./commercial-page-presentation";
 import { pageFreshnessCaveat } from "./gaugeapp-page-presentation";
+import { OFFICE_PROFILE_COMMAND, officeProfilePresentation } from "./office-profile-presentation";
 import {
     discardPendingDeviceLink,
     deviceLinkBrowserUrl,
@@ -378,6 +380,31 @@ function OrganizationPolicyEditor(props: {
             <div class="gaugeapp-actions"><button type="button" disabled={!changed()} onClick={() => setDraft(baseline())}>Discard</button><button type="button" class="primary" disabled={!changed() || !props.commands.includes("organization-policy.set")} onClick={() => void props.onSubmit("organization-policy.set", payload())}>Apply changes</button></div>
         </section>
     </>;
+}
+
+// WS-424. Enrollment is permanent, so the panel names the Project Host and
+// submits only after the administrator acknowledges both.
+function OfficeProfilePanel(props: {
+    readonly page: AdministrationGaugeAppPage<"organization-policy">;
+    readonly commands: readonly string[];
+    readonly onSubmit: SubmitPageCommand;
+}): JSX.Element {
+    const [acknowledged, setAcknowledged] = createSignal(false);
+    const view = createMemo(() => officeProfilePresentation(props.page.model.office_profile, props.commands, acknowledged()));
+    return <section class="gaugeapp-panel gaugeapp-office-profile" aria-labelledby="office-profile-heading">
+        <div class="gaugeapp-policy-group">
+            <h2 id="office-profile-heading">Office-controlled profile</h2>
+            <p><strong>{view().status}.</strong> {view().detail}</p>
+            <Show when={view().host}>{(host) => <p>Project Host: <code>{host()}</code></p>}</Show>
+            <Show when={view().offerEnrollment}>
+                <label class="gaugeapp-check"><input type="checkbox" checked={acknowledged()} onChange={(event) => setAcknowledged(event.currentTarget.checked)} />I understand this Project Host will hold this organization's work and the profile cannot be left.</label>
+                <div class="gaugeapp-actions"><button type="button" class="primary" disabled={view().enrollPayload === null} onClick={() => {
+                    const payload = view().enrollPayload;
+                    if (payload) void props.onSubmit(OFFICE_PROFILE_COMMAND, payload);
+                }}>Enroll this Project Host</button></div>
+            </Show>
+        </div>
+    </section>;
 }
 
 interface SoftwarePolicyDraft {
@@ -968,7 +995,10 @@ function AdministrationPage(props: { page: GaugeAppPageModel; session: GaugeAppS
 
         <Show when={providers()}>{(value) => <ModelProvidersPage {...props} page={value()} />}</Show>
 
-        <Show when={policy()}>{(value) => <OrganizationPolicyEditor page={value()} commands={props.commands} onSubmit={props.onSubmit} />}</Show>
+        <Show when={policy()}>{(value) => <>
+            <OrganizationPolicyEditor page={value()} commands={props.commands} onSubmit={props.onSubmit} />
+            <OfficeProfilePanel page={value()} commands={props.commands} onSubmit={props.onSubmit} />
+        </>}</Show>
 
         <Show when={hosts()}>{(value) => <ProjectHostsPage page={value()} commands={props.commands} onSubmit={props.onSubmit} onOpenProject={props.onOpenProject} homePolicy={props.api.homeExecutionPolicy} />}</Show>
 
@@ -1960,10 +1990,18 @@ function ignoreRetiredAction(error: unknown): void {
 // page status. Event handlers have no later caller to reject to.
 function ignoreReportedAction(): void {}
 
+/** What sealing a new provider link for the account needs (DR-0334). */
+interface ProviderLinkSealing {
+    readonly links: AccountLinkRecipients;
+    readonly provider: string;
+    readonly currentVersion: number;
+}
+
 type SubmitPageSecret = (
     commandId: "provider-connection.api-key.add" | "provider-connection.compatible.add",
     payload: Readonly<Record<string, unknown>>,
     secret: string,
+    sealing: ProviderLinkSealing,
 ) => Promise<GaugeAppCommandResult>;
 
 export interface OrganizationInvitationAccess {
@@ -2013,6 +2051,10 @@ function AccountPage(props: {
     organizationInvitation?: OrganizationInvitationAccess | null;
     onOrganizationInvitationResponded?: () => void;
     openExternal?: (url: string) => Promise<boolean>;
+    /** Open GaugeDesk's own Model access, where provider sign-ins run
+     *  (DR-0360). Present only inside GaugeDesk; on the web the page says to
+     *  sign in from GaugeDesk instead. */
+    openModelAccess?: () => void;
 }): JSX.Element {
     const typedPage = createMemo(() => parseAccountGaugeAppPage(props.page));
     const account = () => { const page = typedPage(); return page.id === "account" ? page.model : null; };
@@ -2134,6 +2176,10 @@ function AccountPage(props: {
     const canAddApiKey = () => props.commands.includes("provider-connection.api-key.add");
     const canAddCompatible = () => props.commands.includes("provider-connection.compatible.add");
     const canAddConnection = () => canAddApiKey() || canAddCompatible();
+    const hasLinkRecipients = () => (providers()?.account_links.recipients.length ?? 0) > 0;
+    const waitingLabel = (count: number) => count === 1
+        ? "Waiting for 1 of your devices"
+        : `Waiting for ${count} of your devices`;
     const toggleConnectionForm = () => {
         if (addingConnection()) return closeConnectionForm();
         setProviderKind(canAddApiKey() ? "openai" : "openai-generic");
@@ -2151,6 +2197,8 @@ function AccountPage(props: {
         const compatible = provider === "openai-generic";
         const models = providerModels().split(/[\n,]/).map((model) => model.trim()).filter(Boolean);
         const secret = providerSecret();
+        const links = providers()?.account_links;
+        if (!links) return;
         setProviderSecret("");
         await props.onSubmitSecret(
             compatible ? "provider-connection.compatible.add" : "provider-connection.api-key.add",
@@ -2160,6 +2208,11 @@ function AccountPage(props: {
                 ...(compatible ? { base_url: providerEndpoint().trim(), models } : {}),
             },
             secret,
+            {
+                links,
+                provider,
+                currentVersion: connections().find((connection) => connection.id === provider)?.version ?? 0,
+            },
         );
         setProviderEndpoint("");
         setProviderModels("");
@@ -2236,12 +2289,6 @@ function AccountPage(props: {
         const response = await props.onSubmit("managed-inference.plan.change", { action });
         const url = text(valueRecord(response.result)?.url, "");
         if (url) window.location.assign(url);
-    };
-    const beginSubscription = async (provider: "openai-codex" | "xai-grok") => {
-        const response = await props.onSubmit("provider-connection.subscription.begin", { provider });
-        const login = valueRecord(valueRecord(response.result)?.login);
-        const verificationUrl = text(login?.verification_url, "");
-        if (verificationUrl) window.open(verificationUrl, "_blank", "noopener,noreferrer");
     };
     const pendingDeviceLink = () => devices()?.pending_link ?? null;
     const finishDeviceLink = async (status: AccountDeviceLinkStatus) => {
@@ -2488,7 +2535,8 @@ function AccountPage(props: {
 
         <Show when={props.page.id === "provider-connections"}>
             <section class="gaugeapp-panel gaugeapp-section-stack">
-                <div class="gaugeapp-section-head"><div><h2>Connections</h2><p>Your keys stay sealed; provider account tokens never pass through the browser.</p></div><Show when={canAddConnection()}><button type="button" onClick={toggleConnectionForm}>{addingConnection() ? "Close" : "Add connection"}</button></Show></div>
+                <div class="gaugeapp-section-head"><div><h2>Connections</h2><p>A key is sealed here for each of your trusted devices. GaugeWright keeps only copies it cannot open.</p></div><Show when={canAddConnection()}><button type="button" disabled={!hasLinkRecipients()} onClick={toggleConnectionForm}>{addingConnection() ? "Close" : "Add connection"}</button></Show></div>
+                <Show when={providers() && !hasLinkRecipients()}><div class="gaugeapp-inline-notice" role="status"><span>Open GaugeDesk on one of your computers first. A key is sealed for your devices, and none of them can hold one yet.</span></div></Show>
                 <Show when={addingConnection()}><form class="gaugeapp-provider-form" onSubmit={(event) => { event.preventDefault(); void submitConnection().catch(ignoreReportedAction); }}>
                     <label><span>Connection type</span><select value={providerKind()} onChange={(event) => setProviderKind(event.currentTarget.value)}><Show when={canAddApiKey()}><option value="openai">OpenAI API key</option><option value="anthropic">Anthropic API key</option></Show><Show when={canAddCompatible()}><option value="openai-generic">OpenAI-compatible endpoint</option></Show></select></label>
                     <label><span>Name</span><input value={providerName()} placeholder="Optional label" onInput={(event) => setProviderName(event.currentTarget.value)} /></label>
@@ -2504,36 +2552,20 @@ function AccountPage(props: {
                         <Show when={editing()} fallback={<div><strong>{text(connection.name, text(connection.provider, "Provider"))}</strong><span>{text(connection.provider, "Provider")}</span></div>}>
                             <input aria-label={`Rename ${text(connection.name, "connection")}`} value={renamingConnection()?.label ?? ""} onInput={(event) => setRenamingConnection({ id, label: event.currentTarget.value })} />
                         </Show>
-                        <span class={`gaugeapp-connection-state ${active() ? text(connection.verification, "unverified") : "revoked"}`}>{active() ? text(connection.verification, "unverified") : "revoked"}</span>
+                        <span class={`gaugeapp-connection-state ${active() ? "linked" : "revoked"}`}>{active() ? "linked" : "revoked"}</span>
+                        <Show when={active() && connection.waiting.length > 0}><span class="gaugeapp-connection-waiting">{waitingLabel(connection.waiting.length)}</span></Show>
                         <div class="gaugeapp-card-actions">
                             <Show when={editing()} fallback={<button type="button" disabled={!active() || !props.commands.includes("provider-connection.rename")} onClick={() => setRenamingConnection({ id, label: text(connection.name, "") })}>Rename</button>}><button type="button" disabled={!active() || !props.commands.includes("provider-connection.rename") || !renamingConnection()?.label.trim()} onClick={() => { const draft = renamingConnection(); if (draft) void props.onSubmit("provider-connection.rename", draft); setRenamingConnection(null); }}>Save</button></Show>
-                            <button type="button" disabled={!active() || !props.commands.includes("provider-connection.verify")} onClick={() => void props.onSubmit("provider-connection.verify", { id })}>Verify</button>
                             <CommandButton command="provider-connection.revoke" commands={props.commands} label="Revoke" danger disabled={!active()} payload={{ id }} onSubmit={props.onSubmit} />
                         </div>
                     </div>;
                 }}</For></div></Show>
             </section>
             <section class="gaugeapp-panel gaugeapp-section-stack">
-                <div class="gaugeapp-section-head"><div><h2>Provider accounts</h2><p>Use an existing subscription instead of an API key.</p></div></div>
-                <For each={[
-                    ["openai-codex", "ChatGPT / Codex", providers()?.subscription_sign_ins.codex],
-                    ["xai-grok", "Grok", providers()?.subscription_sign_ins.grok],
-                ] as const}>{([provider, label, status]) => {
-                    const login = () => status?.login;
-                    const linked = () => status?.linked === true;
-                    const pending = () => ["pending", "cancelling"].includes(text(login()?.status, ""));
-                    return <div class="gaugeapp-provider-account-row">
-                        <div><strong>{label}</strong><span>{linked() ? "Connected" : pending() ? "Waiting for provider" : "Not connected"}</span></div>
-                        <Show when={login()?.user_code}><code>{text(login()?.user_code, "")}</code></Show>
-                        <div class="gaugeapp-card-actions">
-                            <Show when={pending()} fallback={<Show when={linked()} fallback={<button type="button" disabled={!props.commands.includes("provider-connection.subscription.begin")} onClick={() => void beginSubscription(provider)}>Sign in</button>}><button type="button" disabled={!props.commands.includes("provider-connection.subscription.complete")} onClick={() => void props.onSubmit("provider-connection.subscription.complete", { provider, action: "status" })}>Refresh status</button></Show>}>
-                                <Show when={login()?.verification_url}><a href={text(login()?.verification_url, "#")} target="_blank" rel="noreferrer">Open</a></Show>
-                                <button type="button" disabled={!props.commands.includes("provider-connection.subscription.complete")} onClick={() => void props.onSubmit("provider-connection.subscription.complete", { provider, action: "status" })}>I finished</button>
-                                <button type="button" disabled={!props.commands.includes("provider-connection.subscription.complete")} onClick={() => void props.onSubmit("provider-connection.subscription.complete", { provider, action: "cancel" })}>Cancel</button>
-                            </Show>
-                        </div>
-                    </div>;
-                }}</For>
+                <div class="gaugeapp-section-head"><div><h2>Provider accounts</h2><p>Sign in to ChatGPT / Codex or Grok in GaugeDesk on your computer. It reaches your other devices from there.</p></div>
+                    <Show when={props.openModelAccess}>{(open) => <button type="button" onClick={() => open()()}>Sign in in GaugeDesk</button>}</Show>
+                </div>
+                <Show when={!props.openModelAccess}><p class="gaugeapp-empty">Open GaugeDesk on your computer and sign in from Settings → Model access.</p></Show>
             </section>
             <section class="gaugeapp-panel gaugeapp-section-stack">
                 <div class="gaugeapp-section-head"><div><h2>Default model</h2><p>Used when a project does not select another admitted connection.</p></div></div>
@@ -3468,13 +3500,17 @@ function GaugeAppPage(props: {
     organizationInvitation?: OrganizationInvitationAccess | null;
     onOrganizationInvitationResponded?: () => void;
     openExternal?: (url: string) => Promise<boolean>;
+    /** Open GaugeDesk's own Model access, where provider sign-ins run
+     *  (DR-0360). Present only inside GaugeDesk; on the web the page says to
+     *  sign in from GaugeDesk instead. */
+    openModelAccess?: () => void;
     onOpenProject?: (project: { readonly id: string; readonly name: string }) => void;
     onOpenGaugeApp?: (app: GaugeAppKind, page: string) => void;
     projectFocus?: string | null;
     onOpenProjectAccess?: (projectId: string) => void;
     onClearProjectFocus?: () => void;
 }): JSX.Element {
-    if (props.app === "account-settings") return <AccountPage page={props.page} commands={props.commands} onSubmit={props.onSubmit} onSubmitSecret={props.onSubmitSecret} api={props.api} onRefresh={props.onRefresh} deviceLinkInvitation={props.deviceLinkInvitation} onDeviceLinkClaimed={props.onDeviceLinkClaimed} organizationInvitation={props.organizationInvitation} onOrganizationInvitationResponded={props.onOrganizationInvitationResponded} openExternal={props.openExternal} />;
+    if (props.app === "account-settings") return <AccountPage page={props.page} commands={props.commands} onSubmit={props.onSubmit} onSubmitSecret={props.onSubmitSecret} api={props.api} onRefresh={props.onRefresh} deviceLinkInvitation={props.deviceLinkInvitation} onDeviceLinkClaimed={props.onDeviceLinkClaimed} organizationInvitation={props.organizationInvitation} onOrganizationInvitationResponded={props.onOrganizationInvitationResponded} openExternal={props.openExternal} openModelAccess={props.openModelAccess} />;
     if (props.app === "commercial-operations") return <CommercialPage page={props.page} commands={props.commands} onSubmit={props.onSubmit} />;
     return <AdministrationPage page={props.page} session={props.session} commands={props.commands} onSubmit={props.onSubmit} api={props.api} onRefresh={props.onRefresh} onOpenProject={props.onOpenProject} onOpenGaugeApp={props.onOpenGaugeApp} projectFocus={props.projectFocus} onOpenProjectAccess={props.onOpenProjectAccess} onClearProjectFocus={props.onClearProjectFocus} />;
 }
@@ -3551,6 +3587,10 @@ export function createGaugeAppWorkspace(options: {
     organizationInvitation?: Accessor<OrganizationInvitationAccess | null>;
     onOrganizationInvitationResponded?: () => void;
     openExternal?: (url: string) => Promise<boolean>;
+    /** Open GaugeDesk's own Model access, where provider sign-ins run
+     *  (DR-0360). Present only inside GaugeDesk; on the web the page says to
+     *  sign in from GaugeDesk instead. */
+    openModelAccess?: () => void;
     onAccountErased?: () => void | Promise<void>;
     onOrganizationDeleted?: (tenantId: string) => void | Promise<void>;
     onOpenProject?: (project: { readonly id: string; readonly name: string }) => void;
@@ -3923,6 +3963,10 @@ export function createGaugeAppWorkspace(options: {
             }
             setTransientResult({ owner: request, value: response.result });
             setStatus(request, response.receipt.status === "applying" ? "Approved; waiting for service confirmation" : decision === "accept" ? "Change applied" : "Change discarded");
+            const revokedNotice = decision === "accept" && proposal.command_id === "trusted-device.revoke"
+                ? revokedDeviceNotice(response.result)
+                : null;
+            if (revokedNotice) setStatus(request, revokedNotice);
             if (
                 decision === "accept"
                 && proposal.command_id === "account.erase"
@@ -4030,7 +4074,7 @@ export function createGaugeAppWorkspace(options: {
             request.finish();
         }
     };
-    const submitSecret: SubmitPageSecret = async (commandId, payload, secret) => {
+    const submitSecret: SubmitPageSecret = async (commandId, payload, secret, sealing) => {
         const admitted = session();
         const current = page();
         if (!admitted || !current || options.app !== "account-settings") {
@@ -4039,7 +4083,7 @@ export function createGaugeAppWorkspace(options: {
         const request = pageOperations.begin();
         setStatus(request, "Connecting provider…");
         try {
-            const response = await options.api.submitAccountProviderSecret({
+            const response = await options.api.submitAccountProviderLink({
                 session_id: admitted.id,
                 generation: admitted.generation,
                 app: "account-settings",
@@ -4050,7 +4094,7 @@ export function createGaugeAppWorkspace(options: {
                 idempotency_key: newIdempotencyKey(),
                 payload,
                 client: "web",
-            }, secret);
+            }, secret, sealing.links, sealing.provider, sealing.currentVersion);
             request.assertCurrent();
             setStatus(request, "Provider connected");
             await refetchSession();
@@ -4171,6 +4215,7 @@ export function createGaugeAppWorkspace(options: {
                         organizationInvitation={options.organizationInvitation?.() ?? null}
                         onOrganizationInvitationResponded={options.onOrganizationInvitationResponded}
                         openExternal={options.openExternal}
+                        openModelAccess={options.openModelAccess}
                         onOpenProject={options.onOpenProject}
                         onOpenGaugeApp={options.onOpenGaugeApp}
                         projectFocus={projectFocus()}

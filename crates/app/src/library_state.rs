@@ -3812,16 +3812,20 @@ impl Workbench {
         Some(project)
     }
 
+    /// Each record arrives with the position the store admitted it at.
     pub(crate) fn apply_atomic_project_home_rebind(
         &mut self,
-        project: ProjectRecord,
-        workspace: Option<crate::library::ProjectCollaborationWorkspaceRecord>,
+        (project, project_position): (ProjectRecord, Option<i64>),
+        workspace: Option<(
+            crate::library::ProjectCollaborationWorkspaceRecord,
+            Option<i64>,
+        )>,
     ) {
         let id = project.id.clone();
-        self.library.apply_project(project);
-        if let Some(workspace) = workspace {
+        self.library.apply_project_at(project, project_position);
+        if let Some((workspace, position)) = workspace {
             self.library
-                .apply_project_collaboration_workspace(workspace);
+                .apply_project_collaboration_workspace_at(workspace, position);
         }
         self.notify_library_changed("project", &id, "upsert");
     }
@@ -3940,6 +3944,12 @@ impl Workbench {
             {
                 continue;
             }
+            // A built-in Agent's authoring target is this Home's seed; the
+            // receiving Home binds the placement to its own (federation.rs,
+            // `collect_project_log`).
+            if crate::app_support::is_builtin_agent(&instance.agent_id) {
+                continue;
+            }
             if let Some(target) = self.library.authoring_target_for(&instance.agent_id) {
                 target_ids.insert(target.id.clone());
             }
@@ -4008,15 +4018,16 @@ impl Workbench {
     pub(crate) fn write_agent_record(&mut self, record: AgentRecord) -> i64 {
         let id = record.id.clone();
         let op = Self::library_op_str(record.op);
-        let pos = self
+        let admitted = self
             .store_mut()
             .append_record(
                 LIBRARY_SCOPE,
                 "agent",
                 &serde_json::to_string(&record).unwrap(),
             )
-            .unwrap_or(0);
-        self.library.apply_agent(record);
+            .ok();
+        self.library.apply_agent_at(record, admitted);
+        let pos = admitted.unwrap_or(0);
         self.notify_library_changed("archetype", &id, op);
         pos
     }
@@ -4024,24 +4035,30 @@ impl Workbench {
     pub(crate) fn write_project_record(&mut self, record: ProjectRecord) {
         let id = record.id.clone();
         let op = Self::library_op_str(record.op);
-        let _ = self.store_mut().append_record(
-            LIBRARY_SCOPE,
-            "project",
-            &serde_json::to_string(&record).unwrap(),
-        );
-        self.library.apply_project(record);
+        let position = self
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "project",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .ok();
+        self.library.apply_project_at(record, position);
         self.notify_library_changed("project", &id, op);
     }
 
     pub(crate) fn write_instance_record(&mut self, record: InstanceRecord) {
         let id = record.id.clone();
         let op = Self::library_op_str(record.op);
-        let _ = self.store_mut().append_record(
-            LIBRARY_SCOPE,
-            "instance",
-            &serde_json::to_string(&record).unwrap(),
-        );
-        self.library.apply_instance(record);
+        let position = self
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "instance",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .ok();
+        self.library.apply_instance_at(record, position);
         self.notify_library_changed("placement", &id, op);
     }
 
@@ -4052,10 +4069,12 @@ impl Workbench {
         let id = record.id.clone();
         let op = Self::library_op_str(record.op);
         let payload = serde_json::to_string(&record).map_err(std::io::Error::other)?;
-        self.store_mut()
+        let position = self
+            .store_mut()
             .append_record(LIBRARY_SCOPE, "public_deployment_binding", &payload)
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
-        self.library.apply_public_deployment(record);
+        self.library
+            .apply_public_deployment_at(record, Some(position));
         self.notify_library_changed("public_deployment", &id, op);
         Ok(())
     }
@@ -4077,12 +4096,15 @@ impl Workbench {
     pub(crate) fn write_chat_record(&mut self, record: ChatRecord) {
         let id = record.id.clone();
         let op = Self::library_op_str(record.op);
-        let _ = self.store_mut().append_record(
-            LIBRARY_SCOPE,
-            "chat",
-            &serde_json::to_string(&record).unwrap(),
-        );
-        self.library.apply_chat(record);
+        let position = self
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "chat",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .ok();
+        self.library.apply_chat_at(record, position);
         self.notify_library_changed("chat", &id, op);
     }
 
@@ -4096,11 +4118,14 @@ impl Workbench {
                 "chat",
                 &serde_json::to_string(&record).unwrap(),
             )
-            .unwrap_or(0);
-        self.library.apply_chat(ChatRecord {
-            created_position: position,
-            ..record
-        });
+            .ok();
+        self.library.apply_chat_at(
+            ChatRecord {
+                created_position: position.unwrap_or(0),
+                ..record
+            },
+            position,
+        );
         self.notify_library_changed("chat", &id, op);
     }
 
@@ -4114,21 +4139,24 @@ impl Workbench {
                 "workstream",
                 &serde_json::to_string(&record).unwrap(),
             )
-            .unwrap_or(0);
-        self.library.apply_workstream(record);
+            .ok();
+        self.library.apply_workstream_at(record, position);
         self.notify_library_changed("workstream", &id, op);
-        position
+        position.unwrap_or(0)
     }
 
     pub(crate) fn write_work_target_record(&mut self, record: WorkTargetRecord) {
         let id = record.id.clone();
         let op = Self::library_op_str(record.op);
-        let _ = self.store_mut().append_record(
-            LIBRARY_SCOPE,
-            "work_target",
-            &serde_json::to_string(&record).unwrap(),
-        );
-        self.library.apply_work_target(record);
+        let position = self
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "work_target",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .ok();
+        self.library.apply_work_target_at(record, position);
         self.notify_library_changed("work_target", &id, op);
     }
 
@@ -4160,24 +4188,30 @@ impl Workbench {
     pub(crate) fn write_placement_targets_record(&mut self, record: PlacementTargetsRecord) {
         let id = record.placement_id.clone();
         let op = Self::library_op_str(record.op);
-        let _ = self.store_mut().append_record(
-            LIBRARY_SCOPE,
-            "placement_targets",
-            &serde_json::to_string(&record).unwrap(),
-        );
-        self.library.apply_placement_targets(record);
+        let position = self
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "placement_targets",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .ok();
+        self.library.apply_placement_targets_at(record, position);
         self.notify_library_changed("placement", &id, op);
     }
 
     pub(crate) fn write_chat_target_record(&mut self, record: ChatTargetBindingRecord) {
         let id = record.chat_id.clone();
         let op = Self::library_op_str(record.op);
-        let _ = self.store_mut().append_record(
-            LIBRARY_SCOPE,
-            "chat_target",
-            &serde_json::to_string(&record).unwrap(),
-        );
-        self.library.apply_chat_target(record);
+        let position = self
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "chat_target",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .ok();
+        self.library.apply_chat_target_at(record, position);
         self.notify_library_changed("chat", &id, op);
     }
 
@@ -4210,11 +4244,13 @@ impl Workbench {
         record: ChatTargetBasisRecord,
     ) -> Result<(), String> {
         let payload = serde_json::to_string(&record).map_err(|error| error.to_string())?;
-        self.store_mut()
+        let position = self
+            .store_mut()
             .append_record(LIBRARY_SCOPE, "chat_target_basis", &payload)
             .map_err(|error| format!("{error:?}"))?;
         let id = record.chat_id.clone();
-        self.library.apply_chat_target_basis(record);
+        self.library
+            .apply_chat_target_basis_at(record, Some(position));
         self.notify_library_changed("chat", &id, "upsert");
         Ok(())
     }
@@ -4225,12 +4261,16 @@ impl Workbench {
     ) {
         let id = record.project_id.clone();
         let op = Self::library_op_str(record.op);
-        let _ = self.store_mut().append_record(
-            LIBRARY_SCOPE,
-            "project_collaboration_workspace",
-            &serde_json::to_string(&record).unwrap(),
-        );
-        self.library.apply_project_collaboration_workspace(record);
+        let position = self
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "project_collaboration_workspace",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .ok();
+        self.library
+            .apply_project_collaboration_workspace_at(record, position);
         self.notify_library_changed("project", &id, op);
     }
 
@@ -4360,12 +4400,15 @@ impl Workbench {
     pub(crate) fn write_workstream_root_record(&mut self, record: WorkstreamRootRecord) {
         let id = record.workstream_id.clone();
         let op = Self::library_op_str(record.op);
-        let _ = self.store_mut().append_record(
-            LIBRARY_SCOPE,
-            "workstream_root",
-            &serde_json::to_string(&record).unwrap(),
-        );
-        self.library.apply_workstream_root(record);
+        let position = self
+            .store_mut()
+            .append_record(
+                LIBRARY_SCOPE,
+                "workstream_root",
+                &serde_json::to_string(&record).unwrap(),
+            )
+            .ok();
+        self.library.apply_workstream_root_at(record, position);
         self.notify_library_changed("workstream", &id, op);
     }
 
@@ -5275,12 +5318,12 @@ impl Workbench {
         let pos = self
             .store_mut()
             .append_record(LIBRARY_SCOPE, "chat", &serde_json::to_string(&rec).unwrap())
-            .unwrap_or(0);
+            .ok();
         let rec = ChatRecord {
-            created_position: pos,
+            created_position: pos.unwrap_or(0),
             ..rec
         };
-        self.library.apply_chat(rec);
+        self.library.apply_chat_at(rec, pos);
         self.notify_library_changed("chat", &chat_id, "upsert");
         let binding = (targets.len() == 1).then(|| ChatTargetBindingRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
@@ -7563,10 +7606,13 @@ impl Workbench {
                 return Err(ForkChatError::Continuity(format!("{error:?}")));
             }
         };
-        self.library.apply_chat(ChatRecord {
-            created_position: pos,
-            ..rec
-        });
+        self.library.apply_chat_at(
+            ChatRecord {
+                created_position: pos,
+                ..rec
+            },
+            Some(pos),
+        );
         // Keep the former singular record strictly as a one-member wire/storage
         // compatibility projection.  A multi-target child has no primary.
         if let ([member], Some(basis)) = (members.as_slice(), singular_basis) {

@@ -3774,6 +3774,42 @@
       }
     },
     {
+      "id": "account.directory.challenge",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/directory/challenge",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "publish_from_here in gaugedesk-app account_publish",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "obtain-single-use-root-publication-challenge",
+      "requestSchema": "http/empty",
+      "responseSchema": "rust:gaugedesk-app/account_routes/post_account_directory_challenge",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_publish_tests.rs#an_accounts_first_computer_mints_publishes_and_announces_and_withdraws_alone"
+        ],
+        "authority": [
+          "crates/app/src/root_publication_tests.rs#a_bearer_alone_cannot_publish_a_root_of_its_own"
+        ],
+        "journey": [
+          "crates/app/src/account_publish_tests.rs#an_accounts_first_computer_mints_publishes_and_announces_and_withdraws_alone"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/root_publication_tests.rs#an_enrolled_devices_proof_publishes_its_root_once_per_challenge"
+        ]
+      }
+    },
+    {
       "id": "account.home-routes.publish",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",
@@ -3914,6 +3950,78 @@
         "deployed": [],
         "property": [
           "crates/app/src/directory_sync.rs#the_directory_record_carries_no_secrets_and_the_blob_round_trips"
+        ]
+      }
+    },
+    {
+      "id": "desktop.local-projects.read",
+      "jurisdiction": "local-desktop-workbench",
+      "transport": "http-json-over-loopback",
+      "method": "GET",
+      "path": "/local-projects",
+      "producer": "gaugedesk-app open_control_plane",
+      "consumer": "GaugeDesk desktop account menu via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "authentication": "local-desktop-process-authority",
+      "scope": "desktop-window-signed-in-account-and-local-account-projects",
+      "capability": "list-signed-out-projects-an-account-may-receive",
+      "requestSchema": "http/empty",
+      "responseSchema": "gw://schemas/desktop/local-projects/v1",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/features/local-project-transfer.feature#the account menu moves the chosen signed-out projects to the signed-in account"
+        ],
+        "authority": [
+          "crates/app/src/project_transfer_tests.rs#only_the_window_with_a_signed_in_account_may_move_signed_out_work"
+        ],
+        "journey": [
+          "crates/app/src/project_transfer_tests.rs#a_signed_in_account_receives_the_local_accounts_project_and_its_chats"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_transfer_tests.rs#personal_an_organizations_and_another_accounts_project_never_move"
+        ]
+      }
+    },
+    {
+      "id": "desktop.local-projects.transfer",
+      "jurisdiction": "local-desktop-workbench",
+      "transport": "http-json-over-loopback",
+      "method": "POST",
+      "path": "/local-projects/transfer",
+      "producer": "gaugedesk-app open_control_plane",
+      "consumer": "GaugeDesk desktop account menu via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "authentication": "local-desktop-process-authority",
+      "scope": "desktop-window-signed-in-account-and-local-account-projects",
+      "capability": "transfer-signed-out-projects-to-signed-in-account",
+      "requestSchema": "rust:gaugedesk-app/project_transfer/TransferLocalProjects",
+      "responseSchema": "gw://schemas/desktop/local-projects-transfer/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/features/local-project-transfer.feature#the account menu moves the chosen signed-out projects to the signed-in account"
+        ],
+        "authority": [
+          "crates/app/src/project_transfer_tests.rs#only_the_window_with_a_signed_in_account_may_move_signed_out_work"
+        ],
+        "journey": [
+          "crates/app/src/project_transfer_tests.rs#a_signed_in_account_receives_the_local_accounts_project_and_its_chats"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/project_transfer_tests.rs#personal_an_organizations_and_another_accounts_project_never_move"
         ]
       }
     },
@@ -4382,6 +4490,42 @@
         "deployed": [],
         "property": [
           "crates/app/src/account_links_tests.rs#a_device_trusted_later_waits_until_a_holder_seals_for_it"
+        ]
+      }
+    },
+    {
+      "id": "account.links.check.record",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/links/:provider/check",
+      "producer": "gaugedesk-app account_links",
+      "consumer": "HubLinkAuthority via gaugedesk-app account_links_sync",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "record-own-device-link-check",
+      "requestSchema": "rust:gaugedesk-app/account_links/CheckBody",
+      "responseSchema": "rust:gaugedesk-app/account_links/LinkCheckRecord",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "authority": [
+          "crates/app/src/account_links_tests.rs#the_authority_answers_only_on_the_hub_and_only_a_bound_device_is_a_device"
+        ],
+        "journey": [
+          "crates/app/tests/account_links_hub.rs#two_desktops_share_a_link_through_the_hub_which_cannot_read_it"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_links_tests.rs#only_a_device_holding_the_current_version_records_a_check"
         ]
       }
     },
@@ -7229,6 +7373,188 @@
         "property": [
           "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#archetype-authority-matrix"
         ]
+      }
+    },
+    {
+      "id": "home.archetype.copy-as-panel",
+      "method": "POST",
+      "path": "/archetypes/:id/copy-as-panel",
+      "producer": "gaugedesk-app library_routes::copy_agent_as_panel",
+      "consumer": "FacetBrowser / PanelAgentSurface via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "authentication": "account-session-and-home-admission; exact Agent authoring owner",
+      "scope": "person-home-archetype",
+      "capability": "copy-owned-work-agent-as-panel",
+      "requestSchema": "rust:gaugedesk-app/library_routes/ForkArchetype",
+      "responseSchema": "gw://schemas/archetype/identity/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/panel_authoring_contract_tests.rs#copy_authenticates_and_preserves_source_and_replay_identity",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-production-client",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "authority": [
+          "crates/app/src/panel_authoring_contract_tests.rs#copy_authenticates_and_preserves_source_and_replay_identity",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-authority",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "journey": [
+          "web/e2e/steps/panel-authoring-contract.steps.ts#panel-authoring-browser-journey",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "property": [
+          "crates/app/src/panel_authoring_contract_tests.rs#copy_authenticates_and_preserves_source_and_replay_identity",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "deployed": []
+      }
+    },
+    {
+      "id": "home.archetype.panel-profile.read",
+      "method": "GET",
+      "path": "/archetypes/:id/panel-profile",
+      "producer": "gaugedesk-app library_routes::get_panel_profile",
+      "consumer": "FacetBrowser / PanelAgentSurface via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "authentication": "account-session-and-home-admission; exact Agent authoring owner",
+      "scope": "person-home-archetype",
+      "capability": "read-owned-panel-draft-profile",
+      "requestSchema": "http/path-archetype-id",
+      "responseSchema": "rust:gaugedesk-app/library/PanelPublicProfile",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/panel_authoring_contract_tests.rs#profile_wire_roundtrip_reopens_and_invalid_or_unowned_writes_preserve_state",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-contract",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "authority": [
+          "crates/app/src/panel_authoring_contract_tests.rs#profile_wire_roundtrip_reopens_and_invalid_or_unowned_writes_preserve_state",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-authority",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "journey": [
+          "web/e2e/steps/panel-authoring-contract.steps.ts#panel-authoring-browser-journey",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "property": [
+          "crates/app/src/panel_authoring_contract_tests.rs#profile_wire_roundtrip_reopens_and_invalid_or_unowned_writes_preserve_state",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-property",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "deployed": []
+      }
+    },
+    {
+      "id": "home.archetype.panel-profile.update",
+      "method": "PUT",
+      "path": "/archetypes/:id/panel-profile",
+      "producer": "gaugedesk-app library_routes::put_panel_profile",
+      "consumer": "FacetBrowser / PanelAgentSurface via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "authentication": "account-session-and-home-admission; exact Agent authoring owner",
+      "scope": "person-home-archetype",
+      "capability": "update-owned-panel-draft-profile",
+      "requestSchema": "rust:gaugedesk-app/library/PanelPublicProfile",
+      "responseSchema": "rust:gaugedesk-app/library/PanelPublicProfile",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/panel_authoring_contract_tests.rs#profile_wire_roundtrip_reopens_and_invalid_or_unowned_writes_preserve_state",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-contract",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "authority": [
+          "crates/app/src/panel_authoring_contract_tests.rs#profile_wire_roundtrip_reopens_and_invalid_or_unowned_writes_preserve_state",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-authority",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "journey": [
+          "web/e2e/steps/panel-authoring-contract.steps.ts#panel-authoring-browser-journey",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "property": [
+          "crates/app/src/panel_authoring_contract_tests.rs#profile_wire_roundtrip_reopens_and_invalid_or_unowned_writes_preserve_state",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-property",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "deployed": []
+      }
+    },
+    {
+      "id": "home.archetype.preview",
+      "method": "POST",
+      "path": "/archetypes/:id/preview",
+      "producer": "gaugedesk-app library_routes::start_panel_preview",
+      "consumer": "FacetBrowser / PanelAgentSurface via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "authentication": "account-session-and-home-admission; exact Agent authoring owner",
+      "scope": "person-home-archetype",
+      "capability": "preview-owned-agent-draft-or-panel-placement-version",
+      "requestSchema": "rust:gaugedesk-app/library_routes/StartPanelPreview",
+      "responseSchema": "gw://schemas/chat/identity/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/panel_authoring_contract_tests.rs#draft_and_pinned_preview_are_hidden_isolated_replaced_and_deleted",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-preview",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "authority": [
+          "crates/app/src/panel_authoring_contract_tests.rs#draft_and_pinned_preview_are_hidden_isolated_replaced_and_deleted",
+          "web/packages/control-plane-client/src/panel-authoring-transport.test.ts#panel-authoring-authority",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "journey": [
+          "web/e2e/steps/panel-authoring-contract.steps.ts#panel-authoring-browser-journey",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "property": [
+          "crates/app/src/panel_authoring_contract_tests.rs#draft_and_pinned_preview_are_hidden_isolated_replaced_and_deleted",
+          "crates/app/src/panel_authoring_contract_tests.rs#home_admission_all_four_routes_refuse_missing_mismatched_and_revoked_credentials",
+          "web/packages/control-plane-client/src/panel-authoring-home-transport.test.ts#uses POST-issued admissions for all four routes and preserves state on missing, principal-mismatched and revoked credentials"
+        ],
+        "deployed": []
       }
     },
     {
@@ -10538,6 +10864,13 @@
   "exceptions": [
     {
       "method": "GET",
+      "path": "/account/home-links/{home_id}",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "GET",
       "path": "/account/hub-session",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
@@ -10635,6 +10968,13 @@
       "expires": "2026-10-31"
     },
     {
+      "method": "POST",
+      "path": "/account/project-invitations/email",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
       "method": "GET",
       "path": "/account/tenants/{id}/shared-project",
       "owner": "gaugedesk",
@@ -10651,34 +10991,6 @@
     {
       "method": "GET",
       "path": "/account/tenants/{tenant}/project-share-candidates",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "POST",
-      "path": "/archetypes/{id}/copy-as-panel",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "GET",
-      "path": "/archetypes/{id}/panel-profile",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "PUT",
-      "path": "/archetypes/{id}/panel-profile",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "POST",
-      "path": "/archetypes/{id}/preview",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"
@@ -10882,6 +11194,27 @@
     {
       "method": "POST",
       "path": "/gaugeapps/administration/enterprise-identity/credential",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/home/invitations/{id}/cancel",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "POST",
+      "path": "/home/invitations/{id}/resend",
+      "owner": "gaugedesk",
+      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
+      "expires": "2026-10-31"
+    },
+    {
+      "method": "GET",
+      "path": "/home/projects/{project}/invitations",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

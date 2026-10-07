@@ -131,6 +131,9 @@ impl Workbench {
         scope: &str,
         kind: &str,
     ) -> Result<Option<serde_json::Value>, AdmitError> {
+        if crate::engine::is_task_attempt_scope(scope) {
+            return Ok(None);
+        }
         let value = match kind {
             "run" => serde_json::json!(self.run_state(scope)?),
             "review" => serde_json::json!(self.review_state(scope)?),
@@ -161,6 +164,9 @@ pub(crate) async fn get_audit(
     State(wb): State<SharedWorkbench>,
     Path(scope): Path<String>,
 ) -> impl IntoResponse {
+    if crate::engine::is_task_attempt_scope(&scope) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let wb = wb.lock_unpoisoned();
     match wb.audit_events_value(&scope) {
         Ok(events) => (StatusCode::OK, Json(events)).into_response(),

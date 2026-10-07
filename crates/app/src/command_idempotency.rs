@@ -97,6 +97,16 @@ pub(crate) fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Office operational lookup only; caller free text is not persisted.
+pub(crate) fn office_retry_key(key: &str) -> String {
+    format!("office-http:v1:{}", digest(key.as_bytes()))
+}
+
+/// Exact office path lookup without persisting caller-controlled segments.
+pub(crate) fn office_path(path: &str) -> String {
+    format!("office-path:v1:{}", digest(path.as_bytes()))
+}
+
 /// The caller this request speaks for, as a hash of the credentials it carried.
 ///
 /// Shared with the streamed upload route rather than reimplemented there: two
@@ -264,7 +274,12 @@ fn authentication_ceremony_path(path: &str) -> bool {
     path == "/auth" || path.starts_with("/auth/")
 }
 
-fn status_response(status: StatusCode, command_id: &str, command_status: &str) -> Response {
+fn status_response(
+    status: StatusCode,
+    command_id: &str,
+    command_status: &str,
+    correlation: Option<crate::stream::TaskCorrelation>,
+) -> Response {
     (
         status,
         Json(serde_json::json!({
@@ -272,6 +287,7 @@ fn status_response(status: StatusCode, command_id: &str, command_status: &str) -
             "rejected": format!("command already {command_status}; refresh its projection"),
             "command_id": command_id,
             "command_status": command_status,
+            "correlation": correlation,
         })),
     )
         .into_response()
@@ -304,6 +320,17 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
         Ok(key) => key,
         Err(response) => return response,
     };
+    let raw_key = key.clone();
+    let office = request
+        .extensions()
+        .get::<crate::identity::AuthenticatedActionContext>()
+        .is_some_and(|context| {
+            matches!(
+                context.authentication(),
+                crate::identity::ActorAuthentication::OfficeStaff { .. }
+            )
+        });
+    let key = if office { office_retry_key(&key) } else { key };
     let uri = request.uri().to_string();
     let caller_hash = caller_hash(request.headers());
     let (mut parts, body) = request.into_parts();
@@ -317,14 +344,15 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
                 .into_response()
         }
     };
-    let snapshot = command_snapshot(
-        &method,
-        &uri,
-        parts.uri.path(),
-        &caller_hash,
-        &digest(&bytes),
-    );
-    let (scope, command_id) = command_identity(&method, parts.uri.path(), &caller_hash, &key);
+    let path = if office {
+        office_path(parts.uri.path())
+    } else {
+        parts.uri.path().into()
+    };
+    let legacy_scope = command_identity(&method, parts.uri.path(), &caller_hash, &raw_key).0;
+    let body_digest = digest(&bytes);
+    let snapshot = command_snapshot(&method, &uri, &path, &caller_hash, &body_digest);
+    let (scope, command_id) = command_identity(&method, &path, &caller_hash, &key);
     let intent = ClaimedHttpCommand {
         command_id: command_id.clone(),
         scope,
@@ -334,13 +362,32 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
 
     {
         let mut guard = wb.lock_unpoisoned();
-        let (receipt, claimed) = match guard.store_mut().claim_command(
-            intent.command_id(),
-            intent.scope(),
-            intent.key(),
-            intent.snapshot(),
-        ) {
+        let claim = if office {
+            guard.store_mut().claim_command_excluding(
+                intent.command_id(),
+                (intent.scope(), intent.key()),
+                intent.snapshot(),
+                None,
+                &[(&legacy_scope, &raw_key), (&legacy_scope, intent.key())],
+            )
+        } else {
+            guard.store_mut().claim_command(
+                intent.command_id(),
+                intent.scope(),
+                intent.key(),
+                intent.snapshot(),
+            )
+        };
+        let (receipt, claimed) = match claim {
             Ok(receipt) => receipt,
+            Err(gaugedesk_store::AdmitError::Rejected(_)) if office => {
+                return status_response(
+                    StatusCode::CONFLICT,
+                    &command_id,
+                    "legacy-receipt-unavailable",
+                    None,
+                );
+            }
             Err(error) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -354,16 +401,52 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
                 StatusCode::CONFLICT,
                 &command_id,
                 "key-reused-with-different-input",
+                None,
             );
         }
         if !claimed {
-            return status_response(StatusCode::CONFLICT, &command_id, &receipt.status);
+            // A receipt status alone is not task-stage evidence. Repair only
+            // from this addressed task's own admitted durable settlement.
+            let correlation = parts
+                .uri
+                .path()
+                .strip_prefix("/chats/")
+                .and_then(|path| path.strip_suffix("/task"))
+                .filter(|chat| !chat.is_empty() && !chat.contains('/'))
+                .and_then(|chat| {
+                    let author = crate::engine::verified_task_author(
+                        &mut guard,
+                        &parts.headers,
+                        &method,
+                        parts.uri.path(),
+                    )?;
+                    crate::engine::task_correlation(
+                        guard.store_ref(),
+                        chat,
+                        intent.key(),
+                        &author,
+                        Some(&TaskAttempt {
+                            command_id: command_id.clone(),
+                            body_digest: body_digest.clone(),
+                        }),
+                    )
+                });
+            return status_response(
+                StatusCode::CONFLICT,
+                &command_id,
+                &receipt.status,
+                correlation,
+            );
         }
     }
 
     // Replace any pre-existing extension. Its provenance is this exact claim,
     // not a value carried by another layer or submitted as request data.
     parts.extensions.insert(intent);
+    parts.extensions.insert(TaskAttempt {
+        command_id: command_id.clone(),
+        body_digest,
+    });
     let request = Request::from_parts(parts, Body::from(bytes));
     let response = next.run(request).await;
     let command_status = if response.status().is_success() || response.status().is_redirection() {
@@ -844,4 +927,11 @@ mod tests {
         assert!(!authentication_ceremony_path("/account/tenants"));
         assert!(!authentication_ceremony_path("/authorization/policy"));
     }
+}
+
+/// Server-only coordinate of the exact claimed HTTP attempt; never an actor.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskAttempt {
+    pub command_id: String,
+    pub body_digest: String,
 }

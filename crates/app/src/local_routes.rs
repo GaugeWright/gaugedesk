@@ -205,6 +205,16 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
                 .post(crate::publisher_routes::ensure_collection_recipient),
         )
         .route("/projects", post(lr::create_project))
+        // Signed-out work moves to a signed-in account only by this explicit
+        // transfer, from the window alone (DR-0328 §7).
+        .route(
+            "/local-projects",
+            get(crate::project_transfer::list_local_projects),
+        )
+        .route(
+            "/local-projects/transfer",
+            post(crate::project_transfer::transfer_local_projects),
+        )
         .route(
             "/organizations/{tenant}/shared-project/materialize",
             post(lr::post_materialize_organization_shared_project),

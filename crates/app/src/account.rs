@@ -445,6 +445,11 @@ pub struct AccountDirectoryRecord {
     /// falls back to its own canonical default rather than failing.
     #[serde(default)]
     pub origin: String,
+    /// Each earlier root's signed hand-over to the next, oldest first, so a
+    /// client that pinned an earlier root follows the chain instead of raising
+    /// the changed-root alarm (ADR 0133 §3, DR-0361).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<gaugedesk_directory_protocol::RootTransition>,
 }
 
 /// The blind account-plane route for one granted project.
@@ -476,6 +481,7 @@ impl From<HomeRouteRecord> for crate::home::OpaqueHomeRoute {
             author_authority: record.author_authority,
             author_root_pubkey: record.author_root_pubkey,
             author_signature: record.author_signature,
+            placement: None,
         }
     }
 }

@@ -19,6 +19,11 @@ function record(root: string, routes: unknown[]) {
     return JSON.stringify({ entry: { directory: { root_pubkey: root, home_routes: routes } } });
 }
 
+/** A directory from before per-computer entries: no list, one entry. */
+function beforeEntries(body: string) {
+    return async (url: string) => (url.endsWith("/entries") ? null : body);
+}
+
 function memoryStorage() {
     const held = new Map<string, string>();
     return {
@@ -61,7 +66,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
             json: plane({ directory: { root_pubkey: ROOT, origin: "https://dir.example" } }),
             subject: "person-1",
             storage: memoryStorage(),
-            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            fetchJson: beforeEntries(record(ROOT, [hubRelayRoute])),
         });
         expect(routes.verified).toBe(true);
         expect(routes.routes[0]?.relay?.homeFingerprint).toBe("ab".repeat(32));
@@ -85,7 +90,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
             }),
             subject: "",
             storage,
-            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            fetchJson: beforeEntries(record(ROOT, [hubRelayRoute])),
         });
         expect(routes.verified).toBe(true);
         expect(routes.routes[0]?.relay?.homeFingerprint).toBe("ab".repeat(32));
@@ -102,7 +107,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
             json: plane({ directory: { root_pubkey: ROOT, origin: "https://dir.example" } }),
             subject: "",
             storage: memoryStorage(),
-            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            fetchJson: beforeEntries(record(ROOT, [hubRelayRoute])),
             onDegraded: (reason) => reasons.push(reason),
         });
         expect(routes.verified).toBe(false);
@@ -133,7 +138,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
         const options = {
             subject: "person-1",
             storage,
-            fetchJson: async () => record(OTHER, [hubRelayRoute]),
+            fetchJson: beforeEntries(record(OTHER, [hubRelayRoute])),
         };
         const conflicts: Error[] = [];
         const routes = await resolveHomeRoutes({
@@ -157,7 +162,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
             json: first,
             subject: "person-1",
             storage,
-            fetchJson: async () => record(ROOT, []),
+            fetchJson: beforeEntries(record(ROOT, [])),
         });
 
         const conflicts: Error[] = [];
@@ -168,7 +173,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
             }),
             subject: "person-1",
             storage,
-            fetchJson: async () => record(OTHER, []),
+            fetchJson: beforeEntries(record(OTHER, [])),
             onRootKeyConflict: (error) => conflicts.push(error),
         });
         expect(conflicts).toHaveLength(1);
@@ -177,6 +182,79 @@ describe("resolving routes across both channels (DESK-5g)", () => {
             routes.routes[0]?.endpoint,
             "a substitution must stop the pins, not strand the person",
         ).toBe("https://a.example");
+    });
+
+    it("moves the pin along a hand-over the pinned root signed (DR-0361)", async () => {
+        const handOver = { from: ROOT, to: OTHER, issued_at_ms: 1, signature: "sig" };
+        const reaches = vi.fn(
+            (pinned: string, current: string, chain: string) =>
+                pinned === ROOT && current === OTHER && JSON.parse(chain).length === 1,
+        );
+        setDirectoryModuleLoader(async () => ({
+            verify_signed_put_json: () => true,
+            root_chain_reaches_json: reaches,
+        }));
+        const storage = memoryStorage();
+        await resolveHomeRoutes({
+            json: plane({ directory: { root_pubkey: ROOT, origin: "" } }),
+            subject: "person-1",
+            storage,
+            fetchJson: beforeEntries(record(ROOT, [])),
+        });
+
+        const conflicts: Error[] = [];
+        const moved = await resolveHomeRoutes({
+            json: plane({
+                directory: { root_pubkey: OTHER, origin: "", transitions: [handOver] },
+            }),
+            subject: "person-1",
+            storage,
+            fetchJson: beforeEntries(record(OTHER, [hubRelayRoute])),
+            onRootKeyConflict: (error) => conflicts.push(error),
+        });
+        expect(conflicts).toHaveLength(0);
+        expect(moved.verified).toBe(true);
+        expect(reaches).toHaveBeenCalledOnce();
+
+        // A hand-over the verifier refuses leaves the new pin where it is and
+        // a further change an alarm again.
+        reaches.mockReturnValue(false);
+        await resolveHomeRoutes({
+            json: plane({
+                directory: { root_pubkey: ROOT, origin: "", transitions: [handOver] },
+            }),
+            subject: "person-1",
+            storage,
+            fetchJson: beforeEntries(record(ROOT, [])),
+            onRootKeyConflict: (error) => conflicts.push(error),
+        });
+        expect(conflicts).toHaveLength(1);
+    });
+
+    it("keeps a changed root an alarm for a verifier that cannot follow hand-overs", async () => {
+        setDirectoryModuleLoader(async () => ({ verify_signed_put_json: () => true }));
+        const storage = memoryStorage();
+        await resolveHomeRoutes({
+            json: plane({ directory: { root_pubkey: ROOT, origin: "" } }),
+            subject: "person-1",
+            storage,
+            fetchJson: beforeEntries(record(ROOT, [])),
+        });
+        const conflicts: Error[] = [];
+        await resolveHomeRoutes({
+            json: plane({
+                directory: {
+                    root_pubkey: OTHER,
+                    origin: "",
+                    transitions: [{ from: ROOT, to: OTHER, issued_at_ms: 1, signature: "sig" }],
+                },
+            }),
+            subject: "person-1",
+            storage,
+            fetchJson: beforeEntries(record(OTHER, [])),
+            onRootKeyConflict: (error) => conflicts.push(error),
+        });
+        expect(conflicts).toHaveLength(1);
     });
 
     it("pins per subject, so signing in as someone else is not a conflict", async () => {
@@ -188,7 +266,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
                 json: plane({ directory: { root_pubkey: root, origin: "" } }),
                 subject,
                 storage,
-                fetchJson: async () => record(root, []),
+                fetchJson: beforeEntries(record(root, [])),
                 onRootKeyConflict: (error) => conflicts.push(error),
             });
         }
@@ -200,7 +278,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
         // the same correct answer: no signed routes, endpoints still usable.
         const cases = [
             { verify: () => true, fetchJson: async () => { throw new Error("directory down"); } },
-            { verify: () => false, fetchJson: async () => record(ROOT, [hubRelayRoute]) },
+            { verify: () => false, fetchJson: beforeEntries(record(ROOT, [hubRelayRoute])) },
             { verify: () => true, fetchJson: async () => null },
         ];
         for (const { verify, fetchJson } of cases) {
@@ -229,7 +307,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
             }),
             subject: "person-1",
             storage: memoryStorage(),
-            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            fetchJson: beforeEntries(record(ROOT, [hubRelayRoute])),
         });
         expect(routes.verified).toBe(false);
         expect(routes.routes.map((route) => route.project)).toEqual(["proj-b"]);
@@ -247,7 +325,7 @@ describe("resolving routes across both channels (DESK-5g)", () => {
             }),
             subject: "person-1",
             storage: memoryStorage(),
-            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            fetchJson: beforeEntries(record(ROOT, [hubRelayRoute])),
         });
         expect(routes.routes.map((route) => route.project).sort()).toEqual(["proj-a", "proj-b"]);
         expect(routes.routes.find((route) => route.project === "proj-a")?.relay).toBeTruthy();
@@ -288,7 +366,7 @@ describe("a degradation says why (DESK-7 diagnosis)", () => {
             json: plane({ directory: { root_pubkey: ROOT, origin: "" } }),
             subject: "person-1",
             storage: memoryStorage(),
-            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            fetchJson: beforeEntries(record(ROOT, [hubRelayRoute])),
             onDegraded: collect,
         });
 
@@ -314,7 +392,7 @@ describe("a degradation says why (DESK-7 diagnosis)", () => {
             json: plane({ directory: { root_pubkey: ROOT, origin: "" } }),
             subject: "person-1",
             storage: memoryStorage(),
-            fetchJson: async () => record(ROOT, [hubRelayRoute]),
+            fetchJson: beforeEntries(record(ROOT, [hubRelayRoute])),
             onDegraded: (reason) => reasons.push(reason),
         });
         expect(routes.verified).toBe(true);

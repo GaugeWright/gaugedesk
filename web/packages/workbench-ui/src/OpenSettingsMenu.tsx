@@ -15,6 +15,7 @@ import { AccountMenu, type AccountMenuItem, type MenuComposition } from "./Accou
 import { SettingsPanel, type SettingsPanelApi } from "./SettingsPanel";
 import type { SettingsRoom } from "./SettingsSurface";
 import { DevicesModal, type DevicesModalApi } from "./DevicesModal";
+import { LocalProjectTransferDialog, localProjectTransferLabel, type LocalProjectTransferOffer } from "./LocalProjectTransferDialog";
 
 export interface SettingsMenuApi extends SettingsPanelApi, DevicesModalApi {
     productAnalyticsPolicy?(tenant: string): Promise<ProductAnalyticsPolicy>;
@@ -126,6 +127,10 @@ export function SettingsMenu(props: {
     onUseLocal?: () => void;
     /** The selected native local account has no external sign-in to end. */
     localAccount?: Accessor<boolean>;
+    /** Signed-out projects on this computer the signed-in account could
+     *  receive (DR-0328 §7). The menu offers the move only while it is set. */
+    localProjectTransfer?: Accessor<LocalProjectTransferOffer | null>;
+    onTransferLocalProjects?: (projects: readonly string[]) => Promise<void>;
     switchingAccount?: Accessor<boolean>;
     accountSwitchError?: Accessor<string>;
     /** Authenticated org floor supplied only by an enrolled composition. */
@@ -143,6 +148,10 @@ export function SettingsMenu(props: {
     const [devicesOpen, setDevicesOpen] = createSignal(false);
     const [settingsOpen, setSettingsOpen] = createSignal(false);
     const [privacyOpen, setPrivacyOpen] = createSignal(false);
+    const [transferOpen, setTransferOpen] = createSignal(false);
+    const transferOffer = () => (props.onTransferLocalProjects && !props.localAccount?.()
+        ? props.localProjectTransfer?.() ?? null
+        : null);
     const [privacyPolicy, setPrivacyPolicy] = createSignal<ProductAnalyticsPolicy | null>(null);
     const [privacyBusy, setPrivacyBusy] = createSignal(false);
     const [privacyError, setPrivacyError] = createSignal("");
@@ -318,6 +327,18 @@ export function SettingsMenu(props: {
                 },
             });
         }
+        const offer = transferOffer();
+        if (offer && offer.projects.length > 0) {
+            rows.push({
+                id: "move-local-projects",
+                label: localProjectTransferLabel(offer.account),
+                submenu: true,
+                run: () => {
+                    setMenuOpen(false);
+                    setTransferOpen(true);
+                },
+            });
+        }
         if ((props.accountChoices?.().length ?? 0) > 0 || props.onUseLocal) {
             rows.push({
                 id: "change-account",
@@ -467,6 +488,17 @@ export function SettingsMenu(props: {
                         onClose={() => setSettingsOpen(false)}
                     />
                 </SettingsModalBoundary>
+            </Show>
+            <Show when={transferOpen() && transferOffer()}>
+                {(offer) => (
+                    <SettingsModalBoundary surface="Move signed-out projects" onClose={() => setTransferOpen(false)}>
+                        <LocalProjectTransferDialog
+                            offer={offer()}
+                            onMove={(projects) => props.onTransferLocalProjects!(projects)}
+                            onClose={() => setTransferOpen(false)}
+                        />
+                    </SettingsModalBoundary>
+                )}
             </Show>
             <Show when={privacyOpen()}>
                 <SettingsModalBoundary surface="Privacy & analytics" onClose={() => setPrivacyOpen(false)}>

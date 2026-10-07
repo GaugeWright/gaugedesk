@@ -25,7 +25,9 @@ const models = {
             id: "openai", provider: "openai", name: "OpenAI", kind: "api-key", endpoint_class: "provider-hosted",
             base_url: null, linked: true, status: "active", version: 1, execution_classes: ["private-home"],
             models: ["model-a"], linked_at_ms: null, last_verified_at_ms: null, verification: "unverified",
+            waiting: ["device:phone"],
         }],
+        account_links: { account: "acct-a", recipients: [{ device_id: "device:mac", public_key: "043ad3861a95621392516bb593ef05583ed2e5866f5cb6260a3017237fd89b90afd0961c7e37075a6791a39c61f56295b02b6d26567b615e60aa41ee1c8e83388d" }] },
         default_model: { connection_id: "openai", model: "model-a" },
         subscription_sign_ins: { codex: signIn("openai-codex"), grok: signIn("xai-grok") },
         managed_inference: {

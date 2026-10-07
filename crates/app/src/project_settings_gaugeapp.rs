@@ -144,9 +144,10 @@ impl GaugeAppDefinition for ProjectSettings {
                 };
                 Ok(Applied {
                     facts: vec![record],
-                    committed: Box::new(move |wb| {
-                        wb.library.apply_project(project);
-                        wb.notify_library_changed("project", &id, "upsert");
+                    committed: Box::new(move |wb, positions| {
+                        if wb.library.apply_project_at(project, Some(positions[0])) {
+                            wb.notify_library_changed("project", &id, "upsert");
+                        }
                     }),
                 })
             }
@@ -158,7 +159,7 @@ impl GaugeAppDefinition for ProjectSettings {
                     .map_err(|reason| boxed_error(StatusCode::CONFLICT, reason))?;
                 Ok(Applied {
                     facts: Vec::new(),
-                    committed: Box::new(move |wb| {
+                    committed: Box::new(move |wb, _| {
                         wb.notify_library_changed("project", &id, "upsert");
                         for chat in &synced_chats {
                             wb.notify_library_changed("chat", chat, "upsert");
@@ -349,6 +350,67 @@ mod tests {
         assert!(!can_manage_project(Some(Role::viewer()), true));
         assert!(!can_manage_project(Some(Role::new("auditor")), true));
         assert!(!can_manage_project(None, true));
+    }
+
+    #[test]
+    fn committed_project_callbacks_reject_delayed_records_after_a_newer_command() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let headers = HeaderMap::new();
+        let mut wb = shared.lock_unpoisoned();
+        let project =
+            crate::library_routes::create_named_project(&mut wb, "positioned-project", "Original")
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        let session = build(&wb, &headers, &project).unwrap().session;
+        let envelope = |key: &str, name: &str| GaugeAppCommandEnvelope {
+            session_id: session.id.clone(),
+            generation: session.generation.clone(),
+            app: APP,
+            scope: session.scope.clone(),
+            page_id: PAGE.into(),
+            command_id: NAME_SET.into(),
+            expected_basis: session.pages[0].resource_basis.clone(),
+            idempotency_key: key.into(),
+            payload: json!({ "name": name }),
+            client: GaugeAppClient::Web,
+        };
+
+        // Admit an older real domain record while retaining its projection
+        // callback. This models delayed projection application, not concurrent
+        // command authorization outside the current Workbench lock.
+        let older_envelope = envelope("older", "Older");
+        let older =
+            ProjectSettings::apply(&mut wb, &session.actor, &project, &older_envelope).unwrap();
+        let older_admission = wb
+            .store_mut()
+            .admit_record_facts(
+                "positioned-project-command",
+                "older",
+                &serde_json::to_string(&older_envelope).unwrap(),
+                &older.facts,
+            )
+            .unwrap();
+        assert!(!older_admission.replayed);
+        assert_eq!(older_admission.positions.len(), 1);
+
+        // The ordinary host appends the project, its command receipt fact and
+        // chained audit record to different scopes. Only the project position
+        // belongs to this callback; a receipt/audit position cannot substitute.
+        let newer_envelope = envelope("newer", "Newer");
+        apply(&mut wb, &headers, &project, &newer_envelope).unwrap();
+        assert_eq!(wb.library.projects[&project].name, "Newer");
+        (older.committed)(&mut wb, &older_admission.positions);
+        assert_eq!(wb.library.projects[&project].name, "Newer");
+
+        // A genuine command retry must not re-apply its earlier projection.
+        let mut newest = wb.library.projects[&project].clone();
+        newest.name = "Newest".into();
+        wb.write_project_record(newest);
+        apply(&mut wb, &headers, &project, &newer_envelope).unwrap();
+        assert_eq!(wb.library.projects[&project].name, "Newest");
     }
 
     #[test]

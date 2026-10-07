@@ -74,6 +74,14 @@ fn selected_ids(
 }
 
 fn validate_log(wire: &HandoffWire) -> Result<(), AdmitError> {
+    // HTTP attempt companions belong only to this installation. Reject the
+    // entire offer: dropping an imported row would shift retained chat ordinals.
+    if wire.log.iter().any(|record| {
+        crate::engine::is_task_attempt_scope(&record.scope)
+            || record.kind == crate::engine::TASK_CORRELATION_ATTEMPT_KIND
+    }) {
+        return Err(refused("incoming log contains private HTTP task metadata"));
+    }
     if wire.project.is_empty() || wire.project.contains("::") {
         return Err(refused(
             "incoming project id aliases a nested authority scope",
@@ -96,9 +104,27 @@ fn validate_log(wire: &HandoffWire) -> Result<(), AdmitError> {
     let agents = selected_ids(&rows, "instance", "agent_id", |v| {
         using.contains(v["id"].as_str().unwrap_or_default())
     });
+    // A built-in Agent is the receiving Home's own seed. Its record may travel
+    // as a reference to the pinned version, but another Home's seed of it
+    // (authoring instance, authoring target) is never admitted.
+    let seeded = |id: &str| crate::app_support::is_builtin_agent(id);
     let authoring = selected_ids(&rows, "agent", "instance_id", |v| {
-        agents.contains(v["id"].as_str().unwrap_or_default())
+        let id = v["id"].as_str().unwrap_or_default();
+        agents.contains(id) && !seeded(id)
     });
+    let seed_rows = selected_ids(&rows, "agent", "instance_id", |v| {
+        seeded(v["id"].as_str().unwrap_or_default())
+    });
+    if rows.iter().any(|(kind, v)| {
+        (kind == "instance" && seed_rows.contains(v["id"].as_str().unwrap_or_default()))
+            || (kind == "work_target"
+                && v["owner"]["kind"] == "archetype"
+                && seeded(v["owner"]["archetype_id"].as_str().unwrap_or_default()))
+    }) {
+        return Err(refused(
+            "incoming log carries another Home's seed of a built-in Agent",
+        ));
+    }
     let instances = using.union(&authoring).cloned().collect::<BTreeSet<_>>();
     let chats = selected_ids(&rows, "chat", "id", |v| {
         using.contains(v["instance_id"].as_str().unwrap_or_default())
@@ -277,7 +303,11 @@ fn incoming_library(wire: &HandoffWire) -> Result<Library, AdmitError> {
     Ok(library)
 }
 
-fn home_facts(wire: &HandoffWire, home: &HomeId) -> Result<Vec<CommandRecordFact>, AdmitError> {
+fn home_facts(
+    wire: &HandoffWire,
+    home: &HomeId,
+    local_account: &str,
+) -> Result<Vec<CommandRecordFact>, AdmitError> {
     let mut facts = Vec::new();
     for record in &wire.log {
         if record.scope != LIBRARY_SCOPE {
@@ -288,14 +318,15 @@ fn home_facts(wire: &HandoffWire, home: &HomeId) -> Result<Vec<CommandRecordFact
                 let mut original: ProjectRecord = serde_json::from_str(&record.payload)?;
                 original.home_id = home.clone();
                 // A local account belongs to its own computer and does not
-                // travel: a project its origin's local account owned, or one
+                // travel: a project its origin's local account owned (which
+                // the origin names by its own federation authority), or one
                 // with no recorded owner, arrives as this computer's local
                 // account's, and the account that accepts it takes it from
                 // there (DR-0328 §4). An account's project keeps its owner.
                 if crate::project_owner::takes_legacy_owner(&original)
                     || crate::project_owner::recorded_owner(&original) == Some(wire.source.as_str())
                 {
-                    crate::project_owner::record_owner(&mut original.extra, &wire.target);
+                    crate::project_owner::record_owner(&mut original.extra, local_account);
                 }
                 facts.push(fact(LIBRARY_SCOPE, "project", &original)?);
             }
@@ -315,7 +346,48 @@ fn home_facts(wire: &HandoffWire, home: &HomeId) -> Result<Vec<CommandRecordFact
     Ok(facts)
 }
 
+/// A relocated placement of a built-in Agent binds to this Home's own seed of
+/// it, so this Home must hold that seed at the exact published version the
+/// placement pins. The offered record is a reference and is never admitted.
+fn compatible_seeded_agents(current: &Library, incoming: &Library) -> Result<(), AdmitError> {
+    for placement in incoming.instances.values() {
+        if !crate::app_support::is_builtin_agent(&placement.agent_id) {
+            continue;
+        }
+        let local = current.agents.get(&placement.agent_id).ok_or_else(|| {
+            refused("incoming project uses a built-in Agent this Home has not seeded")
+        })?;
+        let offered = incoming
+            .agents
+            .get(&placement.agent_id)
+            .and_then(|agent| agent.versions.get(&placement.version))
+            .ok_or_else(|| refused("incoming placement pins no built-in Agent version"))?;
+        match local.versions.get(&placement.version) {
+            Some(held) if serde_json::to_value(held)? == serde_json::to_value(offered)? => {}
+            _ => {
+                return Err(refused(
+                    "incoming project pins a built-in Agent version this Home does not hold",
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn compatible_library(current: &Library, incoming: &Library) -> Result<(), AdmitError> {
+    compatible_seeded_agents(current, incoming)?;
+    for (id, offered) in &incoming.agents {
+        if crate::app_support::is_builtin_agent(id) {
+            continue;
+        }
+        if let Some(existing) = current.agents.get(id) {
+            if serde_json::to_value(existing)? != serde_json::to_value(offered)? {
+                return Err(refused(
+                    "incoming library identity conflicts with local authority",
+                ));
+            }
+        }
+    }
     macro_rules! check {
         ($($field:ident),+ $(,)?) => {$(
             for (id, offered) in &incoming.$field {
@@ -328,7 +400,6 @@ fn compatible_library(current: &Library, incoming: &Library) -> Result<(), Admit
         )+};
     }
     check!(
-        agents,
         instances,
         chats,
         workstreams,
@@ -354,6 +425,16 @@ fn compatible_library(current: &Library, incoming: &Library) -> Result<(), Admit
         }
     }
     Ok(())
+}
+
+/// The offered record of a built-in Agent: checked against this Home's seed by
+/// [`compatible_seeded_agents`], never written over it.
+fn is_seeded_agent_reference(record: &HandoffLogRecord) -> bool {
+    record.scope == LIBRARY_SCOPE
+        && record.kind == "agent"
+        && serde_json::from_str::<serde_json::Value>(&record.payload).is_ok_and(|value| {
+            crate::app_support::is_builtin_agent(value["id"].as_str().unwrap_or_default())
+        })
 }
 
 fn matching_existing_scopes(
@@ -575,6 +656,7 @@ pub(super) fn commit(
             !reused.contains(&record.scope)
                 && (wire.project_commands.is_none()
                     || !is_project_scope(&record.scope, &wire.project))
+                && !is_seeded_agent_reference(record)
         })
         .map(|record| CommandRecordFact {
             scope_id: record.scope.clone(),
@@ -593,7 +675,7 @@ pub(super) fn commit(
             state = handoff::evolve(&state, event);
         }
     }
-    facts.extend(home_facts(wire, &home)?);
+    facts.extend(home_facts(wire, &home, guard.authority().as_str())?);
     // Pin the key the origin signs its runs with, as the pairing that verified
     // this move vouches for it now, so the runs arriving here stay checkable
     // after that pairing expires or is revoked (DR-0201). A revoked pairing

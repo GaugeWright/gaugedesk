@@ -294,13 +294,15 @@ export class RouteHttpError extends Error {
     readonly status: number;
     readonly method: string;
     readonly path: string;
+    readonly correlation?: unknown;
 
-    constructor(method: string, path: string, status: number, message: string) {
+    constructor(method: string, path: string, status: number, message: string, correlation?: unknown) {
         super(message);
         this.name = "RouteHttpError";
         this.status = status;
         this.method = method;
         this.path = path;
+        this.correlation = correlation;
     }
 }
 
@@ -317,9 +319,9 @@ async function routeError(
         return new RouteHttpError(method, path, res.status, prefix);
     }
     try {
-        const parsed = JSON.parse(detail) as { error?: unknown };
+        const parsed = JSON.parse(detail) as { error?: unknown; correlation?: unknown };
         if (typeof parsed.error === "string" && parsed.error) {
-            return new RouteHttpError(method, path, res.status, `${prefix} ${parsed.error}`);
+            return new RouteHttpError(method, path, res.status, `${prefix} ${parsed.error}`, parsed.correlation);
         }
     } catch {
         /* not JSON — fall through to the raw text */
@@ -350,8 +352,8 @@ export function browserRouteJson(
             body: body !== undefined ? JSON.stringify(body) : undefined,
         });
         if (res.status === 409) {
-            const r = (await res.json()) as { rejected?: string; error?: string; message?: string; command_status?: string };
-            throw new Rejected(r.rejected ?? r.error ?? r.message ?? "unknown", r.command_status);
+            const r = (await res.json()) as { rejected?: string; error?: string; message?: string; command_status?: string; correlation?: unknown };
+            throw Object.assign(new Rejected(r.rejected ?? r.error ?? r.message ?? "unknown", r.command_status), { correlation: r.correlation });
         }
         if (res.status === TURN_STOPPED_STATUS) throw new TurnStopped();
         if (!res.ok) throw await routeError(method, path, res);

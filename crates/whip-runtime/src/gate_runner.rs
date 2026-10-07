@@ -461,6 +461,82 @@ pub struct GateImportEvidence {
     pub envelope_digest: String,
 }
 
+/// Why a checked operation's readback could not be used.
+///
+/// `Unknown` is missing or unreadable evidence: the operation cannot be
+/// verified at all, so no claim about it may be made. `Drifted` is present,
+/// intact evidence that no longer matches the current basis — the running
+/// compiler, the lock or package set, or the governance envelope — so a
+/// previous witness is invalid until it is readmitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GateImportRefusalClass {
+    Unknown,
+    Drifted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateImportRefusal {
+    pub class: GateImportRefusalClass,
+    pub detail: String,
+}
+
+impl std::fmt::Display for GateImportRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+/// How a target runtime store recorded one program-version creation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GateImportOperationKind {
+    /// Carries an exact import witness.
+    Checked,
+    /// Created without a witness.
+    Unwitnessed,
+    /// A version that existed before operations were recorded; its accepting
+    /// calls cannot be reconstructed.
+    LegacyGap,
+}
+
+/// One row of a target runtime store's own import-operation roster. This is
+/// the target's local account; it never certifies the Home population.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GateImportRosterEntry {
+    pub operation_id: String,
+    pub version_id: String,
+    pub witness_digest: Option<String>,
+    pub kind: GateImportOperationKind,
+}
+
+/// Read a gate state directory's import-operation roster without creating or
+/// repairing its store. `None` means the target store does not exist.
+pub fn gate_import_roster(
+    state_dir: &Path,
+) -> Result<Option<Vec<GateImportRosterEntry>>, GateRunError> {
+    let path = state_dir.join("runtime.sqlite");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let store = SqliteStore::open_read_only(&path)?;
+    let roster = store.program_import_operation_roster()?;
+    Ok(Some(
+        roster
+            .operations
+            .into_iter()
+            .map(|operation| GateImportRosterEntry {
+                operation_id: operation.operation_id,
+                version_id: operation.version_id,
+                witness_digest: operation.witness_digest,
+                kind: match operation.kind {
+                    ProgramImportOperationKind::Checked => GateImportOperationKind::Checked,
+                    ProgramImportOperationKind::Unwitnessed => GateImportOperationKind::Unwitnessed,
+                    ProgramImportOperationKind::LegacyGap => GateImportOperationKind::LegacyGap,
+                },
+            })
+            .collect(),
+    ))
+}
+
 /// Re-read one checked operation without creating or repairing its target
 /// store. A retained item uses the source and IR pinned by its historical
 /// version, under the Home's current governance envelope; an edit to the
@@ -470,58 +546,88 @@ pub fn verify_gate_import_operation(
     state_dir: &Path,
     operation_id: &str,
 ) -> Result<GateImportEvidence, GateRunError> {
-    let repair = |detail: &str| {
+    readback_gate_import_operation(current, state_dir, operation_id).map_err(|refusal| {
         GateRunError::NoDisposition(format!(
-        "gate import operation {operation_id} cannot be used: {detail}; preserve the item and repair its exact Home/target evidence"
-    ))
+            "gate import operation {operation_id} cannot be used: {refusal}; preserve the item and repair its exact Home/target evidence"
+        ))
+    })
+}
+
+/// [`verify_gate_import_operation`] with the refusal classified, for a
+/// Home-wide revalidation pass that must tell missing evidence (`Unknown`)
+/// from evidence a changed basis has invalidated (`Drifted`).
+pub fn readback_gate_import_operation(
+    current: &GateProgram,
+    state_dir: &Path,
+    operation_id: &str,
+) -> Result<GateImportEvidence, GateImportRefusal> {
+    let unknown = |detail: String| GateImportRefusal {
+        class: GateImportRefusalClass::Unknown,
+        detail,
     };
+    let drifted = |detail: String| GateImportRefusal {
+        class: GateImportRefusalClass::Drifted,
+        detail,
+    };
+    let read = |error: StoreError| unknown(format!("target store unreadable: {error:?}"));
     let path = state_dir.join("runtime.sqlite");
     if !path.is_file() {
-        return Err(repair("target runtime store is missing"));
+        return Err(unknown("target runtime store is missing".into()));
     }
-    let store = SqliteStore::open_read_only(&path)?;
+    let store = SqliteStore::open_read_only(&path).map_err(read)?;
     let target_store_incarnation =
         whipplescript_kernel::host_facade::require_home_store_incarnation(&store)
-            .map_err(|error| repair(&error.to_string()))?;
+            .map_err(|error| unknown(error.to_string()))?;
     let operation = store
-        .program_import_operation(operation_id)?
-        .ok_or_else(|| repair("target operation is missing"))?;
+        .program_import_operation(operation_id)
+        .map_err(read)?
+        .ok_or_else(|| unknown("target operation is missing".into()))?;
     if operation.kind != ProgramImportOperationKind::Checked {
-        return Err(repair("target operation is not checked"));
+        return Err(unknown("target operation is not checked".into()));
     }
     let witness_digest = operation
         .witness_digest
         .as_deref()
-        .ok_or_else(|| repair("checked target operation has no witness digest"))?;
+        .ok_or_else(|| unknown("checked target operation has no witness digest".into()))?;
     let witness = store
-        .program_import_witness(&operation.version_id, witness_digest)?
-        .ok_or_else(|| repair("target import witness is missing"))?;
+        .program_import_witness(&operation.version_id, witness_digest)
+        .map_err(read)?
+        .ok_or_else(|| unknown("target import witness is missing".into()))?;
     let version = store
-        .get_program_version(&operation.version_id)?
-        .ok_or_else(|| repair("target program version is missing"))?;
+        .get_program_version(&operation.version_id)
+        .map_err(read)?
+        .ok_or_else(|| unknown("target program version is missing".into()))?;
     let source = store
-        .get_content(&version.source_hash)?
-        .ok_or_else(|| repair("retained program source is missing"))?;
+        .get_content(&version.source_hash)
+        .map_err(read)?
+        .ok_or_else(|| unknown("retained program source is missing".into()))?;
     let snapshot = store
-        .get_content(&version.ir_hash)?
-        .ok_or_else(|| repair("retained IR snapshot is missing"))?;
+        .get_content(&version.ir_hash)
+        .map_err(read)?
+        .ok_or_else(|| unknown("retained IR snapshot is missing".into()))?;
     if stable_hash_hex(&source) != version.source_hash
         || stable_hash_hex(&snapshot) != version.ir_hash
     {
-        return Err(repair("retained source or IR differs from its version"));
+        return Err(unknown(
+            "retained source or IR differs from its version".into(),
+        ));
     }
-    let retained = GateProgram::compile(&source, &current.envelope)?;
+    let retained = GateProgram::compile(&source, &current.envelope).map_err(|error| {
+        drifted(format!(
+            "retained program no longer admits under the current envelope: {error}"
+        ))
+    })?;
     if retained.ir.workflow != version.program_name
         || whipplescript_parser::snapshot::identity_projection(&retained.ir.to_snapshot())
             != snapshot
     {
-        return Err(repair(
-            "current compiler does not reproduce the retained program",
+        return Err(drifted(
+            "current compiler does not reproduce the retained program".into(),
         ));
     }
     let source_digest = whipplescript_kernel::exec_http::sha256_hex(source.as_bytes());
-    let compiler_artifact_digest = whipplescript::host_runtime::native_compiler_artifact_digest()
-        .map_err(GateRunError::NoDisposition)?;
+    let compiler_artifact_digest =
+        whipplescript::host_runtime::native_compiler_artifact_digest().map_err(unknown)?;
     let basis = CheckedImportBasis {
         program_source_digest: &source_digest,
         version_source_digest: None,
@@ -530,8 +636,8 @@ pub fn verify_gate_import_operation(
         packages: &[],
     };
     if !import_coverage::current_basis(&witness, &retained.ir, &basis) {
-        return Err(repair(
-            "import witness differs from the retained current basis",
+        return Err(drifted(
+            "import witness differs from the retained current basis".into(),
         ));
     }
     Ok(GateImportEvidence {
@@ -547,6 +653,14 @@ pub fn verify_gate_import_operation(
         lock_digest: NO_LOCK_DIGEST.to_owned(),
         envelope_digest: whipplescript_kernel::exec_http::sha256_hex(current.envelope.as_bytes()),
     })
+}
+
+impl GateProgram {
+    /// Digest of the authored source, comparable with
+    /// [`GateImportEvidence::source_digest`].
+    pub fn source_digest(&self) -> String {
+        whipplescript_kernel::exec_http::sha256_hex(self.source.as_bytes())
+    }
 }
 
 /// Call `check_use` after version selection and before instance creation,

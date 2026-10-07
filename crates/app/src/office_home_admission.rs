@@ -58,6 +58,12 @@ pub async fn require_office_home_admission(
     if request.uri().path() == "/health" && request.method() == Method::GET {
         return next.run(request).await;
     }
+    // The channel serves only the Project Host its organization enrolled in the
+    // office-controlled profile (WS-424). This is decided from the Home's own
+    // store before any credential is checked or any body is read.
+    if let Some((status, error)) = wb.lock_unpoisoned().office_profile_channel_refusal() {
+        return (status, Json(json!({ "error": error }))).into_response();
+    }
     // Verify only workforce authentication outside the Home mutex. Neither the
     // source verifier nor its worker receives a route, project or work payload.
     let source = wb.lock_unpoisoned().office_staff_verifier();

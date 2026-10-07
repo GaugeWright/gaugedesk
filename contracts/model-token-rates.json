@@ -1,5 +1,14 @@
 {
-  "version": "unrated-2026-09-15",
+  "version": "openai-published-2026-10-06",
   "currency": "USD",
-  "models": {}
+  "models": {
+    "gpt-4.1-mini": {
+      "input_uncached": 400000,
+      "input_cache_read": 100000,
+      "input_cache_write": 400000,
+      "output": 1600000,
+      "source": "https://developers.openai.com/api/docs/pricing (Standard tier: input $0.40, cached input $0.10, output $1.60 per 1M tokens). The page lists no cache-write rate for this model; OpenAI bills the prompt tokens that populate its cache as ordinary input, so cache writes carry the input rate.",
+      "as_of": "2026-10-06"
+    }
+  }
 }

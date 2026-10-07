@@ -74,6 +74,10 @@ async fn office_chat_stream_checks_current_parents_before_buffered_disclosure() 
         sender
             .send(ServerEvent::User {
                 text: "synthetic clinical event".into(),
+                client_request_id: None,
+                chat_id: None,
+                home_id: None,
+                actor_id: None,
             })
             .unwrap();
         assert!(next(&mut body)
@@ -84,6 +88,10 @@ async fn office_chat_stream_checks_current_parents_before_buffered_disclosure() 
         sender
             .send(ServerEvent::User {
                 text: "must remain undisclosed".into(),
+                client_request_id: None,
+                chat_id: None,
+                home_id: None,
+                actor_id: None,
             })
             .unwrap();
         match change {
@@ -177,6 +185,10 @@ async fn office_chat_stream_keeps_exact_parent_across_source_recheck_and_outage(
             .sender(&chat)
             .send(ServerEvent::User {
                 text: format!("same parent {status}"),
+                client_request_id: None,
+                chat_id: None,
+                home_id: None,
+                actor_id: None,
             })
             .unwrap();
         assert!(next(&mut body)

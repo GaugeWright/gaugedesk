@@ -36,6 +36,9 @@ mod record_admission_prefix;
 #[cfg(test)]
 mod record_claim_tests;
 mod request_admission;
+mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
 #[cfg(test)]
 mod typed_codec_tests;
 
@@ -249,7 +252,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 11;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 12;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -651,6 +654,26 @@ const MIGRATIONS: &[Migration] = &[
                  UNIQUE (command_scope, command_key)
              );",
     },
+    Migration {
+        version: 12,
+        name: "scope-fold-checkpoints",
+        // SCALE-1: derived, rebuildable checkpoints of a lifecycle's fold. One
+        // row per (scope, kind, lifecycle); the codec version and reducer build
+        // are in the key so a changed reducer never resumes an old fold. The
+        // anchor is the SHA-256 of the stored bytes of the event at `position`,
+        // so a checkpoint whose history moved underneath it is ignored.
+        sql: "CREATE TABLE IF NOT EXISTS scope_snapshots (
+                 scope_id      TEXT    NOT NULL,
+                 kind          TEXT    NOT NULL,
+                 lifecycle     TEXT    NOT NULL,
+                 codec_version INTEGER NOT NULL,
+                 reducer_build TEXT    NOT NULL,
+                 position      INTEGER NOT NULL CHECK (position >= 0),
+                 anchor_sha256 TEXT    NOT NULL CHECK (length(anchor_sha256) = 64),
+                 state         TEXT    NOT NULL,
+                 PRIMARY KEY (scope_id, kind, lifecycle, codec_version, reducer_build)
+             );",
+    },
 ];
 
 /// The fail-closed downgrade-guard refusal (DR-0054 Phase B): diagnosable — it
@@ -763,16 +786,14 @@ fn retained_kind_payloads(
     Ok(selected_rows)
 }
 
+/// Fold a lifecycle from its newest valid checkpoint, or from the start
+/// (SCALE-1, [`snapshot`]). Unavailable retained history still refuses.
 fn fold_retained<L: Lifecycle>(
     conn: &Connection,
     codec: Option<&Arc<dyn ContentCodec>>,
     scope: &str,
 ) -> Result<L::State, AdmitError> {
-    let mut state = L::State::default();
-    for plain in retained_kind_payloads(conn, codec, scope, L::KIND)? {
-        state = L::evolve(&state, serde_json::from_str(&plain)?);
-    }
-    Ok(state)
+    snapshot::fold::<L>(conn, codec, scope)
 }
 
 fn encode_payload(
@@ -1052,7 +1073,13 @@ impl Store {
         idempotency_key: &str,
         snapshot_json: &str,
     ) -> Result<(CommandRecord, bool), AdmitError> {
-        self.claim_command_with_basis(command_id, scope_id, idempotency_key, snapshot_json, None)
+        self.claim_command_with_basis(
+            command_id,
+            (scope_id, idempotency_key),
+            snapshot_json,
+            None,
+            &[],
+        )
     }
 
     /// Claim exact caller intent under current product and process standing.
@@ -1067,26 +1094,52 @@ impl Store {
     ) -> Result<(CommandRecord, bool), AdmitError> {
         self.claim_command_with_basis(
             command_id,
-            scope_id,
-            idempotency_key,
+            (scope_id, idempotency_key),
             snapshot_json,
             Some(basis),
+            &[],
         )
+    }
+
+    /// Exclude every earlier receipt coordinate under the same claim writer.
+    /// A format change never implicitly restarts recorded work.
+    pub fn claim_command_excluding(
+        &mut self,
+        command_id: &str,
+        scope_key: (&str, &str),
+        snapshot: &str,
+        basis: Option<&command_dispatch::DispatchReadBasis>,
+        excluded: &[(&str, &str)],
+    ) -> Result<(CommandRecord, bool), AdmitError> {
+        self.claim_command_with_basis(command_id, scope_key, snapshot, basis, excluded)
     }
 
     fn claim_command_with_basis(
         &mut self,
         command_id: &str,
-        scope_id: &str,
-        idempotency_key: &str,
+        scope_key: (&str, &str),
         snapshot_json: &str,
         basis: Option<&command_dispatch::DispatchReadBasis>,
+        excluded: &[(&str, &str)],
     ) -> Result<(CommandRecord, bool), AdmitError> {
+        let (scope_id, idempotency_key) = scope_key;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(basis) = basis {
             command_dispatch::check_dispatch_basis(&tx, &self.path, basis)?;
+        }
+        for (legacy_scope, legacy_key) in excluded {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE scope_id=?1 AND idempotency_key=?2)",
+                params![legacy_scope, legacy_key],
+                |row| row.get(0),
+            )?;
+            if exists {
+                return Err(AdmitError::Rejected(gaugedesk_core::Rejection {
+                    reason: "legacy command receipt requires explicit resolution",
+                }));
+            }
         }
         tx.prepare_cached(
             "INSERT OR IGNORE INTO commands
@@ -1968,6 +2021,52 @@ impl Store {
         Ok(position)
     }
 
+    /// Append one owning record and a position-linked companion in another
+    /// scope as one commit. The link receives the actual owning position under
+    /// the SQLite write lock; any encode/link/write failure rolls both back.
+    pub fn append_record_with_linked_record(
+        &mut self,
+        scope: &str,
+        kind: &str,
+        payload: &str,
+        companion_scope: &str,
+        companion_kind: &str,
+        link: impl FnOnce(i64) -> Result<String, AdmitError>,
+    ) -> Result<i64, AdmitError> {
+        let codec = self.codec.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let position: i64 = tx
+            .prepare_cached(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+            )?
+            .query_row(params![scope], |row| row.get(0))?;
+        let companion = link(position)?;
+        for (record_scope, record_kind, record_payload) in [
+            (scope, kind, payload),
+            (companion_scope, companion_kind, companion.as_str()),
+        ] {
+            let stored = match &codec {
+                Some(codec) => codec
+                    .encode(record_scope, record_kind, record_payload)
+                    .map_err(AdmitError::Codec)?,
+                None => record_payload.to_owned(),
+            };
+            let assigned: i64 = tx
+                .prepare_cached(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM events WHERE scope_id = ?1",
+                )?
+                .query_row(params![record_scope], |row| row.get(0))?;
+            tx.prepare_cached(
+                "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![record_scope, assigned, record_kind, stored])?;
+        }
+        tx.commit()?;
+        Ok(position)
+    }
+
     /// Append one [`ChainedRecordFact`] whose payload is resolved against the
     /// scope's committed head **inside** the write transaction that appends it —
     /// the standalone sibling of
@@ -2315,6 +2414,7 @@ impl Store {
             .execute(params![scope_id, position, L::KIND, payload])?;
             new_state = L::evolve(&new_state, event);
         }
+        snapshot::checkpoint::<L>(&tx, self.codec.as_ref(), scope_id, &new_state)?;
         tx.commit()?;
         Ok(new_state)
     }
@@ -2387,6 +2487,7 @@ impl Store {
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
         )?
         .execute(params![scope_id, command_key, base])?;
+        snapshot::checkpoint::<L>(&tx, self.codec.as_ref(), scope_id, &new_state)?;
         tx.commit()?;
         Ok(new_state)
     }
@@ -2415,6 +2516,123 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changed_command_scope_excludes_every_prior_coordinate() {
+        let excluded = [
+            ("old-raw-path", "raw-key"),
+            ("old-opaque-key-path", "opaque-key"),
+        ];
+        for (scope, key) in excluded {
+            let mut store = Store::open_in_memory().unwrap();
+            store
+                .claim_command("old", scope, key, "old snapshot")
+                .unwrap();
+            assert!(store
+                .claim_command_excluding(
+                    "new",
+                    ("opaque-path", "opaque-key"),
+                    "new snapshot",
+                    None,
+                    &excluded,
+                )
+                .is_err());
+            assert!(store
+                .command_for_key("opaque-path", "opaque-key")
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store
+                    .command_for_key(scope, key)
+                    .unwrap()
+                    .unwrap()
+                    .snapshot_json,
+                "old snapshot"
+            );
+        }
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(
+            store
+                .claim_command_excluding(
+                    "new",
+                    ("opaque-path", "opaque-key"),
+                    "new snapshot",
+                    None,
+                    &excluded,
+                )
+                .unwrap()
+                .1
+        );
+        assert!(
+            !store
+                .claim_command_excluding(
+                    "new",
+                    ("opaque-path", "opaque-key"),
+                    "new snapshot",
+                    None,
+                    &excluded,
+                )
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
+    fn opaque_command_claim_never_restarts_a_legacy_receipt() {
+        for status in ["received", "processing", "applied", "rejected", "expired"] {
+            let mut store = Store::open_in_memory().unwrap();
+            store
+                .claim_command("legacy", "scope", "raw-key", "original")
+                .unwrap();
+            store.set_command_status("legacy", status).unwrap();
+            assert!(
+                store
+                    .claim_command_excluding(
+                        "opaque",
+                        ("scope", "opaque-key"),
+                        "original",
+                        None,
+                        &[("scope", "raw-key")],
+                    )
+                    .is_err(),
+                "{status}"
+            );
+            assert!(store
+                .command_for_key("scope", "opaque-key")
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store
+                    .command_for_key("scope", "raw-key")
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                status
+            );
+        }
+        let mut store = Store::open_in_memory().unwrap();
+        let (_, claimed) = store
+            .claim_command_excluding(
+                "opaque",
+                ("scope", "opaque-key"),
+                "original",
+                None,
+                &[("scope", "raw-key")],
+            )
+            .unwrap();
+        assert!(claimed);
+        let (record, claimed) = store
+            .claim_command_excluding(
+                "opaque",
+                ("scope", "opaque-key"),
+                "original",
+                None,
+                &[("scope", "raw-key")],
+            )
+            .unwrap();
+        assert!(!claimed);
+        assert_eq!(record.snapshot_json, "original");
+    }
+
     use super::*;
     use gaugedesk_core::managed_machine_execution::{
         ExecutionCapability, ExecutionPhase, ExecutionProfile, ExecutionRequest,
@@ -2463,7 +2681,7 @@ mod tests {
         let path = dir.path().join("main-v10.sqlite");
         let original = {
             let store = Store::open(path.to_str().unwrap()).unwrap();
-            store.conn.execute_batch("DROP TABLE command_pair_results; DELETE FROM schema_migrations WHERE version=11;").unwrap();
+            store.conn.execute_batch("DROP TABLE command_pair_results; DROP TABLE scope_snapshots; DELETE FROM schema_migrations WHERE version>=11;").unwrap();
             store.conn.execute("INSERT INTO home_reference_journal_bindings(project_id,home_id,incarnation) VALUES ('original-project','original-home',?1)", ["a".repeat(32)]).unwrap();
             store.conn.execute("INSERT INTO project_authority_keys(project_id,authority_id,public_key,custody,wrapped_seed) VALUES ('original-project','original-authority',?1,'project-v1',?2)", rusqlite::params![format!("04{}", "a".repeat(128)), vec![42_u8; 32]]).unwrap();
             let created: String = store
@@ -2479,7 +2697,7 @@ mod tests {
         };
         for _ in 0..2 {
             let store = Store::open(path.to_str().unwrap()).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 11);
+            assert_eq!(store.schema_version().unwrap(), SUPPORTED_SCHEMA_VERSION);
             let created: String = store
                 .conn
                 .query_row(
@@ -3547,6 +3765,19 @@ mod tests {
                 "{change}"
             );
             assert!(store.command("new").unwrap().is_none(), "{change}");
+            assert!(
+                store
+                    .claim_command_excluding(
+                        "new-format",
+                        ("opaque-scope", "opaque-key"),
+                        "new input",
+                        Some(&basis),
+                        &[("old-scope", "old-key")],
+                    )
+                    .is_err(),
+                "{change}"
+            );
+            assert!(store.command("new-format").unwrap().is_none(), "{change}");
             assert!(
                 store
                     .claim_command_against("existing", "scope", "existing", "original", &basis)

@@ -1845,3 +1845,118 @@ async fn a_projects_owner_invites_into_it_without_a_role() {
     .await;
     assert!(status.is_success(), "{status} {body}");
 }
+
+fn membership(
+    account: &str,
+    organization: &str,
+    role: &str,
+    status: MembershipStatus,
+) -> MembershipRecord {
+    MembershipRecord {
+        id: account.into(),
+        op: RecordOp::Upsert,
+        org_id: organization.into(),
+        authority: account.into(),
+        email: String::new(),
+        role: role.into(),
+        status,
+        managed_by_scim: false,
+        team: None,
+    }
+}
+
+/// DR-0374: an organization's owners and admins reach that organization's own
+/// shared projects without a grant, and nothing else through their role.
+#[test]
+fn an_organizations_owner_and_admin_reach_its_shared_project_and_nothing_else() {
+    const ORGANIZATION: &str = "organization:abc";
+    for (role, status, reaches) in [
+        ("owner", MembershipStatus::Active, true),
+        ("admin", MembershipStatus::Active, true),
+        ("member", MembershipStatus::Active, false),
+        ("owner", MembershipStatus::Deprovisioned, false),
+    ] {
+        let (_root, wb) = open();
+        wb.lock_unpoisoned().enable_hosted_home_mode();
+        append(
+            &wb,
+            "membership",
+            &membership(CLAIMANT, ORGANIZATION, role, status),
+        );
+        project(
+            &wb,
+            "shared",
+            serde_json::json!({ "organization": ORGANIZATION }),
+        );
+        project(
+            &wb,
+            "elsewhere",
+            serde_json::json!({ "organization": "organization:def" }),
+        );
+        project(&wb, "other", serde_json::json!({ "owner": OTHER }));
+        project(&wb, "legacy", serde_json::json!({}));
+        let guard = wb.lock_unpoisoned();
+        let org = Org::rebuild(guard.store_ref()).unwrap();
+        let reached = guard.account_project_ids(CLAIMANT, &org);
+        assert_eq!(reached.contains("shared"), reaches, "{role} {status:?}");
+        for id in ["elsewhere", "other", "legacy", DEFAULT_PROJECT] {
+            assert!(!reached.contains(id), "{role} reaches {id} by role alone");
+        }
+        // The standing is the project's own membership, not a side door.
+        let owners = guard.project_owner_resolver();
+        let library = crate::library::Library::rebuild(guard.store_ref()).unwrap();
+        let members = owners.members_in(
+            &library,
+            &owners.legacy_owner(guard.store_ref()),
+            &library.projects["shared"],
+            &org,
+        );
+        assert_eq!(members.contains(CLAIMANT), reaches, "{role} {status:?}");
+    }
+}
+
+/// The Hub holds only an organization's reservation of its shared project,
+/// which lives on a Home. Its owner reaches that project id there, read from
+/// the organization's own directory, and an ordinary member does not.
+#[test]
+fn a_hub_admits_an_organizations_owner_to_its_reserved_shared_project() {
+    let (_root, wb) = open();
+    let mut guard = wb.lock_unpoisoned();
+    let tenant = crate::tenancy::provision_organization(
+        guard.store_mut(),
+        CLAIMANT,
+        &crate::account::account_scope(CLAIMANT),
+        "Acme Studio",
+        None,
+    )
+    .unwrap();
+    let scope = crate::org::tenant_scope(&tenant.id);
+    guard
+        .store_mut()
+        .append_record(
+            &scope,
+            "membership",
+            &serde_json::to_string(&membership(
+                OTHER,
+                &tenant.id,
+                "member",
+                MembershipStatus::Active,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let reserved = crate::tenancy::organization_project_intent(guard.store_ref(), &tenant.id)
+        .unwrap()
+        .unwrap()
+        .project_id;
+    let org = Org::rebuild_in(guard.store_ref(), &scope).unwrap();
+    assert!(guard
+        .account_project_ids(CLAIMANT, &org)
+        .contains(&reserved));
+    assert!(!guard.account_project_ids(OTHER, &org).contains(&reserved));
+    // Another directory's owner role does not reach this organization's project.
+    let home_directory = Org::rebuild(guard.store_ref()).unwrap();
+    assert!(!guard
+        .account_project_ids(CLAIMANT, &home_directory)
+        .contains(&reserved));
+}

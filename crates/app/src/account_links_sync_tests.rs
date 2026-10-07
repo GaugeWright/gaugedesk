@@ -54,7 +54,7 @@ impl LinkAuthority for Authority {
         Ok(self
             .set
             .borrow()
-            .recipients()
+            .all_recipients()
             .into_iter()
             .map(|(device, key)| LinkRecipient::new(device, key.clone()).unwrap())
             .collect())
@@ -102,6 +102,15 @@ impl LinkAuthority for Authority {
     fn revoke(&self, provider: &str) -> Result<(), String> {
         let mut set = self.set.borrow_mut();
         let facts = account_links::revoke_link(&set, provider, 1).map_err(refused)?;
+        set.apply(facts);
+        Ok(())
+    }
+
+    fn report_check(&self, provider: &str, version: u64, reachable: bool) -> Result<(), String> {
+        let mut set = self.set.borrow_mut();
+        let facts =
+            account_links::record_check(&set, provider, &self.device, version, reachable, 1)
+                .map_err(refused)?;
         set.apply(facts);
         Ok(())
     }
@@ -395,4 +404,234 @@ fn a_sign_in_only_this_desktop_holds_refreshes_without_asking() {
         before_refresh(&mac.wb, &mac.scope(), "openai-codex"),
         RefreshTurn::Refresh
     );
+}
+
+#[test]
+fn a_device_checks_a_link_it_holds_and_the_account_keeps_only_the_answer() {
+    let set = Authority::shared();
+    let (mac, laptop) = (
+        Desktop::new(&set, "device:mac"),
+        Desktop::new(&set, "device:laptop"),
+    );
+    mac.reconcile();
+    laptop.reconcile();
+    mac.link_locally("openai", "sk-good");
+    mac.link_locally("openai-codex", "bundle");
+    mac.reconcile();
+
+    let asked = std::sync::Mutex::new(Vec::new());
+    let checker = |provider: &str, _base_url: &str, secret: &str| {
+        asked
+            .lock()
+            .unwrap()
+            .push((provider.to_owned(), secret.to_owned()));
+        (provider == "openai").then_some(secret == "sk-good")
+    };
+    let checked = check_links(
+        PERSON,
+        &["openai".to_owned(), "openai-codex".to_owned()],
+        &laptop.keys,
+        &laptop.authority,
+        &checker,
+    )
+    .unwrap();
+    assert_eq!(checked, vec![("openai".to_owned(), true)]);
+    assert_eq!(
+        asked.lock().unwrap()[0],
+        ("openai".to_owned(), "sk-good".to_owned())
+    );
+
+    let held = format!("{:?}", set.borrow().checks);
+    assert!(
+        !held.contains("sk-good"),
+        "the account keeps the answer, never the key"
+    );
+    assert!(set
+        .borrow()
+        .check("openai")
+        .is_some_and(|check| check.reachable));
+    assert!(set.borrow().check("openai-codex").is_none());
+
+    // A newer version needs its own check.
+    mac.link_locally("openai", "sk-rotated");
+    mac.reconcile();
+    assert!(set.borrow().check("openai").is_none());
+}
+
+// ---- hosted Homes (DR-0380) -----------------------------------------------------
+
+const HOME: &str = "home:cloud:personal";
+/// The id the Home knows the person by, which is not their account id.
+const HOME_ACTOR: &str = "person@example.com";
+
+/// A hosted Home that serves the account, asking the authority in memory.
+struct HostedHome {
+    _root: tempfile::TempDir,
+    wb: SharedWorkbench,
+    key: crate::account_link_seal::HomeLinkRecipientKey,
+    set: Rc<RefCell<LinkSet>>,
+    /// The account answers; when false, asking fails and changes nothing.
+    reachable: std::cell::Cell<bool>,
+}
+
+impl HostedHome {
+    fn new(set: &Rc<RefCell<LinkSet>>) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let key = crate::account_link_seal::HomeLinkRecipientKey::new(
+            root.path().join("keys/account-link/home.recipient"),
+            Box::new(crate::at_rest::LoopbackKeyWrap::generate().unwrap()),
+        );
+        let home = Self {
+            _root: root,
+            wb,
+            key,
+            set: set.clone(),
+            reachable: std::cell::Cell::new(true),
+        };
+        home.serve();
+        home
+    }
+
+    /// The Hub records this Home's key in a tenant the person belongs to.
+    fn serve(&self) {
+        let public = self.key.ensure().unwrap();
+        self.set.borrow_mut().homes.insert(HOME.to_owned(), public);
+    }
+
+    fn scope(&self) -> String {
+        crate::account::account_scope(HOME_ACTOR)
+    }
+
+    fn reconcile(&self) -> HomeReconciled {
+        reconcile_home(&self.wb, HOME, &self.scope(), &self.key, self).unwrap()
+    }
+
+    /// The secret this Home's broker would resolve for the person's turn.
+    fn token(&self, provider: &str) -> Option<String> {
+        let guard = self.wb.lock_unpoisoned();
+        let record = credentials_in_scope(guard.store_ref(), &self.scope())
+            .remove(provider)
+            .filter(|record| record.admits(ModelExecutionClass::PrivateHome))?;
+        guard.unseal_account_secret(&record.sealed_token)
+    }
+}
+
+impl HomeLinkSource for HostedHome {
+    fn home_links(&self, home_id: &str) -> Result<Option<HomeLinks>, String> {
+        if !self.reachable.get() {
+            return Err("the account did not answer".into());
+        }
+        match account_links::home_links_view(&self.set.borrow(), home_id) {
+            Ok(view) => Ok(Some(HomeLinks {
+                account: PERSON.to_owned(),
+                links: serde_json::from_value(view["links"].clone()).unwrap(),
+            })),
+            Err(account_links::LinkRefusal::HomeNotServing) => Ok(None),
+            Err(refusal) => Err(refused(refusal)),
+        }
+    }
+}
+
+impl Desktop {
+    fn link_for_homes(&self, provider: &str, secret: &str) {
+        let mut guard = self.wb.lock_unpoisoned();
+        let sealed = guard.seal_account_secret(secret).unwrap();
+        guard
+            .upsert_account_credential_in_with_policy(
+                &self.scope(),
+                provider.to_owned(),
+                sealed,
+                String::new(),
+                BTreeSet::from([
+                    ModelExecutionClass::LocalInteractive,
+                    ModelExecutionClass::PrivateHome,
+                ]),
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_home_use_link_made_on_a_desktop_reaches_the_persons_hosted_home() {
+    let set = Authority::shared();
+    let mac = Desktop::new(&set, "device:mac");
+    let home = HostedHome::new(&set);
+    mac.reconcile();
+    mac.link_for_homes("openai", "sk-for-homes");
+    mac.publish_link("openai").unwrap();
+
+    assert_eq!(home.reconcile().taken, vec!["openai".to_owned()]);
+    assert_eq!(home.token("openai").as_deref(), Some("sk-for-homes"));
+    assert!(home.reconcile().taken.is_empty(), "taken once");
+
+    // A link only for the person's own devices never reaches it.
+    mac.link_locally("anthropic", "sk-local");
+    mac.publish_link("anthropic").unwrap();
+    home.reconcile();
+    assert_eq!(home.token("anthropic"), None);
+}
+
+#[test]
+fn a_home_that_starts_serving_later_is_sealed_for_by_a_device() {
+    let set = Authority::shared();
+    let mac = Desktop::new(&set, "device:mac");
+    mac.reconcile();
+    mac.link_for_homes("openai", "sk-1");
+    mac.publish_link("openai").unwrap();
+
+    let home = HostedHome::new(&set);
+    assert!(home.reconcile().taken.is_empty(), "waiting for a device");
+    assert_eq!(
+        mac.reconcile().sealed_for,
+        vec![("openai".to_owned(), HOME.to_owned())]
+    );
+    assert_eq!(home.reconcile().taken, vec!["openai".to_owned()]);
+    assert_eq!(home.token("openai").as_deref(), Some("sk-1"));
+}
+
+#[test]
+fn a_home_drops_what_the_account_takes_away_and_only_that() {
+    let set = Authority::shared();
+    let mac = Desktop::new(&set, "device:mac");
+    let home = HostedHome::new(&set);
+    mac.reconcile();
+    mac.link_for_homes("openai", "sk-1");
+    mac.publish_link("openai").unwrap();
+    home.reconcile();
+
+    // Not reaching the account removes nothing.
+    home.reachable.set(false);
+    assert!(reconcile_home(&home.wb, HOME, &home.scope(), &home.key, &home).is_err());
+    assert_eq!(home.token("openai").as_deref(), Some("sk-1"));
+    home.reachable.set(true);
+
+    // The person's own link on this Home is never replaced or removed.
+    {
+        let mut guard = home.wb.lock_unpoisoned();
+        let sealed = guard.seal_account_secret("sk-home-own").unwrap();
+        guard
+            .upsert_account_credential_in_with_policy(
+                &home.scope(),
+                "xai".to_owned(),
+                sealed,
+                String::new(),
+                BTreeSet::from([ModelExecutionClass::PrivateHome]),
+            )
+            .unwrap();
+    }
+
+    // The person leaves the Home's tenant.
+    set.borrow_mut().homes.clear();
+    assert_eq!(home.reconcile().removed, vec!["openai".to_owned()]);
+    assert_eq!(home.token("openai"), None);
+    assert_eq!(home.token("xai").as_deref(), Some("sk-home-own"));
+
+    // Back again, then the link is revoked.
+    home.serve();
+    mac.reconcile();
+    assert_eq!(home.reconcile().taken, vec!["openai".to_owned()]);
+    mac.authority.revoke("openai").unwrap();
+    assert_eq!(home.reconcile().removed, vec!["openai".to_owned()]);
+    assert_eq!(home.token("xai").as_deref(), Some("sk-home-own"));
 }

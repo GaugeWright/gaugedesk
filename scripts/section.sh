@@ -37,6 +37,24 @@ cd "$(dirname "$0")/.."
 # mirror from a checkout of this repository.
 projected() { [ ! -d specs ]; }
 
+# Recording-only peer tool: a successful Cargo invocation confirms use of its
+# explicit target even when Cargo does no compilation. Never guess the target
+# from a job timestamp, or change the command when the peer tool is absent.
+recorded_desktop_check() {
+    local output="$1" recorder root token="" status=0
+    shift
+    root="$(cd .. && pwd -P)"
+    recorder="$root/GaugeWright/tools/gate-output-use.mjs"
+    if [ -f "$recorder" ] && command -v node >/dev/null 2>&1; then
+        token="$(node "$recorder" begin "$root" "$output" 2>/dev/null || :)"
+    fi
+    "$@" || status=$?
+    if [ "$status" -eq 0 ] && [ -n "$token" ]; then
+        node "$recorder" finish "$root" "$output" "$token" 2>/dev/null || :
+    fi
+    return "$status"
+}
+
 # A section whose script this tree does not carry.
 #
 # On the trunk that is a broken checkout and fails, loudly, naming the file.
@@ -69,7 +87,7 @@ case "${1:-}" in
     # means there is no `gaugewright` cell to compare against.
     echo "#unasserted: $1 needs a materialized workspace; the digest check answered instead"
     echo "-- $1 SKIPPED: no gaugewright cell outside a workspace --" >&2 ;;
-  check-composition)       node --test scripts/check-lanes.test.mjs scripts/check-live-fabric.test.mjs scripts/tokenwright-integration-report.test.mjs ;;
+  check-composition)       node --test scripts/check-lanes.test.mjs scripts/check-live-fabric.test.mjs scripts/tokenwright-integration-report.test.mjs scripts/desktop-output-use.test.mjs scripts/release-output-use.test.mjs ;;
   architecture-boundaries) python3 scripts/architecture-check.py ;;
   license-boundary)        python3 scripts/check-license-boundary.py ;;
   product-contracts)
@@ -134,6 +152,21 @@ case "${1:-}" in
   case-collisions)         node scripts/check-case-collisions.mjs ;;
   mirror-projection)       node scripts/check-mirror-projection.mjs ;;
   spec-audit)              python3 scripts/audit-gate.py ;;
+  models)
+    # The Quint models (specs/models): every model typechecks, every guaranteed
+    # invariant holds over sampled histories, and every teeth probe, flipped,
+    # breaks one (RF-C1, RF-C2); then the crypto admission cohort's stricter
+    # oracle. Quint is the version specs/models/package-lock.json locks, never
+    # a host's global install: an unpinned `npm install -g` met Quint 0.33's
+    # stricter effect checker in ten models that 0.32 accepts. The models are
+    # private, so the public tree runs none of this.
+    if carries specs/models/package.json "the formal model checks"; then
+        node scripts/prepare-npm-dependencies.mjs specs/models
+        export QUINT="$PWD/specs/models/node_modules/.bin/quint"
+        # Eight at once: the `cores` the models target declares in BUCK.
+        QUINT_JOBS="${QUINT_JOBS:-8}" bash scripts/check-models.sh all
+        python3 scripts/check-crypto-models.py
+    fi ;;
   documentation)
     if command -v mkdocs >/dev/null 2>&1; then
         mkdocs build --strict
@@ -227,6 +260,16 @@ case "${1:-}" in
     CARGO_TARGET_DIR="$PWD/target/no-default-features" \
         cargo check -p gaugedesk-app --no-default-features --all-targets ;;
   web)
+    # The actual client journey consumes a private cfg(test) production router.
+    # Native-web supplies its keyed test artifact; the ordinary web unit owns
+    # the complete Cargo input tree and resolves its own --locked test build.
+    node --test scripts/prepare-panel-authoring-fixture.test.mjs
+    fixture_mode=()
+    if [ -n "${GAUGEDESK_WASM_TUNNEL:-}" ] || [ -n "${GAUGEDESK_WASM_DIRECTORY:-}" ]; then
+        fixture_mode=(--native)
+    fi
+    GAUGEDESK_PANEL_AUTHORING_FIXTURE=$(node scripts/prepare-panel-authoring-fixture.mjs "${fixture_mode[@]}")
+    export GAUGEDESK_PANEL_AUTHORING_FIXTURE
     # Fleet slots retain node_modules. Reuse only a successful, input-matched
     # installation with bounded package checks; directory presence is insufficient.
     node scripts/prepare-npm-dependencies.mjs web
@@ -368,7 +411,8 @@ case "${1:-}" in
         # Cargo creates temporary siblings when creating a new target directory.
         # Keep those probes beneath the writable build-output mount, rather
         # than beside this shell's read-only manifest in the fleet sandbox.
-        cargo check --manifest-path src-tauri/Cargo.toml --locked \
+        recorded_desktop_check "${CARGO_TARGET_DIR:-$PWD/target/desktop}" \
+          cargo check --manifest-path src-tauri/Cargo.toml --locked \
           --target-dir "${CARGO_TARGET_DIR:-$PWD/target/desktop}"
         exit 0
     fi

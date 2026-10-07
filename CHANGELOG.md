@@ -19,6 +19,81 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-06
+
+- A project created in GaugeDesk can now be handed off to a paired computer.
+  The receiving computer used to refuse every such project because both held
+  their own copy of the built-in Default Agent; it now uses its own. A project
+  handed off from a signed-out window arrives as the receiving computer's
+  signed-out work, where its window can see it, and a project's settings open
+  its paired-device handoff, invite and co-drive pane again (People & sharing
+  ▸ Paired devices…).
+
+- Project Model access shows a loading or unavailable message when organization
+  model access has not loaded, instead of crashing the settings page.
+
+- When the account service cannot be reached, the Panel deployment dialog
+  explains the temporary connectivity problem and lets you retry the account
+  list without closing the dialog.
+
+- Every account signed in on a desktop now has keys of its own there, and
+  signing in makes that computer reachable for the account under them: the
+  computer publishes its own directory entry, and signing out withdraws it
+  while the account's other computers stay reachable. An account's first
+  computer creates its keys; approving another computer from it hands them
+  over. The account that claimed a computer moves off the computer's own key,
+  which signs the hand-over so browsers that trusted it follow. Publishing an
+  account's root to the Hub now carries proof from one of the account's own
+  devices.
+
+- A provider key you allow for Home use now reaches every GaugeWright-hosted
+  Home you work in — your own and your organizations' — without linking it
+  there again. Each Home gets its own sealed copy, which one of your devices
+  seals for it. It loses that copy when you leave the Home's organization,
+  remove Home use from the key, or revoke the key. Provider sign-ins (Codex,
+  Grok) stay on your devices for now. The Hub serves this to Homes at
+  `GET /account/home-links/{home}`.
+
+- An organization's owners and admins reach the organization's own shared
+  projects again, including Model access, without needing a project grant. On
+  hosted GaugeWright they had been refused them with "not in scope for this
+  project". Other roles still need a grant, and no role reaches another
+  organization's or another account's projects (DR-0374).
+
+- Federated runs refuse an unreadable organization placement policy instead of
+  treating it as an open policy. Absent and explicitly open policies are unchanged.
+
+- Long-lived runs, target settlements, managed machine executions and GaugeVault
+  credentials no longer re-read their whole history on every change: the store
+  checkpoints their state every 64 events and continues from there. The store
+  schema moves to version 12; an older build refuses a store this one has opened.
+
+- A Home composed with a verified-funding producer now pays managed work chats
+  from credits: each model call, compaction included, holds its input plus
+  8,192 output tokens at the model's price plus 20% before it is sent, and the
+  turn settles from its usage. A model with no known price is refused, and a
+  call whose outcome is unknown keeps its hold rather than being sent again.
+
+- Office Home integrations can require encrypted library metadata before startup
+  loads or seeds project and chat titles. Missing keys, incompatible history
+  and unavailable encryption refuse startup. Clinical mode remains disabled.
+
+- Revoking a trusted device now says which of your provider links it held, so
+  you can replace those keys if you no longer trust it. Its copies of them are
+  deleted either way.
+
+- Signing in again on a desktop no longer adds another copy of that computer
+  to your Trusted Devices: the new sign-in retires the device the previous one
+  made, and your provider links stop being sealed for it.
+
+- Project settings → People & sharing lists the invitations still waiting to
+  be accepted. Each can be cancelled, which stops its link working, or sent
+  again, which makes a fresh link and stops the earlier one.
+
+- An email invitation can be emailed from Project settings: "Email it to …"
+  beside a new link asks GaugeWright to send it, naming you by your verified
+  address and never naming the project. An account may send twenty a day.
+
 - Update the browser build dependency to reject malformed source maps that can stall processing.
 
 - Apply configured content encryption to typed lifecycle events and refuse unreadable protected history during approval and receipt checks.
@@ -103,6 +178,11 @@ Releases up to and including 0.4.30 are recorded on the
   projects still go to its members only, until an owner allows invitations by
   email under Organization Policy → Project sharing.
 
+- Projects made on a desktop without signing in can be moved to the account
+  you are signed in as: the account menu offers **Move signed-out projects to**
+  that account, lists each project to move or leave behind, and moves them
+  with their chats. The signed-out Personal project always stays.
+
 - Signing in to ChatGPT / Codex from a hosted Home or the Hub no longer needs
   the Codex CLI: GaugeDesk speaks OpenAI's device-code sign-in itself. A Home
   or Hub without `codex` installed now offers a code instead of failing.
@@ -128,6 +208,12 @@ Releases up to and including 0.4.30 are recorded on the
   Missing project signing custody stops new work before target effects start;
   historical verification uses public roots. Upgrade hosts before using the
   new project receipt frames in forward compensation.
+
+- GaugeApp command projection callbacks receive their domain records' exact
+  admitted positions, so a delayed project update cannot replace a newer one.
+  Implementations constructing `gaugeapp_host::Applied` must accept the
+  additional ordered position slice in `committed`; receipt and audit positions
+  are excluded, and command retries still invoke no callback.
 
 ## [0.7.1] — 2026-10-05
 

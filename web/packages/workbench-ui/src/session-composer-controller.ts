@@ -1,5 +1,5 @@
-import { createComputed, createEffect, createMemo, createSignal, on, type Accessor, type JSX } from "solid-js";
-import { alreadyApplied, turnStopped } from "@gaugewright/control-plane-client";
+import { createComputed, createEffect, createMemo, createSignal, onCleanup, on, type Accessor, type JSX } from "solid-js";
+import { alreadyApplied, turnStopped, taskCorrelation } from "@gaugewright/control-plane-client";
 import {
     buildOutgoing,
     classifyAttachment,
@@ -14,6 +14,7 @@ import {
     newOutboxId,
     type OutboxRow,
     type OutboxStore,
+    type TaskCommandAddress,
 } from "./composer-outbox";
 
 export type ComposerAttachmentCapability = "image" | "text" | "document";
@@ -103,8 +104,16 @@ export interface SessionComposerControllerOptions {
         text: string,
         images: readonly ImageRef[],
         composedId: string,
-    ) => Promise<void>;
+        bindTask?: (attempt: TaskCommandAttempt) => Promise<void>,
+    ) => Promise<void | TaskCommandAttempt>;
+    /** Quick-start creates a chat; its existing create guarantee stays separate. */
+    readonly correlatesTask?: Accessor<boolean>;
+    readonly taskScope?: Accessor<TaskCommandScope | undefined>;
+    /** Existing authenticated read only; never resend or rebind the original address. */
+    readonly recoverTask?: (address: TaskCommandAddress) => Promise<{ scope: TaskCommandScope; events: readonly unknown[] } | undefined>;
     readonly stop?: () => Promise<void>;
+    /** Optional only for actual runTask transports. Management has separate authority. */
+    readonly taskCommands?: TaskCommandLedger;
     readonly runtime?: ComposerRuntimeCommands;
     /** Where composed messages live before they are sent (ADR 0137). Defaults to
      *  a session-scoped store, so every surface has the tier and durability is a
@@ -141,6 +150,7 @@ export interface SessionComposerControllerOptions {
 }
 
 export interface SessionComposerController {
+    readonly taskCommands?: TaskCommandLedger;
     readonly scope: Accessor<string>;
     readonly draft: Accessor<string>;
     readonly setDraft: (value: string) => void;
@@ -249,7 +259,8 @@ export function createSessionComposerController(
             canHold: canWithdraw(item),
         })),
         ...rows()
-            .filter((row) => !sending().has(row.id))
+            .filter((row) => !sending().has(row.id) && (!row.task_address
+                || sameTaskAddress(row.task_address, taskCommandAddress(options.taskScope?.()))))
             .map((row) => ({ id: row.id, text: row.text, held: row.held })),
     ]);
     const isRuntimeRow = (id: number | string) =>
@@ -286,6 +297,18 @@ export function createSessionComposerController(
         setError(message);
         options.onStatus?.(message);
     };
+    /** Where no queue is shown, a message held because its delivery could not
+     *  be confirmed would otherwise be invisible. It is never resent on its
+     *  own — that is the one outcome that can run a turn twice — so the reader
+     *  is told it exists. The notice clears itself once no such row remains. */
+    const UNCONFIRMED_NOTICE = "A message you sent could not be confirmed. It is kept and will not be resent automatically.";
+    const unconfirmedHere = () => rows().filter((row) =>
+        row.held && row.dispatched && row.scope === options.scope() && !sending().has(row.id)).length;
+    createEffect(on(unconfirmedHere, (count, previous) => {
+        if (options.capabilities().queue) return;
+        if (count > (previous ?? 0)) report(UNCONFIRMED_NOTICE);
+        else if (count === 0 && error() === UNCONFIRMED_NOTICE) setError("");
+    }));
 
     /** The signal is the working copy the composer renders; the store is where
      *  it survives. Writes are **awaitable** and chained per row: awaitable
@@ -344,7 +367,14 @@ export function createSessionComposerController(
                 // that. Where the host offers no such guarantee, resending is the
                 // one outcome that can run a turn twice, so the row is set aside
                 // for a person to judge instead. See ADR 0137 §3.
-                if (!options.appliesComposedIdOnce?.()) {
+                if (options.taskCommands && (options.correlatesTask?.() ?? true)) {
+                    for (const row of loaded) {
+                        if (!row.dispatched) continue;
+                        const held = { ...row, held: true, dispatched: true, task_correlated: true };
+                        loaded = loaded.map((other) => other.id === row.id ? held : other);
+                        persist(held);
+                    }
+                } else if (!options.appliesComposedIdOnce?.()) {
                     for (const row of loaded) {
                         if (!row.dispatched) continue;
                         const settled = { ...row, dispatched: false, held: true };
@@ -373,6 +403,24 @@ export function createSessionComposerController(
                 }
                 setRows([...byId.values()].sort((a, b) => a.seq - b.seq));
                 hydrated.add(scope);
+                // A surface that shows no queue cannot show a held row. A row the
+                // host refused there (set aside, never dispatched — such a surface
+                // offers no stash) goes back into the box; one whose fate is
+                // unknown stays held, and is announced rather than resent.
+                if (!options.capabilities().queue) {
+                    for (const row of rows()) {
+                        if (row.held && !row.dispatched && !inFlight.has(row.id)) returnToBox(row);
+                    }
+                }
+                for (const row of loaded) {
+                    if (!row.dispatched || !row.task_correlated || !row.task_address || !options.recoverTask || !options.taskCommands) continue;
+                    void options.recoverTask(row.task_address).then((recovered) => {
+                        if (token !== hydration || !recovered || !sameTaskAddress(row.task_address, taskCommandAddress(recovered.scope))) return;
+                        const attempt = options.taskCommands!.begin(recovered.scope, row.id, row.text, 0);
+                        observeDelivery(row, attempt);
+                        for (const event of recovered.events) options.taskCommands!.observe(recovered.scope, event);
+                    }).catch(() => { /* Original address remains held; no resend. */ });
+                }
                 queueMicrotask(drain);
             })
             .catch(() => {
@@ -453,7 +501,8 @@ export function createSessionComposerController(
         // Nothing may be sent from a scope whose stored rows have not arrived.
         // Hydration re-drains, so this defers the send rather than dropping it.
         if (!hydrated.has(options.scope())) return;
-        const next = rows().find((row) => !row.held && !sending().has(row.id));
+        const next = rows().find((row) => !row.held && !sending().has(row.id)
+            && (!row.task_address || sameTaskAddress(row.task_address, taskCommandAddress(options.taskScope?.()))));
         if (!next) return;
         // A runtime can take a follow-up while its turn is still running; without
         // one, the row waits for settlement. Either way the row leaves the outbox
@@ -472,7 +521,8 @@ export function createSessionComposerController(
         // recoverable from nowhere if the tab dies mid-request: the exact loss
         // this outbox exists to prevent. A write that fails refuses the dispatch
         // and sets the row aside instead.
-        void persist({ ...next, dispatched: true }).then((stored) => {
+        void persist({ ...next, dispatched: true,
+            ...((options.correlatesTask?.() ?? Boolean(options.taskCommands)) ? { task_correlated: true } : {}) }).then((stored) => {
             if (stored) {
                 deliver(next, asFollowUp, dispatchScope);
                 return;
@@ -489,7 +539,55 @@ export function createSessionComposerController(
         });
     };
 
+    const deliverySubscriptions = new Set<() => void>();
+    const watchedAttempts = new WeakSet<TaskCommandAttempt>();
+    let disposed = false;
+    onCleanup(() => { disposed = true; hydration++; for (const dispose of deliverySubscriptions) dispose(); });
+    const holdUnconfirmed = (id: string) => {
+        setRows((current) => current.map((row) => {
+            if (row.id !== id) return row;
+            const held = { ...row, held: true, dispatched: true, task_correlated: true };
+            persist(held);
+            return held;
+        }));
+    };
+    /** The addressed Home refused this exact message, so it did not run and
+     *  cannot run later: sending it again is safe. Where the queue is shown it
+     *  is set aside there for the reader to release; where it is not, a held
+     *  row would be invisible, so it goes back into the box the way any failed
+     *  send on such a surface does. */
+    const refuse = (id: string) => {
+        const row = rows().find((candidate) => candidate.id === id);
+        if (row && !options.capabilities().queue && row.scope === options.scope()) {
+            returnToBox(row);
+            report("The Home did not accept this message. It is back in the box.");
+            return;
+        }
+        setAside(id);
+    };
+    const observeDelivery = (row: OutboxRow, attempt: TaskCommandAttempt | undefined) => {
+        if (disposed) return;
+        if (!attempt || attempt.id !== row.id) { holdUnconfirmed(row.id); return; }
+        const apply = () => {
+            const outcome = attempt.outcome();
+            if (outcome === "accepted" || outcome === "settled") drop(row.id);
+            else if (outcome === "refused") refuse(row.id);
+            else holdUnconfirmed(row.id);
+        };
+        apply();
+        if (!attempt.outcome() && !watchedAttempts.has(attempt)) {
+            watchedAttempts.add(attempt);
+            let dispose: (() => void) | undefined;
+            dispose = attempt.subscribe(() => {
+                apply();
+                if (attempt.outcome()) { dispose?.(); if (dispose) deliverySubscriptions.delete(dispose); }
+            });
+            if (attempt.outcome()) dispose();
+            else deliverySubscriptions.add(dispose);
+        }
+    };
     const deliver = (next: OutboxRow, asFollowUp: boolean, dispatchScope: string) => {
+        const correlated = options.correlatesTask?.() ?? Boolean(options.taskCommands);
         const finish = () => {
             markSending(next.id, false);
             queueMicrotask(drain);
@@ -504,9 +602,31 @@ export function createSessionComposerController(
                 .finally(finish);
             return;
         }
-        void options.send(next.text, next.images, next.id)
-            .then(() => drop(next.id))
+        let bound: TaskCommandAttempt | undefined;
+        const bindTask = correlated ? async (attempt: TaskCommandAttempt) => {
+            if (disposed) throw new Error("Task controller closed before submission");
+            if (attempt.id !== next.id) throw new Error("Task attempt identity does not match the saved message");
+            const addressedRow = { ...next, dispatched: true, task_correlated: true, task_address: attempt.address };
+            const saved = await persist(addressedRow);
+            if (!saved) throw new Error("This task was not submitted because its original address could not be saved");
+            if (disposed) throw new Error("Task controller closed before submission");
+            setRows((current) => current.map((row) => row.id === next.id ? addressedRow : row));
+            bound = attempt;
+            // Register before the effect; synchronous observations cannot be lost.
+            observeDelivery(next, attempt);
+        } : undefined;
+        const delivery = correlated ? options.send(next.text, next.images, next.id, bindTask)
+            : options.send(next.text, next.images, next.id);
+        void delivery.then((attempt) => {
+                if (correlated) observeDelivery(next, bound === attempt ? attempt || undefined : undefined);
+                else drop(next.id);
+            })
             .catch((cause) => {
+                if (correlated) {
+                    observeDelivery(next, bound ?? taskCommandAttemptForError(cause));
+                    if (!turnStopped(cause)) report(failureMessage(cause));
+                    return;
+                }
                 // A host that refuses this send because it already applied the
                 // composed id has not failed — it has answered the question the
                 // resend was asked to ask (ADR 0137 §3). The turn ran; exactly one
@@ -849,6 +969,7 @@ export function createSessionComposerController(
     };
 
     return {
+        taskCommands: options.taskCommands,
         scope: options.scope,
         draft,
         setDraft,
@@ -877,5 +998,100 @@ export function createSessionComposerController(
         editQueued,
         removeQueued,
         sendNowQueued,
+    };
+}
+
+
+/** Addressed transport and optional verified requester; credentials are never requester labels. */
+export interface TaskCommandScope {
+    readonly home: object;
+    readonly chat: string;
+    readonly authority?: { readonly home_id: string; readonly actor_id: string };
+    readonly project?: string | null;
+    /** Only the existing per-visitor Session capability transport sets this. */
+    readonly publicSession?: boolean;
+}
+export function taskCommandAddress(scope: TaskCommandScope | undefined): TaskCommandAddress | undefined {
+    if (!scope?.authority) return undefined;
+    return { ...scope.authority, project_id: scope.project ?? null, chat_id: scope.chat };
+}
+export function sameTaskAddress(a: TaskCommandAddress | undefined, b: TaskCommandAddress | undefined): boolean {
+    return !!a && !!b && a.home_id === b.home_id && a.actor_id === b.actor_id
+        && a.project_id === b.project_id && a.chat_id === b.chat_id;
+}
+export interface TaskCommandAttempt {
+    readonly id: string;
+    readonly address?: TaskCommandAddress;
+    readonly outcome: () => "accepted" | "settled" | "refused" | undefined;
+    readonly subscribe: (listener: () => void) => () => void;
+}
+const errorAttempts = new WeakMap<object, TaskCommandAttempt>();
+/** Preserve the exact exception, including primitive and frozen throws. */
+export function attachTaskCommandAttempt(error: unknown, attempt: TaskCommandAttempt): unknown {
+    if ((typeof error === "object" && error !== null) || typeof error === "function") errorAttempts.set(error, attempt);
+    return error;
+}
+function taskCommandAttemptForError(error: unknown): TaskCommandAttempt | undefined {
+    return ((typeof error === "object" && error !== null) || typeof error === "function") ? errorAttempts.get(error) : undefined;
+}
+export interface PendingTaskCommand {
+    readonly scope: TaskCommandScope;
+    readonly id: string;
+    readonly text: string;
+    readonly baselineLines: number;
+    readonly uncertain: boolean;
+    readonly attempt: TaskCommandAttempt;
+}
+export interface TaskCommandLedger {
+    readonly pending: Accessor<readonly PendingTaskCommand[]>;
+    begin(scope: TaskCommandScope, id: string, text: string, baselineLines: number): TaskCommandAttempt;
+    observe(scope: TaskCommandScope, fact: unknown): void;
+    uncertain(scope: TaskCommandScope, id: string): void;
+}
+export function createTaskCommandLedger(): TaskCommandLedger {
+    const [pending, setPending] = createSignal<readonly PendingTaskCommand[]>([]);
+    const states = new WeakMap<TaskCommandAttempt, { outcome?: "accepted" | "settled" | "refused"; listeners: Set<() => void> }>();
+    const matches = (command: PendingTaskCommand, scope: TaskCommandScope, id: string) =>
+        command.scope.home === scope.home && command.scope.chat === scope.chat && command.id === id
+        && (command.scope.project ?? null) === (scope.project ?? null);
+    return {
+        pending,
+        begin: (scope, id, text, baselineLines) => {
+            if (!id) throw new Error("A task command requires its composed identity.");
+            const existing = pending().find((command) => matches(command, scope, id)
+                && command.scope.authority?.home_id === scope.authority?.home_id
+                && command.scope.authority?.actor_id === scope.authority?.actor_id);
+            if (existing) return existing.attempt;
+            const state: { outcome?: "accepted" | "settled" | "refused"; listeners: Set<() => void> } = { listeners: new Set() };
+            const attempt: TaskCommandAttempt = Object.freeze({ id, address: taskCommandAddress(scope), outcome: () => state.outcome,
+                subscribe: (listener: () => void) => {
+                    state.listeners.add(listener);
+                    if (state.outcome) listener();
+                    return () => state.listeners.delete(listener);
+                } });
+            states.set(attempt, state);
+            setPending((current) => [...current, { scope, id, text, baselineLines, uncertain: false, attempt }]);
+            return attempt;
+        },
+        observe: (scope, fact) => {
+            const correlation = taskCorrelation(fact);
+            if (!correlation || correlation.chat_id !== scope.chat) return;
+            if (fact && typeof fact === "object" && "origin" in fact &&
+                (fact as { origin?: unknown }).origin !== scope.chat) return;
+            const confirmed = pending().filter((command) => {
+                if (!matches(command, scope, correlation.client_request_id)) return false;
+                const author = command.scope.authority;
+                return author ? correlation.home_id === author.home_id && correlation.actor_id === author.actor_id
+                    : command.scope.publicSession === true && !correlation.home_id && !correlation.actor_id;
+            });
+            for (const command of confirmed) {
+                const state = states.get(command.attempt)!;
+                state.outcome = correlation.outcome;
+                for (const listener of [...state.listeners]) listener();
+            }
+            setPending((current) => current.filter((command) => !confirmed.includes(command)));
+        },
+        uncertain: (scope, id) => setPending((current) => current.map((command) =>
+            matches(command, scope, id) ? { ...command, uncertain: true } : command)),
     };
 }

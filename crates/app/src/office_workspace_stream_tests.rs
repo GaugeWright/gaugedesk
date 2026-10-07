@@ -77,6 +77,10 @@ async fn office_workspace_stream_discloses_only_current_project_references() {
         .workspace_sender()
         .send(ServerEvent::User {
             text: "synthetic PHI on wrong channel".into(),
+            client_request_id: None,
+            chat_id: None,
+            home_id: None,
+            actor_id: None,
         })
         .unwrap();
     notify(&wb, "project_tracker", "shared");

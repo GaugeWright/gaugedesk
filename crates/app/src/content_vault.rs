@@ -95,6 +95,8 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     "office_native_settlement",
     "office_task_filing",
     "office_legacy_answers",
+    // A plan's titles, evidence references and reopen causes (DR-0386).
+    gaugedesk_core::plan::PLAN_KIND,
     // Historical Agent improve records may still contain private scenario
     // text. Keep their at-rest protection and account-erasure coverage after
     // the campaign adapter is removed.
@@ -150,9 +152,27 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     crate::office_home_admission::lease::LEASE_KIND,
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupContentProtection {
+    Ordinary,
+    AuthenticatedLibrary,
+}
+
 pub(crate) fn configured_content_vault(
     root: &Path,
     content_keywrap: impl Fn(&Path) -> std::io::Result<Box<dyn KeyWrap>>,
+) -> std::io::Result<Option<Arc<ContentVault>>> {
+    configured_content_vault_with_protection(
+        root,
+        content_keywrap,
+        StartupContentProtection::Ordinary,
+    )
+}
+
+fn configured_content_vault_with_protection(
+    root: &Path,
+    content_keywrap: impl Fn(&Path) -> std::io::Result<Box<dyn KeyWrap>>,
+    protection: StartupContentProtection,
 ) -> std::io::Result<Option<Arc<ContentVault>>> {
     // Fail-closed posture (SOC 2 finding 2.6 / DR-0086): content encryption is ON by
     // default so a deployment that forgets a flag still seals personal data at rest.
@@ -160,6 +180,11 @@ pub(crate) fn configured_content_vault(
     // so defaulting on is safe on the desktop path; the hosted path supplies its own
     // keywrap closure and is likewise unaffected by the default.
     if content_encryption_opted_out() {
+        if protection == StartupContentProtection::AuthenticatedLibrary {
+            return Err(std::io::Error::other(
+                "protected library startup requires content encryption",
+            ));
+        }
         return Ok(None);
     }
     // KEK selection is creds-only: a hosted deployment sets GAUGEDESK_CONTENT_KEK_ID
@@ -172,6 +197,12 @@ pub(crate) fn configured_content_vault(
     // deployment sets nothing and uses the co-located local file.
     let vault = ContentVault::new(root.join("content-keys"), content_keywrap(root)?)
         .with_ledger(configured_erasure_ledger(root));
+    let vault = match protection {
+        StartupContentProtection::Ordinary => vault,
+        StartupContentProtection::AuthenticatedLibrary => {
+            vault.require_authenticated_scopes([crate::library::LIBRARY_SCOPE])
+        }
+    };
     // Every workbench opened to serve refuses a project scope that no
     // session holds and no unattended step declared (DR-0312, WS-740).
     vault.enforce_session_holds();
@@ -256,6 +287,14 @@ pub(crate) fn open_startup_store(
     root: &Path,
     content_keywrap: impl Fn(&Path) -> std::io::Result<Box<dyn KeyWrap>>,
 ) -> std::io::Result<(Store, Option<Arc<ContentVault>>)> {
+    open_startup_store_with_protection(root, content_keywrap, StartupContentProtection::Ordinary)
+}
+
+pub(crate) fn open_startup_store_with_protection(
+    root: &Path,
+    content_keywrap: impl Fn(&Path) -> std::io::Result<Box<dyn KeyWrap>>,
+    protection: StartupContentProtection,
+) -> std::io::Result<(Store, Option<Arc<ContentVault>>)> {
     // A store a newer build wrote stays typed, so the desktop can tell the
     // person to update rather than show them SQLite's text.
     let mut store =
@@ -265,7 +304,12 @@ pub(crate) fn open_startup_store(
                 None => crate::io(error),
             }
         })?;
-    let content_vault = configured_content_vault(root, content_keywrap)?;
+    let content_vault = match protection {
+        StartupContentProtection::Ordinary => configured_content_vault(root, content_keywrap)?,
+        StartupContentProtection::AuthenticatedLibrary => {
+            configured_content_vault_with_protection(root, content_keywrap, protection)?
+        }
+    };
     if let Some(vault) = &content_vault {
         // Re-erase-on-open sweep (SOC 2 finding 4.7 / DR-0086): this runs on every
         // store open, which includes the open immediately after a backup restore and
@@ -283,6 +327,32 @@ pub(crate) fn open_startup_store(
             );
         }
         store = store.with_codec(vault.clone());
+    }
+    // Validate every row before projection: ordinary projection reads omit
+    // undecodable rows, which would otherwise allow startup to seed over
+    // protected metadata after its selection was dropped.
+    let history = store
+        .retained_events(crate::library::LIBRARY_SCOPE)
+        .map_err(crate::io)?;
+    if content_vault.is_none()
+        && history
+            .iter()
+            .any(|row| row.2.starts_with(ENCRYPTED_PREFIX))
+    {
+        return Err(std::io::Error::other(
+            "encrypted library requires content custody",
+        ));
+    }
+    if protection == StartupContentProtection::AuthenticatedLibrary && history.is_empty() {
+        // Decode never creates a missing key. Only genuinely empty history
+        // may initialize a first key, outside a product-store writer.
+        let vault = content_vault
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("library content custody unavailable"))?;
+        vault.initialize_scope_key(crate::library::LIBRARY_SCOPE)?;
+        vault
+            .with_legacy_key(crate::library::LIBRARY_SCOPE, false, |_| Some(()))
+            .ok_or_else(|| std::io::Error::other("library content custody unavailable"))?;
     }
     Ok((store, content_vault))
 }

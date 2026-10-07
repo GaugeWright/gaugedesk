@@ -400,6 +400,7 @@ impl Workbench {
         self.store_ref().events(scope).map(|events| {
             let rows: Vec<_> = events
                 .into_iter()
+                .filter(|(_, kind, _)| kind != crate::engine::TASK_CORRELATION_ATTEMPT_KIND)
                 .map(|(position, kind, payload)| {
                     serde_json::json!({ "position": position, "kind": kind, "payload": payload })
                 })

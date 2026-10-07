@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     middleware::Next,
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use gaugedesk_core::ids::AuthorityId;
@@ -34,18 +34,34 @@ pub fn routes() -> Router<SharedWorkbench> {
             "/home/invitations/accept",
             post(crate::home_invitation::post_accept_invitation),
         )
+        // Pending invitations, for whoever may invite to the project
+        // (DR-0332).
+        .route(
+            "/home/projects/{project}/invitations",
+            get(crate::home_invitation::get_project_invitations),
+        )
+        .route(
+            "/home/invitations/{id}/cancel",
+            post(crate::home_invitation::post_cancel_invitation),
+        )
+        .route(
+            "/home/invitations/{id}/resend",
+            post(crate::home_invitation::post_resend_invitation),
+        )
 }
 
 async fn post_admission(
-    State(wb): State<SharedWorkbench>,
+    State(shared): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let mut wb = wb.lock_unpoisoned();
+    let mut wb = shared.lock_unpoisoned();
     let actor = match wb.admit_data_request(net_http::bearer(&headers), None) {
         Ok(actor) => AuthorityId::new(actor),
         Err((code, message)) => return (code, Json(json!({ "error": message }))).into_response(),
     };
     let home = wb.home_id().clone();
+    let office =
+        net_http::bearer(&headers).is_some_and(|bearer| wb.has_office_staff_source(bearer));
     let token = if let Some(bearer) =
         net_http::bearer(&headers).filter(|bearer| wb.has_office_staff_source(bearer))
     {
@@ -67,8 +83,19 @@ async fn post_admission(
             }
         }
     } else {
-        wb.home_admissions.open(home.clone(), actor)
+        wb.home_admissions.open(home.clone(), actor.clone())
     };
+    drop(wb);
+    // Admission is where a person first reaches this Home: take their
+    // Home-use links now rather than at their first turn (DR-0380). An office
+    // source's lease is not a person's sign-in the account would know.
+    if !office {
+        crate::account_links_sync::person_reached_home(
+            &shared,
+            actor.as_str(),
+            net_http::bearer(&headers),
+        );
+    }
     (
         StatusCode::CREATED,
         Json(json!({
@@ -174,7 +201,7 @@ pub async fn require_home_admission(
         }
     }
 
-    let (admitted, member_use) = {
+    let (admitted, member_use, office) = {
         let mut workbench = wb.lock_unpoisoned();
         (
             authenticate_home_work_request(
@@ -184,6 +211,8 @@ pub async fn require_home_admission(
                 req.uri().path(),
             ),
             workbench.member_use.clone(),
+            net_http::bearer(req.headers())
+                .is_some_and(|bearer| workbench.has_office_staff_source(bearer)),
         )
     };
     let context = match admitted {
@@ -196,6 +225,14 @@ pub async fn require_home_admission(
     // Never promote a legacy fallback or an upstream extension into proof.
     let verified = context.is_some();
     if let Some(context) = context {
+        // A person working here takes their Home-use links (DR-0380).
+        if !office {
+            crate::account_links_sync::person_reached_home(
+                &wb,
+                context.actor().as_str(),
+                net_http::bearer(req.headers()),
+            );
+        }
         req.extensions_mut()
             .insert(crate::identity::AuthenticatedActor(context.actor().clone()));
         req.extensions_mut().insert(context);

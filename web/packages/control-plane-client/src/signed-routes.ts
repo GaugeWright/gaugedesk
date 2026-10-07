@@ -12,10 +12,11 @@
  *
  * The pin is trust-on-first-use, per ADR 0132: the first signed-in load for a
  * subject records the root it saw, and any later change is refused rather than
- * adopted. A public key is not a credential, so keeping it is not the at-rest
+ * adopted — unless the pinned root itself signed the hand-over (DR-0361). A public key is not a credential, so keeping it is not the at-rest
  * exposure `ENTSEC-6` forbids.
  */
 
+import { placementHolds } from "./directory-module";
 import { parseOpaqueHomeRoutes, type OpaqueHomeRoute } from "./home-routing";
 
 const PIN_PREFIX = "gw.root.";
@@ -35,6 +36,8 @@ export interface SignedRouteOptions {
     readonly verify: (json: string) => boolean | Promise<boolean>;
     readonly fetchJson?: (url: string) => Promise<string | null>;
     readonly storage?: Pick<Storage, "getItem" | "setItem">;
+    /** Check a route's placement; the wasm module's by default. Injected for tests. */
+    readonly placementHolds?: (route: unknown, trustedProjectKey: string) => Promise<boolean>;
 }
 
 function store(options: SignedRouteOptions): Pick<Storage, "getItem" | "setItem"> | null {
@@ -60,6 +63,12 @@ export function pinRootKey(options: SignedRouteOptions, root: string): "pinned" 
     if (existing) return "conflict";
     store(options)?.setItem(PIN_PREFIX + options.subject, root);
     return "pinned";
+}
+
+/** Move a subject's pin to `root`. Only for a root reached from the pinned one
+ * along hand-overs that root signed (DR-0361); the caller proves that. */
+export function advancePinnedRootKey(options: SignedRouteOptions, root: string): void {
+    store(options)?.setItem(PIN_PREFIX + options.subject, root);
 }
 
 export class RootKeyConflict extends Error {}
@@ -88,8 +97,56 @@ export async function signedHomeRoutes(
         return response.text();
     });
 
-    const body = await fetchJson(`${origin}/directory/${encodeURIComponent(root)}`);
-    if (!body) return null;
+    const path = `${origin}/directory/${encodeURIComponent(root)}`;
+    // Every computer the account is signed in on keeps its own entry under the
+    // root (DR-0359 §2). A directory from before that serves no list, and its
+    // one entry stands in for it.
+    const listed = await fetchJson(`${path}/entries`);
+    let puts: string[];
+    if (listed !== null) {
+        const value = JSON.parse(listed) as { puts?: unknown };
+        if (!Array.isArray(value.puts) || !value.puts.every((put) => typeof put === "string")) {
+            throw new Error("the directory served a malformed list of entries");
+        }
+        puts = value.puts as string[];
+    } else {
+        const single = await fetchJson(path);
+        if (!single) return null;
+        puts = [single];
+    }
+    // A computer that has withdrawn is listed by its retraction, which routes
+    // nothing; an account whose computers have all withdrawn has published none.
+    puts = puts.filter((put) => !isRetraction(put));
+    if (puts.length === 0) return null;
+
+    // Oldest first, so a newer computer's route for a project replaces an
+    // older one's.
+    const merged = new Map<string, OpaqueHomeRoute>();
+    for (const body of puts) {
+        for (const route of await verifiedRoutes(options, body, root)) {
+            merged.delete(route.project);
+            merged.set(route.project, route);
+        }
+    }
+    return [...merged.values()];
+}
+
+function isRetraction(put: string): boolean {
+    try {
+        return (JSON.parse(put) as { entry?: { retracted?: unknown } }).entry?.retracted === true;
+    } catch {
+        return false;
+    }
+}
+
+/** One signed put's routes, once it verifies and names the pinned root. Any
+ * entry that does not refuses the whole read: nothing but the root writes under
+ * it. */
+async function verifiedRoutes(
+    options: SignedRouteOptions,
+    body: string,
+    root: string,
+): Promise<OpaqueHomeRoute[]> {
     if (!(await options.verify(body))) {
         throw new Error("the account directory record failed signature verification");
     }
@@ -105,5 +162,16 @@ export async function signedHomeRoutes(
         );
     }
     const routes = put.entry?.directory?.home_routes;
-    return parseOpaqueHomeRoutes({ routes: Array.isArray(routes) ? routes : [] }, "signed");
+    const placed: unknown[] = [];
+    for (const route of Array.isArray(routes) ? routes : []) {
+        // A route carrying its project's placement is held to it, against the
+        // project key this root-signed record names (DR-0370).
+        const projectKey = (route as { placement?: { project_key?: unknown } } | null)
+            ?.placement?.project_key;
+        if (typeof projectKey === "string" && !(await (options.placementHolds ?? placementHolds)(route, projectKey))) {
+            continue;
+        }
+        placed.push(route);
+    }
+    return parseOpaqueHomeRoutes({ routes: placed }, "signed");
 }

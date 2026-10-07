@@ -221,6 +221,7 @@ pub(crate) fn stage_lifecycle<L: Lifecycle>(
             position += 1;
         }
     }
+    crate::snapshot::checkpoint::<L>(tx, codec, &batch.scope, &state)?;
     Ok(positions)
 }
 

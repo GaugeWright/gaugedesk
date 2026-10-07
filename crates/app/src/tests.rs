@@ -539,6 +539,380 @@ async fn send_raw(app: &Router, uri: &str) -> (StatusCode, axum::http::HeaderMap
 }
 
 #[tokio::test]
+async fn task_correlation_router_repairs_exact_completion_and_addresses_refusals() {
+    let _fake_agent = fake_agent_env();
+    let _dir = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(_dir.path()).unwrap();
+    crate::account_signin::store_session_for_test(&wb);
+    crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+    let bearer = crate::desktop_session::home_session(&wb).unwrap();
+    let app = open_control_plane(wb.clone());
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/chats",
+        Some(r#"{"id":"correlation-router"}"#),
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    async fn task(
+        app: &Router,
+        chat: &str,
+        key: &str,
+        prompt: &str,
+        bearer: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (_, admission) = send_as(app, "POST", "/home/admissions", Some("{}"), bearer).await;
+        let admission: serde_json::Value = serde_json::from_str(&admission).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/chats/{chat}/task"))
+            .header("authorization", format!("Bearer {bearer}"))
+            .header(
+                "x-gaugewright-home-admission",
+                admission["admission"].as_str().unwrap(),
+            )
+            .header("idempotency-key", key)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"prompt":prompt}).to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    let (status, result) = task(
+        &app,
+        "correlation-router",
+        "router-composition",
+        "synthetic work",
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        result["correlation"]["client_request_id"],
+        "router-composition"
+    );
+    assert_eq!(result["correlation"]["chat_id"], "correlation-router");
+    assert_eq!(result["correlation"]["outcome"], "settled");
+    let (status, replay) = task(
+        &app,
+        "correlation-router",
+        "router-composition",
+        "synthetic work",
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        replay["correlation"], result["correlation"],
+        "same-key durable repair"
+    );
+    let (status, changed) = task(
+        &app,
+        "correlation-router",
+        "router-composition",
+        "changed work",
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        changed["correlation"].is_null(),
+        "changed input cannot claim old completion"
+    );
+    let (status, snapshot) = send_as(
+        &app,
+        "GET",
+        "/chats/correlation-router/transcript",
+        None,
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&snapshot).unwrap();
+    let users: Vec<_> = rows.iter().filter(|row| row["type"] == "user").collect();
+    assert_eq!(users.len(), 1, "replay must not execute twice");
+    assert_eq!(users[0]["client_request_id"], "router-composition");
+    assert_eq!(users[0]["chat_id"], "correlation-router");
+    assert!(rows
+        .iter()
+        .any(|row| row["type"] == "taskcorrelation" && row["outcome"] == "settled"));
+    let private_scope = wb
+        .lock_unpoisoned()
+        .store_ref()
+        .scope_ids()
+        .unwrap()
+        .into_iter()
+        .find(|scope| crate::engine::is_task_attempt_scope(scope))
+        .unwrap();
+    let private = wb
+        .lock_unpoisoned()
+        .store_ref()
+        .records(&private_scope, crate::engine::TASK_CORRELATION_ATTEMPT_KIND)
+        .unwrap();
+    assert_eq!(private.len(), 1);
+    let private: serde_json::Value = serde_json::from_str(&private[0]).unwrap();
+    for path in [
+        "/scopes/correlation-router/audit",
+        "/projections/correlation-router/audit",
+        "/projections/correlation-router/task_correlation_attempt",
+    ] {
+        let (status, body) = send_as(&app, "GET", path, None, &bearer).await;
+        assert!(
+            status.is_success() || status == StatusCode::NOT_FOUND,
+            "{path}: {status} {body}"
+        );
+        assert!(
+            !body.contains(private["body_digest"].as_str().unwrap()),
+            "private digest leaked through {path}"
+        );
+        assert!(!body.contains("task_correlation_attempt") || status == StatusCode::NOT_FOUND);
+    }
+    for path in [
+        format!("/scopes/{private_scope}/audit"),
+        format!("/projections/{private_scope}/audit"),
+        format!("/projections/{private_scope}/run"),
+    ] {
+        let (status, body) = send_as(&app, "GET", &path, None, &bearer).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "private scope must not be public: {path}: {body}"
+        );
+        assert!(!body.contains(private["body_digest"].as_str().unwrap()));
+    }
+    assert!(!snapshot.contains(private["body_digest"].as_str().unwrap()));
+    // Existing verifier + durable membership fixture: distinct credential and
+    // actor, and renewed credential for the original author, share the key.
+    {
+        let mut guard = wb.lock_unpoisoned();
+        guard.set_identity_provider(Some(std::sync::Arc::new(
+            crate::identity::LoopbackIdentityProvider::new()
+                .enroll(
+                    "synthetic-bob",
+                    gaugedesk_core::ids::AuthorityId::new("actor:bob"),
+                    Default::default(),
+                )
+                .enroll(
+                    "synthetic-alice-renewed",
+                    gaugedesk_core::ids::AuthorityId::new(
+                        result["correlation"]["actor_id"].as_str().unwrap(),
+                    ),
+                    Default::default(),
+                ),
+        )));
+        let member = crate::org::MembershipRecord {
+            id: "actor:bob".into(),
+            op: crate::library::RecordOp::Upsert,
+            org_id: crate::org::ORG_ID.into(),
+            authority: "actor:bob".into(),
+            email: "bob@example.test".into(),
+            role: "owner".into(),
+            status: crate::org::MembershipStatus::Active,
+            managed_by_scim: false,
+            team: None,
+        };
+        guard
+            .store_mut()
+            .append_record(
+                crate::org::ORG_SCOPE,
+                "membership",
+                &serde_json::to_string(&member).unwrap(),
+            )
+            .unwrap();
+    }
+    let held = crate::engine::claim_turn("correlation-router").unwrap();
+    for credential in ["synthetic-bob", "synthetic-alice-renewed"] {
+        let (status, refusal) = task(
+            &app,
+            "correlation-router",
+            "router-composition",
+            "synthetic work",
+            credential,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+        if credential == "synthetic-bob" {
+            // Bob has no standing in the Personal project this chat started in
+            // (WS-587, DR-0328), so he is not a verified requester here and his
+            // refusal is addressed to nobody: his client keeps it unknown.
+            assert!(refusal["correlation"].is_null(), "{credential}: {refusal}");
+        } else {
+            assert_eq!(
+                refusal["correlation"]["outcome"], "refused",
+                "{credential}: {refusal}"
+            );
+            assert_eq!(
+                refusal["correlation"]["actor_id"],
+                result["correlation"]["actor_id"]
+            );
+        }
+        let (status, replay) = task(
+            &app,
+            "correlation-router",
+            "router-composition",
+            "synthetic work",
+            credential,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            replay["correlation"].is_null(),
+            "different actor/credential claim cannot reuse original settlement: {replay}"
+        );
+    }
+    drop(held);
+    let claim = crate::engine::claim_turn("correlation-router").unwrap();
+    let (status, busy) = task(
+        &app,
+        "correlation-router",
+        "busy-composition",
+        "busy work",
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(busy["correlation"]["outcome"], "refused");
+    assert_eq!(busy["correlation"]["client_request_id"], "busy-composition");
+    drop(claim);
+    // Existing generic receipt ownership does not currently permit this key to
+    // retry after busy; status alone must not become task admission evidence.
+    let (status, retry) = task(
+        &app,
+        "correlation-router",
+        "busy-composition",
+        "busy work",
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(retry["correlation"].is_null());
+    assert!(crate::engine::task_correlation(
+        wb.lock_unpoisoned().store_ref(),
+        "correlation-router",
+        "busy-composition",
+        &crate::stream::TaskAuthor {
+            home_id: result["correlation"]["home_id"].as_str().unwrap().into(),
+            actor_id: result["correlation"]["actor_id"].as_str().unwrap().into()
+        },
+        None
+    )
+    .is_none());
+    let (status, missing) = task(
+        &app,
+        "correlation-missing",
+        "missing-composition",
+        "work",
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["correlation"]["outcome"], "refused");
+    assert_eq!(
+        missing["correlation"]["client_request_id"],
+        "missing-composition"
+    );
+    assert_eq!(missing["correlation"]["chat_id"], "correlation-missing");
+    let (status, malformed) = task(&app, "correlation-router", "", "work", &bearer).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        malformed["correlation"].is_null(),
+        "generic envelope rejection is not task-stage evidence"
+    );
+    let (status, legacy) = send_as(
+        &app,
+        "POST",
+        "/chats/correlation-router/task",
+        Some(r#"{"prompt":"legacy unbound local task"}"#),
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{legacy}");
+    let legacy: serde_json::Value = serde_json::from_str(&legacy).unwrap();
+    assert!(
+        legacy["correlation"].is_null(),
+        "missing Home author proof must remain unbound"
+    );
+    let records = wb
+        .lock_unpoisoned()
+        .store_ref()
+        .records("correlation-router", "transcript")
+        .unwrap();
+    let user: serde_json::Value = records
+        .iter()
+        .filter_map(|row| serde_json::from_str::<serde_json::Value>(row).ok())
+        .find(|row| row["type"] == "user" && row["text"] == "legacy unbound local task")
+        .unwrap();
+    assert!(user.get("client_request_id").is_none() && user.get("actor_id").is_none());
+    let pending = tokio::spawn({
+        let app = app.clone();
+        let bearer = bearer.clone();
+        async move {
+            task(
+                &app,
+                "correlation-router",
+                "startup-composition",
+                "[startup] waiting",
+                &bearer,
+            )
+            .await
+        }
+    });
+    for _ in 0..100 {
+        if crate::engine::turn_is_live("correlation-router") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(crate::engine::turn_is_live("correlation-router"));
+    assert!(
+        crate::engine::running_turn_interrupt("correlation-router").is_none(),
+        "stop reaches startup before a handle"
+    );
+    let (status, ack) = send_as(
+        &app,
+        "POST",
+        "/chats/correlation-router/stop",
+        Some("{}"),
+        &bearer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    assert_eq!(ack["stopped"], true);
+    assert!(
+        ack["correlation"].is_null(),
+        "stop acknowledgement is not task settlement"
+    );
+    let (status, stopped) = pending.await.unwrap();
+    assert_eq!(status.as_u16(), 499);
+    assert!(
+        stopped["correlation"].is_null(),
+        "startup had no admitted task fact"
+    );
+    assert!(crate::engine::task_correlation(
+        wb.lock_unpoisoned().store_ref(),
+        "correlation-router",
+        "startup-composition",
+        &crate::stream::TaskAuthor {
+            home_id: result["correlation"]["home_id"].as_str().unwrap().into(),
+            actor_id: result["correlation"]["actor_id"].as_str().unwrap().into()
+        },
+        None
+    )
+    .is_none());
+    let records = wb
+        .lock_unpoisoned()
+        .store_ref()
+        .records("correlation-router", "transcript")
+        .unwrap();
+    assert!(!records.join("\n").contains("startup-composition"));
+}
+
+#[tokio::test]
 async fn transcript_is_durable_across_a_fresh_read() {
     let _fake_agent = fake_agent_env();
     let (_d, wb) = workbench();

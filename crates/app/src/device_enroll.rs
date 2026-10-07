@@ -119,6 +119,20 @@ pub struct EnrollRequest {
 pub struct EnrollAuthorize {
     pub delegation: DeviceDelegation,
     pub sealed_key: SealedKey,
+    /// The account's root itself, sealed to the confirmed subkey, when the holder
+    /// hands it over (DR-0361 §1: an account's root is held on each computer it is
+    /// signed in on). Absent from a holder whose root is the install's own key,
+    /// which never leaves its computer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_root: Option<SealedKey>,
+}
+
+/// What a completed enrollment gave this device.
+pub struct Enrolled {
+    pub account_key: [u8; 32],
+    /// The account's root, when the holder handed it over. Its public key is
+    /// the pinned root the delegation chains to.
+    pub root: Option<SigningKey>,
 }
 
 /// Why the wire shell refused an enrollment step (fail-closed; the reducer owns the rest).
@@ -174,7 +188,7 @@ impl NewDevice {
     /// Message 4 — verify the authorization and unseal the account key. Fail-closed: the
     /// delegation must chain to the pinned root, be unexpired, bind *our* subkey, and the
     /// sealed key must open under our private subkey.
-    pub fn complete(&self, auth: &EnrollAuthorize, now: u64) -> Result<[u8; 32], EnrollError> {
+    pub fn complete(&self, auth: &EnrollAuthorize, now: u64) -> Result<Enrolled, EnrollError> {
         auth.delegation
             .verify(now)
             .map_err(|_| EnrollError::BadDelegation)?;
@@ -185,7 +199,23 @@ impl NewDevice {
             return Err(EnrollError::NotOurSubkey);
         }
         let bytes = open_sealed(&self.subkey, &auth.sealed_key).ok_or(EnrollError::Unseal)?;
-        bytes.try_into().map_err(|_| EnrollError::Unseal)
+        let account_key = bytes.try_into().map_err(|_| EnrollError::Unseal)?;
+        let root = match &auth.sealed_root {
+            None => None,
+            Some(sealed) => {
+                let seed: [u8; 32] = open_sealed(&self.subkey, sealed)
+                    .ok_or(EnrollError::Unseal)?
+                    .try_into()
+                    .map_err(|_| EnrollError::Unseal)?;
+                let root = SigningKey::from_seed(&seed).map_err(|_| EnrollError::Unseal)?;
+                // The root handed over must be the one this device pinned.
+                if root.public_key().as_str() != self.account_root {
+                    return Err(EnrollError::ForeignRoot);
+                }
+                Some(root)
+            }
+        };
+        Ok(Enrolled { account_key, root })
     }
 }
 
@@ -194,6 +224,9 @@ pub struct Holder {
     pub root: SigningKey,
     pub account_key: [u8; 32],
     pub session: String,
+    /// Whether the root itself goes to the new device: an account's own root
+    /// does (DR-0361 §1), the install's governance key does not.
+    pub hands_over_root: bool,
 }
 
 impl Holder {
@@ -202,6 +235,20 @@ impl Holder {
             root,
             account_key,
             session: session.into(),
+            hands_over_root: false,
+        }
+    }
+
+    /// A holder of an account's own root, which it hands to the new device
+    /// along with the account key.
+    pub fn handing_over_root(
+        root: SigningKey,
+        account_key: [u8; 32],
+        session: impl Into<String>,
+    ) -> Self {
+        Self {
+            hands_over_root: true,
+            ..Self::new(root, account_key, session)
         }
     }
 
@@ -221,9 +268,18 @@ impl Holder {
     pub fn authorize(&self, presented_subkey: &PublicKey, expiry: u64) -> Option<EnrollAuthorize> {
         let delegation = DeviceDelegation::issue(&self.root, presented_subkey.clone(), expiry);
         let sealed_key = seal_to_subkey(presented_subkey, &self.account_key)?;
+        let sealed_root = if self.hands_over_root {
+            Some(seal_to_subkey(
+                presented_subkey,
+                &self.root.to_seed_bytes(),
+            )?)
+        } else {
+            None
+        };
         Some(EnrollAuthorize {
             delegation,
             sealed_key,
+            sealed_root,
         })
     }
 }
@@ -238,7 +294,7 @@ pub fn run_enrollment(
     relay: impl Fn(PublicKey) -> PublicKey,
     expiry: u64,
     now: u64,
-) -> Result<[u8; 32], EnrollError> {
+) -> Result<Enrolled, EnrollError> {
     let mut state = EnrollmentState::default();
     let real_subkey = nd.subkey_pubkey();
 
@@ -353,7 +409,36 @@ mod tests {
             ..nd
         };
         let recovered = run_enrollment(&nd, &holder, |k| k, 100, 1).expect("should enroll");
-        assert_eq!(&recovered, b"ACCOUNT-KEY-32-bytes-exactly!!!!");
+        assert_eq!(&recovered.account_key, b"ACCOUNT-KEY-32-bytes-exactly!!!!");
+        assert!(
+            recovered.root.is_none(),
+            "the install's governance key never leaves its computer"
+        );
+    }
+
+    #[test]
+    fn an_accounts_own_root_goes_to_the_new_device_with_its_key() {
+        let holder =
+            Holder::handing_over_root(subkey(99), *b"ACCOUNT-KEY-32-bytes-exactly!!!!", "sess-r");
+        let nd = NewDevice::open("sess-r", holder.account_root().as_str(), subkey(11));
+        let recovered = run_enrollment(&nd, &holder, |k| k, 100, 1).expect("should enroll");
+        assert_eq!(
+            recovered.root.map(|root| root.public_key()),
+            Some(holder.account_root())
+        );
+
+        // A root that is not the pinned one is refused, even sealed correctly.
+        let auth = holder
+            .authorize(&nd.subkey_pubkey(), 100)
+            .expect("authorize");
+        let swapped = EnrollAuthorize {
+            sealed_root: seal_to_subkey(&nd.subkey_pubkey(), &[42u8; 32]),
+            ..auth
+        };
+        assert!(matches!(
+            nd.complete(&swapped, 1),
+            Err(EnrollError::ForeignRoot)
+        ));
     }
 
     #[test]
@@ -367,7 +452,7 @@ mod tests {
         let attacker = subkey(66).public_key();
         // The relay substitutes the attacker's subkey for the device's real one.
         let out = run_enrollment(&nd, &holder, |_| attacker.clone(), 100, 1);
-        assert_eq!(out, Err(EnrollError::SasMismatch));
+        assert_eq!(out.err(), Some(EnrollError::SasMismatch));
     }
 
     #[test]
@@ -380,6 +465,6 @@ mod tests {
         };
         // now >= expiry → the new device's verify() rejects.
         let out = run_enrollment(&nd, &holder, |k| k, 10, 10);
-        assert_eq!(out, Err(EnrollError::BadDelegation));
+        assert_eq!(out.err(), Some(EnrollError::BadDelegation));
     }
 }

@@ -21,9 +21,10 @@ use gaugedesk_app::gate::{
     COERCE_SCREEN_ENVELOPE, COERCE_SCREEN_GATE, REVIEW_BY_HAND_ENVELOPE, REVIEW_BY_HAND_GATE,
 };
 use gaugedesk_whip_runtime::gate_runner::{
-    deliver_verdict, deliver_verdict_with_use_check, reviews_awaiting_a_person, run_gate,
-    run_gate_with_home_admission, run_gate_with_use_check, verify_gate_import_operation,
-    Disposition, GateCoercionConfig, GateProgram, GateRunError, GateTransport, GateVersionUse,
+    deliver_verdict, deliver_verdict_with_use_check, readback_gate_import_operation,
+    reviews_awaiting_a_person, run_gate, run_gate_with_home_admission, run_gate_with_use_check,
+    verify_gate_import_operation, Disposition, GateCoercionConfig, GateImportRefusalClass,
+    GateProgram, GateRunError, GateTransport, GateVersionUse,
 };
 use gaugedesk_whip_runtime::sansio_types::{HttpRequest, HttpResponse, TransportError};
 use whipplescript_kernel::coerce_native::CoerceProvider;
@@ -394,6 +395,24 @@ fn home_readback_revalidates_the_exact_retained_gate_import_operation() {
     let refused = verify_gate_import_operation(&compiled(), state.path(), OPERATION_ID)
         .expect_err("changed compiler premise must invalidate the target witness");
     assert!(format!("{refused}").contains("import witness differs"));
+    assert_eq!(
+        readback_gate_import_operation(&compiled(), state.path(), OPERATION_ID)
+            .unwrap_err()
+            .class,
+        GateImportRefusalClass::Drifted,
+        "a changed compiler premise is drift, not missing evidence"
+    );
+    assert_eq!(
+        readback_gate_import_operation(
+            &compiled(),
+            state.path(),
+            "imp_99999999999999999999999999999999"
+        )
+        .unwrap_err()
+        .class,
+        GateImportRefusalClass::Unknown,
+        "an operation the target never recorded is unknown"
+    );
 }
 
 #[test]

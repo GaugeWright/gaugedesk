@@ -43,7 +43,7 @@ fn request(chat: &str, body: Body, context: Option<AuthenticatedActionContext>) 
             "/chats/{chat}/context/stream?name=private-recording.txt"
         ))
         .header("authorization", format!("Bearer {ALICE}"))
-        .header("idempotency-key", "upload-test")
+        .header("idempotency-key", "synthetic-private-patient-upload-key")
         .body(body)
         .unwrap();
     if let Some(context) = context {
@@ -435,18 +435,26 @@ async fn office_upload_commits_exact_binary_with_original_staff_and_http_receipt
     let handle = reply["resource"].as_str().unwrap();
     let (scope, command_id) = crate::command_idempotency::command_identity(
         &axum::http::Method::POST,
-        &format!("/chats/{chat}/context/stream"),
+        &crate::command_idempotency::office_path(&format!("/chats/{chat}/context/stream")),
         &crate::command_idempotency::caller_hash(request(&chat, Body::empty(), None).headers()),
-        "upload-test",
+        &crate::command_idempotency::office_retry_key("synthetic-private-patient-upload-key"),
     );
     let guard = wb.lock_unpoisoned();
     let command = guard
         .store_ref()
-        .command_for_key(&scope, "upload-test")
+        .command_for_key(
+            &scope,
+            &crate::command_idempotency::office_retry_key("synthetic-private-patient-upload-key"),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(command.command_id, command_id);
     assert_eq!(command.status, "applied");
+    assert!(!command
+        .idempotency_key
+        .contains("synthetic-private-patient"));
+    assert!(!command.snapshot_json.contains("private-recording.txt"));
+    assert!(!command.snapshot_json.contains("synthetic-private-patient"));
     let record = crate::resource_store::get(
         guard.store_ref(),
         &chat,
@@ -597,7 +605,7 @@ fn buffered_request(
         .method("POST")
         .uri(format!("/chats/{chat}/context/upload"))
         .header("authorization", format!("Bearer {ALICE}"))
-        .header("idempotency-key", "buffered-test")
+        .header("idempotency-key", "synthetic-private-patient-buffered-key")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::json!({"files": files}).to_string()))
         .unwrap();
@@ -632,9 +640,9 @@ async fn office_buffered_upload_publishes_all_files_with_one_original_command() 
     let request = buffered_request(&chat, files, Some(captured));
     let (scope, command_id) = crate::command_idempotency::command_identity(
         &axum::http::Method::POST,
-        request.uri().path(),
+        &crate::command_idempotency::office_path(request.uri().path()),
         &crate::command_idempotency::caller_hash(request.headers()),
-        "buffered-test",
+        &crate::command_idempotency::office_retry_key("synthetic-private-patient-buffered-key"),
     );
     let response = buffered_app(&wb, true).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -648,11 +656,19 @@ async fn office_buffered_upload_publishes_all_files_with_one_original_command() 
     let guard = wb.lock_unpoisoned();
     let command = guard
         .store_ref()
-        .command_for_key(&scope, "buffered-test")
+        .command_for_key(
+            &scope,
+            &crate::command_idempotency::office_retry_key("synthetic-private-patient-buffered-key"),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(command.command_id, command_id);
     assert_eq!(command.status, "applied");
+    assert!(!command
+        .idempotency_key
+        .contains("synthetic-private-patient"));
+    assert!(!command.snapshot_json.contains("private-recording.txt"));
+    assert!(!command.snapshot_json.contains("synthetic-private-patient"));
     let record = crate::resource_store::get(
         guard.store_ref(),
         &chat,
@@ -796,9 +812,9 @@ async fn office_buffered_receipt_failure_leaves_no_partial_resource_or_access() 
     );
     let (scope, command_id) = crate::command_idempotency::command_identity(
         &axum::http::Method::POST,
-        request.uri().path(),
+        &crate::command_idempotency::office_path(request.uri().path()),
         &crate::command_idempotency::caller_hash(request.headers()),
-        "buffered-test",
+        &crate::command_idempotency::office_retry_key("synthetic-private-patient-buffered-key"),
     );
     let response = buffered_app(&wb, true).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -822,7 +838,12 @@ async fn office_buffered_receipt_failure_leaves_no_partial_resource_or_access() 
     assert_eq!(
         guard
             .store_ref()
-            .command_for_key(&scope, "buffered-test")
+            .command_for_key(
+                &scope,
+                &crate::command_idempotency::office_retry_key(
+                    "synthetic-private-patient-buffered-key"
+                )
+            )
             .unwrap()
             .unwrap()
             .status,
@@ -852,4 +873,240 @@ async fn office_buffered_receipt_failure_leaves_no_partial_resource_or_access() 
             .count(),
         0
     );
+}
+
+#[tokio::test]
+async fn office_upload_refuses_prior_path_formats_before_native_import() {
+    for opaque in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (wb, admission_app, _, _) = fixture(root.path());
+        let hub = hub().await;
+        install(&wb, &hub);
+        let admission = admit(&admission_app, ALICE).await;
+        let captured = context(&wb, &admission);
+        let chat = chat(&wb);
+        let native =
+            gaugedesk_workspace::Instance::init_at(root.path().join("prior-format-upload"))
+                .unwrap();
+        let eng = native.create_engagement(&chat).unwrap();
+        eng.write_file("unrelated.txt", "existing work").unwrap();
+        wb.lock_unpoisoned()
+            .register_engagement(&chat, "shared", Box::new(eng.clone()));
+        let prefix = wb
+            .lock_unpoisoned()
+            .engagement_context_target_root(&chat, None)
+            .unwrap();
+        let relative = prefix.map_or_else(
+            || "private-recording.txt".into(),
+            |prefix| format!("{prefix}/private-recording.txt"),
+        );
+        let submitted = request(
+            &chat,
+            Body::from("synthetic private upload"),
+            Some(captured),
+        );
+        let raw_key = "synthetic-private-patient-upload-key";
+        let key = crate::command_idempotency::office_retry_key(raw_key);
+        let old_key = if opaque { key.as_str() } else { raw_key };
+        let caller = crate::command_idempotency::caller_hash(submitted.headers());
+        let (old_scope, old_id) = crate::command_idempotency::command_identity(
+            &axum::http::Method::POST,
+            submitted.uri().path(),
+            &caller,
+            old_key,
+        );
+        let (new_scope, _) = crate::command_idempotency::command_identity(
+            &axum::http::Method::POST,
+            &crate::command_idempotency::office_path(submitted.uri().path()),
+            &caller,
+            &key,
+        );
+        {
+            let mut g = wb.lock_unpoisoned();
+            g.store_mut()
+                .claim_command(&old_id, &old_scope, old_key, "original legacy fixture")
+                .unwrap();
+            g.store_mut()
+                .set_command_status(&old_id, "applied")
+                .unwrap();
+        }
+        assert_eq!(
+            app(&wb).oneshot(submitted).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let g = wb.lock_unpoisoned();
+        assert!(g
+            .store_ref()
+            .command_for_key(&new_scope, &key)
+            .unwrap()
+            .is_none());
+        let old = g
+            .store_ref()
+            .command_for_key(&old_scope, old_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.status, "applied");
+        assert_eq!(old.snapshot_json, "original legacy fixture");
+        assert!(crate::resource_store::list(g.store_ref(), &chat)
+            .unwrap()
+            .is_empty());
+        assert!(g
+            .store_ref()
+            .records(&chat, "context-import")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            std::fs::read_dir(g.staging_uploads_dir()).unwrap().count(),
+            0
+        );
+        assert!(eng.read_file(&relative).is_err());
+        assert_eq!(eng.read_file("unrelated.txt").unwrap(), "existing work");
+    }
+}
+
+#[tokio::test]
+async fn office_rejected_http_receipts_keep_private_path_key_and_body_out_of_plaintext() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let (wb, admission_app, _, _) = fixture(root.path());
+    let hub = hub().await;
+    install(&wb, &hub);
+    let admission = admit(&admission_app, ALICE).await;
+    let staff = context(&wb, &admission);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoked = calls.clone();
+    let guarded = Router::new()
+        .route(
+            "/rejected/{private_path}",
+            axum::routing::post(move || {
+                let invoked = invoked.clone();
+                async move {
+                    invoked.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::BAD_REQUEST
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            wb.clone(),
+            crate::command_idempotency::guard,
+        ));
+    let build = |key: &str, body: &str| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/rejected/synthetic-private-patient-path?note=synthetic-private-query")
+            .header("authorization", format!("Bearer {ALICE}"))
+            .header("idempotency-key", key)
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        request.extensions_mut().insert(staff.clone());
+        request
+    };
+    let raw_key = "synthetic-private-patient-key";
+    let submitted = build(raw_key, "synthetic-private-patient-body");
+    let caller = crate::command_idempotency::caller_hash(submitted.headers());
+    let path = submitted.uri().path().to_owned();
+    let key = crate::command_idempotency::office_retry_key(raw_key);
+    let (scope, _) = crate::command_idempotency::command_identity(
+        &axum::http::Method::POST,
+        &crate::command_idempotency::office_path(&path),
+        &caller,
+        &key,
+    );
+    assert_eq!(
+        guarded.clone().oneshot(submitted).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    let original = wb
+        .lock_unpoisoned()
+        .store_ref()
+        .command_for_key(&scope, &key)
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.status, "rejected");
+    for stored in [
+        &original.scope_id,
+        &original.idempotency_key,
+        &original.snapshot_json,
+    ] {
+        assert!(!stored.contains("synthetic-private"), "{stored}");
+    }
+    for body in ["synthetic-private-patient-body", "changed private input"] {
+        assert_eq!(
+            guarded
+                .clone()
+                .oneshot(build(raw_key, body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        wb.lock_unpoisoned()
+            .store_ref()
+            .command_for_key(&scope, &key)
+            .unwrap()
+            .unwrap()
+            .snapshot_json,
+        original.snapshot_json
+    );
+
+    for status in ["received", "processing", "applied", "rejected", "expired"] {
+        for opaque in [false, true] {
+            let raw = format!("private-legacy-{status}-{opaque}");
+            let opaque_key = crate::command_idempotency::office_retry_key(&raw);
+            let old_key = if opaque { &opaque_key } else { &raw };
+            let (old_scope, old_id) = crate::command_idempotency::command_identity(
+                &axum::http::Method::POST,
+                &path,
+                &caller,
+                old_key,
+            );
+            let (new_scope, _) = crate::command_idempotency::command_identity(
+                &axum::http::Method::POST,
+                &crate::command_idempotency::office_path(&path),
+                &caller,
+                &opaque_key,
+            );
+            {
+                let mut guard = wb.lock_unpoisoned();
+                guard
+                    .store_mut()
+                    .claim_command(&old_id, &old_scope, old_key, "original legacy snapshot")
+                    .unwrap();
+                guard
+                    .store_mut()
+                    .set_command_status(&old_id, status)
+                    .unwrap();
+            }
+            assert_eq!(
+                guarded
+                    .clone()
+                    .oneshot(build(&raw, "patient input"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CONFLICT,
+                "{status}/{opaque}"
+            );
+            let guard = wb.lock_unpoisoned();
+            assert!(guard
+                .store_ref()
+                .command_for_key(&new_scope, &opaque_key)
+                .unwrap()
+                .is_none());
+            let old = guard
+                .store_ref()
+                .command_for_key(&old_scope, old_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(old.status, status);
+            assert_eq!(old.snapshot_json, "original legacy snapshot");
+        }
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

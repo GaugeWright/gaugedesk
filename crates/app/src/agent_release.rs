@@ -34,6 +34,10 @@ pub const DIRECT_PROVIDER_STREAM: &str = "direct_provider_stream";
 pub const HIBERNATABLE_WEBSOCKET: &str = "hibernatable_websocket";
 pub const PUBLISHER_PROTOCOL: &str = "gaugewright.publisher.v1";
 const PUBLIC_PUBLISHER_KEY_SUFFIX: &str = "::public-publisher";
+/// Where a release carries its panel placement's admitted config overlay and
+/// project notes. The public host strips `workspace/` when it seeds a session.
+pub const PLACEMENT_CONFIG_RELEASE_PATH: &str = "workspace/agent/placement/config.json";
+pub const PLACEMENT_NOTES_RELEASE_PATH: &str = "workspace/agent/placement/NOTES.md";
 const DEFAULT_PUBLIC_TURN_RESERVE_CENTS: u64 = 5;
 /// Account-plan allowance held for one public managed turn. This is a bounded
 /// accounting reservation; the provider-side request cutoff remains a
@@ -1001,6 +1005,77 @@ impl Workbench {
             .authorize(method, path_and_query, body)
     }
 
+    /// The release files carrying `instance_id`'s admitted project-local
+    /// configuration: its config overlay and its project notes, as the
+    /// placement's lifecycle last admitted them (`SetLocalConfig`).
+    ///
+    /// They travel as session files under `agent/placement/`, because the
+    /// public host seeds `initial_workspace` into every session and does not
+    /// carry persona instructions. An empty overlay or empty notes add nothing,
+    /// so a placement that was never configured publishes exactly as before.
+    ///
+    /// The overlay is config-only (ADR 0035): it may not choose the provider
+    /// or model, which the version's frozen profile and the deployment's
+    /// funding decide (DR-0143 §5, DR-0272). Such an overlay is refused rather
+    /// than published beside a provider it contradicts.
+    pub(crate) fn placement_release_files(
+        &self,
+        instance_id: &str,
+    ) -> io::Result<Vec<ReleaseFile>> {
+        let state = self
+            .store_ref()
+            .fold::<gaugedesk_core::instance::InstanceState>(instance_id)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "panel placement configuration could not be read: {error:?}"
+                ))
+            })?;
+        let mut files = Vec::new();
+        if let Some(config) = state
+            .local_config
+            .as_deref()
+            .map(str::trim)
+            .filter(|config| !config.is_empty())
+        {
+            let overlay: serde_json::Map<String, serde_json::Value> = serde_json::from_str(config)
+                .map_err(|error| {
+                    invalid(format!(
+                        "panel placement config is not a JSON object: {error}"
+                    ))
+                })?;
+            gaugedesk_boundary::AgentConfig::runtime_settings_from_json(config)
+                .map_err(|error| invalid(format!("invalid panel placement config: {error}")))?;
+            for functional in ["provider", "model"] {
+                if overlay
+                    .get(functional)
+                    .is_some_and(|value| !value.is_null())
+                {
+                    return Err(invalid(format!(
+                        "panel placement config may not set `{functional}`; the Panel-agent \
+                         version and the deployment's funding decide it"
+                    )));
+                }
+            }
+            if !overlay.is_empty() {
+                let mut bytes = serde_json::to_vec_pretty(&overlay).map_err(invalid)?;
+                bytes.push(b'\n');
+                files.push(ReleaseFile::new(
+                    PLACEMENT_CONFIG_RELEASE_PATH,
+                    "application/json",
+                    bytes,
+                ));
+            }
+        }
+        if let Some(notes) = state.notes.as_deref().filter(|n| !n.trim().is_empty()) {
+            files.push(ReleaseFile::new(
+                PLACEMENT_NOTES_RELEASE_PATH,
+                "text/markdown",
+                notes.as_bytes().to_vec(),
+            ));
+        }
+        Ok(files)
+    }
+
     /// Build and sign the complete release for one using placement.
     ///
     /// The result can be uploaded after this method returns and remains
@@ -1239,6 +1314,23 @@ impl Workbench {
         let (workspace_assets, instructions) = release_discipline_files(discipline.files)?;
         let mut initial_workspace = spec.initial_workspace;
         initial_workspace.extend(workspace_assets);
+        // The placement's admitted project-local configuration is the other
+        // half of the release (DR-0143 §2/§4). It is read from the placement's
+        // admitted lifecycle state here, never from the caller's spec, so no
+        // publish request can supply or replace it.
+        for file in self.placement_release_files(&instance.id)? {
+            if initial_workspace
+                .iter()
+                .any(|existing| existing.path == file.path)
+            {
+                return Err(invalid(format!(
+                    "the version's initial content already carries `{}`, which the \
+                     placement's configuration is published under",
+                    file.path
+                )));
+            }
+            initial_workspace.push(file);
+        }
 
         let release = AgentRelease {
             schema: AGENT_RELEASE_SCHEMA.to_owned(),
@@ -1325,6 +1417,11 @@ impl Workbench {
             .get(&placement.version)
             .and_then(|version| version.panel_profile.clone())
             .ok_or_else(|| invalid("panel placement has no frozen public profile"))?;
+        // The release is that frozen profile plus the placement's admitted
+        // configuration. Resolve the configuration before anything reaches the
+        // edge, so a placement whose overlay cannot be published is refused
+        // without a hosted round trip or a pending binding.
+        self.placement_release_files(&placement.id)?;
         let recipient = placement.collection_recipient.clone();
         if profile.collection.is_some() && recipient.is_none() {
             return Err(invalid(
@@ -2986,6 +3083,144 @@ mod publisher_tests {
         );
     }
 
+    fn set_placement_config(
+        guard: &mut crate::Workbench,
+        placement: &str,
+        config: &str,
+        notes: &str,
+    ) {
+        guard
+            .store_mut()
+            .admit::<gaugedesk_core::instance::InstanceState>(
+                placement,
+                gaugedesk_core::instance::InstanceCommand::SetLocalConfig {
+                    config: config.to_owned(),
+                    notes: notes.to_owned(),
+                },
+            )
+            .unwrap();
+    }
+
+    /// PANEL-2 (WS-462): a release is the frozen profile plus the placement's
+    /// admitted project-local configuration, and the configuration cannot
+    /// reach a functional field.
+    #[test]
+    fn placement_config_reaches_the_release_and_cannot_edit_functional_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let workbench = crate::open_workbench(root.path()).unwrap();
+        let mut guard = workbench.lock_unpoisoned();
+        let frozen = crate::library::PanelPublicProfile {
+            model: crate::library::PanelModelPolicy {
+                pinned: Some("gpt-5.5".to_owned()),
+                ..Default::default()
+            },
+            ..crate::library::PanelPublicProfile::default()
+        };
+        guard
+            .seed_panel_placement("inst-placement-config", frozen)
+            .unwrap();
+        let profile = guard.panel_profile("inst-placement-config-agent").unwrap();
+        let build = |guard: &crate::Workbench| {
+            guard.build_agent_release(
+                "inst-placement-config",
+                release_spec(
+                    &profile,
+                    release_provider(&profile.model, None, ReleaseFunding::Managed).unwrap(),
+                    1_800_000_000_000,
+                ),
+            )
+        };
+        let carried = |release: &SignedAgentRelease, path: &str| {
+            release
+                .payload
+                .initial_workspace
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| String::from_utf8(file.bytes.clone()).unwrap())
+        };
+
+        // Never configured: nothing is added.
+        let bare = build(&guard).unwrap();
+        assert_eq!(carried(&bare, PLACEMENT_CONFIG_RELEASE_PATH), None);
+        assert_eq!(carried(&bare, PLACEMENT_NOTES_RELEASE_PATH), None);
+
+        set_placement_config(
+            &mut guard,
+            "inst-placement-config",
+            r#"{"thinking":"high"}"#,
+            "Answer in French. The project sells bicycles.",
+        );
+        let configured = build(&guard).unwrap();
+        let config: serde_json::Value = serde_json::from_str(
+            &carried(&configured, PLACEMENT_CONFIG_RELEASE_PATH)
+                .expect("the admitted overlay is carried"),
+        )
+        .unwrap();
+        assert_eq!(config, serde_json::json!({ "thinking": "high" }));
+        assert_eq!(
+            carried(&configured, PLACEMENT_NOTES_RELEASE_PATH).as_deref(),
+            Some("Answer in French. The project sells bicycles."),
+        );
+        assert_ne!(
+            bare.release_id(),
+            configured.release_id(),
+            "configuration is part of the signed release"
+        );
+        // Every functional field still comes from the frozen version.
+        assert_eq!(configured.payload.panels, profile.panels);
+        assert_eq!(configured.payload.audience_inputs, profile.audience_inputs);
+        assert_eq!(configured.payload.retention, profile.retention);
+        assert_eq!(configured.payload.collection, profile.collection);
+        assert_eq!(
+            configured.payload.provider.model,
+            bare.payload.provider.model
+        );
+        assert_eq!(configured.payload.capabilities, bare.payload.capabilities);
+
+        // The overlay cannot choose the provider or model the version froze.
+        for overlay in [r#"{"model":"gpt-4o"}"#, r#"{"provider":"anthropic"}"#] {
+            set_placement_config(&mut guard, "inst-placement-config", overlay, "");
+            let refused = build(&guard).unwrap_err().to_string();
+            assert!(refused.contains("may not set"), "{refused}");
+        }
+
+        // Nor can a publish request name a functional field: the request is
+        // operational-only and refuses what it does not know.
+        let operational = serde_json::json!({
+            "placement_id": "inst-placement-config",
+            "deployment_id": "panel",
+            "edge_origin": "https://panels.example",
+            "allowed_origins": ["https://example.com"],
+            "per_visitor_turn_limit": 20,
+            "max_concurrent_sessions": 5,
+            "funding_ref": "gaugedesk:managed-plan:v1:61:62",
+            "credential_ref": ""
+        });
+        serde_json::from_value::<PublishDeploymentRequest>(operational.clone())
+            .expect("the operational request is accepted");
+        for (field, value) in [
+            (
+                "panels",
+                serde_json::json!({ "components": ["gw-chat", "gw-files"] }),
+            ),
+            ("public_abilities", serde_json::json!(["command.run"])),
+            ("model", serde_json::json!("gpt-4o")),
+            ("provider", serde_json::json!("anthropic")),
+            ("audience_inputs", serde_json::json!(["image"])),
+            ("initial_workspace", serde_json::json!([])),
+            ("collection", serde_json::json!(null)),
+            ("local_config", serde_json::json!("{}")),
+            ("notes", serde_json::json!("override")),
+        ] {
+            let mut request = operational.clone();
+            request[field] = value;
+            assert!(
+                serde_json::from_value::<PublishDeploymentRequest>(request).is_err(),
+                "a deployment request must not carry `{field}`"
+            );
+        }
+    }
+
     #[test]
     fn managed_panel_provider_uses_the_wire_declared_by_its_exact_surface() {
         let route = crate::managed_inference::metered_route("gpt-5.6-terra");
@@ -3352,6 +3587,64 @@ mod publisher_tests {
         );
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].path, "discipline/discipline.json");
+    }
+
+    /// A bundle without `SKILL.md` keeps the legacy treatment: every asset is
+    /// an always-on instruction except those under `workspace/`, which become
+    /// the release's initial workspace with the prefix the public host strips.
+    #[test]
+    fn legacy_discipline_bundle_partitions_workspace_assets_from_instructions() {
+        let responses = r#"{"greeting":"hello"}"#;
+        let brief = "# Client brief\n";
+        let (workspace, instructions) = release_discipline_files(vec![
+            (
+                "discipline.json".to_owned(),
+                r#"{"schema":"gaugedesk.discipline.v1"}"#.to_owned(),
+            ),
+            ("persona.md".to_owned(), "# Persona\n".to_owned()),
+            ("notes/extra.md".to_owned(), "# Extra\n".to_owned()),
+            ("workspace/responses.json".to_owned(), responses.to_owned()),
+            ("workspace/brief.md".to_owned(), brief.to_owned()),
+        ])
+        .unwrap();
+
+        let workspace_paths = workspace
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            workspace_paths,
+            BTreeSet::from(["workspace/responses.json", "workspace/brief.md"])
+        );
+        let instruction_paths = instructions
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            instruction_paths,
+            BTreeSet::from([
+                "discipline/discipline.json",
+                "discipline/persona.md",
+                "discipline/notes/extra.md",
+            ])
+        );
+
+        let body = |path: &str| {
+            workspace
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("{path} missing from workspace"))
+        };
+        assert_eq!(body("workspace/responses.json").bytes, responses.as_bytes());
+        assert_eq!(body("workspace/brief.md").bytes, brief.as_bytes());
+        assert_eq!(
+            body("workspace/responses.json").media_type,
+            discipline_media_type("workspace/responses.json")
+        );
+        assert_eq!(
+            body("workspace/responses.json").media_type,
+            "application/json"
+        );
     }
 
     /// The rejection body is a diagnostic, not a payload.

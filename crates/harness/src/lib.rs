@@ -336,6 +336,32 @@ pub trait WorkspacePayloadRetention: Send + Sync {
     fn retain(&self, file: &PreparedWorkspaceFile, body: &[u8]) -> Result<(), String>;
 }
 
+/// One provider call a runtime has prepared and is about to send on a
+/// host-managed (credit-funded) model route. Borrowed correlation only: no
+/// credential, header, or response is exposed, and nothing here authorizes
+/// the send by itself.
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedModelCall<'a> {
+    /// The runtime command this call belongs to.
+    pub command_id: &'a str,
+    /// 1-based position of this call within the command. Every call the
+    /// runtime makes counts, a compaction summary included, so the pair
+    /// `(command_id, ordinal)` names exactly one provider spend.
+    pub ordinal: u64,
+    pub url: &'a str,
+    /// The exact provider request body the runtime built.
+    pub body: &'a serde_json::Value,
+    /// The most output tokens the runtime asks this call for.
+    pub output_limit: u64,
+}
+
+/// Holds credit for each managed provider call before it is sent
+/// (GaugeWright DR-0203). An error refuses that call, and the runtime sends
+/// nothing for it. The product owns settlement; this seam only admits.
+pub trait ManagedCallMeter: Send + Sync {
+    fn admit_call(&self, call: &ManagedModelCall<'_>) -> Result<(), String>;
+}
+
 /// The seam between the admission shell and any agent runtime (DR-0031): drive one
 /// turn to a neutral [`TurnOutcome`]. WhippleScript implements this trait.
 pub trait Harness: Send {
@@ -408,6 +434,22 @@ pub trait Harness: Send {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "workspace payload retention unsupported",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Meter the next turn's managed provider calls one by one. An adapter
+    /// that cannot hold credit before each call refuses a required meter, so
+    /// a credit-funded turn never runs unmetered. Consumed once per turn.
+    fn bind_managed_call_meter(
+        &mut self,
+        meter: Option<Arc<dyn ManagedCallMeter>>,
+    ) -> io::Result<()> {
+        if meter.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this runtime cannot hold credit before each managed model call",
             ));
         }
         Ok(())
@@ -531,6 +573,11 @@ pub struct HarnessSpec {
     /// Reference-bound provider material for native governed runtimes. Secret
     /// bytes are released only for the exact admitted `credential_ref`.
     pub credential_capability: Option<Arc<dyn CredentialCapability>>,
+    /// `Some` under the office-controlled healthcare profile: the one approved
+    /// inference endpoint this turn may reach. The runtime refuses the turn
+    /// rather than reach any other provider, endpoint, model, broker or host.
+    /// `None` keeps ordinary provider resolution.
+    pub office_inference: Option<OfficeInferenceEndpoint>,
     /// The shell's sandbox POLICY (worktree writable, read-only definition
     /// surface in use mode, provider hosts, egress ack); the adapter EXTENDS it
     /// with any runtime-private needs.
@@ -579,6 +626,52 @@ pub enum CredentialProbe {
     Ready,
     /// Nothing usable — the actionable, user-facing reason.
     Missing(String),
+}
+
+/// The office-approved inference endpoint a turn under the office-controlled
+/// healthcare profile must reach, and nothing else (HIPAA-2,
+/// `specs/experience/office-healthcare.md`).
+///
+/// It is the exact approved base URL and model, the socket addresses the
+/// request may connect to, and — for anything but literal loopback — the trust
+/// roots and SHA-256 leaf-certificate pins its TLS identity must present. A
+/// runtime that receives one connects only to these addresses, never resolves
+/// the host through DNS, never follows a redirect or proxy, and refuses any
+/// provider, model, endpoint, broker or managed route that differs from it.
+/// It grants no office authority of its own: who may start a turn, and under
+/// which original command, is decided elsewhere.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OfficeInferenceEndpoint {
+    pub base_url: String,
+    pub model: String,
+    pub addresses: Vec<std::net::SocketAddr>,
+    /// `None` only for a literal-loopback `http` endpoint.
+    pub tls: Option<OfficeTlsIdentity>,
+}
+
+/// The approved TLS identity of an office inference endpoint: DER trust roots
+/// (used instead of the platform's) and the SHA-256 of each admitted leaf.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OfficeTlsIdentity {
+    pub trust_roots_der: Vec<Vec<u8>>,
+    pub certificate_sha256: Vec<[u8; 32]>,
+}
+
+impl std::fmt::Debug for OfficeInferenceEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OfficeInferenceEndpoint")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("addresses", &self.addresses)
+            .field("tls", &self.tls.as_ref().map(|_| "[pinned]"))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for OfficeTlsIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OfficeTlsIdentity { [pinned] }")
+    }
 }
 
 /// Provider material released by a GaugeDesk-owned credential capability.
@@ -639,6 +732,21 @@ pub struct RecordedRuntimeSpec<'a> {
     pub access: &'a dyn TurnAccess,
 }
 
+/// Read-only native evidence for an already verified completed product origin.
+/// The product retains its exact pair/phase proof and current reader boundary;
+/// these borrowed coordinates alone grant no access or original task authority.
+/// Unlike pending recovery, this does not ask a reader to resubmit old images.
+/// The synchronous check may borrow the actual thread-confined product writer;
+/// no task capability or check can be retained after this observation returns.
+pub struct CompletedProductRuntimeSpec<'a> {
+    pub chat_id: &'a str,
+    pub command_id: &'a str,
+    pub policy_epoch: u64,
+    pub signed_policy_envelope: &'a str,
+    pub preparation: &'a RuntimeTurnPreparation,
+    pub access: &'a dyn Fn() -> Result<(), String>,
+}
+
 /// Constructs a [`Harness`] per chat from a resolved [`HarnessSpec`] — the
 /// construction seam beside the settled [`Harness::run_turn`] contract.
 ///
@@ -663,6 +771,18 @@ pub trait HarnessFactory: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "original runtime observation unavailable",
+        ))
+    }
+
+    /// Observe original saved native evidence under a verified completed product
+    /// origin. No images, provider, credentials or execution participate.
+    fn observe_completed_product_runtime(
+        &self,
+        _spec: &CompletedProductRuntimeSpec<'_>,
+    ) -> io::Result<TurnOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "completed product runtime observation unavailable",
         ))
     }
 

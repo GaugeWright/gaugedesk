@@ -40,6 +40,9 @@ export const ports = {
     enterpriseApp: num("GW_E2E_ENTERPRISE_APP", 4174),
     // The stand-in Hub for the desktop account handoff (LOGIN-5, ADR 0123).
     hub: num("GW_E2E_HUB", 7910),
+    // The loopback publisher-protocol fixture Panel deployments publish to
+    // (`panel-edge.mjs`, PANEL-7).
+    edge: num("GW_E2E_EDGE", 7920),
 };
 
 export const aliceCP = `http://127.0.0.1:${ports.alice}`;
@@ -48,6 +51,7 @@ export const brokerAddr = `ws://127.0.0.1:${ports.broker}`;
 export const previewURL = `http://127.0.0.1:${ports.preview}`;
 export const enterpriseCP = `http://127.0.0.1:${ports.enterprise}`;
 export const hubURL = `http://127.0.0.1:${ports.hub}`;
+export const edgeURL = `http://127.0.0.1:${ports.edge}`;
 /** The combined enterprise workbench (ee/web's built bundle, served whole-dist). */
 export const enterpriseAppURL = `http://127.0.0.1:${ports.enterpriseApp}/apps/enterprise-workbench/`;
 

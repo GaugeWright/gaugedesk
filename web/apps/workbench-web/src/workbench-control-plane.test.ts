@@ -1333,15 +1333,16 @@ describe("work carried to a relay-only Home (DESK-7, HOME-1)", () => {
                     subject: "person-1",
                 }));
             }
-            if (url === `https://dir.example/directory/${encodeURIComponent("ed25519:root")}`) {
-                return new Response(JSON.stringify({
+            // Every computer's entry under the root (DR-0359 §2); this account has one.
+            if (url === `https://dir.example/directory/${encodeURIComponent("ed25519:root")}/entries`) {
+                return new Response(JSON.stringify({ version: 1, puts: [JSON.stringify({
                     entry: { directory: {
                         root_pubkey: "ed25519:root",
                         home_routes: [{
                             project: "proj-relay", home_id: "home:r", endpoint: "", relay: locator,
                         }],
                     } },
-                }));
+                })] }));
             }
             if (url === "https://hub.example/account/home-routes") {
                 return new Response(JSON.stringify({ routes: [] }));
@@ -1596,5 +1597,140 @@ describe("GaugeApp management on the one host", () => {
         const command = bodies.find((body) => "command_id" in body)!;
         expect([command.app, command.page_id, command.command_id, command.expected_basis, command.payload])
             .toEqual(["panel-settings", "inbox", "panel.inbox.review", "basis-inbox", { item_id: "item-1", verdict: "keep" }]);
+    });
+});
+
+// Callback browser transport fixtures, not actual Home admission authority.
+describe("task command Home binding (WS-459)", () => {
+    function fixture(options: { taskActor?: boolean; renewedActor?: boolean } = {}) {
+        let actor = "alice";
+        let admissions = 0;
+        const tasks: { body: string; key: string | null; admission: string | null }[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+                status, headers: { "content-type": "application/json" },
+            });
+            if (url === "https://hub.example/account/homes") return json({
+                homes: [{ id: "home:a", kind: "cloud", endpoint: "https://home.example" }], selected_home: "home:a",
+            });
+            if (url === "https://home.example/home/admissions") {
+                admissions++;
+                if (admissions > 1 && options.renewedActor) actor = "bob";
+                return json({ home: "home:a", admission: `admission-${admissions}` }, 201);
+            }
+            if (url === "https://hub.example/account/home-routes") return json({ routes: [] });
+            if (url === "https://hub.example/account/directory") return json({}, 404);
+            if (url === "https://home.example/file-actions/actor") return json({ home: "home:a", actor });
+            if (url === "https://home.example/chats/chat-a/task") {
+                const headers = new Headers(init?.headers);
+                tasks.push({ body: String(init?.body), key: headers.get("idempotency-key"),
+                    admission: headers.get("x-gaugewright-home-admission") });
+                if (tasks.length === 1 && !options.taskActor) return json({ error: "target Home admission required" }, 401);
+                if (options.taskActor) actor = "bob";
+                return json({ correlation: { client_request_id: "request-a", chat_id: "chat-a", outcome: "settled" } });
+            }
+            throw new Error(`unexpected task fixture route ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("account-token");
+        return { api, tasks, admissions: () => admissions };
+    }
+    it("renews the exact admission refusal with identical addressed key and body", async () => {
+        const { api, tasks, admissions } = fixture();
+        const context = await api.taskContext("chat-a" as never);
+        await expect(context.runTask("hello", [], "request-a")).resolves.toMatchObject({
+            correlation: { client_request_id: "request-a", chat_id: "chat-a", outcome: "settled" },
+        });
+        expect(tasks).toEqual([
+            { body: '{"prompt":"hello"}', key: "request-a", admission: "admission-1" },
+            { body: '{"prompt":"hello"}', key: "request-a", admission: "admission-2" },
+        ]);
+        expect(admissions()).toBe(2);
+        expect((await api.taskContext("chat-a" as never)).scope.home).toBe(context.scope.home);
+        api.setBearer("renewed-account-token");
+        expect((await api.taskContext("chat-a" as never)).scope.home).toBe(context.scope.home);
+        api.setCurrentProject("project:other" as ProjectId);
+        expect((await api.taskContext("chat-a" as never)).scope.home).not.toBe(context.scope.home);
+    });
+    it("never resends under a different actual actor after renewal", async () => {
+        const { api, tasks } = fixture({ renewedActor: true });
+        const context = await api.taskContext("chat-a" as never);
+        await expect(context.runTask("hello", [], "request-a")).rejects.toThrow("Task Home actor changed");
+        expect(tasks).toHaveLength(1);
+    });
+    it("rejects a late response after a cookie-only actor switch without resending", async () => {
+        const { api, tasks } = fixture({ taskActor: true });
+        const context = await api.taskContext("chat-a" as never);
+        await expect(context.runTask("hello", [], "request-a")).rejects.toThrow("Task Home actor changed");
+        expect(tasks).toHaveLength(1);
+    });
+    it("cannot reroute old work to a newly selected project", async () => {
+        const { api, tasks } = fixture();
+        const context = await api.taskContext("chat-a" as never);
+        api.setCurrentProject("project:other" as ProjectId);
+        await expect(context.runTask("hello", [], "request-a")).rejects.toThrow("Task project selection changed");
+        expect(tasks).toHaveLength(0);
+    });
+});
+
+describe("co-resident task author preflight", () => {
+    it("bootstraps the exact missing Home admission before actor proof and opens no task", async () => {
+        const requests: { path: string; method: string | undefined; bearer: string | null; admission: string | null }[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const path = new URL(String(input)).pathname;
+            const headers = new Headers(init?.headers);
+            requests.push({ path, method: init?.method, bearer: headers.get("authorization"),
+                admission: headers.get("x-gaugewright-home-admission") });
+            if (path === "/home/admissions") return Response.json({ home: "home:a", admission: "renewed" });
+            if (path === "/file-actions/actor") return headers.get("x-gaugewright-home-admission") === "renewed"
+                ? Response.json({ home: "home:a", actor: "alice" })
+                : Response.json({ error: "target Home admission required" }, { status: 401 });
+            throw new Error(`unexpected preflight route ${path}`);
+        }));
+        const api = new WorkbenchControlPlane("https://local.example", { splitHomes: false });
+        api.setBearer("alice-login");
+        const context = await api.taskContext("chat-a" as never);
+        expect(context.scope.authority).toEqual({ home_id: "home:a", actor_id: "alice" });
+        expect(requests).toEqual([
+            { path: "/file-actions/actor", method: "GET", bearer: "Bearer alice-login", admission: null },
+            { path: "/home/admissions", method: "POST", bearer: "Bearer alice-login", admission: null },
+            { path: "/file-actions/actor", method: "GET", bearer: "Bearer alice-login", admission: "renewed" },
+        ]);
+    });
+});
+
+describe("scoped task stream lifetime", () => {
+    it("owns one reconnect loop and closes every stream on disposal", async () => {
+        vi.useFakeTimers();
+        const streams: ReadableStreamDefaultController<Uint8Array>[] = [];
+        const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const path = new URL(String(input)).pathname;
+            if (path === "/file-actions/actor") return Response.json({ home: "home:a", actor: "alice" });
+            if (path === "/chats/chat-a/events") {
+                const body = new ReadableStream<Uint8Array>({ start(controller) {
+                    streams.push(controller);
+                    controller.enqueue(new TextEncoder().encode('data: {"type":"text","delta":"hello"}\n\n'));
+                    init?.signal?.addEventListener("abort", () => { try { controller.close(); } catch { /* Already closed. */ } });
+                } });
+                return new Response(body, { headers: { "content-type": "text/event-stream" } });
+            }
+            throw new Error(`unexpected stream fixture ${path}`);
+        }));
+        let close: (() => void) | undefined;
+        try {
+            const api = new WorkbenchControlPlane("https://local.example", { splitHomes: false });
+            api.setBearer("alice-login"); api.setHomeAdmission("minted");
+            const context = await api.taskContext("chat-a" as never);
+            const event = vi.fn(); const opened = vi.fn();
+            close = context.subscribe(event, opened); await flush();
+            expect(streams).toHaveLength(1); expect(opened).toHaveBeenCalledTimes(1);
+            expect(event).toHaveBeenCalledWith({ type: "text", delta: "hello" });
+            streams[0]!.close(); await flush(); await vi.advanceTimersByTimeAsync(251); await flush();
+            expect(streams).toHaveLength(2); expect(opened).toHaveBeenCalledTimes(2);
+            close(); await flush(); await vi.advanceTimersByTimeAsync(10_000); await flush();
+            expect(streams).toHaveLength(2);
+        } finally { close?.(); vi.useRealTimers(); }
     });
 });

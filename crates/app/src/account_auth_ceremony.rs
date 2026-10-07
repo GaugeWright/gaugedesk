@@ -41,12 +41,27 @@ const SESSION_TTL_SECS: u64 = 12 * 60 * 60;
 const RECOVERY_ATTEMPT_WINDOW_SECS: u64 = 15 * 60;
 const RECOVERY_ATTEMPT_LIMIT: usize = 5;
 const PENDING_MAX: usize = 512;
+/// How many invitation emails one account may ask for in a day. The address
+/// comes from an invitation the caller holds, which the account service cannot
+/// tell from one the caller made up, so this bounds what a sender can send.
+const INVITATION_MAIL_LIMIT: usize = 20;
+const INVITATION_MAIL_WINDOW_SECS: u64 = 24 * 60 * 60;
 
 pub trait EmailChallengeSender: Send + Sync {
     fn send_verification(&self, email: &str, code: &str, expires_in: u64) -> Result<(), String>;
 
     fn send_recovery(&self, email: &str, code: &str, expires_in: u64) -> Result<(), String> {
         self.send_verification(email, code, expires_in)
+    }
+    /// Email a project invitation's link to the address it is for, naming
+    /// who invited by their verified address (DR-0332).
+    fn send_project_invitation(
+        &self,
+        _to: &str,
+        _inviter: &str,
+        _link: &str,
+    ) -> Result<(), String> {
+        Err("this deployment does not send invitations".to_owned())
     }
 }
 
@@ -91,6 +106,17 @@ impl EmailChallengeSender for TestFileEmailChallengeSender {
     fn send_recovery(&self, email: &str, code: &str, expires_in: u64) -> Result<(), String> {
         self.write(email, code, expires_in, "recovery")
     }
+    fn send_project_invitation(&self, to: &str, inviter: &str, link: &str) -> Result<(), String> {
+        let body = serde_json::to_vec(&json!({
+            "email": to,
+            "inviter": inviter,
+            "link": link,
+            "purpose": "project-invitation",
+        }))
+        .map_err(|error| format!("test email serialization failed: {error}"))?;
+        std::fs::write(&self.path, body)
+            .map_err(|error| format!("test email delivery failed: {error}"))
+    }
 }
 
 impl EmailChallengeSender for WebhookEmailChallengeSender {
@@ -101,21 +127,33 @@ impl EmailChallengeSender for WebhookEmailChallengeSender {
     fn send_recovery(&self, email: &str, code: &str, expires_in: u64) -> Result<(), String> {
         self.send(email, code, expires_in, "gaugedesk-account-recovery")
     }
+    fn send_project_invitation(&self, to: &str, inviter: &str, link: &str) -> Result<(), String> {
+        self.post(json!({
+            "to": to,
+            "template": "gaugedesk-project-invitation",
+            "inviter": inviter,
+            "link": link,
+        }))
+    }
 }
 
 impl WebhookEmailChallengeSender {
     fn send(&self, email: &str, code: &str, expires_in: u64, template: &str) -> Result<(), String> {
+        self.post(json!({
+            "to": email,
+            "template": template,
+            "code": code,
+            "expires_in": expires_in,
+        }))
+    }
+
+    fn post(&self, body: serde_json::Value) -> Result<(), String> {
         let mut request = ureq::post(&self.endpoint).set("content-type", "application/json");
         if let Some(bearer) = &self.bearer {
             request = request.set("authorization", &format!("Bearer {bearer}"));
         }
         request
-            .send_json(json!({
-                "to": email,
-                "template": template,
-                "code": code,
-                "expires_in": expires_in,
-            }))
+            .send_json(body)
             .map(|_| ())
             .map_err(|error| format!("email delivery failed: {error}"))
     }
@@ -299,6 +337,9 @@ struct PendingCeremonies {
     authorizations: BTreeMap<String, PendingAuthorization>,
     authorization_proofs: BTreeMap<String, AuthorizationProof>,
     additional_registrations: BTreeMap<String, PendingAdditionalRegistration>,
+    /// When each account last asked for invitation mail, newest last, within
+    /// the last day (DR-0332).
+    invitation_mail: BTreeMap<String, Vec<u64>>,
 }
 
 pub struct AccountAuthRuntime {
@@ -2166,6 +2207,145 @@ pub fn routes() -> axum::Router<SharedWorkbench> {
             "/auth/account/authorization/finish",
             post(post_authorization_finish),
         )
+        .route(
+            "/account/project-invitations/email",
+            post(post_project_invitation_email),
+        )
+}
+
+#[derive(Deserialize)]
+struct ProjectInvitationEmailRequest {
+    invite: String,
+}
+
+/// The address an email invitation is for, read from the invitation itself.
+/// An invitation bound to an account, or anything that is not an invitation,
+/// has none.
+fn invitation_address(invite: &str) -> Option<String> {
+    if invite.len() > 4096 {
+        return None;
+    }
+    let bytes = hex::decode(invite).ok()?;
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if envelope.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        || envelope
+            .get("invitation")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        || envelope
+            .get("secret")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    {
+        return None;
+    }
+    normalize_email_contact(envelope.get("invited_email")?.as_str()?)
+}
+
+/// What the account service sends for `account`: the invited address, and
+/// the account's own verified address to name as the inviter.
+fn invitation_mail(
+    runtime: &AccountAuthRuntime,
+    wb: &crate::Workbench,
+    account: &str,
+    invite: &str,
+    now: u64,
+) -> Result<(String, String), (StatusCode, &'static str)> {
+    let to = invitation_address(invite).ok_or((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "that is not an email invitation",
+    ))?;
+    let auth = AccountAuth::rebuild(wb.store_ref()).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "account directory unavailable",
+        )
+    })?;
+    let inviter = auth
+        .emails
+        .values()
+        .filter(|record| record.account_id == account && record.status == AuthMethodStatus::Active)
+        .max_by_key(|record| record.verified_at)
+        .map(|record| record.email.clone())
+        .ok_or((
+            StatusCode::CONFLICT,
+            "verify an email address on your account to send invitations",
+        ))?;
+    let mut pending = runtime.lock();
+    sweep(&mut pending, now);
+    let sent = pending
+        .invitation_mail
+        .entry(account.to_owned())
+        .or_default();
+    if sent.len() >= INVITATION_MAIL_LIMIT {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "you have sent as many invitation emails as a day allows; copy the link instead",
+        ));
+    }
+    sent.push(now);
+    Ok((to, inviter))
+}
+
+/// `POST /account/project-invitations/email` — email an invitation's link to
+/// the address it is for, on the inviter's request (DR-0332). Where this
+/// process is not the account service, the signed-in account's own is asked.
+async fn post_project_invitation_email(
+    State(wb): State<SharedWorkbench>,
+    Extension(auth): Extension<AuthShellState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let runtime = match runtime(&auth) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            if crate::account_signin::hub_session_actor(&wb).is_some() {
+                return crate::account_signin::proxy_account_authority(
+                    &wb,
+                    axum::http::Method::POST,
+                    "/account/project-invitations/email".to_owned(),
+                    headers,
+                    body,
+                )
+                .await;
+            }
+            return error.response();
+        }
+    };
+    let Ok(request) = serde_json::from_slice::<ProjectInvitationEmailRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid invitation email request").into_response();
+    };
+    let planned = {
+        let guard = wb.lock_unpoisoned();
+        let Some(account) = authenticated_account(&guard, &headers) else {
+            return (StatusCode::UNAUTHORIZED, "sign in to send an invitation").into_response();
+        };
+        invitation_mail(&runtime, &guard, &account, &request.invite, unix_now())
+    };
+    let (to, inviter) = match planned {
+        Ok(planned) => planned,
+        Err((status, message)) => {
+            return (status, Json(json!({ "error": message }))).into_response()
+        }
+    };
+    let link = crate::home_invitation::invitation_url(&request.invite);
+    let recipient = to.clone();
+    let sent = tokio::task::spawn_blocking(move || {
+        runtime
+            .sender
+            .send_project_invitation(&recipient, &inviter, &link)
+    })
+    .await;
+    match sent {
+        Ok(Ok(())) => (StatusCode::ACCEPTED, Json(json!({ "sent_to": to }))).into_response(),
+        _ => (
+            StatusCode::BAD_GATEWAY,
+            Json(
+                json!({ "error": "the invitation email could not be sent; copy the link instead" }),
+            ),
+        )
+            .into_response(),
+    }
 }
 
 fn sweep(store: &mut PendingCeremonies, now: u64) {
@@ -2186,6 +2366,10 @@ fn sweep(store: &mut PendingCeremonies, now: u64) {
     store
         .additional_registrations
         .retain(|_, entry| entry.expires_at > now);
+    for sent in store.invitation_mail.values_mut() {
+        sent.retain(|at| at.saturating_add(INVITATION_MAIL_WINDOW_SECS) > now);
+    }
+    store.invitation_mail.retain(|_, sent| !sent.is_empty());
 }
 
 fn authorization_proof_id(proof: &str) -> String {
@@ -2491,6 +2675,76 @@ mod tests {
             AccountAuthRuntime::new(config, sender.clone()).unwrap(),
             sender,
         )
+    }
+
+    fn email_invite(address: Option<&str>) -> String {
+        let mut envelope = json!({
+            "version": 1,
+            "invitation": "hinv-1",
+            "invited_authority": "",
+            "project": "proj-1",
+            "home_id": "home:owner",
+            "endpoint": "https://home.example",
+            "secret": "capability",
+        });
+        if let Some(address) = address {
+            envelope["invited_email"] = json!(address);
+        }
+        hex::encode(serde_json::to_vec(&envelope).unwrap())
+    }
+
+    #[test]
+    fn invitation_mail_goes_to_the_invited_address_from_the_inviters_own() {
+        let (runtime, _sender) = runtime();
+        let mut wb = crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        let invite = email_invite(Some("Alex@Example.test"));
+        assert_eq!(
+            invitation_mail(&runtime, &wb, "account-sam", &invite, 1).unwrap_err(),
+            (
+                StatusCode::CONFLICT,
+                "verify an email address on your account to send invitations"
+            ),
+        );
+        append_facts(
+            wb.store_mut(),
+            &[AccountAuthFact::Email(
+                VerifiedEmailRecord::new("account-sam", "sam@example.test", 1).unwrap(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            invitation_mail(&runtime, &wb, "account-sam", &invite, 1),
+            Ok((
+                "alex@example.test".to_owned(),
+                "sam@example.test".to_owned()
+            )),
+        );
+        for not_email in [email_invite(None), "not-hex".to_owned(), hex::encode(b"{}")] {
+            assert_eq!(
+                invitation_mail(&runtime, &wb, "account-sam", &not_email, 1)
+                    .unwrap_err()
+                    .0,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            );
+        }
+        for _ in 1..INVITATION_MAIL_LIMIT {
+            invitation_mail(&runtime, &wb, "account-sam", &invite, 2).unwrap();
+        }
+        assert_eq!(
+            invitation_mail(&runtime, &wb, "account-sam", &invite, 3)
+                .unwrap_err()
+                .0,
+            StatusCode::TOO_MANY_REQUESTS,
+        );
+        // A day later the account may send again.
+        assert!(invitation_mail(
+            &runtime,
+            &wb,
+            "account-sam",
+            &invite,
+            3 + INVITATION_MAIL_WINDOW_SECS
+        )
+        .is_ok());
     }
 
     fn account_with_recovery_code() -> (

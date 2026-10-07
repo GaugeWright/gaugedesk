@@ -10,6 +10,9 @@ steps/               step definitions (drive the real UI, assert on rendered pro
 run.mjs              the `npm run e2e` entrypoint — resolves free ports, runs the pipeline
 fed-control-plane.sh launches a control plane for tests (fresh state each run, port-scoped)
 broker.sh            launches the rendezvous broker (federation scenarios)
+panel-edge.mjs       a loopback publisher-protocol edge Panel deployments publish to
+                     and drain from, plus test routes that play a visitor and seed a
+                     deployment from before project bindings (PANEL-7)
 ```
 
 ## Two tiers

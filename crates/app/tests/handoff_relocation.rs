@@ -2773,3 +2773,211 @@ async fn a_v1_signed_envelope_passes_supply_and_is_refused_by_the_meet() {
         "the refusal comes from the meet, not from supply: {body}"
     );
 }
+
+/// A Home opened the way the product opens one: seeded with the built-in
+/// Agents, the Personal project and their placements, under its own Home id.
+/// The raw-record tests above never see a seed, which is how a relocation of a
+/// product-created project between two real Homes went untested (WS-787).
+fn seeded_instance(
+    authority: &str,
+    broker: &str,
+) -> (Router, Arc<Mutex<Workbench>>, tempfile::TempDir) {
+    let root = tempfile::tempdir().unwrap();
+    let shared = gaugedesk_app::open_workbench_for_home_with_content_keywrap(
+        root.path(),
+        gaugedesk_core::ids::HomeId::new(format!("home:{authority}")),
+        AuthorityId::new(authority),
+        |_| {
+            Ok(Box::new(gaugedesk_app::at_rest::LoopbackKeyWrap::new(
+                [7; 32],
+            )))
+        },
+    )
+    .unwrap();
+    // As in the product, the Home's federation authority is not its local
+    // account's name: a project its local account owns must arrive as the
+    // receiving computer's local account's, not as an unknown `alice`.
+    *shared.lock().unwrap().federation_mut().unwrap() = Federation::open_bound(
+        AuthorityId::new(format!("{authority}-root")),
+        AuthorityId::new(authority),
+        root.path(),
+        broker.to_string(),
+    )
+    .unwrap();
+    (open_control_plane(shared.clone()), shared, root)
+}
+
+/// The latest library record of `kind` whose `key` is `id`, as the store holds it.
+fn library_record(wb: &Arc<Mutex<Workbench>>, kind: &str, key: &str, id: &str) -> Option<Value> {
+    wb.lock()
+        .unwrap()
+        .store_ref()
+        .records("library", kind)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
+        .find(|value| value[key] == id)
+}
+
+async fn relocate_preauthorized(
+    from: &Router,
+    to: &Router,
+    from_authority: &str,
+    to_authority: &str,
+    project: &str,
+) -> Value {
+    let (status, body) = post(
+        to,
+        "/federation/handoff/preauth",
+        json!({ "peer": from_authority }),
+    )
+    .await;
+    assert!(status.is_success(), "preauth: {status} {body}");
+    let (status, body) = post(
+        from,
+        "/federation/handoff/relocate",
+        json!({ "project": project, "peer": to_authority }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "relocate {project}: {body}");
+    assert_eq!(body["phase"], "committed", "relocate {project}: {body}");
+    body
+}
+
+/// WS-787: a project created through the product route carries an automatic
+/// placement of the seeded Default Agent. A built-in Agent is each Home's own
+/// seed, not project content, so the relocation carries the placement and the
+/// receiving Home binds it to its own seed — it never ships, nor admits,
+/// another Home's authoring instance, authoring target or bytes for it. A
+/// custom Agent placed in the project still travels whole, and a removed
+/// placement does not drag its Agent along.
+#[tokio::test(flavor = "multi_thread")]
+async fn product_created_projects_relocate_between_two_seeded_homes() {
+    let (broker, _relay) = start_broker().await;
+    let (alice, alice_wb, _ra) = seeded_instance("alice", &broker);
+    let (bob, bob_wb, _rb) = seeded_instance("bob", &broker);
+    pair(&alice, &bob).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let seed_target = "target-archetype-agent-default";
+    let bob_seed = library_record(&bob_wb, "work_target", "id", seed_target).unwrap();
+    assert_eq!(bob_seed["authority"], "home:bob");
+    let alice_seed = library_record(&alice_wb, "work_target", "id", seed_target).unwrap();
+    assert_eq!(alice_seed["authority"], "home:alice");
+
+    // The product route: the project arrives with its automatic placement of
+    // the seeded Default Agent.
+    let (status, created) = post(&alice, "/projects", json!({ "name": "Acme" })).await;
+    assert!(status.is_success(), "create project: {status} {created}");
+    let project = created["id"].as_str().unwrap().to_owned();
+    let general = format!("inst-general-{project}");
+    assert_eq!(
+        library_record(&alice_wb, "instance", "id", &general).unwrap()["agent_id"],
+        "agent-default"
+    );
+
+    relocate_preauthorized(&alice, &bob, "alice-root", "bob-root", &project).await;
+    let received = library_record(&bob_wb, "project", "id", &project).unwrap();
+    assert_eq!(received["home_id"], "home:bob");
+    assert_eq!(
+        received["owner"], "bob",
+        "alice's local account's project arrives as bob's local account's"
+    );
+    let placement = library_record(&bob_wb, "instance", "id", &general).unwrap();
+    assert_eq!(placement["agent_id"], "agent-default");
+    assert_eq!(placement["project_id"], project.as_str());
+    assert_eq!(
+        library_record(&bob_wb, "work_target", "id", seed_target).unwrap(),
+        bob_seed,
+        "bob's own seed of the Default Agent is untouched by the relocation"
+    );
+    assert_eq!(
+        library_record(&alice_wb, "work_target", "id", seed_target).unwrap(),
+        alice_seed,
+        "alice keeps her own seed: it never left her Home"
+    );
+
+    // The other direction: a project bob creates moves to alice the same way.
+    let (_, created) = post(&bob, "/projects", json!({ "name": "Initech" })).await;
+    let theirs = created["id"].as_str().unwrap().to_owned();
+    relocate_preauthorized(&bob, &alice, "bob-root", "alice-root", &theirs).await;
+    let received = library_record(&alice_wb, "project", "id", &theirs).unwrap();
+    assert_eq!(received["home_id"], "home:alice");
+    assert_eq!(received["owner"], "alice");
+    assert_eq!(
+        library_record(
+            &alice_wb,
+            "instance",
+            "id",
+            &format!("inst-general-{theirs}")
+        )
+        .unwrap()["agent_id"],
+        "agent-default"
+    );
+    assert_eq!(
+        library_record(&alice_wb, "work_target", "id", seed_target).unwrap(),
+        alice_seed
+    );
+
+    // A second product-created project whose general placement is removed and
+    // a custom Agent placed instead: the custom Agent and its authoring target
+    // travel, and the removed placement's seeded Agent does not.
+    let (_, created) = post(&alice, "/projects", json!({ "name": "Globex" })).await;
+    let project = created["id"].as_str().unwrap().to_owned();
+    let (status, body) = delete(
+        &alice,
+        &format!("/projects/{project}/placements/inst-general-{project}"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "remove general placement: {status} {body}"
+    );
+    let (status, agent) = post(&alice, "/archetypes", json!({ "name": "Analyst" })).await;
+    assert!(status.is_success(), "create Agent: {status} {agent}");
+    let agent_id = agent["id"].as_str().unwrap().to_owned();
+    let (status, body) = post(
+        &alice,
+        &format!("/projects/{project}/placements"),
+        json!({ "agent_id": agent_id }),
+    )
+    .await;
+    assert!(status.is_success(), "place Agent: {status} {body}");
+
+    relocate_preauthorized(&alice, &bob, "alice-root", "bob-root", &project).await;
+    assert_eq!(
+        library_record(&bob_wb, "agent", "id", &agent_id).unwrap()["name"],
+        "Analyst"
+    );
+    assert!(
+        library_record(
+            &bob_wb,
+            "work_target",
+            "id",
+            &format!("target-archetype-{agent_id}")
+        )
+        .is_some(),
+        "the custom Agent's authoring target travelled with the project"
+    );
+    assert_eq!(
+        library_record(&bob_wb, "work_target", "id", seed_target).unwrap(),
+        bob_seed
+    );
+}
+
+async fn delete(app: &Router, uri: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("idempotency-key", format!("handoff-test-delete-{uri}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}

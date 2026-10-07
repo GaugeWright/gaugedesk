@@ -70,11 +70,9 @@ async fn a_project_that_has_run_nothing_costs_a_recorded_zero() {
     );
 }
 
-/// The card ships with no rates, and the document says so rather than implying
-/// the project was free.
-///
-/// `rated_models: 0` is the honest reading of an empty card, and it is what a
-/// surface needs to explain a null total that has no other gap to point at.
+/// The report names the card it was priced under — its currency, version and
+/// how many models it rates — so a surface can tell a priced total from one
+/// the card could not price, rather than implying an unpriced project was free.
 #[tokio::test]
 async fn the_report_names_the_rate_card_it_was_priced_under() {
     let (_dir, app) = control_plane();

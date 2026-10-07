@@ -189,7 +189,7 @@ impl GaugeAppDefinition for PanelSettings {
         ruled.map_err(|error| boxed_error(StatusCode::CONFLICT, error.to_string()))?;
         Ok(Applied {
             facts: Vec::new(),
-            committed: Box::new(move |wb| {
+            committed: Box::new(move |wb, _| {
                 wb.notify_library_changed("project", &project, "upsert");
             }),
         })

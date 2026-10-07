@@ -785,6 +785,324 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_correlation_machine_requester_is_distinct_from_runtime_principal() {
+        let _fake_agent = crate::test_support::fake_agent_env();
+        let root = tempfile::tempdir().unwrap();
+        let wb = open_workbench(root.path()).unwrap();
+        crate::account_signin::store_session_for_test(&wb);
+        crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+        let app = open_control_plane(wb.clone());
+        let key = P256SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let public_key = PublicKey::new(hex::encode(key.verifying_key().to_sec1_bytes()));
+        let (status, invitation) = json_call(
+            &app,
+            "POST",
+            "/mobile/enrollment/invitations",
+            json!({ "endpoint": "https://machine.example.test" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let secret = invitation["secret"].as_str().unwrap();
+        let (status, claim) = json_call(
+            &app,
+            "POST",
+            "/mobile/enrollment/claim",
+            json!({
+                "invitationId": invitation["invitationId"],
+                "secret": secret,
+                "machine": invitation["machine"],
+                "endpoint": invitation["endpoint"],
+                "device": "device:android",
+                "publicKey": public_key,
+                "label": "Pixel"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let request_id = claim["requestId"].as_str().unwrap();
+        let challenge = claim["challenge"].as_str().unwrap();
+        let (status, _) = json_call(
+            &app,
+            "POST",
+            "/mobile/enrollment/prove",
+            json!({
+                "requestId": request_id,
+                "signature": raw_signature(&key, challenge)
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, approved) = json_call(
+            &app,
+            "POST",
+            &format!("/mobile/enrollment/requests/{request_id}/approve"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let grant_id = approved["grantId"].as_str().unwrap().to_string();
+        let (status, pickup) = json_call(
+            &app,
+            "POST",
+            "/mobile/enrollment/status",
+            json!({ "requestId": request_id, "secret": secret }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let credential = pickup["credential"].as_str().unwrap().to_string();
+        let (status, pickup_retry) = json_call(
+            &app,
+            "POST",
+            "/mobile/enrollment/status",
+            json!({ "requestId": request_id, "secret": secret }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pickup_retry["credential"], credential);
+
+        // A Machine restart retains the hashed grant; the raw credential stays
+        // only in the simulated Android vault (`credential` here).
+        drop(app);
+        drop(wb);
+        let reopened = open_workbench(root.path()).unwrap();
+        // The requester proof crosses the whole Home composition (task route,
+        // command guard, identity) beside the controller protocol a host mounts.
+        let reopened_app = open_control_plane(reopened.clone()).merge(
+            crate::open_route_stack::open_control_plane(reopened.clone()),
+        );
+        let (status, resume) = json_call(
+            &reopened_app,
+            "POST",
+            "/mobile/sessions/challenge",
+            json!({ "grantId": grant_id, "device": "device:android" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, opened) = json_call(
+            &reopened_app,
+            "POST",
+            "/mobile/sessions",
+            json!({
+                "challengeId": resume["challengeId"],
+                "grantId": grant_id,
+                "device": "device:android",
+                "credential": credential,
+                "signature": raw_signature(&key, resume["challenge"].as_str().unwrap())
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let token = opened["session"].as_str().unwrap().to_string();
+        assert!(authorize_session(&mut reopened.lock_unpoisoned(), &token).is_some());
+
+        let bearer = crate::desktop_session::home_session(&reopened).unwrap();
+        let home = reopened.lock_unpoisoned().home_id().as_str().to_owned();
+        let (status, body) = json_call(
+            &reopened_app,
+            "POST",
+            "/chats",
+            json!({"id":"machine-correlation"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        for (index, person) in [None, Some(bearer.as_str())].into_iter().enumerate() {
+            let fetch = |method: &str, path: &str, body: String, id: String| {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(MACHINE_SESSION_HEADER, &token)
+                    .header("idempotency-key", id)
+                    .header("content-type", "application/json");
+                if let Some(person) = person {
+                    request = request.header("authorization", format!("Bearer {person}"));
+                }
+                request.body(Body::from(body)).unwrap()
+            };
+            let identity = reopened_app
+                .clone()
+                .oneshot(fetch(
+                    "GET",
+                    "/file-actions/actor",
+                    String::new(),
+                    format!("identity:{index}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(identity.status(), StatusCode::OK);
+            let identity: serde_json::Value =
+                serde_json::from_slice(&identity.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(identity["actor"], "device:android");
+            assert_eq!(identity["home"], home);
+            let command_key = format!("machine-request:{index}");
+            let response = reopened_app
+                .clone()
+                .oneshot(fetch(
+                    "POST",
+                    "/chats/machine-correlation/task",
+                    json!({"prompt":"synthetic requester turn"}).to_string(),
+                    command_key.clone(),
+                ))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["correlation"]["home_id"], home);
+            assert_eq!(body["correlation"]["actor_id"], identity["actor"]);
+            assert_eq!(body["correlation"]["client_request_id"], command_key);
+            assert_eq!(body["correlation"]["outcome"], "settled");
+            let response = reopened_app
+                .clone()
+                .oneshot(fetch(
+                    "POST",
+                    "/chats/machine-correlation/task",
+                    json!({"prompt":"synthetic requester turn"}).to_string(),
+                    command_key,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let replay: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(replay["correlation"], body["correlation"]);
+        }
+        let users = reopened
+            .lock_unpoisoned()
+            .store_ref()
+            .records("machine-correlation", "transcript")
+            .unwrap()
+            .into_iter()
+            .filter_map(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+            .filter(|event| event["type"] == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), 2);
+        assert!(users
+            .iter()
+            .all(|user| user["actor_id"] == "device:android"));
+        // Request author proves the enrolled device. It never supplies the
+        // runtime actor: the existing verified person context remains distinct.
+        let person = reopened
+            .lock_unpoisoned()
+            .authenticate_action_context(&bearer)
+            .unwrap();
+        assert_ne!(person.actor().as_str(), "device:android");
+        struct ActorHarness(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+        impl gaugedesk_harness::Harness for ActorHarness {
+            fn bind_authenticated_actor(&mut self, actor: &str) {
+                *self.0.lock().unwrap() = Some(actor.to_owned());
+            }
+            fn run_turn(
+                &mut self,
+                _gate: &dyn gaugedesk_harness::EgressGate,
+                _prompt: &str,
+                _images: &[gaugedesk_harness::ImageContent],
+                _sink: &mut dyn FnMut(&gaugedesk_harness::Observation),
+            ) -> std::io::Result<gaugedesk_harness::TurnOutcome> {
+                Ok(gaugedesk_harness::TurnOutcome {
+                    assistant_text: "synthetic runtime outcome".into(),
+                    ..Default::default()
+                })
+            }
+        }
+        struct ActorFactory(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+        impl gaugedesk_harness::HarnessFactory for ActorFactory {
+            fn kind(&self) -> &'static str {
+                "whip"
+            }
+            fn create(
+                &self,
+                _spec: &gaugedesk_harness::HarnessSpec,
+            ) -> std::io::Result<Box<dyn gaugedesk_harness::Harness>> {
+                Ok(Box::new(ActorHarness(self.0.clone())))
+            }
+            fn reuse_across_turns(&self) -> bool {
+                false
+            }
+            fn credential_status(
+                &self,
+                _provider: &str,
+                _capability: Option<&dyn gaugedesk_harness::CredentialCapability>,
+            ) -> gaugedesk_harness::CredentialProbe {
+                gaugedesk_harness::CredentialProbe::Ready
+            }
+        }
+        for account_bearer in [None, Some(bearer.as_str())] {
+            let mut headers = HeaderMap::new();
+            headers.insert(MACHINE_SESSION_HEADER, token.parse().unwrap());
+            if let Some(account_bearer) = account_bearer {
+                headers.insert(
+                    "authorization",
+                    format!("Bearer {account_bearer}").parse().unwrap(),
+                );
+            }
+            let (author, context, expected_actor) = {
+                let mut guard = reopened.lock_unpoisoned();
+                let author = crate::engine::verified_task_author(
+                    &mut guard,
+                    &headers,
+                    &axum::http::Method::POST,
+                    "/chats/machine-correlation/task",
+                )
+                .unwrap();
+                let context = guard
+                    .engagement_task_context("machine-correlation")
+                    .unwrap();
+                let expected = if account_bearer.is_some() {
+                    person.actor().as_str().to_owned()
+                } else {
+                    guard
+                        .library_project_of_chat("machine-correlation")
+                        .and_then(|project| guard.local_personal_tracker_context(&project))
+                        .map(|context| context.actor().as_str().to_owned())
+                        .unwrap_or_else(|| guard.authority().as_str().to_owned())
+                };
+                (author, context, expected)
+            };
+            assert_eq!(author.actor_id, "device:android");
+            assert_ne!(author.actor_id, expected_actor);
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let result = crate::engine::run_engagement_turn(
+                &reopened,
+                "machine-correlation",
+                &context.worktree,
+                &context.sender,
+                crate::engine::EngagementTurnInput {
+                    task: "synthetic actor boundary",
+                    images: &[],
+                    mode: context.mode,
+                    authenticated_actor: None,
+                    authenticated_context: None,
+                    local_operator: true,
+                    contribution_by: None,
+                    account_scope: crate::account::ACCOUNT_SCOPE,
+                    tenant_scope: crate::org::ORG_SCOPE,
+                    account_bearer,
+                    client_request_id: Some("internal-requester-proof"),
+                    client_author: Some(&author),
+                    client_attempt: None,
+                    client_build: None,
+                    runtime_command_id: None,
+                    original_http_command: None,
+                    harness_factory: Some(crate::harness_select::TurnHarnessFactory::Custom(
+                        std::sync::Arc::new(ActorFactory(observed.clone())),
+                    )),
+                },
+            )
+            .unwrap();
+            assert_eq!(result.run_phase, gaugedesk_core::run::RunPhase::Completed);
+            assert_eq!(
+                observed.lock().unwrap().as_deref(),
+                Some(expected_actor.as_str()),
+                "request correlation must not alter baseline runtime principal"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn enrollment_restart_session_and_revocation_are_device_bound() {
         let root = tempfile::tempdir().unwrap();
         let wb = open_workbench(root.path()).unwrap();

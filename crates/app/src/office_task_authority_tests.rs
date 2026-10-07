@@ -137,7 +137,13 @@ async fn office_task_startup_checkpoints_refuse_removed_access() {
         .unwrap();
         assert!(
             authority
-                .claim_upload_command(&wb, "valid-upload", "upload", "valid-key", "input")
+                .claim_upload_command(
+                    &wb,
+                    "valid-upload",
+                    ("upload", "valid-key"),
+                    ("upload", "legacy-valid-key"),
+                    "input"
+                )
                 .unwrap()
                 .1
         );
@@ -196,7 +202,13 @@ async fn office_task_startup_checkpoints_refuse_removed_access() {
         assert!(authority.checkpoint(&wb).is_err(), "{change}");
         assert!(
             authority
-                .claim_upload_command(&wb, "refused-upload", "upload", "key", "input")
+                .claim_upload_command(
+                    &wb,
+                    "refused-upload",
+                    ("upload", "key"),
+                    ("upload", "legacy-key"),
+                    "input"
+                )
                 .is_err(),
             "{change}"
         );
@@ -284,7 +296,13 @@ async fn restored_local_standing_cannot_revive_an_original_office_task() {
         assert!(access.check_current().is_err(), "runtime: {change}");
         assert!(
             original
-                .claim_upload_command(&wb, "revived-old-command", "upload", "key", "input",)
+                .claim_upload_command(
+                    &wb,
+                    "revived-old-command",
+                    ("upload", "key"),
+                    ("upload", "legacy-key"),
+                    "input",
+                )
                 .is_err(),
             "{change}"
         );
@@ -451,6 +469,9 @@ async fn cold_reopen_refuses_original_startup_even_after_fresh_staff_admission()
                 account_scope: "account",
                 tenant_scope: ORG_SCOPE,
                 account_bearer: Some(ALICE),
+                client_request_id: None,
+                client_author: None,
+                client_attempt: None,
                 runtime_command_id: None,
                 original_http_command: Some(&original),
                 harness_factory: None,
@@ -533,7 +554,13 @@ async fn office_task_original_ceiling_cannot_be_extended_by_source_recheck() {
     assert!(wb.lock_unpoisoned().office_staff_lease(ALICE).is_some());
     assert!(authority.checkpoint(&wb).is_err());
     assert!(authority
-        .claim_upload_command(&wb, "expired-upload", "upload", "key", "input")
+        .claim_upload_command(
+            &wb,
+            "expired-upload",
+            ("upload", "key"),
+            ("upload", "legacy-key"),
+            "input"
+        )
         .is_err());
     assert!(wb
         .lock_unpoisoned()
@@ -579,6 +606,9 @@ async fn engine_rejects_revoked_office_task_before_durable_turn_or_harness() {
             account_scope: "account",
             tenant_scope: ORG_SCOPE,
             account_bearer: Some(ALICE),
+            client_request_id: None,
+            client_author: None,
+            client_attempt: None,
             runtime_command_id: None,
             original_http_command: None,
             harness_factory: None,
@@ -866,6 +896,9 @@ async fn engine_refuses_office_work_without_original_http_claim_before_factory()
             account_scope: "account",
             tenant_scope: ORG_SCOPE,
             account_bearer: Some(ALICE),
+            client_request_id: None,
+            client_author: None,
+            client_attempt: None,
             runtime_command_id: None,
             original_http_command: None,
             harness_factory: Some(crate::harness_select::TurnHarnessFactory::Custom(
@@ -918,8 +951,8 @@ async fn original_office_writer_joins_witnessed_cut_typed_completion_and_receipt
         .claim_upload_command(
             &wb,
             "original-task",
-            "task-completion",
-            "original-key",
+            ("task-completion", "original-key"),
+            ("task-completion", "legacy-original-key"),
             "original-input",
         )
         .unwrap();
@@ -1294,6 +1327,9 @@ async fn middleware_original_task_identity_reaches_the_office_harness_binding() 
                         authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                         client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
                         account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
+                        client_request_id: None,
+                        client_author: None,
+                        client_attempt: None,
                         runtime_command_id: mismatch.then_some("substituted-command"), original_http_command: Some(&original),
                         harness_factory: Some(crate::harness_select::TurnHarnessFactory::Custom(std::sync::Arc::new(Probe(output)))),
                     });
@@ -1344,6 +1380,7 @@ async fn office_foreground_task_route_refuses_a_missing_middleware_claim() {
         axum::http::HeaderMap::new(),
         None,
         Some(axum::extract::Extension(captured)),
+        None,
         None,
         None,
         axum::Json(
@@ -1704,6 +1741,9 @@ async fn production_office_startup_uses_original_http_claim_and_recorded_native_
                                         authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                                         client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
                                         account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
+                                        client_request_id: None,
+                                        client_author: None,
+                                        client_attempt: None,
                                         runtime_command_id: None, original_http_command: Some(&original),
                                         harness_factory: Some(crate::harness_select::TurnHarnessFactory::Custom(Arc::new(probe))),
                                     });
@@ -1917,6 +1957,9 @@ async fn production_office_startup_uses_original_http_claim_and_recorded_native_
                                             authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                                             client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
                                             account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
+                                            client_request_id: None,
+                                            client_author: None,
+                                            client_attempt: None,
                                             runtime_command_id: None, original_http_command: Some(&original),
                                             harness_factory: Some(crate::harness_select::TurnHarnessFactory::Custom(Arc::new(RecordedProbe { observed: observed.clone(), command: original.command_id().into(), policy: original_policy.clone() }))),
                                         });
@@ -2068,6 +2111,9 @@ async fn production_office_startup_uses_original_http_claim_and_recorded_native_
                                             authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                                             client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
                                             account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
+                                            client_request_id: None,
+                                            client_author: None,
+                                            client_attempt: None,
                                             runtime_command_id: None, original_http_command: Some(&original), harness_factory: Some(crate::harness_select::TurnHarnessFactory::Custom(Arc::new(probe))),
                                         });
                                     assert!(engine_retry.is_err(), "recovery without sealed original runtime preparation succeeded");
@@ -2123,7 +2169,11 @@ async fn production_office_startup_uses_original_http_claim_and_recorded_native_
                                 assert_eq!(
                                     input.2,
                                     crate::stream::ServerEvent::User {
-                                        text: "synthetic original task".into()
+                                        text: "synthetic original task".into(),
+                                        client_request_id: None,
+                                        chat_id: None,
+                                        home_id: None,
+                                        actor_id: None,
                                     }
                                     .to_json()
                                 );

@@ -188,6 +188,36 @@ const securityPolicy = shape({
     allow_auto_upgrade: booleanValue,
 });
 const projectSharingValue = oneOf("members", "anyone");
+
+/// The office-controlled profile binding (WS-424). It binds the organization
+/// this Home holds to the Project Host named here, and has no exit, so the
+/// page offers enrollment only while it is `available`.
+export type OfficeProfileState =
+    | { readonly state: "enrolled"; readonly home_id: string; readonly this_home: string; readonly bound_here: boolean; readonly enrolled_by: string; readonly enrolled_at_ms: number }
+    | { readonly state: "available"; readonly this_home: string }
+    | { readonly state: "unavailable"; readonly this_home: string | null; readonly reason: string };
+const officeProfileState: ModelReader<OfficeProfileState> = (value, path) => {
+    // A Hub that predates WS-424 sends nothing; it cannot enroll this Home.
+    if (value === undefined) {
+        return { state: "unavailable", this_home: null, reason: "This Home does not offer the office-controlled profile." };
+    }
+    const source = objectValue(value, path);
+    const state = oneOf("enrolled", "available", "unavailable")(source.state, `${path}.state`);
+    const thisHome = stringValue(source.this_home, `${path}.this_home`);
+    if (state === "enrolled") {
+        return {
+            state,
+            home_id: stringValue(source.home_id, `${path}.home_id`),
+            this_home: thisHome,
+            bound_here: booleanValue(source.bound_here, `${path}.bound_here`),
+            enrolled_by: stringValue(source.enrolled_by, `${path}.enrolled_by`),
+            enrolled_at_ms: integerValue(source.enrolled_at_ms, `${path}.enrolled_at_ms`),
+        };
+    }
+    if (state === "available") return { state, this_home: thisHome };
+    return { state, this_home: thisHome, reason: stringValue(source.reason, `${path}.reason`) };
+};
+
 export const parseOrganizationPolicyModel = shape({
     resource: shape({ rules: arrayOf(jsonValue) }),
     security: nullable(securityPolicy),
@@ -199,6 +229,7 @@ export const parseOrganizationPolicyModel = shape({
     // DR-0332. A Hub that predates it sends nothing, which is members only.
     project_sharing: (value: unknown, path: string) =>
         value === undefined ? "members" as const : projectSharingValue(value, path),
+    office_profile: officeProfileState,
 });
 export type OrganizationPolicyPageV1 = ReturnType<typeof parseOrganizationPolicyModel>;
 

@@ -15,4 +15,5 @@ sha2 = "0.11"
 hex = "0.4"
 
 [dev-dependencies]
+ring = "0.17"
 tempfile = "3"

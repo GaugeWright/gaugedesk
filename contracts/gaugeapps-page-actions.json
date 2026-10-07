@@ -42,15 +42,12 @@
           "capability": "provider-connections.read-personal",
           "secretBoundary": "keys and OAuth/device tokens are sealed and never read back",
           "emptyState": "No connection shows an add-connection action and managed-inference eligibility.",
-          "unavailableState": "Broker outage preserves connection references as stale and disables verification or mutation.",
+          "unavailableState": "Broker outage preserves connection references as stale and disables mutation.",
           "actions": [
             { "id": "add-api-key-connection", "operation": "provider-connection.api-key.add", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "sealed key submission" },
-            { "id": "begin-provider-sign-in", "operation": "provider-connection.subscription.begin", "lifecycle": "provider-specific-account-link", "capability": "provider-connections.manage-personal", "secretBoundary": "provider token exchange stays server-side" },
-            { "id": "complete-provider-sign-in", "operation": "provider-connection.subscription.complete", "lifecycle": "provider-specific-account-link", "capability": "provider-connections.manage-personal", "secretBoundary": "device/OAuth proof is consumed" },
             { "id": "add-compatible-endpoint", "operation": "provider-connection.compatible.add", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "endpoint is public; key is sealed" },
-            { "id": "verify-connection", "operation": "provider-connection.verify", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "verification returns status/models, never credentials" },
             { "id": "rename-connection", "operation": "provider-connection.rename", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "metadata only" },
-            { "id": "revoke-connection", "operation": "provider-connection.revoke", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "sealed material is erased without readback" },
+            { "id": "revoke-connection", "operation": "provider-connection.revoke", "lifecycle": "personal-provider-connection", "capability": "provider-connections.manage-personal", "secretBoundary": "every device copy is deleted without readback" },
             { "id": "set-personal-default-model", "operation": "provider-connection.default-model.set", "lifecycle": "personal-model-default", "capability": "provider-connections.manage-personal", "secretBoundary": "model reference only" },
             { "id": "change-managed-inference", "operation": "managed-inference.plan.change", "lifecycle": "managed-inference-plan", "capability": "managed-inference.manage-personal", "secretBoundary": "billing handoff uses tenant billing authority" }
           ]
@@ -254,6 +251,7 @@
           "unavailableState": "Authority outage leaves the draft local, marks the server basis stale, and blocks apply/review.",
           "actions": [
             { "id": "apply-policy-changes", "operation": "organization-policy.set", "lifecycle": "organization-policy", "capability": "organization-policy.manage", "secretBoundary": "typed policy fields only" },
+            { "id": "enroll-office-profile", "operation": "office-profile.enroll", "lifecycle": "office-profile", "capability": "organization-policy.manage", "secretBoundary": "Project Host id only; one-way, no exit command" },
             { "id": "discard-policy-draft", "operation": "organization-policy.draft.discard", "lifecycle": "client-draft", "capability": "organization-policy.read", "secretBoundary": "no server effect" },
             { "id": "accept-policy-proposal", "operation": "organization-policy.proposal.accept", "lifecycle": "sensitive-change-review", "capability": "organization-policy.review", "secretBoundary": "review is bound to proposal revision" },
             { "id": "discard-policy-proposal", "operation": "organization-policy.proposal.discard", "lifecycle": "sensitive-change-review", "capability": "organization-policy.review", "secretBoundary": "proposal evidence remains" }

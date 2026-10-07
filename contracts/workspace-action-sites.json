@@ -936,6 +936,26 @@
     },
     {
       "site": {
+        "callable": "publish_from_here",
+        "capability": "publish",
+        "count": 1,
+        "expression": "crate :: directory_sync :: publish (& http , directory , & put)",
+        "file": "crates/app/src/account_publish.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
+        "callable": "withdraw_from_here",
+        "capability": "publish",
+        "count": 1,
+        "expression": "crate :: directory_sync :: publish (& http , directory , & put)",
+        "file": "crates/app/src/account_publish.rs"
+      },
+      "profile": "publication-review"
+    },
+    {
+      "site": {
         "callable": "retract_published_entry",
         "capability": "publish",
         "count": 1,

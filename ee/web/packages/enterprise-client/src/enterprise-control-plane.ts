@@ -28,13 +28,14 @@ import {
     startConsumerOidcLink,
     startConsumerOidcAvatar,
     submitGaugeAppCommand,
-    submitAccountProviderSecret,
+    submitAccountProviderLink,
     submitOrganizationSsoCredential,
     submitOrganizationProviderSecret,
     verifyOrganizationProviderCandidate,
     type OrganizationProviderCandidate,
     readAccountDeviceLink,
     type AccountDeviceLinkStatus,
+    type AccountLinkRecipients,
     type GaugeAppCommandEnvelope,
     type GaugeAppAgentLiveFrame,
     type GaugeAppKind,
@@ -175,8 +176,14 @@ export class EnterpriseControlPlane implements EnterpriseAdminApi {
         return submitGaugeAppCommand(this.json, envelope);
     }
 
-    submitAccountProviderSecret(envelope: GaugeAppCommandEnvelope, secret: string) {
-        return submitAccountProviderSecret(this.json, envelope, secret);
+    submitAccountProviderLink(
+        envelope: GaugeAppCommandEnvelope,
+        secret: string,
+        links: AccountLinkRecipients,
+        provider: string,
+        currentVersion: number,
+    ) {
+        return submitAccountProviderLink(this.json, envelope, secret, links, provider, currentVersion);
     }
     submitOrganizationSsoCredential(envelope: GaugeAppCommandEnvelope, secret?: string) {
         return submitOrganizationSsoCredential(this.json, envelope, secret);

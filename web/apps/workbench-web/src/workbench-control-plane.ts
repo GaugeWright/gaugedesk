@@ -46,6 +46,7 @@ import type {
     HomeId,
     OpaqueHomeRoute,
     CreatedHomeInvitation,
+    PendingHomeInvitation,
     TunnelEventStream,
     TunnelRoute,
     TunnelRouteRequest,
@@ -216,6 +217,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     private readonly route: RouteJson;
     private readonly request: RouteRequest;
     private readonly events: RouteEventStream;
+    private readonly localTaskEventSource: RouteEventStream;
     private readonly splitHomes: boolean;
     private readonly nativeShell: boolean;
     private nativeRemote = false;
@@ -231,6 +233,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     private pool: HomePool<workbenchClient.WorkbenchTransport> | null = null;
     private currentProject: ProjectId | null = null;
     private readonly restartWorkStreams = new Set<() => void>();
+    private readonly taskHomeActors = new Map<string, object>();
 
     constructor(
         private readonly base = controlPlaneBase(),
@@ -249,6 +252,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.route = browserRouteJson(this.base, auth);
         this.request = browserRouteRequest(this.base, auth);
         const eventSource = browserRouteEventStream(this.base, auth);
+        this.localTaskEventSource = eventSource;
         this.events = reconnectingRouteEventStream(() => eventSource, {
             beforeReconnect: async (reason) => {
                 if (
@@ -1142,6 +1146,26 @@ export class WorkbenchControlPlane implements ControlPlane {
         });
     }
 
+    /** The account service emails an email invitation's link (DR-0332). */
+    emailHomeInvitation(invite: string): Promise<string> {
+        return accountClient.emailHomeInvitation(this.route, invite);
+    }
+
+    async pendingHomeInvitations(project: ProjectId): Promise<PendingHomeInvitation[]> {
+        const transport = await this.requireHomeTransport();
+        return accountClient.listPendingHomeInvitations(transport.json, project);
+    }
+
+    async cancelHomeInvitation(id: string): Promise<void> {
+        const transport = await this.requireHomeTransport();
+        await accountClient.cancelHomeInvitation(transport.json, id);
+    }
+
+    async resendHomeInvitation(id: string): Promise<CreatedHomeInvitation> {
+        const transport = await this.requireHomeTransport();
+        return accountClient.resendHomeInvitation(transport.json, id);
+    }
+
     getRun(scope: ScopeId): Promise<RunState> {
         return workbenchClient.getRun(this.workbenchTransport(), scope);
     }
@@ -1695,6 +1719,130 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     createEngagement(id?: EngagementId): Promise<Engagement> {
         return workbenchClient.createEngagement(this.workbenchTransport(), id);
+    }
+
+    /** Bind repair to the actual Home actor, independently of renewed credentials.
+     * Legacy transports without the existing actor door remain transport-local;
+     * replacing that transport cannot confirm their pending task. */
+    async taskContext(id: EngagementId) {
+        const project = this.currentProject;
+        const generation = this.credentialGeneration;
+        const remote = this.usesRemoteHome();
+        const execute = <T>(operation: (transport: workbenchClient.WorkbenchTransport) => Promise<T>) =>
+            remote ? this.withHomeAdmissionRetry(operation) : this.requireHomeTransport().then(operation);
+        const assertProject = () => {
+            if (this.currentProject !== project) throw new Error("Task project selection changed");
+        };
+        const identity = async (transport: workbenchClient.WorkbenchTransport) => {
+            try {
+                const value = await transport.json("GET", "/file-actions/actor") as {
+                    home?: unknown; actor?: unknown;
+                };
+                if (typeof value?.home === "string" && value.home.trim()
+                    && typeof value.actor === "string" && value.actor.trim()) {
+                    return JSON.stringify([value.home, value.actor]);
+                }
+                return null;
+            } catch (error) {
+                if (isExpiredHomeAdmission(error)) throw error;
+                return null;
+            }
+        };
+        const initial = await execute(async (transport) => {
+            assertProject();
+            let proof: string | null;
+            try { proof = await identity(transport); }
+            catch (error) {
+                // The co-resident stream already renews this exact pre-effect
+                // admission refusal. Actor preflight precedes opening that stream.
+                if (remote || !(error instanceof RouteHttpError) || error.status !== 401 || !isExpiredHomeAdmission(error)) throw error;
+                assertProject();
+                this.homeAdmission = null;
+                await this.admitHome();
+                assertProject();
+                proof = await identity(transport);
+            }
+            assertProject();
+            return { transport, proof };
+        });
+        let home: object = initial.transport;
+        if (initial.proof) {
+            const key = JSON.stringify([project, initial.proof]);
+            home = this.taskHomeActors.get(key) ?? {};
+            this.taskHomeActors.set(key, home);
+        }
+        const verify = async (transport: workbenchClient.WorkbenchTransport) => {
+            assertProject();
+            if (initial.proof) {
+                if (await identity(transport) !== initial.proof) throw new Error("Task Home actor changed");
+            } else if (transport !== initial.transport || this.credentialGeneration !== generation) {
+                throw new Error("Legacy task transport changed without Home actor proof");
+            }
+            assertProject();
+        };
+        const request = async <T>(action: (transport: workbenchClient.WorkbenchTransport) => Promise<T>) => {
+            assertProject();
+            let value: T;
+            try {
+                value = await execute(async (transport) => {
+                    await verify(transport);
+                    return action(transport);
+                });
+            } catch (error) {
+                assertProject();
+                await verify(await this.requireHomeTransport());
+                throw error;
+            }
+            // A cookie can change without a bearer generation update. Failure of
+            // this post-response check remains uncertain and never retries an effect.
+            await verify(await this.requireHomeTransport());
+            return value;
+        };
+        const events: RouteEventStream = (path, onMessage, onOpen, onClose) => {
+            const subscription = openReconnectingEventStream(() => {
+                assertProject();
+                return execute(async (transport) => {
+                    try { await verify(transport); }
+                    catch (error) {
+                        if (remote || !(error instanceof RouteHttpError) || error.status !== 401 || !isExpiredHomeAdmission(error)) throw error;
+                        assertProject();
+                        this.homeAdmission = null;
+                        await this.admitHome();
+                        await verify(transport);
+                    }
+                    // One reconnect owner: localWorkTransport.events already
+                    // reconnects for generic callers, so use its raw source here.
+                    return transport === this.localWorkTransport ? this.localTaskEventSource : transport.events;
+                });
+            }, path, onMessage, onOpen, onClose, {
+                beforeReconnect: async (reason) => {
+                    assertProject();
+                    if (reason?.status === 401 && /target Home admission required/.test(reason.detail ?? "")) {
+                        if (remote) await this.invalidateHomeTransport(project);
+                        else {
+                            this.homeAdmission = null;
+                            await this.admitHome();
+                        }
+                    }
+                },
+            });
+            this.restartWorkStreams.add(subscription.reconnect);
+            return () => {
+                this.restartWorkStreams.delete(subscription.reconnect);
+                subscription.close();
+            };
+        };
+        return {
+            scope: { home, chat: String(id), project: project ? String(project) : null, ...(initial.proof ? { authority: {
+                home_id: (JSON.parse(initial.proof) as [string, string])[0],
+                actor_id: (JSON.parse(initial.proof) as [string, string])[1],
+            } } : {}) },
+            runTask: (prompt: string, images: { data: string; mimeType: string }[], composedId: string) =>
+                request((transport) => workbenchClient.runTask(transport, id, prompt, images, composedId)),
+            transcript: () => request((transport) => workbenchClient.getTranscript(transport, id)),
+            subscribe: (onEvent: (event: workbenchClient.StreamEvent) => void, onOpen?: () => void) =>
+                workbenchClient.subscribe({ ...initial.transport, events }, id, onEvent, onOpen),
+        };
     }
 
     runTask(
@@ -2506,6 +2654,17 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     hubSessionClaimHome(person: string): Promise<accountClient.HubSessionStatus> {
         return this.desktopSessionJson().then((json) => accountClient.hubSessionClaimHome(json, person));
+    }
+
+    /** This computer's signed-out projects the window's signed-in account
+     *  could receive (DR-0328 §7). Always the co-resident control plane,
+     *  never a remote Home: only the window holds the local account's work. */
+    localProjects(): Promise<accountClient.LocalProjects> {
+        return this.desktopSessionJson().then((json) => accountClient.localProjects(json));
+    }
+
+    transferLocalProjects(projects: readonly ProjectId[]): Promise<{ readonly moved: readonly ProjectId[] }> {
+        return this.desktopSessionJson().then((json) => accountClient.transferLocalProjects(json, projects));
     }
 
     hubSessionAccounts(): Promise<accountClient.HubSessionAccounts> {

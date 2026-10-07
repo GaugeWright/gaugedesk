@@ -112,6 +112,9 @@ impl Workbench {
                 "office identity cannot select another directory",
             ));
         }
+        if let Some(refusal) = self.office_profile_channel_refusal() {
+            return Err(refusal);
+        }
         let lease = self.office_staff_lease(bearer).ok_or((
             StatusCode::UNAUTHORIZED,
             "office source lease is expired or revoked",

@@ -101,6 +101,8 @@ async fn hub() -> Hub {
 
 fn install(wb: &SharedWorkbench, hub: &Hub) {
     wb.lock_unpoisoned()
+        .enroll_office_profile_for_test("office-admin");
+    wb.lock_unpoisoned()
         .configure_office_staff_source(source::HubStaffSource::at(&hub.address).unwrap())
         .unwrap();
 }

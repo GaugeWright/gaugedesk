@@ -333,6 +333,88 @@ impl LinkRecipientStore {
     }
 }
 
+/// A hosted Home's own recipient key (DR-0380): one per Home, for every person
+/// it serves, since each copy's derivation binds the person's account. The
+/// seed is kept wrapped by the Home's content key-encryption key — Key Vault
+/// in production — so the file alone opens nothing, and the Hub, which records
+/// only the public half, never holds it.
+pub struct HomeLinkRecipientKey {
+    path: PathBuf,
+    wrap: Box<dyn crate::at_rest::KeyWrap>,
+}
+
+impl HomeLinkRecipientKey {
+    pub fn new(path: impl Into<PathBuf>, wrap: Box<dyn crate::at_rest::KeyWrap>) -> Self {
+        Self {
+            path: path.into(),
+            wrap,
+        }
+    }
+
+    /// Load or create the Home's key and return its public half, which is
+    /// what the Hub records in the Home's tenant.
+    pub fn ensure(&self) -> io::Result<LinkRecipientPublicKey> {
+        Ok(self.private_key(true)?.public_key())
+    }
+
+    /// Open the key to read a copy sealed to this Home.
+    pub fn open(&self) -> io::Result<LinkRecipientPrivateKey> {
+        self.private_key(false)
+    }
+
+    fn private_key(&self, create: bool) -> io::Result<LinkRecipientPrivateKey> {
+        let seed = if create && !self.path.exists() {
+            self.create()?
+        } else {
+            self.read()?
+        };
+        LinkRecipientPrivateKey::from_seed(seed)
+            .map_err(|_| io::Error::other("stored Home recipient key is invalid"))
+    }
+
+    fn read(&self) -> io::Result<[u8; 32]> {
+        let wrapped = std::fs::read(&self.path)?;
+        self.wrap
+            .unwrap(&wrapped)
+            .map_err(|_| io::Error::other("the Home recipient key did not unwrap"))
+    }
+
+    fn create(&self) -> io::Result<[u8; 32]> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let seed = loop {
+            let mut candidate = [0_u8; 32];
+            getrandom::getrandom(&mut candidate)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            if SecretKey::from_slice(&candidate).is_ok() {
+                break candidate;
+            }
+        };
+        let wrapped = self
+            .wrap
+            .wrap(&seed)
+            .map_err(|_| io::Error::other("could not wrap the Home recipient key"))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&self.path) {
+            Ok(mut file) => {
+                file.write_all(&wrapped)?;
+                file.sync_all()?;
+                Ok(seed)
+            }
+            // Lost a create race: whoever won holds the key copies are sealed to.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => self.read(),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 fn read_seed(path: &std::path::Path) -> io::Result<[u8; 32]> {
     std::fs::read(path)?
         .as_slice()

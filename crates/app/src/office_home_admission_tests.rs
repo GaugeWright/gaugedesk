@@ -21,6 +21,9 @@ fn membership(wb: &SharedWorkbench, actor: &str, status: crate::org::MembershipS
         managed_by_scim: false,
         team: None,
     };
+    // The office channel serves only an enrolled Project Host (WS-424).
+    wb.lock_unpoisoned()
+        .enroll_office_profile_for_test("office-admin");
     wb.lock_unpoisoned()
         .store_mut()
         .append_record(

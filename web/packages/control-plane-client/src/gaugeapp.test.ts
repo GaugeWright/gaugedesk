@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import vector from "../../../../crates/app/tests/account-link-seal-vector.json";
 import {
     claimAccountDeviceLink,
     completeAccountDeviceLink,
@@ -23,7 +24,7 @@ import {
     startConsumerOidcAvatar,
     subscribeGaugeAppAgentEvents,
     submitGaugeAppCommand,
-    submitAccountProviderSecret,
+    submitAccountProviderLink,
     submitOrganizationSsoCredential,
     type GaugeAppCommandEnvelope,
     type GaugeAppSession,
@@ -110,7 +111,7 @@ describe("typed GaugeApp client", () => {
             .rejects.toThrow(/enterprise identity/);
     });
 
-    it("submits provider credentials only through the sealed account route", async () => {
+    it("seals a provider key for every trusted device and submits only the copies (DR-0334)", async () => {
         const route = fakeJson({ receipt: { status: "applied" }, result: { connection_id: "openai" } });
         const providerEnvelope: GaugeAppCommandEnvelope = {
             ...envelope("web"),
@@ -121,15 +122,33 @@ describe("typed GaugeApp client", () => {
             idempotency_key: "provider-openai-1",
             payload: { provider: "openai", label: "OpenAI API" },
         };
-        await submitAccountProviderSecret(route.json, providerEnvelope, "sk-example");
-        expect(route.calls[0]).toEqual([
+        const links = {
+            account: "acct-alice",
+            recipients: [
+                { device_id: "device:mac", public_key: vector.recipient_public_key_hex },
+                { device_id: "device:laptop", public_key: vector.recipient_public_key_hex },
+            ],
+        };
+        await submitAccountProviderLink(route.json, providerEnvelope, "sk-example", links, "openai", 2);
+        const [method, path, body, options] = route.calls[0] as [string, string, {
+            envelope: GaugeAppCommandEnvelope;
+            sealed: { expected_version: number; copies: { device_id: string }[] };
+        }, unknown];
+        expect([method, path, options]).toEqual([
             "POST",
             "/gaugeapps/account-settings/provider-connections/secrets",
-            { envelope: providerEnvelope, secret: "sk-example" },
             { idempotencyKey: "provider-openai-1" },
         ]);
-        await expect(submitAccountProviderSecret(route.json, envelope("web"), "secret"))
+        expect(body.envelope).toEqual(providerEnvelope);
+        expect(body.sealed.expected_version).toBe(2);
+        expect(body.sealed.copies.map((copy) => copy.device_id)).toEqual(["device:mac", "device:laptop"]);
+        const sent = JSON.stringify(body);
+        expect(sent).not.toContain("sk-example");
+        expect(sent).not.toContain(Buffer.from("sk-example").toString("hex"));
+        await expect(submitAccountProviderLink(route.json, envelope("web"), "secret", links, "openai", 0))
             .rejects.toThrow(/Account Settings/);
+        await expect(submitAccountProviderLink(route.json, providerEnvelope, "secret", { ...links, recipients: [] }, "openai", 0))
+            .rejects.toThrow(/Open GaugeDesk/);
     });
 
     it("starts consumer linking through the authenticated account route", async () => {

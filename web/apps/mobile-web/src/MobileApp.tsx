@@ -1,3 +1,5 @@
+import type { StreamEvent } from "@gaugewright/control-plane-client";
+import { createTaskCommandLedger, sameTaskAddress, taskCommandAddress } from "@gaugewright/workbench-ui/session-composer-controller";
 /**
  * The mobile **flow client** (`mobile-client.md`; MOB-029): the one place that
  * composes the committed D-MOBILE islands into the device's actual user journey —
@@ -78,7 +80,7 @@ import {
     ProjectSettingsContent,
     ProjectSettingsMenu,
     type PairingState,
-    pendingUserAfterSnapshot,
+    withPendingTasks,
     type ProjectSettingsPage,
     QueueSheet,
     reduceCarousel,
@@ -1260,29 +1262,13 @@ function MobileSession(props: {
     // plus the live SSE, exactly the desktop chat pane's source — so the mobile
     // Chat stop shows what the agent actually did, not just the consent surface.
     const [transcript, setTranscript] = createSignal<Transcript>(emptyTranscript);
-    const [pendingUser, setPendingUser] = createSignal<{
-        id: EngagementId;
-        text: string;
-        baselineLines: number;
-    } | null>(null);
-    const visibleTranscript = (): Transcript => {
-        const admitted = transcript();
-        const pending = pendingUser();
-        if (!pending || pending.id !== engagement()) return admitted;
-        const echo = pendingUserAfterSnapshot(admitted, pending.text, pending.baselineLines);
-        if (echo.lines.length === 0) return admitted;
-        const at = Math.min(pending.baselineLines, admitted.lines.length);
-        const lines = [
-            ...admitted.lines.slice(0, at),
-            ...echo.lines,
-            ...admitted.lines.slice(at),
-        ].map((line, seq) => line.seq === seq ? line : { ...line, seq });
-        return {
-            lines,
-            openText: admitted.openText === null || admitted.openText < at
-                ? admitted.openText
-                : admitted.openText + echo.lines.length,
-        };
+    const taskCommands = createTaskCommandLedger();
+    const visibleTranscript = (): Transcript => withPendingTasks(transcript(),
+        taskCommands.pending().filter((command) =>
+            command.scope.home === api && command.scope.chat === engagement()
+            && (!command.scope.authority || sameTaskAddress(taskCommandAddress(command.scope), taskCommandAddress(session.taskScope?.())))));
+    const observeTaskEvents = (id: EngagementId, events: readonly StreamEvent[]) => {
+        for (const event of events) taskCommands.observe({ home: api, chat: String(id), project: props.account?.project.id ?? null }, event);
     };
     let unsubscribe: (() => void) | null = null;
     onCleanup(() => unsubscribe?.());
@@ -1531,17 +1517,43 @@ function MobileSession(props: {
         setDraftText(savedDraft ?? "");
         setSelectedFile(null);
         setTranscript(emptyTranscript);
-        setPendingUser(null);
         setApproval(null);
         // A chat is selected → un-grey the chat/files panes and land on Chat.
         setCarousel((c) => applySelection(c, { chatSelected: true, fileSelected: false }));
         setCarousel((c) => reduceCarousel(c, tapGesture("chat")));
         try {
-            setTranscript(fromSnapshot(await api.getTranscript(id)));
+            const events = await api.getTranscript(id);
+            observeTaskEvents(id, events);
+            if (engagement() === id) setTranscript(fromSnapshot(events));
         } catch (e) {
             append(`transcript error: ${String(e)}`);
         }
-        unsubscribe = api.subscribe(id, (ev) => setTranscript((t) => reduceTranscript(t, ev)));
+        // The live stream cannot replay what it missed: a reconnect, including
+        // the close a lagged subscriber gets (SCALE-4), reloads the durable
+        // transcript. The first open follows the load above.
+        let streamOpened = false;
+        unsubscribe = api.subscribe(
+            id,
+            (ev) => {
+                observeTaskEvents(id, [ev]);
+                if (engagement() === id) setTranscript((t) => reduceTranscript(t, ev));
+            },
+            () => {
+                if (!streamOpened) {
+                    streamOpened = true;
+                    return;
+                }
+                void api.getTranscript(id).then(
+                    (snapshot) => {
+                        observeTaskEvents(id, snapshot);
+                        if (engagement() === id) setTranscript(fromSnapshot(snapshot));
+                    },
+                    () => {
+                        /* the next reconnect retries */
+                    },
+                );
+            },
+        );
     }
 
     let openedInitialEngagement = false;
@@ -1885,17 +1897,13 @@ function MobileSession(props: {
         selectedFile,
         selectFile: (path) => (path === null ? setSelectedFile(null) : openFile(path)),
         worktreeRev: filesKey,
-        onPendingUser: (id, text) => {
-            if (text === null) {
-                setPendingUser((pending) => pending?.id === id ? null : pending);
-            } else if (engagement() === id) {
-                setPendingUser({ id, text, baselineLines: transcript().lines.length });
-            }
-        },
+        taskCommands,
+        project: () => props.account?.project.id ?? null,
         onSettled: async (id) => {
             if (engagement() === id) {
                 try {
                     const events = await api.getTranscript(id);
+                    observeTaskEvents(id, events);
                     if (engagement() === id) setTranscript(fromSnapshot(events));
                 } catch (cause) {
                     append(`transcript error: ${String(cause)}`);
@@ -1915,7 +1923,11 @@ function MobileSession(props: {
         busy: session.busy,
         capabilities: session.composerCapabilities,
         canCommand: session.canCommand,
-        send: (text, images) => session.send(text, images),
+        send: (text, images, composedId, bindTask) => session.send(text, images, composedId, bindTask),
+        taskCommands,
+        taskScope: session.taskScope,
+        recoverTask: session.recoverTask,
+        appliesComposedIdOnce: () => session.appliesComposedIdOnce === true,
         stop: session.stop,
         draft: { value: draft, set: setDraft },
         // The host owns the draft across selection changes: `selectEngagement`

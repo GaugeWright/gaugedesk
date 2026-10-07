@@ -31,6 +31,11 @@ export type { TurnActivity, TurnObservation } from "@gaugewright/workbench-ui/se
 
 /** Narrow transport consumed by the shared panel Session projection. */
 export interface EmbedSessionApi {
+    /** Existing native Home actor observation; absent means author-unbound. */
+    taskIdentity?(): Promise<{ home_id: string; actor_id: string }>;
+    /** Existing per-visitor capability transport, distinct from a shared native chat. */
+    readonly publicSessionCorrelation?: boolean;
+    readonly appliesComposedIdOnce?: boolean;
     getChoiceCards?(id: EngagementId): Promise<ChoiceCard[]>;
     answerChoiceCard?(id: EngagementId, cardId: string, selections: ChoiceSelection[]): Promise<void>;
     transcribeAudio?(audio: Blob, signal: AbortSignal): Promise<string>;
@@ -38,7 +43,7 @@ export interface EmbedSessionApi {
     subscribe(id: EngagementId, onEvent: (ev: StreamEvent) => void, onOpen?: () => void): () => void;
     engagementDiff(id: EngagementId): Promise<string>;
     getMerge(id: EngagementId): Promise<MergeState>;
-    runEmbedTurn(id: EngagementId, prompt: string, images?: { data: string; mimeType: string }[]): Promise<unknown>;
+    runEmbedTurn(id: EngagementId, prompt: string, images?: { data: string; mimeType: string }[], composedId?: string): Promise<unknown>;
     /** `composedId` carries the outbox identity so a resend is idempotent
      *  (ADR 0137 §3). An implementation that cannot key on it may ignore it;
      *  what it must not do is treat two sends of the same id as two turns. */

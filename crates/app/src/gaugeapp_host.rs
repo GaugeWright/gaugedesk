@@ -465,12 +465,16 @@ pub struct CommandPlan {
     pub transient_result: Option<Value>,
 }
 
+/// Apply a committed command's projection using its ordered domain-fact positions.
+pub type CommittedProjection = Box<dyn FnOnce(&mut Workbench, &[i64])>;
+
 /// What applying a command leaves for the host to make durable.
 pub struct Applied {
     /// Records admitted in the same transaction as the command's receipt.
     pub facts: Vec<CommandRecordFact>,
-    /// Run once those records are durable, and never for a replay.
-    pub committed: Box<dyn FnOnce(&mut Workbench)>,
+    /// Run once those records are durable, and never for a replay. The positions
+    /// match `facts` in order and exclude the receipt and audit suffix.
+    pub committed: CommittedProjection,
 }
 
 impl Applied {
@@ -478,7 +482,7 @@ impl Applied {
     pub fn done() -> Self {
         Self {
             facts: Vec::new(),
-            committed: Box::new(|_| {}),
+            committed: Box::new(|_, _| {}),
         }
     }
 }
@@ -1067,6 +1071,7 @@ fn apply_command_with_services<D: GaugeAppDefinition>(
         mut facts,
         committed,
     } = D::apply(wb, &session.actor, id, envelope)?;
+    let domain_fact_count = facts.len();
     let receipt = gaugeapp_receipt(session, envelope, "applied");
     let change = GaugeAppChangeRecord {
         id: change_id,
@@ -1107,7 +1112,7 @@ fn apply_command_with_services<D: GaugeAppDefinition>(
             )
         })?;
     if !result.replayed {
-        committed(wb);
+        committed(wb, &result.positions[..domain_fact_count]);
         if let Some(entry) = crate::audit::committed_entry(result.chained_payload.as_deref()) {
             crate::audit::finish_committed_in(wb, &tenant_scope, &entry);
         }

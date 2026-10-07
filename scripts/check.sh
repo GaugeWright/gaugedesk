@@ -8,12 +8,13 @@
 #   scripts/check.sh rust       one section, while iterating
 #   scripts/check.sh web
 #   scripts/check.sh contracts
+#   scripts/check.sh models     the Quint models
 #
 # `all` runs every section even when one of them fails and names the failures
 # together at the end, so a red `dependencies` — an advisory about the world,
 # not about the diff — can no longer decide whether the bar says anything about
 # the change under test. The sections that never touch the cargo target
-# directory — contracts, web, dependencies — run alongside the ones that do,
+# directory — contracts, web, models, dependencies — run alongside the ones that do,
 # and their transcripts are replayed in that order once the cargo sections
 # finish; under Buck2 they run after them instead. See run_all.
 #
@@ -24,9 +25,10 @@
 #
 # Deliberately not in `all`, because each needs something a change gate should
 # not require: coverage, mobile and desktop packaging, OIDC/SAML provider
-# matrices, and the deployed production canaries. The Quint models are their own
-# path-triggered gate — run `scripts/check-models.sh both` when you change
-# anything under specs/models.
+# matrices, and the deployed production canaries. The Quint models are in it,
+# as the `models` section (WS-48): under Buck2 it re-runs only when a model,
+# its scripts or the Quint that specs/models/package-lock.json locks changes,
+# which is the path filter formal-models.yml used to state.
 #
 # Both native shells *are* in `all`, because the `native-shells` job makes them
 # enforced pull-request gates and a local green bar that omits an enforced gate
@@ -103,6 +105,11 @@ elif command -v buck2 >/dev/null 2>&1 \
   via_buck2=1
 fi
 export GREEN_BAR_VIA_BUCK2="$via_buck2"
+# A cold proof owns this fresh directory; normal jobs retain their warm output.
+# Explicit config below carries it through the existing daemon into its action.
+if [ -n "${GREEN_BAR_COLD_CARGO_TARGET_DIR:-}" ]; then
+  export CARGO_TARGET_DIR="$GREEN_BAR_COLD_CARGO_TARGET_DIR"
+fi
 # One nonce for the whole run, and the prerequisite word beside it: the first
 # is what a world-reading section demands before it will run, the second is part
 # of every action's key, so a run that skipped a section is never served to one
@@ -126,7 +133,11 @@ gate_section() {
   transcript="$(mktemp)"
   if [ -n "$via_buck2" ]; then
     local log
-    log="$(buck2 build "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" \
+    local cold_args=()
+    if [ -n "${GREEN_BAR_COLD_CARGO_TARGET_DIR:-}" ]; then
+      cold_args=(--no-remote-cache -c "green_bar.cold_cargo_target_dir=$GREEN_BAR_COLD_CARGO_TARGET_DIR")
+    fi
+    log="$(buck2 build "//:$1" ${cold_args[@]+"${cold_args[@]}"} -c "green_bar.run=$GREEN_BAR_RUN" \
       -c "green_bar.prerequisites=${prerequisites:-required}" --show-full-simple-output)" || status=$?
     [ "$status" -eq 0 ] && { cat "$log" | tee "$transcript"; status=$?; }
   else
@@ -478,6 +489,13 @@ run_web() {
     if native_targets; then gate_section native-web; else gate_section web; fi
 }
 
+# The Quint models. No cargo, no word: Quint is installed from its own lockfile,
+# so there is no host prerequisite for an absence to be about.
+run_models() {
+    echo "== formal models =="
+    gate_section models
+}
+
 # The dependency audit lives here rather than in a workflow step so that the
 # documented local green bar and the enforced gate stay the same command. It is
 # its own section because it is the one part of this script that needs the
@@ -601,9 +619,9 @@ end_alongside() {
 # separate process has its own errexit and none of that state.
 #
 # The sections that never touch the cargo target directory — `contracts`,
-# `web`, `dependencies` — run alongside the ones that do. `rust` is most of the
-# bar and saturates the cores only while it compiles; the other three are
-# single-threaded scripts, node builds and network calls that on their own
+# `web`, `models`, `dependencies` — run alongside the ones that do. `rust` is
+# most of the bar and saturates the cores only while it compiles; the others
+# are scripts, node builds, simulator runs and network calls that on their own
 # leave the machine idle, and nothing they read or write meets what the cargo
 # sections read or write (`web`'s one cargo call builds a wasm target into its
 # own profile directory). So they start first, in the background, and the cargo
@@ -641,7 +659,7 @@ run_all() {
     local lane rc index
     local transcripts
     transcripts="$(mktemp -d)"
-    local alongside=(contracts web dependencies)
+    local alongside=(contracts web models dependencies)
     local foreground=(rust desktop mobile windows)
     local pids=()
 
@@ -714,7 +732,7 @@ run_all() {
         rc=0
         case "$lane" in
             desktop|mobile) lane_runner "$lane" "$prerequisites" || rc=$? ;;
-            contracts|web|dependencies) lane_runner "$lane" ${word[@]+"${word[@]}"} || rc=$? ;;
+            contracts|web|models|dependencies) lane_runner "$lane" ${word[@]+"${word[@]}"} || rc=$? ;;
             *) lane_runner "$lane" || rc=$? ;;
         esac
 
@@ -781,8 +799,9 @@ dispatch() {
         mobile) run_mobile "$(prerequisite_policy "${2:-}")" ;;
         rust) run_rust ;;
         web) run_web ;;
+        models) run_models ;;
         windows) run_windows ;;
-        *) echo "usage: scripts/check.sh [all|required|contracts|dependencies|desktop|mobile|rust|web|windows]" >&2; exit 2 ;;
+        *) echo "usage: scripts/check.sh [all|required|contracts|dependencies|desktop|mobile|models|rust|web|windows]" >&2; exit 2 ;;
     esac
 }
 

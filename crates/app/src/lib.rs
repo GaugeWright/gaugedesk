@@ -15,9 +15,11 @@ pub mod account_auth_ceremony;
 pub mod account_auth_custody;
 pub mod account_avatar;
 pub mod account_identity;
+pub mod account_keys;
 pub mod account_link_seal;
 pub mod account_links;
 pub mod account_links_sync;
+pub mod account_publish;
 pub mod account_routes;
 pub mod account_session;
 pub mod account_signin;
@@ -73,6 +75,7 @@ pub mod gate_service;
 pub mod gaugeapp_agent;
 pub mod gaugeapp_contract;
 pub mod gaugeapp_host;
+pub mod gaugevault_admin;
 pub mod gaugevault_dispatch;
 pub mod gaugevault_intake;
 pub mod gaugevault_namespace;
@@ -109,6 +112,7 @@ pub mod net_relay;
 pub mod net_server;
 pub mod net_tls;
 pub mod office_home_admission;
+pub mod office_profile;
 pub mod official_skills;
 pub mod open_api;
 pub mod open_route_stack;
@@ -125,10 +129,12 @@ pub mod project_credential_routes;
 pub mod project_fork;
 pub mod project_model_selection;
 pub mod project_owner;
+pub mod project_plan;
 mod project_policy_authority;
 pub mod project_settings_gaugeapp;
 pub mod project_tracker;
 pub mod project_tracker_routes;
+pub mod project_transfer;
 pub mod project_workflow;
 pub mod project_workflow_routes;
 pub mod protected_profiles;
@@ -139,6 +145,7 @@ pub mod relay_route_stack;
 pub mod remote_runtime;
 pub mod resolution_recording_policy;
 pub mod resource_store;
+pub mod root_publication;
 pub mod roster;
 pub mod secret;
 pub mod session;
@@ -155,6 +162,7 @@ pub mod tokenwright;
 pub mod turn_summary;
 mod whip_costs;
 mod whip_views;
+pub mod work_chat_funding;
 pub mod workbench_auth;
 pub mod workbench_state;
 pub mod workstream_host_contract;
@@ -187,7 +195,8 @@ pub use open_runtime::{
 pub(crate) use workbench_state::build_workbench;
 pub use workbench_state::{
     open_workbench, open_workbench_for_home_with_content_keywrap,
-    open_workbench_with_content_keywrap, SharedWorkbench, Workbench,
+    open_workbench_for_home_with_protected_library, open_workbench_with_content_keywrap,
+    SharedWorkbench, Workbench,
 };
 
 #[cfg(test)]
@@ -201,5 +210,11 @@ mod tests;
 
 #[cfg(test)]
 mod host_action_admission_tests;
+
+#[cfg(test)]
+mod panel_authoring_contract_tests;
+
+#[cfg(test)]
+mod raw_model_context_runtime_tests;
 
 pub mod host_action_delivery;

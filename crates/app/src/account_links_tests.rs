@@ -468,3 +468,380 @@ fn revoking_a_trusted_device_in_the_registry_deletes_its_copies() {
     assert_eq!(open(&set, PHONE.0, PHONE.1), None);
     assert_eq!(open(&set, MAC.0, MAC.1).as_deref(), Some("sk-1"));
 }
+
+/// A Hub-held link from before DR-0334, sealed with the Hub's own key.
+fn hold_on_the_hub(guard: &mut crate::Workbench, scope: &str, provider: &str, secret: &str) {
+    let sealed = guard.seal_account_secret(secret).unwrap();
+    guard
+        .upsert_account_credential_in_with_policy(
+            scope,
+            provider.to_owned(),
+            sealed,
+            String::new(),
+            BTreeSet::from([ModelExecutionClass::PrivateHome]),
+        )
+        .unwrap();
+}
+
+#[test]
+fn what_the_hub_held_moves_to_the_devices_once_one_can_hold_it() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    let mut guard = wb.lock_unpoisoned();
+    let scope = crate::account::account_scope(PERSON);
+    hold_on_the_hub(&mut guard, &scope, "openai", "sk-web");
+
+    // No device yet: nothing moves, and the Hub's copy stays.
+    assert_eq!(
+        migrate_held_links(&mut guard, PERSON, &scope, NOW).ok(),
+        Some(vec![])
+    );
+    assert!(
+        crate::account::credentials_in_scope(guard.store_ref(), &scope)["openai"]
+            .admits(ModelExecutionClass::PrivateHome)
+    );
+
+    for id in [MAC.0, PHONE.0] {
+        guard.upsert_account_device_in(&scope, &device(id)).unwrap();
+    }
+    for (id, seed) in [MAC, PHONE] {
+        let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+        for fact in register_recipient(&set, id, key(seed).public_key().as_str(), NOW).unwrap() {
+            fact.append(&mut guard, &scope).unwrap();
+        }
+    }
+    assert_eq!(
+        migrate_held_links(&mut guard, PERSON, &scope, NOW).ok(),
+        Some(vec!["openai".to_owned()])
+    );
+    let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+    assert_eq!(open(&set, MAC.0, MAC.1).as_deref(), Some("sk-web"));
+    assert_eq!(open(&set, PHONE.0, PHONE.1).as_deref(), Some("sk-web"));
+    assert!(set.links["openai"]
+        .execution_classes
+        .contains(&ModelExecutionClass::LocalInteractive));
+    let held = crate::account::credentials_in_scope(guard.store_ref(), &scope);
+    assert!(
+        held["openai"].sealed_token.is_empty(),
+        "the Hub's copy is gone"
+    );
+    assert!(!held["openai"].admits(ModelExecutionClass::PrivateHome));
+    assert_eq!(
+        migrate_held_links(&mut guard, PERSON, &scope, NOW).ok(),
+        Some(vec![]),
+        "it moves once"
+    );
+}
+
+#[test]
+fn a_link_the_account_already_holds_wins_over_the_hubs_older_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    let mut guard = wb.lock_unpoisoned();
+    let scope = crate::account::account_scope(PERSON);
+    guard
+        .upsert_account_device_in(&scope, &device(MAC.0))
+        .unwrap();
+    let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+    for fact in register_recipient(&set, MAC.0, key(MAC.1).public_key().as_str(), NOW).unwrap() {
+        fact.append(&mut guard, &scope).unwrap();
+    }
+    let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+    for fact in put_link(
+        &set,
+        "openai",
+        None,
+        &put(0, sealed(1, "sk-device", &[MAC])),
+        NOW,
+    )
+    .unwrap()
+    {
+        fact.append(&mut guard, &scope).unwrap();
+    }
+    hold_on_the_hub(&mut guard, &scope, "openai", "sk-older-web");
+
+    assert_eq!(
+        migrate_held_links(&mut guard, PERSON, &scope, NOW).ok(),
+        Some(vec![])
+    );
+    let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+    assert_eq!(open(&set, MAC.0, MAC.1).as_deref(), Some("sk-device"));
+    assert!(
+        crate::account::credentials_in_scope(guard.store_ref(), &scope)["openai"]
+            .sealed_token
+            .is_empty()
+    );
+}
+
+#[test]
+fn only_a_device_holding_the_current_version_records_a_check() {
+    let mut set = set_with(&[MAC]);
+    // A trusted device that never registered a key holds no copy.
+    set.active_devices.insert(PHONE.0.to_owned());
+    apply!(
+        set,
+        put_link(
+            &set,
+            "openai",
+            None,
+            &put(0, sealed(1, "sk-1", &[MAC])),
+            NOW
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        record_check(&set, "openai", PHONE.0, 1, true, NOW),
+        Err(LinkRefusal::NotADevice),
+        "a device with no copy has not used the key"
+    );
+    assert_eq!(
+        record_check(&set, "openai", MAC.0, 2, true, NOW),
+        Err(LinkRefusal::Stale { current: 1 })
+    );
+    apply!(
+        set,
+        record_check(&set, "openai", MAC.0, 1, false, NOW).unwrap()
+    );
+    assert_eq!(
+        set.check("openai").map(|check| check.reachable),
+        Some(false)
+    );
+    assert_eq!(
+        links_view(&set, None)["links"][0]["reachable"],
+        serde_json::json!(false)
+    );
+}
+
+// ---- hosted Homes (DR-0380) -----------------------------------------------------
+
+const HOME: (&str, u8) = ("home:cloud:personal", 11);
+
+/// An account with these devices, served by [`HOME`].
+fn set_served(devices: &[(&str, u8)]) -> LinkSet {
+    let mut set = set_with(devices);
+    set.homes
+        .insert(HOME.0.to_owned(), key(HOME.1).public_key());
+    set
+}
+
+fn put_for_homes(expected_version: u64, copies: Vec<SealedLinkCopy>) -> PutLink {
+    let mut put = put(expected_version, copies);
+    put.execution_classes = BTreeSet::from([
+        ModelExecutionClass::LocalInteractive,
+        ModelExecutionClass::PrivateHome,
+    ]);
+    put
+}
+
+#[test]
+fn a_home_use_link_reaches_every_home_serving_the_person_without_a_grant() {
+    let mut set = set_served(&[MAC]);
+    // Made on a device that seals for every recipient it is given.
+    apply!(
+        set,
+        put_link(
+            &set,
+            "openai",
+            Some(MAC.0),
+            &put_for_homes(0, sealed(1, "sk-1", &[MAC, HOME])),
+            NOW
+        )
+        .unwrap(),
+    );
+    assert_eq!(open(&set, HOME.0, HOME.1).as_deref(), Some("sk-1"));
+    assert_eq!(set.homes_holding("openai"), vec![HOME.0.to_owned()]);
+    let view = home_links_view(&set, HOME.0).unwrap();
+    assert_eq!(view["links"][0]["provider"], "openai");
+    assert!(view["links"][0]["copy"].is_object());
+
+    // Made by a page that sealed only for the devices: the Home waits for one,
+    // which seals for it as for a device trusted later.
+    apply!(
+        set,
+        put_link(
+            &set,
+            "openai",
+            None,
+            &put_for_homes(1, sealed(2, "sk-2", &[MAC])),
+            NOW
+        )
+        .unwrap(),
+    );
+    assert_eq!(set.waiting("openai"), vec![HOME.0.to_owned()]);
+    assert_eq!(open(&set, HOME.0, HOME.1), None, "the old version is gone");
+    assert!(home_links_view(&set, HOME.0).unwrap()["links"][0]["copy"].is_null());
+    apply!(
+        set,
+        add_copies(&set, "openai", 2, &sealed(2, "sk-2", &[HOME])).unwrap()
+    );
+    assert_eq!(open(&set, HOME.0, HOME.1).as_deref(), Some("sk-2"));
+    assert!(set.waiting("openai").is_empty());
+}
+
+#[test]
+fn a_link_not_for_home_use_never_reaches_a_home() {
+    let mut set = set_served(&[MAC]);
+    // The device offered the Home a copy anyway; it is dropped, not refused.
+    apply!(
+        set,
+        put_link(
+            &set,
+            "openai",
+            Some(MAC.0),
+            &put(0, sealed(1, "sk-1", &[MAC, HOME])),
+            NOW
+        )
+        .unwrap(),
+    );
+    assert!(set
+        .copies
+        .values()
+        .all(|copy| copy.copy.device_id != HOME.0));
+    assert!(set.waiting("openai").is_empty());
+    assert!(add_copies(&set, "openai", 1, &sealed(1, "sk-1", &[HOME])).is_err());
+    assert_eq!(home_links_view(&set, HOME.0).unwrap()["links"], json!([]));
+
+    // A sign-in a Home would have to refresh on its own does not reach one yet.
+    let mut oauth = put_for_homes(1, sealed(2, "bundle", &[MAC, HOME]));
+    oauth.authentication = CredentialAuthentication::OAuth;
+    apply!(
+        set,
+        put_link(&set, "openai", Some(MAC.0), &oauth, NOW).unwrap()
+    );
+    assert_eq!(open(&set, HOME.0, HOME.1), None);
+    assert!(set.waiting("openai").is_empty());
+}
+
+#[test]
+fn a_copy_for_a_home_that_does_not_serve_the_person_is_refused() {
+    let set = set_with(&[MAC]);
+    assert!(matches!(
+        put_link(&set, "openai", Some(MAC.0), &put_for_homes(0, sealed(1, "sk", &[MAC, HOME])), NOW),
+        Err(LinkRefusal::Coverage { unexpected, .. }) if unexpected == vec![HOME.0.to_owned()]
+    ));
+    assert_eq!(
+        home_links_view(&set, HOME.0),
+        Err(LinkRefusal::HomeNotServing)
+    );
+}
+
+#[test]
+fn leaving_the_homes_tenant_takes_its_copies_away() {
+    let mut set = set_served(&[MAC]);
+    apply!(
+        set,
+        put_link(
+            &set,
+            "openai",
+            Some(MAC.0),
+            &put_for_homes(0, sealed(1, "sk-1", &[MAC, HOME])),
+            NOW
+        )
+        .unwrap(),
+    );
+    set.homes.clear();
+    assert_eq!(open(&set, HOME.0, HOME.1), None);
+    assert_eq!(
+        home_links_view(&set, HOME.0),
+        Err(LinkRefusal::HomeNotServing)
+    );
+    let departed = set.departed_copies();
+    assert_eq!(departed.len(), 1);
+    apply!(set, departed);
+    assert!(set
+        .copies
+        .values()
+        .all(|copy| copy.copy.device_id != HOME.0));
+    assert_eq!(open(&set, MAC.0, MAC.1).as_deref(), Some("sk-1"));
+
+    // Revoking the link takes every copy, the Home's included.
+    let mut set = set_served(&[MAC]);
+    apply!(
+        set,
+        put_link(
+            &set,
+            "openai",
+            Some(MAC.0),
+            &put_for_homes(0, sealed(1, "sk-1", &[MAC, HOME])),
+            NOW
+        )
+        .unwrap(),
+    );
+    apply!(set, revoke_link(&set, "openai", NOW).unwrap());
+    assert!(set.copies.is_empty());
+}
+
+#[test]
+fn the_homes_serving_a_person_are_their_active_tenants_recorded_homes() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    let mut guard = wb.lock_unpoisoned();
+    let scope = crate::account::account_scope(PERSON);
+    let tenant =
+        crate::tenancy::provision_personal_tenant(guard.store_mut(), PERSON, "Person").unwrap();
+    assert!(LinkSet::rebuild(guard.store_ref(), &scope)
+        .unwrap()
+        .homes
+        .is_empty());
+
+    // Only a Home id may be recorded, and only a P-256 key.
+    assert!(record_hosted_home_recipient(
+        &mut guard,
+        &tenant,
+        "device:mac",
+        key(1).public_key().as_str(),
+        NOW
+    )
+    .is_err());
+    assert!(record_hosted_home_recipient(&mut guard, &tenant, HOME.0, "not a key", NOW).is_err());
+    let public = key(HOME.1).public_key();
+    assert!(
+        record_hosted_home_recipient(&mut guard, &tenant, HOME.0, public.as_str(), NOW).unwrap()
+    );
+    assert!(
+        !record_hosted_home_recipient(&mut guard, &tenant, HOME.0, public.as_str(), NOW).unwrap()
+    );
+    let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+    assert_eq!(set.homes.get(HOME.0), Some(&public));
+
+    // Someone who is not a member of that tenant is not served by its Home.
+    let stranger = crate::account::account_scope("acct-stranger");
+    assert!(LinkSet::rebuild(guard.store_ref(), &stranger)
+        .unwrap()
+        .homes
+        .is_empty());
+
+    // A member who leaves is no longer served.
+    let tenant_scope = crate::org::tenant_scope(&tenant);
+    let mut member = crate::org::Org::rebuild_in(guard.store_ref(), &tenant_scope)
+        .unwrap()
+        .member_by_authority(PERSON)
+        .unwrap()
+        .clone();
+    member.status = crate::org::MembershipStatus::Deprovisioned;
+    guard
+        .write_account_record_in(&tenant_scope, "membership", &member.id.clone(), &member)
+        .unwrap();
+    assert!(LinkSet::rebuild(guard.store_ref(), &scope)
+        .unwrap()
+        .homes
+        .is_empty());
+
+    // An erased Home is forgotten for everyone.
+    member.status = crate::org::MembershipStatus::Active;
+    guard
+        .write_account_record_in(&tenant_scope, "membership", &member.id.clone(), &member)
+        .unwrap();
+    assert_eq!(
+        LinkSet::rebuild(guard.store_ref(), &scope)
+            .unwrap()
+            .homes
+            .len(),
+        1
+    );
+    forget_hosted_home_recipient(&mut guard, &tenant, HOME.0).unwrap();
+    assert!(LinkSet::rebuild(guard.store_ref(), &scope)
+        .unwrap()
+        .homes
+        .is_empty());
+}

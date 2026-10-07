@@ -382,6 +382,171 @@ The files you edit are instructions for a different agent. They are not instruct
 You cannot test the Agent from this chat. Your instructions are not the Agent's, so anything you try here is shaped by them and tells the user nothing reliable about how the Agent behaves. When the user wants to see the Agent in action, tell them to use "test in a chat" on the Agent in the Workshop. It runs the draft as it stands, with no need to publish, in a separate chat with its own empty files, and testing again replaces that chat with one running the latest draft. For a Panel agent, "try in a preview chat" works the same way. Do not role-play the Agent to show what it would say.
 "#;
 
+struct ClientTaskContext {
+    author: crate::stream::TaskAuthor,
+    attempt: Option<crate::command_idempotency::TaskAttempt>,
+    client_request_id: String,
+    chat_id: String,
+    sender: Option<broadcast::Sender<ServerEvent>>,
+}
+
+impl ClientTaskContext {
+    fn user(&self, text: &str) -> ServerEvent {
+        ServerEvent::User {
+            text: text.to_owned(),
+            client_request_id: Some(self.client_request_id.clone()),
+            chat_id: Some(self.chat_id.clone()),
+            home_id: Some(self.author.home_id.clone()),
+            actor_id: Some(self.author.actor_id.clone()),
+        }
+    }
+
+    fn settled(&self, store: &mut Store, scope: &str) -> Result<(), AdmitError> {
+        let event = ServerEvent::TaskCorrelation {
+            home_id: self.author.home_id.clone(),
+            actor_id: self.author.actor_id.clone(),
+            client_request_id: self.client_request_id.clone(),
+            chat_id: self.chat_id.clone(),
+            outcome: crate::stream::TaskCorrelationOutcome::Settled,
+        };
+        append_transcript(store, scope, &event)?;
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(event);
+        }
+        Ok(())
+    }
+}
+
+fn admit_task_user(
+    store: &mut Store,
+    scope: &str,
+    task: &str,
+    client: Option<&ClientTaskContext>,
+) -> Result<i64, AdmitError> {
+    let event = client.map_or_else(
+        || ServerEvent::User {
+            text: task.to_owned(),
+            client_request_id: None,
+            chat_id: None,
+            home_id: None,
+            actor_id: None,
+        },
+        |client| client.user(task),
+    );
+    let payload = event.to_json();
+    let position = if let Some(attempt) = client.and_then(|client| client.attempt.as_ref()) {
+        let attempt_scope = task_attempt_scope(&attempt.command_id);
+        store.append_record_with_linked_record(
+            scope,
+            "transcript",
+            &payload,
+            &attempt_scope,
+            TASK_CORRELATION_ATTEMPT_KIND,
+            |user_entry_id| {
+                Ok(serde_json::to_string(&TaskAttemptRecord {
+                    chat_id: scope.to_owned(),
+                    user_entry_id,
+                    attempt: attempt.clone(),
+                })?)
+            },
+        )?
+    } else {
+        append_transcript(store, scope, &event)?
+    };
+    if let Some(sender) = client.and_then(|client| client.sender.as_ref()) {
+        let _ = sender.send(event);
+    }
+    Ok(position)
+}
+
+pub(crate) const TASK_CORRELATION_ATTEMPT_KIND: &str = "task_correlation_attempt";
+const TASK_ATTEMPT_SCOPE_PREFIX: &str = "http-task-attempt::";
+pub(crate) fn task_attempt_scope(command_id: &str) -> String {
+    format!("{TASK_ATTEMPT_SCOPE_PREFIX}{command_id}")
+}
+pub(crate) fn is_task_attempt_scope(scope: &str) -> bool {
+    scope.starts_with(TASK_ATTEMPT_SCOPE_PREFIX)
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TaskAttemptRecord {
+    chat_id: String,
+    user_entry_id: i64,
+    #[serde(flatten)]
+    attempt: crate::command_idempotency::TaskAttempt,
+}
+
+/// Match the existing actor inspection door; a legacy fallback is never an author.
+pub(crate) fn verified_task_author(
+    wb: &mut crate::Workbench,
+    headers: &axum::http::HeaderMap,
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<crate::stream::TaskAuthor> {
+    let context =
+        crate::home_routes::authenticate_home_work_request(wb, headers, method, path).ok()??;
+    Some(crate::stream::TaskAuthor {
+        home_id: wb.home_id().as_str().to_owned(),
+        actor_id: context.actor().as_str().to_owned(),
+    })
+}
+
+/// Repair from the actual authored User and its owning summary, never generic
+/// receipt status or a secondary publication. HTTP callers require the exact
+/// claimed attempt/body coordinate; test/internal turns may lack that coordinate.
+pub(crate) fn task_correlation(
+    store: &Store,
+    chat: &str,
+    key: &str,
+    author: &crate::stream::TaskAuthor,
+    attempt: Option<&crate::command_idempotency::TaskAttempt>,
+) -> Option<crate::stream::TaskCorrelation> {
+    let expected_position = if let Some(expected) = attempt {
+        let records = store
+            .records(
+                &task_attempt_scope(&expected.command_id),
+                TASK_CORRELATION_ATTEMPT_KIND,
+            )
+            .ok()?;
+        Some(records.into_iter().find_map(|payload| {
+            let record: TaskAttemptRecord = serde_json::from_str(&payload).ok()?;
+            (record.chat_id == chat && &record.attempt == expected).then_some(record.user_entry_id)
+        })?)
+    } else {
+        None
+    };
+    let events = store.events(chat).ok()?;
+    events.iter().rev().find_map(|(position, kind, payload)| {
+        if kind != "transcript" {
+            return None;
+        }
+        let user: serde_json::Value = serde_json::from_str(payload).ok()?;
+        if user["type"] != "user"
+            || user["chat_id"] != chat
+            || user["client_request_id"] != key
+            || user["home_id"] != author.home_id
+            || user["actor_id"] != author.actor_id
+        {
+            return None;
+        }
+        if expected_position.is_some_and(|expected| expected != *position) {
+            return None;
+        }
+        let settled = events.iter().any(|(summary_position, kind, payload)| {
+            *summary_position > *position
+                && kind == crate::turn_summary::TURN_SUMMARY_KIND
+                && serde_json::from_str::<crate::turn_summary::TurnSummary>(payload)
+                    .is_ok_and(|summary| summary.user_entry_id == *position)
+        });
+        settled.then(|| crate::stream::TaskCorrelation {
+            home_id: author.home_id.clone(),
+            actor_id: author.actor_id.clone(),
+            client_request_id: key.to_owned(),
+            chat_id: chat.to_owned(),
+            outcome: crate::stream::TaskCorrelationOutcome::Settled,
+        })
+    })
+}
+
 /// Append a durable transcript record (admitted run evidence) to the engagement's
 /// log — the snapshot the client reduces on load (`app-stack.md`: repairable).
 fn record_transcript(store: &mut Store, scope: &str, event: &ServerEvent) {
@@ -419,6 +584,7 @@ fn admit_turn_summary(
     error: Option<String>,
     diff: &str,
     reads: &[gaugedesk_core::resource::ResourceId],
+    client: Option<&ClientTaskContext>,
 ) -> Result<(), AdmitError> {
     let changed_paths = crate::advancement::TurnFacts::changed_paths_of(diff);
     let summary = crate::turn_summary::TurnSummary {
@@ -431,6 +597,11 @@ fn admit_turn_summary(
         certified_reads: crate::turn_summary::join_certified_reads(store, scope, reads)?,
     };
     crate::turn_summary::append(store, scope, &summary)?;
+    if let Some(client) = client {
+        // The owning summary already settled the turn. Publication failure must
+        // not replace its result or bypass managed reservation settlement.
+        let _ = client.settled(store, scope);
+    }
     Ok(())
 }
 
@@ -972,8 +1143,8 @@ pub fn run_task_streaming<G: EgressGate>(
     sink: &mut dyn FnMut(&Observation),
 ) -> Result<TaskResult, EngineError> {
     run_task_streaming_billed(
-        store, engagement, scope, harness, gate, task, images, sink, None, None, "", None, None,
-        None, None,
+        store, engagement, scope, harness, gate, task, images, sink, None, None, None, "", None,
+        None, None, None, None,
     )
 }
 
@@ -1002,6 +1173,9 @@ fn run_task_streaming_billed<G: EgressGate>(
     sink: &mut dyn FnMut(&Observation),
     managed_billing_scope: Option<&str>,
     managed_funding_ref: Option<&str>,
+    // Holds each managed call's credit and settles the turn from its usage
+    // (GaugeWright DR-0203). Exclusive with the unverified pair above.
+    credit_meter: Option<std::sync::Arc<crate::work_chat_funding::WorkChatMeter>>,
     // Context the model sees ahead of the task but the transcript does not record
     // as user text — currently answers to questions this agent asked (ADR 0113).
     prompt_prefix: &str,
@@ -1012,8 +1186,13 @@ fn run_task_streaming_billed<G: EgressGate>(
     pause_project: Option<&str>,
     office: Option<office_turn_startup::OfficeTurnContext<'_>>,
     office_startup: Option<office_turn_startup::OfficeTurnStartup>,
+    client: Option<&ClientTaskContext>,
 ) -> Result<TaskResult, EngineError> {
-    if office.is_some() && (managed_billing_scope.is_some() || managed_funding_ref.is_some()) {
+    if office.is_some()
+        && (managed_billing_scope.is_some()
+            || managed_funding_ref.is_some()
+            || credit_meter.is_some())
+    {
         return Err(EngineError::Message(
             "office turn cannot reserve hosted inference".into(),
         ));
@@ -1099,13 +1278,7 @@ fn run_task_streaming_billed<G: EgressGate>(
         // Admit the user message as durable transcript evidence (turn-boundary). The
         // transcript records the **raw** task; mode framing is invisible context the
         // model receives, not something the user typed.
-        let user_entry_id = append_transcript(
-            store,
-            scope,
-            &ServerEvent::User {
-                text: task.to_string(),
-            },
-        )?;
+        let user_entry_id = admit_task_user(store, scope, task, client)?;
         crate::target_change_set::admit_turn_process_declaration(
             store,
             scope,
@@ -1118,6 +1291,11 @@ fn run_task_streaming_billed<G: EgressGate>(
         managed_billing_scope.is_some(),
         managed_funding_ref.is_some()
     );
+    if credit_meter.is_some() && managed_billing_scope.is_some() {
+        return Err(EngineError::Message(
+            "a credit-funded turn cannot also reserve an unverified plan".into(),
+        ));
+    }
     let managed_reservation_id = managed_billing_scope
         .zip(managed_funding_ref)
         .map(|(billing_scope, funding_ref)| {
@@ -1161,6 +1339,18 @@ fn run_task_streaming_billed<G: EgressGate>(
             .bind_workspace_payload_retention(None)
             .map_err(EngineError::Harness)?;
     }
+    // Every call the runtime makes this turn holds credit before it is sent.
+    // A runtime that cannot meter per call refuses here, before any spend.
+    if let Some(meter) = &credit_meter {
+        meter.begin_turn(scope, user_entry_id);
+    }
+    harness
+        .bind_managed_call_meter(
+            credit_meter
+                .clone()
+                .map(|meter| meter as std::sync::Arc<dyn gaugedesk_harness::ManagedCallMeter>),
+        )
+        .map_err(EngineError::Harness)?;
     let outcome: TurnOutcome = match harness.run_turn(gate, &prompt, images, sink) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -1198,6 +1388,7 @@ fn run_task_streaming_billed<G: EgressGate>(
                 Some(reason),
                 &diff,
                 &[],
+                client,
             )?;
             if let (Some(reservation_id), Some(billing_scope)) =
                 (&managed_reservation_id, managed_billing_scope)
@@ -1256,7 +1447,19 @@ fn run_task_streaming_billed<G: EgressGate>(
         store.admit::<RunState>(scope, RunCommand::FailRun)?;
         RunPhase::Failed
     };
-    if let Some(usage) = &outcome.managed_usage {
+    if let Some(meter) = &credit_meter {
+        // Settled from the runtime's usage. A turn that ends without it keeps
+        // its holds: the calls' outcome is unknown until reconciled.
+        if let Some(usage) = &outcome.managed_usage {
+            meter.settle(usage, None).map_err(EngineError::Message)?;
+        } else if !meter.held().is_empty() {
+            tracing::warn!(
+                scope,
+                held = meter.held().len(),
+                "managed turn ended without usage; its credit holds stay open"
+            );
+        }
+    } else if let Some(usage) = &outcome.managed_usage {
         crate::managed_inference::append_usage(
             store,
             scope,
@@ -1445,6 +1648,7 @@ fn run_task_streaming_billed<G: EgressGate>(
         outcome.error.clone(),
         &diff,
         &output_reads,
+        client,
     )?;
 
     // Turn outcome as operational metadata only (counts + phases, no content).
@@ -1512,6 +1716,17 @@ pub fn run_task_remote(
     gate: &dyn EgressGate,
     task: &str,
 ) -> Result<RemoteTaskResult, EngineError> {
+    run_task_remote_correlated(store, scope, harness, gate, task, None)
+}
+
+fn run_task_remote_correlated(
+    store: &mut Store,
+    scope: &str,
+    harness: &mut dyn gaugedesk_harness::RemoteHarness,
+    gate: &dyn EgressGate,
+    task: &str,
+    client: Option<&ClientTaskContext>,
+) -> Result<RemoteTaskResult, EngineError> {
     // 1. Admit the run into durable truth (same precondition as the local path):
     //    a fresh engagement begins from Init, a subsequent turn re-enters from the
     //    prior terminal state. Either way the run must be re-admitted (INV-11).
@@ -1522,13 +1737,7 @@ pub fn run_task_remote(
     store.admit::<RunState>(scope, begin)?;
     store.admit::<RunState>(scope, RunCommand::AdmitRun)?;
     store.admit::<RunState>(scope, RunCommand::StartRun)?;
-    let user_entry_id = append_transcript(
-        store,
-        scope,
-        &ServerEvent::User {
-            text: task.to_string(),
-        },
-    )?;
+    let user_entry_id = admit_task_user(store, scope, task, client)?;
 
     let remote_address = harness.address().to_string();
 
@@ -1564,6 +1773,7 @@ pub fn run_task_remote(
                     Some(reason),
                     "",
                     &[],
+                    client,
                 )?;
                 return Err(EngineError::Harness(e));
             }
@@ -1595,6 +1805,7 @@ pub fn run_task_remote(
         None,
         "",
         &reads,
+        client,
     )?;
 
     Ok(RemoteTaskResult {
@@ -1707,6 +1918,7 @@ fn record_precheck_failure(
     task: &str,
     reason: String,
     code: &str,
+    client: Option<&ClientTaskContext>,
 ) -> Result<TaskResult, EngineError> {
     // The run starts then immediately fails on the gate — the same lifecycle a turn
     // that reaches the harness and errors admits (RequestRun→AdmitRun→StartRun→FailRun),
@@ -1729,14 +1941,8 @@ fn record_precheck_failure(
             .admit::<RunState>(scope, cmd)
             .map_err(|e| format!("{e:?}"))?;
     }
-    let user_entry_id = append_transcript(
-        store,
-        scope,
-        &ServerEvent::User {
-            text: task.to_string(),
-        },
-    )
-    .map_err(|error| format!("{error:?}"))?;
+    let user_entry_id =
+        admit_task_user(store, scope, task, client).map_err(|error| format!("{error:?}"))?;
     record_transcript(
         store,
         scope,
@@ -1753,6 +1959,7 @@ fn record_precheck_failure(
         Some(reason.clone()),
         "",
         &[],
+        client,
     )
     .map_err(|error| format!("{error:?}"))?;
     Ok(TaskResult {
@@ -1807,6 +2014,11 @@ pub struct EngagementTurnInput<'a> {
     /// authenticates only the prompt-free invocation preparation call; it is
     /// never a provider credential or durable runtime input.
     pub account_bearer: Option<&'a str>,
+    /// Exact caller-composed identity for foreground task observations. This is
+    /// UI correlation, never the WhippleScript runtime command identity below.
+    pub client_request_id: Option<&'a str>,
+    pub client_author: Option<&'a crate::stream::TaskAuthor>,
+    pub client_attempt: Option<&'a crate::command_idempotency::TaskAttempt>,
     /// Stable Home-admitted command identity for unattended execution. A retry
     /// reuses this exact WhippleScript command/receipt. Foreground HTTP turns
     /// instead derive it from their original middleware claim below.
@@ -2026,6 +2238,9 @@ fn run_claimed_engagement_turn(
         account_scope,
         tenant_scope,
         account_bearer,
+        client_request_id,
+        client_author,
+        client_attempt,
         runtime_command_id,
         original_http_command,
         mut harness_factory,
@@ -2221,6 +2436,17 @@ fn run_claimed_engagement_turn(
         )
     };
 
+    let client_context =
+        client_request_id
+            .zip(client_author)
+            .map(|(key, author)| ClientTaskContext {
+                author: author.clone(),
+                attempt: client_attempt.cloned(),
+                client_request_id: key.to_owned(),
+                chat_id: id.to_owned(),
+                sender: Some(sender.clone()),
+            });
+    let client = client_context.as_ref();
     let (package_root, package_version_ref) = match mode {
         ChatMode::Edit => (None, None),
         ChatMode::Use => package_selection
@@ -2428,6 +2654,7 @@ fn run_claimed_engagement_turn(
             thinking: None,
             system_prompt,
             credential_capability: None,
+            office_inference: None,
             sandbox: gaugedesk_harness::sandbox::SandboxPolicy::new(vec![worktree.to_path_buf()]),
             // The fake seam offers no people: this path never reaches a model, so
             // there is no tool schema for a roster to appear on.
@@ -2445,8 +2672,10 @@ fn run_claimed_engagement_turn(
             actor.as_str(),
             None,
             None,
+            None,
             runtime_command_id,
             original_http_command,
+            client,
             process_declaration,
             office_authority.as_ref(),
             None,
@@ -2465,6 +2694,7 @@ fn run_claimed_engagement_turn(
                 task,
                 reason,
                 "organization_model_unavailable",
+                client,
             );
         }
         // The private composition may override the authored provider/model. Public
@@ -2500,6 +2730,7 @@ fn run_claimed_engagement_turn(
                     task,
                     reason,
                     "credential_migration_failed",
+                    client,
                 );
             }
         }
@@ -2555,6 +2786,7 @@ fn run_claimed_engagement_turn(
                         task,
                         reason,
                         "credential_refresh_failed",
+                        client,
                     );
                 }
             }
@@ -2582,6 +2814,7 @@ fn run_claimed_engagement_turn(
                         task,
                         reason,
                         "credential_refresh_failed",
+                        client,
                     );
                 }
             }
@@ -2642,10 +2875,73 @@ fn run_claimed_engagement_turn(
                 code: Some("no_credential".into()),
             });
             let mut g = wb.lock_unpoisoned();
-            return record_precheck_failure(&mut g.store, id, task, reason, "no_credential");
+            return record_precheck_failure(
+                &mut g.store,
+                id,
+                task,
+                reason,
+                "no_credential",
+                client,
+            );
         }
         let mut resolved_funding_ref = credential_ref.clone();
-        let managed_billing_scope = if is_host_managed_provider(&provider) {
+        // A composition that names a verified-funding producer pays managed
+        // work chats from credits, holding each call before it is sent
+        // (GaugeWright DR-0203). Without one, the unverified local plan path
+        // below records usage and draws nothing.
+        let funding_authority = wb.lock_unpoisoned().managed_funding_authority.clone();
+        let mut credit_meter = None;
+        let managed_billing_scope = if let Some(authority) = funding_authority
+            .as_ref()
+            .filter(|_| is_host_managed_provider(&provider))
+        {
+            let admitted = {
+                let card = gaugedesk_whip_runtime::whip_stats::repository_rate_card()?;
+                let g = wb.lock_unpoisoned();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|error| format!("{error:?}"))?
+                    .as_secs();
+                crate::work_chat_funding::admit(
+                    g.store_ref(),
+                    authority,
+                    now,
+                    account_scope,
+                    tenant_scope,
+                    model.as_deref().unwrap_or_default(),
+                    &card,
+                )
+                .map_err(|error| format!("{error:?}"))?
+            };
+            match admitted {
+                Ok(funding) => {
+                    credit_meter = Some(std::sync::Arc::new(
+                        crate::work_chat_funding::WorkChatMeter::new(
+                            std::sync::Arc::new(wb.clone()),
+                            authority.clone(),
+                            funding,
+                        ),
+                    ));
+                    None
+                }
+                Err(refusal) => {
+                    let reason = refusal.reason();
+                    let _ = sender.send(ServerEvent::Error {
+                        reason: reason.clone(),
+                        code: Some(refusal.code().into()),
+                    });
+                    let mut g = wb.lock_unpoisoned();
+                    return record_precheck_failure(
+                        &mut g.store,
+                        id,
+                        task,
+                        reason,
+                        refusal.code(),
+                        client,
+                    );
+                }
+            }
+        } else if is_host_managed_provider(&provider) {
             let resolved = {
                 let g = wb.lock_unpoisoned();
                 crate::managed_inference::resolve_plan(g.store_ref(), account_scope, tenant_scope)
@@ -2664,6 +2960,7 @@ fn run_claimed_engagement_turn(
                     task,
                     reason,
                     "managed_plan_required",
+                    client,
                 );
             };
             if !plan.admits_future_run() {
@@ -2682,6 +2979,7 @@ fn run_claimed_engagement_turn(
                     task,
                     reason,
                     "managed_plan_suspended",
+                    client,
                 );
             }
             resolved_funding_ref = crate::managed_inference::funding_ref(&scope, &plan);
@@ -2936,6 +3234,9 @@ fn run_claimed_engagement_turn(
             // Work-chat persona is immutable authored package content.
             system_prompt,
             credential_capability,
+            // No office enrollment selects an approved inference endpoint yet
+            // (HIPAA-2); the runtime enforces one when this carries it.
+            office_inference: None,
             // A linked provider account (ACCT-1), if any — resolved above,
             // nearest-scope-wins (LLM-2, ADR 0062).
             sandbox: sandbox_policy,
@@ -2948,8 +3249,12 @@ fn run_claimed_engagement_turn(
         // so it may use this capability only after the governed turn settles.
         // Managed usage requires its own reservation and the hosted organization
         // broker is remote; both retain the first-message fallback for now.
+        // A title request is a second model call outside the governed turn's
+        // pinned transport, so an office-bound turn never makes one.
         if should_auto_title
+            && spec.office_inference.is_none()
             && managed_billing_scope.is_none()
+            && credit_meter.is_none()
             && (organization_selection.is_none() || title_broker.is_some())
         {
             title_model = Some(crate::chat_title::TitleModelContext {
@@ -2976,8 +3281,10 @@ fn run_claimed_engagement_turn(
             managed_billing_scope
                 .as_ref()
                 .map(|_| resolved_funding_ref.as_str()),
+            credit_meter,
             runtime_command_id,
             original_http_command,
+            client,
             process_declaration,
             office_authority.as_ref(),
             task_action_context.as_ref(),
@@ -3579,8 +3886,10 @@ fn drive_persistent_turn(
     actor_ref: &str,
     managed_billing_scope: Option<&str>,
     managed_funding_ref: Option<&str>,
+    credit_meter: Option<std::sync::Arc<crate::work_chat_funding::WorkChatMeter>>,
     runtime_command_id: Option<&str>,
     original_http_command: Option<&crate::command_idempotency::ClaimedHttpCommand>,
+    client: Option<&ClientTaskContext>,
     process_declaration: Option<crate::target_change_set::TurnProcessDeclaration>,
     office_authority: Option<&office_authority::OfficeTaskAuthority>,
     task_action_context: Option<&crate::identity::AuthenticatedActionContext>,
@@ -3591,7 +3900,10 @@ fn drive_persistent_turn(
     // free; fresh startup still follows successful office harness binding.
     let mut prepared_office_fork = None;
     let prepared_office_startup = if let Some(authority) = office_authority {
-        if managed_billing_scope.is_some() || managed_funding_ref.is_some() {
+        if managed_billing_scope.is_some()
+            || managed_funding_ref.is_some()
+            || credit_meter.is_some()
+        {
             return Err(EngineError::Message(
                 "office turn cannot reserve hosted inference".into(),
             ));
@@ -3871,6 +4183,7 @@ fn drive_persistent_turn(
             &mut sink,
             managed_billing_scope,
             managed_funding_ref,
+            credit_meter,
             &answers,
             fork_snapshot,
             pause_project.as_deref(),
@@ -3887,6 +4200,7 @@ fn drive_persistent_turn(
                 })
                 .transpose()?,
             prepared_office_startup,
+            client,
         );
         // The claim is released by its guard when the turn returns, not here: the
         // bookkeeping below is still part of this turn, and freeing the chat before
@@ -3977,6 +4291,616 @@ mod tests {
     use gaugedesk_harness::testing::{ScriptedHarness, ScriptedToolCall, ScriptedTurn};
     use gaugedesk_workspace::Instance;
     use std::io;
+
+    struct RefuseCorrelationMarker;
+    impl gaugedesk_store::ContentCodec for RefuseCorrelationMarker {
+        fn encode(&self, _scope: &str, kind: &str, payload: &str) -> Result<String, String> {
+            if kind == "transcript"
+                && serde_json::from_str::<serde_json::Value>(payload)
+                    .is_ok_and(|v| v["type"] == "taskcorrelation")
+            {
+                Err("synthetic secondary publication failure".into())
+            } else {
+                Ok(payload.into())
+            }
+        }
+        fn decode(&self, _scope: &str, _kind: &str, payload: &str) -> Option<String> {
+            Some(payload.into())
+        }
+    }
+
+    #[test]
+    fn task_correlation_atomic_user_failure_leaves_no_private_or_public_admission() {
+        struct RefuseUser(bool);
+        impl gaugedesk_store::ContentCodec for RefuseUser {
+            fn encode(&self, _scope: &str, kind: &str, payload: &str) -> Result<String, String> {
+                if (self.0 && kind == TASK_CORRELATION_ATTEMPT_KIND)
+                    || (!self.0
+                        && kind == "transcript"
+                        && serde_json::from_str::<serde_json::Value>(payload)
+                            .is_ok_and(|v| v["type"] == "user"))
+                {
+                    Err("synthetic owning User failure".into())
+                } else {
+                    Ok(payload.into())
+                }
+            }
+            fn decode(&self, _scope: &str, _kind: &str, payload: &str) -> Option<String> {
+                Some(payload.into())
+            }
+        }
+        struct NeverRun;
+        impl Harness for NeverRun {
+            fn run_turn(
+                &mut self,
+                _gate: &dyn EgressGate,
+                _prompt: &str,
+                _images: &[ImageContent],
+                _sink: &mut dyn FnMut(&Observation),
+            ) -> io::Result<TurnOutcome> {
+                panic!("User admission must precede runtime")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("atomic-chat").unwrap();
+        for refuse_companion in [false, true] {
+            let mut store = Store::open_in_memory()
+                .unwrap()
+                .with_codec(std::sync::Arc::new(RefuseUser(refuse_companion)));
+            let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+            let client = ClientTaskContext {
+                author: crate::stream::TaskAuthor {
+                    home_id: "home:test".into(),
+                    actor_id: "actor:test".into(),
+                },
+                attempt: Some(crate::command_idempotency::TaskAttempt {
+                    command_id: "claimed:atomic".into(),
+                    body_digest: "synthetic-body".into(),
+                }),
+                client_request_id: "atomic-key".into(),
+                chat_id: "atomic-chat".into(),
+                sender: None,
+            };
+            assert!(run_task_streaming_billed(
+                &mut store,
+                &eng,
+                "atomic-chat",
+                &mut NeverRun,
+                &gate,
+                "work",
+                &[],
+                &mut |_| {},
+                None,
+                None,
+                None,
+                "",
+                None,
+                None,
+                None,
+                None,
+                Some(&client)
+            )
+            .is_err());
+            assert!(store
+                .records("atomic-chat", TASK_CORRELATION_ATTEMPT_KIND)
+                .unwrap()
+                .is_empty());
+            assert!(store
+                .records("atomic-chat", "transcript")
+                .unwrap()
+                .is_empty());
+            assert!(crate::turn_summary::latest(&store, "atomic-chat")
+                .unwrap()
+                .is_none());
+            assert!(store
+                .records(
+                    &task_attempt_scope("claimed:atomic"),
+                    TASK_CORRELATION_ATTEMPT_KIND
+                )
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn task_correlation_encrypted_user_erasure_leaves_private_metadata_without_repair_authority() {
+        use crate::{at_rest::LoopbackKeyWrap, content_vault::ContentVault};
+        let dir = tempfile::tempdir().unwrap();
+        let vault = std::sync::Arc::new(ContentVault::new(
+            dir.path().join("keys"),
+            Box::new(LoopbackKeyWrap::new([7; 32])),
+        ));
+        let mut store = Store::open(dir.path().join("store.sqlite").to_str().unwrap())
+            .unwrap()
+            .with_codec(vault.clone());
+        let client = ClientTaskContext {
+            author: crate::stream::TaskAuthor {
+                home_id: "home:test".into(),
+                actor_id: "actor:test".into(),
+            },
+            attempt: Some(crate::command_idempotency::TaskAttempt {
+                command_id: "opaque-erasure-claim".into(),
+                body_digest: "synthetic-body-digest".into(),
+            }),
+            client_request_id: "erase-key".into(),
+            chat_id: "erase-chat".into(),
+            sender: None,
+        };
+        record_precheck_failure(
+            &mut store,
+            "erase-chat",
+            "synthetic private task",
+            "synthetic precheck failure".into(),
+            "synthetic_failure",
+            Some(&client),
+        )
+        .unwrap();
+        assert!(task_correlation(
+            &store,
+            "erase-chat",
+            "erase-key",
+            &client.author,
+            client.attempt.as_ref()
+        )
+        .is_some());
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        let payload:String=connection.query_row("SELECT payload FROM events WHERE scope_id='erase-chat' AND kind='transcript' ORDER BY position LIMIT 1",[],|row|row.get(0)).unwrap();
+        assert!(!payload.contains("synthetic private task"));
+        let private_scope = task_attempt_scope(&client.attempt.as_ref().unwrap().command_id);
+        let before = store
+            .records(&private_scope, TASK_CORRELATION_ATTEMPT_KIND)
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].contains("synthetic-body-digest"));
+        assert!(vault.crypto_erase("erase-chat"));
+        assert!(store
+            .records("erase-chat", "transcript")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .records(&private_scope, TASK_CORRELATION_ATTEMPT_KIND)
+                .unwrap(),
+            before,
+            "existing receipt metadata classification remains unchanged"
+        );
+        assert!(task_correlation(
+            &store,
+            "erase-chat",
+            "erase-key",
+            &client.author,
+            client.attempt.as_ref()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn task_correlation_exact_attempt_author_and_summary_only_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("attempt-chat").unwrap();
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        let mut store = Store::open_in_memory()
+            .unwrap()
+            .with_codec(std::sync::Arc::new(RefuseCorrelationMarker));
+        let author = crate::stream::TaskAuthor {
+            home_id: "home:test".into(),
+            actor_id: "actor:alice".into(),
+        };
+        let first = crate::command_idempotency::TaskAttempt {
+            command_id: "claimed:alice:v1".into(),
+            body_digest: "original-body".into(),
+        };
+        let rotated = crate::command_idempotency::TaskAttempt {
+            command_id: "claimed:alice:v2".into(),
+            body_digest: "original-body".into(),
+        };
+        let bob = crate::stream::TaskAuthor {
+            actor_id: "actor:bob".into(),
+            ..author.clone()
+        };
+        let client = ClientTaskContext {
+            author: author.clone(),
+            attempt: Some(first.clone()),
+            client_request_id: "same-key".into(),
+            chat_id: "attempt-chat".into(),
+            sender: None,
+        };
+        let result = run_task_streaming_billed(
+            &mut store,
+            &eng,
+            "attempt-chat",
+            &mut ScriptedHarness::new(vec![TurnOutcome {
+                assistant_text: "done".into(),
+                ..TurnOutcome::default()
+            }]),
+            &gate,
+            "work",
+            &[],
+            &mut |_| {},
+            None,
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
+            Some(&client),
+        )
+        .unwrap();
+        assert_eq!(
+            result.run_phase,
+            RunPhase::Completed,
+            "marker failure cannot replace outcome"
+        );
+        assert!(
+            task_correlation(&store, "attempt-chat", "same-key", &author, Some(&first)).is_some()
+        );
+        assert!(task_correlation(&store, "attempt-chat", "same-key", &bob, Some(&first)).is_none());
+        assert!(
+            task_correlation(&store, "attempt-chat", "same-key", &author, Some(&rotated)).is_none()
+        );
+        let changed = crate::command_idempotency::TaskAttempt {
+            body_digest: "changed-body".into(),
+            ..first.clone()
+        };
+        assert!(
+            task_correlation(&store, "attempt-chat", "same-key", &author, Some(&changed)).is_none()
+        );
+        let other_home = crate::stream::TaskAuthor {
+            home_id: "home:other".into(),
+            ..author.clone()
+        };
+        assert!(task_correlation(
+            &store,
+            "attempt-chat",
+            "same-key",
+            &other_home,
+            Some(&first)
+        )
+        .is_none());
+        let events = store.events("attempt-chat").unwrap();
+        let user = events
+            .iter()
+            .find(|(_, kind, payload)| {
+                kind == "transcript"
+                    && serde_json::from_str::<serde_json::Value>(payload).unwrap()["type"] == "user"
+            })
+            .unwrap();
+        let summary = crate::turn_summary::latest(&store, "attempt-chat")
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.user_entry_id, user.0);
+        let metadata = store
+            .records(
+                &task_attempt_scope(&first.command_id),
+                TASK_CORRELATION_ATTEMPT_KIND,
+            )
+            .unwrap();
+        assert_eq!(metadata.len(), 1);
+        let metadata: TaskAttemptRecord = serde_json::from_str(&metadata[0]).unwrap();
+        assert_eq!(metadata.user_entry_id, user.0);
+        assert_eq!(metadata.chat_id, "attempt-chat");
+        assert_eq!(metadata.attempt, first);
+        assert!(!store
+            .records("attempt-chat", "transcript")
+            .unwrap()
+            .join("\n")
+            .contains("taskcorrelation"));
+        // A later credential-scoped attempt with the same author/key is not the
+        // earlier turn: its own User exists but has no owning settle yet.
+        let next = ClientTaskContext {
+            attempt: Some(rotated.clone()),
+            ..client
+        };
+        let position = admit_task_user(&mut store, "attempt-chat", "work", Some(&next)).unwrap();
+        assert_ne!(position, summary.user_entry_id);
+        assert!(
+            task_correlation(&store, "attempt-chat", "same-key", &author, Some(&rotated)).is_none()
+        );
+        // Even a matching optional public marker cannot substitute for a summary.
+        store
+            .append_record(
+                "attempt-chat",
+                "transcript",
+                &ServerEvent::TaskCorrelation {
+                    home_id: author.home_id.clone(),
+                    actor_id: author.actor_id.clone(),
+                    client_request_id: "same-key".into(),
+                    chat_id: "attempt-chat".into(),
+                    outcome: crate::stream::TaskCorrelationOutcome::Settled,
+                }
+                .to_json(),
+            )
+            .unwrap_err();
+        assert!(
+            task_correlation(&store, "attempt-chat", "same-key", &author, Some(&rotated)).is_none()
+        );
+    }
+
+    #[test]
+    fn task_correlation_admission_precedes_execution_and_settlement_is_repairable() {
+        struct ObservedHarness {
+            receiver: tokio::sync::broadcast::Receiver<ServerEvent>,
+        }
+        impl Harness for ObservedHarness {
+            fn run_turn(
+                &mut self,
+                _gate: &dyn EgressGate,
+                _prompt: &str,
+                _images: &[ImageContent],
+                _sink: &mut dyn FnMut(&Observation),
+            ) -> io::Result<TurnOutcome> {
+                let user = serde_json::to_value(
+                    self.receiver.try_recv().expect("admitted before harness"),
+                )
+                .unwrap();
+                assert_eq!(user["type"], "user");
+                assert_eq!(user["client_request_id"], "composed-one");
+                assert_eq!(user["chat_id"], "correlated-chat");
+                assert!(self.receiver.try_recv().is_err(), "no premature terminal");
+                Ok(TurnOutcome {
+                    assistant_text: "done".into(),
+                    ..TurnOutcome::default()
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("correlated-chat").unwrap();
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        let (sender, receiver) = broadcast::channel(8);
+        let mut terminal_receiver = sender.subscribe();
+        let client = ClientTaskContext {
+            author: crate::stream::TaskAuthor {
+                home_id: "home:test".into(),
+                actor_id: "actor:test".into(),
+            },
+            attempt: None,
+            client_request_id: "composed-one".into(),
+            chat_id: "correlated-chat".into(),
+            sender: Some(sender),
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        let result = run_task_streaming_billed(
+            &mut store,
+            &eng,
+            "correlated-chat",
+            &mut ObservedHarness { receiver },
+            &gate,
+            "work",
+            &[],
+            &mut |_| {},
+            None,
+            None,
+            None,
+            "",
+            None,
+            None,
+            None,
+            None,
+            Some(&client),
+        )
+        .unwrap();
+        assert_eq!(result.run_phase, RunPhase::Completed);
+        let user = terminal_receiver.try_recv().unwrap();
+        assert!(matches!(user, ServerEvent::User { .. }));
+        let terminal = serde_json::to_value(terminal_receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(terminal["outcome"], "settled");
+        assert_eq!(terminal["client_request_id"], "composed-one");
+        assert_eq!(terminal["chat_id"], "correlated-chat");
+        let repaired = task_correlation(
+            &store,
+            "correlated-chat",
+            "composed-one",
+            &client.author,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            repaired.outcome,
+            crate::stream::TaskCorrelationOutcome::Settled
+        );
+        assert!(
+            task_correlation(&store, "other-chat", "composed-one", &client.author, None).is_none()
+        );
+        assert!(
+            task_correlation(&store, "correlated-chat", "other-key", &client.author, None)
+                .is_none()
+        );
+        let events = store.events("correlated-chat").unwrap();
+        let summary = events
+            .iter()
+            .find(|(_, kind, _)| kind == crate::turn_summary::TURN_SUMMARY_KIND)
+            .unwrap();
+        let terminal = events
+            .iter()
+            .find(|(_, _, payload)| payload.contains("taskcorrelation"))
+            .unwrap();
+        assert!(summary.0 < terminal.0, "terminal follows admitted summary");
+    }
+
+    #[test]
+    fn task_correlation_failed_preflight_and_remote_turns_keep_exact_identity() {
+        use crate::test_support::RemoteLoopbackHarness;
+        let mut store = Store::open_in_memory().unwrap();
+        let client = ClientTaskContext {
+            author: crate::stream::TaskAuthor {
+                home_id: "home:test".into(),
+                actor_id: "actor:test".into(),
+            },
+            attempt: None,
+            client_request_id: "failed-composition".into(),
+            chat_id: "failed-chat".into(),
+            sender: None,
+        };
+        let result = record_precheck_failure(
+            &mut store,
+            "failed-chat",
+            "work",
+            "synthetic no credential".into(),
+            "no_credential",
+            Some(&client),
+        )
+        .unwrap();
+        assert_eq!(result.run_phase, RunPhase::Failed);
+        assert_eq!(
+            task_correlation(
+                &store,
+                "failed-chat",
+                "failed-composition",
+                &client.author,
+                None
+            )
+            .unwrap()
+            .outcome,
+            crate::stream::TaskCorrelationOutcome::Settled
+        );
+        let scope = "scope:acme:correlated-remote";
+        let client = ClientTaskContext {
+            author: crate::stream::TaskAuthor {
+                home_id: "home:test".into(),
+                actor_id: "actor:test".into(),
+            },
+            attempt: None,
+            client_request_id: "remote-composition".into(),
+            chat_id: scope.into(),
+            sender: None,
+        };
+        let mut remote = RemoteLoopbackHarness::text("127.0.0.1:7799", &["remote work"]);
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        let result = run_task_remote_correlated(
+            &mut store,
+            scope,
+            &mut remote,
+            &gate,
+            "work",
+            Some(&client),
+        )
+        .unwrap();
+        assert_eq!(result.run_phase, RunPhase::Completed);
+        assert!(result.federated_observations > 0);
+        assert_eq!(
+            task_correlation(&store, scope, "remote-composition", &client.author, None)
+                .unwrap()
+                .chat_id,
+            scope
+        );
+        let old_scope = "scope:acme:legacy-remote";
+        let mut legacy_remote = RemoteLoopbackHarness::text("127.0.0.1:7799", &["legacy work"]);
+        run_task_remote(
+            &mut store,
+            old_scope,
+            &mut legacy_remote,
+            &gate,
+            "legacy work",
+        )
+        .unwrap();
+        assert!(!store
+            .records(old_scope, "transcript")
+            .unwrap()
+            .join("\n")
+            .contains("client_request_id"));
+    }
+
+    #[test]
+    fn task_correlation_transport_failure_has_durable_settlement_not_refusal() {
+        struct DeadHarness;
+        impl Harness for DeadHarness {
+            fn run_turn(
+                &mut self,
+                _gate: &dyn EgressGate,
+                _prompt: &str,
+                _images: &[ImageContent],
+                _sink: &mut dyn FnMut(&Observation),
+            ) -> io::Result<TurnOutcome> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "synthetic runtime death",
+                ))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("failure-chat").unwrap();
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        let client = ClientTaskContext {
+            author: crate::stream::TaskAuthor {
+                home_id: "home:test".into(),
+                actor_id: "actor:test".into(),
+            },
+            attempt: Some(crate::command_idempotency::TaskAttempt {
+                command_id: "claimed:failure".into(),
+                body_digest: "body:failure".into(),
+            }),
+            client_request_id: "transport-composition".into(),
+            chat_id: "failure-chat".into(),
+            sender: None,
+        };
+        let mut store = Store::open_in_memory()
+            .unwrap()
+            .with_codec(std::sync::Arc::new(RefuseCorrelationMarker));
+        assert!(matches!(
+            run_task_streaming_billed(
+                &mut store,
+                &eng,
+                "failure-chat",
+                &mut DeadHarness,
+                &gate,
+                "work",
+                &[],
+                &mut |_| {},
+                Some(crate::account::ACCOUNT_SCOPE),
+                Some("gaugedesk:managed-plan:v1:test"),
+                None,
+                "",
+                None,
+                None,
+                None,
+                None,
+                Some(&client)
+            ),
+            Err(EngineError::Harness(_))
+        ));
+        assert_eq!(
+            store.fold::<RunState>("failure-chat").unwrap().phase,
+            RunPhase::Failed
+        );
+        assert_eq!(
+            task_correlation(
+                &store,
+                "failure-chat",
+                "transport-composition",
+                &client.author,
+                None
+            )
+            .unwrap()
+            .outcome,
+            crate::stream::TaskCorrelationOutcome::Settled
+        );
+        assert!(!store
+            .records("failure-chat", "transcript")
+            .unwrap()
+            .join("\n")
+            .contains("taskcorrelation"));
+        let reservations =
+            crate::managed_inference::fold_reservations(&store, crate::account::ACCOUNT_SCOPE)
+                .unwrap();
+        assert_eq!(reservations.reserved, 1);
+        assert_eq!(reservations.settled, 0);
+        assert_eq!(reservations.released, 1);
+        assert_eq!(reservations.outstanding, 0);
+        assert!(task_correlation(
+            &store,
+            "failure-chat",
+            "transport-composition",
+            &client.author,
+            client.attempt.as_ref()
+        )
+        .is_some());
+    }
 
     #[derive(Debug)]
     struct PresentCredential;
@@ -4650,6 +5574,7 @@ mod tests {
             "summarize the deck",
             "No model sign-in found. Link a key in Account settings.".to_string(),
             "no_credential",
+            None,
         )
         .unwrap();
 
@@ -4829,6 +5754,120 @@ mod tests {
         assert_eq!(assistants, vec!["Reading the file.", "All set."]);
     }
 
+    /// A credit-funded turn holds every call the runtime makes, compaction
+    /// included, and settles them from the turn's usage.
+    #[test]
+    fn credit_funded_turn_holds_each_call_and_settles_from_usage() {
+        use crate::work_chat_funding::tests as funded;
+        use std::sync::{Arc, Mutex};
+
+        struct MeteringHarness {
+            meter: Option<Arc<dyn gaugedesk_harness::ManagedCallMeter>>,
+        }
+        impl Harness for MeteringHarness {
+            fn bind_managed_call_meter(
+                &mut self,
+                meter: Option<Arc<dyn gaugedesk_harness::ManagedCallMeter>>,
+            ) -> std::io::Result<()> {
+                self.meter = meter;
+                Ok(())
+            }
+            fn run_turn(
+                &mut self,
+                _gate: &dyn EgressGate,
+                _prompt: &str,
+                _images: &[ImageContent],
+                _sink: &mut dyn FnMut(&Observation),
+            ) -> std::io::Result<TurnOutcome> {
+                let meter = self
+                    .meter
+                    .take()
+                    .expect("a credit-funded turn binds a meter");
+                for (ordinal, text) in [(1, "main"), (2, "compaction summary"), (3, "main")] {
+                    let body = serde_json::json!({ "input": text });
+                    meter
+                        .admit_call(&gaugedesk_harness::ManagedModelCall {
+                            command_id: "command:1",
+                            ordinal,
+                            url: "https://gateway.test/v1/responses",
+                            body: &body,
+                            output_limit: 8_192,
+                        })
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(TurnOutcome {
+                    assistant_text: "done".into(),
+                    managed_usage: Some(funded::usage(1_000, 100)),
+                    ..TurnOutcome::default()
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let inst = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
+        let eng = inst.create_engagement("e1").unwrap();
+        let gate = MembraneGate::new(&AgentConfig::default(), default_external_tools());
+        let ledger_store = funded::funded_store(1_000_000_000);
+        let funding = funded::funding(&ledger_store);
+        let ledger = Arc::new(Mutex::new(ledger_store));
+        let meter = Arc::new(crate::work_chat_funding::WorkChatMeter::new(
+            ledger.clone(),
+            funded::authority(),
+            funding,
+        ));
+        let mut store = Store::open_in_memory().unwrap();
+
+        // A runtime that cannot meter per call refuses before any spend.
+        let mut unmetered = gaugedesk_harness::testing::ScriptedHarness::new(vec![]);
+        assert!(run_task_streaming_billed(
+            &mut store,
+            &eng,
+            "e1",
+            &mut unmetered,
+            &gate,
+            "go",
+            &[],
+            &mut |_| {},
+            None,
+            None,
+            Some(meter.clone()),
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(funded::ledger_state(&ledger).reservations.is_empty());
+
+        let mut harness = MeteringHarness { meter: None };
+        run_task_streaming_billed(
+            &mut store,
+            &eng,
+            "e1",
+            &mut harness,
+            &gate,
+            "again",
+            &[],
+            &mut |_| {},
+            None,
+            None,
+            Some(meter.clone()),
+            "",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let state = funded::ledger_state(&ledger);
+        assert_eq!(state.reservations.len(), 3);
+        assert_eq!(state.held_nanos_usd(), 0);
+        assert_eq!(state.drawn_nanos_usd, 5_400_000);
+    }
+
     #[test]
     fn managed_usage_is_admitted_to_run_and_billing_scopes() {
         use gaugedesk_harness::testing::ScriptedHarness;
@@ -4849,6 +5888,16 @@ mod tests {
             ..TurnOutcome::default()
         }]);
         let mut store = Store::open_in_memory().unwrap();
+        let client = ClientTaskContext {
+            author: crate::stream::TaskAuthor {
+                home_id: "home:test".into(),
+                actor_id: "actor:test".into(),
+            },
+            attempt: None,
+            client_request_id: "billed-composition".into(),
+            chat_id: "e1".into(),
+            sender: None,
+        };
         run_task_streaming_billed(
             &mut store,
             &eng,
@@ -4860,14 +5909,33 @@ mod tests {
             &mut |_| {},
             Some(crate::account::ACCOUNT_SCOPE),
             Some("gaugedesk:managed-plan:v1:test"),
+            None,
             "",
             None,
             None,
             None,
             None,
+            Some(&client),
         )
         .unwrap();
 
+        assert_eq!(
+            task_correlation(&store, "e1", "billed-composition", &client.author, None)
+                .unwrap()
+                .outcome,
+            crate::stream::TaskCorrelationOutcome::Settled
+        );
+        assert!(
+            task_correlation(
+                &store,
+                crate::account::ACCOUNT_SCOPE,
+                "billed-composition",
+                &client.author,
+                None
+            )
+            .is_none(),
+            "task UI identity never becomes billing-scope evidence"
+        );
         let run_usage = crate::managed_inference::fold_usage(&store, "e1", 0).unwrap();
         let billed =
             crate::managed_inference::fold_usage(&store, crate::account::ACCOUNT_SCOPE, 10)
@@ -4986,6 +6054,9 @@ mod tests {
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
                 account_bearer: None,
+                client_request_id: None,
+                client_author: None,
+                client_attempt: None,
                 runtime_command_id: None,
                 original_http_command: None,
                 harness_factory: None,
@@ -5060,6 +6131,9 @@ mod tests {
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
                 account_bearer: None,
+                client_request_id: None,
+                client_author: None,
+                client_attempt: None,
                 runtime_command_id: None,
                 original_http_command: None,
                 harness_factory: None,
@@ -5136,6 +6210,9 @@ mod tests {
                 account_scope: crate::account::ACCOUNT_SCOPE,
                 tenant_scope: crate::org::ORG_SCOPE,
                 account_bearer: None,
+                client_request_id: None,
+                client_author: None,
+                client_attempt: None,
                 runtime_command_id: None,
                 original_http_command: None,
                 harness_factory: None,
@@ -5591,6 +6668,9 @@ mod tests {
                         account_scope: crate::account::ACCOUNT_SCOPE,
                         tenant_scope: crate::org::ORG_SCOPE,
                         account_bearer: None,
+                        client_request_id: None,
+                        client_author: None,
+                        client_attempt: None,
                         runtime_command_id: None,
                         client_build: None,
                         original_http_command: None,

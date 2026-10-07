@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { managedInferencePresentation, subscriptionPresentation } from "./account-page-presentation.ts";
+import { managedInferencePresentation, revokedDeviceNotice, subscriptionPresentation } from "./account-page-presentation.ts";
 
 const model = {
     plan: { plan: "Managed", status: "active", included_tokens: 5000 },
@@ -33,4 +33,18 @@ test("customer linkage controls the billing handoff, not existence of a plan", (
     assert.match(managedInferencePresentation(unlinked).unavailableReason, /signup is not available/);
     assert.equal(managedInferencePresentation({ ...unlinked, billing: { ...unlinked.billing, configured_plan: { checkout_available: true } } }).available, true);
     assert.equal(managedInferencePresentation(model).unavailableReason, null);
+});
+
+test("revoking a device names the provider links it held, for rotating (DR-0334)", () => {
+    assert.equal(revokedDeviceNotice({ revoked_sessions: [] }), null);
+    assert.equal(revokedDeviceNotice({ held_links: [] }), null);
+    assert.equal(revokedDeviceNotice(null), null);
+    assert.equal(
+        revokedDeviceNotice({ held_links: ["openai"] }),
+        "Device revoked. It held your OpenAI link: if you no longer trust it, replace that key with the provider and link it again.",
+    );
+    assert.equal(
+        revokedDeviceNotice({ held_links: ["openai", "anthropic", "xai-grok"] }),
+        "Device revoked. It held your OpenAI, Anthropic and Grok links: if you no longer trust it, replace those keys with the provider and link them again.",
+    );
 });

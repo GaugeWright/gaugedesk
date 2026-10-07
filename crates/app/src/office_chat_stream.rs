@@ -155,9 +155,12 @@ impl Stream for OfficeChatStream {
                 self.ended = true;
                 return Poll::Ready(None);
             }
-            Poll::Ready(Some(Err(_))) if !check => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
+            // A lagged subscriber has missed events it can never be sent: end
+            // the stream so the client reconnects and reloads the durable
+            // transcript, rather than continuing with a gap (SCALE-4).
+            Poll::Ready(Some(Err(_))) => {
+                self.ended = true;
+                return Poll::Ready(None);
             }
             Poll::Pending if !check => return Poll::Pending,
             _ => None,

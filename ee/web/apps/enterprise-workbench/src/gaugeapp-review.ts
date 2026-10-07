@@ -85,6 +85,7 @@ export const REVIEW_COMMANDS = {
     "enterprise-identity.group-mapping.edit": ["administration", "enterprise-identity", "Change group mapping"],
     "enterprise-identity.group-mapping.remove": ["administration", "enterprise-identity", "Remove group mapping"],
     "organization-policy.set": ["administration", "organization-policy", "Change organization policy"],
+    "office-profile.enroll": ["administration", "organization-policy", "Enroll the office-controlled profile"],
     "software-policy.set": ["administration", "software-policy", "Change software policy"],
     "billing.contact.set": ["administration", "billing", "Change billing contact"],
     "account.profile.set": ["account-settings", "account", "Change your name"],
@@ -741,6 +742,13 @@ export function summarizeGaugeAppChange(proposal: GaugeAppProposal, page: GaugeA
                 field("Automatic publisher upgrades", enabled(security.allow_auto_upgrade), enabled(oldSecurity.allow_auto_upgrade ?? false));
                 field("Eligible Project Hosts", strings(data(p.placement).allowed_operators, "All operators"), strings(data(m.placement).allowed_operators, "All operators"));
                 field("Require approval for new placements", enabled(data(p.archetype_approval).require_approval), enabled(data(m.archetype_approval).require_approval));
+                break;
+            }
+            case "office-profile.enroll": {
+                const current = optionalData(m.office_profile);
+                field("Project Host", string(p.home_id));
+                field("Office-controlled profile", "Enrolled", current?.state === "enrolled" ? "Enrolled" : "Not enrolled");
+                note = "Permanent. This organization's work stays on this Project Host: no project can move to another Home or be transferred to an account. There is no way to leave the profile.";
                 break;
             }
             case "software-policy.set":

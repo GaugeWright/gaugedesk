@@ -744,6 +744,12 @@ impl Lifecycle for State {
     fn evolve(state: &State, event: Event) -> State {
         evolve(state, event)
     }
+
+    /// Checkpointed (SCALE-1). Raise the version with any change to `evolve`
+    /// or to the state's shape.
+    fn snapshot_codec() -> Option<crate::SnapshotCodec<Self::State>> {
+        Some(crate::SnapshotCodec::serde("gaugevault_credential", 1))
+    }
 }
 
 #[cfg(test)]

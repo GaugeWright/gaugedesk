@@ -1,6 +1,7 @@
 import type { RouteJson } from "./control-plane-transport";
 import type { RouteEventStream } from "./browser-route-json";
-import type { AccountDeviceLink, AccountGaugeAppPageId } from "./gaugeapp-account-models";
+import type { AccountDeviceLink, AccountGaugeAppPageId, AccountLinkRecipients } from "./gaugeapp-account-models";
+import { sealLinkCopies } from "./account-link-seal";
 import { parseGaugeAppPage, type AccountGaugeAppPage, type AdministrationGaugeAppPage, type AdministrationGaugeAppPageId, type CommercialGaugeAppPage, type ProjectHostsPage, type ModelProvidersPage } from "./gaugeapp-page-models";
 import type { CommercialGaugeAppPageId } from "./gaugeapp-commercial-models";
 import { arrayOf, booleanValue, integerValue, invalidModel, objectValue, oneOf, shape, stringValue, type ModelReader } from "./gaugeapp-model-validation";
@@ -338,10 +339,21 @@ export async function submitGaugeAppCommand(
     return value as GaugeAppCommandResult;
 }
 
-export async function submitAccountProviderSecret(
+/**
+ * Link a provider key for the whole account (DR-0334): seal it here, in the
+ * page that holds it, for each of the account's trusted devices, and submit
+ * only those copies. The Hub admits them as the link's next version and never
+ * receives the key. `currentVersion` is the version the page read for this
+ * provider, 0 when it has none; a link that moved since is refused, and the
+ * page reads again.
+ */
+export async function submitAccountProviderLink(
     json: RouteJson,
     envelope: GaugeAppCommandEnvelope,
     secret: string,
+    links: AccountLinkRecipients,
+    provider: string,
+    currentVersion: number,
 ): Promise<GaugeAppCommandResult<{ readonly connection_id: string; readonly verification: "unverified" }>> {
     if (envelope.app !== "account-settings" || ![
         "provider-connection.api-key.add",
@@ -349,8 +361,19 @@ export async function submitAccountProviderSecret(
     ].includes(envelope.command_id)) {
         throw new Error("The sealed provider route accepts Account Settings credential links only.");
     }
+    if (links.recipients.length === 0) {
+        throw new Error("None of your trusted devices can hold provider links yet. Open GaugeDesk on one of your computers first.");
+    }
+    const copies = await sealLinkCopies(
+        { account: links.account, provider, version: currentVersion + 1 },
+        secret,
+        links.recipients,
+    );
     const route = gaugeAppRoutes["account-settings"].providerSecret;
-    return await json(route.method, route.path, { envelope, secret }, {
+    return await json(route.method, route.path, {
+        envelope,
+        sealed: { expected_version: currentVersion, copies },
+    }, {
         idempotencyKey: envelope.idempotency_key,
     }) as GaugeAppCommandResult<{ readonly connection_id: string; readonly verification: "unverified" }>;
 }

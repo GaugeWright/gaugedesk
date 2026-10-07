@@ -342,7 +342,10 @@ impl Federation {
         Self::open_bound(authority.clone(), authority, root, broker_addr)
     }
 
-    fn open_bound(
+    /// [`Federation::open`] for a Home whose public authority is not the name
+    /// of its local key slot — as on every product Home, whose authority is
+    /// root-derived while its local account keeps its own name.
+    pub fn open_bound(
         authority: AuthorityId,
         key_authority: AuthorityId,
         root: &Path,
@@ -1052,6 +1055,9 @@ fn engine_peer_turn(
             account_scope: crate::account::ACCOUNT_SCOPE,
             tenant_scope: crate::org::ORG_SCOPE,
             account_bearer: None,
+            client_request_id: None,
+            client_author: None,
+            client_attempt: None,
             runtime_command_id: None,
             original_http_command: None,
             harness_factory: None,
@@ -1916,9 +1922,12 @@ fn run_allowed(store: &Store, project: &str, operator: &str) -> bool {
 /// [ADR 0074]: ../../../specs/decisions/0074-continuous-abac-floor-on-federated-runs.md
 fn run_place_floor_admits(store: &Store, library: &crate::library::Library, project: &str) -> bool {
     use gaugedesk_core::boundary_lifecycle::{pairing_admitted, PlacementPolicy};
-    let policy = crate::org::Org::rebuild(store)
-        .map(|o| o.effective_placement_policy())
-        .unwrap_or_else(|_| PlacementPolicy::open());
+    let Ok(org) = crate::org::Org::rebuild(store) else {
+        // An absent policy is open; an unreadable current policy is not.
+        // Uncertainty must not bypass the continuous placement floor (INV-20).
+        return false;
+    };
+    let policy = org.effective_placement_policy();
     if policy == PlacementPolicy::open() {
         return true; // no-op on the default (no-org) path
     }
@@ -2238,6 +2247,16 @@ impl Workbench {
         require_project_writes_available(self.store_ref(), project).is_err()
     }
 
+    /// Whether `project` is known here and bound to another Home: it has moved
+    /// away, and the Home it moved to serves and steps it. A project this Home
+    /// does not know at all is not "elsewhere"; its absence is its own answer.
+    pub(crate) fn project_homed_elsewhere(&self, project: &str) -> bool {
+        self.library
+            .projects
+            .get(project)
+            .is_some_and(|record| &record.home_id != self.home_id())
+    }
+
     /// [`Self::project_moving`] for the project a chat belongs to. A chat with no
     /// project (an authoring chat) belongs to no move.
     pub(crate) fn chat_project_moving(&self, chat: &str) -> bool {
@@ -2320,6 +2339,18 @@ fn apply_handoff(
     Ok(state)
 }
 
+/// Abort `project`'s pending move and wake its folder whips. The pause a
+/// pending move put on them ends with this (DR-0201 §3), so they resume now
+/// rather than at the supervisor's next sweep.
+pub(crate) fn abort_handoff(
+    wb: &mut Workbench,
+    project: &str,
+) -> Result<HandoffState, &'static str> {
+    let state = apply_handoff(wb.store_mut(), project, HandoffCommand::AbortHandoff)?;
+    wb.hint_project_workflows(crate::project_workflow::project_hint(project));
+    Ok(state)
+}
+
 /// Commit the reducer's Home flip and both project/workspace Home bindings in
 /// one SQLite transaction. Projections change only after all facts commit.
 fn commit_handoff_and_rebind(
@@ -2365,13 +2396,19 @@ fn commit_handoff_and_rebind(
     if let Some(payload) = &workspace_payload {
         records.push((LIBRARY_SCOPE, "project_collaboration_workspace", payload));
     }
-    wb.store_mut()
+    let positions = wb
+        .store_mut()
         .append_records_atomically(&records)
         .map_err(|_| "handoff: atomic Home commit failed")?;
+    let project_position = positions.get(events.len()).copied();
+    let workspace_position = positions.get(events.len() + 1).copied();
     for event in events {
         state = handoff::evolve(&state, event);
     }
-    wb.apply_atomic_project_home_rebind(project_record, workspace_record);
+    wb.apply_atomic_project_home_rebind(
+        (project_record, project_position),
+        workspace_record.map(|record| (record, workspace_position)),
+    );
     Ok(state)
 }
 
@@ -2381,7 +2418,11 @@ fn handoff_response(
     cmd: HandoffCommand,
 ) -> axum::response::Response {
     let mut guard = wb.lock_unpoisoned();
-    match apply_handoff(guard.store_mut(), project, cmd) {
+    let applied = match cmd {
+        HandoffCommand::AbortHandoff => abort_handoff(&mut guard, project),
+        cmd => apply_handoff(guard.store_mut(), project, cmd),
+    };
+    match applied {
         Ok(state) => (StatusCode::OK, Json(handoff_state_json(project, &state))).into_response(),
         Err(reason) => (StatusCode::BAD_REQUEST, reason).into_response(),
     }
@@ -2473,11 +2514,7 @@ pub async fn post_handoff_abort(
             .into_response();
     }
     let mut guard = wb.lock_unpoisoned();
-    let response = match apply_handoff(
-        guard.store_mut(),
-        &req.project,
-        HandoffCommand::AbortHandoff,
-    ) {
+    let response = match abort_handoff(&mut guard, &req.project) {
         Ok(state) => {
             let _ =
                 record_outgoing_handoff(guard.store_mut(), "resolved", &req.project, peer.as_str());
@@ -2776,18 +2813,33 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
         .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.payload).ok())
         .filter_map(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
         .collect();
+    // Only a live placement binds its Agent into the project. A removed
+    // placement's tombstone still travels as history, but the Agent it once
+    // named is not part of what moves (the receiver counts live placements).
     let agent_ids: std::collections::BTreeSet<String> = instances
         .iter()
         .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.payload).ok())
+        .filter(|v| v.get("op").and_then(|op| op.as_str()) != Some("tombstone"))
         .filter_map(|v| {
             v.get("agent_id")
                 .and_then(|a| a.as_str())
                 .map(str::to_string)
         })
         .collect();
+    // A built-in Agent is each Home's own seed, not project content: the
+    // receiving Home binds the placement to its own seed of the same id. Its
+    // record travels only so the receiver can check it holds the same
+    // published version; its authoring instance, authoring target and bytes
+    // never leave this Home.
+    let seeded_agent_ids: std::collections::BTreeSet<String> = agent_ids
+        .iter()
+        .filter(|id| crate::app_support::is_builtin_agent(id))
+        .cloned()
+        .collect();
     let instance_values = instances
         .iter()
         .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .filter(|v| v.get("op").and_then(|op| op.as_str()) != Some("tombstone"))
         .collect::<Vec<_>>();
     // Omit authoring bytes only when every placement of this Agent in the
     // relocating project is protected. A mixed licensed/protected project
@@ -2857,9 +2909,63 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
             }
         }
     }
+    // A built-in Agent's record is this Home's own: its config, authoring
+    // owner and other published versions stay here. What travels is only a
+    // reference to the versions the project's placements pin, which the
+    // receiver checks against its own seed.
+    for record in &mut agents {
+        let Ok(agent) = serde_json::from_str::<crate::library::AgentRecord>(&record.payload) else {
+            continue;
+        };
+        if !seeded_agent_ids.contains(&agent.id) {
+            continue;
+        }
+        let pinned: std::collections::BTreeSet<u64> = instance_values
+            .iter()
+            .filter(|value| value.get("agent_id").and_then(|id| id.as_str()) == Some(&agent.id))
+            .filter_map(|value| value.get("version").and_then(|version| version.as_u64()))
+            .collect();
+        let reference = crate::library::AgentRecord {
+            schema: agent.schema,
+            extra: Default::default(),
+            id: agent.id.clone(),
+            authoring_owner: None,
+            op: agent.op,
+            // The shipped name, never one this Home gave its seed.
+            name: crate::app_support::builtin_archetypes()
+                .iter()
+                .find(|builtin| builtin.id == agent.id)
+                .map_or_else(String::new, |builtin| builtin.name.to_owned()),
+            agent_kind: agent.agent_kind,
+            panel_profile: None,
+            instance_id: String::new(),
+            config: "{}".into(),
+            current_version: pinned
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(agent.current_version),
+            versions: agent
+                .versions
+                .into_iter()
+                .filter(|(version, _)| pinned.contains(version))
+                .collect(),
+            auto_upgrade: false,
+            forked_from: None,
+        };
+        if let Ok(payload) = serde_json::to_string(&reference) {
+            record.payload = payload;
+        }
+    }
     let authoring_instance_ids: std::collections::BTreeSet<String> = agents
         .iter()
         .filter_map(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .filter(|value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .is_none_or(|id| !seeded_agent_ids.contains(id))
+        })
         .filter_map(|value| {
             value
                 .get("instance_id")
@@ -2921,7 +3027,11 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
             && owner
                 .and_then(|owner| owner.get("archetype_id"))
                 .and_then(|id| id.as_str())
-                .is_some_and(|id| agent_ids.contains(id) && !protected_agent_ids.contains(id));
+                .is_some_and(|id| {
+                    agent_ids.contains(id)
+                        && !protected_agent_ids.contains(id)
+                        && !seeded_agent_ids.contains(id)
+                });
         project_owned || referenced_archetype
     });
     let project_target_ids = targets
@@ -3079,7 +3189,38 @@ fn collect_project_log(store: &Store, project: &str) -> Vec<HandoffLogRecord> {
                 payload,
             }),
     );
+    out.retain(|record| record.kind != crate::engine::TASK_CORRELATION_ATTEMPT_KIND);
     out
+}
+
+/// A local account is named only on its own computer: `local-user` here and
+/// `local-user` there are two different accounts. A project this computer's
+/// local account owns therefore travels owned by this Home's federation
+/// authority — the identity the receiver verified the offer against — and the
+/// receiver gives it to its own local account (DR-0328 §4). An account's
+/// project keeps its owner.
+fn local_owner_as_origin(
+    mut log: Vec<HandoffLogRecord>,
+    local_account: &str,
+    origin: &str,
+) -> Vec<HandoffLogRecord> {
+    for record in &mut log {
+        if record.scope != LIBRARY_SCOPE || record.kind != "project" {
+            continue;
+        }
+        let Ok(mut project) =
+            serde_json::from_str::<crate::library::ProjectRecord>(&record.payload)
+        else {
+            continue;
+        };
+        if crate::project_owner::recorded_owner(&project) == Some(local_account) {
+            crate::project_owner::record_owner(&mut project.extra, origin);
+            if let Ok(payload) = serde_json::to_string(&project) {
+                record.payload = payload;
+            }
+        }
+    }
+    log
 }
 
 /// The origin's snapshot of a project's content: one tagged, erasure-respecting
@@ -3607,7 +3748,7 @@ async fn resolve_handoffs_in_doubt(wb: &SharedWorkbench, peer: &AuthorityId) {
                 }
             }
             InDoubtResolution::CancelOffer => {
-                let _ = apply_handoff(guard.store_mut(), &project, HandoffCommand::AbortHandoff);
+                let _ = abort_handoff(&mut guard, &project);
                 let _ =
                     record_outgoing_handoff(guard.store_mut(), "resolved", &project, peer.as_str());
                 tracing::info!(%project, %peer, "handoff in doubt resolved: the offer did not stand");
@@ -3973,12 +4114,7 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
             (serde_json::json!({ "ok": ok }), false)
         }
         HandoffMsgKind::Declined => {
-            let ok = apply_handoff(
-                guard.store_mut(),
-                &wire.project,
-                HandoffCommand::AbortHandoff,
-            )
-            .is_ok();
+            let ok = abort_handoff(&mut guard, &wire.project).is_ok();
             if ok {
                 let _ = record_outgoing_handoff(
                     guard.store_mut(),
@@ -4225,6 +4361,15 @@ async fn drive_relocate(
 ) -> (StatusCode, serde_json::Value) {
     let (broker, me, source_home, subkey, delegation, pins, peer_key) = {
         let guard = wb.lock_unpoisoned();
+        // A project on an office-profile Home never moves to another Home
+        // (WS-424). Every relocation, by route or by an accepted invitation,
+        // starts here.
+        if let Some(refusal) = guard.office_profile_exit_refusal() {
+            return (
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": refusal }),
+            );
+        }
         let me = guard.federation_authority().clone();
         let root = federation_root_signing_key(&guard);
         let (subkey, delegation) = device_identity(&guard_root(&guard), &me, &root);
@@ -4340,7 +4485,11 @@ async fn drive_relocate(
                 let project_authority =
                     project_authority::prepare(&guard, project, peer.as_str(), &peer_key)?;
                 Ok((
-                    collect_project_log(guard.store_ref(), project),
+                    local_owner_as_origin(
+                        collect_project_log(guard.store_ref(), project),
+                        guard.authority().as_str(),
+                        me.as_str(),
+                    ),
                     content,
                     credential_key,
                     guard
@@ -4463,7 +4612,7 @@ async fn drive_relocate(
             } else {
                 let _ =
                     record_outgoing_handoff(guard.store_mut(), "resolved", project, peer.as_str());
-                let _ = apply_handoff(guard.store_mut(), project, HandoffCommand::AbortHandoff);
+                let _ = abort_handoff(&mut guard, project);
                 relocation_verdict(&verdict)
             }
         }
@@ -4678,6 +4827,15 @@ pub async fn post_invite(
         .project_owner_refusal(&headers, &req.project)
     {
         return refusal;
+    }
+    if req.disposition == InviteDisposition::Relocate {
+        if let Some(refusal) = wb.lock_unpoisoned().office_profile_exit_refusal() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": refusal })),
+            )
+                .into_response();
+        }
     }
     let invite_id = crate::library::gen_id("invite");
     let confirm = invite_confirm_code(&invite_id);
@@ -6883,6 +7041,32 @@ mod handoff_routes_tests {
     }
 
     #[test]
+    fn task_correlation_private_attempt_never_crosses_project_export() {
+        let mut store = mem_store();
+        seed_relocation_agent(&mut store, false);
+        let scope = "project::project-1::synthetic";
+        store
+            .append_record(
+                scope,
+                crate::engine::TASK_CORRELATION_ATTEMPT_KIND,
+                r#"{"command_id":"opaque-attempt","body_digest":"synthetic-body-digest"}"#,
+            )
+            .unwrap();
+        store
+            .append_record(
+                scope,
+                "transcript",
+                r#"{"type":"user","text":"synthetic admitted message"}"#,
+            )
+            .unwrap();
+        let log = collect_project_log(&store, "project-1");
+        assert!(log.iter().any(|record| record.kind == "transcript"));
+        assert!(!log.iter().any(|record| record.kind
+            == crate::engine::TASK_CORRELATION_ATTEMPT_KIND
+            || record.payload.contains("synthetic-body-digest")));
+    }
+
+    #[test]
     fn protected_relocation_excludes_plaintext_agent_definition() {
         let mut store = mem_store();
         seed_relocation_agent(&mut store, true);
@@ -7068,6 +7252,7 @@ mod handoff_routes_tests {
                 author_authority: String::new(),
                 author_root_pubkey: String::new(),
                 author_signature: None,
+                placement: None,
             },
             &source_root,
         )
@@ -7400,7 +7585,8 @@ mod handoff_routes_tests {
             )
             .unwrap();
 
-        let app = featured_routes(true).with_state(Arc::new(Mutex::new(wb)));
+        let shared = Arc::new(Mutex::new(wb));
+        let app = featured_routes(true).with_state(shared.clone());
         let accept = |bearer: Option<&str>| {
             let mut b = Request::builder()
                 .method("POST")
@@ -7421,12 +7607,36 @@ mod handoff_routes_tests {
             "an anonymous handoff-accept is refused in enterprise mode"
         );
         // A valid member bearer passes the gate and reaches the handoff logic (no pending ⇒ 404).
-        let resp = app.oneshot(accept(Some("member-token"))).await.unwrap();
+        assert!(
+            shared.lock().unwrap().session_roster().is_empty(),
+            "a refused accept leaves no roster entry"
+        );
+        let resp = app
+            .clone()
+            .oneshot(accept(Some("member-token")))
+            .await
+            .unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::NOT_FOUND,
             "a valid member is let through the auth gate"
         );
+        // ITGOV-3(d): admission writes the member's session into the IT roster (ITGOV-2).
+        let roster = shared.lock().unwrap().session_roster();
+        assert_eq!(roster.len(), 1, "the admitted accept is on the roster");
+        assert_eq!(roster[0].authority, "member-auth");
+        // The batch accept admits through the same gate and the same roster entry.
+        let all = Request::builder()
+            .method("POST")
+            .uri("/federation/handoff/accept-all")
+            .header("authorization", "Bearer member-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(all).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let roster = shared.lock().unwrap().session_roster();
+        assert_eq!(roster.len(), 1, "one bearer is one roster session");
+        assert_eq!(roster[0].authority, "member-auth");
     }
 }
 
@@ -7471,9 +7681,33 @@ mod run_place_floor_tests {
     }
 
     #[test]
+    fn malformed_retained_policy_refuses_instead_of_becoming_open() {
+        let mut store = store_with_policy(None);
+        store
+            .append_record(
+                crate::org::ORG_SCOPE,
+                "placement_policy",
+                &serde_json::json!({
+                    "id": "", "op": "upsert",
+                    "policy": { "require_attested": "not a boolean", "allowed_operators": [] }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert!(
+            crate::org::Org::rebuild(&store).is_err(),
+            "malformed is distinct from absent policy"
+        );
+        let lib = lib_with("p1", Some(Placement::local()));
+        assert!(
+            !run_place_floor_admits(&store, &lib, "p1"),
+            "unknown current org policy cannot admit a federated run"
+        );
+    }
+
+    #[test]
     fn open_policy_is_a_noop() {
         // No org policy configured ⇒ the floor admits every run (the solo / default path).
-        let store = store_with_policy(None);
         let lib = lib_with(
             "p1",
             Some(Placement {
@@ -7481,10 +7715,13 @@ mod run_place_floor_tests {
                 attested: false,
             }),
         );
-        assert!(
-            run_place_floor_admits(&store, &lib, "p1"),
-            "no org policy ⇒ org-ness never touches the run path"
-        );
+        for policy in [None, Some(PlacementPolicy::open())] {
+            let store = store_with_policy(policy);
+            assert!(
+                run_place_floor_admits(&store, &lib, "p1"),
+                "absent or explicitly open policy leaves the default path unchanged"
+            );
+        }
     }
 
     #[test]

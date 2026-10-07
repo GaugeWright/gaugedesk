@@ -7,11 +7,20 @@
  * from records, because no record exists until it is submitted. From submission
  * on, the host's queue is the authority and the browser holds a projection again.
  *
- * `held` means *unsubmitted on purpose*. There is no host-side notion of holding;
+ * `held` with no dispatch means *unsubmitted on purpose*. A dispatched held row
+ * is an uncertain task submission retained until an addressed observation arrives.
+ * There is no host-side notion of deliberate holding;
  * a held row simply never leaves this store, which is why stashing needs no
  * protocol verb on any surface.
  */
 import type { ImageRef } from "./attachments";
+
+export interface TaskCommandAddress {
+    readonly home_id: string;
+    readonly actor_id: string;
+    readonly project_id: string | null;
+    readonly chat_id: string;
+}
 
 export interface OutboxRow {
     /** Minted when the message is composed and never reassigned. Submission is an
@@ -34,6 +43,10 @@ export interface OutboxRow {
      *  set aside rather than resent, because resending is the one outcome that
      *  can duplicate a turn. */
     readonly dispatched?: boolean;
+    /** Correlated task category; absent on older rows and management/create commands. */
+    readonly task_correlated?: boolean;
+    /** Non-secret address proved before submission, never a credential or admission grant. */
+    readonly task_address?: TaskCommandAddress;
 }
 
 /** Where composed messages are kept before they are sent. Async on purpose: the

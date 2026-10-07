@@ -138,6 +138,12 @@ export interface AccountDirectory {
      * the caller where it already was.
      */
     readonly subject: string;
+    /**
+     * Signed hand-overs from earlier roots to later ones (DR-0361), oldest
+     * first, as the hub stores them. Opaque here: only the verifier reads them,
+     * and only to move a pin along them.
+     */
+    readonly transitions: readonly unknown[];
 }
 
 /**
@@ -164,12 +170,13 @@ export async function accountDirectory(json: RouteJson): Promise<AccountDirector
         return null;
     }
     const record = value as
-        { root_pubkey?: unknown; origin?: unknown; subject?: unknown } | null;
+        { root_pubkey?: unknown; origin?: unknown; subject?: unknown; transitions?: unknown } | null;
     const rootPubkey = typeof record?.root_pubkey === "string" ? record.root_pubkey.trim() : "";
     if (!rootPubkey) return null;
     const origin = typeof record?.origin === "string" ? record.origin.trim() : "";
     const subject = typeof record?.subject === "string" ? record.subject.trim() : "";
-    return { rootPubkey, origin: origin.replace(/\/+$/, ""), subject };
+    const transitions = Array.isArray(record?.transitions) ? record.transitions : [];
+    return { rootPubkey, origin: origin.replace(/\/+$/, ""), subject, transitions };
 }
 
 /**
@@ -307,6 +314,9 @@ export interface EnrollmentTicket {
     readonly session: string;
     readonly account_root: string;
     readonly broker: string;
+    /** The account whose own root the holder hands over (DR-0361 §1); a new device
+     *  signed in as anyone else refuses the ticket. Absent for the install's key. */
+    readonly account?: string;
 }
 
 /** One enrollment leg's live status: its phase and the 6-char SAS to compare out-of-band
@@ -711,6 +721,56 @@ export async function hubSessionClaimHome(json: RouteJson, person: string): Prom
     return hubSessionStatusFrom(await json("POST", "/account/hub-session/claim-home", {
         person, confirm: true,
     }));
+}
+
+/** A project this computer's local account owns that the signed-in account
+ * may receive (DR-0328 §7). */
+export interface LocalProject {
+    readonly id: ProjectId;
+    readonly name: string;
+}
+
+/** The signed-out projects the window's signed-in account could receive, and
+ * which account that is. */
+export interface LocalProjects {
+    readonly account: string;
+    readonly projects: readonly LocalProject[];
+}
+
+/** What this computer's local account could move to the window's signed-in
+ * account. A desktop window only: the relay, a hosted Home and a signed-out
+ * window are refused. */
+export async function localProjects(json: RouteJson): Promise<LocalProjects> {
+    const o = await json("GET", "/local-projects") as {
+        account?: string;
+        projects?: { id?: string; name?: string }[];
+    } | null;
+    return {
+        account: typeof o?.account === "string" ? o.account : "",
+        projects: (o?.projects ?? [])
+            .filter((project) => typeof project.id === "string" && project.id)
+            .map((project) => ({
+                id: project.id as ProjectId,
+                name: typeof project.name === "string" && project.name ? project.name : project.id as string,
+            })),
+    };
+}
+
+/** Move the named signed-out projects, and their chats, to the window's
+ * signed-in account. All of them move or none do. */
+export async function transferLocalProjects(
+    json: RouteJson,
+    projects: readonly ProjectId[],
+): Promise<{ readonly account: string; readonly moved: readonly ProjectId[] }> {
+    if (projects.length === 0) throw new Error("Choose at least one project to move");
+    const o = await json("POST", "/local-projects/transfer", { projects }) as {
+        account?: string;
+        moved?: string[];
+    } | null;
+    return {
+        account: typeof o?.account === "string" ? o.account : "",
+        moved: (o?.moved ?? []) as ProjectId[],
+    };
 }
 
 /** Native roster is a non-secret projection. Retaining a session does not

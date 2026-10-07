@@ -168,6 +168,7 @@ const examples = {
     "enterprise-identity.group-mapping.remove": [{ group: "engineering" }, {}],
     "organization-policy.set": [{ ...policy, security: { ...policy.security, idle_timeout_secs: 3600 } }, policy],
     "software-policy.set": [{ ...software, minimum_version: "2.0.0" }, software],
+    "office-profile.enroll": [{ home_id: "home:front-office" }, { ...policy, office_profile: { state: "available", this_home: "home:front-office" } }],
     "billing.contact.set": [{ name: "Ada Lovelace", email: "billing@example.invalid" }, { billing_contact: { name: "Previous contact", email: "old@example.invalid" } }],
     "account.authenticator.remove": [{ id: "passkey-a", kind: "passkey" }, { authenticators: [{ id: "passkey-a", label: "Laptop passkey" }] }],
     "account.session.revoke-current": [{}, sessions],
@@ -338,6 +339,15 @@ test("ownership, role and policy changes show exact current and proposed values"
     assert.equal(result.fields.length, 1, "unchanged policy values do not crowd the review");
     assert.deepEqual(result.fields.find((field) => field.label === "Idle timeout"), { label: "Idle timeout", value: "60 minutes", before: "30 minutes" });
     assert.ok(summary("organization-policy.set", policy, policy).unavailable);
+});
+
+test("office-profile enrollment names the Project Host and says it is permanent", () => {
+    const result = summary("office-profile.enroll", ...examples["office-profile.enroll"]);
+    assert.deepEqual(result.fields[0], { label: "Project Host", value: "home:front-office" });
+    assert.deepEqual(result.fields[1], { label: "Office-controlled profile", value: "Enrolled", before: "Not enrolled" });
+    assert.match(result.note, /no way to leave the profile/i);
+    assert.match(result.note, /cannot|no project can move/i);
+    assert.doesNotMatch(result.note, /hosted routes/, "enrollment does not yet close the hosted data routes (WS-426)");
 });
 
 test("refund review uses the processor currency and exact minor-unit amount", () => {

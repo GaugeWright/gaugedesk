@@ -535,7 +535,8 @@ export interface WorkspaceChange {
  *  its kind, so the client can place the fork-point seam correctly. Only `text`
  *  lacks it: streamed deltas are operational-only and never inherited. */
 export type StreamEvent =
-    | { type: "user"; text: string; entry_id?: number; forkable?: boolean; origin?: string }
+    | { type: "user"; text: string; entry_id?: number; forkable?: boolean; origin?: string; client_request_id?: string; chat_id?: string; home_id?: string; actor_id?: string }
+    | { type: "taskcorrelation"; client_request_id: string; chat_id: string; home_id?: string; actor_id?: string; outcome: "accepted" | "settled"; origin?: string }
     | { type: "assistant"; text: string; entry_id?: number; forkable?: boolean; origin?: string; settled_at_unix_ms?: number }
     | { type: "text"; delta: string }
     | { type: "tool"; tool: string; mediated: boolean; call_id?: string; target?: string; args?: string; origin?: string }

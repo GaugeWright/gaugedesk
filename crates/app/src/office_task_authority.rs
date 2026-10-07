@@ -248,14 +248,24 @@ impl OfficeTaskAuthority {
         &self,
         wb: &SharedWorkbench,
         command_id: &str,
-        scope: &str,
-        key: &str,
+        scope_key: (&str, &str),
+        legacy: (&str, &str),
         snapshot: &str,
     ) -> Result<(gaugedesk_store::CommandRecord, bool), AdmitError> {
+        let (scope, key) = scope_key;
         let mut wb = wb.lock_unpoisoned();
         let basis = self.prepare_basis(&wb)?;
-        wb.store_mut()
-            .claim_command_against(command_id, scope, key, snapshot, &basis)
+        let mut excluded = vec![legacy];
+        if legacy.0 != scope {
+            excluded.push((legacy.0, key));
+        }
+        wb.store_mut().claim_command_excluding(
+            command_id,
+            (scope, key),
+            snapshot,
+            Some(&basis),
+            &excluded,
+        )
     }
 
     pub(crate) fn prepare_basis(

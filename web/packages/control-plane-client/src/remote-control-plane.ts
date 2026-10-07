@@ -41,10 +41,12 @@ export interface ControlPlane {
         onEvent: (event: StreamEvent) => void,
         onOpen?: () => void,
     ): () => void;
+    taskIdentity?(): Promise<{ home_id: string; actor_id: string }>;
     runTask(
         id: EngagementId,
         prompt: string,
         images?: { data: string; mimeType: string }[],
+        composedId?: string,
     ): Promise<unknown>;
     stopTurn(id: EngagementId): Promise<StopTurnResult>;
     engagementDiff(id: EngagementId): Promise<string>;
@@ -364,12 +366,19 @@ export class RemoteControlPlane implements ControlPlane {
         return workbench.subscribe(this.transport(), id, onEvent, onOpen);
     }
 
+    async taskIdentity(): Promise<{ home_id: string; actor_id: string }> {
+        const identity = await this.route("GET", "/file-actions/actor") as { home?: unknown; actor?: unknown };
+        if (typeof identity.home !== "string" || !identity.home || typeof identity.actor !== "string" || !identity.actor) throw new Error("Task Home actor proof is unavailable");
+        return { home_id: identity.home, actor_id: identity.actor };
+    }
+
     runTask(
         id: EngagementId,
         prompt: string,
         images: { data: string; mimeType: string }[] = [],
+        composedId?: string,
     ) {
-        return workbench.runTask(this.transport(), id, prompt, images);
+        return workbench.runTask(this.transport(), id, prompt, images, composedId);
     }
 
     stopTurn(id: EngagementId) {

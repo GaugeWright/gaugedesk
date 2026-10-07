@@ -27,3 +27,29 @@ export function managedInferencePresentation(managed: ProviderConnectionsPageV1[
             : "Use GaugeWright-managed model access without bringing a provider account.",
     } as const;
 }
+
+const PROVIDER_NAMES: Readonly<Record<string, string>> = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "openai-generic": "your OpenAI-compatible endpoint",
+    "openrouter": "OpenRouter",
+    "xai": "xAI",
+    "openai-codex": "ChatGPT / Codex",
+    "xai-grok": "Grok",
+};
+
+/**
+ * What to tell a person after revoking a trusted device. The device's copies
+ * of their provider links are deleted, but it cannot unlearn a key it opened,
+ * so the links it held are named for rotating (DR-0334 §5). `result` is the
+ * revoke command's result as the server sent it.
+ */
+export function revokedDeviceNotice(result: unknown): string | null {
+    const held = result && typeof result === "object" && Array.isArray((result as { held_links?: unknown }).held_links)
+        ? (result as { held_links: unknown[] }).held_links.filter((provider): provider is string => typeof provider === "string")
+        : [];
+    if (held.length === 0) return null;
+    const names = held.map((provider) => PROVIDER_NAMES[provider] ?? provider);
+    const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+    return `Device revoked. It held your ${list} ${held.length === 1 ? "link" : "links"}: if you no longer trust it, replace ${held.length === 1 ? "that key" : "those keys"} with the provider and link ${held.length === 1 ? "it" : "them"} again.`;
+}

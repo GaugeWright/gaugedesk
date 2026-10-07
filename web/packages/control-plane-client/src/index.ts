@@ -39,6 +39,7 @@ export * from "./gaugeapp-page-models";
 export * from "./tokenwright-environment";
 export * from "./placement-policy";
 export * from "./projection-carriage";
+export * from "./task-correlation";
 export * from "./remote-control-plane";
 export * from "./workspace-delta";
 export * from "./project-tracker";

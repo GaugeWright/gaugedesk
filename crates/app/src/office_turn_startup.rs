@@ -109,6 +109,10 @@ impl StartupSnapshot {
                 kind: "transcript".into(),
                 payload: ServerEvent::User {
                     text: self.task.clone(),
+                    client_request_id: None,
+                    chat_id: None,
+                    home_id: None,
+                    actor_id: None,
                 }
                 .to_json(),
             },

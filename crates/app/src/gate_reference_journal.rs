@@ -138,6 +138,36 @@ impl GateHomeJournal<'_> {
         }
     }
 
+    pub fn reference_operations_for_target(
+        &self,
+        home_id: &str,
+        target_store: &str,
+    ) -> Result<Vec<ReferenceOperation>, JournalError> {
+        match self {
+            Self::Project { journal, .. } => {
+                journal.reference_operations_for_target(home_id, target_store)
+            }
+            Self::LegacyPrototype(store) => {
+                store.reference_operations_for_target(home_id, target_store)
+            }
+        }
+    }
+
+    pub fn reference_use_pins_for_target(
+        &self,
+        home_id: &str,
+        target_store: &str,
+    ) -> Result<Vec<ReferenceUsePin>, JournalError> {
+        match self {
+            Self::Project { journal, .. } => {
+                journal.reference_use_pins_for_target(home_id, target_store)
+            }
+            Self::LegacyPrototype(store) => {
+                store.reference_use_pins_for_target(home_id, target_store)
+            }
+        }
+    }
+
     pub fn classify_legacy_reference_use_unknown(
         &mut self,
         home_id: &str,

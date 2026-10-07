@@ -180,10 +180,25 @@ pub struct Workbench {
     /// Which projects members used lately, shared by every composition so a
     /// request is counted once however many layers see it (DR-0312).
     pub(crate) member_use: crate::key_delegation::MemberUse,
+    /// The verified-funding producer this composition trusts for credit-funded
+    /// work chats (GaugeWright DR-0203). Absent, a managed turn keeps the
+    /// unverified local plan path and draws no credits.
+    pub(crate) managed_funding_authority: Option<crate::managed_funding::FundingAuthority>,
     /// Sessions a test opens to drive the workbench directly, as a request
     /// handler would inside its session (WS-740).
     #[cfg(test)]
     pub(crate) test_session_holds: Vec<crate::content_vault::SessionHold>,
+}
+
+impl Workbench {
+    /// Fund this composition's managed work chats from verified grants and
+    /// credits. Route composition chooses the producer; no request can.
+    pub fn set_managed_funding_authority(
+        &mut self,
+        authority: Option<crate::managed_funding::FundingAuthority>,
+    ) {
+        self.managed_funding_authority = authority;
+    }
 }
 
 pub type SharedWorkbench = Arc<Mutex<Workbench>>;
@@ -226,6 +241,7 @@ pub fn open_workbench_with_content_keywrap(
         None,
         content_keywrap,
         StartupSeed::production(),
+        content_vault::StartupContentProtection::Ordinary,
     )?
     .with_attestation_mode(attestation_mode_from_env())
     .with_attestation_enabled(attestation_enabled());
@@ -294,6 +310,7 @@ pub(crate) fn open_lean_workbench_with_content_keywrap(
         None,
         content_keywrap,
         StartupSeed::lean(),
+        content_vault::StartupContentProtection::Ordinary,
     )?
     .with_attestation_mode(attestation_mode_from_env())
     .with_attestation_enabled(attestation_enabled());
@@ -316,6 +333,28 @@ pub fn open_workbench_for_home_with_content_keywrap(
         Some((home_id, authority_id)),
         content_keywrap,
         StartupSeed::production(),
+        content_vault::StartupContentProtection::Ordinary,
+    )?
+    .with_attestation_mode(attestation_mode_from_env())
+    .with_attestation_enabled(attestation_enabled());
+    Ok(Arc::new(Mutex::new(wb)))
+}
+
+/// Open an explicitly selected Home with authenticated library metadata from
+/// the first read/write. Refuses plaintext history and unavailable custody;
+/// supplies no migration, clinical enrollment or staff permission.
+pub fn open_workbench_for_home_with_protected_library(
+    root: &std::path::Path,
+    home_id: HomeId,
+    authority_id: AuthorityId,
+    content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
+) -> std::io::Result<SharedWorkbench> {
+    let wb = build_workbench_with_content_keywrap_for_home(
+        root,
+        Some((home_id, authority_id)),
+        content_keywrap,
+        StartupSeed::production(),
+        content_vault::StartupContentProtection::AuthenticatedLibrary,
     )?
     .with_attestation_mode(attestation_mode_from_env())
     .with_attestation_enabled(attestation_enabled());
@@ -339,6 +378,7 @@ pub(crate) fn build_workbench_with_content_keywrap(
         None,
         content_keywrap,
         StartupSeed::production(),
+        content_vault::StartupContentProtection::Ordinary,
     )
 }
 
@@ -347,11 +387,19 @@ fn build_workbench_with_content_keywrap_for_home(
     explicit_identity: Option<(HomeId, AuthorityId)>,
     content_keywrap: impl Fn(&std::path::Path) -> std::io::Result<Box<dyn at_rest::KeyWrap>>,
     seed: StartupSeed,
+    protection: content_vault::StartupContentProtection,
 ) -> std::io::Result<Workbench> {
     crate::protected_profiles::scavenge_stale_materializations();
     let (root, targets_dir) = prepare_workbench_root(root)?;
 
-    let (mut store, content_vault) = content_vault::open_startup_store(&root, content_keywrap)?;
+    let (mut store, content_vault) = match protection {
+        content_vault::StartupContentProtection::Ordinary => {
+            content_vault::open_startup_store(&root, content_keywrap)?
+        }
+        content_vault::StartupContentProtection::AuthenticatedLibrary => {
+            content_vault::open_startup_store_with_protection(&root, content_keywrap, protection)?
+        }
+    };
     let providers = default_workspace_providers();
     let home_id = explicit_identity
         .as_ref()
@@ -451,6 +499,7 @@ impl Workbench {
             project_workflow_changed: broadcast::channel(64).0,
             project_workflow_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             member_use: Default::default(),
+            managed_funding_authority: None,
             #[cfg(test)]
             test_session_holds: Vec::new(),
         }
@@ -478,3 +527,7 @@ impl Workbench {
         provider_for(&self.providers, inst_id)
     }
 }
+
+#[cfg(test)]
+#[path = "protected_library_startup_tests.rs"]
+mod protected_library_startup_tests;

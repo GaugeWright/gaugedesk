@@ -116,37 +116,39 @@ describe("createRemoteSession", () => {
     });
 
     it("send() echoes the user line optimistically and starts a turn", async () => {
-        let turn!: Promise<void>;
+        let turn!: Promise<unknown>;
         createRoot((dispose) => {
             const f = fakeApi();
             const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
-            turn = session.send("do the thing");
+            turn = session.send("do the thing", [], "composed-one");
             expect(session.transcript().lines.at(-1)?.text).toBe("do the thing");
-            expect(f.calls.runEmbedTurn).toHaveBeenCalledWith(ENG, "do the thing", []);
+            expect(f.calls.runEmbedTurn).toHaveBeenCalledWith(ENG, "do the thing", [], "composed-one");
             dispose();
         });
         await turn;
     });
 
     it("carries native image input through the scoped turn command", async () => {
-        let turn!: Promise<void>;
+        let turn!: Promise<unknown>;
         createRoot((dispose) => {
             const f = fakeApi();
             const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
             const image = { name: "pasted.png", mimeType: "image/png", data: "aGVsbG8=" };
-            turn = session.send("[attached image: pasted.png]", [image]);
+            turn = session.send("[attached image: pasted.png]", [image], "composed-image");
             expect(f.calls.runEmbedTurn).toHaveBeenCalledWith(
                 ENG,
                 "[attached image: pasted.png]",
                 [image],
+                "composed-image",
             );
+            expect(f.calls.runTask).not.toHaveBeenCalled();
             dispose();
         });
         await turn;
     });
 
     it("send() rejects blank input", async () => {
-        let turn!: Promise<void>;
+        let turn!: Promise<unknown>;
         createRoot((dispose) => {
             const f = fakeApi();
             const { session } = createRemoteSession({ api: f.api, engagementId: ENG });
@@ -242,5 +244,35 @@ describe("createRemoteSession", () => {
             dispose();
         });
         expect(f.calls.closed).toBe(true);
+    });
+});
+
+// WS-459: a public Session's durable User names the admitted request, which is
+// the one fact that confirms a composed message. A User carrying text alone —
+// what an older runtime still records — confirms nothing, so the message stays
+// unconfirmed rather than being retired on its text.
+describe("public Session task confirmation", () => {
+    async function sendWith(user: StreamEvent) {
+        const f = fakeApi();
+        const api = { ...f.api, publicSessionCorrelation: true, getTranscript: async () => [user] };
+        let result!: { session: ReturnType<typeof createRemoteSession>["session"]; dispose: () => void };
+        createRoot((dispose) => {
+            result = { session: createRemoteSession({ api, engagementId: ENG }).session, dispose };
+        });
+        const attempt = await result.session.send("hello", [], "composed-one");
+        return { attempt, session: result.session, dispose: result.dispose };
+    }
+    it("confirms from a durable User carrying the request and Session", async () => {
+        const { attempt, session, dispose } = await sendWith({ type: "user", text: "hello",
+            client_request_id: "composed-one", chat_id: String(ENG) } as StreamEvent);
+        expect(attempt && attempt.outcome()).toBe("accepted");
+        expect(session.taskCommands?.pending()).toEqual([]);
+        dispose();
+    });
+    it("leaves a text-only durable User unconfirmed", async () => {
+        const { attempt, session, dispose } = await sendWith({ type: "user", text: "hello" } as StreamEvent);
+        expect(attempt && attempt.outcome()).toBeUndefined();
+        expect(session.taskCommands?.pending()).toHaveLength(1);
+        dispose();
     });
 });

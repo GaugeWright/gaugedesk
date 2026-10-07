@@ -275,11 +275,15 @@ export interface Session {
      *  so that resending after an uncertain dispatch is answered rather than
      *  guessed. A Session that cannot may ignore it — but must not let one
      *  composed id become two turns. */
+    readonly taskCommands?: import("./session-composer-controller").TaskCommandLedger;
+    readonly taskScope?: import("solid-js").Accessor<import("./session-composer-controller").TaskCommandScope | undefined>;
+    readonly recoverTask?: import("./session-composer-controller").SessionComposerControllerOptions["recoverTask"];
     readonly send: (
         text: string,
         images?: readonly ImageRef[],
         composedId?: string,
-    ) => Promise<void>;
+        bindTask?: (attempt: import("./session-composer-controller").TaskCommandAttempt) => Promise<void>,
+    ) => Promise<void | import("./session-composer-controller").TaskCommandAttempt>;
     /** Does {@link send} carry `composedId` through to a host that applies it at
      *  most once? Only then may an unsettled dispatch be recovered by resending
      *  it; otherwise the composer sets that message aside for a person. Absent

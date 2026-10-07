@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { acceptHomeInvitation, createHomeInvitation, parseHomeInvitation } from "./home-invitation";
+import {
+    acceptHomeInvitation,
+    cancelHomeInvitation,
+    createHomeInvitation,
+    emailHomeInvitation,
+    listPendingHomeInvitations,
+    parseHomeInvitation,
+    resendHomeInvitation,
+} from "./home-invitation";
 
 function invitation(overrides: Record<string, unknown> = {}): string {
     const value = JSON.stringify({
@@ -110,5 +118,39 @@ describe("ordinary Home invitations", () => {
             project: "proj-1" as never,
             endpoint: "https://home.example",
         })).rejects.toThrow(/malformed/);
+    });
+
+    it("asks the account service to email an invitation and reports where it went", async () => {
+        const route = vi.fn(async () => ({ sent_to: "alex@example.test" }));
+        await expect(emailHomeInvitation(route, "abcd")).resolves.toBe("alex@example.test");
+        expect(route).toHaveBeenCalledWith("POST", "/account/project-invitations/email", { invite: "abcd" });
+        await expect(emailHomeInvitation(vi.fn(async () => ({})), "abcd")).rejects.toThrow();
+    });
+
+    it("lists, cancels and resends pending invitations without ever reading a link", async () => {
+        const route = vi.fn(async (method: string, path: string) => {
+            if (method === "GET") {
+                return {
+                    invitations: [
+                        { id: "hinv-1", authority: "", email: "alex@example.test", role: "viewer", expires_at: 9 },
+                        { id: "hinv-2", authority: "account:sam", email: null, role: "member", expires_at: 10 },
+                        { id: "", authority: "x", expires_at: 1 },
+                        { id: "hinv-3", authority: "", email: null, expires_at: 1 },
+                    ],
+                };
+            }
+            if (path.endsWith("/resend")) {
+                return { invite: invitation(), url: "https://desk.gaugewright.com/invite?d=x", expires_at: 11 };
+            }
+            return null;
+        });
+        await expect(listPendingHomeInvitations(route, "proj/1" as never)).resolves.toEqual([
+            { id: "hinv-1", authority: "", email: "alex@example.test", role: "viewer", expiresAt: 9 },
+            { id: "hinv-2", authority: "account:sam", email: null, role: "member", expiresAt: 10 },
+        ]);
+        expect(route).toHaveBeenCalledWith("GET", "/home/projects/proj%2F1/invitations");
+        await cancelHomeInvitation(route, "hinv-1");
+        expect(route).toHaveBeenCalledWith("POST", "/home/invitations/hinv-1/cancel", {});
+        await expect(resendHomeInvitation(route, "hinv-2")).resolves.toMatchObject({ expiresAt: 11, homeId: "home:owner" });
     });
 });

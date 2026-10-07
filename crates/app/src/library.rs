@@ -998,10 +998,64 @@ pub struct Library {
     /// placements are applied, so each project's scopes are keyed under its
     /// own key (DR-0312). Attached by the workbench; absent in a bare library.
     pub(crate) scope_index: Option<std::sync::Arc<crate::content_vault::ScopeProjectIndex>>,
+    /// The store position last applied to each record, by kind and id
+    /// (DR-0115 §3). An apply at or below it is a write that lost a race to a
+    /// newer one, and is ignored, so the projection converges on the store
+    /// whatever order concurrent writers reach it in.
+    pub(crate) applied: AppliedPositions,
 }
 
-/// Apply one record to its map: `Tombstone` removes the id, `Upsert` sets it.
-fn fold_one<T>(map: &mut BTreeMap<String, T>, id: &str, op: RecordOp, rec: T) {
+/// Last-applied library-scope position per `(record kind, id)` (DR-0115 §3).
+///
+/// A tombstone records its position too, so a stale upsert cannot resurrect an
+/// id a newer write retracted. An unpositioned apply — the startup fold, which
+/// reads the log in position order, and a seed or repair that writes no record
+/// — is unconditional and leaves the entry alone.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct AppliedPositions(BTreeMap<(&'static str, String), i64>);
+
+impl AppliedPositions {
+    /// Whether a write admitted at `position` may be applied, recording it if
+    /// so. `None` always applies.
+    fn admit(&mut self, kind: &'static str, id: &str, position: Option<i64>) -> bool {
+        let Some(position) = position else {
+            return true;
+        };
+        match self.0.get_mut(&(kind, id.to_owned())) {
+            Some(last) if *last >= position => false,
+            Some(last) => {
+                *last = position;
+                true
+            }
+            None => {
+                self.0.insert((kind, id.to_owned()), position);
+                true
+            }
+        }
+    }
+
+    /// The position last applied to `id` of `kind`, if any write applied one.
+    #[cfg(test)]
+    pub(crate) fn get(&self, kind: &'static str, id: &str) -> Option<i64> {
+        self.0.get(&(kind, id.to_owned())).copied()
+    }
+}
+
+/// Apply one record admitted at `position` to its map: `Tombstone` removes the
+/// id, `Upsert` sets it. An apply at or below the id's last-applied position is
+/// ignored (DR-0115 §3); returns whether it applied.
+fn fold_one<T>(
+    map: &mut BTreeMap<String, T>,
+    applied: &mut AppliedPositions,
+    kind: &'static str,
+    id: &str,
+    op: RecordOp,
+    rec: T,
+    position: Option<i64>,
+) -> bool {
+    if !applied.admit(kind, id, position) {
+        return false;
+    }
     match op {
         RecordOp::Tombstone => {
             map.remove(id);
@@ -1010,6 +1064,7 @@ fn fold_one<T>(map: &mut BTreeMap<String, T>, id: &str, op: RecordOp, rec: T) {
             map.insert(id.to_string(), rec);
         }
     }
+    true
 }
 
 impl Library {
@@ -1027,22 +1082,54 @@ impl Library {
         for row in records("agent")? {
             let r: AgentRecord = serde_json::from_str(&row)?;
             guard_record_schema("agent", &r.id, r.schema)?;
-            fold_one(&mut lib.agents, &r.id.clone(), r.op, r);
+            fold_one(
+                &mut lib.agents,
+                &mut lib.applied,
+                "agent",
+                &r.id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         for row in records("project")? {
             let r: ProjectRecord = serde_json::from_str(&row)?;
             guard_record_schema("project", &r.id, r.schema)?;
-            fold_one(&mut lib.projects, &r.id.clone(), r.op, r);
+            fold_one(
+                &mut lib.projects,
+                &mut lib.applied,
+                "project",
+                &r.id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         for row in records("instance")? {
             let r: InstanceRecord = serde_json::from_str(&row)?;
             guard_record_schema("instance", &r.id, r.schema)?;
-            fold_one(&mut lib.instances, &r.id.clone(), r.op, r);
+            fold_one(
+                &mut lib.instances,
+                &mut lib.applied,
+                "instance",
+                &r.id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         for row in records("public_deployment_binding")? {
             let r: PublicDeploymentBindingRecord = serde_json::from_str(&row)?;
             guard_record_schema("public_deployment_binding", &r.id, r.schema)?;
-            fold_one(&mut lib.public_deployments, &r.id.clone(), r.op, r);
+            fold_one(
+                &mut lib.public_deployments,
+                &mut lib.applied,
+                "public_deployment_binding",
+                &r.id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         for row in records("chat")? {
             let r: ChatRecord = serde_json::from_str(&row)?;
@@ -1052,22 +1139,54 @@ impl Library {
         for row in records("workstream")? {
             let r: WorkstreamRecord = serde_json::from_str(&row)?;
             guard_record_schema("workstream", &r.id, r.schema)?;
-            fold_one(&mut lib.workstreams, &r.id.clone(), r.op, r);
+            fold_one(
+                &mut lib.workstreams,
+                &mut lib.applied,
+                "workstream",
+                &r.id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         for row in records("work_target")? {
             let r: WorkTargetRecord = serde_json::from_str(&row)?;
             guard_record_schema("work_target", &r.id, r.schema)?;
-            fold_one(&mut lib.work_targets, &r.id.clone(), r.op, r);
+            fold_one(
+                &mut lib.work_targets,
+                &mut lib.applied,
+                "work_target",
+                &r.id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         for row in records("placement_targets")? {
             let r: PlacementTargetsRecord = serde_json::from_str(&row)?;
             guard_record_schema("placement_targets", &r.placement_id, r.schema)?;
-            fold_one(&mut lib.placement_targets, &r.placement_id.clone(), r.op, r);
+            fold_one(
+                &mut lib.placement_targets,
+                &mut lib.applied,
+                "placement_targets",
+                &r.placement_id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         for row in records("chat_target")? {
             let r: ChatTargetBindingRecord = serde_json::from_str(&row)?;
             guard_record_schema("chat_target", &r.chat_id, r.schema)?;
-            fold_one(&mut lib.chat_targets, &r.chat_id.clone(), r.op, r);
+            fold_one(
+                &mut lib.chat_targets,
+                &mut lib.applied,
+                "chat_target",
+                &r.chat_id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         for row in records("chat_target_set")? {
             let r: ChatTargetSetRevisionRecord = serde_json::from_str(&row)?;
@@ -1100,15 +1219,26 @@ impl Library {
             guard_record_schema("project_collaboration_workspace", &r.project_id, r.schema)?;
             fold_one(
                 &mut lib.project_collaboration_workspaces,
+                &mut lib.applied,
+                "project_collaboration_workspace",
                 &r.project_id.clone(),
                 r.op,
                 r,
+                None,
             );
         }
         for row in records("workstream_root")? {
             let r: WorkstreamRootRecord = serde_json::from_str(&row)?;
             guard_record_schema("workstream_root", &r.workstream_id, r.schema)?;
-            fold_one(&mut lib.workstream_roots, &r.workstream_id.clone(), r.op, r);
+            fold_one(
+                &mut lib.workstream_roots,
+                &mut lib.applied,
+                "workstream_root",
+                &r.workstream_id.clone(),
+                r.op,
+                r,
+                None,
+            );
         }
         Ok(lib)
     }
@@ -1118,13 +1248,43 @@ impl Library {
         self.agents.is_empty() && self.projects.is_empty()
     }
 
-    /// In-memory apply mirrors of the four kinds, so a route appends a record
-    /// then updates the projection without re-folding.
+    /// In-memory apply mirrors of each kind, so a route appends a record then
+    /// updates the projection without re-folding.
+    ///
+    /// The plain `apply_*` form is unconditional: a seed or repair that writes
+    /// no record. A write that appended one uses the `_at` form with the
+    /// position the store admitted it at, which ignores an apply at or below
+    /// the id's last-applied position (DR-0115 §3) and returns whether it
+    /// applied.
     pub fn apply_agent(&mut self, r: AgentRecord) {
-        fold_one(&mut self.agents, &r.id.clone(), r.op, r);
+        self.apply_agent_at(r, None);
+    }
+    pub fn apply_agent_at(&mut self, r: AgentRecord, position: Option<i64>) -> bool {
+        let id = r.id.clone();
+        fold_one(
+            &mut self.agents,
+            &mut self.applied,
+            "agent",
+            &id,
+            r.op,
+            r,
+            position,
+        )
     }
     pub fn apply_project(&mut self, r: ProjectRecord) {
-        fold_one(&mut self.projects, &r.id.clone(), r.op, r);
+        self.apply_project_at(r, None);
+    }
+    pub fn apply_project_at(&mut self, r: ProjectRecord, position: Option<i64>) -> bool {
+        let id = r.id.clone();
+        fold_one(
+            &mut self.projects,
+            &mut self.applied,
+            "project",
+            &id,
+            r.op,
+            r,
+            position,
+        )
     }
 
     pub fn project_home_id(&self, project_id: &str) -> Option<&HomeId> {
@@ -1133,19 +1293,51 @@ impl Library {
             .map(|project| &project.home_id)
     }
     pub fn apply_instance(&mut self, r: InstanceRecord) {
+        self.apply_instance_at(r, None);
+    }
+    pub fn apply_instance_at(&mut self, r: InstanceRecord, position: Option<i64>) -> bool {
         if let Some(index) = &self.scope_index {
             if r.op == RecordOp::Upsert {
                 index.record_instance(&r.id, r.project_id.as_deref());
             }
         }
-        fold_one(&mut self.instances, &r.id.clone(), r.op, r);
+        let id = r.id.clone();
+        fold_one(
+            &mut self.instances,
+            &mut self.applied,
+            "instance",
+            &id,
+            r.op,
+            r,
+            position,
+        )
     }
     pub fn apply_public_deployment(&mut self, r: PublicDeploymentBindingRecord) {
-        fold_one(&mut self.public_deployments, &r.id.clone(), r.op, r);
+        self.apply_public_deployment_at(r, None);
+    }
+    pub fn apply_public_deployment_at(
+        &mut self,
+        r: PublicDeploymentBindingRecord,
+        position: Option<i64>,
+    ) -> bool {
+        let id = r.id.clone();
+        fold_one(
+            &mut self.public_deployments,
+            &mut self.applied,
+            "public_deployment_binding",
+            &id,
+            r.op,
+            r,
+            position,
+        )
     }
     pub fn apply_chat(&mut self, r: ChatRecord) {
+        self.apply_chat_at(r, None);
+    }
+    pub fn apply_chat_at(&mut self, r: ChatRecord, position: Option<i64>) -> bool {
         // Lineage survives the tombstone (ADR 0141): op-independent, and a
-        // rename's read-modify-write carries the same immutable fields.
+        // rename's read-modify-write carries the same immutable fields, so a
+        // stale apply rewrites it with the same value.
         self.chat_lineage.insert(
             r.id.clone(),
             ChatLineage {
@@ -1156,25 +1348,87 @@ impl Library {
         if let Some(index) = &self.scope_index {
             index.record_chat(&r.id, &r.instance_id);
         }
-        fold_one(&mut self.chats, &r.id.clone(), r.op, r);
-    }
-    pub fn apply_workstream(&mut self, r: WorkstreamRecord) {
-        fold_one(&mut self.workstreams, &r.id.clone(), r.op, r);
-    }
-    pub fn apply_work_target(&mut self, r: WorkTargetRecord) {
-        fold_one(&mut self.work_targets, &r.id.clone(), r.op, r);
-    }
-    pub fn apply_placement_targets(&mut self, r: PlacementTargetsRecord) {
+        let id = r.id.clone();
         fold_one(
-            &mut self.placement_targets,
-            &r.placement_id.clone(),
+            &mut self.chats,
+            &mut self.applied,
+            "chat",
+            &id,
             r.op,
             r,
-        );
+            position,
+        )
+    }
+    pub fn apply_workstream(&mut self, r: WorkstreamRecord) {
+        self.apply_workstream_at(r, None);
+    }
+    pub fn apply_workstream_at(&mut self, r: WorkstreamRecord, position: Option<i64>) -> bool {
+        let id = r.id.clone();
+        fold_one(
+            &mut self.workstreams,
+            &mut self.applied,
+            "workstream",
+            &id,
+            r.op,
+            r,
+            position,
+        )
+    }
+    pub fn apply_work_target(&mut self, r: WorkTargetRecord) {
+        self.apply_work_target_at(r, None);
+    }
+    pub fn apply_work_target_at(&mut self, r: WorkTargetRecord, position: Option<i64>) -> bool {
+        let id = r.id.clone();
+        fold_one(
+            &mut self.work_targets,
+            &mut self.applied,
+            "work_target",
+            &id,
+            r.op,
+            r,
+            position,
+        )
+    }
+    pub fn apply_placement_targets(&mut self, r: PlacementTargetsRecord) {
+        self.apply_placement_targets_at(r, None);
+    }
+    pub fn apply_placement_targets_at(
+        &mut self,
+        r: PlacementTargetsRecord,
+        position: Option<i64>,
+    ) -> bool {
+        let id = r.placement_id.clone();
+        fold_one(
+            &mut self.placement_targets,
+            &mut self.applied,
+            "placement_targets",
+            &id,
+            r.op,
+            r,
+            position,
+        )
     }
     pub fn apply_chat_target(&mut self, r: ChatTargetBindingRecord) {
-        fold_one(&mut self.chat_targets, &r.chat_id.clone(), r.op, r);
+        self.apply_chat_target_at(r, None);
     }
+    pub fn apply_chat_target_at(
+        &mut self,
+        r: ChatTargetBindingRecord,
+        position: Option<i64>,
+    ) -> bool {
+        let id = r.chat_id.clone();
+        fold_one(
+            &mut self.chat_targets,
+            &mut self.applied,
+            "chat_target",
+            &id,
+            r.op,
+            r,
+            position,
+        )
+    }
+    /// Target-set revisions are immutable and keyed by revision, so they
+    /// converge under any order without a position.
     pub fn apply_chat_target_set(&mut self, r: ChatTargetSetRevisionRecord) -> Result<(), String> {
         validate_target_set_revision(&r)?;
         let revisions = self.chat_target_sets.entry(r.chat_id.clone()).or_default();
@@ -1191,10 +1445,23 @@ impl Library {
         Ok(())
     }
     pub fn apply_chat_target_basis(&mut self, r: ChatTargetBasisRecord) {
+        self.apply_chat_target_basis_at(r, None);
+    }
+    pub fn apply_chat_target_basis_at(
+        &mut self,
+        r: ChatTargetBasisRecord,
+        position: Option<i64>,
+    ) -> bool {
+        // One position per chat and target, joined by a NUL no id contains.
+        let key = format!("{}\u{0}{}", r.chat_id, r.target_id);
+        if !self.applied.admit("chat_target_basis", &key, position) {
+            return false;
+        }
         self.chat_target_bases
             .entry(r.chat_id.clone())
             .or_default()
             .insert(r.target_id.clone(), r);
+        true
     }
 
     pub fn chat_target_basis(&self, chat_id: &str, target_id: &str) -> Option<&str> {
@@ -1207,20 +1474,42 @@ impl Library {
         &mut self,
         r: ProjectCollaborationWorkspaceRecord,
     ) {
+        self.apply_project_collaboration_workspace_at(r, None);
+    }
+    pub fn apply_project_collaboration_workspace_at(
+        &mut self,
+        r: ProjectCollaborationWorkspaceRecord,
+        position: Option<i64>,
+    ) -> bool {
+        let id = r.project_id.clone();
         fold_one(
             &mut self.project_collaboration_workspaces,
-            &r.project_id.clone(),
+            &mut self.applied,
+            "project_collaboration_workspace",
+            &id,
             r.op,
             r,
-        );
+            position,
+        )
     }
     pub fn apply_workstream_root(&mut self, r: WorkstreamRootRecord) {
+        self.apply_workstream_root_at(r, None);
+    }
+    pub fn apply_workstream_root_at(
+        &mut self,
+        r: WorkstreamRootRecord,
+        position: Option<i64>,
+    ) -> bool {
+        let id = r.workstream_id.clone();
         fold_one(
             &mut self.workstream_roots,
-            &r.workstream_id.clone(),
+            &mut self.applied,
+            "workstream_root",
+            &id,
             r.op,
             r,
-        );
+            position,
+        )
     }
 
     pub fn target_for_chat(&self, chat_id: &str) -> Option<&WorkTargetRecord> {
@@ -2405,6 +2694,225 @@ mod tests {
                 "client has not attested yet"
             );
             assert!(proj.ceiling_description.starts_with("attestation pending"));
+        }
+    }
+
+    /// DR-0115 §3: projection application is position-keyed last-write-wins.
+    mod convergence {
+        use super::*;
+        use std::sync::{Arc, Barrier, Mutex};
+
+        fn workstream(id: &str, name: &str, op: RecordOp) -> WorkstreamRecord {
+            WorkstreamRecord {
+                id: id.to_owned(),
+                op,
+                instance_id: "placement".to_owned(),
+                name: name.to_owned(),
+                created_position: 0,
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: BTreeMap::new(),
+            }
+        }
+
+        fn names(library: &Library) -> BTreeMap<String, String> {
+            library
+                .workstreams
+                .iter()
+                .map(|(id, record)| (id.clone(), record.name.clone()))
+                .collect()
+        }
+
+        #[test]
+        fn an_apply_at_or_below_the_last_applied_position_is_ignored() {
+            let mut library = Library::default();
+            assert!(
+                library.apply_workstream_at(workstream("w", "newer", RecordOp::Upsert), Some(5))
+            );
+            assert!(
+                !library.apply_workstream_at(workstream("w", "older", RecordOp::Upsert), Some(3))
+            );
+            assert!(
+                !library.apply_workstream_at(workstream("w", "same", RecordOp::Upsert), Some(5))
+            );
+            assert_eq!(library.workstreams["w"].name, "newer");
+            assert_eq!(library.applied.get("workstream", "w"), Some(5));
+            // Positions are per kind and id: another id, or the same id of
+            // another kind, is untouched by this one's.
+            assert!(
+                library.apply_workstream_at(workstream("v", "other", RecordOp::Upsert), Some(1))
+            );
+            assert_eq!(library.applied.get("workstream_root", "w"), None);
+        }
+
+        #[test]
+        fn a_stale_upsert_cannot_resurrect_a_newer_tombstone() {
+            let mut library = Library::default();
+            library.apply_workstream_at(workstream("w", "first", RecordOp::Upsert), Some(2));
+            library.apply_workstream_at(workstream("w", "", RecordOp::Tombstone), Some(7));
+            assert!(
+                !library.apply_workstream_at(workstream("w", "late", RecordOp::Upsert), Some(6))
+            );
+            assert!(!library.workstreams.contains_key("w"));
+            assert!(
+                library.apply_workstream_at(workstream("w", "revived", RecordOp::Upsert), Some(8))
+            );
+            assert_eq!(library.workstreams["w"].name, "revived");
+        }
+
+        #[test]
+        fn a_chat_target_basis_converges_per_chat_and_target() {
+            let basis = |target: &str, basis: &str| ChatTargetBasisRecord {
+                chat_id: "c".to_owned(),
+                target_id: target.to_owned(),
+                basis: basis.to_owned(),
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: BTreeMap::new(),
+            };
+            let mut library = Library::default();
+            library.apply_chat_target_basis_at(basis("t1", "new"), Some(4));
+            library.apply_chat_target_basis_at(basis("t2", "other"), Some(2));
+            assert!(!library.apply_chat_target_basis_at(basis("t1", "old"), Some(3)));
+            assert_eq!(library.chat_target_basis("c", "t1"), Some("new"));
+            assert_eq!(library.chat_target_basis("c", "t2"), Some("other"));
+        }
+
+        /// Append a workstream through `store`, then apply it to the shared
+        /// projection with the position the store admitted it at.
+        fn write(store: &mut Store, library: &Mutex<Library>, record: WorkstreamRecord) -> i64 {
+            let position = store
+                .append_record(
+                    LIBRARY_SCOPE,
+                    "workstream",
+                    &serde_json::to_string(&record).unwrap(),
+                )
+                .unwrap();
+            library
+                .lock()
+                .unwrap()
+                .apply_workstream_at(record, Some(position));
+            position
+        }
+
+        /// Two writers on their own connections, each also admitting into its
+        /// own scope, reach the projection in the reverse of the order the store
+        /// admitted them. The projection still ends where a fold of the log does.
+        #[test]
+        fn writers_that_reach_the_projection_out_of_order_converge_on_the_store() {
+            let store = Store::open_in_memory().unwrap();
+            let library = Arc::new(Mutex::new(Library::default()));
+            let appended = Arc::new(Barrier::new(2));
+            let applied = Arc::new(Barrier::new(2));
+
+            let mut first_store = store.sibling().unwrap();
+            let first = {
+                let (library, appended, applied) = (
+                    Arc::clone(&library),
+                    Arc::clone(&appended),
+                    Arc::clone(&applied),
+                );
+                std::thread::spawn(move || {
+                    first_store.append_record("scope-a", "note", "{}").unwrap();
+                    let record = workstream("w", "first", RecordOp::Upsert);
+                    let position = first_store
+                        .append_record(
+                            LIBRARY_SCOPE,
+                            "workstream",
+                            &serde_json::to_string(&record).unwrap(),
+                        )
+                        .unwrap();
+                    appended.wait();
+                    // The second writer appends after this one and applies first.
+                    applied.wait();
+                    let took = library
+                        .lock()
+                        .unwrap()
+                        .apply_workstream_at(record, Some(position));
+                    (position, took)
+                })
+            };
+            let mut second_store = store.sibling().unwrap();
+            let second = {
+                let (library, appended, applied) = (
+                    Arc::clone(&library),
+                    Arc::clone(&appended),
+                    Arc::clone(&applied),
+                );
+                std::thread::spawn(move || {
+                    appended.wait();
+                    second_store.append_record("scope-b", "note", "{}").unwrap();
+                    let position = write(
+                        &mut second_store,
+                        &library,
+                        workstream("w", "second", RecordOp::Upsert),
+                    );
+                    applied.wait();
+                    position
+                })
+            };
+            let (first_position, first_took) = first.join().unwrap();
+            let second_position = second.join().unwrap();
+            assert!(first_position < second_position);
+            assert!(
+                !first_took,
+                "the older write lost its race and must not apply"
+            );
+
+            let projection = library.lock().unwrap();
+            assert_eq!(projection.workstreams["w"].name, "second");
+            assert_eq!(
+                names(&projection),
+                names(&Library::rebuild(&store).unwrap())
+            );
+        }
+
+        /// Many writers over a few ids, with upserts and tombstones, applying in
+        /// whatever order the scheduler gives them.
+        #[test]
+        fn concurrent_writers_over_shared_ids_converge_on_the_store() {
+            let store = Store::open_in_memory().unwrap();
+            let library = Arc::new(Mutex::new(Library::default()));
+            let writers: Vec<_> = (0..4)
+                .map(|writer| {
+                    let mut store = store.sibling().unwrap();
+                    let library = Arc::clone(&library);
+                    std::thread::spawn(move || {
+                        for step in 0..40 {
+                            store
+                                .append_record(&format!("scope-{writer}"), "note", "{}")
+                                .unwrap();
+                            let id = format!("w{}", (writer + step) % 3);
+                            let op = if step % 5 == 4 {
+                                RecordOp::Tombstone
+                            } else {
+                                RecordOp::Upsert
+                            };
+                            let record = workstream(&id, &format!("{writer}-{step}"), op);
+                            let position = store
+                                .append_record(
+                                    LIBRARY_SCOPE,
+                                    "workstream",
+                                    &serde_json::to_string(&record).unwrap(),
+                                )
+                                .unwrap();
+                            if step % 2 == writer % 2 {
+                                std::thread::yield_now();
+                            }
+                            library
+                                .lock()
+                                .unwrap()
+                                .apply_workstream_at(record, Some(position));
+                        }
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            let projection = library.lock().unwrap();
+            assert_eq!(
+                names(&projection),
+                names(&Library::rebuild(&store).unwrap())
+            );
         }
     }
 }

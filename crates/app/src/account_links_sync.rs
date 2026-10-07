@@ -104,6 +104,74 @@ pub trait LinkAuthority {
     fn revoke(&self, provider: &str) -> Result<(), String>;
     /// Ask to be the one device refreshing an OAuth link.
     fn take_lease(&self, provider: &str, ttl_ms: u64) -> Result<Lease, String>;
+    /// Record whether the provider accepted this version's key (DR-0360).
+    fn report_check(&self, provider: &str, version: u64, reachable: bool) -> Result<(), String>;
+}
+
+/// Asks a provider whether it accepts a key, without spending anything:
+/// `Some(accepted)`, or `None` for a provider this cannot ask.
+pub type KeyChecker<'a> = dyn Fn(&str, &str, &str) -> Option<bool> + Send + Sync + 'a;
+
+/// Check each named link this device holds and record the answer at the
+/// account, so the person's other surfaces can show whether the provider
+/// accepts it (DR-0360: a key is checked on the device that uses it). A link
+/// this device cannot open, or a provider `checker` cannot ask, is skipped.
+pub fn check_links(
+    account: &str,
+    providers: &[String],
+    keys: &LinkRecipientStore,
+    authority: &dyn LinkAuthority,
+    checker: &KeyChecker<'_>,
+) -> Result<Vec<(String, bool)>, String> {
+    let mut checked = Vec::new();
+    for provider in providers {
+        let Some(envelope) = authority.copy(provider)? else {
+            continue;
+        };
+        let Ok(secret) = open_copy(account, keys, &envelope) else {
+            continue;
+        };
+        let Ok(secret) = String::from_utf8(secret) else {
+            continue;
+        };
+        let Some(reachable) = checker(provider, &envelope.base_url, &secret) else {
+            continue;
+        };
+        authority.report_check(provider, envelope.version, reachable)?;
+        checked.push((provider.clone(), reachable));
+    }
+    Ok(checked)
+}
+
+/// Ask the provider to list its models with the key, the one call that
+/// proves it is accepted without spending anything. OAuth logins are not
+/// asked: refreshing them is their check.
+pub fn provider_key_check(provider: &str, base_url: &str, secret: &str) -> Option<bool> {
+    let url = match provider {
+        "openai" => "https://api.openai.com/v1/models".to_owned(),
+        "anthropic" => "https://api.anthropic.com/v1/models?limit=1".to_owned(),
+        "openai-generic" if !base_url.trim().is_empty() => {
+            format!("{}/models", base_url.trim_end_matches('/'))
+        }
+        _ => return None,
+    };
+    let headers: Vec<(String, String)> = if provider == "anthropic" {
+        vec![
+            ("x-api-key".to_owned(), secret.to_owned()),
+            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+        ]
+    } else {
+        vec![("authorization".to_owned(), format!("Bearer {secret}"))]
+    };
+    let http =
+        crate::net_http::HttpClient::with_timeout_no_redirects(std::time::Duration::from_secs(15));
+    match http.get_string_headers(&url, &headers) {
+        Ok((status, _)) if (200..300).contains(&status) => Some(true),
+        // An authentication or permission refusal is the provider saying no.
+        Ok((401 | 403, _)) => Some(false),
+        // Anything else says nothing about the key.
+        _ => None,
+    }
 }
 
 /// What [`LinkAuthority::register`] answers when the account authority does
@@ -643,6 +711,20 @@ impl LinkAuthority for HubLinkAuthority {
             .map(|_| Lease::Granted)
     }
 
+    fn report_check(&self, provider: &str, version: u64, reachable: bool) -> Result<(), String> {
+        let body = serde_json::json!({ "version": version, "reachable": reachable }).to_string();
+        let response = self.http.post_json_headers(
+            &self.url(&Self::provider_path(provider, "/check")),
+            &self.headers(true),
+            &body,
+        );
+        // A Hub from before checks are kept has nowhere to put one.
+        if matches!(response, Ok((404, _))) {
+            return Ok(());
+        }
+        Self::answer::<serde_json::Value>("recording the provider's answer", response).map(|_| ())
+    }
+
     fn revoke(&self, provider: &str) -> Result<(), String> {
         let response = self.http.delete_headers(
             &self.url(&Self::provider_path(provider, "")),
@@ -723,8 +805,18 @@ pub fn spawn_reconcile(wb: &SharedWorkbench, account: &str, now: bool) {
         return;
     };
     let (wb, account) = (wb.clone(), account.to_owned());
-    std::thread::spawn(
-        move || match reconcile(&wb, &account, &scope, &keys, &authority) {
+    std::thread::spawn(move || {
+        let outcome = reconcile(&wb, &account, &scope, &keys, &authority);
+        if let Ok(done) = &outcome {
+            // What this device just took or made is what it checks.
+            let changed: Vec<String> = done.taken.iter().chain(&done.published).cloned().collect();
+            if let Err(error) =
+                check_links(&account, &changed, &keys, &authority, &provider_key_check)
+            {
+                eprintln!("[account-links] could not record a provider check: {error}");
+            }
+        }
+        match outcome {
             Ok(done)
                 if !done.taken.is_empty()
                     || !done.removed.is_empty()
@@ -738,8 +830,8 @@ pub fn spawn_reconcile(wb: &SharedWorkbench, account: &str, now: bool) {
             Ok(_) => {}
             Err(error) if error == NOT_SERVED => {}
             Err(error) => eprintln!("[account-links] could not reconcile provider links: {error}"),
-        },
-    );
+        }
+    });
 }
 
 /// After `account` links `provider` on this desktop, make it the account's.
@@ -750,7 +842,15 @@ pub fn spawn_publish(wb: &SharedWorkbench, account: &str, provider: &str) {
     let (wb, account, provider) = (wb.clone(), account.to_owned(), provider.to_owned());
     std::thread::spawn(move || {
         match publish_link(&wb, &account, &scope, &provider, &keys, &authority) {
-            Ok(_) => {}
+            Ok(_) => {
+                let _ = check_links(
+                    &account,
+                    std::slice::from_ref(&provider),
+                    &keys,
+                    &authority,
+                    &provider_key_check,
+                );
+            }
             Err(error) if error == NOT_SERVED => {}
             Err(error) => {
                 eprintln!("[account-links] could not publish the {provider} link: {error}")
@@ -768,6 +868,309 @@ pub fn spawn_revoke(wb: &SharedWorkbench, account: &str, provider: &str) {
     std::thread::spawn(move || {
         if let Err(error) = revoke(&provider, &authority) {
             eprintln!("[account-links] could not revoke the {provider} link: {error}");
+        }
+    });
+}
+
+// ---- a hosted Home's half (DR-0380) -------------------------------------------
+
+/// One link as the account lists it for a hosted Home, with that Home's copy
+/// of its current version once a device has sealed one.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct HomeLinkEnvelope {
+    pub provider: String,
+    pub version: u64,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub authentication: CredentialAuthentication,
+    #[serde(default)]
+    pub execution_classes: BTreeSet<ModelExecutionClass>,
+    #[serde(default)]
+    pub copy: Option<SealedLinkCopy>,
+}
+
+/// What the account holds for one hosted Home and one person.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct HomeLinks {
+    /// The account the copies were sealed under, which is not always the id
+    /// the Home knows the person by.
+    pub account: String,
+    pub links: Vec<HomeLinkEnvelope>,
+}
+
+/// The account authority, asked by a hosted Home with a person's session.
+pub trait HomeLinkSource {
+    /// `None` when the account says this Home does not serve the person.
+    fn home_links(&self, home_id: &str) -> Result<Option<HomeLinks>, String>;
+}
+
+/// What one [`reconcile_home`] changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HomeReconciled {
+    /// Providers whose current version this Home now holds.
+    pub taken: Vec<String>,
+    /// Providers this Home no longer holds a copy of.
+    pub removed: Vec<String>,
+}
+
+/// Bring what a hosted Home holds for one person in step with their account.
+/// `scope` is where this Home keeps that person's credentials, which is where
+/// its broker resolves them. A link the person made on this Home itself stays
+/// theirs here and is never replaced (DR-0380 §7). Nothing is removed unless
+/// the account answered.
+pub fn reconcile_home(
+    wb: &SharedWorkbench,
+    home_id: &str,
+    scope: &str,
+    key: &crate::account_link_seal::HomeLinkRecipientKey,
+    source: &dyn HomeLinkSource,
+) -> Result<HomeReconciled, String> {
+    let listed = source.home_links(home_id)?;
+    let mut done = HomeReconciled::default();
+    // A removed credential's record stays folded in as a tombstone; only one
+    // still held counts as a link here.
+    let locals: std::collections::BTreeMap<_, _> =
+        credentials_in_scope(wb.lock_unpoisoned().store_ref(), scope)
+            .into_iter()
+            .filter(|(_, record)| {
+                record.op == RecordOp::Upsert && record.status == CredentialStatus::Active
+            })
+            .collect();
+    let mirrored = mirrors(wb, scope);
+    let mut current = BTreeSet::new();
+    if let Some(listed) = &listed {
+        for link in &listed.links {
+            let Some(copy) = link.copy.as_ref().filter(|copy| copy.device_id == home_id) else {
+                continue;
+            };
+            let local = locals.get(&link.provider);
+            let mirror = mirrored.get(&link.provider);
+            match (local, mirror) {
+                // The person's own link on this Home.
+                (Some(_), None) => continue,
+                // Changed here since it was taken: the person's own now.
+                (Some(local), Some(mirror)) if local.version != mirror.local_version => {
+                    write_mirror(
+                        wb,
+                        scope,
+                        &MirrorRecord {
+                            op: RecordOp::Tombstone,
+                            ..mirror.clone()
+                        },
+                    )?;
+                    continue;
+                }
+                _ => {}
+            }
+            current.insert(link.provider.clone());
+            if mirror.is_some_and(|m| {
+                local.is_some() && m.version == link.version && m.account == listed.account
+            }) {
+                continue;
+            }
+            let context = LinkContext::new(&listed.account, &link.provider, link.version)
+                .map_err(|error| format!("the link's context is invalid: {error:?}"))?;
+            let private = key
+                .open()
+                .map_err(|error| format!("this Home holds no recipient key: {error}"))?;
+            let secret = open_link_copy(&context, &private, copy)
+                .map_err(|_| format!("this Home's copy of {} did not open", link.provider))?;
+            let text = String::from_utf8(secret)
+                .map_err(|_| "a provider link's secret is not text".to_owned())?;
+            let mut guard = wb.lock_unpoisoned();
+            let sealed = guard
+                .seal_account_secret(&text)
+                .ok_or_else(|| "could not seal the link on this Home".to_owned())?;
+            guard
+                .upsert_account_credential_in_with_policy(
+                    scope,
+                    link.provider.clone(),
+                    sealed,
+                    link.base_url.clone(),
+                    link.execution_classes.clone(),
+                )
+                .map_err(|error| format!("could not store the link: {error:?}"))?;
+            let local_version = credentials_in_scope(guard.store_ref(), scope)
+                .get(&link.provider)
+                .map_or(0, |record| record.version);
+            drop(guard);
+            write_mirror(
+                wb,
+                scope,
+                &MirrorRecord {
+                    id: link.provider.clone(),
+                    op: RecordOp::Upsert,
+                    account: listed.account.clone(),
+                    version: link.version,
+                    local_version,
+                },
+            )?;
+            done.taken.push(link.provider.clone());
+        }
+    }
+    // Every copy the account no longer gives this Home goes: a link revoked,
+    // superseded, or no longer for Home use, or a person this Home stopped
+    // serving.
+    for (provider, mirror) in mirrored {
+        if current.contains(&provider) {
+            continue;
+        }
+        let ours = locals
+            .get(&provider)
+            .is_some_and(|local| local.version == mirror.local_version);
+        if !ours {
+            continue;
+        }
+        wb.lock_unpoisoned()
+            .tombstone_account_credential_in(scope, provider.clone())
+            .map_err(|error| format!("could not remove a link: {error:?}"))?;
+        write_mirror(
+            wb,
+            scope,
+            &MirrorRecord {
+                op: RecordOp::Tombstone,
+                ..mirror
+            },
+        )?;
+        done.removed.push(provider);
+    }
+    Ok(done)
+}
+
+/// The account authority at the Hub, as a hosted Home asks it with the
+/// session a person reached the Home with.
+pub struct HubHomeLinks {
+    hub: String,
+    bearer: String,
+    http: crate::net_http::HttpClient,
+}
+
+impl HubHomeLinks {
+    pub fn new(hub: String, bearer: String) -> Self {
+        Self {
+            hub,
+            bearer,
+            http: crate::net_http::HttpClient::with_timeout_no_redirects(
+                std::time::Duration::from_secs(15),
+            ),
+        }
+    }
+}
+
+impl HomeLinkSource for HubHomeLinks {
+    fn home_links(&self, home_id: &str) -> Result<Option<HomeLinks>, String> {
+        let url = format!(
+            "{}/account/home-links/{}",
+            self.hub.trim_end_matches('/'),
+            url::form_urlencoded::byte_serialize(home_id.as_bytes()).collect::<String>()
+        );
+        let headers = vec![(
+            "authorization".to_owned(),
+            format!("Bearer {}", self.bearer),
+        )];
+        let (status, body) = self
+            .http
+            .get_string_headers(&url, &headers)
+            .map_err(|error| format!("reading this Home's provider links: {error}"))?;
+        if status == 403
+            && serde_json::from_str::<serde_json::Value>(&body)
+                .is_ok_and(|value| value["home_serves"] == serde_json::Value::Bool(false))
+        {
+            return Ok(None);
+        }
+        if status == 404 {
+            // A Hub that predates DR-0380: nothing to take, and nothing it said.
+            return Err(NOT_SERVED.to_owned());
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "reading this Home's provider links: the account answered {status}: {body}"
+            ));
+        }
+        serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|error| format!("reading this Home's provider links: {error}"))
+    }
+}
+
+struct HomeCopies {
+    home_id: String,
+    key: crate::account_link_seal::HomeLinkRecipientKey,
+    public_key: crate::account_link_seal::LinkRecipientPublicKey,
+}
+
+fn home_copies() -> &'static std::sync::OnceLock<HomeCopies> {
+    static HOME_COPIES: std::sync::OnceLock<HomeCopies> = std::sync::OnceLock::new();
+    &HOME_COPIES
+}
+
+/// Make this process a hosted Home that holds its members' Home-use links
+/// (DR-0380): load or create its recipient key and keep it for the process.
+/// Returns the public half, which the Hub records. A second call keeps the
+/// first Home's key.
+pub fn enable_home_copies(
+    home_id: &str,
+    key: crate::account_link_seal::HomeLinkRecipientKey,
+) -> std::io::Result<crate::account_link_seal::LinkRecipientPublicKey> {
+    let public_key = key.ensure()?;
+    let _ = home_copies().set(HomeCopies {
+        home_id: home_id.to_owned(),
+        key,
+        public_key,
+    });
+    home_copies()
+        .get()
+        .map(|copies| copies.public_key.clone())
+        .ok_or_else(|| std::io::Error::other("the Home's recipient key was not kept"))
+}
+
+/// This Home's id and recipient key, when it holds its members' links: what
+/// it answers the Hub over the private network.
+pub fn home_recipient() -> Option<(String, crate::account_link_seal::LinkRecipientPublicKey)> {
+    home_copies()
+        .get()
+        .map(|copies| (copies.home_id.clone(), copies.public_key.clone()))
+}
+
+/// A person reached this hosted Home with `bearer`: take their Home-use links
+/// in the background, at most once a minute per person. Does nothing unless
+/// [`enable_home_copies`] made this process a Home that holds them.
+pub fn person_reached_home(wb: &SharedWorkbench, actor: &str, bearer: Option<&str>) {
+    let (Some(copies), Some(bearer)) = (home_copies().get(), bearer) else {
+        return;
+    };
+    if actor.is_empty() {
+        return;
+    }
+    {
+        let mut runs = last_runs()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let key = format!("home-copies:{actor}");
+        if runs
+            .get(&key)
+            .is_some_and(|last| last.elapsed() < RECONCILE_EVERY)
+        {
+            return;
+        }
+        runs.insert(key, std::time::Instant::now());
+    }
+    let Some(hub) = crate::account_signin::hub_base() else {
+        return;
+    };
+    let source = HubHomeLinks::new(hub, bearer.to_owned());
+    let scope = crate::account::account_scope(actor);
+    let wb = wb.clone();
+    std::thread::spawn(move || {
+        match reconcile_home(&wb, &copies.home_id, &scope, &copies.key, &source) {
+            Ok(done) if !done.taken.is_empty() || !done.removed.is_empty() => eprintln!(
+                "[account-links] this Home took {:?}, removed {:?}",
+                done.taken, done.removed
+            ),
+            Ok(_) => {}
+            Err(error) if error == NOT_SERVED => {}
+            Err(error) => eprintln!("[account-links] could not take this Home's links: {error}"),
         }
     });
 }

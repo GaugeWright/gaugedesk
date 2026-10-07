@@ -289,6 +289,10 @@ export function EnterpriseWorkbench(): JSX.Element {
     };
 
     const [accountEnabled, setAccountEnabled] = createSignal(true);
+    // Inside GaugeDesk, Provider Connections signs in to a provider through
+    // this computer's own Model access (DR-0360); on the web there is none.
+    const [modelAccessRequest, setModelAccessRequest] = createSignal(0);
+    const insideGaugeDesk = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
     const account = createGaugeAppWorkspace({
         api,
         app: "account-settings",
@@ -296,6 +300,9 @@ export function EnterpriseWorkbench(): JSX.Element {
         active: () => activeApp() === "account-settings",
         scope: () => undefined,
         openExternal,
+        openModelAccess: insideGaugeDesk
+            ? () => setModelAccessRequest((count) => count + 1)
+            : undefined,
         onPageChange: (page) => {
             if (activeApp() === "account-settings") writeManagementLocation("account-settings", page, tenant());
         },
@@ -515,6 +522,7 @@ export function EnterpriseWorkbench(): JSX.Element {
     const surfaceOpen = () => Boolean(proposalAccess() || activeController()?.session());
     const gaugeApps: WorkbenchGaugeApps = {
         active: surfaceOpen,
+        modelAccessRequest,
         selectedTenant: () => memberships().find((membership) => membership.id === tenant()) ?? null,
         accountIdentity: () => gaugeAppMenuIdentity(
             account.session.error ? undefined : account.session(), accountIndex(),

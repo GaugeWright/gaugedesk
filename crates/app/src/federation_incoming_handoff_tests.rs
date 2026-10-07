@@ -121,6 +121,208 @@ fn fixture_with_protection(
     (wb, wire, source_dir, target_dir)
 }
 
+#[test]
+fn task_correlation_signed_incoming_private_metadata_refuses_before_commit() {
+    for (scope, kind) in [
+        (
+            "project::p1::notes",
+            crate::engine::TASK_CORRELATION_ATTEMPT_KIND,
+        ),
+        (
+            "correlation-chat",
+            crate::engine::TASK_CORRELATION_ATTEMPT_KIND,
+        ),
+        ("http-task-attempt::foreign-claim", "note"),
+    ] {
+        let (wb, mut wire, _source, target) = fixture();
+        wire.log.push(HandoffLogRecord {
+            scope: LIBRARY_SCOPE.into(),
+            kind: "instance".into(),
+            payload: serde_json::json!({"id":"correlation-placement","kind":"using","agent_id":"synthetic-agent","project_id":"p1"}).to_string(),
+        });
+        wire.log.push(HandoffLogRecord {
+            scope: LIBRARY_SCOPE.into(),
+            kind: "chat".into(),
+            payload: serde_json::json!({"id":"correlation-chat","instance_id":"correlation-placement","title":"Synthetic history"}).to_string(),
+        });
+        wire.log.push(HandoffLogRecord {
+            scope: scope.into(),
+            kind: kind.into(),
+            payload: "{}".into(),
+        });
+        // Keep the original-command archive consistent with the offered log;
+        // the refusal must come from private metadata, not archive mismatch.
+        let mut offered = Store::open_in_memory().unwrap();
+        for record in &wire.log {
+            offered
+                .append_record(&record.scope, &record.kind, &record.payload)
+                .unwrap();
+        }
+        wire.project_commands = Some(
+            offered
+                .export_command_scopes(|scope| is_project_scope(scope, "p1"))
+                .unwrap(),
+        );
+        wire.log
+            .retain(|record| !is_project_scope(&record.scope, "p1"));
+        wire.log
+            .extend(wire.project_commands.as_ref().unwrap().events().map(
+                |(scope, _, kind, payload)| HandoffLogRecord {
+                    scope: scope.into(),
+                    kind: kind.into(),
+                    payload: payload.into(),
+                },
+            ));
+        let before = {
+            let mut guard = wb.lock_unpoisoned();
+            assert!(
+                verify_handoff(&guard, &wire).is_ok(),
+                "signed source authority must remain valid: {:?}",
+                verify_handoff(&guard, &wire).err()
+            );
+            handoff_oneshot_arm(
+                guard.store_mut(),
+                "alice",
+                "p1",
+                "private-metadata-offer",
+                now_secs() + 3600,
+            );
+            guard.store_ref().scope_high_water_marks().unwrap()
+        };
+        assert_eq!(
+            admit_handoff(&wb, &wire)["committed"],
+            false,
+            "{scope}/{kind}"
+        );
+        let guard = wb.lock_unpoisoned();
+        assert_eq!(guard.store_ref().scope_high_water_marks().unwrap(), before);
+        assert!(!target.path().join("collaboration-workspaces").exists());
+        assert!(guard.store_ref().events(scope).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn task_correlation_multi_turn_chat_export_import_preserves_summary_and_boundary_positions() {
+    let (wb, mut wire, _source, _target) = fixture();
+    let mut source = Store::open_in_memory().unwrap();
+    for record in &wire.log {
+        source
+            .append_record(&record.scope, &record.kind, &record.payload)
+            .unwrap();
+    }
+    source.append_record(LIBRARY_SCOPE,"instance",&serde_json::json!({"id":"correlation-placement","kind":"using","agent_id":"synthetic-agent","project_id":"p1"}).to_string()).unwrap();
+    source.append_record(LIBRARY_SCOPE,"chat",&serde_json::json!({"id":"correlation-chat","instance_id":"correlation-placement","title":"Synthetic correlation history"}).to_string()).unwrap();
+    let mut coordinates = Vec::new();
+    for turn in 0..2 {
+        let claim = format!("synthetic-claim:{turn}");
+        let attempt_scope = crate::engine::task_attempt_scope(&claim);
+        let user=source.append_record_with_linked_record("correlation-chat","transcript",&serde_json::json!({"type":"user","text":format!("turn {turn}"),"home_id":"home:alice","actor_id":"alice","chat_id":"correlation-chat","client_request_id":format!("composed:{turn}")}).to_string(),&attempt_scope,crate::engine::TASK_CORRELATION_ATTEMPT_KIND,|position|Ok(serde_json::json!({"chat_id":"correlation-chat","user_entry_id":position,"command_id":claim,"body_digest":format!("private-input:{turn}")}).to_string())).unwrap();
+        let assistant = source
+            .append_record(
+                "correlation-chat",
+                "transcript",
+                &serde_json::json!({"type":"assistant","text":format!("settled {turn}")})
+                    .to_string(),
+            )
+            .unwrap();
+        crate::turn_summary::append(
+            &mut source,
+            "correlation-chat",
+            &crate::turn_summary::TurnSummary {
+                user_entry_id: user,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let boundary = crate::engine::TurnBoundaryRecord {
+            user_entry_id: user,
+            assistant_entry_id: assistant,
+            before_workspace_cut: format!("before:{turn}"),
+            after_workspace_cut: format!("after:{turn}"),
+            runtime_before: gaugedesk_harness::RuntimePosition {
+                instance_ref: "synthetic-runtime".into(),
+                sequence: turn * 2,
+            },
+            runtime_after: gaugedesk_harness::RuntimePosition {
+                instance_ref: "synthetic-runtime".into(),
+                sequence: turn * 2 + 1,
+            },
+            reads_before: vec![],
+            reads_after: vec![],
+            fork_snapshot: None,
+        };
+        source
+            .append_record(
+                "correlation-chat",
+                crate::engine::TURN_BOUNDARY_KIND,
+                &serde_json::to_string(&boundary).unwrap(),
+            )
+            .unwrap();
+        coordinates.push((user, assistant));
+    }
+    wire.log = collect_project_log(&source, "p1");
+    assert!(!wire
+        .log
+        .iter()
+        .any(|record| crate::engine::is_task_attempt_scope(&record.scope)
+            || record.kind == crate::engine::TASK_CORRELATION_ATTEMPT_KIND
+            || record.payload.contains("private-input:")));
+    {
+        let mut guard = wb.lock_unpoisoned();
+        handoff_oneshot_arm(
+            guard.store_mut(),
+            "alice",
+            "p1",
+            "correlation-offer",
+            now_secs() + 3600,
+        );
+    }
+    assert_eq!(admit_handoff(&wb, &wire)["committed"], true);
+    let guard = wb.lock_unpoisoned();
+    let imported = guard.store_ref().events("correlation-chat").unwrap();
+    assert_eq!(
+        imported,
+        source.events("correlation-chat").unwrap(),
+        "full chat ordinals and original records must survive actual receiving admission"
+    );
+    let summaries = guard
+        .store_ref()
+        .records("correlation-chat", crate::turn_summary::TURN_SUMMARY_KIND)
+        .unwrap();
+    let boundaries = guard
+        .store_ref()
+        .records("correlation-chat", crate::engine::TURN_BOUNDARY_KIND)
+        .unwrap();
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(boundaries.len(), 2);
+    for (index, (user, assistant)) in coordinates.into_iter().enumerate() {
+        let summary: crate::turn_summary::TurnSummary =
+            serde_json::from_str(&summaries[index]).unwrap();
+        let boundary: crate::engine::TurnBoundaryRecord =
+            serde_json::from_str(&boundaries[index]).unwrap();
+        assert_eq!(summary.user_entry_id, user);
+        assert_eq!(
+            (boundary.user_entry_id, boundary.assistant_entry_id),
+            (user, assistant)
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&imported[user as usize].2).unwrap()["type"],
+            "user"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&imported[assistant as usize].2).unwrap()
+                ["type"],
+            "assistant"
+        );
+    }
+    assert!(!guard
+        .store_ref()
+        .scope_ids()
+        .unwrap()
+        .iter()
+        .any(|scope| crate::engine::is_task_attempt_scope(scope)));
+}
+
 #[tokio::test]
 async fn late_receiving_failure_rolls_back_authority_and_reuses_installed_workspace() {
     for (failure, protected) in [("home", false), ("receipt", false), ("receipt", true)] {
@@ -884,4 +1086,161 @@ fn receiving_authority_refuses_conflicting_retention_and_missing_committed_regis
         );
         assert!(guard.project_signing_key("p1").is_err(), "{fault}");
     }
+}
+
+/// A Home's library as the product seeds it, and an offer's library holding one
+/// placement of that Home's seeded Default Agent in project `p1`.
+fn seeded_default_offer() -> (Library, Library, tempfile::TempDir) {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+    let current = wb.lock_unpoisoned().library.clone();
+    let mut incoming = Library::default();
+    incoming.apply_agent(current.agents[crate::app_support::DEFAULT_AGENT].clone());
+    let mut placement = current.instances[crate::app_support::DEFAULT_PLACEMENT].clone();
+    placement.id = "inst-general-p1".into();
+    placement.project_id = Some("p1".into());
+    incoming.apply_instance(placement);
+    (current, incoming, root)
+}
+
+fn refusal(result: Result<(), AdmitError>) -> &'static str {
+    match result {
+        Err(AdmitError::Rejected(rejection)) => rejection.reason,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_seeded_agent_placement_binds_to_the_receivers_own_seed_at_its_pinned_version() {
+    let (current, incoming, _root) = seeded_default_offer();
+    compatible_library(&current, &incoming).unwrap();
+
+    // The receiver's own seed differs from the offered record in what it does
+    // not pin — another Home's authoring basis or later version — and still binds.
+    let mut moved_on = current.clone();
+    let mut agent = moved_on.agents[crate::app_support::DEFAULT_AGENT].clone();
+    agent.current_version = 2;
+    agent.versions.insert(2, agent.versions[&1].clone());
+    moved_on.apply_agent(agent);
+    compatible_library(&moved_on, &incoming).unwrap();
+
+    let mut other_version = incoming.clone();
+    let mut agent = other_version.agents[crate::app_support::DEFAULT_AGENT].clone();
+    agent.versions.get_mut(&1).unwrap().package_ref = "another-release".into();
+    other_version.apply_agent(agent);
+    assert_eq!(
+        refusal(compatible_library(&current, &other_version)),
+        "incoming project pins a built-in Agent version this Home does not hold"
+    );
+
+    let mut unseeded = current.clone();
+    unseeded.agents.remove(crate::app_support::DEFAULT_AGENT);
+    assert_eq!(
+        refusal(compatible_library(&unseeded, &incoming)),
+        "incoming project uses a built-in Agent this Home has not seeded"
+    );
+}
+
+#[test]
+fn an_offer_carrying_another_homes_seed_of_a_built_in_agent_is_refused() {
+    let (_wb, wire, _source, _target) = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let seeded = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+    let library = seeded.lock_unpoisoned().library.clone();
+    let seed_target = library
+        .authoring_target_for(crate::app_support::DEFAULT_AGENT)
+        .unwrap()
+        .clone();
+    let mut placement = library.instances[crate::app_support::DEFAULT_PLACEMENT].clone();
+    placement.id = "inst-general-p1".into();
+    placement.project_id = Some("p1".into());
+    let record = |kind: &str, value: serde_json::Value| HandoffLogRecord {
+        scope: LIBRARY_SCOPE.into(),
+        kind: kind.into(),
+        payload: value.to_string(),
+    };
+    let mut referenced = wire.clone();
+    referenced.log.extend([
+        record("instance", serde_json::to_value(&placement).unwrap()),
+        record(
+            "agent",
+            serde_json::to_value(&library.agents[crate::app_support::DEFAULT_AGENT]).unwrap(),
+        ),
+    ]);
+    incoming_library(&referenced).unwrap();
+
+    let mut carried = referenced.clone();
+    carried.log.push(record(
+        "work_target",
+        serde_json::to_value(&seed_target).unwrap(),
+    ));
+    assert_eq!(
+        refusal(incoming_library(&carried).map(|_| ())),
+        "incoming log carries another Home's seed of a built-in Agent"
+    );
+    let mut carried = referenced;
+    carried.log.push(record(
+        "instance",
+        serde_json::to_value(&library.instances[crate::app_support::DEFAULT_INSTANCE]).unwrap(),
+    ));
+    assert_eq!(
+        refusal(incoming_library(&carried).map(|_| ())),
+        "incoming log carries another Home's seed of a built-in Agent"
+    );
+}
+
+#[test]
+fn a_seeded_agent_travels_only_as_a_reference_to_its_pinned_version() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+    let mut guard = wb.lock_unpoisoned();
+    let mut agent = guard.library.agents[crate::app_support::DEFAULT_AGENT].clone();
+    agent.config = r#"{"model":"this Home's own choice"}"#.into();
+    agent.name = "Renamed here".into();
+    agent.authoring_owner = Some("local-user".into());
+    agent.versions.insert(2, agent.versions[&1].clone());
+    agent.current_version = 2;
+    let mut placement = guard.library.instances[crate::app_support::DEFAULT_PLACEMENT].clone();
+    placement.id = "inst-general-p1".into();
+    placement.project_id = Some("p1".into());
+    placement.version = 1;
+    let store = guard.store_mut();
+    store
+        .append_record(
+            LIBRARY_SCOPE,
+            "agent",
+            &serde_json::to_string(&agent).unwrap(),
+        )
+        .unwrap();
+    store
+        .append_record(
+            LIBRARY_SCOPE,
+            "instance",
+            &serde_json::to_string(&placement).unwrap(),
+        )
+        .unwrap();
+    let log = collect_project_log(guard.store_ref(), "p1");
+    let shipped: Vec<crate::library::AgentRecord> = log
+        .iter()
+        .filter(|record| record.scope == LIBRARY_SCOPE && record.kind == "agent")
+        .map(|record| serde_json::from_str(&record.payload).unwrap())
+        .collect();
+    assert_eq!(shipped.len(), 1);
+    let reference = &shipped[0];
+    assert_eq!(reference.id, crate::app_support::DEFAULT_AGENT);
+    assert_eq!(reference.config, "{}");
+    assert_eq!(reference.name, "Default");
+    assert_eq!(reference.authoring_owner, None);
+    assert_eq!(reference.instance_id, "");
+    assert_eq!(
+        reference.versions.keys().copied().collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        serde_json::to_value(&reference.versions[&1]).unwrap(),
+        serde_json::to_value(&agent.versions[&1]).unwrap()
+    );
+    assert!(!log
+        .iter()
+        .any(|record| record.kind == "work_target" && record.payload.contains("\"archetype\"")));
 }

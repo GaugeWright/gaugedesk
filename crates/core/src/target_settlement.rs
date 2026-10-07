@@ -886,6 +886,12 @@ impl Lifecycle for TargetSettlementState {
     fn evolve(state: &Self::State, event: Self::Event) -> Self::State {
         evolve(state, event)
     }
+
+    /// Checkpointed (SCALE-1). Raise the version with any change to `evolve`
+    /// or to the state's shape.
+    fn snapshot_codec() -> Option<crate::SnapshotCodec<Self::State>> {
+        Some(crate::SnapshotCodec::serde("target_settlement", 1))
+    }
 }
 
 /// One declaration member queued in the stable target's Home-owned lane.
@@ -1287,6 +1293,12 @@ impl Lifecycle for TargetSettlementLaneState {
 
     fn evolve(state: &Self::State, event: Self::Event) -> Self::State {
         evolve_target_lane(state, event)
+    }
+
+    /// Checkpointed (SCALE-1). Raise the version with any change to `evolve`
+    /// or to the state's shape.
+    fn snapshot_codec() -> Option<crate::SnapshotCodec<Self::State>> {
+        Some(crate::SnapshotCodec::serde("target_settlement_lane", 1))
     }
 }
 

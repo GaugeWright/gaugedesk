@@ -1848,6 +1848,12 @@ pub(crate) async fn post_context_stream(
         return (StatusCode::BAD_REQUEST, "name is not a file name").into_response();
     }
 
+    let raw_key = key.clone();
+    let key = if office.is_some() {
+        crate::command_idempotency::office_retry_key(&key)
+    } else {
+        key
+    };
     let caller = crate::command_idempotency::caller_hash(&headers);
     let staging_dir = wb.lock_unpoisoned().staging_uploads_dir();
     if let Err(error) = std::fs::create_dir_all(&staging_dir) {
@@ -2041,19 +2047,42 @@ pub(crate) async fn post_context_stream(
         "region": query.region,
     })
     .to_string();
-    let snapshot = crate::command_idempotency::command_snapshot(
-        &method,
-        &route,
-        &meaning,
-        &caller,
-        &body_sha256,
-    );
+    let receipt_path = if office.is_some() {
+        crate::command_idempotency::office_path(&route)
+    } else {
+        route.clone()
+    };
+    let legacy_scope =
+        crate::command_idempotency::command_identity(&method, &route, &caller, &raw_key).0;
+    let snapshot = if office.is_some() {
+        crate::command_idempotency::command_snapshot(
+            &method,
+            &meaning,
+            &receipt_path,
+            &caller,
+            &body_sha256,
+        )
+    } else {
+        crate::command_idempotency::command_snapshot(
+            &method,
+            &route,
+            &meaning,
+            &caller,
+            &body_sha256,
+        )
+    };
     let (scope, command_id) =
-        crate::command_idempotency::command_identity(&method, &route, &caller, &key);
+        crate::command_idempotency::command_identity(&method, &receipt_path, &caller, &key);
 
     let outcome = {
         let claimed = match &office {
-            Some(office) => office.claim_upload_command(&wb, &command_id, &scope, &key, &snapshot),
+            Some(office) => office.claim_upload_command(
+                &wb,
+                &command_id,
+                (&scope, &key),
+                (&legacy_scope, &raw_key),
+                &snapshot,
+            ),
             None => {
                 wb.lock_unpoisoned()
                     .store_mut()
@@ -2162,6 +2191,11 @@ pub(crate) async fn get_context_stream(
     ) {
         Ok(office) => office,
         Err(_) => return office_upload_refused(),
+    };
+    let key = if office.is_some() {
+        crate::command_idempotency::office_retry_key(&key)
+    } else {
+        key
     };
     let caller = crate::command_idempotency::caller_hash(&headers);
     let staging_dir = wb.lock_unpoisoned().staging_uploads_dir();

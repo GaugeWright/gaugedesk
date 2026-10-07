@@ -18,6 +18,7 @@ fn staff(wb: &mut Workbench) -> AuthenticatedActionContext {
             &serde_json::to_string(&policy).unwrap(),
         )
         .unwrap();
+    wb.enroll_office_profile_for_test("office-admin");
     wb.configure_office_staff_source(HubStaffSource::at("https://auth.example").unwrap())
         .unwrap();
     let source = wb.office_staff_verifier().unwrap();

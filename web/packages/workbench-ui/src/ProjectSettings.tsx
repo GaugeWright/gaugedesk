@@ -12,9 +12,11 @@ import type {
     ProjectId,
     ProjectKeyDelegations,
     ProjectNode,
+    PendingHomeInvitation,
     ProjectShareDirectory,
     ProjectUpstream,
 } from "@gaugewright/control-plane-client";
+import { parseHomeInvitation } from "@gaugewright/control-plane-client";
 import { ProjectModelAccessContent, type ProjectModelAccessApi } from "./ProjectModelAccessPanel";
 import { WhipCostsSection, type WhipCostsApi } from "./WhipCosts";
 import type { DeploymentSelection } from "./DeploymentPanel";
@@ -46,6 +48,14 @@ export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi 
         project: ProjectId,
         role?: "member" | "viewer",
     ): Promise<CreatedHomeInvitation>;
+    /** Ask the account service to email an email invitation's link to the
+     *  address it is for; resolves to that address (DR-0332). */
+    emailHomeInvitation?(invite: string): Promise<string>;
+    /** The project's invitations still waiting to be accepted, with a way to
+     *  withdraw one or replace its link (DR-0332). */
+    pendingHomeInvitations?(project: ProjectId): Promise<PendingHomeInvitation[]>;
+    cancelHomeInvitation?(id: string): Promise<void>;
+    resendHomeInvitation?(id: string): Promise<CreatedHomeInvitation>;
     setProjectNetworkIsolated(project: ProjectId, isolated: boolean): Promise<void>;
     /** Rename a work target for the whole project (DR-0248): its name is the
      *  folder every chat and Agent sees it as. */
@@ -79,10 +89,23 @@ interface ProjectSettingsProps {
     /** The selected organization's members and sharing policy (DR-0332). */
     readonly projectShareDirectory?: () => Promise<ProjectShareDirectory>;
     readonly onOpenOrganizationPeople?: () => void;
+    /** The project's Engagement pane: handoff, combined invite and co-drive
+     *  with paired devices. */
+    readonly onOpenEngagement?: () => void;
 }
 
 function describeError(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+/** The address an email invitation is for, or nothing for one chosen from
+ *  an organization or one that does not parse. */
+function invitedAddress(encoded: string): string | undefined {
+    try {
+        return parseHomeInvitation(encoded).email;
+    } catch {
+        return undefined;
+    }
 }
 
 function compactAuthority(authority: string): string {
@@ -125,6 +148,11 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
     const [peer, setPeer] = createSignal("");
     const [invite, setInvite] = createSignal<CreatedHomeInvitation | null>(null);
     const [pendingRevoke, setPendingRevoke] = createSignal<Participant | null>(null);
+    const [pendingInvites] = createResource(
+        () => props.api.pendingHomeInvitations !== undefined && source(),
+        ([project]) => props.api.pendingHomeInvitations?.(project) ?? Promise.resolve([]),
+    );
+    const [pendingCancel, setPendingCancel] = createSignal<string | null>(null);
     const [status, setStatus] = createSignal("");
     const [busy, setBusy] = createSignal(false);
     const activePeers = () => (peers() ?? []).filter((candidate) => candidate.active);
@@ -156,6 +184,7 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
         try {
             setInvite(await props.api.createHomeInvitation(recipient, props.project.id, role()));
             setAuthority("");
+            setRefresh((value) => value + 1);
             setStatus("Invitation ready. It is shown once and expires automatically.");
         } catch (error) {
             setStatus(describeError(error));
@@ -172,7 +201,39 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
         try {
             setInvite(await props.api.createHomeInvitation({ email: address }, props.project.id, role()));
             setEmail("");
+            setRefresh((value) => value + 1);
             setStatus(`Invitation ready. Only an account that has verified ${address} can accept it. It is shown once and expires automatically.`);
+        } catch (error) {
+            setStatus(describeError(error));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const [emailed, setEmailed] = createSignal<string | null>(null);
+    const emailInvite = async (encoded: string) => {
+        if (!props.api.emailHomeInvitation) return;
+        setBusy(true);
+        setStatus("");
+        try {
+            const sentTo = await props.api.emailHomeInvitation(encoded);
+            setEmailed(encoded);
+            setStatus(`Emailed to ${sentTo}, naming you as the person who invited them.`);
+        } catch (error) {
+            setStatus(describeError(error));
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const resendInvite = async (id: string) => {
+        if (!props.api.resendHomeInvitation) return;
+        setBusy(true);
+        setStatus("");
+        try {
+            setInvite(await props.api.resendHomeInvitation(id));
+            setStatus("New link ready. The earlier link no longer works.");
+            setRefresh((value) => value + 1);
         } catch (error) {
             setStatus(describeError(error));
         } finally {
@@ -242,12 +303,40 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
             <Show when={invite()}>{(value) => <div class="project-settings-once">
                 <div><strong>Invitation link</strong><small>Copy it now; the capability is not retained in this page.</small></div>
                 <code>{value().url}</code>
-                <div class="project-settings-inline-actions"><button type="button" onClick={() => void navigator.clipboard.writeText(value().url)}>Copy</button><button type="button" onClick={() => setInvite(null)}>Done</button></div>
+                <div class="project-settings-inline-actions">
+                    <button type="button" onClick={() => void navigator.clipboard.writeText(value().url)}>Copy</button>
+                    <Show when={props.api.emailHomeInvitation && invitedAddress(value().invite)}>{(address) =>
+                        <button type="button" disabled={busy() || emailed() === value().invite} onClick={() => void emailInvite(value().invite)}>{emailed() === value().invite ? "Emailed" : `Email it to ${address()}`}</button>
+                    }</Show>
+                    <button type="button" onClick={() => setInvite(null)}>Done</button>
+                </div>
             </div>}</Show>
+            <Show when={(pendingInvites() ?? []).length > 0}>
+                <div class="project-settings-rows" data-pending-invitations>
+                    <h3 class="project-settings-subhead">Waiting to be accepted</h3>
+                    <For each={pendingInvites() ?? []}>
+                        {(pending) => <div class="project-settings-row project-settings-person-row">
+                            <div><strong>{pending.email ?? compactAuthority(pending.authority)}</strong><small>{pending.role} · expires {new Date(pending.expiresAt * 1000).toLocaleDateString()}</small></div>
+                            <Show when={pendingCancel() === pending.id} fallback={
+                                <div class="project-settings-inline-actions">
+                                    <Show when={props.api.resendHomeInvitation}><button type="button" disabled={busy()} onClick={() => void resendInvite(pending.id)}>Send again</button></Show>
+                                    <Show when={props.api.cancelHomeInvitation}><button type="button" class="danger" disabled={busy()} onClick={() => setPendingCancel(pending.id)}>Cancel</button></Show>
+                                </div>
+                            }>
+                                <div class="project-settings-inline-actions"><button type="button" onClick={() => setPendingCancel(null)}>Keep</button><button type="button" class="danger" disabled={busy()} onClick={() => void run(async () => {
+                                    await props.api.cancelHomeInvitation?.(pending.id);
+                                    setPendingCancel(null);
+                                }, "Invitation cancelled. Its link no longer works.")}>Cancel invitation</button></div>
+                            </Show>
+                        </div>}
+                    </For>
+                </div>
+            </Show>
         </section>
 
         <section class="project-settings-section">
-            <ProjectPageHeader title="Project Host" description={handoff()?.home === "target" ? "This project's Home is held by the destination." : "Move this project's Home to a paired, trusted device."} />
+            <ProjectPageHeader title="Project Host" description={handoff()?.home === "target" ? "This project's Home is held by the destination." : "Move this project's Home to a paired, trusted device."}
+                action={props.onOpenEngagement && <button type="button" data-project-engagement onClick={props.onOpenEngagement}>Paired devices…</button>} />
             <Show when={activePeers().length > 0} fallback={<p class="project-settings-empty">No paired device is available for handoff.</p>}>
                 <div class="project-settings-form project-settings-handoff-form">
                     <label><span>Destination</span><select value={peer()} onChange={(event) => setPeer(event.currentTarget.value)}><option value="">Choose device</option><For each={activePeers()}>{(candidate) => <option value={candidate.authority}>{compactAuthority(candidate.authority)}</option>}</For></select></label>

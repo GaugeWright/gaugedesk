@@ -1,3 +1,4 @@
+import { attachTaskCommandAttempt, createTaskCommandLedger, sameTaskAddress, taskCommandAddress, type TaskCommandAttempt, type TaskCommandScope } from "@gaugewright/workbench-ui/session-composer-controller";
 /**
  * The workbench shell (`navigation.md` B1): a four-panel layout under a top
  * human-task-queue bar. It is a thin renderer — it renders projections and
@@ -32,7 +33,6 @@ import {
     browserAccounts,
     selectBrowserAccount,
     claimConsumerSignup,
-    clientRequestId,
     consumeAccountSignupTicket,
     consumeCallbackToken,
     endSession,
@@ -65,7 +65,6 @@ import {
     type MergeAction,
     type MergePhase,
     type MergeState,
-    type ClientRequestId,
     parseHomeInvitation,
     parseNativeHandoffCode,
     parseWebReturnHandoffCode,
@@ -146,7 +145,7 @@ import {
     type ProjectSettingsPage,
     parseEnabledModels,
     panelManifest,
-    pendingUserAfterSnapshot,
+    withPendingTasks,
     readChatModel,
     readChatProvider,
     readChatThinking,
@@ -327,6 +326,9 @@ export interface WorkbenchGaugeApps {
      * Home remains authoritative for the invitation itself. */
     readonly projectShareDirectory?: () => Promise<ProjectShareDirectory>;
     readonly openOrganizationPeople?: () => void;
+    /** Each increment opens this GaugeDesk's own Settings at Model access,
+     *  where provider sign-ins run (DR-0360). */
+    readonly modelAccessRequest?: Accessor<number>;
     /** Ordinary work navigation selects the preserved work surface again. */
     readonly close: () => void;
     /** Native mobile account sessions arrive through the OS-vault handoff
@@ -785,6 +787,29 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         props.gaugeApps?.accountIdentity(), Boolean(props.gaugeApps), hubSession(), authority(),
         localAccount(),
     ));
+    // Work done here signed out is the local account's, and moves to the
+    // signed-in account only when the person moves it (DR-0328 §7). The
+    // window's own control plane says what could move and to whom; a plane
+    // that is not the window, or a window with no account, answers with a
+    // refusal, which offers nothing.
+    const [localProjectOffer, { refetch: refetchLocalProjects }] = createResource(
+        () => api.desktopSessionAvailable && menuIdentity() && !localAccount()
+            ? hubSession()?.person || "window"
+            : false,
+        () => api.localProjects().catch(() => null),
+    );
+    const localProjectTransfer = () => {
+        const offer = localProjectOffer();
+        if (!offer?.account || offer.projects.length === 0) return null;
+        const session = hubSession();
+        const account = (session?.person === offer.account ? session.label : null) || offer.account;
+        return { account, projects: offer.projects };
+    };
+    const transferLocalProjects = async (projects: readonly string[]) => {
+        await api.transferLocalProjects(projects as ProjectId[]);
+        bumpNav();
+        await refetchLocalProjects();
+    };
     // What the signed-in account reaches (ADR 0114): Homes and opaque
     // project-to-Home routes, proxied by the control plane with its sealed
     // bearer. Only fetched while a live session exists.
@@ -1520,6 +1545,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             connection: selection.connection,
         };
     });
+    const [taskRouteProject, setTaskRouteProject] = createSignal<ProjectId | null>(null);
     // Tell the control plane which project is open, so work resolves to *that*
     // project's Home rather than one selected Home (DESK-3). Several Homes stay
     // connected at once; this only decides which one serves the work in hand.
@@ -1527,47 +1553,38 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const requested = projectSettings()?.id
             ?? panelSettings()?.projectId
             ?? (projectHome()?.id === routedProject() ? routedProject() : null);
-        api.setCurrentProject((requested ?? currentProject()?.id ?? null) as ProjectId | null);
+        const project = (requested ?? currentProject()?.id ?? null) as ProjectId | null;
+        api.setCurrentProject(project);
+        setTaskRouteProject(project);
     });
     // The transcript is a projection of durable truth: a **snapshot** of admitted
     // records (refetched per engagement, survives reloads) concatenated with the
     // **live** SSE reduction of the in-progress turn. No client-only history.
     const [snapshot, setSnapshot] = createSignal<Transcript>(empty);
     const [live, setLive] = createSignal<Transcript>(empty);
-    const [pendingSend, setPendingSend] = createSignal<{
-        id: EngagementId;
-        rid: ClientRequestId;
-        text: string;
-        baselineLines: number;
-    } | null>(null);
-    const transcript = (): Transcript => ({
-        lines: [...snapshot().lines, ...live().lines],
-        openText: live().openText,
-    });
-    async function loadSnapshot(id: EngagementId) {
+    const taskCommands = createTaskCommandLedger();
+    const [visibleTaskScope, setVisibleTaskScope] = createSignal<TaskCommandScope | null>(null);
+    const transcript = (): Transcript => {
+        const scope = visibleTaskScope();
+        const admitted = { lines: [...snapshot().lines, ...live().lines], openText: live().openText };
+        return withPendingTasks(admitted, scope ? taskCommands.pending().filter((command) =>
+            command.scope.home === scope.home && command.scope.chat === scope.chat) : []);
+    };
+    async function loadSnapshot(id: EngagementId, context?: Awaited<ReturnType<WorkbenchControlPlane["taskContext"]>>) {
         try {
-            const repaired = fromSnapshot(await api.getTranscript(id));
-            setSnapshot(repaired);
-            const pending = pendingSend();
-            setLive(
-                pending?.id === id
-                    ? pendingUserAfterSnapshot(repaired, pending.text, pending.baselineLines)
-                    : empty,
-            );
+            const addressed = context ?? await api.taskContext(id);
+            const events = await addressed.transcript();
+            for (const event of events) taskCommands.observe(addressed.scope, event);
+            if (selected() !== id) return;
+            const visible = visibleTaskScope();
+            if (context && visible && visible.home !== context.scope.home) return;
+            setVisibleTaskScope(addressed.scope);
+            setSnapshot(fromSnapshot(events));
+            setLive(empty);
         } catch {
-            /* a fresh engagement has no snapshot */
+            /* No authoritative snapshot: the pending intent stays non-standing. */
         }
     }
-    // The optimistic send, modeled as an **explicit pending command** (app-stack.md,
-    // "Optimistic UI models pending commands explicitly"): when a turn starts we echo
-    // the user's line into the live transcript at once and record a `clientRequestId`
-    // for the in-flight command. Reconciliation is the transcript's snapshot-repair
-    // model (the doctrine's named transcript mechanism): on settle OR rejection we
-    // re-read the durable snapshot, which retires the optimistic echo — a kept turn
-    // shows the admitted line, a failed/rejected turn drops it (no dangling echo).
-    let nextRid = 1;
-    const retireSend = (rid: ClientRequestId) =>
-        setPendingSend((p) => (p?.rid === rid ? null : p));
     const [draft, setDraft] = createSignal("");
     // The unselected Chat pane is a real quick-start surface, not a dead-end
     // status message. Keep its draft distinct from an open chat's composer so
@@ -1818,33 +1835,38 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // reloading rebuilds from the snapshot — the chat is durable, not client-only.
     createEffect(() => {
         const id = selected();
+        taskRouteProject();
+        bearer();
+        setVisibleTaskScope(null);
         if (!id) return;
         setStreamReady(false);
         setSelectedFile(null);
         setSnapshot(empty);
         setLive(empty);
         void loadSnapshot(id);
-        const unsubscribe = api.subscribe(
-            id,
-            (ev) => {
-                setLive((t) => reduce(t, ev));
-                // Reflect what the agent is doing, live, from the operational stream.
-                if (ev.type === "text") setActivity("writing…");
-                else if (ev.type === "tool") setActivity("using a tool…");
-                else if (ev.type === "blocked") setActivity("effect blocked by the membrane");
-                // A tool that finished may have written the worktree mid-turn, so
-                // the Files pane must not wait for the turn to settle (WS-637).
-                if (ev.type === "toolresult") bumpWorktree();
-            },
-            () => {
-                setStreamReady(true);
-                // The transcript stream cannot replay events missed during a
-                // disconnect. Reconcile with its durable server snapshot on
-                // every open; the request is harmless on the initial open.
-                void loadSnapshot(id);
-            },
-        );
-        onCleanup(unsubscribe);
+        let disposed = false;
+        let unsubscribe: (() => void) | undefined;
+        void api.taskContext(id).then((context) => {
+            if (disposed) return;
+            setVisibleTaskScope(context.scope);
+            unsubscribe = context.subscribe(
+                (ev) => {
+                    taskCommands.observe(context.scope, ev);
+                    if (disposed || selected() !== id || visibleTaskScope()?.home !== context.scope.home) return;
+                    setLive((t) => reduce(t, ev));
+                    if (ev.type === "text") setActivity("writing…");
+                    else if (ev.type === "tool") setActivity("using a tool…");
+                    else if (ev.type === "blocked") setActivity("effect blocked by the membrane");
+                    if (ev.type === "toolresult") bumpWorktree();
+                },
+                () => {
+                    if (disposed) return;
+                    setStreamReady(true);
+                    void loadSnapshot(id, context);
+                },
+            );
+        }).catch(() => { /* The existing admission/connection surface reports unavailability. */ });
+        onCleanup(() => { disposed = true; unsubscribe?.(); });
     });
 
     // Auto-open the single changed file in View (round-7 #3). A one-way side effect
@@ -2170,6 +2192,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         // the turn's idempotency key, so a resend after an uncertain dispatch is
         // answered by the receipt rather than guessed at by the client.
         composedId?: string,
+        bindTask?: (attempt: TaskCommandAttempt) => Promise<void>,
     ) {
         // This turn may run in the background while the user looks at a different
         // chat, so every *display-mutating* side effect is gated on `isCurrent()` —
@@ -2177,7 +2200,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         // is on screen (round-13). The per-chat run tone is set regardless, so the
         // chat's dot in Browse reflects its own state.
         const isCurrent = () => selected() === id;
-        const rid = clientRequestId(`${id}:${nextRid++}`);
+        const rid = composedId ?? crypto.randomUUID();
+        const context = await api.taskContext(id);
+        const attempt = taskCommands.begin(context.scope, rid, prompt, snapshot().lines.length);
+        const unsubscribeCorrelation = context.subscribe((event) => taskCommands.observe(context.scope, event));
         setRunTone(id, "working");
         if (isCurrent()) {
             setActivity("thinking…");
@@ -2185,18 +2211,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // Immediate feedback (round-7 #6): echo the user's message into the
             // transcript the instant the turn starts — only when this chat is the one
             // on screen, else we'd inject it into the displayed chat's transcript. The
-            // echo is an optimistic pending command, retired by snapshot-repair below.
-            setPendingSend({ id, rid, text: prompt, baselineLines: snapshot().lines.length });
-            setLive((t) => reduce(t, { type: "user", text: prompt }));
+            // echo is an operational pending command, retired only by an exact
+            // addressed command observation, including durable snapshot repair.
+            setVisibleTaskScope(context.scope);
         }
         setPendingApprovals([]); // a fresh turn clears the prior turn's pending approvals
         try {
-            const res = (await api.runTask(id, prompt, images, composedId)) as {
+            if (bindTask) await bindTask(attempt);
+            const res = (await context.runTask(prompt, images, rid)) as {
                 pending_approvals?: string[];
                 run_phase?: string;
                 diff?: string;
                 error?: string;
             };
+            taskCommands.observe(context.scope, res);
             if (isCurrent()) setPendingApprovals(res?.pending_approvals ?? []);
             // A turn can return 200 yet have *failed* (e.g. the model rejected an
             // attached image): the runtime error rides `run_phase`/`error`, not an HTTP
@@ -2211,7 +2239,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         ? `turn failed${res?.error ? ` — ${res.error}` : ""}`
                         : "turn complete",
                 );
-                await Promise.all([loadSnapshot(id), refetchRun(), refetchDiff(), refetchMerge()]);
+                await Promise.all([loadSnapshot(id, context), refetchRun(), refetchDiff(), refetchMerge()]);
                 // A default clean turn has already synchronized by the time the
                 // projections refresh, so the branch-vs-line diff is empty. Keep
                 // the response's turn diff on screen for this settled turn: it is
@@ -2220,7 +2248,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }
             if (failed) throw new Error(res?.error || "The turn failed.");
             recordFeature("chat.turn", "completed");
+            return attempt;
         } catch (e) {
+            taskCommands.observe(context.scope, e);
+            taskCommands.uncertain(context.scope, rid);
             // A turn someone stopped did not go wrong: it reached the end they
             // chose for it. Marking the chat with the error tone and announcing
             // a failure would dress their own decision up as a fault — the
@@ -2233,14 +2264,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 // A rejection (INV-2) surfaces its reason; either way repair from the
                 // durable snapshot so a failed turn leaves no dangling optimistic echo.
                 setStatus(stopped ? "stopped" : describeFailure("run that turn", e));
-                await loadSnapshot(id);
-                // A rejected command will never acquire a later admitted user event,
-                // so do not carry the pending echo beyond this repair.
+                await loadSnapshot(id, context);
+                // Repair can confirm only exact addressed authority observations;
+                // otherwise the pending command remains non-standing.
                 setLive(empty);
             }
-            throw e;
+            throw attachTaskCommandAttempt(e, attempt);
         } finally {
-            retireSend(rid);
+            unsubscribeCorrelation();
             if (isCurrent()) {
                 setActivity("");
             }
@@ -2611,10 +2642,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 librarySyncAvailable={import.meta.env.VITE_HOME_SPLIT !== "true"}
                 identity={menuIdentity}
                 localAccount={localAccount}
+                localProjectTransfer={localProjectTransfer}
+                onTransferLocalProjects={transferLocalProjects}
                 version={clientBuild.version}
                 hubUrl={props.hubUrl}
                 openAccount={accountRequest}
-                openModels={modelsRequest}
+                openModels={() => modelsRequest() + (props.gaugeApps?.modelAccessRequest?.() ?? 0)}
                 onAccountChanged={refreshModelAccess}
                 analyticsAvailable={Boolean(props.gaugeApps)}
                 analyticsTenant={props.gaugeApps?.selectedTenant}
@@ -2868,15 +2901,24 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         // message survives a reload, a chat switch and an outage. IndexedDB
         // rather than a string store because attachments are bytes.
         outbox: createIndexedDbOutboxStore(),
+        taskCommands,
+        correlatesTask: () => Boolean(selected()),
+        taskScope: () => visibleTaskScope() ?? undefined,
+        recoverTask: async (address) => {
+            const context = await api.taskContext(address.chat_id as EngagementId);
+            if (!sameTaskAddress(address, taskCommandAddress(context.scope))) return undefined;
+            const events = await context.transcript();
+            return { scope: context.scope, events };
+        },
         scope: () => selected() ? String(selected()) : "quick-start",
         busy: () => selected() ? busy() : false,
         capabilities: () => selected()
             ? UNIVERSAL_COMPOSER_CAPABILITIES
             : BASIC_COMPOSER_CAPABILITIES,
-        send: async (text, images, composedId) => {
+        send: async (text, images, composedId, bindTask) => {
             const id = selected();
             if (id) {
-                await runPrompt(id, text, [...images], composedId);
+                return runPrompt(id, text, [...images], composedId, bindTask);
             } else {
                 await createNewChat(text, [...images]);
             }
@@ -3241,7 +3283,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     onRequestMethodInspection={() => void changeMethodInspection("request")}
                     onRevokeMethodInspection={() => void changeMethodInspection("revoke")}
                     onOpenContextSources={() => setShowSources(true)}
-                    pendingSend={pendingSend()?.id === selected() ? pendingSend()?.rid : undefined}
+                    pendingSend={taskCommands.pending().find((command) => command.scope.home === visibleTaskScope()?.home && command.scope.chat === selected())?.id}
                     onResolveCredential={() => setAccountRequest((n) => n + 1)}
                     transcriptTail={
                         <Show when={busy()}>
@@ -3492,15 +3534,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         canCommand: () => true,
         merge: (action) => void onMerge(action),
         onContentSaved: () => void Promise.all([refetchDiff(), refetchMerge()]),
-        send: async (text, images = [], composedId) => {
+        send: async (text, images = [], composedId, bindTask) => {
             // A leaf may outlive one render turn during a selection change. Refuse
             // to route its command to a different engagement.
             if (selected() !== id) throw new Error("This chat is no longer selected.");
-            await runPrompt(id, text, [...images], composedId);
+            return runPrompt(id, text, [...images], composedId, bindTask);
         },
         // This leaf always has an engagement, so the composed id is always the
         // turn's idempotency key and a resend is always answerable (ADR 0137 §3).
         appliesComposedIdOnce: true,
+        taskScope: () => visibleTaskScope() ?? undefined,
+        taskCommands,
         stop: async () => {
             if (selected() !== id) throw new Error("This chat is no longer selected.");
             await stopTurn();
@@ -4433,6 +4477,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                             ? (kind) => void attachTarget(workspace().project.id, workspace().project.name, kind, "content")
                                             : undefined}
                                         onManageDeployment={setDeployment}
+                                        onOpenEngagement={() => {
+                                            const { id, name } = workspace().project;
+                                            closeProjectSettings();
+                                            setEngagement({ id, name });
+                                        }}
                                         projectShareDirectory={props.gaugeApps?.projectShareDirectory}
                                         onOpenOrganizationPeople={props.gaugeApps?.openOrganizationPeople}
                                     />}

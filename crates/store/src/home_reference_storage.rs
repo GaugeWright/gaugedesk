@@ -237,6 +237,24 @@ impl HomeReferenceJournal {
             .refuse_reference_operation(home_id, operation_id, reason_code)
     }
 
+    pub fn reference_operations_for_target(
+        &self,
+        home_id: &str,
+        target_store: &str,
+    ) -> Result<Vec<ReferenceOperation>, JournalError> {
+        self.inner
+            .reference_operations_for_target(home_id, target_store)
+    }
+
+    pub fn reference_use_pins_for_target(
+        &self,
+        home_id: &str,
+        target_store: &str,
+    ) -> Result<Vec<ReferenceUsePin>, JournalError> {
+        self.inner
+            .reference_use_pins_for_target(home_id, target_store)
+    }
+
     pub fn bind_exact_reference_use<F>(
         &mut self,
         home_id: &str,

@@ -330,8 +330,33 @@ impl Workbench {
             ));
         }
 
+        // On a Home that holds the office-controlled profile, every project is
+        // the enrolled organization's, and so is a fork of one: it inherits the
+        // profile and never becomes an account's project outside it (WS-424;
+        // DR-0371). The forking person keeps reaching it through a grant.
+        let profile_organization = match self.office_profile() {
+            Ok(None) => None,
+            Ok(Some(profile)) => Some(
+                self.project_organization(&source)
+                    .map(str::to_owned)
+                    .unwrap_or(profile.organization),
+            ),
+            Err(_) => {
+                return Err(ForkError::Conflict(
+                    "the office-controlled profile is unavailable; nothing was forked".into(),
+                ))
+            }
+        };
         let mut extra = BTreeMap::new();
-        crate::project_owner::record_owner(&mut extra, actor);
+        match &profile_organization {
+            Some(organization) => {
+                extra.insert(
+                    "organization".to_owned(),
+                    serde_json::Value::String(organization.clone()),
+                );
+            }
+            None => crate::project_owner::record_owner(&mut extra, actor),
+        }
         extra.insert(
             UPSTREAM_EXTRA.to_owned(),
             serde_json::to_value(&upstream).map_err(|e| ForkError::Failed(e.to_string()))?,
@@ -376,6 +401,9 @@ impl Workbench {
                     actor: actor.to_owned(),
                 },
             )?;
+            if profile_organization.is_some() {
+                self.grant_fork_to_forker(&id, actor)?;
+            }
             Ok::<_, String>(self.replace_agents(source_id, &id, actor))
         })();
         match populated {
@@ -385,6 +413,25 @@ impl Workbench {
                 Err(ForkError::Failed(error))
             }
         }
+    }
+
+    /// Grant the forking person the organization-owned fork they made inside
+    /// the office-controlled profile. An administrator already reaches it.
+    fn grant_fork_to_forker(&mut self, fork_id: &str, actor: &str) -> Result<(), String> {
+        if actor.is_empty() || actor == "anonymous" {
+            return Ok(());
+        }
+        let grant = crate::org::MemberGrantRecord {
+            id: crate::org::MemberGrantRecord::make_id(actor, fork_id),
+            op: RecordOp::Upsert,
+            authority: actor.to_owned(),
+            project_id: fork_id.to_owned(),
+        };
+        let raw = serde_json::to_string(&grant).map_err(|error| error.to_string())?;
+        self.store_mut()
+            .append_record(crate::org::ORG_SCOPE, "member_grant", &raw)
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"))
     }
 
     /// Re-place the source's active Agents on the fork at their pinned

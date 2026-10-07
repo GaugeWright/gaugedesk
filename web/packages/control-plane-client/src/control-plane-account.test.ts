@@ -25,6 +25,7 @@ describe("the account directory projection (DESK-5f)", () => {
             rootPubkey: "ed25519:abc",
             origin: "https://directory.example",
             subject: "person-1",
+            transitions: [],
         });
     });
 
@@ -41,6 +42,7 @@ describe("the account directory projection (DESK-5f)", () => {
             rootPubkey: "ed25519:abc",
             origin: "https://directory.example",
             subject: "",
+            transitions: [],
         });
     });
 
@@ -63,6 +65,17 @@ describe("the account directory projection (DESK-5f)", () => {
         }
     });
 
+    it("carries the hub's root hand-overs for the verifier to follow (DR-0361)", async () => {
+        const handOver = { from: "a", to: "k", issued_at_ms: 1, signature: "s" };
+        const json = vi.fn(async () => ({
+            root_pubkey: "k",
+            transitions: [handOver],
+        })) as unknown as RouteJson;
+        await expect(accountDirectory(json)).resolves.toMatchObject({ transitions: [handOver] });
+        const malformed = vi.fn(async () => ({ root_pubkey: "k", transitions: "x" })) as unknown as RouteJson;
+        await expect(accountDirectory(malformed)).resolves.toMatchObject({ transitions: [] });
+    });
+
     it("falls back to no origin rather than inventing one", async () => {
         // The caller owns the canonical default; a client-side guess here would
         // silently disagree with the desktop's.
@@ -71,6 +84,7 @@ describe("the account directory projection (DESK-5f)", () => {
             rootPubkey: "k",
             origin: "",
             subject: "",
+            transitions: [],
         });
     });
 });

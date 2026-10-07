@@ -939,3 +939,96 @@ fn an_unattended_step_leaves_no_key_open_after_it() {
     assert_eq!(vault.open_project_keys(), 0, "and leaves no key open");
     assert!(vault.opened_projects().is_empty());
 }
+
+// ---- DR-0201: a Home steps only the runs of projects it holds, and a run ----
+// ---- whose project is mid-move takes no write, its delegation included ----
+
+/// A launch admitted without its delegation, so the supervisor's first look at
+/// it would derive one, which is a write to the project.
+fn launch_without_delegation(
+    shared: &crate::SharedWorkbench,
+    context: &AuthenticatedActionContext,
+    request: &ProjectWorkflowLaunch,
+) -> ProjectWorkflowInvocation {
+    let mut wb = shared.lock_unpoisoned();
+    declare(&mut wb, context);
+    wb.launch_project_workflow_admitted(context, request, LIMITS)
+        .unwrap()
+}
+
+/// A pending move parks the run before its standing is read, so nothing is
+/// derived, filed or recorded as lapsed in a project that is being carried
+/// away, and aborting the move wakes it rather than leaving it to a sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_mid_move_parks_without_a_write_and_resumes_when_the_move_aborts() {
+    use gaugedesk_core::handoff::HandoffEvent;
+    let (_root, shared, context, request) = fixture(include_str!("tutorials/basics.whip"));
+    let invocation = launch_without_delegation(&shared, &context, &request);
+    shared
+        .lock_unpoisoned()
+        .store_mut()
+        .append_record(
+            &crate::federation::handoff_scope(DEFAULT_PROJECT),
+            "event",
+            &serde_json::to_string(&HandoffEvent::HandoffOffered).unwrap(),
+        )
+        .unwrap();
+    let scope = invocation.product_scope.clone();
+    // The startup sweep is the only one within the test: resuming must come
+    // from the abort waking it.
+    let (stop, mut notices, supervisor) = supervise(&shared, Duration::from_secs(3600));
+    settles(&mut notices, &scope, ProjectWorkflowOutcome::Parked).await;
+    {
+        let wb = shared.lock_unpoisoned();
+        assert!(
+            ledger_events(&wb).is_empty(),
+            "no delegation is derived for a project mid-move"
+        );
+        assert!(open_items(&wb, &invocation).is_empty(), "nothing was filed");
+    }
+
+    crate::federation::abort_handoff(&mut shared.lock_unpoisoned(), DEFAULT_PROJECT).unwrap();
+    assert_eq!(
+        open_task(&shared, &invocation).await.title,
+        "Create a chat in Personal"
+    );
+    assert_eq!(
+        count(&ledger_events(&shared.lock_unpoisoned()), "derived"),
+        1
+    );
+    stop.send(true).unwrap();
+    supervisor.await.unwrap().unwrap();
+}
+
+/// Once a project has moved, the Home it left keeps the retained launch but
+/// is not where the run lives: it reports the run as moved on every look,
+/// steps nothing, and writes nothing — no delegation, no lapse, and no task
+/// asking a member to resume work that is now another Home's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_whose_project_moved_away_is_left_to_the_home_it_moved_to() {
+    let (_root, shared, context, request) = fixture(include_str!("tutorials/basics.whip"));
+    let invocation = launch_without_delegation(&shared, &context, &request);
+    {
+        let mut wb = shared.lock_unpoisoned();
+        let moved = wb
+            .project_record_for_home_rebind(
+                DEFAULT_PROJECT,
+                gaugedesk_core::ids::HomeId::new("the-home-it-moved-to"),
+            )
+            .unwrap();
+        wb.apply_atomic_project_home_rebind((moved, None), None);
+        assert!(wb.project_homed_elsewhere(DEFAULT_PROJECT));
+    }
+    let scope = invocation.product_scope.clone();
+    let (stop, mut notices, supervisor) = supervise(&shared, Duration::from_millis(40));
+    // Two looks, so the second is a sweep finding it again rather than a
+    // single pass that happened not to write.
+    settles(&mut notices, &scope, ProjectWorkflowOutcome::Moved).await;
+    settles(&mut notices, &scope, ProjectWorkflowOutcome::Moved).await;
+    stop.send(true).unwrap();
+    supervisor.await.unwrap().unwrap();
+    let wb = shared.lock_unpoisoned();
+    assert!(ledger_events(&wb).is_empty(), "no delegation is derived");
+    assert!(open_items(&wb, &invocation).is_empty(), "nothing was filed");
+    assert!(resume_tasks(&wb).is_empty(), "nobody is asked to resume it");
+}

@@ -66,6 +66,15 @@ export default defineConfig({
             timeout: 30_000,
             env: { HUB_PORT: String(ports.hub) },
         },
+        // The publisher-protocol fixture a Panel deployment publishes to and
+        // drains from (PANEL-7). The built client's default edge points here.
+        {
+            command: "node e2e/panel-edge.mjs",
+            url: `http://127.0.0.1:${ports.edge}/health`,
+            reuseExistingServer: false,
+            timeout: 30_000,
+            env: { EDGE_PORT: String(ports.edge) },
+        },
         // The primary control plane (alice / `local-user`) — the one the existing
         // single-instance suite drives. Port-scoped launcher so the peer instance
         // survives (no blanket pkill). Its CORS allowlist blesses THIS run's preview

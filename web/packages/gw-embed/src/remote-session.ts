@@ -1,3 +1,5 @@
+import { attachTaskCommandAttempt, createTaskCommandLedger, taskCommandAddress, sameTaskAddress, type TaskCommandScope, type TaskCommandAttempt } from "@gaugewright/workbench-ui/session-composer-controller";
+import { withPendingTasks } from "@gaugewright/workbench-ui/transcript";
 /**
  * A {@link Session} projection over one EDGE-5 browser connection for a single
  * hosted engagement. This is the adapter that makes the shared panels
@@ -33,6 +35,7 @@ export interface RemoteSessionOptions {
     readonly api: EmbedSessionApi;
     /** The single engagement this embedded session is bound to. */
     readonly engagementId: EngagementId;
+    readonly projectId?: string | null;
 }
 
 export function createRemoteSession(opts: RemoteSessionOptions): { session: Session; dispose: () => void } {
@@ -40,6 +43,9 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
     // `artifacts/` wherever a file appears (DR-0310).
     const api = visitorApi(opts.api);
     const id = opts.engagementId;
+    const scope = { home: opts.api, chat: String(id), publicSession: opts.api.publicSessionCorrelation === true, project: opts.projectId ?? null };
+    const [taskScope, setTaskScope] = createSignal<TaskCommandScope>();
+    const taskCommands = createTaskCommandLedger();
     const [engagementId] = createSignal<EngagementId | null>(id);
     const [selectedFile, setSelectedFile] = createSignal<string | null>(null);
     const [worktreeRev, setWorktreeRev] = createSignal(0);
@@ -100,13 +106,16 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
     // snapshot.
     const [snapshot, setSnapshot] = createSignal<Transcript>(empty);
     const [live, setLive] = createSignal<Transcript>(empty);
-    const transcript = (): Transcript => ({
+    const transcript = (): Transcript => withPendingTasks({
         lines: [...snapshot().lines, ...live().lines],
         openText: live().openText,
-    });
+    }, taskCommands.pending().filter((command) => !command.scope.authority
+        || sameTaskAddress(taskCommandAddress(command.scope), taskCommandAddress(taskScope()))));
     async function loadSnapshot() {
         try {
-            setSnapshot(fromSnapshot(await api.getTranscript(id)));
+            const events = await api.getTranscript(id);
+            for (const event of events) taskCommands.observe(scope, event);
+            setSnapshot(fromSnapshot(events));
             setLive(empty);
         } catch {
             /* a fresh engagement has no snapshot yet */
@@ -117,6 +126,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
     const unsubscribe = api.subscribe(
         id,
         (ev) => {
+            taskCommands.observe(scope, ev);
             setLive((t) => reduce(t, ev));
             if (ev.type !== "text" || !api.recordFirstTextRendered) return;
             const record = () => api.recordFirstTextRendered?.();
@@ -147,28 +157,58 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         bumpWorktree();
     }
 
-    async function send(text: string, images: readonly ImageRef[] = []): Promise<void> {
+    async function send(text: string, images: readonly ImageRef[] = [], composedId?: string,
+        bindTask?: (attempt: TaskCommandAttempt) => Promise<void>): Promise<TaskCommandAttempt> {
         const t = text.trim();
         if (!t) throw new Error("A message is required.");
         if (busy()) throw new Error("A turn is already running.");
+        const requestId = composedId ?? crypto.randomUUID();
         setDispatching(true);
+        const authority = api.taskIdentity ? await api.taskIdentity().catch(() => undefined) : undefined;
+        const addressed = { ...scope, authority };
+        setTaskScope(addressed);
+        const attempt = taskCommands.begin(addressed, requestId, t, snapshot().lines.length);
+        const verify = async () => {
+            if (!authority) return;
+            const current = await api.taskIdentity!();
+            if (current.home_id !== authority.home_id || current.actor_id !== authority.actor_id) throw new Error("Task Home actor changed");
+        };
         // Optimistic echo: show the user's line the instant the turn starts; the
         // snapshot re-read in settle() retires it (a failed turn drops it).
-        setLive((tr) => reduce(tr, { type: "user", text: t }));
         // The Session DO admits the stable command and streams its durable
         // observations over the same WebSocket while this promise is pending.
         try {
-            await api.runEmbedTurn(id, t, [...images]);
+            if (bindTask) await bindTask(attempt);
+            if (authority) await verify();
+            const result = await api.runEmbedTurn(id, t, [...images], requestId);
+            if (authority) await verify();
+            taskCommands.observe(addressed, result);
             await settle();
+            return attempt;
         } catch (error) {
+            try { await verify(); taskCommands.observe(addressed, error); } catch { /* Unverified author remains unknown. */ }
+            taskCommands.uncertain(addressed, requestId);
             await loadSnapshot();
-            throw error;
+            throw attachTaskCommandAttempt(error, attempt);
         } finally {
             setDispatching(false);
         }
     }
 
     const session: Session = {
+        taskCommands,
+        taskScope,
+        recoverTask: async (address) => {
+            if (!api.taskIdentity || address.chat_id !== String(id) || address.project_id !== scope.project) return undefined;
+            const authority = await api.taskIdentity();
+            const addressed = { ...scope, authority };
+            if (!sameTaskAddress(address, taskCommandAddress(addressed))) return undefined;
+            const events = await api.getTranscript(id);
+            const after = await api.taskIdentity();
+            if (after.home_id !== authority.home_id || after.actor_id !== authority.actor_id) return undefined;
+            setTaskScope(addressed);
+            return { scope: addressed, events };
+        },
         api,
         engagementId,
         worktreeRev,
@@ -195,6 +235,7 @@ export function createRemoteSession(opts: RemoteSessionOptions): { session: Sess
         merge: (action: MergeAction) => void api.mergeCommand(id, action).then(() => settle()),
         onContentSaved: () => void Promise.allSettled([refetchDiff(), refetchMerge()]),
         send,
+        appliesComposedIdOnce: api.appliesComposedIdOnce === true,
         stop: api.stopTurn ? () => api.stopTurn!() : undefined,
         compact: api.compactTurn ? () => api.compactTurn!() : undefined,
     };

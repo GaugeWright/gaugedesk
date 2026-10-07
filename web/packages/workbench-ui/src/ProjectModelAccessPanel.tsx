@@ -60,6 +60,14 @@ export function ProjectModelAccessContent(props: {
     const [organizationSelection] = createResource(tick, () =>
         props.api.projectOrganizationModelSelection(props.project),
     );
+    const organizationError = () => organizationOptions.error || organizationSelection.error;
+    const organizationLoading = () => organizationOptions.loading || organizationSelection.loading;
+    // An errored Solid resource throws when read. All organization value reads
+    // share this guard, including the default-selection effect and actions.
+    const availableOrganizationOptions = () =>
+        organizationError() || organizationLoading() ? undefined : organizationOptions();
+    const availableOrganizationSelection = () =>
+        organizationError() || organizationLoading() ? undefined : organizationSelection();
 
     const [provider, setProvider] = createSignal("openai");
     const [token, setToken] = createSignal("");
@@ -71,11 +79,12 @@ export function ProjectModelAccessContent(props: {
     const [organizationModel, setOrganizationModel] = createSignal("");
     const [admittedPrivateBroker, setAdmittedPrivateBroker] = createSignal("");
     const selectedOption = () =>
-        organizationOptions()?.options.find((option) => option.connection === organizationConnection());
+        availableOrganizationOptions()?.options.find((option) => option.connection === organizationConnection());
 
     createEffect(() => {
-        const options = organizationOptions()?.options ?? [];
-        const current = organizationSelection();
+        if (organizationError() || organizationLoading()) return;
+        const options = availableOrganizationOptions()?.options ?? [];
+        const current = availableOrganizationSelection();
         const currentOption = current
             ? options.find((option) => option.connection === current.connection)
             : undefined;
@@ -135,7 +144,7 @@ export function ProjectModelAccessContent(props: {
         }
     };
     const chooseOrganizationModel = async () => {
-        const options = organizationOptions();
+        const options = availableOrganizationOptions();
         const option = selectedOption();
         if (!options || !option || !organizationModel()) {
             setStatus("choose an available organization connection and model");
@@ -176,19 +185,21 @@ export function ProjectModelAccessContent(props: {
                 <section class="admin-section">
                     <h4>Organization-managed access</h4>
                     <Show
-                        when={(organizationOptions()?.options.length ?? 0) > 0}
+                        when={(availableOrganizationOptions()?.options.length ?? 0) > 0}
                         fallback={
                             <p class="muted" data-organization-model-empty>
-                                {organizationOptions.error
+                                {organizationError()
                                     ? "Organization model access is unavailable right now."
-                                    : "No organization connection is available to this project."}
+                                    : organizationLoading()
+                                      ? "Loading organization model access…"
+                                      : "No organization connection is available to this project."}
                             </p>
                         }
                     >
-                        <Show when={organizationSelection()}>
+                        <Show when={availableOrganizationSelection()}>
                             {(selection) => {
                                 const current = () =>
-                                    organizationOptions()?.options.find(
+                                    availableOrganizationOptions()?.options.find(
                                         (option) => option.connection === selection().connection,
                                     );
                                 return (
@@ -206,7 +217,7 @@ export function ProjectModelAccessContent(props: {
                                 value={organizationConnection()}
                                 onChange={(event) => setOrganizationConnection(event.currentTarget.value)}
                             >
-                                <For each={organizationOptions()?.options ?? []}>
+                                <For each={availableOrganizationOptions()?.options ?? []}>
                                     {(option) => <option value={option.connection}>{option.name}</option>}
                                 </For>
                             </select>
@@ -222,7 +233,7 @@ export function ProjectModelAccessContent(props: {
                             <button type="button" class="tree-action" onClick={() => void chooseOrganizationModel()}>
                                 Use
                             </button>
-                            <Show when={organizationSelection()}>
+                            <Show when={availableOrganizationSelection()}>
                                 <button type="button" class="tree-action" onClick={() => void clearOrganizationModel()}>
                                     Remove
                                 </button>

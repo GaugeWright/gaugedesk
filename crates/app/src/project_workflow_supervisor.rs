@@ -48,9 +48,13 @@ pub enum ProjectWorkflowOutcome {
     Parked,
     /// Completed, failed or cancelled; it will not be stepped again.
     Finished(String),
-    /// Refused or failed this time: lost standing, a pending handoff, or a
-    /// fault. It is retried on the next wake and never treated as finished.
+    /// Refused or failed this time: lost standing or a fault. It is retried on
+    /// the next wake and never treated as finished.
     NeedsAttention { detail: String },
+    /// Its project is on another Home now, which steps it from there
+    /// (DR-0201). This Home neither steps it nor writes to it, and looks again
+    /// on the next wake, because a project can move back.
+    Moved,
 }
 
 /// Hint that something every launch in `project` might be waiting on changed.
@@ -153,11 +157,26 @@ fn drive(
     config: ProjectWorkflowSupervisorConfig,
     shutdown: &watch::Receiver<bool>,
 ) -> Option<ProjectWorkflowOutcome> {
+    // Where the project is decides whether this Home may touch the run at all,
+    // and it is read under the same lock as standing because reading standing
+    // can write: a first unattended look derives the run's delegation and a
+    // lapse records itself. A project whose move is pending takes no write
+    // (DR-0201 §3), so its runs park until the move commits or aborts, and a
+    // project that has moved away is stepped by the Home it moved to.
     // Paused work waits for a member without a fault each sweep, and work
     // whose delegation ended is finished however its run reads (DR-0312).
-    let standing = wb
-        .lock_unpoisoned()
-        .workflow_standing(scope, crate::key_delegation::now_ms());
+    let standing = {
+        let mut wb = wb.lock_unpoisoned();
+        if let Some((project, _, _)) = launch_scope_parts(scope) {
+            if wb.project_homed_elsewhere(&project) {
+                return Some(ProjectWorkflowOutcome::Moved);
+            }
+            if wb.project_moving(&project) {
+                return Some(ProjectWorkflowOutcome::Parked);
+            }
+        }
+        wb.workflow_standing(scope, crate::key_delegation::now_ms())
+    };
     match standing {
         Ok(crate::key_delegation::Standing::Held(_)) => {}
         Ok(crate::key_delegation::Standing::Lapsed(_)) => {

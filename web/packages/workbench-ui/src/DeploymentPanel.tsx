@@ -142,6 +142,7 @@ export function DeploymentPanel(props: {
     const [managedTenants, setManagedTenants] = createSignal<AccountTenant[]>([]);
     const [managedTenantId, setManagedTenantId] = createSignal("");
     const [managedUnavailable, setManagedUnavailable] = createSignal("");
+    const [managedLoading, setManagedLoading] = createSignal(false);
     const [credentialRef, setCredentialRef] = createSignal(props.defaultCredentialRef);
     // Spend limits are typed in dollars and published in cents; the text is kept
     // as typed so a half-entered amount is not rewritten under the cursor.
@@ -178,6 +179,7 @@ export function DeploymentPanel(props: {
     /** The one destructive action awaiting a second click: `revoke`, `session:<id>`, `key:<ref>`. */
     const [confirming, setConfirming] = createSignal<string | null>(null);
     let stopMonitor = () => {};
+    let disposed = false;
     const managedFunding = () => fundingMode() === "managed";
     const managing = () => binding() !== null;
     const provider = () => providerName(keyProvider());
@@ -279,27 +281,43 @@ export function DeploymentPanel(props: {
         }
     }
 
-    onMount(async () => {
-        void loadCredentials().catch(() => {});
+    async function loadManagedTenants() {
+        if (managedLoading()) return;
         if (!props.api.deploymentManagedTenants) {
             setFundingMode("byok");
-        } else {
-            try {
-                const tenants = await props.api.deploymentManagedTenants();
-                const eligible = tenants.filter((tenant) => tenant.role === "owner" || tenant.role === "admin");
-                setManagedTenants(eligible);
-                if (eligible[0]) setManagedTenantId(eligible[0].id);
-                else setFundingMode("byok");
-            } catch (reason) {
-                setManagedUnavailable(`GaugeWright billing is unavailable right now: ${String(reason)}`);
-                setFundingMode("byok");
-            }
+            return;
         }
+        setManagedLoading(true);
+        try {
+            const tenants = await props.api.deploymentManagedTenants();
+            if (disposed) return;
+            const eligible = tenants.filter((tenant) => tenant.role === "owner" || tenant.role === "admin");
+            setManagedTenants(eligible);
+            setManagedUnavailable("");
+            if (!eligible.some((tenant) => tenant.id === managedTenantId())) {
+                setManagedTenantId(eligible[0]?.id ?? "");
+            }
+            if (!eligible.length) setFundingMode("byok");
+        } catch (reason) {
+            if (disposed) return;
+            setManagedUnavailable(reason instanceof TypeError
+                ? "The account service can't be reached right now. Try again in a minute."
+                : `GaugeWright billing is unavailable right now: ${String(reason)}`);
+            setFundingMode("byok");
+        } finally {
+            if (!disposed) setManagedLoading(false);
+        }
+    }
+
+    onMount(async () => {
+        void loadCredentials().catch(() => {});
+        await loadManagedTenants();
+        if (disposed) return;
         const existing = props.selection.deployments.find((candidate) => candidate.status === "active")
             ?? props.selection.deployments[0];
         if (existing) await loadDeployment(existing);
     });
-    onCleanup(() => stopMonitor());
+    onCleanup(() => { disposed = true; stopMonitor(); });
 
     function deploymentInput(): PublicDeploymentInput {
         const spend = spendCents();
@@ -652,13 +670,19 @@ export function DeploymentPanel(props: {
                 </div>
                 <div class="pa-options" role="radiogroup" aria-label="Who pays">
                     <Option type="radio" name="pa-funding" checked={managedFunding()} disabled={!managedTenants().length}
-                        title={managedTenants().length ? undefined : "You don't administer a GaugeWright account that can pay for deployments."}
+                        title={managedTenants().length ? undefined : managedLoading()
+                            ? "Loading accounts…" : managedUnavailable() || "You don't administer a GaugeWright account that can pay for deployments."}
                         onChange={() => setFundingMode("managed")}
                         label="GaugeWright billing" detail="Usage is billed to an account you administer." />
                     <Option type="radio" name="pa-funding" checked={!managedFunding()} onChange={() => setFundingMode("byok")}
                         label="Your own provider key" detail="The key's provider bills you directly for what visitors use, and the deployment runs on that provider." />
                 </div>
-                <Show when={managedUnavailable()}><p class="pa-hint warn">{managedUnavailable()}</p></Show>
+                <Show when={managedUnavailable()}>
+                    <p class="pa-hint warn" role="status">{managedLoading() ? "Loading accounts…" : managedUnavailable()}{" "}
+                        <button type="button" class="pa-quiet" disabled={managedLoading()}
+                            onClick={() => void loadManagedTenants()}>{managedLoading() ? "Retrying…" : "Retry"}</button>
+                    </p>
+                </Show>
                 <Show when={managedFunding()}>
                     <label class="pa-field"><span>Account</span>
                         <select class="pa-input" value={managedTenantId()} onChange={(event) => setManagedTenantId(event.currentTarget.value)}>

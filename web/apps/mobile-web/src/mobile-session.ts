@@ -37,7 +37,7 @@ import {
     type Session,
     type SessionApi,
 } from "@gaugewright/workbench-ui/session-context";
-import { type ComposerCapabilities } from "@gaugewright/workbench-ui/session-composer-controller";
+import { attachTaskCommandAttempt, createTaskCommandLedger, type TaskCommandLedger, sameTaskAddress, taskCommandAddress, type ComposerCapabilities } from "@gaugewright/workbench-ui/session-composer-controller";
 import { canSendOnConnection } from "@gaugewright/workbench-ui/connection-banner";
 import { type ConnectionStatus } from "@gaugewright/workbench-ui/connection";
 import { type Transcript } from "@gaugewright/workbench-ui/transcript";
@@ -69,10 +69,13 @@ export const MOBILE_COMPOSER_CAPABILITIES: ComposerCapabilities = Object.freeze(
  *  structurally so the account-scoped proxy `MobileApp` builds satisfies it as
  *  readily as the direct client does. */
 export interface MobileSessionApi {
+    getTranscript?(id: EngagementId): Promise<import("@gaugewright/control-plane-client").StreamEvent[]>;
+    taskIdentity?(): Promise<{ home_id: string; actor_id: string }>;
     runTask(
         id: EngagementId,
         text: string,
         images?: { data: string; mimeType: string }[],
+        composedId?: string,
     ): Promise<unknown>;
     stopTurn(id: EngagementId): Promise<StopTurnResult>;
     getTree(id: EngagementId): Promise<FileEntry[]>;
@@ -81,6 +84,8 @@ export interface MobileSessionApi {
 
 export interface MobileSessionOptions {
     readonly api: MobileSessionApi;
+    readonly taskCommands?: TaskCommandLedger;
+    readonly project?: Accessor<string | null>;
     /** The open chat, or null. The host owns selection and its subscription. */
     readonly engagementId: Accessor<EngagementId | null>;
     /** The host's fold of the durable snapshot plus live SSE. */
@@ -98,12 +103,9 @@ export interface MobileSessionOptions {
     readonly worktreeRev: Accessor<unknown>;
     /** A turn settled: re-derive the sibling task-queue and files projections. */
     readonly onSettled: (id: EngagementId) => void | Promise<void>;
-    readonly onPendingUser?: (id: EngagementId, text: string | null) => void;
-    /** Put the text of a failed send back in the draft. The shared controller
-     *  reports the failure but does not restore the text, and the retired mobile
-     *  composer did — a phone loses more by dropping a message typed with thumbs
-     *  than a desktop does, so the behavior is kept rather than quietly lost. */
-    readonly onSendFailed: (text: string) => void;
+    /** Compatibility slot for older hosts. Addressed task failure recovery belongs
+     *  to the original outbox row; restoring text alone would mint a second identity. */
+    readonly onSendFailed?: (text: string) => void;
     readonly onStatus: (message: string) => void;
 }
 
@@ -126,6 +128,7 @@ interface DispatchedTurn {
 
 export function createMobileSession(options: MobileSessionOptions): Session {
     const { api } = options;
+    const taskCommands = options.taskCommands ?? createTaskCommandLedger();
     const [dispatched, setDispatched] = createSignal<DispatchedTurn | null>(null);
     let dispatches = 0;
     const busy = () => dispatched() !== null;
@@ -144,16 +147,42 @@ export function createMobileSession(options: MobileSessionOptions): Session {
     // `images` is ignored rather than dropped silently: the capability set above
     // declares no attachments, so the shared composer never offers a way to
     // produce one and this parameter is always empty.
-    const send: Session["send"] = async (text) => {
+    const [taskScope, setTaskScope] = createSignal<import("@gaugewright/workbench-ui/session-composer-controller").TaskCommandScope>();
+    const send: Session["send"] = async (text, _images, composedId, bindTask) => {
         const id = options.engagementId();
         if (id === null) throw new Error("Open a chat before sending.");
+        const requestId = composedId ?? crypto.randomUUID();
+        const project = options.project?.() ?? null;
         setDispatched({ seq: ++dispatches, lines: options.transcript().lines.length });
-        options.onPendingUser?.(id, text);
+        const authority = api.taskIdentity ? await api.taskIdentity().catch(() => undefined) : undefined;
+        const scope = { home: api, chat: String(id), authority, project };
+        setTaskScope(scope);
+        const attempt = taskCommands.begin(scope, requestId, text, options.transcript().lines.length);
+        const assertSelection = () => {
+            if (options.engagementId() !== id || (options.project?.() ?? null) !== project) throw new Error("Task mobile selection changed");
+        };
+        const verify = async () => {
+            assertSelection();
+            if (!authority) return;
+            const current = await api.taskIdentity!();
+            assertSelection();
+            if (current.home_id !== authority.home_id || current.actor_id !== authority.actor_id) throw new Error("Task Home actor changed");
+        };
         options.onStatus(`send: ${text}`);
         try {
-            await api.runTask(id, text, []);
+            assertSelection();
+            if (bindTask) await bindTask(attempt);
+            assertSelection();
+            if (authority) await verify();
+            const result = await api.runTask(id, text, [], requestId);
+            assertSelection();
+            if (authority) await verify();
+            taskCommands.observe(scope, result);
             options.onStatus("turn complete");
+            return attempt;
         } catch (cause) {
+            try { await verify(); taskCommands.observe(scope, cause); } catch { /* Different actor remains unknown. */ }
+            taskCommands.uncertain(scope, requestId);
             // A stopped turn is not a failed send. Handing the text back is
             // right for a dropped relay and wrong here: the reader cancelled
             // this message, and refilling the composer with it proposes the very
@@ -161,16 +190,15 @@ export function createMobileSession(options: MobileSessionOptions): Session {
             // projections are re-derived exactly as they are for a completed one.
             if (turnStopped(cause)) {
                 options.onStatus("turn stopped");
-                throw cause;
+                throw attachTaskCommandAttempt(cause, attempt);
             }
             options.onStatus(`turn error: ${String(cause)}`);
-            options.onSendFailed(text);
-            throw cause;
+            throw attachTaskCommandAttempt(cause, attempt);
         } finally {
             try {
                 await options.onSettled(id);
             } finally {
-                options.onPendingUser?.(id, null);
+                // The ledger retires only an addressed authority observation, never finally.
                 setDispatched(null);
             }
         }
@@ -178,6 +206,22 @@ export function createMobileSession(options: MobileSessionOptions): Session {
 
     return {
         api: sessionApi,
+        taskCommands,
+        taskScope,
+        recoverTask: async (address) => {
+            if (!api.taskIdentity || !api.getTranscript || options.engagementId() !== address.chat_id
+                || (options.project?.() ?? null) !== address.project_id) return undefined;
+            const authority = await api.taskIdentity();
+            const scope = { home: api, chat: address.chat_id, project: options.project?.() ?? null, authority };
+            if (!sameTaskAddress(address, taskCommandAddress(scope))) return undefined;
+            const events = await api.getTranscript(address.chat_id as EngagementId);
+            const after = await api.taskIdentity();
+            if (options.engagementId() !== address.chat_id || (options.project?.() ?? null) !== address.project_id
+                || after.home_id !== authority.home_id || after.actor_id !== authority.actor_id) return undefined;
+            setTaskScope(scope);
+            return { scope, events };
+        },
+        appliesComposedIdOnce: true,
         engagementId: options.engagementId,
         worktreeRev: options.worktreeRev,
         selectedFile: options.selectedFile,

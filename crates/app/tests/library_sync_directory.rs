@@ -258,6 +258,7 @@ fn seed_published_record(
         )
         .expect("seals under this account's key"),
         retracted: false,
+        device: String::new(),
     };
     let put = gaugedesk_directory_protocol::sign_entry(entry, &signing).expect("signs");
     held.lock().unwrap().insert(root.clone(), put);
@@ -275,6 +276,7 @@ fn route_elsewhere(project: &str) -> gaugedesk_app::home::OpaqueHomeRoute {
         author_authority: String::new(),
         author_root_pubkey: String::new(),
         author_signature: None,
+        placement: None,
     }
 }
 

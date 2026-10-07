@@ -513,6 +513,14 @@ const COMMANDS: &[CommandPolicy] = &[
         capability: Capability::ConfigureSecurity,
         review: ReviewPolicy::Human,
     },
+    // Enrolling this organization and its Project Host in the office-controlled
+    // profile (WS-424). One-way: there is no command that leaves it.
+    CommandPolicy {
+        id: "office-profile.enroll",
+        page: "organization-policy",
+        capability: Capability::ConfigureSecurity,
+        review: ReviewPolicy::Human,
+    },
     CommandPolicy {
         id: "software-policy.set",
         page: "software-policy",
@@ -1516,13 +1524,27 @@ fn project_page(
                 "group_mappings": org.group_mappings.values().collect::<Vec<_>>(),
             })
         }
-        "organization-policy" => json!({
-            "resource": org.policy(),
-            "security": org.security,
-            "placement": org.effective_placement_policy(),
-            "archetype_approval": { "require_approval": org.effective_require_archetype_approval() },
-            "project_sharing": org.effective_project_sharing(),
-        }),
+        "organization-policy" => {
+            // The office-controlled profile binds only the directory this Home
+            // holds; another tenant's page shows why it cannot be enrolled.
+            let profile = if store_scope == gaugedesk_app::org::ORG_SCOPE {
+                wb.office_profile()?
+            } else {
+                None
+            };
+            json!({
+                "resource": org.policy(),
+                "security": org.security,
+                "placement": org.effective_placement_policy(),
+                "archetype_approval": { "require_approval": org.effective_require_archetype_approval() },
+                "project_sharing": org.effective_project_sharing(),
+                "office_profile": gaugedesk_app::office_profile::office_profile_view(
+                    profile.as_ref(),
+                    wb.home_id().as_str(),
+                    wb.office_profile_enrollable(store_scope),
+                ),
+            })
+        }
         // `organization-sessions.read-affected` is declared on this page, and
         // until now nothing served it: the model carried the four policy fields
         // and no session at all, while the coverage gate credited this read
@@ -2230,6 +2252,13 @@ struct SsoAdmissionPayload {
 struct GroupMappingRemovePayload {
     group: String,
 }
+/// The administrator confirms the Project Host the page showed them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfficeProfileEnrollPayload {
+    home_id: String,
+}
+
 #[derive(Deserialize)]
 struct PolicyPayload {
     resource: Policy,
@@ -2597,6 +2626,13 @@ fn plan_command(
             }
         }
         "project-home.handoff" => {
+            if scope == gaugedesk_app::org::ORG_SCOPE {
+                if let Some(refusal) = wb.office_profile_exit_refusal() {
+                    return Err(
+                        (StatusCode::CONFLICT, Json(json!({ "error": refusal }))).into_response()
+                    );
+                }
+            }
             let value: HandoffPayload = parse(&command.payload)?;
             let tenant = tenant_id(headers);
             let actor = wb.actor(bearer(headers));
@@ -3597,6 +3633,36 @@ fn plan_command(
                 notices,
                 audit_action: "organization-policy.set",
                 audit_target: ORG_ID.into(),
+                transient_result: None,
+            }
+        }
+        "office-profile.enroll" => {
+            let value: OfficeProfileEnrollPayload = parse(&command.payload)?;
+            let actor = wb.actor(bearer(headers));
+            let record = wb
+                .plan_office_profile_enrollment(
+                    &scope,
+                    &tenant_id(headers),
+                    value.home_id.trim(),
+                    &actor,
+                    gaugedesk_app::account::session_now_ms(),
+                )
+                .map_err(|(status, message)| {
+                    (status, Json(json!({ "error": message }))).into_response()
+                })?;
+            MutationPlan {
+                facts: vec![fact(
+                    &scope,
+                    gaugedesk_app::office_profile::OFFICE_PROFILE_KIND,
+                    &record,
+                )?],
+                notices: vec![(
+                    gaugedesk_app::office_profile::OFFICE_PROFILE_KIND,
+                    record.id.clone(),
+                    "upsert",
+                )],
+                audit_action: "office-profile.enroll",
+                audit_target: record.home_id,
                 transient_result: None,
             }
         }
@@ -5525,7 +5591,10 @@ mod tests {
             .iter()
             .find(|page| page["id"] == "organization-policy")
             .unwrap();
-        assert_eq!(policy["commands"], json!(["organization-policy.set"]));
+        assert_eq!(
+            policy["commands"],
+            json!(["organization-policy.set", "office-profile.enroll"])
+        );
         assert!(!session["commands"]
             .as_array()
             .unwrap()
@@ -5614,6 +5683,150 @@ mod tests {
         assert_eq!(
             page["page"]["model"]["archetype_approval"]["require_approval"],
             true
+        );
+    }
+
+    async fn propose_and_review(
+        app: &Router,
+        session: &Value,
+        basis: &Value,
+        command_id: &str,
+        payload: Value,
+        key: &str,
+    ) -> (StatusCode, Value) {
+        let (status, proposed) = request(
+            app,
+            Method::POST,
+            "/gaugeapps/administration/commands",
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "page_id": "organization-policy", "command_id": command_id,
+                "expected_basis": basis, "idempotency_key": key,
+                "payload": payload, "client": "web"
+            }),
+            Some(key),
+        )
+        .await;
+        if status != StatusCode::OK {
+            return (status, proposed);
+        }
+        let id = proposed["proposal"]["id"].as_str().unwrap();
+        request(
+            app,
+            Method::POST,
+            &format!("/gaugeapps/administration/proposals/{id}/review"),
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "decision": "accept", "client": "web"
+            }),
+            Some(&format!("{key}-review")),
+        )
+        .await
+    }
+
+    async fn organization_policy_page(app: &Router, session: &Value) -> Value {
+        let uri = format!(
+            "/gaugeapps/administration/pages/organization-policy?session={}&generation={}&scope={}",
+            session["id"].as_str().unwrap(),
+            session["generation"].as_str().unwrap(),
+            session["scope"]["id"].as_str().unwrap(),
+        );
+        let (status, page) = request(app, Method::GET, &uri, Value::Null, None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        page["page"].clone()
+    }
+
+    /// WS-424: an administrator enrolls this organization and the Project
+    /// Host the page names; the enrollment cannot be repeated, re-pointed or
+    /// undone, and the organization's projects can no longer be handed off.
+    #[tokio::test]
+    async fn an_administrator_enrolls_the_office_profile_once_and_cannot_leave_it() {
+        let (_dir, shared, app) = test_app();
+        let home = shared.lock_unpoisoned().home_id().as_str().to_owned();
+        let session = open(&app).await;
+        let page = organization_policy_page(&app, &session).await;
+        assert_eq!(page["model"]["office_profile"]["state"], "available");
+        assert_eq!(page["model"]["office_profile"]["this_home"], home.as_str());
+
+        // A stale client that was shown another Project Host is refused.
+        let (status, refused) = propose_and_review(
+            &app,
+            &session,
+            &page["resource_basis"],
+            "office-profile.enroll",
+            json!({ "home_id": "home:somewhere-else" }),
+            "office-profile-stale",
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "{refused}");
+        assert!(shared.lock_unpoisoned().office_profile().unwrap().is_none());
+
+        let (status, applied) = propose_and_review(
+            &app,
+            &session,
+            &page["resource_basis"],
+            "office-profile.enroll",
+            json!({ "home_id": home }),
+            "office-profile-enroll",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(applied["receipt"]["status"], "applied");
+        let profile = shared.lock_unpoisoned().office_profile().unwrap().unwrap();
+        assert_eq!(profile.home_id, home);
+        assert_eq!(profile.enrolled_by, "authority:owner");
+
+        let page = organization_policy_page(&app, &session).await;
+        assert_eq!(page["model"]["office_profile"]["state"], "enrolled");
+        assert_eq!(page["model"]["office_profile"]["bound_here"], true);
+
+        let (status, again) = propose_and_review(
+            &app,
+            &session,
+            &page["resource_basis"],
+            "office-profile.enroll",
+            json!({ "home_id": home }),
+            "office-profile-again",
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "{again}");
+
+        // Moving a project to another Project Host is refused before any
+        // handoff intent is prepared.
+        let hosts_basis =
+            read_page_json(&app, &session, "project-hosts").await["page"]["resource_basis"].clone();
+        let (status, handoff) = request(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/commands",
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "page_id": "project-hosts", "command_id": "project-home.handoff",
+                "expected_basis": hosts_basis, "idempotency_key": "office-profile-handoff",
+                "payload": {
+                    "project_id": "proj-clinic",
+                    "expected_current_home_id": home,
+                    "target_home_id": "home:hosted"
+                },
+                "client": "web"
+            }),
+            Some("office-profile-handoff"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{handoff}");
+        assert!(
+            handoff["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("office-controlled profile"),
+            "{handoff}"
+        );
+        assert_eq!(
+            shared.lock_unpoisoned().office_profile().unwrap(),
+            Some(profile)
         );
     }
 

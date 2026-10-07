@@ -77,8 +77,17 @@ export const parseProviderConnection = shape({
     execution_classes: arrayOf(oneOf("local-interactive", "private-home", "public-deployment")),
     models: strings, linked_at_ms: nullable(integerValue), last_verified_at_ms: nullable(integerValue),
     verification: oneOf("unverified", "reachable", "unreachable"),
+    /** The trusted devices still waiting for a copy of this link (DR-0334). */
+    waiting: strings,
 });
 export type ProviderConnectionModel = ReturnType<typeof parseProviderConnection>;
+
+/** What a page needs to seal a new link for every device of the account. */
+export const parseAccountLinkRecipients = shape({
+    account: stringValue,
+    recipients: arrayOf(shape({ device_id: stringValue, public_key: stringValue })),
+});
+export type AccountLinkRecipients = ReturnType<typeof parseAccountLinkRecipients>;
 
 const providerSignIn = shape({
     provider: stringValue, linked: booleanValue, expires: nullable(integerValue), expired: booleanValue,
@@ -153,6 +162,7 @@ export function parseSubscriptionBilling(value: unknown, path: string) {
 export type SubscriptionBilling = ReturnType<typeof parseSubscriptionBilling>;
 export const parseProviderConnectionsModel = shape({
     connections: arrayOf(parseProviderConnection),
+    account_links: parseAccountLinkRecipients,
     default_model: nullable(shape({ connection_id: stringValue, model: stringValue })),
     subscription_sign_ins: shape({ codex: providerSignIn, grok: providerSignIn }),
     managed_inference: shape({ plan: nullable(managedPlan), usage: parseManagedInferenceUsage, billing: parseSubscriptionBilling }),

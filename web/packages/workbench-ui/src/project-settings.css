@@ -43,11 +43,17 @@
 
 .project-settings-page-head span,
 .project-settings-form label > span,
+.project-settings-subhead,
 .project-settings-menu header span {
     color: var(--muted);
     font-size: var(--fs-label);
     letter-spacing: .08em;
     text-transform: uppercase;
+}
+
+.project-settings-subhead {
+    margin: 12px 0 0;
+    font-weight: 400;
 }
 
 .project-settings-page-head h1 {

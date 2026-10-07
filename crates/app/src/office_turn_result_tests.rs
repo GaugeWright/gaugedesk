@@ -680,6 +680,9 @@ async fn exercise_original_office_result(
                     authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                     client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
                     account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
+                    client_request_id: None,
+                    client_author: None,
+                    client_attempt: None,
                     runtime_command_id: None, original_http_command: Some(&original), harness_factory: Some(crate::harness_select::TurnHarnessFactory::Custom(Arc::new(probe))),
                 });
                 if matches!(case, "clean" | "failed" | "repeated-writes") {
@@ -1131,6 +1134,9 @@ workflow Method {
                 let refused = crate::engine::run_engagement_turn(&wb, &chat, &worktree, &sender, crate::engine::EngagementTurnInput {
                     task, images: &changed, mode, authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                     client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
+                    client_request_id: None,
+                    client_author: None,
+                    client_attempt: None,
                     account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE), runtime_command_id: None,
                     original_http_command: Some(&original), harness_factory: None,
                 }).unwrap_err();
@@ -1161,6 +1167,9 @@ workflow Method {
                 let failed = crate::engine::run_engagement_turn(&wb, &chat, &worktree, &sender, crate::engine::EngagementTurnInput {
                     task, images: &images, mode, authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                     client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
+                    client_request_id: None,
+                    client_author: None,
+                    client_attempt: None,
                     account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE), runtime_command_id: None,
                     original_http_command: Some(&original), harness_factory: None,
                 });
@@ -1217,6 +1226,9 @@ workflow Method {
                 let refused = crate::engine::run_engagement_turn(&wb, &chat, &worktree, &sender, crate::engine::EngagementTurnInput {
                     task, images: &images, mode, authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                     client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
+                    client_request_id: None,
+                    client_author: None,
+                    client_attempt: None,
                     account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE), runtime_command_id: None,
                     original_http_command: Some(&original), harness_factory: None,
                 });
@@ -1240,6 +1252,9 @@ workflow Method {
             let recovered = crate::engine::run_engagement_turn(&wb, &chat, &worktree, &sender, crate::engine::EngagementTurnInput {
                 task, images: &images, mode, authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                 client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
+                client_request_id: None,
+                client_author: None,
+                client_attempt: None,
                 account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE), runtime_command_id: None,
                 original_http_command: Some(&original), harness_factory: None,
             });
@@ -1382,6 +1397,9 @@ workflow Method {
                     account_scope: "account",
                     tenant_scope: ORG_SCOPE,
                     account_bearer: Some(ALICE),
+                    client_request_id: None,
+                    client_author: None,
+                    client_attempt: None,
                     runtime_command_id: None,
                     original_http_command: Some(&original),
                     harness_factory: None,

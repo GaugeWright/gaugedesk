@@ -1035,6 +1035,58 @@ impl Store {
         use_pin(&self.conn, home_id, target_store, use_key)
     }
 
+    /// Every Home operation registered against one target store — pending,
+    /// completed and refused — in operation-id order. This is the Home's own
+    /// account of that target, read for revalidation; it is not a seal and
+    /// certifies no Home-wide population.
+    pub fn reference_operations_for_target(
+        &self,
+        home_id: &str,
+        target_store: &str,
+    ) -> Result<Vec<ReferenceOperation>, JournalError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT operation_id FROM home_reference_operations \
+             WHERE home_id = ?1 AND target_store = ?2 ORDER BY operation_id",
+        )?;
+        let ids = stmt
+            .query_map(params![home_id, target_store], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                operation(&self.conn, &id)?.ok_or(JournalError::Conflict(
+                    "listed reference operation disappeared",
+                ))
+            })
+            .collect()
+    }
+
+    /// Every immutable use pin bound against one target store, in use-key
+    /// order, exact and legacy-unknown alike.
+    pub fn reference_use_pins_for_target(
+        &self,
+        home_id: &str,
+        target_store: &str,
+    ) -> Result<Vec<ReferenceUsePin>, JournalError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT use_key FROM home_reference_use_pins \
+             WHERE home_id = ?1 AND target_store = ?2 ORDER BY use_key",
+        )?;
+        let keys = stmt
+            .query_map(params![home_id, target_store], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        keys.into_iter()
+            .map(|key| {
+                use_pin(&self.conn, home_id, target_store, &key)?.ok_or(JournalError::Conflict(
+                    "listed reference use pin disappeared",
+                ))
+            })
+            .collect()
+    }
+
     /// Preserve a pre-journal item's unresolved lineage without inventing an
     /// accepting operation. It remains unusable until its lifecycle is chosen
     /// explicitly; an exact retry cannot silently upgrade this classification.

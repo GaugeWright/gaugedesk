@@ -47,6 +47,7 @@ pub fn signed_put(
         directory: directory_record(&root_pubkey, acct, placement_pointers, home_routes),
         sealed_blob: seal_account_blob(key, acct)?,
         retracted: false,
+        device: String::new(),
     };
     gaugedesk_directory_protocol::sign_entry(entry, signing_key).ok()
 }
@@ -218,6 +219,39 @@ pub fn fetch(http: &HttpClient, base: &str, root: &str) -> Result<Option<Fetched
         404 => Ok(None),
         _ => Err(format!("directory fetch HTTP {status}: {body}")),
     }
+}
+
+/// Every computer's latest live entry under `root` (DR-0359 §2), oldest first.
+/// A directory that predates per-computer entries does not serve the list, and
+/// its one entry stands in for it.
+pub fn fetch_live_entries(
+    http: &HttpClient,
+    base: &str,
+    root: &str,
+) -> Result<Vec<FetchedRecord>, String> {
+    let url = format!("{}/directory/{}/entries", base.trim_end_matches('/'), root);
+    let (status, body) = http.get_string_headers(&url, &[])?;
+    match status {
+        200..=299 => parse_live_entries(&body),
+        404 => Ok(fetch(http, base, root)?
+            .filter(|record| !record.entry.retracted)
+            .into_iter()
+            .collect()),
+        _ => Err(format!("directory entries fetch HTTP {status}: {body}")),
+    }
+}
+
+fn parse_live_entries(body: &str) -> Result<Vec<FetchedRecord>, String> {
+    #[derive(serde::Deserialize)]
+    struct Live {
+        puts: Vec<String>,
+    }
+    let live: Live = serde_json::from_str(body).map_err(|e| format!("parse entries: {e}"))?;
+    live.puts
+        .iter()
+        .map(|put| parse_fetched_record(put))
+        .filter(|record| !matches!(record, Ok(record) if record.entry.retracted))
+        .collect()
 }
 
 fn parse_fetched_record(body: &str) -> Result<FetchedRecord, String> {
@@ -841,6 +875,7 @@ mod tests {
             author_authority: String::new(),
             author_root_pubkey: String::new(),
             author_signature: None,
+            placement: None,
         }
     }
 
@@ -875,6 +910,7 @@ mod tests {
             sealed_blob: seal_account_blob(guard.account_key(), &seeded_account())
                 .expect("seals under this workbench's own account key"),
             retracted: false,
+            device: String::new(),
         };
         let routes = |guard: &crate::Workbench| {
             Account::rebuild(guard.store_ref())
@@ -971,6 +1007,7 @@ mod tests {
                 author_authority: String::new(),
                 author_root_pubkey: String::new(),
                 author_signature: None,
+                placement: None,
             },
             &serving,
         )
@@ -992,6 +1029,7 @@ mod tests {
             ),
             sealed_blob: String::new(),
             retracted: false,
+            device: String::new(),
         };
         let put = gaugedesk_directory_protocol::sign_entry(entry, &root_key).unwrap();
         let applied = guard.library_sync_reconcile_routes(&FetchedRecord {
@@ -1132,6 +1170,7 @@ mod tests {
             ),
             sealed_blob: String::new(),
             retracted: false,
+            device: String::new(),
         };
         // The same record with and without the proof that makes it mean anything.
         let unsigned = |routes: Vec<crate::home::OpaqueHomeRoute>| FetchedRecord {
@@ -1225,6 +1264,7 @@ mod tests {
                 author_authority: String::new(),
                 author_root_pubkey: String::new(),
                 author_signature: None,
+                placement: None,
             },
             &serving,
         )
@@ -1256,6 +1296,7 @@ mod tests {
                 ),
                 sealed_blob: String::new(),
                 retracted: false,
+                device: String::new(),
             },
             &root_key,
         )
@@ -1297,6 +1338,7 @@ mod tests {
                 ),
                 sealed_blob: String::new(),
                 retracted: false,
+                device: String::new(),
             },
             &root_key,
         )
@@ -1350,6 +1392,7 @@ mod tests {
                 author_authority: String::new(),
                 author_root_pubkey: String::new(),
                 author_signature: None,
+                placement: None,
             },
             &serving,
         )
