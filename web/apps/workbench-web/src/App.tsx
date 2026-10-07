@@ -75,6 +75,8 @@ import {
     type WorkTargetNode,
     resolveSignInRoute,
     beginWorkEmailLogin,
+    sharedAgentProject,
+    workRouteProject,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { ManagementChat } from "./ManagementChat";
@@ -908,7 +910,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 .catch(() => {});
         }
     }
-    const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string; kind: AgentKind } | null>(null);
+    // `project` is the shared project a member authors this Agent through,
+    // whose Home serves its settings (DR-0453); null for the person's own.
+    const [agentSettings, setAgentSettings] = createSignal<{ id: ArchetypeId; name: string; kind: AgentKind; project: ProjectId | null } | null>(null);
     // The per-project Engagement pane (FED-7), opened from a project node.
     const [engagement, setEngagement] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // LLM-2: the per-project model-access panel (pin a BYOK key at project scope).
@@ -1457,6 +1461,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     lineage: `${a.name} · Workshop`,
                     // An edit chat's context is the method it edits.
                     context: a.name,
+                    // The shared project a member edits this Agent through,
+                    // whose Home serves the chat (DR-0453).
+                    authoringProject: sharedAgentProject(a),
                     conflict: c.conflict,
                     workstream: ws.workstreams.find((w) => w.id === c.workstream)?.name
                         ?? "Main",
@@ -1493,6 +1500,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     candidate: c.candidateRevision,
                     acts: c.availableActs,
                     preview: a.kind,
+                    authoringProject: sharedAgentProject(a),
                 };
             }
         }
@@ -1568,11 +1576,19 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // Tell the control plane which project is open, so work resolves to *that*
     // project's Home rather than one selected Home (DESK-3). Several Homes stay
     // connected at once; this only decides which one serves the work in hand.
+    // An edit chat, preview or settings of an Agent a member authors through
+    // a shared project names no project of its own, so it keeps to that
+    // project's Home rather than falling back to the selected one (DR-0453).
     createEffect(() => {
         const requested = projectSettings()?.id
             ?? panelSettings()?.projectId
             ?? (projectHome()?.id === routedProject() ? routedProject() : null);
-        const project = (requested ?? currentProject()?.id ?? null) as ProjectId | null;
+        const project = workRouteProject({
+            requested: (requested ?? null) as ProjectId | null,
+            agentSettings: agentSettings()?.project ?? null,
+            chatProject: (currentProject()?.id ?? null) as ProjectId | null,
+            authoring: chatInfo()?.authoringProject ?? null,
+        });
         api.setCurrentProject(project);
         setTaskRouteProject(project);
     });
@@ -1925,12 +1941,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // Selecting an Agent opens its settings and nothing else: the open work or
     // edit chat stays where it was, as it does under a GaugeApp
     // (navigation.md), and the Agent's row stays selected in the nav.
-    function openAgentSettings(id: ArchetypeId, name: string, kind: AgentKind) {
+    function openAgentSettings(id: ArchetypeId, name: string, kind: AgentKind, project: ProjectId | null = null) {
         closeProjectSettings();
         closePanelSettings();
         setTutorialsProject(null);
         setOpenedPanelAgent(null);
-        setAgentSettings({ id, name, kind });
+        setAgentSettings({ id, name, kind, project });
         workbenchShell.openPane("content");
     }
 
@@ -2585,7 +2601,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             api={api}
             selected={selected()}
             onSelect={openChat}
-            onOpenArchetypeSettings={(id, name, kind) => openAgentSettings(id, name, kind)}
+            onOpenArchetypeSettings={(id, name, kind, project) => openAgentSettings(id, name, kind, project)}
             openedArchetype={agentSettings()?.id ?? null}
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}

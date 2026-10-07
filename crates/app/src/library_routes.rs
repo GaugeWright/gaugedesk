@@ -92,8 +92,46 @@ pub(crate) fn workspace_actor(wb: &Workbench, headers: &axum::http::HeaderMap) -
     }
 }
 
+/// Admit the caller to what only Agent `id`'s owner does: delete, fork,
+/// copy or pull it. Answers with the owner.
 #[allow(clippy::result_large_err)]
 pub(crate) fn admit_agent_authoring_owner(
+    wb: &Workbench,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<String, axum::response::Response> {
+    let actor = admit_agent_author(wb, id, headers)?;
+    if !wb.agent_authoring_owned_by(id, Some(&actor)) {
+        // A member of a project it is placed in authors it, but the Agent
+        // stays its owner's (DR-0453).
+        return Err((StatusCode::FORBIDDEN, "only this Agent's owner may do that").into_response());
+    }
+    Ok(actor)
+}
+
+/// Admit the caller to author Agent `id` — its edit chats, settings, tries
+/// and published versions: its owner, or a member of a shared project it is
+/// placed in (DR-0453). Answers with the caller.
+#[allow(clippy::result_large_err)]
+pub(crate) fn admit_agent_author(
+    wb: &Workbench,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<String, axum::response::Response> {
+    let actor = admit_agent_caller(wb, id, headers)?;
+    if !wb.agent_authoring_visible(id, Some(&actor)) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Agent authoring is unavailable to this account",
+        )
+            .into_response());
+    }
+    Ok(actor)
+}
+
+/// The authenticated caller of an Agent route, once the Agent exists.
+#[allow(clippy::result_large_err)]
+fn admit_agent_caller(
     wb: &Workbench,
     id: &str,
     headers: &HeaderMap,
@@ -114,13 +152,6 @@ pub(crate) fn admit_agent_authoring_owner(
     if !wb.library.agents.contains_key(id) {
         return Err((StatusCode::NOT_FOUND, "no such Agent").into_response());
     }
-    if !wb.agent_authoring_visible(id, Some(&actor)) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Agent authoring is unavailable to this account",
-        )
-            .into_response());
-    }
     Ok(actor)
 }
 
@@ -137,13 +168,25 @@ pub fn scope_workspace_value(
     actor: Option<&str>,
 ) -> serde_json::Value {
     use crate::workbench_auth::ProjectVisibility;
+    // The Agents the caller authors: its own, and those placed in a shared
+    // project it is a member of (DR-0453), read with one fold of the directory.
+    let shared = actor
+        .map(|actor| wb.member_authorable_agents(actor))
+        .unwrap_or_default();
+    let authors = |id: &str| wb.agent_authoring_owned_by(id, actor) || shared.contains_key(id);
     if let Some(agents) = value.get_mut("archetypes").and_then(|v| v.as_array_mut()) {
-        agents.retain(|agent| {
-            agent["id"]
-                .as_str()
-                .is_some_and(|id| wb.agent_authoring_visible(id, actor))
-        });
+        agents.retain(|agent| agent["id"].as_str().is_some_and(authors));
         for agent in agents {
+            // An Agent the caller authors as a member names the projects it
+            // reaches it through, so a client keeps its authoring on the Home
+            // serving them.
+            if let Some(through) = agent["id"]
+                .as_str()
+                .filter(|id| !wb.agent_authoring_owned_by(id, actor))
+                .and_then(|id| shared.get(id))
+            {
+                agent["shared_through"] = serde_json::json!(through);
+            }
             if let Some(chats) = agent.get_mut("chats").and_then(|v| v.as_array_mut()) {
                 chats.retain(|chat| {
                     chat["id"]
@@ -151,14 +194,21 @@ pub fn scope_workspace_value(
                         .is_some_and(|id| wb.authoring_chat_visible(id, actor) == Some(true))
                 });
             }
+            // A preview a member started is that member's own; one started
+            // before member previews existed is its author's, as it was.
+            if let Some(previews) = agent.get_mut("previews").and_then(|v| v.as_array_mut()) {
+                previews.retain(|preview| {
+                    preview["project_id"]
+                        .as_str()
+                        .and_then(|project| wb.panel_preview_started_by(project))
+                        .is_none_or(|starter| Some(starter.as_str()) == actor)
+                });
+            }
         }
     }
     if let Some(targets) = value.get_mut("work_targets").and_then(|v| v.as_array_mut()) {
         targets.retain(|target| {
-            target["owner_kind"] != "archetype"
-                || target["owner_id"]
-                    .as_str()
-                    .is_some_and(|id| wb.agent_authoring_visible(id, actor))
+            target["owner_kind"] != "archetype" || target["owner_id"].as_str().is_some_and(authors)
         });
     }
     if let Some(streams) = value.get_mut("workstreams").and_then(|v| v.as_array_mut()) {
@@ -168,7 +218,7 @@ pub fn scope_workspace_value(
                 .and_then(|id| wb.library.instances.get(id))
                 .is_none_or(|instance| {
                     instance.kind != crate::library::InstanceKind::Authoring
-                        || wb.agent_authoring_visible(&instance.agent_id, actor)
+                        || authors(&instance.agent_id)
                 })
         });
     }
@@ -871,7 +921,7 @@ pub async fn get_agent(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_author(&wb, &id, &headers) {
         return error;
     }
     match wb.agent_record(&id) {
@@ -897,7 +947,7 @@ pub async fn get_panel_profile(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_author(&wb, &id, &headers) {
         return error;
     }
     match wb.panel_profile(&id) {
@@ -916,7 +966,7 @@ pub async fn put_panel_profile(
     Json(profile): Json<PanelPublicProfile>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_author(&wb, &id, &headers) {
         return error;
     }
     match wb.set_panel_profile(&id, profile) {
@@ -938,7 +988,7 @@ pub async fn get_archetype_abilities(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_author(&wb, &id, &headers) {
         return error;
     }
     match wb.archetype_abilities(&id) {
@@ -962,7 +1012,7 @@ pub async fn put_archetype_abilities(
     Json(body): Json<UpdateArchetypeAbilities>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_author(&wb, &id, &headers) {
         return error;
     }
     match wb.set_archetype_abilities(&id, body.abilities) {
@@ -1012,7 +1062,7 @@ pub async fn update_agent(
         }
     }
     let mut wb = wb.lock_unpoisoned();
-    if let Err(error) = admit_agent_authoring_owner(&wb, &id, &headers) {
+    if let Err(error) = admit_agent_author(&wb, &id, &headers) {
         return error;
     }
     let Some(updated) = wb.update_agent_record(&id, body.name, body.config) else {
@@ -1718,17 +1768,37 @@ pub async fn post_publish_archetype(
     Json(body): Json<PublishArchetype>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let owner = match admit_agent_authoring_owner(&wb, &id, &headers) {
-        Ok(owner) => owner,
+    let actor = match admit_agent_author(&wb, &id, &headers) {
+        Ok(actor) => actor,
         Err(error) => return error,
     };
-    let verified_owner = crate::method_access::account_backed(&wb, &headers).then_some(owner);
-    match wb.publish_archetype_version(&id, body.auto_upgrade, verified_owner.as_deref()) {
-        Ok((new_version, auto_upgraded)) => (
-            StatusCode::OK,
-            Json(json!({ "version": new_version, "auto_upgraded": auto_upgraded })),
-        )
-            .into_response(),
+    // A member of a shared project the Agent is placed in publishes it on its
+    // owner's behalf: the owner stays its publisher, and the version records
+    // who asked (DR-0453).
+    let (publisher, requested_by) = if wb.agent_authoring_owned_by(&id, Some(&actor)) {
+        (Some(actor), None)
+    } else {
+        (wb.agent_authoring_owner(&id), Some(actor))
+    };
+    let verified_publisher = crate::method_access::account_backed(&wb, &headers)
+        .then_some(publisher)
+        .flatten();
+    match wb.publish_archetype_version(
+        &id,
+        body.auto_upgrade,
+        verified_publisher.as_deref(),
+        requested_by.as_deref(),
+    ) {
+        Ok((new_version, auto_upgraded)) => {
+            if let Some(member) = &requested_by {
+                crate::audit::record(&mut wb, member, "agent.publish", &id);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({ "version": new_version, "auto_upgraded": auto_upgraded })),
+            )
+                .into_response()
+        }
         Err(PublishArchetypeError::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such archetype" })),
@@ -1773,10 +1843,26 @@ pub async fn post_accept_placement(
 pub async fn post_upgrade_placement(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
+    // Its project's owner upgrades a placement, and so does a member of that
+    // project; a viewer does not (DR-0453).
+    if let Some(refusal) = wb.placement_deployer_refusal(&headers, &id) {
+        return refusal;
+    }
+    let requested_by = wb
+        .library
+        .project_of_instance(&id)
+        .map(str::to_owned)
+        .and_then(|project| wb.project_member_requester(&headers, &project));
     match wb.upgrade_placement_version(&id) {
-        Ok(version) => (StatusCode::OK, Json(json!({ "version": version }))).into_response(),
+        Ok(version) => {
+            if let Some(member) = &requested_by {
+                crate::audit::record(&mut wb, member, "placement.upgrade", &id);
+            }
+            (StatusCode::OK, Json(json!({ "version": version }))).into_response()
+        }
         Err(UpgradePlacementError::PlacementNotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such placement" })),
@@ -1863,7 +1949,7 @@ pub async fn create_chat_under_agent(
     Json(body): Json<CreateChat>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let creator = match admit_agent_authoring_owner(&wb, &id, &headers) {
+    let creator = match admit_agent_author(&wb, &id, &headers) {
         Ok(actor) => actor,
         Err(error) => return error,
     };
@@ -1910,11 +1996,14 @@ pub async fn start_panel_preview(
     Json(body): Json<StartPanelPreview>,
 ) -> impl IntoResponse {
     let mut wb = wb.lock_unpoisoned();
-    let creator = match admit_agent_authoring_owner(&wb, &id, &headers) {
+    let creator = match admit_agent_author(&wb, &id, &headers) {
         Ok(actor) => actor,
         Err(error) => return error,
     };
-    match wb.start_panel_preview_chat(&id, body.placement_id.as_deref()) {
+    // A member of a shared project the Agent is placed in tries it as itself:
+    // the preview is its own (DR-0453).
+    let member = (!wb.agent_authoring_owned_by(&id, Some(&creator))).then_some(creator.as_str());
+    match wb.start_panel_preview_chat_as(&id, body.placement_id.as_deref(), member) {
         Ok(chat) => {
             if let Some(chat_id) = chat["id"].as_str() {
                 wb.claim_chat_owner(chat_id, &creator);
@@ -1922,7 +2011,9 @@ pub async fn start_panel_preview(
             (StatusCode::CREATED, Json(chat)).into_response()
         }
         Err(error) => {
-            let status = if error.contains("requires") || error.contains("not text") {
+            let status = if error.ends_with("in your project") {
+                StatusCode::FORBIDDEN
+            } else if error.contains("requires") || error.contains("not text") {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR

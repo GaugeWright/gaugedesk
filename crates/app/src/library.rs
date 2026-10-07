@@ -276,6 +276,11 @@ pub struct ArchetypeVersionRecord {
     /// versions and therefore have no public profile.
     #[serde(default)]
     pub panel_profile: Option<PanelPublicProfile>,
+    /// The member of a shared project who asked for this version, when it
+    /// was not its publisher: the Agent's owner publishes it, and this names
+    /// who requested the publish (DR-0453). Absent when the publisher did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

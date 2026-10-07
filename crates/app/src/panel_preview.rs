@@ -59,6 +59,11 @@ pub struct PanelPreviewMarker {
     /// The hidden Agent, written on the hidden project's marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_agent_id: Option<String>,
+    /// The member of a shared project who started this preview of an Agent
+    /// placed there (DR-0453), whose own it is. Absent for one its author
+    /// started, which belongs to whoever owns what it previews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<String>,
 }
 
 fn marker_of(
@@ -246,6 +251,16 @@ impl Workbench {
             .map(|project| project.id.clone())
     }
 
+    /// The member who started the preview whose hidden project is
+    /// `project_id`, when a member did (DR-0453).
+    pub(crate) fn panel_preview_started_by(&self, project_id: &str) -> Option<String> {
+        self.library
+            .projects
+            .get(project_id)
+            .and_then(|project| marker_of(&project.extra))
+            .and_then(|marker| marker.started_by)
+    }
+
     /// Whether `project_id` names a preview's hidden project.
     pub(crate) fn is_panel_preview_project_id(&self, project_id: &str) -> bool {
         self.library
@@ -314,11 +329,42 @@ impl Workbench {
     /// A preview of the same thing that is already open is replaced, so trying
     /// a draft again picks up the edits made since. Returns the chat, as
     /// creating any chat does.
+    #[cfg(test)]
     pub(crate) fn start_panel_preview_chat(
         &mut self,
         agent_id: &str,
         placement_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
+        self.start_panel_preview_chat_as(agent_id, placement_id, None)
+    }
+
+    /// [`Self::start_panel_preview_chat`], started by `member` — a member of
+    /// a shared project the Agent is placed in, not its author (DR-0453). The
+    /// preview is that member's own: it replaces only the member's earlier
+    /// preview of the same thing, never its author's or another member's, and
+    /// a version it tries is pinned by a placement in one of the member's
+    /// projects.
+    pub(crate) fn start_panel_preview_chat_as(
+        &mut self,
+        agent_id: &str,
+        placement_id: Option<&str>,
+        member: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        if let (Some(member), Some(placement)) = (member, placement_id) {
+            let reached = self
+                .library
+                .project_of_instance(placement)
+                .is_some_and(|project| {
+                    self.agent_member_projects(agent_id, member)
+                        .contains(project)
+                });
+            if !reached {
+                return Err(
+                    "a version preview requires this Panel agent's placement in your project"
+                        .to_owned(),
+                );
+            }
+        }
         let agent = self
             .library
             .agents
@@ -377,7 +423,9 @@ impl Workbench {
             .values()
             .filter(|project| {
                 marker_of(&project.extra).is_some_and(|marker| {
-                    marker.agent_id == agent.id && marker.placement_id.as_deref() == placement_id
+                    marker.agent_id == agent.id
+                        && marker.placement_id.as_deref() == placement_id
+                        && marker.started_by.as_deref() == member
                 })
             })
             .map(|project| project.id.clone())
@@ -393,6 +441,7 @@ impl Workbench {
             version,
             project_id: None,
             preview_agent_id: None,
+            started_by: member.map(str::to_owned),
         };
         let mut preview_agent_id: Option<String> = None;
         let built = (|| {
@@ -616,6 +665,7 @@ impl Workbench {
                     discipline_ref: discipline.reference,
                     source_owner_authority: None,
                     panel_profile: None,
+                    requested_by: None,
                 }),
                 gaugedesk_workspace::MergeOutcome::Conflict => {
                     Err("the preview's snapshot could not be committed".to_owned())
@@ -753,6 +803,7 @@ mod tests {
             version: Some(3),
             project_id: None,
             preview_agent_id: Some("agent-b".to_owned()),
+            started_by: Some("member-account".to_owned()),
         };
         let mut extra = std::collections::BTreeMap::new();
         extra.insert(

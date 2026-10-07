@@ -1036,11 +1036,24 @@ impl Workbench {
         class: ModelExecutionClass,
     ) -> Option<SelectedCredential> {
         self.selected_credential_for_project_in_class(
-            self.library_project_of_chat(chat_id).as_deref(),
+            self.credential_project_of_chat(chat_id, actor).as_deref(),
             provider,
             actor,
             class,
         )
+    }
+
+    /// The project whose credentials a turn in `chat_id` run by `actor` may
+    /// spend: the chat's own project, or, for a member's edit chat or
+    /// preview of an Agent placed in a project it is a member of, that
+    /// project (DR-0453). A preview's hidden project holds no credentials.
+    fn credential_project_of_chat(&self, chat_id: &str, actor: &str) -> Option<String> {
+        match self.library_project_of_chat(chat_id) {
+            Some(project) if !self.is_panel_preview_project_id(&project) => Some(project),
+            project => self
+                .member_authoring_project_of_chat(chat_id, actor)
+                .or(project),
+        }
     }
 
     /// ADR 0062's nearest-holder rule for work in `project_id`: the project's
@@ -1363,7 +1376,7 @@ impl Workbench {
     ) -> Vec<String> {
         let mut providers =
             self.linked_providers_in_class(&self.account_scope_for_actor(actor), class);
-        if let Some(project_id) = self.library_project_of_chat(chat_id) {
+        if let Some(project_id) = self.credential_project_of_chat(chat_id, actor) {
             for provider in self.linked_providers_in_class(&project_scope(&project_id), class) {
                 if !providers.contains(&provider) {
                     providers.push(provider);

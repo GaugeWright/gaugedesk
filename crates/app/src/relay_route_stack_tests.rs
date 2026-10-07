@@ -360,6 +360,35 @@ async fn the_owner_keeps_the_connection_through_a_refusal() {
     assert_eq!(close, None);
 }
 
+/// A route that never crosses is refused to the owner too, but over the
+/// connection their other calls share, which a hang-up would have failed.
+#[tokio::test]
+async fn the_owner_keeps_the_connection_through_a_local_only_refusal() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    crate::account_signin::store_session_for_test(&wb);
+    crate::home_owner::claim_if_never_claimed(&wb).unwrap();
+    let app = relay_control_plane(wb.clone(), Arc::new(Owner));
+    let (status, close) = connection_header(
+        &app,
+        "/account/onboarding-status",
+        &[("authorization", "Bearer owner-bearer")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(close, None);
+
+    let strangers = relay_control_plane(wb.clone(), Arc::new(Stranger));
+    let (status, close) = connection_header(
+        &strangers,
+        "/account/onboarding-status",
+        &[("authorization", "Bearer not-the-owner")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(close.as_deref(), Some("close"));
+}
+
 /// DR-0328 §6: any account signed in on this computer crosses the relay as
 /// itself, beside the claimant, and reaches only its own projects.
 #[tokio::test]
@@ -409,11 +438,9 @@ fn a_member_reaches_its_projects_work_and_nothing_host_wide() {
         (Method::PUT, "/account/settings"),
         (Method::GET, "/admin/members"),
         (Method::POST, "/archetypes"),
-        (Method::GET, "/archetypes/agent-1/settings/sessions"),
         (Method::POST, "/federation/invite"),
         (Method::POST, "/home/invitations"),
         (Method::GET, "/home/projects/proj-1/invitations"),
-        (Method::POST, "/public-deployments"),
         (Method::POST, "/tutorials/basics/start"),
         (Method::GET, "/roster"),
         (Method::POST, "/projects"),
@@ -437,5 +464,52 @@ fn a_member_reaches_its_projects_work_and_nothing_host_wide() {
         (Method::GET, "/tasks"),
     ] {
         assert!(!member_refused(&method, path), "{method} {path}");
+    }
+}
+
+/// A member authors, tries, publishes and deploys the Agents placed in its
+/// projects; the handler behind decides which those are (DR-0453). What stays
+/// the owner's about an Agent or a deployment never crosses.
+#[test]
+fn a_member_reaches_its_projects_agents_and_not_what_stays_the_owners() {
+    for (method, path) in [
+        (Method::GET, "/archetypes/agent-1"),
+        (Method::PUT, "/archetypes/agent-1"),
+        (Method::GET, "/archetypes/agent-1/abilities"),
+        (Method::PUT, "/archetypes/agent-1/abilities"),
+        (Method::GET, "/archetypes/agent-1/panel-profile"),
+        (Method::PUT, "/archetypes/agent-1/panel-profile"),
+        (Method::POST, "/archetypes/agent-1/chats"),
+        (Method::POST, "/archetypes/agent-1/preview"),
+        (Method::POST, "/archetypes/agent-1/publish"),
+        (Method::POST, "/archetypes/agent-1/settings/sessions"),
+        (Method::POST, "/archetypes/agent-1/settings/agent/messages"),
+        (Method::POST, "/archetypes/agent-1/settings/commands"),
+        (Method::POST, "/placements/inst-1/upgrade"),
+        (Method::POST, "/public-deployments"),
+        (Method::GET, "/public-deployments/publisher-authority"),
+        (Method::POST, "/public-deployments/inspect"),
+        (Method::POST, "/public-deployments/credentials/list"),
+    ] {
+        assert!(!member_refused(&method, path), "{method} {path}");
+    }
+    for (method, path) in [
+        (Method::POST, "/archetypes"),
+        (Method::DELETE, "/archetypes/agent-1"),
+        (Method::POST, "/archetypes/agent-1/fork"),
+        (Method::POST, "/archetypes/agent-1/copy-as-panel"),
+        (Method::POST, "/archetypes/agent-1/pull-from-source"),
+        (Method::POST, "/archetypes/agent-1/use"),
+        (Method::DELETE, "/archetypes/agent-1/chats"),
+        (Method::GET, "/archetypes//settings/sessions"),
+        (Method::POST, "/public-deployments/control"),
+        (Method::POST, "/public-deployments/import"),
+        (Method::POST, "/public-deployments/erase-session"),
+        (Method::POST, "/public-deployments/collect"),
+        (Method::POST, "/public-deployments/credentials/provision"),
+        (Method::POST, "/public-deployments/credentials/revoke"),
+        (Method::GET, "/public-deployments"),
+    ] {
+        assert!(member_refused(&method, path), "{method} {path}");
     }
 }

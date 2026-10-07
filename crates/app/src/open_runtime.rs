@@ -762,6 +762,7 @@ mod reachability_tests {
                 "owner-bearer" => Some("account-root".to_owned()),
                 "someone-elses-bearer" => Some("someone-else".to_owned()),
                 "invitee-bearer" => Some("invitee-account".to_owned()),
+                "viewer-bearer" => Some("viewer-account".to_owned()),
                 _ => None,
             })
         }
@@ -776,7 +777,9 @@ mod reachability_tests {
                 return Ok(EmailStanding::Unrecognised);
             };
             Ok(
-                if account == "invitee-account" && email == "invitee@example.test" {
+                if (account == "invitee-account" && email == "invitee@example.test")
+                    || (account == "viewer-account" && email == "viewer@example.test")
+                {
                     EmailStanding::Holds { account }
                 } else {
                     EmailStanding::DoesNotHold { account }
@@ -798,7 +801,7 @@ mod reachability_tests {
     }
 
     /// [`reachable_home`], with the Home's workbench.
-    async fn reachable_home_and_workbench() -> (
+    pub(super) async fn reachable_home_and_workbench() -> (
         TestRelay,
         tempfile::TempDir,
         crate::SharedWorkbench,
@@ -991,7 +994,7 @@ mod reachability_tests {
 
     /// One JSON request carried over the relay. Each carries its own
     /// idempotency key, so two alike are two commands.
-    async fn carried_json(
+    pub(super) async fn carried_json(
         address: std::net::SocketAddr,
         method: &str,
         path: &str,
@@ -1064,7 +1067,7 @@ mod reachability_tests {
     }
 
     /// Wait until this Home authors a relay route for `project`.
-    async fn routed(wb: &crate::SharedWorkbench, project: &str) -> bool {
+    pub(super) async fn routed(wb: &crate::SharedWorkbench, project: &str) -> bool {
         for _ in 0..200 {
             let relayed = Account::rebuild(wb.lock_unpoisoned().store_ref())
                 .ok()
@@ -1304,6 +1307,12 @@ mod reachability_tests {
         tasks.iter().for_each(|task| task.abort());
     }
 }
+
+// DR-0453: a member authors, tries, publishes and deploys the Agent placed in
+// the shared project, over the same relay as `reachability_tests`.
+#[cfg(test)]
+#[path = "open_runtime_member_authoring_tests.rs"]
+mod member_authoring_tests;
 
 #[cfg(test)]
 mod control_plane_failure_tests {

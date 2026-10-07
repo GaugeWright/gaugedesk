@@ -38,6 +38,7 @@ declare module "@gaugewright/control-plane-client/generated/tunnel.js" {
         takeHeaders(): Record<string, string>;
         isHandshaking(): boolean;
         isPaired(): boolean;
+        peerFinished(): boolean;
         takeCredit(): Uint8Array;
     }
     /** One event stream on its own pinned session (WS-634). */

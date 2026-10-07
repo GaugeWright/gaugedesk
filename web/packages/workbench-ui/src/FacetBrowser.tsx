@@ -38,6 +38,8 @@ import {
     type WorkstreamId,
     type WorkstreamNode,
     applyWorkspaceDelta,
+    ownsAgent,
+    sharedAgentProject,
 } from "@gaugewright/control-plane-client";
 import type { ProjectionCarriage } from "@gaugewright/control-plane-client";
 import { ContextMenu, type MenuState } from "./ContextMenu";
@@ -188,7 +190,10 @@ export function FacetBrowser(props: {
     api: FacetBrowserApi;
     selected: EngagementId | null;
     onSelect: (id: EngagementId) => void;
-    onOpenArchetypeSettings: (id: ArchetypeId, name: string, kind: AgentKind) => void;
+    /** Open an Agent's settings. `project` is the shared project a member
+     *  authors it through, whose Home serves them (DR-0453); `null` for the
+     *  person's own Agent. */
+    onOpenArchetypeSettings: (id: ArchetypeId, name: string, kind: AgentKind, project: ProjectId | null) => void;
     /** The Agent whose settings are open, shown selected in the tree. */
     openedArchetype?: ArchetypeId | null;
     /** Open the per-project Engagement pane (hand off / share a project, FED-7). */
@@ -1365,6 +1370,9 @@ export function FacetBrowser(props: {
     );
 
     // A Workshop archetype row's menu (shared by right-click and the ⋯ button).
+    // An Agent placed in a shared project its member authors offers every
+    // authoring act its owner's does; copying, forking, pulling into and
+    // deleting it stay the owner's, which the Home refuses a member (DR-0453).
     type ArchetypeNode = Workspace["archetypes"][number];
     const archetypeMenuItems = (a: ArchetypeNode): MenuState["items"] => [
         ...(a.kind === "work"
@@ -1378,15 +1386,15 @@ export function FacetBrowser(props: {
             ]),
         { label: "new authoring chat", icon: "page-edit", hint: "Open a chat to edit what this Agent does — you review every change before it's kept", run: () => newEditChat(a.id) },
         { label: "new workstream", icon: "child-branch", hint: "Create a shared auto-sync line over this Agent's edit chats", run: () => startEdit({ kind: "new-workstream", placementId: a.instanceId }) },
-        { label: "settings", run: () => props.onOpenArchetypeSettings(a.id, a.name, a.kind) },
+        { label: "settings", run: () => props.onOpenArchetypeSettings(a.id, a.name, a.kind, sharedAgentProject(a)) },
         { label: "publish a new version", hint: "Make this the current version — placements of it get an upgrade-available notice (UX-9)", run: () => void withRefresh(() => props.api.publishArchetype(a.id), "published a new version") },
-        ...(a.kind === "work" ? [{ label: "copy as Panel agent", run: () => void withRefresh(() => props.api.copyAgentAsPanel(a.id), "Panel agent created") }] : []),
-        { label: "fork", run: () => void withRefresh(() => props.api.forkArchetype(a.id), "Agent forked") },
-        ...(a.forkedFrom
+        ...(ownsAgent(a) && a.kind === "work" ? [{ label: "copy as Panel agent", run: () => void withRefresh(() => props.api.copyAgentAsPanel(a.id), "Panel agent created") }] : []),
+        ...(ownsAgent(a) ? [{ label: "fork", run: () => void withRefresh(() => props.api.forkArchetype(a.id), "Agent forked") }] : []),
+        ...(ownsAgent(a) && a.forkedFrom
             ? [{ label: "pull updates from source", hint: `Merge improvements from “${a.forkedFromName ?? "the source"}” into this fork (ADR 0038)`, run: () => void withRefresh(() => props.api.pullFromSource(a.id), "pulled updates from the source") }]
             : []),
         { label: "rename", run: () => startEdit({ kind: "rename-archetype", id: a.id }, a.name) },
-        ...(a.isDefault
+        ...(a.isDefault || !ownsAgent(a)
             ? []
             : [{ label: "delete", danger: true, run: () => void withRefresh(() => props.api.deleteArchetype(a.id), "Agent deleted") }]),
     ];
@@ -2353,12 +2361,12 @@ export function FacetBrowser(props: {
                                             aria-label={`${a.kind === "panel" ? "Panel agent" : "Agent"} ${a.name}`}
                                             title={`Open ${a.name} settings`}
                                             onClick={() => {
-                                                if (!editingIs("rename-archetype", a.id)) props.onOpenArchetypeSettings(a.id, a.name, a.kind);
+                                                if (!editingIs("rename-archetype", a.id)) props.onOpenArchetypeSettings(a.id, a.name, a.kind, sharedAgentProject(a));
                                             }}
                                             onKeyDown={(e) => {
                                                 if (e.key !== "Enter" && e.key !== " ") return;
                                                 e.preventDefault();
-                                                props.onOpenArchetypeSettings(a.id, a.name, a.kind);
+                                                props.onOpenArchetypeSettings(a.id, a.name, a.kind, sharedAgentProject(a));
                                             }}
                                             onContextMenu={(e) => openMenu(e, archetypeMenuItems(a))}
                                         >

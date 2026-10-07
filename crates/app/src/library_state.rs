@@ -83,6 +83,7 @@ fn published_archetype_version(
         discipline_ref: discipline.reference,
         source_owner_authority: None,
         panel_profile: None,
+        requested_by: None,
     })
 }
 
@@ -6758,6 +6759,7 @@ impl Workbench {
                 discipline_ref: frozen_discipline.reference,
                 source_owner_authority: source_owner_authority.map(str::to_owned),
                 panel_profile: panel_profile.clone(),
+                requested_by: None,
             };
             engagement
                 .commit_turn(&format!("freeze archetype version {version}"))
@@ -6776,11 +6778,16 @@ impl Workbench {
         result
     }
 
+    /// Freeze the Agent's draft as its next version, published by
+    /// `source_owner_authority`. `requested_by` names a member of a shared
+    /// project the Agent is placed in who asked for this version, which
+    /// records it beside its publisher (DR-0453).
     pub(crate) fn publish_archetype_version(
         &mut self,
         id: &str,
         auto_upgrade: Option<bool>,
         source_owner_authority: Option<&str>,
+        requested_by: Option<&str>,
     ) -> Result<(u64, u64), PublishArchetypeError> {
         let mut agent = self
             .library
@@ -6799,12 +6806,13 @@ impl Workbench {
                 "panel agent has no public profile".to_owned(),
             ));
         }
-        let version_record = self.freeze_archetype_draft(
+        let mut version_record = self.freeze_archetype_draft(
             &target_id,
             new_version,
             agent.panel_profile.clone(),
             source_owner_authority,
         )?;
+        version_record.requested_by = requested_by.map(str::to_owned);
         if let Some(auto_upgrade) = auto_upgrade {
             agent.auto_upgrade = auto_upgrade;
         }

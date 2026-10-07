@@ -16,13 +16,21 @@ pub async fn publish_deployment(
     headers: axum::http::HeaderMap,
     Json(mut request): Json<PublishDeploymentRequest>,
 ) -> Response {
-    // Publishing from a project is its owner's act (DR-0328 §5).
-    if let Some(refusal) = workbench
-        .lock_unpoisoned()
-        .placement_owner_refusal(&headers, &request.placement_id)
-    {
-        return refusal;
-    }
+    // Publishing from a project is its owner's act (DR-0328 §5), which a
+    // member of the project may ask for: the deployment stays the owner's and
+    // is signed by the owner's key, and its binding records who asked
+    // (DR-0453).
+    let requested_by = {
+        let workbench = workbench.lock_unpoisoned();
+        if let Some(refusal) = workbench.placement_deployer_refusal(&headers, &request.placement_id)
+        {
+            return refusal;
+        }
+        workbench
+            .library
+            .project_of_instance(&request.placement_id)
+            .and_then(|project| workbench.project_member_requester(&headers, project))
+    };
     let structured = request.funding.clone();
     if structured.is_some()
         && (!request.funding_ref.trim().is_empty()
@@ -59,6 +67,17 @@ pub async fn publish_deployment(
             Some(DeploymentFundingSelection::Managed { .. })
         ) || crate::managed_inference::is_managed_funding_ref(&request.funding_ref);
     if managed_selection && request.funding_entitlement.is_none() {
+        // Minting here would spend this computer's own account session. A
+        // member brings an entitlement its own account minted (DR-0453).
+        if requested_by.is_some() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "a project member's managed deployment carries an entitlement from its own account"
+                })),
+            )
+                .into_response();
+        }
         let Some(tenant) = request
             .managed_tenant_id
             .as_deref()
@@ -101,8 +120,23 @@ pub async fn publish_deployment(
     }
     let result = tokio::task::spawn_blocking(move || {
         let mut workbench = workbench.lock_unpoisoned();
-        request.work_chat_default_model = work_chat_default_model(&workbench, &headers);
-        workbench.publish_agent_deployment(request)
+        request.work_chat_default_model = work_chat_default_model(
+            &workbench,
+            &headers,
+            &request.placement_id,
+            requested_by.is_some(),
+        );
+        request.requested_by = requested_by.clone();
+        let published = workbench.publish_agent_deployment(request);
+        if let (Ok(outcome), Some(member)) = (&published, &requested_by) {
+            crate::audit::record(
+                &mut workbench,
+                member,
+                "deployment.publish",
+                &outcome.binding_id,
+            );
+        }
+        published
     })
     .await;
     match result {
@@ -125,14 +159,51 @@ pub async fn publish_deployment(
     }
 }
 
-/// The caller's work-chat default model, which an unpinned Panel version
-/// publishes with (DR-0272).
+/// The publisher's work-chat default model, which an unpinned Panel version
+/// publishes with (DR-0272): the caller's, or, when a member of the project
+/// asks, its owner's, whose key publishes it (DR-0453).
 fn work_chat_default_model(
     workbench: &crate::Workbench,
     headers: &axum::http::HeaderMap,
+    placement: &str,
+    member: bool,
 ) -> Option<String> {
-    let scope = workbench.credential_scope_for(crate::net_http::bearer(headers));
+    let scope = if member {
+        match workbench
+            .library
+            .project_of_instance(placement)
+            .and_then(|project| workbench.project_owner(project))
+        {
+            Some(crate::project_owner::ProjectOwner::Account(owner)) => {
+                workbench.desktop_account_store_scope(&owner)
+            }
+            _ => crate::account::ACCOUNT_SCOPE.to_owned(),
+        }
+    } else {
+        workbench.credential_scope_for(crate::net_http::bearer(headers))
+    };
     workbench.work_chat_default_model_in(&scope).1
+}
+
+/// Refuse what would give a project member reached over the relay a
+/// publisher key of its own on this computer, which keeps nothing of a
+/// member's (DR-0451 §2): naming no publication, it has no key here to name.
+fn member_session_refusal(
+    workbench: &crate::Workbench,
+    headers: &axum::http::HeaderMap,
+) -> Option<Response> {
+    let member = crate::net_http::bearer(headers)
+        .and_then(|token| workbench.resolve_account_session(token))
+        .is_some_and(|(_, method)| method == crate::desktop_session::MEMBER_METHOD);
+    member.then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "a project member publishes from its project's placement, under its owner's key"
+            })),
+        )
+            .into_response()
+    })
 }
 
 /// The account a request publishes as (DR-0328 §5): a desktop account
@@ -176,13 +247,16 @@ pub async fn publisher_authority(
     let workbench = workbench.lock_unpoisoned();
     let key = match (query.placement_id, query.edge_origin, query.deployment_id) {
         (None, None, None) => {
+            if let Some(refusal) = member_session_refusal(&workbench, &headers) {
+                return refusal;
+            }
             let account = publisher_account(&workbench, &headers);
             workbench.public_publisher_key_as(account.as_deref())
         }
         (Some(placement), Some(edge), Some(deployment))
             if !placement.trim().is_empty() && !deployment.trim().is_empty() =>
         {
-            if let Some(refusal) = workbench.placement_owner_refusal(&headers, &placement) {
+            if let Some(refusal) = workbench.placement_deployer_refusal(&headers, &placement) {
                 return refusal;
             }
             match workbench.publication_publisher_key(&placement, &edge, &deployment) {
@@ -260,9 +334,11 @@ pub async fn inspect_deployment(
     headers: axum::http::HeaderMap,
     Json(request): Json<InspectDeploymentRequest>,
 ) -> Response {
+    // Reading a deployment's live state is part of deploying it, which a
+    // member of its project may do (DR-0453).
     if let Some(refusal) = workbench
         .lock_unpoisoned()
-        .deployment_owner_refusal(&headers, &request.deployment_id)
+        .deployment_deployer_refusal(&headers, &request.deployment_id)
     {
         return refusal;
     }
@@ -311,6 +387,18 @@ pub async fn list_credentials(
     headers: axum::http::HeaderMap,
     Json(request): Json<ListPublicCredentialsRequest>,
 ) -> Response {
+    {
+        let guard = workbench.lock_unpoisoned();
+        // Named a placement, the list is of the key deploying from it signs
+        // with, which a member of its project may choose among (DR-0453).
+        let refusal = match request.placement_id.as_deref() {
+            Some(placement) => guard.placement_deployer_refusal(&headers, placement),
+            None => member_session_refusal(&guard, &headers),
+        };
+        if let Some(refusal) = refusal {
+            return refusal;
+        }
+    }
     publisher_task(workbench, move |workbench| {
         let account = publisher_account(workbench, &headers);
         workbench.list_public_credentials(request, account.as_deref())
@@ -323,6 +411,9 @@ pub async fn provision_credential(
     headers: axum::http::HeaderMap,
     Json(request): Json<ProvisionPublicCredentialRequest>,
 ) -> Response {
+    if let Some(refusal) = member_session_refusal(&workbench.lock_unpoisoned(), &headers) {
+        return refusal;
+    }
     publisher_task(workbench, move |workbench| {
         let account = publisher_account(workbench, &headers);
         workbench.provision_public_credential(request, account.as_deref())
@@ -335,6 +426,9 @@ pub async fn revoke_credential(
     headers: axum::http::HeaderMap,
     Json(request): Json<RevokePublicCredentialRequest>,
 ) -> Response {
+    if let Some(refusal) = member_session_refusal(&workbench.lock_unpoisoned(), &headers) {
+        return refusal;
+    }
     publisher_task(workbench, move |workbench| {
         let account = publisher_account(workbench, &headers);
         workbench.revoke_public_credential(request, account.as_deref())

@@ -138,6 +138,8 @@ export function OrganizationSelector(props: {
     onSelect: (id: string) => void;
     onCreate: (displayName: string) => Promise<void>;
     onOpen: (app: GaugeAppKind, page: string) => void;
+    /** The menu opened: the moment its Administration pages are wanted. */
+    onMenuOpen?: () => void;
     /** True while a GaugeApp or proposal surface is covering ordinary work. */
     surfaceOpen: boolean;
     onWork: () => void;
@@ -150,6 +152,9 @@ export function OrganizationSelector(props: {
     const [menuHeight, setMenuHeight] = createSignal(0);
     const [menuPosition, setMenuPosition] = createSignal({ left: 8, bottom: 0 });
     let anchor!: HTMLDivElement;
+    createEffect(() => {
+        if (open()) props.onMenuOpen?.();
+    });
     createEffect(() => {
         if (!open()) return;
         const pane = anchor.closest(".panel-body");
@@ -398,11 +403,19 @@ export function EnterpriseWorkbench(): JSX.Element {
     const providerScope = createMemo<GaugeAppScope | undefined>(() => tenant()
         ? { kind: "provider-tenant", id: tenant()! }
         : undefined);
+    // Administration is admitted when the person reaches for it — its menu, a
+    // link to one of its pages — and not on every page load. Each admission
+    // rebuilds every Administration page on the Hub while it holds the lock
+    // every other request waits on, and one tenant's took a minute (WS-851).
+    const [administrationWanted, setAdministrationWanted] = createSignal(initialGaugeApp() === "administration");
+    createEffect(() => {
+        if (activeApp() === "administration") setAdministrationWanted(true);
+    });
     let commercial: GaugeAppWorkspaceController;
     const administration = createGaugeAppWorkspace({
         api,
         app: "administration",
-        enabled: () => Boolean(account.session() && tenant()),
+        enabled: () => Boolean(account.session() && tenant() && administrationWanted()),
         actor: () => account.session()?.actor,
         active: () => activeApp() === "administration",
         scope: tenantScope,
@@ -459,6 +472,15 @@ export function EnterpriseWorkbench(): JSX.Element {
     };
     const openGaugeApp = (app: GaugeAppKind, page: string): void => {
         const target = controller(app);
+        if (app === "administration" && target && !target.session() && !target.session.error) {
+            // Not admitted yet: admit, and open the page once its grants say
+            // it exists (the activation effect below reads it from the URL).
+            setAdministrationWanted(true);
+            setProposalAccess(null);
+            writeManagementLocation(app, page, tenant());
+            setActiveApp(app);
+            return;
+        }
         if (!target?.session()?.pages.some((candidate) => candidate.id === page)) return;
         setProposalAccess(null);
         // Set the navigation request before activating the App. Its initial
@@ -558,6 +580,7 @@ export function EnterpriseWorkbench(): JSX.Element {
                 void refetchAccountIndex().catch(() => undefined);
             }}
             onOpen={openGaugeApp}
+            onMenuOpen={() => setAdministrationWanted(true)}
             surfaceOpen={surfaceOpen()}
             onWork={closeSurface}
         /></Show>,
@@ -588,9 +611,14 @@ export function EnterpriseWorkbench(): JSX.Element {
                 : undefined;
         },
         get openOrganizationPeople() {
-            return administration.session()?.pages.some((page) => page.id === "people")
-                ? () => openGaugeApp("administration", "people")
-                : undefined;
+            // Before Administration is admitted, offer the link where People
+            // is likely to exist; the server decides when it is followed.
+            const admitted = administration.session();
+            const selected = memberships().find((membership) => membership.id === tenant());
+            const offered = admitted
+                ? admitted.pages.some((page) => page.id === "people")
+                : Boolean(selected && !selected.personal && (selected.role === "owner" || selected.role === "admin"));
+            return offered ? () => openGaugeApp("administration", "people") : undefined;
         },
         close: closeSurface,
         onNativeAccountSessionChanged: async (linked) => {

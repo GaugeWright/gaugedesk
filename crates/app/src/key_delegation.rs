@@ -769,11 +769,21 @@ pub(crate) fn session_holds(
     let Some(vault) = wb.content_vault.clone() else {
         return Vec::new();
     };
-    if let Some(project) = wb.scope_project_of_path(path) {
-        return vec![vault.hold(&project)];
-    }
-    if !reads_across_projects(method, path) {
-        return Vec::new();
+    // A member's authoring of an Agent placed in a shared project — its edit
+    // chats, previews and settings assistant — uses that project's keys, for
+    // the project's credentials it runs on (DR-0453).
+    let authoring = crate::net_http::bearer(headers)
+        .and_then(|token| wb.resolve_account_session(token))
+        .and_then(|(account, _)| wb.member_authoring_project_of_path(path, &account));
+    let mut holds: Vec<_> = wb
+        .scope_project_of_path(path)
+        .into_iter()
+        .chain(authoring)
+        .map(|project| vault.hold(&project))
+        .collect();
+    if !holds.is_empty() || !reads_across_projects(method, path) {
+        holds.dedup_by(|a, b| a.project() == b.project());
+        return holds;
     }
     let visibility = wb.project_visibility_in(
         crate::net_http::bearer(headers),
@@ -789,17 +799,31 @@ pub(crate) fn session_holds(
 }
 
 /// Hold the project `chat` belongs to for work a member started in it, such
-/// as a turn: held while the returned hold lives and lingering after it.
+/// as a turn: held while the returned holds live and lingering after them.
+/// A member's edit chat or preview of an Agent placed in a shared project
+/// also holds that project, whose credentials it runs on (DR-0453).
 pub(crate) fn hold_chat_project(
     wb: &SharedWorkbench,
     chat: &str,
-) -> Option<crate::content_vault::SessionHold> {
+) -> Vec<crate::content_vault::SessionHold> {
     let wb = wb.lock_unpoisoned();
-    let vault = wb.content_vault.clone()?;
-    let project = vault.scope_index().project_of(chat)?;
-    let hold = vault.hold(&project);
-    hold.linger();
-    Some(hold)
+    let Some(vault) = wb.content_vault.clone() else {
+        return Vec::new();
+    };
+    let authoring = wb
+        .chat_member_author(chat)
+        .and_then(|author| wb.member_authoring_project_of_chat(chat, &author));
+    vault
+        .scope_index()
+        .project_of(chat)
+        .into_iter()
+        .chain(authoring)
+        .map(|project| {
+            let hold = vault.hold(&project);
+            hold.linger();
+            hold
+        })
+        .collect()
 }
 
 /// Keep `holds` for as long as `response` is being sent, and for the linger

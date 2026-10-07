@@ -160,6 +160,12 @@ function isUnprovisionedHomeError(error: unknown): boolean {
  * otherwise hold that screen, which has no other way off it, forever. */
 export const HOME_DIAL_TIMEOUT_MS = 20_000;
 
+/** How long a project a fresh route read found unrouted is served by the
+ * selected Home before the next miss reads the routes again. Long enough that
+ * one settings or tracker view does not repeat the read, short enough that a
+ * route authored elsewhere is picked up without a reload. */
+const UNROUTED_RECHECK_MS = 60_000;
+
 export class HomeDialTimeoutError extends Error {
     constructor() {
         super("The Home did not answer in time");
@@ -232,6 +238,9 @@ export class WorkbenchControlPlane implements ControlPlane {
      * selected Home here: whichever project is open decides which Home serves,
      * and a Home that fails degrades only the projects routed to it. */
     private pool: HomePool<workbenchClient.WorkbenchTransport> | null = null;
+    /** Projects a fresh route read found unrouted, with when it did. Cleared
+     * with the pool, since routes read under one credential never serve another. */
+    private readonly unroutedProjects = new Map<ProjectId, number>();
     private currentProject: ProjectId | null = null;
     /** Who shared-project pins are kept for, resolved once per credential. */
     private sharedSubject: { generation: number; subject: Promise<string> } | null = null;
@@ -360,6 +369,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.selectedDirectHome = null;
         void this.pool?.closeAll().catch(() => undefined);
         this.pool = null;
+        this.unroutedProjects.clear();
         for (const reconnect of this.restartWorkStreams) reconnect();
         return true;
     }
@@ -390,6 +400,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.selectedDirectJson = null;
         const pool = this.pool;
         this.pool = null;
+        this.unroutedProjects.clear();
         await Promise.allSettled([
             selected?.("DELETE", "/home/admissions"),
             pool?.closeAll(),
@@ -408,6 +419,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             this.selectedDirectHome = null;
             void this.pool?.closeAll().catch(() => undefined);
             this.pool = null;
+            this.unroutedProjects.clear();
         }
         this.bearer = token;
     }
@@ -689,8 +701,22 @@ export class WorkbenchControlPlane implements ControlPlane {
             // against the previously selected Home and can display another
             // project's workspace.
             if (!String(error).includes("no granted Home route")) throw error;
+            // A project a fresh read has just shown to have no route is not
+            // re-read on every call. Each read is four sequential Hub requests,
+            // and a project that predates route authorship took them before
+            // every settings and tracker call (WS-849).
+            const confirmed = this.unroutedProjects.get(project);
+            if (confirmed !== undefined && Date.now() - confirmed < UNROUTED_RECHECK_MS) throw error;
             pool.replaceRoutes(await this.homeRoutes());
-            route = pool.routeFor(project);
+            try {
+                route = pool.routeFor(project);
+                this.unroutedProjects.delete(project);
+            } catch (again) {
+                if (String(again).includes("no granted Home route")) {
+                    this.unroutedProjects.set(project, Date.now());
+                }
+                throw again;
+            }
         }
         // A relay-only route is not dialable without a tunnel module. That is
         // an absence of a usable route, not a broken connection, so it reads as
@@ -1759,8 +1785,8 @@ export class WorkbenchControlPlane implements ControlPlane {
         );
     }
 
-    listPublicCredentials(edge: string): Promise<PublicCredentialMetadata[]> {
-        return workbenchClient.listPublicCredentials(this.workbenchTransport(), edge);
+    listPublicCredentials(edge: string, placementId?: PlacementId): Promise<PublicCredentialMetadata[]> {
+        return workbenchClient.listPublicCredentials(this.workbenchTransport(), edge, placementId);
     }
 
     provisionPublicCredential(

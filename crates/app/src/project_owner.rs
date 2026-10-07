@@ -131,6 +131,11 @@ impl ProjectOwnerResolver {
         // A Panel agent's preview project is hidden plumbing: it belongs to
         // whoever owns what it previews.
         if let Some(marker) = crate::panel_preview::preview_marker(project) {
+            // One a member of a shared project started is that member's own
+            // while it lasts, so it reaches it and nobody else does (DR-0453).
+            if let Some(member) = marker.started_by.filter(|member| !member.is_empty()) {
+                return ProjectOwner::Account(member);
+            }
             let previewed = marker
                 .placement_id
                 .as_deref()
@@ -502,6 +507,85 @@ impl Workbench {
         }
     }
 
+    /// The refusal for a desktop account session upgrading or deploying from
+    /// a project it neither owns nor works in as a member: its owner may, and
+    /// so may an account holding its grant with a role that authors there,
+    /// while a viewer may not (DR-0453). The deployment stays the owner's and
+    /// is signed by the owner's key; [`Self::project_member_requester`] names
+    /// who asked. Otherwise as [`Self::project_owner_refusal`].
+    pub(crate) fn project_deployer_refusal(
+        &self,
+        headers: &axum::http::HeaderMap,
+        project: &str,
+    ) -> Option<axum::response::Response> {
+        use axum::response::IntoResponse;
+        self.project_owner_refusal(headers, project)?;
+        let member = crate::net_http::bearer(headers)
+            .and_then(|token| self.resolve_account_session(token))
+            .is_some_and(|(account, _)| self.project_member_authors(project, &account));
+        (!member).then(|| {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "only this project's owner or one of its members may do that"
+                })),
+            )
+                .into_response()
+        })
+    }
+
+    /// The member who asks for a deployment act on `project` it does not own
+    /// (DR-0453), for the record of who requested it. `None` for its owner,
+    /// the local channel, and off a desktop.
+    pub(crate) fn project_member_requester(
+        &self,
+        headers: &axum::http::HeaderMap,
+        project: &str,
+    ) -> Option<String> {
+        if !self.desktop_account_mode() {
+            return None;
+        }
+        let (account, _) = crate::net_http::bearer(headers)
+            .and_then(|token| self.resolve_account_session(token))?;
+        match self.project_owner(project)? {
+            ProjectOwner::Account(owner) if owner == account => None,
+            _ => self
+                .project_member_authors(project, &account)
+                .then_some(account),
+        }
+    }
+
+    /// [`Self::project_deployer_refusal`] for the project a placement is on.
+    pub(crate) fn placement_deployer_refusal(
+        &self,
+        headers: &axum::http::HeaderMap,
+        placement: &str,
+    ) -> Option<axum::response::Response> {
+        let project = self.library.project_of_instance(placement)?.to_owned();
+        self.project_deployer_refusal(headers, &project)
+    }
+
+    /// [`Self::project_deployer_refusal`] for the project a public deployment
+    /// was published from, by its hosted id or its binding id.
+    pub(crate) fn deployment_deployer_refusal(
+        &self,
+        headers: &axum::http::HeaderMap,
+        deployment: &str,
+    ) -> Option<axum::response::Response> {
+        let project = self.deployment_project(deployment)?;
+        self.project_deployer_refusal(headers, &project)
+    }
+
+    /// The project a public deployment was published from, by its hosted id
+    /// or its binding id.
+    pub(crate) fn deployment_project(&self, deployment: &str) -> Option<String> {
+        self.library
+            .public_deployments
+            .values()
+            .find(|binding| binding.id == deployment || binding.hosted_deployment_id == deployment)
+            .map(|binding| binding.project_id.clone())
+    }
+
     /// [`Self::project_owner_refusal`] for the project a public deployment
     /// was published from, by its hosted id or its binding id.
     pub(crate) fn deployment_owner_refusal(
@@ -664,17 +748,25 @@ pub(crate) async fn account_project_gate(
     let controller = crate::mobile_machine_session::session_token(request.headers()).is_some();
     let refused = !controller && {
         let wb = wb.lock_unpoisoned();
+        let path = request.uri().path();
         wb.desktop_account_mode()
-            && wb
-                .scope_project_of_path(request.uri().path())
-                .is_some_and(|project| {
-                    // Signed out, this is the local account (DR-0328 §2).
-                    !wb.project_visibility_in(
-                        crate::net_http::bearer(request.headers()),
-                        &crate::workbench_auth::req_scope(request.headers()),
-                    )
-                    .allows(&project)
-                })
+            && (wb.scope_project_of_path(path).is_some_and(|project| {
+                // Signed out, this is the local account (DR-0328 §2).
+                !wb.project_visibility_in(
+                    crate::net_http::bearer(request.headers()),
+                    &crate::workbench_auth::req_scope(request.headers()),
+                )
+                .allows(&project)
+            }) || wb.authoring_chat_of_path(path).is_some_and(|chat| {
+                // An edit chat names no project. An account session reaches
+                // only the edit chats it may read — its own, of an Agent it
+                // authors (DR-0453) — for a turn as for a read.
+                crate::net_http::bearer(request.headers())
+                    .and_then(|token| wb.resolve_account_session(token))
+                    .is_some_and(|(account, _)| {
+                        wb.authoring_chat_visible(&chat, Some(&account)) != Some(true)
+                    })
+            }))
     };
     if refused {
         return (
@@ -688,4 +780,4 @@ pub(crate) async fn account_project_gate(
 
 #[cfg(test)]
 #[path = "project_owner_tests.rs"]
-mod tests;
+pub(crate) mod tests;

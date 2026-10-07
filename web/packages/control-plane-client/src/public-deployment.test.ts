@@ -8,6 +8,7 @@ import {
     revokePublicCredential,
     type WorkbenchTransport,
 } from "./control-plane-workbench";
+import type { PlacementId } from "./control-plane-domain";
 
 const inspection = {
     deployment: {
@@ -100,6 +101,8 @@ describe("public deployment owner client", () => {
 
         await expect(listPublicCredentials(transport, "https://edge.example"))
             .resolves.toEqual([credential]);
+        await expect(listPublicCredentials(transport, "https://edge.example", "inst-panel" as PlacementId))
+            .resolves.toEqual([credential]);
         await expect(provisionPublicCredential(transport, {
             edge_origin: "https://edge.example",
             provider: "openai",
@@ -116,6 +119,12 @@ describe("public deployment owner client", () => {
         expect(json.mock.calls).toEqual([
             ["POST", "/public-deployments/credentials/list", {
                 edge_origin: "https://edge.example",
+            }],
+            // Named a placement, the keys are those its publisher signs with
+            // (DR-0453).
+            ["POST", "/public-deployments/credentials/list", {
+                edge_origin: "https://edge.example",
+                placement_id: "inst-panel",
             }],
             ["POST", "/public-deployments/credentials/provision", {
                 edge_origin: "https://edge.example",

@@ -32,6 +32,27 @@ fn phase_label(phase: AccessPhase) -> &'static str {
     }
 }
 
+/// Whether a directory role works in the projects it is granted rather than
+/// only reading them (DR-0453). A member does, and so do an owner and an admin,
+/// which include everything a member does; a viewer, an auditor and billing do
+/// not.
+pub(crate) fn role_authors(role: &gaugedesk_core::abac::Role) -> bool {
+    matches!(role.as_str(), "member" | "admin" | "owner")
+}
+
+/// The projects `account` holds an explicit grant to in `org` with a role
+/// that authors there: where it may edit, test and deploy the Agents placed
+/// in them (DR-0453). Owning a project is not a grant and is not listed.
+pub(crate) fn member_authoring_projects(
+    org: &crate::org::Org,
+    account: &str,
+) -> std::collections::BTreeSet<String> {
+    if account.is_empty() || !org.role_of(account).is_some_and(|role| role_authors(&role)) {
+        return Default::default();
+    }
+    org.granted_project_ids(account)
+}
+
 pub(crate) fn account_backed(wb: &Workbench, headers: &HeaderMap) -> bool {
     wb.idp.is_some()
         || crate::workbench_auth::web_account_mode()
@@ -101,8 +122,216 @@ impl Workbench {
             || self.agent_authoring_owner(id).as_deref() == Some(actor)
     }
 
-    pub(crate) fn agent_authoring_visible(&self, id: &str, actor: Option<&str>) -> bool {
+    /// Whether `actor` is Agent `id`'s authoring owner. What only the owner
+    /// does to an Agent — delete it, fork it, copy it, pull from its source,
+    /// place it — asks this.
+    pub(crate) fn agent_authoring_owned_by(&self, id: &str, actor: Option<&str>) -> bool {
         actor.is_some_and(|actor| self.agent_authoring_owner(id).as_deref() == Some(actor))
+    }
+
+    /// Whether `actor` may author Agent `id`: open its edit chats, change its
+    /// settings, try it and publish it. Its owner may, and so may a member of
+    /// a shared project it is placed in ([`Self::agent_member_projects`]).
+    pub(crate) fn agent_authoring_visible(&self, id: &str, actor: Option<&str>) -> bool {
+        self.agent_authoring_owned_by(id, actor)
+            || actor.is_some_and(|actor| !self.agent_member_projects(id, actor).is_empty())
+    }
+
+    /// The projects through which `account` authors Agent `id` as a member
+    /// of a shared project (DR-0453): those it holds an explicit grant to in
+    /// this Home's directory, with a role that works there rather than only
+    /// reads, in which `id` is placed. A built-in Agent, a preview's hidden
+    /// Agent and the Agent's own owner have none: the owner authors it as its
+    /// owner. Read from the directory on every call, so taking the grant away
+    /// ends it at once, and an Agent placed in no such project is never
+    /// reached through one.
+    pub(crate) fn agent_member_projects(
+        &self,
+        id: &str,
+        account: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let placed = self.member_authoring_candidate(id, account);
+        if placed.is_empty() {
+            return Default::default();
+        }
+        let Ok(org) = crate::org::Org::rebuild(self.store_ref()) else {
+            return Default::default();
+        };
+        member_authoring_projects(&org, account)
+            .into_iter()
+            .filter(|project| placed.contains(project.as_str()))
+            .collect()
+    }
+
+    /// The projects Agent `id` is placed in, when `account` could author it
+    /// through one of them: never a built-in Agent, a preview's hidden Agent
+    /// or an Agent `account` owns. Read before the directory, so asking about
+    /// an Agent nobody shares costs no fold of it.
+    ///
+    /// A Home on a desktop only, whose own directory holds its projects'
+    /// members. A hosted or enterprise composition admits a project-limited
+    /// member at its own gate, which refuses an Agent's routes, so offering
+    /// one there would list an Agent nothing could reach.
+    fn member_authoring_candidate(
+        &self,
+        id: &str,
+        account: &str,
+    ) -> std::collections::BTreeSet<&str> {
+        if !self.desktop_account_mode()
+            || account.is_empty()
+            || account == "anonymous"
+            || crate::app_support::is_builtin_agent(id)
+            || self
+                .library
+                .agents
+                .get(id)
+                .is_none_or(crate::panel_preview::is_panel_preview_agent)
+            || self.agent_authoring_owner(id).as_deref() == Some(account)
+        {
+            return Default::default();
+        }
+        self.library
+            .instances
+            .values()
+            .filter(|instance| {
+                instance.kind == crate::library::InstanceKind::Using && instance.agent_id == id
+            })
+            .filter_map(|instance| instance.project_id.as_deref())
+            .collect()
+    }
+
+    /// Whether `account` works in `project` as a member of it rather than
+    /// only reading it: an explicit grant, with a role that authors there
+    /// (DR-0453). Its owner is not asked this. A Home on a desktop only, as
+    /// [`Self::member_authoring_candidate`] says.
+    pub(crate) fn project_member_authors(&self, project: &str, account: &str) -> bool {
+        self.desktop_account_mode()
+            && crate::org::Org::rebuild(self.store_ref())
+                .is_ok_and(|org| member_authoring_projects(&org, account).contains(project))
+    }
+
+    /// The Agents `account` authors as a member of a shared project, each
+    /// with the projects it reaches it through, read with one fold of the
+    /// directory, for a projection that asks about every Agent at once.
+    pub(crate) fn member_authorable_agents(
+        &self,
+        account: &str,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        if !self.desktop_account_mode() {
+            return Default::default();
+        }
+        let Ok(org) = crate::org::Org::rebuild(self.store_ref()) else {
+            return Default::default();
+        };
+        let projects = member_authoring_projects(&org, account);
+        if projects.is_empty() {
+            return Default::default();
+        }
+        self.library
+            .agents
+            .keys()
+            .filter_map(|agent| {
+                let through: std::collections::BTreeSet<String> = self
+                    .member_authoring_candidate(agent, account)
+                    .into_iter()
+                    .filter(|project| projects.contains(*project))
+                    .map(str::to_owned)
+                    .collect();
+                (!through.is_empty()).then(|| (agent.clone(), through))
+            })
+            .collect()
+    }
+
+    /// The shared project whose provider credentials `actor`'s edit chat or
+    /// preview of an Agent spends, when `actor` authors that Agent as a
+    /// member of a project it is placed in (DR-0453). A member keeps no
+    /// credentials on this computer, and its chats in the project run on the
+    /// project's own (DR-0451); its authoring work there does too. A preview
+    /// of a placement's version spends that placement's project, else the
+    /// first project the member reaches the Agent through. `None` for the
+    /// Agent's owner, for anyone else's chat, and once the grant is gone.
+    pub(crate) fn member_authoring_project_of_chat(
+        &self,
+        chat_id: &str,
+        actor: &str,
+    ) -> Option<String> {
+        let chat = self.library.chats.get(chat_id)?;
+        let instance = self.library.instances.get(&chat.instance_id)?;
+        let (agent, placement) = if instance.kind == crate::library::InstanceKind::Authoring {
+            if chat.owner.as_deref() != Some(actor) {
+                return None;
+            }
+            (instance.agent_id.clone(), None)
+        } else {
+            let marker = self
+                .library
+                .projects
+                .get(instance.project_id.as_deref()?)
+                .and_then(crate::panel_preview::preview_marker)?;
+            if marker.started_by.as_deref() != Some(actor) {
+                return None;
+            }
+            (marker.agent_id, marker.placement_id)
+        };
+        let projects = self.agent_member_projects(&agent, actor);
+        placement
+            .and_then(|placement| {
+                self.library
+                    .project_of_instance(&placement)
+                    .map(str::to_owned)
+            })
+            .filter(|project| projects.contains(project))
+            .or_else(|| projects.into_iter().next())
+    }
+
+    /// Who a member's own authoring chat is: an edit chat's owner, or the
+    /// member who started a preview (DR-0453). `None` for any other chat.
+    pub(crate) fn chat_member_author(&self, chat_id: &str) -> Option<String> {
+        let chat = self.library.chats.get(chat_id)?;
+        let instance = self.library.instances.get(&chat.instance_id)?;
+        if instance.kind == crate::library::InstanceKind::Authoring {
+            return chat.owner.clone();
+        }
+        self.panel_preview_started_by(instance.project_id.as_deref()?)
+    }
+
+    /// The shared project a request by `account` spends on when the path is
+    /// its authoring of an Agent placed there: one of its edit chats or
+    /// previews, or the Agent's own routes and settings (DR-0453).
+    pub(crate) fn member_authoring_project_of_path(
+        &self,
+        path: &str,
+        account: &str,
+    ) -> Option<String> {
+        let mut segments = path.trim_start_matches('/').split('/');
+        match segments.next()? {
+            "chats" => self.member_authoring_project_of_chat(segments.next()?, account),
+            "archetypes" => self
+                .agent_member_projects(segments.next()?, account)
+                .into_iter()
+                .next(),
+            _ => None,
+        }
+    }
+
+    /// The edit chat a request path addresses, if it addresses one: the
+    /// chat, scope or projection it names whose instance is an Agent's
+    /// authoring root. Such a chat names no project, so the per-project gate
+    /// does not reach it.
+    pub(crate) fn authoring_chat_of_path(&self, path: &str) -> Option<String> {
+        let mut segments = path.trim_start_matches('/').split('/');
+        let chat = match segments.next()? {
+            "chats" | "scopes" => segments.next()?,
+            "projections" => segments
+                .next()
+                .filter(|scope| *scope != crate::library::LIBRARY_SCOPE)?,
+            _ => return None,
+        };
+        let instance = self
+            .library
+            .instances
+            .get(&self.library.chats.get(chat)?.instance_id)?;
+        (instance.kind == crate::library::InstanceKind::Authoring).then(|| chat.to_owned())
     }
 
     /// None denotes a work chat, whose project admission remains separate.

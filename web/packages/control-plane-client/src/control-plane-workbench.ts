@@ -933,14 +933,18 @@ function parsePublicCredential(value: unknown): PublicCredentialMetadata {
     return credential as PublicCredentialMetadata;
 }
 
+/** The provider keys on `edgeOrigin`. Named a placement, they are the keys of
+ *  the publisher a deployment from it signs with — its project owner's — which
+ *  a member of a shared project deploying it chooses among (DR-0453). */
 export async function listPublicCredentials(
     transport: WorkbenchTransport,
     edgeOrigin: string,
+    placementId?: PlacementId,
 ): Promise<PublicCredentialMetadata[]> {
     const value = await transport.json(
         "POST",
         "/public-deployments/credentials/list",
-        { edge_origin: edgeOrigin },
+        placementId ? { edge_origin: edgeOrigin, placement_id: placementId } : { edge_origin: edgeOrigin },
     ) as { credentials?: unknown };
     if (!Array.isArray(value.credentials)) {
         throw new Error("public credential list is malformed");

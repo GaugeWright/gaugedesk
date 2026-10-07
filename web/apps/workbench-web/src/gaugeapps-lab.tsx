@@ -434,7 +434,7 @@ function fixtureWorkspace(scope: ScopeFixture, projectFixtures: readonly Project
     const archetype = ({ seed, id, targetId }: typeof libraryAgents[number]): Workspace["archetypes"][number] => ({
         id, name: seed.name, kind: seed.kind, panelProfile: seed.kind === "panel" ? fixturePanelProfile() : null,
         instanceId: fixturePlacementId(`${id}:authoring`), authoringTargetId: targetId,
-        isDefault: Boolean(seed.isDefault), forkedFrom: null, forkedFromName: null, previews: [],
+        isDefault: Boolean(seed.isDefault), forkedFrom: null, forkedFromName: null, previews: [], sharedThrough: [],
         chats: seed.isDefault ? [] : [editChat(id, targetId, `Improve ${seed.name}`)], workstreams: [],
     });
     const archetypes = libraryAgents.map(archetype);

@@ -100,6 +100,60 @@ describe("Home tunnel failure lifecycle", () => {
 });
 
 describe("routeJson over the tunnel (DESK-7)", () => {
+    it("opens a fresh session rather than reuse one the Home has finished", async () => {
+        // The Home ends an idle crossing with FIN and closes its leg only after a
+        // teardown grace; a request written in that window was never answered.
+        let finished = false;
+        const opened: TunnelFacade[] = [];
+        const json = tunnelRouteJson({
+            open: async () => {
+                const tunnel: TunnelFacade = {
+                    ...fakeTunnel([{ status: 200, body: '{"n":1}' }, { status: 200, body: '{"n":2}' }]),
+                    peerFinished: () => opened.length === 1 && finished,
+                };
+                opened.push(tunnel);
+                return { tunnel, socket: fakeSocket().socket };
+            },
+            tick: async () => undefined,
+            sessions: 1,
+        });
+        await expect(json("GET", "/a")).resolves.toEqual({ n: 1 });
+        finished = true;
+        await expect(json("GET", "/b")).resolves.toEqual({ n: 1 });
+        expect(opened).toHaveLength(2);
+    });
+
+    it("answers when the reply's frame arrives, without waiting on a timer", async () => {
+        // A background tab holds timers to once a second, and a fresh crossing
+        // takes several round trips, so a call that only looked again on a
+        // timer took seconds there (WS-850). Fake timers never fire here.
+        vi.useFakeTimers();
+        try {
+            let answered = false;
+            const tunnel: TunnelFacade = {
+                ...fakeTunnel([]),
+                receiveFrame: () => { answered = true; },
+                pollStatus: () => answered ? 200 : undefined,
+                takeBody: () => '{"ok":true}',
+            };
+            let deliver: (frame: Uint8Array) => void = () => undefined;
+            const socket: TunnelSocket = {
+                send: () => undefined,
+                close: () => undefined,
+                onFrame: (handler) => { deliver = handler; },
+                onClose: () => undefined,
+            };
+            const json = tunnelRouteJson({ open: async () => ({ tunnel, socket }) });
+            const reply = json("GET", "/workspace");
+            await vi.waitFor(() => expect(deliver).not.toBe(undefined));
+            for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+            deliver(new Uint8Array([1]));
+            await expect(reply).resolves.toEqual({ ok: true });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it("carries a request and parses the Home's reply", async () => {
         const tunnel = fakeTunnel([{ status: 201, body: '{"home":"home:a","admission":"t"}' }]);
         const { socket, frames } = fakeSocket();

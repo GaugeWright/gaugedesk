@@ -335,11 +335,16 @@ const ACCEPT_BODY_LIMIT: usize = 64 * 1024;
 /// host-wide rather than about one of its projects (DR-0268 §1, DR-0328 §6).
 ///
 /// A member is not signed in on this computer, so it keeps nothing here —
-/// no Personal, no provider credentials or settings, no Agents, no pairings
-/// — and it creates no project, which would be the computer's owner's to
-/// carry. What it reaches inside its projects is decided per project behind
-/// this, by the same gate and handlers as any account here.
+/// no Personal, no provider credentials or settings, no Agents of its own, no
+/// pairings — and it creates no project, which would be the computer's
+/// owner's to carry. What it reaches inside its projects is decided per
+/// project behind this, by the same gate and handlers as any account here.
+/// That includes authoring, trying, publishing and deploying the Agents
+/// placed in them ([`member_authors`]).
 fn member_refused(method: &Method, path: &str) -> bool {
+    if member_authors(method, path) {
+        return false;
+    }
     const HOST_WIDE: &[&str] = &[
         "/account/",
         "/admin/",
@@ -381,6 +386,33 @@ fn member_refused(method: &Method, path: &str) -> bool {
     )
 }
 
+/// Whether a route is a member's authoring, trying, publishing or deploying
+/// of an Agent placed in one of its projects (DR-0453). The handler behind
+/// decides whether this Agent or placement is one: each admits only an
+/// account that owns it or holds its project's grant with a role that
+/// authors there. What stays the owner's — creating, deleting, forking,
+/// copying or placing an Agent, pausing or erasing a deployment, adding or
+/// revoking a publisher's credential — is still refused here.
+fn member_authors(method: &Method, path: &str) -> bool {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["archetypes", id] => !id.is_empty() && matches!(*method, Method::GET | Method::PUT),
+        ["archetypes", id, "abilities" | "panel-profile"] => {
+            !id.is_empty() && matches!(*method, Method::GET | Method::PUT)
+        }
+        ["archetypes", id, "chats" | "preview" | "publish"] => {
+            !id.is_empty() && *method == Method::POST
+        }
+        // Agent Settings, a GaugeApp at the Agent (`AgentSettings::PATH`).
+        ["archetypes", id, "settings", ..] => !id.is_empty(),
+        ["public-deployments"]
+        | ["public-deployments", "inspect"]
+        | ["public-deployments", "credentials", "list"] => *method == Method::POST,
+        ["public-deployments", "publisher-authority"] => *method == Method::GET,
+        _ => false,
+    }
+}
+
 /// Judge what `account` holds here. Off the async runtime: it reads the store.
 async fn standing_of(wb: &SharedWorkbench, account: &str) -> Standing {
     let wb = wb.clone();
@@ -418,15 +450,6 @@ async fn admit_relay_caller(
             request.headers_mut().remove(*name);
         }
         return hang_up(peer, next.run(request).await);
-    }
-    if local_only(&method, &path) {
-        return hang_up(
-            peer,
-            refuse(
-                StatusCode::FORBIDDEN,
-                "this is done on the computer itself, not from elsewhere",
-            ),
-        );
     }
     let Some(bearer) = net_http::bearer(request.headers()).map(str::to_owned) else {
         return hang_up(
@@ -476,6 +499,22 @@ async fn admit_relay_caller(
     let judged = started.elapsed();
     let home = relay.wb.lock_unpoisoned().home_id().clone();
     let actor = AuthorityId::new(account.clone());
+
+    // Refused to everyone, but hung up only on a stranger. A verified caller's
+    // other calls may be queued on this crossing, and hanging up on them for
+    // one refused read failed those too after the Home's teardown grace: the
+    // browser asks every Home for its onboarding status at startup (WS-850).
+    if local_only(&method, &path) {
+        let refused = refuse(
+            StatusCode::FORBIDDEN,
+            "this is done on the computer itself, not from elsewhere",
+        );
+        return if standing == Standing::Stranger {
+            hang_up(peer, refused)
+        } else {
+            refused
+        };
+    }
 
     // Accepting an invitation is how an account comes to hold a project here,
     // so it is answered for every account the Hub names. It is answered here,

@@ -393,6 +393,12 @@ pub struct PublishDeploymentRequest {
     /// never read from the request body.
     #[serde(skip)]
     pub work_chat_default_model: Option<String>,
+    /// The member of the placement's project who asked for this publication,
+    /// when it is not the project's owner (DR-0453). The deployment stays the
+    /// owner's and is signed by the owner's key; its binding records who asked.
+    /// Filled by the route; never read from the request body.
+    #[serde(skip)]
+    pub requested_by: Option<String>,
 }
 
 fn default_idle_ttl_seconds() -> u64 {
@@ -623,6 +629,12 @@ pub struct AcknowledgeCollectionsRequest {
 #[serde(deny_unknown_fields)]
 pub struct ListPublicCredentialsRequest {
     pub edge_origin: String,
+    /// A placement to deploy from. Named, the list is the credentials of the
+    /// key a publication from that placement signs with — its project
+    /// owner's — which is what a member of the project deploying it may
+    /// choose among (DR-0453). Unnamed, the caller's own key's.
+    #[serde(default)]
+    pub placement_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -819,6 +831,12 @@ impl PublisherCredential {
 /// published under the install's key, as every deployment published before
 /// per-account publishing was, and stays with it.
 pub const BINDING_PUBLISHER_EXTRA: &str = "publisher_account";
+
+/// The [`PublicDeploymentBindingRecord`] extra naming the member of the
+/// project who asked for the binding's latest publication (DR-0453). Its
+/// publisher is still [`BINDING_PUBLISHER_EXTRA`]'s, the project owner's. A
+/// publication its owner asks for removes it.
+pub const BINDING_REQUESTED_BY_EXTRA: &str = "requested_by";
 
 /// The account a binding records as its publisher, if not the install.
 fn binding_publisher(binding: &PublicDeploymentBindingRecord) -> Option<String> {
@@ -1717,6 +1735,17 @@ impl Workbench {
                 serde_json::Value::String(account.clone()),
             );
         }
+        match &request.requested_by {
+            Some(member) => {
+                extra.insert(
+                    BINDING_REQUESTED_BY_EXTRA.to_owned(),
+                    serde_json::Value::String(member.clone()),
+                );
+            }
+            None => {
+                extra.remove(BINDING_REQUESTED_BY_EXTRA);
+            }
+        }
         let pending_binding = PublicDeploymentBindingRecord {
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
             extra,
@@ -2343,10 +2372,18 @@ impl Workbench {
         request: ListPublicCredentialsRequest,
         account: Option<&str>,
     ) -> io::Result<serde_json::Value> {
-        list_public_credentials_with(
-            &self.publisher_credential_as(account)?,
-            &normalized_edge(&request.edge_origin)?,
-        )
+        let credential = match request.placement_id.as_deref() {
+            Some(placement) => {
+                let project = self
+                    .library
+                    .project_of_instance(placement)
+                    .ok_or_else(|| not_found("no such placement"))?
+                    .to_owned();
+                self.project_publisher_credential(&project)?
+            }
+            None => self.publisher_credential_as(account)?,
+        };
+        list_public_credentials_with(&credential, &normalized_edge(&request.edge_origin)?)
     }
 
     /// Send a provider key directly to `account`'s edge registry, or the

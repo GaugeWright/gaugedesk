@@ -1,5 +1,6 @@
 //! Agent Settings, a GaugeApp served by [`crate::gaugeapp_host`] for one
-//! Agent at the Home that owns it. Only a person who may author the Agent is
+//! Agent at the Home that owns it. Only a person who may author the Agent —
+//! its owner, or a member of a shared project it is placed in (DR-0453) — is
 //! admitted, by the same check its config, ability and Panel-profile routes
 //! use, and every command goes through the state method those routes call.
 use axum::{http::HeaderMap, http::StatusCode, response::Response};
@@ -37,8 +38,7 @@ impl GaugeAppDefinition for AgentSettings {
     const COMMANDS: &'static [&'static str] = &[MODEL_SET, ABILITIES_SET, PANEL_PROFILE_SET];
 
     fn admit(wb: &Workbench, headers: &HeaderMap, id: &str) -> Result<Admission, Box<Response>> {
-        let actor = crate::library_routes::admit_agent_authoring_owner(wb, id, headers)
-            .map_err(Box::new)?;
+        let actor = crate::library_routes::admit_agent_author(wb, id, headers).map_err(Box::new)?;
         Ok(Admission {
             actor,
             can_manage: true,

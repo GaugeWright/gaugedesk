@@ -32,7 +32,7 @@ use gaugedesk_app::gaugeapp_contract::{
     GaugeAppCommandGrant, GaugeAppKind, GaugeAppPageAvailability, GaugeAppPageGrant,
     GaugeAppRejection, GaugeAppScope, GaugeAppSession, ReviewPolicy, GAUGEAPP_CHANGE_KIND,
 };
-use gaugedesk_app::gaugeapp_host::GaugeAppDefinition;
+use gaugedesk_app::gaugeapp_host::{log_scope, GaugeAppDefinition, GaugeAppPhases};
 use gaugedesk_app::model_provider_management::projection::{ModelProvidersPage, UnavailableReason};
 use gaugedesk_app::org::{
     sha256_hex, ArchetypeApprovalPolicyRecord, BillingContactRecord, GroupMappingRecord,
@@ -184,6 +184,40 @@ pub trait AdministrationGaugeAppExtension: Send + Sync {
         capabilities: &[Capability],
     ) -> Result<Vec<AdministrationExtensionPage>, AdministrationExtensionError>;
 
+    /// Read what this composition's pages need from outside the Hub's own
+    /// store — another Home, a separately operated authority — with no lock on
+    /// the Workbench held. Nearly every Hub request takes that one lock, so
+    /// work done under it stalls every other request, sign-in included; one
+    /// Administration open held it for a minute (WS-851).
+    ///
+    /// The adapter calls this only after admitting the request for `actor`
+    /// with `capabilities`, and hands the result to
+    /// [`Self::project_prefetched`] only when the locked rebuild admits the
+    /// same tenant, actor and capabilities. `None` means project as before.
+    fn prefetch(
+        &self,
+        _tenant_id: &str,
+        _store_scope: &str,
+        _actor: &str,
+        _capabilities: &[Capability],
+    ) -> Option<AdministrationPrefetch> {
+        None
+    }
+
+    /// [`Self::project`] given what [`Self::prefetch`] read, when it read
+    /// anything for this exact admission.
+    fn project_prefetched(
+        &self,
+        wb: &Workbench,
+        tenant_id: &str,
+        store_scope: &str,
+        actor: &str,
+        capabilities: &[Capability],
+        _prefetched: Option<&AdministrationPrefetch>,
+    ) -> Result<Vec<AdministrationExtensionPage>, AdministrationExtensionError> {
+        self.project(wb, tenant_id, store_scope, actor, capabilities)
+    }
+
     fn plan(
         &self,
         wb: &Workbench,
@@ -215,6 +249,18 @@ pub trait AdministrationGaugeAppExtension: Send + Sync {
 }
 
 pub type AdministrationGaugeAppExtensionHandle = Arc<dyn AdministrationGaugeAppExtension>;
+
+/// What a composition read outside the Workbench lock for one admitted
+/// Administration request. Opaque to the adapter.
+pub struct AdministrationPrefetch(pub Box<dyn std::any::Any + Send + Sync>);
+
+/// A prefetch and the admission it was read for.
+struct PrefetchedAdmission {
+    tenant: String,
+    actor: String,
+    capabilities: Vec<Capability>,
+    data: AdministrationPrefetch,
+}
 
 /// Machine-checkable inventory of every management mutation represented by
 /// the Administration adapter. The legacy route is evidence for migration and
@@ -576,6 +622,7 @@ pub struct Administration;
 pub struct AdministrationServices {
     extension: Option<AdministrationGaugeAppExtensionHandle>,
     captured: bool,
+    prefetched: Option<Arc<PrefetchedAdmission>>,
     auth: Option<crate::auth_oidc::AuthShellState>,
     saml_tests: Option<crate::identity_saml::SamlBrowserState>,
 }
@@ -1036,6 +1083,7 @@ impl GaugeAppDefinition for Administration {
                 .get::<AdministrationGaugeAppExtensionHandle>()
                 .cloned(),
             captured: true,
+            prefetched: None,
             auth: extensions
                 .get::<crate::auth_oidc::AuthShellState>()
                 .cloned(),
@@ -1062,9 +1110,53 @@ impl GaugeAppDefinition for Administration {
                     .into_response(),
             ));
         }
-        let (session, projected) =
-            build_session(wb, headers, services.extension.as_ref()).map_err(Box::new)?;
+        let (session, projected) = build_session_prefetched(
+            wb,
+            headers,
+            services.extension.as_ref(),
+            services.prefetched.as_deref(),
+        )
+        .map_err(Box::new)?;
         Ok(agent_context(session, projected))
+    }
+
+    fn prepares(services: &Self::Services) -> bool {
+        services.captured && services.extension.is_some()
+    }
+
+    /// Admit under the lock, release it, and let the composition read its
+    /// external page state before the locked rebuild. A request that is not
+    /// admitted reads nothing, so an anonymous caller cannot make the Hub open
+    /// a Home or call an authority.
+    fn prepare(
+        wb: &SharedWorkbench,
+        headers: &HeaderMap,
+        mut services: Self::Services,
+    ) -> Self::Services {
+        let Some(extension) = services.extension.clone().filter(|_| services.captured) else {
+            return services;
+        };
+        let admitted = {
+            let guard = wb.lock_unpoisoned();
+            admit_session(&guard, headers)
+        };
+        let Ok(admitted) = admitted else {
+            return services;
+        };
+        if let Some(data) = extension.prefetch(
+            &admitted.tenant,
+            &admitted.store_scope,
+            &admitted.actor,
+            &admitted.capabilities,
+        ) {
+            services.prefetched = Some(Arc::new(PrefetchedAdmission {
+                tenant: admitted.tenant,
+                actor: admitted.actor,
+                capabilities: admitted.capabilities,
+                data,
+            }));
+        }
+        services
     }
 
     fn opened(context: &GaugeAppAgentContext) -> Value {
@@ -1824,11 +1916,26 @@ fn delete_organization_refusal(
     (status, Json(json!({ "error": message }))).into_response()
 }
 
+/// Who an Administration request is, in which tenant, with what.
+struct AdmittedSession {
+    tenant: String,
+    store_scope: String,
+    actor: String,
+    capabilities: Vec<Capability>,
+    recovery_only: bool,
+}
+
 fn build_session(
     wb: &Workbench,
     headers: &HeaderMap,
     extension: Option<&AdministrationGaugeAppExtensionHandle>,
 ) -> Result<(GaugeAppSession, Vec<AdministrationExtensionPage>), Response> {
+    build_session_prefetched(wb, headers, extension, None)
+}
+
+/// Current admission for an Administration request: its capabilities in the
+/// selected tenant, and the actor its organization access is recorded for.
+fn admit_session(wb: &Workbench, headers: &HeaderMap) -> Result<AdmittedSession, Response> {
     let store_scope = req_scope(headers);
     let mut capabilities = wb
         .admin_capabilities(bearer(headers), &store_scope)
@@ -1861,7 +1968,40 @@ fn build_session(
         )
         .map_err(|(status, message)| (status, Json(json!({ "error": message }))).into_response())?
     };
-    let tenant = tenant_id(headers);
+    Ok(AdmittedSession {
+        tenant: tenant_id(headers),
+        store_scope,
+        actor,
+        capabilities,
+        recovery_only,
+    })
+}
+
+fn build_session_prefetched(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    extension: Option<&AdministrationGaugeAppExtensionHandle>,
+    prefetched: Option<&PrefetchedAdmission>,
+) -> Result<(GaugeAppSession, Vec<AdministrationExtensionPage>), Response> {
+    let mut phases = GaugeAppPhases::start("administration.build_session");
+    let AdmittedSession {
+        tenant,
+        store_scope,
+        actor,
+        capabilities,
+        recovery_only,
+    } = admit_session(wb, headers)?;
+    phases.mark("admission");
+    // What was read outside the lock describes the admission it was read
+    // for. If membership or capability moved since, the extension reads
+    // afresh under the lock rather than projecting another admission's data.
+    let prefetched = prefetched
+        .filter(|prefetched| {
+            prefetched.tenant == tenant
+                && prefetched.actor == actor
+                && prefetched.capabilities == capabilities
+        })
+        .map(|prefetched| &prefetched.data);
     let mut projected = Vec::new();
     for policy in PAGES.iter().copied().filter(|policy| {
         (!recovery_only || policy.id == "enterprise-identity")
@@ -1869,15 +2009,17 @@ fn build_session(
             && built_in_page_allowed(&tenant, policy.id)
     }) {
         if let Some(extension) = extension {
-            if !extension
+            let allowed = extension
                 .allow_base_page(wb, &tenant, &store_scope, policy.id)
-                .map_err(extension_error)?
-            {
+                .map_err(extension_error)?;
+            phases.mark(format!("allow:{}", policy.id));
+            if !allowed {
                 continue;
             }
         }
         let model =
             project_page(wb, &store_scope, policy, bearer(headers), headers).map_err(internal)?;
+        phases.mark(format!("page:{}", policy.id));
         let mut commands = Vec::new();
         for command in COMMANDS.iter().filter(|command| {
             command.page == policy.id
@@ -1920,8 +2062,13 @@ fn build_session(
     }
     if let Some(extension) = extension {
         let contributed = extension
-            .project(wb, &tenant, &store_scope, &actor, &capabilities)
+            .project_prefetched(wb, &tenant, &store_scope, &actor, &capabilities, prefetched)
             .map_err(extension_error)?;
+        phases.mark(if prefetched.is_some() {
+            "extension(prefetched)"
+        } else {
+            "extension"
+        });
         for page in contributed.into_iter().filter(|page| {
             (!recovery_only || page.id == "enterprise-identity")
                 && contributed_page_allowed(&tenant, &page.id)
@@ -1986,6 +2133,8 @@ fn build_session(
             }
         }
     }
+    phases.mark("grants");
+    phases.finish(&log_scope(&tenant));
     let scope = GaugeAppScope {
         kind: "tenant".into(),
         id: tenant,
@@ -4863,6 +5012,118 @@ mod tests {
     include!("gaugeapp_external_review_tests.rs");
 
     struct TestAdministrationExtension;
+
+    /// Reads its page outside the Workbench lock, and records what it saw.
+    struct PrefetchingExtension {
+        hub: SharedWorkbench,
+        prefetches: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl AdministrationGaugeAppExtension for PrefetchingExtension {
+        fn prefetch(
+            &self,
+            _tenant_id: &str,
+            _store_scope: &str,
+            actor: &str,
+            _capabilities: &[Capability],
+        ) -> Option<AdministrationPrefetch> {
+            self.prefetches
+                .lock()
+                .unwrap()
+                .push(self.hub.try_lock().is_ok());
+            Some(AdministrationPrefetch(Box::new(format!(
+                "read for {actor}"
+            ))))
+        }
+
+        fn project(
+            &self,
+            _wb: &Workbench,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            _capabilities: &[Capability],
+        ) -> Result<Vec<AdministrationExtensionPage>, AdministrationExtensionError> {
+            Ok(vec![prefetch_page(json!({ "read": null }))])
+        }
+
+        fn project_prefetched(
+            &self,
+            _wb: &Workbench,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            _capabilities: &[Capability],
+            prefetched: Option<&AdministrationPrefetch>,
+        ) -> Result<Vec<AdministrationExtensionPage>, AdministrationExtensionError> {
+            let read = prefetched.and_then(|prefetched| prefetched.0.downcast_ref::<String>());
+            Ok(vec![prefetch_page(json!({ "read": read }))])
+        }
+
+        fn plan(
+            &self,
+            _wb: &Workbench,
+            _tenant_id: &str,
+            _store_scope: &str,
+            _actor: &str,
+            _command: &GaugeAppCommandEnvelope,
+        ) -> Result<Option<AdministrationMutationPlan>, AdministrationExtensionError> {
+            Ok(None)
+        }
+    }
+
+    fn prefetch_page(model: Value) -> AdministrationExtensionPage {
+        AdministrationExtensionPage {
+            id: "backups".into(),
+            read_model: "BackupsPageV1".into(),
+            version: 1,
+            freshness: "live".into(),
+            model,
+            commands: Vec::new(),
+        }
+    }
+
+    /// A composition's external page state is read with the Workbench lock
+    /// free, only after admission, and reaches the projection of exactly that
+    /// admission (WS-851).
+    #[tokio::test]
+    async fn extension_prefetch_runs_outside_the_lock_for_the_admitted_actor_only() {
+        let (_dir, shared, _app) = test_app();
+        let prefetches = Arc::new(Mutex::new(Vec::new()));
+        let extension: AdministrationGaugeAppExtensionHandle = Arc::new(PrefetchingExtension {
+            hub: shared.clone(),
+            prefetches: prefetches.clone(),
+        });
+        let app = routes()
+            .layer(Extension(extension))
+            .with_state(shared.clone());
+        let session = open(&app).await;
+        let page = read_page_json(&app, &session, "backups").await;
+        assert_eq!(
+            page["page"]["model"]["read"], "read for authority:owner",
+            "{page}"
+        );
+        let seen = prefetches.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![true, true],
+            "open and page each prefetch, unlocked"
+        );
+
+        // A request that is not admitted reads nothing.
+        let (status, _) = request_with_bearer(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/sessions",
+            json!({}),
+            None,
+            None,
+            "stranger-token",
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK);
+        assert_eq!(prefetches.lock().unwrap().len(), 2);
+    }
 
     struct TestModelProviderExtension(Arc<Mutex<Value>>);
     impl AdministrationGaugeAppExtension for TestModelProviderExtension {

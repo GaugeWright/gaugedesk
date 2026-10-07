@@ -217,9 +217,13 @@ fn main() -> io::Result<()> {
             let workbench = open_workbench(&root)?;
             println!(
                 "{}",
-                workbench
-                    .lock_unpoisoned()
-                    .list_public_credentials(ListPublicCredentialsRequest { edge_origin }, None)?,
+                workbench.lock_unpoisoned().list_public_credentials(
+                    ListPublicCredentialsRequest {
+                        edge_origin,
+                        placement_id: None,
+                    },
+                    None
+                )?,
             );
         }
         Some("credential-provision") => {

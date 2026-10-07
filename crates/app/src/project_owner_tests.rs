@@ -1573,7 +1573,7 @@ fn off_a_desktop_there_is_only_the_installs_publisher() {
 /// A synthetic edge that admits a first BYOK publication and records the
 /// publisher authority and key every command presented, and every body.
 #[allow(clippy::type_complexity)]
-fn recording_edge() -> (
+pub(crate) fn recording_edge() -> (
     String,
     std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, Vec<u8>)>>>,
 ) {
@@ -2029,4 +2029,257 @@ fn a_hub_admits_an_organizations_owner_to_its_reserved_shared_project() {
     assert!(!guard
         .account_project_ids(CLAIMANT, &home_directory)
         .contains(&reserved));
+}
+
+const MEMBER: &str = "acct-member";
+const VIEWER: &str = "acct-viewer";
+
+/// The claimant's Agent placed in `p-shared`, another of its Agents placed
+/// only in `p-private`, a member and a viewer granted `p-shared` (DR-0453).
+fn shared_project_with_member_and_viewer(wb: &SharedWorkbench) -> (String, String) {
+    claim(wb, CLAIMANT);
+    let agents = {
+        let mut guard = wb.lock_unpoisoned();
+        for id in ["p-shared", "p-private"] {
+            let mut extra = std::collections::BTreeMap::new();
+            record_owner(&mut extra, CLAIMANT);
+            crate::library_routes::create_named_project_with_extra(&mut guard, id, id, extra)
+                .expect("project");
+        }
+        let mut agents = Vec::new();
+        for (name, project) in [("Shared", "p-shared"), ("Private", "p-private")] {
+            let created = guard
+                .create_archetype(
+                    name.into(),
+                    crate::library::AgentKind::Work,
+                    Some(CLAIMANT.into()),
+                )
+                .unwrap_or_else(|_| panic!("create {name}"));
+            guard
+                .bind_agent_to_project(project, &created.id, None)
+                .unwrap_or_else(|_| panic!("place {name}"));
+            agents.push(created.id);
+        }
+        agents
+    };
+    join(wb, MEMBER, "member");
+    grant(wb, MEMBER, "p-shared");
+    join(wb, VIEWER, "viewer");
+    grant(wb, VIEWER, "p-shared");
+    (agents[0].clone(), agents[1].clone())
+}
+
+#[test]
+fn a_projects_member_authors_the_agents_placed_in_it_and_nothing_else() {
+    let (_root, wb) = open();
+    let (shared, private) = shared_project_with_member_and_viewer(&wb);
+    {
+        let guard = wb.lock_unpoisoned();
+        assert_eq!(
+            guard.agent_member_projects(&shared, MEMBER),
+            ["p-shared".to_owned()].into()
+        );
+        assert!(guard.agent_authoring_visible(&shared, Some(MEMBER)));
+        assert!(
+            !guard.agent_authoring_owned_by(&shared, Some(MEMBER)),
+            "the Agent stays its owner's"
+        );
+        assert!(!guard.agent_placeable_by(&shared, MEMBER));
+        assert!(
+            !guard.agent_authoring_visible(&private, Some(MEMBER)),
+            "an Agent placed in no project of the member's"
+        );
+        assert!(
+            !guard.agent_authoring_visible(&shared, Some(VIEWER)),
+            "a viewer authors nothing"
+        );
+        assert!(guard.agent_member_projects(&shared, VIEWER).is_empty());
+        assert!(
+            !guard.agent_authoring_visible(crate::DEFAULT_AGENT, Some(MEMBER)),
+            "a built-in Agent placed in the project is still no one's to edit"
+        );
+        assert!(
+            guard.agent_member_projects(&shared, CLAIMANT).is_empty()
+                && guard.agent_authoring_visible(&shared, Some(CLAIMANT)),
+            "the owner authors it as its owner"
+        );
+        assert_eq!(
+            guard.member_authorable_agents(MEMBER),
+            [(shared.clone(), ["p-shared".to_owned()].into())].into()
+        );
+        assert!(guard.member_authorable_agents(VIEWER).is_empty());
+        assert!(guard.project_member_authors("p-shared", MEMBER));
+        assert!(!guard.project_member_authors("p-shared", VIEWER));
+        assert!(!guard.project_member_authors("p-private", MEMBER));
+    }
+
+    // Making the member a viewer, or taking the grant away, ends it at once.
+    join(&wb, MEMBER, "viewer");
+    assert!(!wb
+        .lock_unpoisoned()
+        .agent_authoring_visible(&shared, Some(MEMBER)));
+    join(&wb, MEMBER, "member");
+    assert!(wb
+        .lock_unpoisoned()
+        .agent_authoring_visible(&shared, Some(MEMBER)));
+    append(
+        &wb,
+        "member_grant",
+        &MemberGrantRecord {
+            id: MemberGrantRecord::make_id(MEMBER, "p-shared"),
+            op: RecordOp::Tombstone,
+            authority: MEMBER.into(),
+            project_id: "p-shared".into(),
+        },
+    );
+    assert!(!wb
+        .lock_unpoisoned()
+        .agent_authoring_visible(&shared, Some(MEMBER)));
+}
+
+#[test]
+fn off_a_desktop_a_projects_member_authors_nothing_yet() {
+    let (_root, wb) = open();
+    let (shared, _) = shared_project_with_member_and_viewer(&wb);
+    let mut guard = wb.lock_unpoisoned();
+    guard.enable_hosted_home_mode();
+    assert!(!guard.agent_authoring_visible(&shared, Some(MEMBER)));
+    assert!(guard.member_authorable_agents(MEMBER).is_empty());
+    assert!(!guard.project_member_authors("p-shared", MEMBER));
+}
+
+#[test]
+fn a_projects_member_deploys_from_it_and_a_viewer_does_not() {
+    let (_root, wb) = open();
+    shared_project_with_member_and_viewer(&wb);
+    let member = bearer_headers(&session(&wb, MEMBER));
+    let viewer = bearer_headers(&session(&wb, VIEWER));
+    let claimant = bearer_headers(&session(&wb, CLAIMANT));
+    let other = bearer_headers(&session(&wb, OTHER));
+    let guard = wb.lock_unpoisoned();
+    let refused = |headers: &axum::http::HeaderMap, project: &str| {
+        guard
+            .project_deployer_refusal(headers, project)
+            .map(|response| response.status())
+    };
+    assert_eq!(refused(&claimant, "p-shared"), None);
+    assert_eq!(refused(&member, "p-shared"), None);
+    assert_eq!(refused(&viewer, "p-shared"), Some(StatusCode::FORBIDDEN));
+    assert_eq!(refused(&other, "p-shared"), Some(StatusCode::FORBIDDEN));
+    assert_eq!(refused(&member, "p-private"), Some(StatusCode::FORBIDDEN));
+    assert_eq!(
+        guard
+            .project_member_requester(&member, "p-shared")
+            .as_deref(),
+        Some(MEMBER),
+        "a member's act records the member"
+    );
+    assert_eq!(guard.project_member_requester(&claimant, "p-shared"), None);
+    assert_eq!(guard.project_member_requester(&viewer, "p-shared"), None);
+}
+
+#[tokio::test]
+async fn a_members_authoring_and_settings_assistant_spend_the_projects_credentials() {
+    let (_root, wb) = open();
+    let (shared, private) = shared_project_with_member_and_viewer(&wb);
+    let app = gated(&wb);
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/projects/p-shared/credentials",
+        Some(&session(&wb, CLAIMANT)),
+        Some(serde_json::json!({ "provider": "openai", "token": "sk-project-key" })),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let chat = {
+        let mut guard = wb.lock_unpoisoned();
+        let chat = guard
+            .create_chat_under_agent(&shared, "member edits")
+            .unwrap_or_else(|_| panic!("an edit chat"))["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        guard.claim_chat_owner(&chat, MEMBER);
+        chat
+    };
+    // A turn in the member's edit chat holds the shared project's keys, and
+    // so does a request for the member's settings assistant: what the
+    // project's credentials are read under.
+    let turn = crate::key_delegation::hold_chat_project(&wb, &chat);
+    assert_eq!(
+        turn.iter().map(|hold| hold.project()).collect::<Vec<_>>(),
+        ["p-shared"]
+    );
+    let member = bearer_headers(&session(&wb, MEMBER));
+    let settings = crate::key_delegation::session_holds(
+        &wb,
+        &member,
+        &axum::http::Method::POST,
+        &format!("/archetypes/{shared}/settings/agent/messages"),
+    );
+    assert_eq!(
+        settings
+            .iter()
+            .map(|hold| hold.project())
+            .collect::<Vec<_>>(),
+        ["p-shared"]
+    );
+    let viewer = bearer_headers(&session(&wb, VIEWER));
+    assert!(crate::key_delegation::session_holds(
+        &wb,
+        &viewer,
+        &axum::http::Method::POST,
+        &format!("/archetypes/{shared}/settings/agent/messages"),
+    )
+    .is_empty());
+    {
+        let guard = wb.lock_unpoisoned();
+        assert_eq!(
+            guard
+                .member_authoring_project_of_chat(&chat, MEMBER)
+                .as_deref(),
+            Some("p-shared")
+        );
+        assert!(
+            guard
+                .credential_ref_for_chat(&chat, "openai", MEMBER)
+                .starts_with(&format!(
+                    "credential:gaugedesk/project/{}/",
+                    hex::encode("p-shared")
+                )),
+            "the member's edit chat runs on the project's key"
+        );
+        assert_eq!(
+            guard.member_authoring_project_of_chat(&chat, VIEWER),
+            None,
+            "only the member's own edit chat"
+        );
+    }
+    let token = |actor: &str, kind: &str, id: &str| {
+        crate::gaugeapp_agent::resolve_agent_credential_in(
+            &wb,
+            actor,
+            &crate::gaugeapp_contract::GaugeAppScope {
+                kind: kind.into(),
+                id: id.into(),
+            },
+        )
+        .map(|credential| match credential {
+            crate::gaugeapp_agent::AgentCredential::OpenAi { token, .. } => token,
+            crate::gaugeapp_agent::AgentCredential::Codex { access, .. } => access,
+        })
+    };
+    assert_eq!(
+        token(MEMBER, "agent", &shared).ok().as_deref(),
+        Some("sk-project-key")
+    );
+    assert_eq!(
+        token(MEMBER, "project", "p-shared").ok().as_deref(),
+        Some("sk-project-key")
+    );
+    assert!(token(MEMBER, "agent", &private).is_err());
+    assert!(token(VIEWER, "agent", &shared).is_err());
+    assert!(token(VIEWER, "project", "p-shared").is_err());
+    assert!(token(OTHER, "project", "p-shared").is_err());
 }

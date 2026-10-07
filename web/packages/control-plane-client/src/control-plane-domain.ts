@@ -211,6 +211,10 @@ export interface ArchetypeNode {
     /** A Panel agent's live previews: disposable work chats running its draft
      *  or a placement's pinned version, listed nowhere else (DR-0272). */
     readonly previews: PanelPreviewNode[];
+    /** The shared projects this person authors the Agent through as a member
+     *  of them, when it is not theirs (DR-0453); empty for their own Agent.
+     *  Its authoring is served by the Home serving these projects. */
+    readonly sharedThrough: readonly ProjectId[];
 }
 /** One live Panel-agent preview. Ending its chat ends the preview. */
 export interface PanelPreviewNode {
@@ -884,7 +888,7 @@ export function parseWorkTarget(raw: unknown): WorkTargetNode {
  *  `/projections/library/workspace` carriage value) into the branded {@link Workspace}. */
 export function parseWorkspace(raw: unknown): Workspace {
     const o = (raw ?? {}) as {
-        archetypes?: { id: string; name: string; kind?: AgentKind; panel_profile?: PanelPublicProfile | null; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; chats: RawChat[]; workstreams?: Parameters<typeof parseWorkstream>[0][]; previews?: { chat: RawChat; placement_id?: string | null; version?: number | null }[] }[];
+        archetypes?: { id: string; name: string; kind?: AgentKind; panel_profile?: PanelPublicProfile | null; instance_id?: string; authoring_target_id: string; is_default: boolean; forked_from?: string | null; forked_from_name?: string | null; shared_through?: string[]; chats: RawChat[]; workstreams?: Parameters<typeof parseWorkstream>[0][]; previews?: { chat: RawChat; placement_id?: string | null; version?: number | null }[] }[];
         projects?: {
             id: string;
             home_id?: string;
@@ -938,6 +942,9 @@ export function parseWorkspace(raw: unknown): Workspace {
                 placementId: preview.placement_id ? (preview.placement_id as PlacementId) : null,
                 version: preview.version ?? null,
             })),
+            sharedThrough: (a.shared_through ?? [])
+                .filter((project): project is string => typeof project === "string" && project.length > 0)
+                .map((project) => project as ProjectId),
         })),
         projects: (o.projects ?? []).map((p) => ({
             id: p.id as ProjectId,

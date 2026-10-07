@@ -64,6 +64,7 @@ const AGENT = {
     isDefault: false,
     forkedFrom: null,
     forkedFromName: null,
+    sharedThrough: [],
     chats: [],
     workstreams: [],
 } as unknown as ArchetypeNode;

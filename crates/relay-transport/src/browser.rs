@@ -78,6 +78,9 @@ pub struct BrowserTunnel {
     /// Ciphertext taken from the session and not yet sent, in frames the relay
     /// accepts.
     frames: crate::wire::FrameQueue,
+    /// Whether the Home has sent its `FIN`: it will answer nothing more on
+    /// this session, though the socket stays open through its teardown grace.
+    peer_finished: bool,
 }
 
 #[wasm_bindgen]
@@ -94,6 +97,7 @@ impl BrowserTunnel {
                 paired: false,
                 meter: crate::wire::CreditMeter::new(),
                 frames: crate::wire::FrameQueue::new(),
+                peer_finished: false,
             })
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -136,7 +140,12 @@ impl BrowserTunnel {
                 self.client.session_mut().received(&bytes);
                 Ok(())
             }
-            RelayFrame::Fin | RelayFrame::FinAck => {
+            RelayFrame::Fin => {
+                self.meter.consumed(frame.len());
+                self.peer_finished = true;
+                Ok(())
+            }
+            RelayFrame::FinAck => {
                 self.meter.consumed(frame.len());
                 Ok(())
             }
@@ -278,6 +287,14 @@ impl BrowserTunnel {
     #[wasm_bindgen(js_name = isPaired)]
     pub fn is_paired(&self) -> bool {
         self.paired
+    }
+
+    /// Whether the Home has finished this session. A caller sends nothing
+    /// more on it: the Home closes its leg only after a teardown grace, and a
+    /// request written in that window is never answered (WS-850).
+    #[wasm_bindgen(js_name = peerFinished)]
+    pub fn peer_finished(&self) -> bool {
+        self.peer_finished
     }
 
     #[wasm_bindgen(js_name = isHandshaking)]

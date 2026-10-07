@@ -21,6 +21,9 @@ import type { RouteEventClose, RouteEventStream, RouteRequest } from "./browser-
  * without loading wasm. Method names match the exported binding exactly. */
 export interface TunnelFacade {
     receiveFrame(frame: Uint8Array): void;
+    /** Whether the Home has sent its `FIN` on this session: it answers nothing
+     *  more, though its leg stays open through a teardown grace. */
+    peerFinished?(): boolean;
     sendRequest(method: string, path: string, body?: string,
                 headers?: Record<string, string>): void;
     takeOutgoing(): Uint8Array;
@@ -178,9 +181,18 @@ interface CarrierSession<F> {
     lastFrameAt(): number;
     /** Abandon it mid-exchange: the next exchange opens a fresh one. */
     drop(): void;
+    /** How many frames and closes the carrier has seen, to wait from. */
+    events(): number;
+    /** Resolve once the carrier sees a frame or a close after `since`, or after
+     *  `ms`, whichever is first. */
+    nextEvent(since: number, ms: number): Promise<void>;
 }
 
-function tunnelCarrier<F extends { receiveFrame(frame: Uint8Array): void; takeCredit(): Uint8Array }>(
+/** The longest an exchange waits without a frame before looking again: for
+ *  progress no frame announces, such as a send buffer draining or a deadline. */
+const TUNNEL_IDLE_POLL_MS = 50;
+
+function tunnelCarrier<F extends { receiveFrame(frame: Uint8Array): void; takeCredit(): Uint8Array; peerFinished?(): boolean }>(
     open: () => Promise<{ tunnel: F; socket: TunnelSocket }>,
     now: () => number,
 ): Carrier<F> {
@@ -195,8 +207,28 @@ function tunnelCarrier<F extends { receiveFrame(frame: Uint8Array): void; takeCr
     let hungUp = false;
     let lastFrameAt = now();
     let queue: Promise<unknown> = Promise.resolve();
+    // An exchange waits on these rather than on a timer. A frame arrives on
+    // the socket's own callback, so waking on it costs nothing, while a timer
+    // is held to once a second in a background tab and a fresh crossing takes
+    // several round trips (WS-850).
+    let events = 0;
+    const waiters = new Set<() => void>();
+    const signal = () => {
+        events += 1;
+        const woken = [...waiters];
+        waiters.clear();
+        for (const wake of woken) wake();
+    };
 
     async function ensure(): Promise<{ tunnel: F; socket: TunnelSocket }> {
+        // A session the Home has finished is never reused: its socket stays
+        // open through the Home's teardown grace, and a request written there
+        // went unanswered until the relay reported 1011 (WS-850).
+        if (live?.tunnel.peerFinished?.()) {
+            const finished = live;
+            live = null;
+            finished.socket.close();
+        }
         if (live) return live;
         let opened: { tunnel: F; socket: TunnelSocket };
         try { opened = await open(); }
@@ -213,12 +245,14 @@ function tunnelCarrier<F extends { receiveFrame(frame: Uint8Array): void; takeCr
             lastFrameAt = now();
             opened.tunnel.receiveFrame(frame);
             sendCredit(opened.tunnel, opened.socket);
+            signal();
         });
         closeReason = undefined;
         opened.socket.onClose((reason) => {
             // Only its own session. A late close from a carrier already
             // replaced must not orphan the one that replaced it.
             if (live === opened) { live = null; closeReason = reason; }
+            signal();
         });
         return opened;
     }
@@ -240,6 +274,16 @@ function tunnelCarrier<F extends { receiveFrame(frame: Uint8Array): void; takeCr
                         if (live === opened) live = null;
                         opened.socket.close();
                     },
+                    events: () => events,
+                    nextEvent: (since, ms) => since !== events ? Promise.resolve() : new Promise<void>((resolve) => {
+                        const wake = () => {
+                            clearTimeout(timer);
+                            waiters.delete(wake);
+                            resolve();
+                        };
+                        const timer = setTimeout(wake, ms);
+                        waiters.add(wake);
+                    }),
                 });
             });
             // Keep the chain alive after a rejection so one failure does not
@@ -310,7 +354,7 @@ function flushFrames(tunnel: { takeOutgoing(): Uint8Array }, socket: TunnelSocke
 export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const now = options.now ?? Date.now;
-    const tick = options.tick ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+    const tick = options.tick;
     const carrier = carrierPool(
         () => tunnelCarrier(options.open, now),
         Math.max(1, options.sessions ?? TUNNEL_CALL_SESSIONS),
@@ -331,6 +375,7 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
         const deadline = now() + timeoutMs;
         let pairedAt: number | undefined;
         for (;;) {
+            const seen = session.events();
             // Not before the relay has spliced this leg. Ciphertext written
             // into an unpaired route has no other end, and relying on the
             // relay to hold it is relying on a component whose whole design
@@ -364,11 +409,15 @@ export function tunnelRouteJson(options: TunnelRouteOptions): TunnelRoute {
             if (!session.live()) {
                 throw new TunnelClosed(session.closeReason() ?? "the Home tunnel closed mid-request");
             }
+            if (tunnel.peerFinished?.()) {
+                session.drop();
+                throw new TunnelClosed("the Home ended the tunnel mid-request");
+            }
             if (now() > deadline) {
                 session.drop();
                 throw new HomeTunnelError(`${method} ${path}: the Home tunnel timed out`);
             }
-            await tick();
+            await (tick ? tick() : session.nextEvent(seen, TUNNEL_IDLE_POLL_MS));
         }
     });
     const route: TunnelRoute = Object.assign((
@@ -462,7 +511,7 @@ export function tunnelRouteRequest(
 ): TunnelRouteRequest {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const now = options.now ?? Date.now;
-    const tick = options.tick ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+    const tick = options.tick;
     const carrier = tunnelCarrier(options.open, now);
 
     const request = (path: string, init: RequestInit = {}) => carrier.run(async (session) => {
@@ -481,6 +530,7 @@ export function tunnelRouteRequest(
         let offset = 0;
         let progressAt = now();
         for (;;) {
+            const seen = session.events();
             if (init.signal?.aborted) {
                 // Mid-request: what crossed already cannot be called back, so
                 // the session goes with it and the next request opens another.
@@ -513,11 +563,15 @@ export function tunnelRouteRequest(
             if (!session.live()) {
                 throw new TunnelClosed(session.closeReason() ?? "the Home tunnel closed mid-request");
             }
+            if (tunnel.peerFinished?.()) {
+                session.drop();
+                throw new TunnelClosed("the Home ended the tunnel mid-request");
+            }
             if (now() - Math.max(progressAt, session.lastFrameAt()) > timeoutMs) {
                 session.drop();
                 throw new HomeTunnelError(`${method} ${path}: the Home tunnel timed out`);
             }
-            await tick();
+            await (tick ? tick() : session.nextEvent(seen, TUNNEL_IDLE_POLL_MS));
         }
     });
     return Object.assign(request, { close: () => carrier.close() });

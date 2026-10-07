@@ -61,3 +61,18 @@ it("recovers the account list in place without losing the deployment draft or ch
     expect(onClose).not.toHaveBeenCalled();
     expect(publishDeployment).not.toHaveBeenCalled();
 });
+
+it("lists the provider keys of the publisher deploying the placement signs with (DR-0453)", async () => {
+    // A member of a shared project deploys its owner's Panel agent with the
+    // owner's keys, which the Home lists only for a named placement.
+    const listPublicCredentials = vi.fn<NonNullable<DeploymentPanelApi["listPublicCredentials"]>>(async () => []);
+    const host = document.createElement("div");
+    document.body.append(host);
+    dispose = render(() => createComponent(DeploymentPanel, {
+        api: { publishDeployment: vi.fn<DeploymentPanelApi["publishDeployment"]>(), listPublicCredentials },
+        selection,
+        defaultEdgeOrigin: "https://edge.example.com", defaultCredentialRef: "provider-key", onClose: vi.fn(),
+    }), host);
+    await vi.waitFor(() => expect(listPublicCredentials).toHaveBeenCalled());
+    expect(listPublicCredentials).toHaveBeenCalledWith("https://edge.example.com", selection.placementId);
+});

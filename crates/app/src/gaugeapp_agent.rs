@@ -1752,6 +1752,56 @@ pub(crate) fn resolve_agent_credential(
     })
 }
 
+/// [`resolve_agent_credential`] for a turn in `scope`. A member of a shared
+/// project keeps no credentials on this computer, and its chats there run on
+/// the project's own (DR-0451); so does its settings assistant for the
+/// project, a placement in it, or an Agent placed in it that it authors
+/// (DR-0453). Anyone else, and a viewer, has only its own.
+pub(crate) fn resolve_agent_credential_in(
+    workbench: &SharedWorkbench,
+    actor: &str,
+    scope: &crate::gaugeapp_contract::GaugeAppScope,
+) -> Result<AgentCredential, GaugeAppAgentError> {
+    match resolve_agent_credential(workbench, actor) {
+        Err(GaugeAppAgentError::NoModelAccess) => {}
+        resolved => return resolved,
+    }
+    let guard = workbench.lock_unpoisoned();
+    let project = match scope.kind.as_str() {
+        "agent" => guard
+            .agent_member_projects(&scope.id, actor)
+            .into_iter()
+            .next(),
+        "placement" => guard
+            .library
+            .project_of_instance(&scope.id)
+            .map(str::to_owned)
+            .filter(|project| guard.project_member_authors(project, actor)),
+        "project" => {
+            Some(scope.id.clone()).filter(|project| guard.project_member_authors(project, actor))
+        }
+        _ => None,
+    }
+    .ok_or(GaugeAppAgentError::NoModelAccess)?;
+    let class = guard.model_execution_class();
+    let record = credentials_in_scope(guard.store_ref(), &crate::account::project_scope(&project))
+        .remove("openai")
+        .filter(|record| record.admits(class))
+        .ok_or(GaugeAppAgentError::NoModelAccess)?;
+    let token = guard
+        .unseal_project_secret(&project, &record.sealed_token)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            GaugeAppAgentError::Credential(
+                "the project's OpenAI credential could not be unsealed".into(),
+            )
+        })?;
+    Ok(AgentCredential::OpenAi {
+        token,
+        endpoint: OPENAI_RESPONSES_ENDPOINT.to_owned(),
+    })
+}
+
 /// The management agent's instructions for one GaugeApp session. One text
 /// serves all six GaugeApps; the app's name, what its scope is, and a line
 /// for the two apps whose boundary a person most often crosses are filled in.
@@ -2673,6 +2723,7 @@ where
     V: FnMut(&GaugeAppAgentContext, &GaugeAppAgentProposal) -> Result<(), GaugeAppAgentError>,
 {
     let actor = context.session.actor.clone();
+    let scope = context.session.scope.clone();
     let mut credential = None;
     run_gaugeapp_agent_turn_with_provider(
         workbench,
@@ -2686,7 +2737,7 @@ where
         direct_key,
         |body, stopped, events| {
             if credential.is_none() {
-                credential = Some(resolve_agent_credential(workbench, &actor)?);
+                credential = Some(resolve_agent_credential_in(workbench, &actor, &scope)?);
             }
             provider_request(
                 credential.as_ref().expect("resolved credential"),

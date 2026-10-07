@@ -1176,6 +1176,26 @@ describe("project-first Home resolution (DESK-3)", () => {
         await api.getWorkspace();
         expect(worked).toEqual(["z"]);
     });
+
+    it("reads the routes once, not per call, for a project with no granted route", async () => {
+        const { api, worked, publishNewProject } = twoHomes();
+        const routeReads = () => vi.mocked(fetch).mock.calls
+            .filter(([url]) => String(url) === "https://hub.example/account/home-routes").length;
+        api.setCurrentProject("proj-a" as never);
+        await api.getWorkspace();
+        const built = routeReads();
+        for (let call = 0; call < 3; call += 1) {
+            expect(await api.listProjectTrackers("proj-unrouted" as never)).toHaveLength(1);
+        }
+        expect(worked).toEqual(["a", "z", "z", "z"]);
+        expect(routeReads()).toBe(built + 1);
+        // A project created after that read is still found by the next miss.
+        publishNewProject();
+        api.setCurrentProject("proj-c" as never);
+        await api.getWorkspace();
+        expect(worked.at(-1)).toBe("c");
+        expect(routeReads()).toBe(built + 2);
+    });
 });
 
 describe("relay-only Homes over the tunnel (DESK-7)", () => {

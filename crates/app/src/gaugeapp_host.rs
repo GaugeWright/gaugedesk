@@ -52,6 +52,75 @@ use crate::{
     LockUnpoisoned, SharedWorkbench, Workbench,
 };
 
+/// A GaugeApp request slower than this names its phases at `warn`.
+///
+/// Every GaugeApp request rebuilds its admission and projections while it holds
+/// the Workbench lock, so a slow build stalls every other request the Home or
+/// Hub serves, sign-in included. On 2026-10-07 one Administration open held the
+/// Hub's lock for 52-68 s at a time and nothing said where (WS-851).
+pub const SLOW_GAUGEAPP_PHASES: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Wall-clock phases of one GaugeApp request, reported only when slow.
+pub struct GaugeAppPhases {
+    label: &'static str,
+    started: std::time::Instant,
+    last: std::time::Instant,
+    phases: Vec<(String, std::time::Duration)>,
+}
+
+impl GaugeAppPhases {
+    pub fn start(label: &'static str) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            label,
+            started: now,
+            last: now,
+            phases: Vec::new(),
+        }
+    }
+
+    /// Close the phase that ran since the previous mark.
+    pub fn mark(&mut self, phase: impl Into<String>) {
+        let now = std::time::Instant::now();
+        self.phases.push((phase.into(), now - self.last));
+        self.last = now;
+    }
+
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// Log the phases when the whole request was slow. `scope` must already be
+    /// safe to log; pass [`log_scope`] of a tenant rather than the tenant.
+    pub fn finish(self, scope: &str) {
+        let total = self.started.elapsed();
+        if total < SLOW_GAUGEAPP_PHASES {
+            return;
+        }
+        let phases = self
+            .phases
+            .iter()
+            .map(|(phase, took)| format!("{phase}={}ms", took.as_millis()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::warn!(
+            target: "gaugeapp",
+            request = self.label,
+            scope,
+            total_ms = total.as_millis() as u64,
+            "slow GaugeApp request: {phases}"
+        );
+    }
+}
+
+/// A tenant as it may appear in a log: its kind and a digest prefix, never the
+/// account subject a personal tenant is named by.
+pub fn log_scope(tenant: &str) -> String {
+    let kind = tenant.split_once(':').map_or("default", |(kind, _)| kind);
+    let digest = Sha256::digest(tenant.as_bytes());
+    format!("{kind}:{}", hex::encode(&digest[..4]))
+}
+
 /// Every GaugeApp this Home serves. Adding one is a line here.
 pub fn routes() -> Router<SharedWorkbench> {
     mount::<crate::project_settings_gaugeapp::ProjectSettings>()
@@ -83,6 +152,26 @@ pub trait GaugeAppDefinition: 'static {
         Self: Sized,
     {
         default_context::<Self>(wb, headers, id)
+    }
+
+    /// Whether [`Self::prepare`] has anything to do for these services. When
+    /// it has not, the request does not leave its task for a blocking thread,
+    /// and so is scheduled exactly as before prepare existed.
+    fn prepares(_services: &Self::Services) -> bool {
+        false
+    }
+
+    /// Work the definition does before its locked [`Self::context`] rebuild,
+    /// with no lock on the Workbench held, on a blocking thread: reading state
+    /// that lives outside this Workbench's store. What it learns travels in the
+    /// services it returns. Opening a session, reading a page and polling for
+    /// updates prepare; other requests rebuild with the services as captured.
+    fn prepare(
+        _wb: &SharedWorkbench,
+        _headers: &HeaderMap,
+        services: Self::Services,
+    ) -> Self::Services {
+        services
     }
 
     /// Retained transports declare their existing session and cursor encoding.
@@ -754,6 +843,24 @@ pub struct OpenScopeBody {
     scope: Option<GaugeAppScope>,
 }
 
+/// Run [`GaugeAppDefinition::prepare`] on a blocking thread, outside the
+/// Workbench lock. A prepare that panics leaves the services as captured.
+async fn prepared<D: GaugeAppDefinition>(
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+    services: D::Services,
+) -> D::Services {
+    if !D::prepares(&services) {
+        return services;
+    }
+    let captured = services.clone();
+    let wb = wb.clone();
+    let headers = headers.clone();
+    tokio::task::spawn_blocking(move || D::prepare(&wb, &headers, services))
+        .await
+        .unwrap_or(captured)
+}
+
 async fn open_session<D: GaugeAppDefinition>(
     State(wb): State<SharedWorkbench>,
     DefinitionServices(services): DefinitionServices<D>,
@@ -770,8 +877,21 @@ async fn open_session<D: GaugeAppDefinition>(
     } else {
         None
     };
+    let mut phases = GaugeAppPhases::start("session.open");
+    let services = prepared::<D>(&wb, &headers, services).await;
+    phases.mark("prepare");
     let guard = wb.lock_unpoisoned();
-    match D::context(&guard, &headers, &id, &services) {
+    phases.mark("lock_wait");
+    let context = D::context(&guard, &headers, &id, &services);
+    drop(guard);
+    phases.mark("context");
+    phases.finish(&log_scope(
+        headers
+            .get("x-gaugewright-tenant")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    ));
+    match context {
         Ok(context)
             if requested
                 .as_ref()
@@ -854,6 +974,7 @@ async fn read_page<D: GaugeAppDefinition>(
     Query(query): Query<SessionQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let services = prepared::<D>(&wb, &headers, services).await;
     let guard = wb.lock_unpoisoned();
     let context = match D::context(&guard, &headers, "", &services) {
         Ok(context) => context,
@@ -889,6 +1010,7 @@ async fn read_updates<D: GaugeAppDefinition>(
     Query(query): Query<UpdatesQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let services = prepared::<D>(&wb, &headers, services).await;
     let guard = wb.lock_unpoisoned();
     let context = match D::context(&guard, &headers, "", &services) {
         Ok(context) => context,

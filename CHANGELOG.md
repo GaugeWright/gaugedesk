@@ -19,6 +19,23 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.7] — 2026-10-07
+
+- Someone you share a project with as a member can now build and ship the
+  Agents placed in it, as you can: open an Agent's authoring chat, change its
+  settings — abilities, the Panel profile, and through the settings assistant —
+  try it in a preview chat, publish a new version, upgrade the project's
+  placement and deploy its Panel agent. The Agent and the deployment stay
+  yours: a version they publish is published by you, the deployment is signed
+  with your key, and each publish and deploy records who asked, which also
+  shows in the audit timeline. Their authoring runs on the project's own model
+  credentials. They reach only the Agents placed in projects you shared with
+  them, never your others, and they cannot delete, fork or copy an Agent,
+  pause or remove a deployment, manage your deployment keys or invite anyone.
+  Someone you shared a project with as a viewer can do none of this, and
+  taking access away ends it at once. Upgrading a placement now needs the
+  project's owner or a member; a viewer could do it before.
+
 ## [0.8.6] — 2026-10-07
 
 - A project on a desktop can be shared. Inviting someone — by email, or from

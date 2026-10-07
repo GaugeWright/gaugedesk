@@ -54,7 +54,9 @@ export interface DeploymentPanelApi {
         expectedRevision: number,
     ): Promise<PublicDeploymentInspection["deployment"]>;
     erasePublicSession?(edge: string, deployment: string, session: string): Promise<void>;
-    listPublicCredentials?(edge: string): Promise<PublicCredentialMetadata[]>;
+    /** The keys deploying from `placementId` may be funded with: its
+     *  publisher's, which a member of a shared project chooses among. */
+    listPublicCredentials?(edge: string, placementId?: PlacementId): Promise<PublicCredentialMetadata[]>;
     provisionPublicCredential?(input: ProvisionPublicCredentialInput): Promise<PublicCredentialMetadata>;
     revokePublicCredential?(edge: string, credentialRef: string): Promise<void>;
     importLegacyDeployment?(input: PublicDeploymentInput): Promise<{
@@ -199,7 +201,7 @@ export function DeploymentPanel(props: {
 
     async function loadCredentials(edge = edgeOrigin()) {
         if (!props.api.listPublicCredentials || !edge.trim()) return;
-        const found = await props.api.listPublicCredentials(edge.trim());
+        const found = await props.api.listPublicCredentials(edge.trim(), props.selection.placementId);
         setCredentials(found);
         if (!credentialRef() && found[0]) setCredentialRef(found[0].credential_ref);
     }
