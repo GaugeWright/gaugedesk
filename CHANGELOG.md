@@ -19,6 +19,8 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-10-07
+
 - The desktop publishes this computer's directory entry for an account with a
   long id again. Minting the account's keys failed with "File name too long",
   because their folder was named after the id in hex; a name that would pass
