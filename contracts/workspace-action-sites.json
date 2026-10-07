@@ -2316,7 +2316,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::workspace_value",
+        "callable": "impl inherent for Workbench::workspace_chat_context",
         "capability": "workstream",
         "count": 1,
         "expression": "workspace . workstream (& workstream . id)",
@@ -2326,7 +2326,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::workspace_value",
+        "callable": "impl inherent for Workbench::workspace_chat_context",
         "capability": "workstream_members",
         "count": 1,
         "expression": "self . workstream_members (& workstream . id)",

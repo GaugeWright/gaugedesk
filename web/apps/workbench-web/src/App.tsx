@@ -1057,9 +1057,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
 
     const [run, { refetch: refetchRun }] = createResource(selected, async (id) => {
         try {
-            const r = await api.getRun(scopeId(id));
-            markLoadOk();
-            return r;
+            // UX-13: the run projection reads through the freshness carriage, like the
+            // merge review below, so a server-declared non-live marker surfaces as
+            // `server-stale` (held data with a caveat) rather than as fresh.
+            const c = await api.getRunCarriage(scopeId(id));
+            setFreshness((s) =>
+                reduceFreshness(s, freshnessEventForMarker(c.freshness.marker, c.freshness.repairHint, Date.now())),
+            );
+            return c.value;
         } catch (e) {
             // The run projection still falls back to Init so the UI renders, but the
             // failure now feeds the freshness signal (it no longer reads as success).

@@ -87,6 +87,21 @@ export async function getRun(transport: WorkbenchTransport, scope: ScopeId): Pro
     return parseRunState(await transport.json("GET", `/scopes/${scope}/run`));
 }
 
+/** The run projection in its freshness carriage (UX-13): the same fold as
+ *  {@link getRun}, read through `GET /projections/:scope/run` so a
+ *  server-declared non-live marker reaches the desktop instead of being lost. */
+export async function getRunCarriage(
+    transport: WorkbenchTransport,
+    scope: ScopeId,
+): Promise<ProjectionCarriage<RunState>> {
+    const raw = (await transport.json("GET", `/projections/${scope}/run?freshness=live`)) as {
+        value: unknown;
+        freshness: { marker?: unknown; generated_at?: unknown; repair_hint?: unknown };
+        client_request_id?: unknown;
+    };
+    return parseProjectionCarriage(raw, (v) => parseRunState(v));
+}
+
 export async function listEngagements(transport: WorkbenchTransport): Promise<EngagementId[]> {
     const o = (await transport.json("GET", "/chats")) as { engagements: string[] };
     return o.engagements.map(engagementId);

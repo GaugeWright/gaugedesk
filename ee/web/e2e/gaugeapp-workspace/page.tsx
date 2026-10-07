@@ -276,6 +276,9 @@ function Harness() {
     const billingUnavailableMode = query.get("billing-unavailable") === "1";
     const commercialLifecycle = query.get("commercial-lifecycle");
     const commercialCurrency = query.get("currency") === "jpy" ? "jpy" : null;
+    // The product ledger lives in the fixture server, so a reload rereads it
+    // and a deletion waits there for its reviewed acceptance (WS-493).
+    const commercialProductsMode = query.get("commercial-products") === "1";
     const identityConfigured = identityMode === "configured" || identityMode === "lifecycle";
     const [scopeId, setScopeId] = createSignal("A");
     const [enabled, setEnabled] = createSignal(true);
@@ -328,6 +331,7 @@ function Harness() {
     const accountLifecycleUrl = `/__fixture/account-lifecycle?key=${encodeURIComponent(accountLifecycleKey)}`;
     const projectHostSettingsUrl = `/__fixture/project-host-settings?key=${encodeURIComponent(accountLifecycleKey)}`;
     const appearanceUrl = `/__fixture/appearance?key=${encodeURIComponent(accountLifecycleKey)}`;
+    const commercialProductsUrl = `/__fixture/commercial-products?key=${encodeURIComponent(accountLifecycleKey)}`;
     if (accountLifecycleMode) void fetch(accountLifecycleUrl)
         .then(async (response) => {
             if (!response.ok) throw new Error(`fixture account read returned ${response.status}`);
@@ -766,6 +770,36 @@ function Harness() {
         app, page_id: firstPage, command_id: commandId, actor: `Person ${id}`,
         expected_basis: `basis-${id}-${serverRevision()}`, payload, status: "proposed",
     } as GaugeAppProposal);
+    type CommercialProductLedger = {
+        revision: number;
+        product_a_status: CommercialProduct["status"];
+        created: CommercialProduct | null;
+        pending_delete: { id: string; product_id: string; expected_basis: string } | null;
+    };
+    const adoptCommercialProducts = (ledger: CommercialProductLedger) => {
+        setCommercialProductStatus(ledger.product_a_status);
+        setCommercialCreatedProduct(ledger.created);
+        proposals.set(scopeId(), ledger.pending_delete ? [{
+            id: ledger.pending_delete.id,
+            app, page_id: "products", command_id: "commercial-product.delete", actor: `Person ${scopeId()}`,
+            expected_basis: ledger.pending_delete.expected_basis, payload: { id: ledger.pending_delete.product_id }, status: "proposed",
+        } as GaugeAppProposal] : []);
+        setServerRevision(ledger.revision);
+    };
+    const readCommercialProducts = async () => {
+        const ledgerResponse = await fetch(commercialProductsUrl);
+        if (!ledgerResponse.ok) throw new Error(`fixture commercial read returned ${ledgerResponse.status}`);
+        adoptCommercialProducts(await ledgerResponse.json() as CommercialProductLedger);
+    };
+    const writeCommercialProducts = async (operation: string, payload: unknown) => {
+        const ledgerResponse = await fetch(commercialProductsUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ operation, payload }),
+        });
+        if (!ledgerResponse.ok) throw new Error(((await ledgerResponse.json()) as { error?: string }).error ?? `fixture commercial write returned ${ledgerResponse.status}`);
+        adoptCommercialProducts(await ledgerResponse.json() as CommercialProductLedger);
+    };
     const accountReviewCommands = new Set(["account.authenticator.remove", "account.session.revoke-current", "account.session.revoke", "account.session.revoke-others"]);
     const applyAccountLifecycle = async (operation: string, payload: unknown) => {
         const lifecycleResponse = await fetch(accountLifecycleUrl, {
@@ -811,6 +845,7 @@ function Harness() {
                 if (!accountResponse.ok) throw new Error(`fixture account read returned ${accountResponse.status}`);
                 setFixtureAccount(await accountResponse.json() as FixtureAccountLifecycleState);
             }
+            if (commercialProductsMode && id === "products") await readCommercialProducts();
             return page(admitted, id);
         },
         readGaugeAppUpdates: async (admitted: GaugeAppSession, after: string): Promise<GaugeAppUpdateSnapshot> => {
@@ -820,7 +855,10 @@ function Harness() {
             record({ updates: admitted.scope.id, after, cursor });
             return { cursor, invalidations: admitted.pages.map((item) => ({ page_id: item.id, resource_basis: `basis-${admitted.scope.id}-${serverRevision()}` })) };
         },
-        gaugeAppProposals: async (admitted: GaugeAppSession) => proposals.get(admitted.scope.id) ?? [],
+        gaugeAppProposals: async (admitted: GaugeAppSession) => {
+            if (commercialProductsMode) await readCommercialProducts();
+            return proposals.get(admitted.scope.id) ?? [];
+        },
         gaugeAppAgentMessages: async (admitted: GaugeAppSession) => {
             if (!persistentAgent) return { messages: events.get(admitted.scope.id) ?? [] };
             const key = encodeURIComponent(`${persistentRun}:${app}:${admitted.scope.kind}:${admitted.scope.id}`);
@@ -953,6 +991,28 @@ function Harness() {
                 return response(null);
             }
             if (reviewNext()) { proposals.set(id, [proposal(id)]); return response(null, "proposed"); }
+            if (commercialProductsMode && request.command_id.startsWith("commercial-product.") && request.command_id !== "commercial-product.read") {
+                const payload = request.payload as { id?: string; revision?: Omit<CommercialProductRevision, "id" | "op" | "product_id" | "revision"> };
+                if (request.command_id === "commercial-product.create") {
+                    if (!payload.id || !payload.revision) throw new Error("fixture rejected an incomplete product");
+                    await writeCommercialProducts(request.command_id, { product: {
+                        id: payload.id,
+                        status: "active",
+                        current_revision: 1,
+                        commercial: { ...payload.revision, id: `${payload.id}:revision:1`, op: "upsert", product_id: payload.id, revision: 1 },
+                        engagement_counts: { open: 0, active: 0, closed: 0 },
+                    } });
+                    return response(null);
+                }
+                if (request.command_id === "commercial-product.delete") {
+                    await writeCommercialProducts(request.command_id, { id: payload.id, expected_basis: `basis-${id}-${serverRevision()}` });
+                    return response(null, "proposed");
+                }
+                if (request.command_id === "commercial-product.retire" || request.command_id === "commercial-product.restore") {
+                    await writeCommercialProducts(request.command_id, { id: payload.id });
+                    return response(null);
+                }
+            }
             if (accountLifecycleMode && request.command_id.startsWith("account.")) {
                 if (accountReviewCommands.has(request.command_id)) {
                     proposals.set(id, [proposal(id, request.command_id, request.payload)]);
@@ -1303,6 +1363,10 @@ function Harness() {
                 return decision === "accept"
                     ? response({ url: "https://checkout.stripe.example.test/session", destination: "checkout" })
                     : response(null);
+            }
+            if (commercialProductsMode) {
+                await writeCommercialProducts("fixture.review", { proposal_id: proposalId, decision, basis: `basis-${admitted.scope.id}-${serverRevision()}` });
+                return response(null);
             }
             if (accountLifecycleMode) {
                 const pendingProposal = (proposals.get(admitted.scope.id) ?? []).find((item) => item.id === proposalId);

@@ -192,12 +192,38 @@ struct EdgeLog {
 /// A loopback stand-in for the deployment object's drain surface. Serves the
 /// sealed artifact once, then records what we acknowledge.
 fn stub_edge(sealed: Value) -> (String, Arc<Mutex<EdgeLog>>) {
+    stub_edge_pages(vec![json!({
+        "deployment_id": DEPLOYMENT,
+        "waiting": 1,
+        "artifacts": [artifact(SESSION, 1_700_000_000_000, sealed)],
+    })])
+}
+
+/// One drained artifact as the edge returns it.
+fn artifact(session: &str, deposited_at_unix_ms: u64, sealed: Value) -> Value {
+    json!({
+        "session_id": session,
+        "release_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "schema_ref": SCHEMA_REF,
+        "recipient_ref": "recipient:collection:theory-a",
+        "revision": 1,
+        // What the emitting session declared, not a number this test chose:
+        // the opener refuses a length that does not describe the plaintext.
+        "byte_len": sealed.get("byte_len").cloned().unwrap_or(json!(1)),
+        "deposited_at_unix_ms": deposited_at_unix_ms,
+        "sealed": sealed,
+    })
+}
+
+/// The stub edge, serving `pages` to successive drain reads and an empty drain
+/// after them.
+fn stub_edge_pages(pages: Vec<Value>) -> (String, Arc<Mutex<EdgeLog>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let log = Arc::new(Mutex::new(EdgeLog::default()));
     let sink = Arc::clone(&log);
     std::thread::spawn(move || {
-        let mut served = false;
+        let mut pages = pages.into_iter();
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -227,28 +253,13 @@ fn stub_edge(sealed: Value) -> (String, Arc<Mutex<EdgeLog>>) {
 
             let payload = if method == "POST" {
                 json!({ "acknowledged": 1 }).to_string()
-            } else if served {
-                json!({ "deployment_id": DEPLOYMENT, "waiting": 0, "artifacts": [] }).to_string()
             } else {
-                served = true;
-                json!({
-                    "deployment_id": DEPLOYMENT,
-                    "waiting": 1,
-                    "artifacts": [{
-                        "session_id": SESSION,
-                        "release_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "schema_ref": SCHEMA_REF,
-                        "recipient_ref": "recipient:collection:theory-a",
-                        "revision": 1,
-                        // What the emitting session declared, not a number this
-                        // test chose: the opener refuses a length that does not
-                        // describe the plaintext.
-                        "byte_len": sealed["byte_len"].clone(),
-                        "deposited_at_unix_ms": 1_700_000_000_000_u64,
-                        "sealed": sealed,
-                    }],
-                })
-                .to_string()
+                pages
+                    .next()
+                    .unwrap_or_else(
+                        || json!({ "deployment_id": DEPLOYMENT, "waiting": 0, "artifacts": [] }),
+                    )
+                    .to_string()
             };
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
@@ -362,6 +373,7 @@ fn drain(workbench: &SharedWorkbench, _edge: &str, _project: &str) -> Value {
         CollectIntoProjectRequest {
             binding_id: BINDING.to_owned(),
             after_unix_ms: None,
+            after: None,
         },
     )
     .expect("the drain chain runs");
@@ -501,6 +513,7 @@ async fn nothing_is_acknowledged_when_the_artifact_cannot_be_opened() {
         CollectIntoProjectRequest {
             binding_id: BINDING.to_owned(),
             after_unix_ms: None,
+            after: None,
         },
     )
     .expect("a refusal is reported, not raised");
@@ -814,6 +827,7 @@ fn a_drain_in_flight_does_not_hold_the_workbench() {
                 CollectIntoProjectRequest {
                     binding_id: BINDING.to_owned(),
                     after_unix_ms: None,
+                    after: None,
                 },
             )
         })
@@ -1347,4 +1361,67 @@ async fn an_inbound_pill_without_one_live_placement_opens_the_project_inbox() {
         screen.get("placement").is_none(),
         "no live placement holds the item, so the project's Inbox opens: {screen}",
     );
+}
+
+/// A drain follows the edge's cursor past a page whose artifacts it refused
+/// (WS-484). Before, the drain read one page: a refusal keeps its hosted copy,
+/// so a page of refusals was the first page every later drain read again, and
+/// whatever waited behind it was never reached.
+#[test]
+fn drain_follows_the_cursor_past_a_refused_page() {
+    let vector = vector();
+    let dir = tempfile::tempdir().unwrap();
+    let workbench = open_workbench(dir.path()).unwrap();
+    let root = workbench.lock_unpoisoned().root_path();
+    install_recipient(&root, &vector.recipient_private_seed_hex);
+    let instant = 1_700_000_000_000_u64;
+    let (edge, log) = stub_edge_pages(vec![
+        json!({
+            "deployment_id": DEPLOYMENT,
+            "waiting": 2,
+            // The index entry outlived its object: refused, kept hosted.
+            "artifacts": [artifact("session-orphaned", instant, Value::Null)],
+            "next_after": format!("{instant}:session-orphaned"),
+        }),
+        json!({
+            "deployment_id": DEPLOYMENT,
+            "waiting": 1,
+            "artifacts": [artifact(SESSION, instant, vector.sealed)],
+            "next_after": null,
+        }),
+    ]);
+    install_binding(&workbench, &edge, ADMISSION_SCOPE);
+
+    let outcome = drain(&workbench, &edge, PROJECT);
+    assert_eq!(outcome["waiting"], 2, "waiting is the first page's count");
+    assert_eq!(outcome["landed"], json!([ARTIFACT]));
+    assert_eq!(outcome["refused"].as_array().unwrap().len(), 1);
+    assert_eq!(outcome["refused"][0]["session_id"], "session-orphaned");
+    assert_eq!(outcome["next_after"], Value::Null);
+
+    let calls = log.lock().unwrap().calls.clone();
+    let reads: Vec<&str> = calls
+        .iter()
+        .filter(|(method, _, _)| method == "GET")
+        .map(|(_, target, _)| target.as_str())
+        .collect();
+    assert_eq!(
+        reads,
+        [
+            format!("/v1/deployments/{ADMISSION_SCOPE}/collections"),
+            format!(
+                "/v1/deployments/{ADMISSION_SCOPE}/collections?after={instant}:session-orphaned"
+            ),
+        ],
+        "the second read resumes at the edge's cursor, inside the same millisecond",
+    );
+    // Only the opened artifact is acknowledged; the refusal keeps its copy.
+    let acknowledged: Vec<&str> = calls
+        .iter()
+        .filter(|(method, _, _)| method == "POST")
+        .map(|(_, _, body)| body.as_str())
+        .collect();
+    assert_eq!(acknowledged.len(), 1);
+    assert!(acknowledged[0].contains(SESSION));
+    assert!(!acknowledged[0].contains("session-orphaned"));
 }

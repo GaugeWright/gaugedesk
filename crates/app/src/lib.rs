@@ -167,6 +167,7 @@ mod whip_views;
 pub mod work_chat_funding;
 pub mod workbench_auth;
 pub mod workbench_state;
+pub mod workspace_pages;
 pub mod workstream_host_contract;
 pub(crate) mod workstream_promotion;
 pub mod workstream_routes;

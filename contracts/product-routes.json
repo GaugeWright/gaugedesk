@@ -4856,6 +4856,78 @@
       }
     },
     {
+      "id": "home.workspace.outline",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/workspace/outline",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "none yet: the workbench client adopts the outline and chat pages in a later SCALE-3 slice (WS-519)",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home",
+      "capability": null,
+      "requestSchema": "none",
+      "responseSchema": "rust:gaugedesk-app/workspace_pages/WorkspaceOutline",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/workspace_pages_tests.rs#pages_traverse_exactly_the_whole_workspace"
+        ],
+        "authority": [
+          "crates/app/src/workspace_pages_tests.rs#a_page_lists_only_what_the_caller_may_see"
+        ],
+        "journey": [
+          "crates/app/src/workspace_pages_tests.rs#pages_traverse_exactly_the_whole_workspace"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/workspace_pages_tests.rs#a_traversal_neither_repeats_nor_drops_a_row_while_chats_are_admitted"
+        ]
+      }
+    },
+    {
+      "id": "home.workspace.chats.page",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/workspace/chats",
+      "producer": "gaugedesk-app hosted Home composition",
+      "consumer": "none yet: the workbench client adopts the outline and chat pages in a later SCALE-3 slice (WS-519)",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home",
+      "capability": null,
+      "requestSchema": "http/workspace-chat-page-query",
+      "responseSchema": "rust:gaugedesk-app/workspace_pages/WorkspaceChatPage",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/workspace_pages_tests.rs#pages_traverse_exactly_the_whole_workspace"
+        ],
+        "authority": [
+          "crates/app/src/workspace_pages_tests.rs#a_page_lists_only_what_the_caller_may_see"
+        ],
+        "journey": [
+          "crates/app/src/workspace_pages_tests.rs#pages_traverse_exactly_the_whole_workspace"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/workspace_pages_tests.rs#a_traversal_neither_repeats_nor_drops_a_row_while_chats_are_admitted"
+        ]
+      }
+    },
+    {
       "id": "home.workspace.events",
       "jurisdiction": "private-home",
       "transport": "sse",

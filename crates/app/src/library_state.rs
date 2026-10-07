@@ -29,6 +29,9 @@ use crate::library::{
     WorkstreamRecord, WorkstreamRootRecord, LIBRARY_RECORD_SCHEMA, LIBRARY_SCOPE,
 };
 use crate::workbench_state::{provider_for, WorkspaceProviders};
+use crate::workspace_pages::{
+    WorkspaceChatCursor, WorkspaceChatLens, WorkspaceChatPage, WorkspaceChatRows,
+};
 use crate::{
     io, library, library_routes, AttestationMode, Workbench, DEFAULT_AGENT, DEFAULT_INSTANCE,
     DEFAULT_PLACEMENT, DEFAULT_PROJECT,
@@ -8001,13 +8004,22 @@ impl Workbench {
         })
     }
 
+    /// The whole workspace projection, every chat row inline. Older clients
+    /// read exactly this shape from `GET /workspace`.
     pub(crate) fn workspace_value(&self) -> serde_json::Value {
+        self.workspace_value_shaped(WorkspaceChatRows::Inline)
+    }
+
+    /// The shared per-read inputs of a chat row: which active workstream each
+    /// member chat is in, and the operator's attention rules (ATTN-2), parsed
+    /// once per projection read.
+    fn workspace_chat_context(
+        &self,
+    ) -> (
+        std::collections::BTreeMap<String, String>,
+        crate::attention::AttentionRules,
+    ) {
         let lib = &self.library;
-        // A chat can appear under a placement and in recent. Observe it once
-        // for this response; a later response gets a fresh observation.
-        let mut observations = BTreeMap::new();
-        // The operator's attention rules (ATTN-2) gate the badge flags below —
-        // parsed once per projection read, shared by every chat row.
         let rules = crate::attention::AttentionRules::parse(
             self.account_settings()
                 .ok()
@@ -8043,6 +8055,22 @@ impl Workbench {
                 }
             }
         }
+        (chat_ws, rules)
+    }
+
+    /// The workspace projection with chat rows either inline or left to
+    /// [`Self::workspace_chat_page`] (SCALE-3). A paged outline builds no chat
+    /// row and observes no chat workspace: it carries the agents, projects,
+    /// placements, targets and workstreams, and marks itself
+    /// `"chat_rows": "paged"` so a reader never mistakes an omitted list for
+    /// an empty one.
+    pub(crate) fn workspace_value_shaped(&self, rows: WorkspaceChatRows) -> serde_json::Value {
+        let lib = &self.library;
+        let inline = rows == WorkspaceChatRows::Inline;
+        // A chat can appear under a placement and in recent. Observe it once
+        // for this response; a later response gets a fresh observation.
+        let mut observations = BTreeMap::new();
+        let (chat_ws, rules) = self.workspace_chat_context();
 
         let archetypes: Vec<_> = lib
             .agents
@@ -8057,6 +8085,11 @@ impl Workbench {
                     .filter_map(|preview| {
                         let chat = lib.chats.get(&preview.chat_id)?;
                         let mut projected = serde_json::to_value(&preview).ok()?;
+                        // A preview's chat is a chat row: the outline keeps
+                        // the preview and its `chat_id`, and builds no row.
+                        if !inline {
+                            return Some(projected);
+                        }
                         projected.as_object_mut()?.insert(
                             "chat".to_owned(),
                             self.library_chat_json(chat, &chat_ws, &rules, &mut observations),
@@ -8064,7 +8097,7 @@ impl Workbench {
                         Some(projected)
                     })
                     .collect::<Vec<_>>();
-                serde_json::json!({
+                let mut projected = serde_json::json!({
                     "id": agent.id,
                     "name": agent.name,
                     "kind": agent.agent_kind,
@@ -8078,10 +8111,18 @@ impl Workbench {
                     "is_default": agent.id == DEFAULT_AGENT,
                     "forked_from": agent.forked_from,
                     "forked_from_name": agent.forked_from.as_ref().and_then(|src| lib.agents.get(src).map(|source| source.name.clone())),
-                    "chats": lib.chats_in(&agent.instance_id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules, &mut observations)).collect::<Vec<_>>(),
                     "workstreams": self.library_workstreams_in(&agent.instance_id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
                     "previews": previews,
-                })
+                });
+                if inline {
+                    projected["chats"] = lib
+                        .chats_in(&agent.instance_id)
+                        .iter()
+                        .map(|chat| self.library_chat_json(chat, &chat_ws, &rules, &mut observations))
+                        .collect::<Vec<_>>()
+                        .into();
+                }
+                projected
             })
             .collect();
 
@@ -8124,7 +8165,7 @@ impl Workbench {
                             .get(&instance.agent_id)
                             .map(|agent| agent.current_version)
                             .unwrap_or(instance.version);
-                        serde_json::json!({
+                        let mut projected = serde_json::json!({
                             "placement_id": instance.id,
                             "kind": instance.placement_kind,
                             "archetype_id": instance.agent_id,
@@ -8147,9 +8188,17 @@ impl Workbench {
                                 "status": binding.status,
                             })).collect::<Vec<_>>(),
                             "target_ids": lib.placement_targets.get(&instance.id).map(|targets| targets.target_ids.clone()).unwrap_or_default(),
-                            "chats": lib.chats_in(&instance.id).iter().map(|chat| self.library_chat_json(chat, &chat_ws, &rules, &mut observations)).collect::<Vec<_>>(),
                             "workstreams": self.library_workstreams_in(&instance.id).iter().map(|workstream| crate::workstream_routes::workstream_json(self, workstream)).collect::<Vec<_>>(),
-                        })
+                        });
+                        if inline {
+                            projected["chats"] = lib
+                                .chats_in(&instance.id)
+                                .iter()
+                                .map(|chat| self.library_chat_json(chat, &chat_ws, &rules, &mut observations))
+                                .collect::<Vec<_>>()
+                                .into();
+                        }
+                        projected
                     })
                     .collect();
                 serde_json::json!({
@@ -8181,32 +8230,16 @@ impl Workbench {
                 .unwrap_or(false)
         });
 
-        let mut recent: Vec<&ChatRecord> = lib.chats.values().collect();
-        recent.retain(|chat| {
-            lib.project_of_chat(&chat.id)
-                .is_none_or(|project| self.owns_project(project))
-                && self.panel_preview_project_of_chat(&chat.id).is_none()
-        });
+        let mut recent: Vec<&ChatRecord> = if inline {
+            lib.chats.values().collect()
+        } else {
+            Vec::new()
+        };
+        recent.retain(|chat| self.recent_chat_listed(chat));
         recent.sort_by_key(|chat| std::cmp::Reverse(chat.created_position));
         let recent: Vec<_> = recent
             .into_iter()
-            .map(|chat| {
-                let inst = lib.instances.get(&chat.instance_id);
-                let archetype_name = inst
-                    .and_then(|instance| lib.agents.get(&instance.agent_id))
-                    .map(|agent| agent.name.clone())
-                    .unwrap_or_default();
-                let mut projected =
-                    self.library_chat_json(chat, &chat_ws, &rules, &mut observations);
-                projected
-                    .as_object_mut()
-                    .expect("chat projections are objects")
-                    .insert(
-                        "archetype".to_owned(),
-                        serde_json::Value::String(archetype_name),
-                    );
-                projected
-            })
+            .map(|chat| self.recent_chat_json(chat, &chat_ws, &rules, &mut observations))
             .collect();
 
         let workstreams: Vec<_> = lib
@@ -8215,10 +8248,9 @@ impl Workbench {
             .map(|workstream| crate::workstream_routes::workstream_json(self, workstream))
             .collect();
 
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "archetypes": archetypes,
             "projects": projects,
-            "recent": recent,
             "workstreams": workstreams,
             "work_targets": lib
                 .work_targets
@@ -8230,7 +8262,96 @@ impl Workbench {
             // The organization this Home was provisioned for, which a project
             // created here belongs to (DR-0325).
             "home_organization": self.owning_organization.as_deref(),
-        })
+        });
+        if inline {
+            value["recent"] = recent.into();
+        } else {
+            value["chat_rows"] = "paged".into();
+        }
+        value
+    }
+
+    /// Whether the Home lists `chat` in Recent at all, before any caller's
+    /// visibility: a chat of a project another Home owns, or of a Panel-agent
+    /// preview, is never a Recent row.
+    pub(crate) fn recent_chat_listed(&self, chat: &ChatRecord) -> bool {
+        self.library
+            .project_of_chat(&chat.id)
+            .is_none_or(|project| self.owns_project(project))
+            && self.panel_preview_project_of_chat(&chat.id).is_none()
+    }
+
+    /// One Recent row: the chat row plus the name of the Agent it runs.
+    fn recent_chat_json(
+        &self,
+        chat: &ChatRecord,
+        chat_ws: &std::collections::BTreeMap<String, String>,
+        rules: &crate::attention::AttentionRules,
+        observations: &mut BTreeMap<String, Option<WorkspaceObservation>>,
+    ) -> serde_json::Value {
+        let lib = &self.library;
+        let archetype_name = lib
+            .instances
+            .get(&chat.instance_id)
+            .and_then(|instance| lib.agents.get(&instance.agent_id))
+            .map(|agent| agent.name.clone())
+            .unwrap_or_default();
+        let mut projected = self.library_chat_json(chat, chat_ws, rules, observations);
+        projected
+            .as_object_mut()
+            .expect("chat projections are objects")
+            .insert(
+                "archetype".to_owned(),
+                serde_json::Value::String(archetype_name),
+            );
+        projected
+    }
+
+    /// One page of chat rows (SCALE-3). `visible` is the caller's filter and
+    /// runs on records before any row is built, so a chat the caller may not
+    /// see is never projected and its workspace never observed. Rows follow
+    /// the lens's total order on `(created_position, id)`; the cursor names
+    /// the last row returned, by value, so a chat admitted or removed between
+    /// pages neither repeats nor hides a row that existed when traversal
+    /// began.
+    pub(crate) fn workspace_chat_page(
+        &self,
+        lens: &WorkspaceChatLens,
+        after: Option<&WorkspaceChatCursor>,
+        limit: usize,
+        visible: impl Fn(&ChatRecord) -> bool,
+    ) -> WorkspaceChatPage {
+        let lib = &self.library;
+        let mut candidates: Vec<&ChatRecord> = lib
+            .chats
+            .values()
+            .filter(|chat| match lens {
+                WorkspaceChatLens::Recent => self.recent_chat_listed(chat),
+                WorkspaceChatLens::Root(root) => &chat.instance_id == root,
+            })
+            .filter(|chat| after.is_none_or(|cursor| lens.follows(cursor, chat)))
+            .filter(|chat| visible(chat))
+            .collect();
+        candidates.sort_by(|a, b| lens.order(a, b));
+        let more = candidates.len() > limit;
+        candidates.truncate(limit);
+        let next = more
+            .then(|| candidates.last().map(|chat| WorkspaceChatCursor::of(chat)))
+            .flatten();
+        let mut observations = BTreeMap::new();
+        let (chat_ws, rules) = self.workspace_chat_context();
+        let rows = candidates
+            .into_iter()
+            .map(|chat| match lens {
+                WorkspaceChatLens::Recent => {
+                    self.recent_chat_json(chat, &chat_ws, &rules, &mut observations)
+                }
+                WorkspaceChatLens::Root(_) => {
+                    self.library_chat_json(chat, &chat_ws, &rules, &mut observations)
+                }
+            })
+            .collect();
+        WorkspaceChatPage { rows, next }
     }
 
     /// SEARCH-2 file-content walk bounds. A per-query worktree walk (NOT a persistent

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { engagementId } from "./control-plane-domain";
+import { engagementId, scopeId } from "./control-plane-domain";
 import type { PlacementId, ProjectId } from "./control-plane-domain";
 import type { WorkbenchTransport } from "./control-plane-workbench";
 import {
@@ -12,6 +12,7 @@ import {
     getResourceExport,
     getResourceReview,
     getChatNotices,
+    getRunCarriage,
     resourceExportCommand,
     resourceReviewCommand,
     renewPlacementDistribution,
@@ -235,5 +236,21 @@ describe("project fork and pull", () => {
         const result = await pullProjectUpstream(transport, "proj-2" as ProjectId, "cut-9", { "b.md": "theirs" });
         expect(json).toHaveBeenLastCalledWith("POST", "/projects/proj-2/upstream/pull", { source_cut: "cut-9", resolutions: { "b.md": "theirs" } });
         expect(result.pulled).toBe(2);
+    });
+});
+
+describe("run projection carriage (UX-13)", () => {
+    it("reads the run through the freshness carriage and keeps a non-live marker", async () => {
+        const json = vi.fn(async () => ({
+            value: { phase: "Running", admitted_once: true },
+            freshness: { marker: "partial", generated_at: 7, repair_hint: "refresh run for chat-1" },
+            client_request_id: null,
+        }));
+        const transport = { base: "", json } as WorkbenchTransport;
+        const carriage = await getRunCarriage(transport, scopeId("chat-1"));
+        expect(json).toHaveBeenCalledExactlyOnceWith("GET", "/projections/chat-1/run?freshness=live");
+        expect(carriage.value.phase).toBe("Running");
+        expect(carriage.freshness.marker).toBe("partial");
+        expect(carriage.freshness.repairHint).toBe("refresh run for chat-1");
     });
 });

@@ -25,8 +25,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gaugedesk_store::home_reference_journal::{
-    ReferenceCompletion, ReferenceEvidence, ReferenceOperation, ReferenceUseEvidence,
-    RevalidatedReferenceEvidence,
+    ReferenceCompletion, ReferenceEvidence, ReferenceOperation, ReferenceSeal,
+    ReferenceUseEvidence, RevalidatedReferenceEvidence,
 };
 #[cfg(test)]
 use gaugedesk_store::Store;
@@ -380,6 +380,91 @@ impl ProjectGateRevalidation {
     }
 }
 
+fn classify_gate_operation(
+    operation: &ReferenceOperation,
+    target_rows: &mut std::collections::BTreeMap<String, (String, GateImportOperationKind)>,
+    current: &Result<&GateProgram, String>,
+    state: &Path,
+    home_id: &str,
+    project_id: &str,
+) -> GateRevalidationEntry {
+    let target_row = target_rows.remove(&operation.operation_id);
+    let mut version_id = target_row.as_ref().map(|(version, _)| version.clone());
+    let status = if operation.refusal.is_some() && target_row.is_some() {
+        GateRevalidationStatus::Unknown("refused Home operation still has target evidence".into())
+    } else if operation.refusal.is_some() {
+        GateRevalidationStatus::Refused
+    } else if operation.completed_epoch.is_none() {
+        GateRevalidationStatus::Pending
+    } else if operation.kind != "checked-program" {
+        GateRevalidationStatus::Unknown(format!(
+            "Home operation kind {} is not a checked program",
+            operation.kind
+        ))
+    } else if operation.target_store_incarnation.is_none() {
+        GateRevalidationStatus::Unknown("Home operation predates target incarnations".into())
+    } else if target_row.is_none() {
+        GateRevalidationStatus::Unknown(
+            "completed Home operation is absent from the target roster".into(),
+        )
+    } else {
+        match current {
+            Err(refusal) => GateRevalidationStatus::Unknown(format!(
+                "current project gate cannot be read: {refusal}"
+            )),
+            Ok(program) => {
+                match readback_gate_import_operation(program, state, &operation.operation_id) {
+                    Err(refusal) => match refusal.class {
+                        GateImportRefusalClass::Unknown => {
+                            GateRevalidationStatus::Unknown(refusal.detail)
+                        }
+                        GateImportRefusalClass::Drifted => {
+                            GateRevalidationStatus::Drifted(refusal.detail)
+                        }
+                    },
+                    Ok(evidence) => {
+                        version_id = Some(evidence.version_id.clone());
+                        let admitted = operation
+                            .revalidated_basis_digest
+                            .as_deref()
+                            .unwrap_or(&operation.basis_digest);
+                        if target_row.as_ref().is_none_or(|(version, kind)| {
+                            version != &evidence.version_id
+                                || *kind != GateImportOperationKind::Checked
+                        }) {
+                            GateRevalidationStatus::Unknown(
+                                "target roster differs from the checked operation evidence".into(),
+                            )
+                        } else if operation.target_store_incarnation.as_deref()
+                            != Some(evidence.target_store_incarnation.as_str())
+                            || operation.witness_digest.as_deref()
+                                != Some(evidence.witness_digest.as_str())
+                        {
+                            GateRevalidationStatus::Unknown(
+                                "target evidence differs from the completed Home pointer".into(),
+                            )
+                        } else if gate_basis_digest(home_id, project_id, &evidence) != admitted {
+                            GateRevalidationStatus::Drifted(
+                                "current compiler, lock or envelope basis differs from the completed Home admission".into(),
+                            )
+                        } else if evidence.source_digest != program.source_digest() {
+                            GateRevalidationStatus::Superseded
+                        } else {
+                            GateRevalidationStatus::Current
+                        }
+                    }
+                }
+            }
+        }
+    };
+    GateRevalidationEntry {
+        operation_id: Some(operation.operation_id.clone()),
+        version_id,
+        use_key: None,
+        status,
+    }
+}
+
 /// Revalidate every Home operation and use pin recorded against a project's
 /// gate, and every row of the gate's own target roster, against the current
 /// project gate. Writes nothing to either store.
@@ -408,70 +493,14 @@ fn revalidate_gate_home(
 
     let mut entries = Vec::new();
     for operation in operations {
-        let target_row = target_rows.remove(&operation.operation_id);
-        let mut version_id = target_row.as_ref().map(|(version, _)| version.clone());
-        let status = if operation.refusal.is_some() {
-            GateRevalidationStatus::Refused
-        } else if operation.completed_epoch.is_none() {
-            GateRevalidationStatus::Pending
-        } else if operation.kind != "checked-program" {
-            GateRevalidationStatus::Unknown(format!(
-                "Home operation kind {} is not a checked program",
-                operation.kind
-            ))
-        } else if operation.target_store_incarnation.is_none() {
-            GateRevalidationStatus::Unknown("Home operation predates target incarnations".into())
-        } else {
-            match current {
-                Err(ref refusal) => GateRevalidationStatus::Unknown(format!(
-                    "current project gate cannot be read: {refusal}"
-                )),
-                Ok(program) => {
-                    match readback_gate_import_operation(program, state, &operation.operation_id) {
-                        Err(refusal) => match refusal.class {
-                            GateImportRefusalClass::Unknown => {
-                                GateRevalidationStatus::Unknown(refusal.detail)
-                            }
-                            GateImportRefusalClass::Drifted => {
-                                GateRevalidationStatus::Drifted(refusal.detail)
-                            }
-                        },
-                        Ok(evidence) => {
-                            version_id = Some(evidence.version_id.clone());
-                            let admitted = operation
-                                .revalidated_basis_digest
-                                .as_deref()
-                                .unwrap_or(&operation.basis_digest);
-                            if operation.target_store_incarnation.as_deref()
-                                != Some(evidence.target_store_incarnation.as_str())
-                                || operation.witness_digest.as_deref()
-                                    != Some(evidence.witness_digest.as_str())
-                            {
-                                GateRevalidationStatus::Unknown(
-                                    "target evidence differs from the completed Home pointer"
-                                        .into(),
-                                )
-                            } else if gate_basis_digest(home_id, project_id, &evidence) != admitted
-                            {
-                                GateRevalidationStatus::Drifted(
-                                    "current compiler, lock or envelope basis differs from the completed Home admission".into(),
-                                )
-                            } else if evidence.source_digest != program.source_digest() {
-                                GateRevalidationStatus::Superseded
-                            } else {
-                                GateRevalidationStatus::Current
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        entries.push(GateRevalidationEntry {
-            operation_id: Some(operation.operation_id),
-            version_id,
-            use_key: None,
-            status,
-        });
+        entries.push(classify_gate_operation(
+            &operation,
+            &mut target_rows,
+            &current,
+            state,
+            home_id,
+            project_id,
+        ));
     }
     // Target admissions the Home never registered: a pre-journal version, an
     // unwitnessed or legacy-gap row, or a target write orphaned by a crash.
@@ -506,6 +535,171 @@ fn revalidate_gate_home(
         target_store: target,
         prototype_journal: matches!(journal, GateHomeJournal::LegacyPrototype(_)),
         entries,
+        home_wide_complete: false,
+    })
+}
+
+/// Exact gate-target evidence at a verified Home seal. Operations outside the
+/// cut, including pre-seal registrations completed afterward, are exposed by
+/// identity but are not recaptured. Gaps are target or Home rows that cannot
+/// be assigned to either the sealed selection
+/// or a later Home obligation. This read is not the final ref CAS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedProjectGateRevalidation {
+    pub target_store: String,
+    pub seal_epoch: i64,
+    pub seal_roster_digest: String,
+    pub selected: Vec<GateRevalidationEntry>,
+    /// Nonterminal operations outside the cut. Some may have registered before
+    /// the seal but completed afterward, or may still be pending.
+    pub later_operation_ids: Vec<String>,
+    pub later_legacy_use_keys: Vec<String>,
+    pub gaps: Vec<GateRevalidationEntry>,
+    /// REFCOV-1 has not proved the complete Home accepting-path inventory.
+    pub home_wide_complete: bool,
+}
+
+impl SealedProjectGateRevalidation {
+    /// A clean gate-target selection still needs the Home-wide inventory, use
+    /// door, current governing bases, norm exclusion and ref CAS before it can
+    /// authorize trunk. Later registered work belongs to the next epoch.
+    pub fn selected_gate_current(&self) -> bool {
+        self.gaps.is_empty()
+            && self.selected.iter().all(|entry| {
+                matches!(
+                    entry.status,
+                    GateRevalidationStatus::Current | GateRevalidationStatus::Superseded
+                )
+            })
+    }
+}
+
+fn revalidate_sealed_gate_home(
+    journal: &GateHomeJournal<'_>,
+    seal: &ReferenceSeal,
+    home_id: &str,
+    project_id: &str,
+    current: Result<&GateProgram, String>,
+    state: &Path,
+) -> io::Result<SealedProjectGateRevalidation> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if seal.home_id != home_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reference seal belongs to another Home",
+        ));
+    }
+    let target = gate_target_store(project_id);
+    let live = journal
+        .reference_operations_for_target(home_id, &target)
+        .map_err(io::Error::other)?;
+    let pins = journal
+        .reference_use_pins_for_target(home_id, &target)
+        .map_err(io::Error::other)?;
+    let roster = gate_import_roster(state).map_err(io::Error::other)?;
+    let mut target_rows: BTreeMap<String, (String, GateImportOperationKind)> = roster
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| (row.operation_id, (row.version_id, row.kind)))
+        .collect();
+    let mut live_by_id = live
+        .into_iter()
+        .map(|operation| (operation.operation_id.clone(), operation))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = Vec::new();
+    let mut gaps = Vec::new();
+    let mut selected_ids = BTreeSet::new();
+    for operation in seal
+        .operations
+        .iter()
+        .filter(|operation| operation.target_store == target)
+    {
+        if !selected_ids.insert(operation.operation_id.clone())
+            || live_by_id.remove(&operation.operation_id).as_ref() != Some(operation)
+        {
+            gaps.push(GateRevalidationEntry {
+                operation_id: Some(operation.operation_id.clone()),
+                version_id: None,
+                use_key: None,
+                status: GateRevalidationStatus::Unknown(
+                    "sealed Home operation differs from its current journal row".into(),
+                ),
+            });
+            continue;
+        }
+        selected.push(classify_gate_operation(
+            operation,
+            &mut target_rows,
+            &current,
+            state,
+            home_id,
+            project_id,
+        ));
+    }
+    let mut later_operation_ids = Vec::new();
+    for operation in live_by_id.into_values() {
+        let target_row = target_rows.remove(&operation.operation_id);
+        if operation.refusal.is_none()
+            && operation
+                .completed_epoch
+                .is_some_and(|epoch| epoch <= seal.epoch)
+        {
+            gaps.push(GateRevalidationEntry {
+                operation_id: Some(operation.operation_id),
+                version_id: target_row.map(|(version, _)| version),
+                use_key: None,
+                status: GateRevalidationStatus::Unknown(
+                    "completed Home operation is missing from the sealed cut".into(),
+                ),
+            });
+        } else if operation.refusal.is_some() && target_row.is_some() {
+            gaps.push(GateRevalidationEntry {
+                operation_id: Some(operation.operation_id),
+                version_id: target_row.map(|(version, _)| version),
+                use_key: None,
+                status: GateRevalidationStatus::Unknown(
+                    "refused Home operation still has target evidence".into(),
+                ),
+            });
+        } else if operation.refusal.is_none() {
+            later_operation_ids.push(operation.operation_id);
+        }
+    }
+    for (operation_id, (version_id, _)) in target_rows {
+        gaps.push(GateRevalidationEntry {
+            operation_id: Some(operation_id),
+            version_id: Some(version_id),
+            use_key: None,
+            status: GateRevalidationStatus::Unknown(
+                "target admission has no Home operation in this or a later epoch".into(),
+            ),
+        });
+    }
+    let mut later_legacy_use_keys = Vec::new();
+    for pin in pins.into_iter().filter(|pin| pin.operation_id.is_none()) {
+        if pin.bound_epoch <= seal.epoch {
+            gaps.push(GateRevalidationEntry {
+                operation_id: None,
+                version_id: Some(pin.version_id),
+                use_key: Some(pin.use_key),
+                status: GateRevalidationStatus::Unknown(
+                    "sealed item is pinned to a legacy version without an exact Home operation"
+                        .into(),
+                ),
+            });
+        } else {
+            later_legacy_use_keys.push(pin.use_key);
+        }
+    }
+    Ok(SealedProjectGateRevalidation {
+        target_store: target,
+        seal_epoch: seal.epoch,
+        seal_roster_digest: seal.roster_digest.clone(),
+        selected,
+        later_operation_ids,
+        later_legacy_use_keys,
+        gaps,
         home_wide_complete: false,
     })
 }
@@ -664,6 +858,35 @@ impl crate::Workbench {
         let journal = self.project_gate_journal(&state_root, project_id, &home_id)?;
         revalidate_gate_home(
             &journal,
+            &home_id,
+            project_id,
+            current.as_ref().map_err(Clone::clone),
+            &state,
+        )
+    }
+
+    /// Revalidate only the gate operations in a durable Home epoch seal.
+    /// The seal is read back from the registered project's own journal; the
+    /// caller cannot supply an invented selection. Later registrations remain
+    /// visible as next-epoch obligations without starving this sealed read.
+    /// This report alone cannot authorize trunk while REFCOV-1 remains open.
+    pub fn revalidate_sealed_project_gate(
+        &mut self,
+        project_id: &str,
+        epoch: i64,
+    ) -> io::Result<SealedProjectGateRevalidation> {
+        let current = project_gate(&self.targets_dir(), project_id).map_err(|e| e.to_string());
+        let state_root = self.root_path();
+        let home_id = self.home_id().as_str().to_owned();
+        let state = gate_state_dir(&state_root, project_id);
+        let journal = self.project_gate_journal(&state_root, project_id, &home_id)?;
+        let seal = journal
+            .sealed_reference_epoch(epoch)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "reference seal is missing"))?;
+        revalidate_sealed_gate_home(
+            &journal,
+            &seal,
             &home_id,
             project_id,
             current.as_ref().map_err(Clone::clone),
@@ -1084,7 +1307,10 @@ mod tests {
                 )
             },
         );
-        assert!(matches!(result, Err(GateRunError::AwaitingReview)));
+        assert!(
+            matches!(result, Err(GateRunError::AwaitingReview)),
+            "{result:?}"
+        );
         let pin = store
             .borrow()
             .reference_use_pin(home, &target, item)
@@ -1165,6 +1391,155 @@ mod tests {
             .unwrap()
             .unwrap();
         pin.operation_id.unwrap()
+    }
+
+    fn admit_through_project_home(
+        journal: &RefCell<GateHomeJournal<'_>>,
+        dir: &Path,
+        targets: &Path,
+        home: &str,
+        project: &str,
+        item: &str,
+    ) -> String {
+        let program = project_gate(targets, project).unwrap();
+        let state = gate_state_dir(dir, project);
+        let arrival = arrival_root(dir, project, item);
+        std::fs::create_dir_all(&arrival).unwrap();
+        std::fs::write(arrival.join("item.json"), br#"{"text":"review me"}"#).unwrap();
+        let target = gate_target_store(project);
+        let result = run_gate_with_home_admission(
+            &program,
+            &unusable_coercion_config(),
+            item,
+            &arrival,
+            &state,
+            &NoProvider,
+            |basis| {
+                let digest = registration_basis_digest(home, project, &basis);
+                Ok(journal
+                    .borrow_mut()
+                    .register_checked_program_request(
+                        home,
+                        &target,
+                        basis.target_store_incarnation,
+                        &format!("gate-item:{project}:{item}"),
+                        &digest,
+                    )
+                    .unwrap()
+                    .operation_id)
+            },
+            |selected| {
+                home_gate_use(
+                    &mut journal.borrow_mut(),
+                    home,
+                    project,
+                    item,
+                    &program,
+                    targets,
+                    &state,
+                    selected,
+                )
+            },
+        );
+        assert!(
+            matches!(result, Err(GateRunError::AwaitingReview)),
+            "{result:?}"
+        );
+        journal
+            .borrow()
+            .reference_use_pin(home, &target, item)
+            .unwrap()
+            .unwrap()
+            .operation_id
+            .unwrap()
+    }
+
+    #[test]
+    fn sealed_project_gate_selects_only_completed_operations_through_its_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = dir.path().join("targets");
+        let project = "project-one";
+        let home = "home-one";
+        let repo = targets
+            .join(crate::library_state::managed_project_target_id(project))
+            .join("repo");
+        crate::gate::install(&repo, crate::gate::GateKind::ReviewByHand).unwrap();
+        let mut product = Store::open_in_memory().unwrap();
+        let project_journal = product
+            .initialize_home_journal(dir.path(), project, home)
+            .unwrap();
+        let journal = RefCell::new(GateHomeJournal::Project {
+            journal: Box::new(project_journal),
+            product: &mut product,
+        });
+        let selected =
+            admit_through_project_home(&journal, dir.path(), &targets, home, project, "selected");
+        let pending = journal
+            .borrow_mut()
+            .register_checked_program_request(
+                home,
+                &gate_target_store(project),
+                &"0".repeat(32),
+                "gate-item:project-one:pending",
+                "pending-basis",
+            )
+            .unwrap()
+            .operation_id;
+        let seal = match &mut *journal.borrow_mut() {
+            GateHomeJournal::Project { journal, .. } => journal
+                .seal_reference_epoch(home, "registry:1", "policy:1", "tree:1")
+                .unwrap(),
+            GateHomeJournal::LegacyPrototype(_) => unreachable!(),
+        };
+        assert_eq!(seal.operations.len(), 1);
+        assert_eq!(seal.operations[0].operation_id, selected);
+        let later =
+            admit_through_project_home(&journal, dir.path(), &targets, home, project, "later");
+        let verified = journal
+            .borrow()
+            .sealed_reference_epoch(seal.epoch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified, seal);
+        let state = gate_state_dir(dir.path(), project);
+        let current = project_gate(&targets, project).unwrap();
+        let report = revalidate_sealed_gate_home(
+            &journal.borrow(),
+            &verified,
+            home,
+            project,
+            Ok(&current),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(report.selected.len(), 1, "{report:?}");
+        assert_eq!(
+            report.selected[0].operation_id.as_deref(),
+            Some(selected.as_str())
+        );
+        assert_eq!(report.selected[0].status, GateRevalidationStatus::Current);
+        let mut outside = vec![later, pending];
+        outside.sort();
+        assert_eq!(report.later_operation_ids, outside);
+        assert!(report.selected_gate_current(), "{report:?}");
+        assert!(!report.home_wide_complete);
+
+        std::fs::remove_file(state.join("runtime.sqlite")).unwrap();
+        let missing = revalidate_sealed_gate_home(
+            &journal.borrow(),
+            &verified,
+            home,
+            project,
+            Ok(&current),
+            &state,
+        )
+        .unwrap();
+        assert!(!missing.selected_gate_current(), "{missing:?}");
+        assert!(matches!(
+            missing.selected[0].status,
+            GateRevalidationStatus::Unknown(_)
+        ));
+        assert!(!state.join("runtime.sqlite").exists(), "read-only");
     }
 
     fn revalidate(

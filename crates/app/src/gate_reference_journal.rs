@@ -5,7 +5,7 @@
 
 use gaugedesk_store::home_reference_journal::{
     HomeReferenceJournal, JournalError, ReferenceCompletion, ReferenceEvidence, ReferenceOperation,
-    ReferenceUseEvidence, ReferenceUsePin, RevalidatedReferenceEvidence,
+    ReferenceSeal, ReferenceUseEvidence, ReferenceUsePin, RevalidatedReferenceEvidence,
 };
 use gaugedesk_store::Store;
 
@@ -18,6 +18,20 @@ pub(super) enum GateHomeJournal<'a> {
 }
 
 impl GateHomeJournal<'_> {
+    /// Only the registered project's dedicated Home journal can supply a
+    /// sealed cut for gate revalidation. Prototype rows have no such authority.
+    pub fn sealed_reference_epoch(
+        &self,
+        epoch: i64,
+    ) -> Result<Option<ReferenceSeal>, JournalError> {
+        match self {
+            Self::Project { journal, .. } => journal.sealed_reference_epoch(epoch),
+            Self::LegacyPrototype(_) => Err(JournalError::Conflict(
+                "prototype reference journal cannot certify a sealed Home cut",
+            )),
+        }
+    }
+
     pub fn register_checked_program_request(
         &mut self,
         home_id: &str,

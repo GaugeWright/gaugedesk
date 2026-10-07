@@ -18,6 +18,17 @@ type AccountLifecycleState = {
     invitations: Array<{ tenant_id: string; display_name: string; role: string }>;
 };
 const accounts = new Map<string, AccountLifecycleState>();
+// The commercial product ledger as an authority holds it, so a browser reload
+// rereads it rather than browser signals (WS-493). Retire and restore apply
+// at once and delete waits for a reviewed acceptance, as the Cloud's command
+// policies say; a product an engagement references is never deleted.
+type CommercialProductLedger = {
+    revision: number;
+    product_a_status: "active" | "retired";
+    created: { id: string; status: "active" | "retired"; [field: string]: unknown } | null;
+    pending_delete: { id: string; product_id: string; expected_basis: string } | null;
+};
+const commercialProducts = new Map<string, CommercialProductLedger>();
 const projectHostSettings = new Map<string, Record<string, string>>();
 const appearancePreferences = new Map<string, Record<string, unknown>>();
 const initialAccount = (key: string): AccountLifecycleState => ({
@@ -111,6 +122,84 @@ const persistentAgent = {
                     }
                     current[body.key] = body.value;
                     projectHostSettings.set(key, current);
+                    response.end(JSON.stringify(current));
+                });
+                return;
+            }
+            if (url.pathname === "/__fixture/commercial-products") {
+                const key = url.searchParams.get("key")?.trim() ?? "";
+                if (!key || key.length > 128) {
+                    response.statusCode = 400;
+                    response.end(JSON.stringify({ error: "invalid fixture commercial key" }));
+                    return;
+                }
+                const current = commercialProducts.get(key) ?? { revision: 1, product_a_status: "active", created: null, pending_delete: null };
+                commercialProducts.set(key, current);
+                response.setHeader("content-type", "application/json");
+                if (request.method === "GET") {
+                    response.end(JSON.stringify(current));
+                    return;
+                }
+                if (request.method !== "POST") {
+                    response.statusCode = 405;
+                    response.end(JSON.stringify({ error: "unsupported fixture method" }));
+                    return;
+                }
+                void readBody(request).then((raw) => {
+                    const body = raw as { operation?: string; payload?: Record<string, unknown> } | null;
+                    const payload = body?.payload ?? {};
+                    const refuse = (status: number, error: string) => {
+                        response.statusCode = status;
+                        response.end(JSON.stringify({ error }));
+                    };
+                    const known = (id: unknown) => id === "product-a" || (current.created !== null && id === current.created.id);
+                    switch (body?.operation) {
+                        case "commercial-product.create": {
+                            const product = payload.product as CommercialProductLedger["created"];
+                            if (!product || typeof product.id !== "string" || known(product.id)) return refuse(409, "product already exists");
+                            current.created = product;
+                            current.revision += 1;
+                            break;
+                        }
+                        case "commercial-product.retire":
+                        case "commercial-product.restore": {
+                            if (!known(payload.id)) return refuse(404, "no such product");
+                            const status = body.operation.endsWith("retire") ? "retired" : "active";
+                            if (payload.id === "product-a") current.product_a_status = status;
+                            else current.created = { ...current.created!, status };
+                            current.revision += 1;
+                            break;
+                        }
+                        case "commercial-product.delete": {
+                            if (!known(payload.id)) return refuse(404, "no such product");
+                            // The seeded product carries the draft engagement.
+                            if (payload.id === "product-a") return refuse(409, "an engagement references this product");
+                            if (current.pending_delete) return refuse(409, "a deletion is already pending review");
+                            current.pending_delete = {
+                                id: `proposal-delete-${String(payload.id)}-${current.revision}`,
+                                product_id: String(payload.id),
+                                expected_basis: String(payload.expected_basis ?? ""),
+                            };
+                            break;
+                        }
+                        case "fixture.review": {
+                            const pending = current.pending_delete;
+                            if (!pending || pending.id !== payload.proposal_id) return refuse(409, "proposal is no longer pending");
+                            // Discarding applies nothing, so only an acceptance must
+                            // still match the basis the deletion was prepared on.
+                            if (payload.decision === "accept" && pending.expected_basis !== String(payload.basis ?? "")) {
+                                return refuse(409, "the product changed after this deletion was prepared");
+                            }
+                            current.pending_delete = null;
+                            if (payload.decision === "accept") {
+                                if (current.created?.id === pending.product_id) current.created = null;
+                                current.revision += 1;
+                            }
+                            break;
+                        }
+                        default:
+                            return refuse(422, "unsupported commercial product operation");
+                    }
                     response.end(JSON.stringify(current));
                 });
                 return;

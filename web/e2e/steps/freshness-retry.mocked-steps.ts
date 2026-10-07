@@ -14,7 +14,7 @@ const { When, Then } = createBdd();
 // Fail every per-chat projection the desktop freshness signal folds. Aborting
 // only some lets a successful load race the shared signal back to `fresh`.
 const FAILING_PROJECTIONS =
-    /\/(chats\/[^/]+\/diff|scopes\/[^/]+\/run|projections\/[^/]+\/merge)(\?|$)/;
+    /\/(chats\/[^/]+\/diff|projections\/[^/]+\/(run|merge))(\?|$)/;
 
 When("the projection refresh starts failing", async ({ page }) => {
     await page.route(FAILING_PROJECTIONS, (route) => route.abort());

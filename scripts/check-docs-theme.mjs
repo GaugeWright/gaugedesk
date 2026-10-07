@@ -27,7 +27,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 
-const SOURCE_DIGEST = "00b6cf5cff5c49e450dfb546ad331f1f0cdf62db904763318ca096f16f34849f";
+const SOURCE_DIGEST = "a21a636a2de2c41b08ae26f6711fb989f87e94164367d3ef5cbc9d38fa61cce7";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -48,7 +48,7 @@ function read(rel) {
 // render time. Written by the projector directly beneath this comment.
 const MANIFEST = {
   "stylesheet": "docs/assets/brand.css",
-  "block": "e558c5d309512c298896a8fcbff903eace0da38ee43f532f4b81b1b8ff10e41d",
+  "block": "2c426added74cfe2e79d4e44b8bcb78aeb3775521355b31cdb62c932102e0466",
   "files": {
     "overrides/partials/logo.html": "4f71dfbe0ac492daf371802423b0ba243bf9902c1d39a480c13abeec7fb5716e",
     "docs/assets/fonts/commit-mono-v1.143.woff2": "f342ca6c3f2597e6c0fcd84b3f3ed64d3ce5bdb6d0af19d190d645a558b1cf29",
@@ -56,15 +56,8 @@ const MANIFEST = {
     "docs/assets/fonts/gaugewright-chrome-latin-ext-regular.woff2": "b80c81d54a9c808a1b377bc0b2f7296a26acae16cb3b8c999c2c9be3c4ee5b2b",
     "docs/assets/fonts/gaugewright-chrome-latin-italic.woff2": "9217d5af7ec046eb8d99f8151c0956818efe76af3952bedc4defd2ca13a96d94",
     "docs/assets/fonts/gaugewright-chrome-latin-regular.woff2": "4503e1a1ce654910e0e8c7e5c65660224c1eb513fbd99294f316f56ecb425333",
-    "docs/assets/fonts/ibm-plex-serif-latin-400-italic.woff2": "d3f861b1ca55e50ca94de4c1756cb0d67c73de615172adf6b5b2078d939c723a",
-    "docs/assets/fonts/ibm-plex-serif-latin-400.woff2": "cb2c5eee2c0a43ff30d2365407c7bc8b20e3bd90720a4a64102ba0b328022a02",
-    "docs/assets/fonts/ibm-plex-serif-latin-700.woff2": "886ea167faf6610c3448a7dd058dbe7c7438f710229c9ff52343ef006960939c",
-    "docs/assets/fonts/ibm-plex-serif-latin-ext-400-italic.woff2": "68091cb647810f7ac24fb72fe7ac506ffc4769ef51435a87969345249fc7f035",
-    "docs/assets/fonts/ibm-plex-serif-latin-ext-400.woff2": "8b4077bd28d36819590924090252e811d4d0b2c78cb4bf1e4abe46d7428a2781",
-    "docs/assets/fonts/ibm-plex-serif-latin-ext-700.woff2": "4c47e5be83b18b0851ffb58d6ec94ef439bd52a190b66ea479cfb19298720f68",
     "docs/assets/fonts/OFL-CommitMono.txt": "005e08f22d472be5139dcaf876dbed7ce8f17a501cd180c3259ad2aaf27237fe",
     "docs/assets/fonts/OFL-GaugeWrightChrome.txt": "9c9ee5ec82bbcd11d95c8732c9924f0fd58743e4c14dfdebd8a898323f6a0be7",
-    "docs/assets/fonts/OFL-IBMPlexSerif.txt": "7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da",
     "docs/assets/mark-clear-64.png": "7fcd1d156b29b9ad25b14bd44d5f8c0b4d35774bffd3594b6ac9308b8caa8fa4"
   }
 };

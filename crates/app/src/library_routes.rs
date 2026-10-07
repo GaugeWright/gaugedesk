@@ -172,38 +172,18 @@ pub fn scope_workspace_value(
                 })
         });
     }
-    // Owner/admin can administer every project, but the everyday Projects
-    // facet shows only the Tutorials instance belonging to this learner.
-    let own_product_project = |id: &str| {
-        wb.library.projects.get(id).is_some_and(|project| {
-            !crate::shipped_tutorials::is_tutorial_project(project)
-                || project
-                    .extra
-                    .get("product")
-                    .and_then(|v| v.get("learner"))
-                    .and_then(|v| v.as_str())
-                    == actor
-        })
-    };
     if let Some(projects) = value.get_mut("projects").and_then(|p| p.as_array_mut()) {
         projects.retain(|p| {
             p.get("id")
                 .and_then(|i| i.as_str())
-                .is_some_and(&own_product_project)
+                .is_some_and(|id| own_product_project(wb, id, actor))
         });
     }
     if let Some(recent) = value.get_mut("recent").and_then(|r| r.as_array_mut()) {
         recent.retain(|chat| {
-            if chat["id"]
+            chat["id"]
                 .as_str()
-                .is_some_and(|id| wb.authoring_chat_visible(id, actor) == Some(false))
-            {
-                return false;
-            }
-            chat.get("id")
-                .and_then(|i| i.as_str())
-                .and_then(|id| wb.library.project_of_chat(id))
-                .is_none_or(&own_product_project)
+                .is_some_and(|id| recent_row_visible(wb, id, vis, actor))
         });
     }
     if matches!(vis, ProjectVisibility::All) {
@@ -252,18 +232,44 @@ pub fn scope_workspace_value(
                 .is_none_or(|id| vis.allows(id))
         });
     }
-    if let Some(recent) = value.get_mut("recent").and_then(|r| r.as_array_mut()) {
-        recent.retain(|c| {
-            c.get("id")
-                .and_then(|i| i.as_str())
-                .map(|id| {
-                    wb.authoring_chat_visible(id, actor)
-                        .unwrap_or_else(|| wb.chat_visible(id, vis))
-                })
-                .unwrap_or(false)
-        });
-    }
     value
+}
+
+/// Owner/admin can administer every project, but the everyday Projects facet
+/// shows only the Tutorials instance belonging to this learner.
+pub(crate) fn own_product_project(wb: &Workbench, id: &str, actor: Option<&str>) -> bool {
+    wb.library.projects.get(id).is_some_and(|project| {
+        !crate::shipped_tutorials::is_tutorial_project(project)
+            || project
+                .extra
+                .get("product")
+                .and_then(|v| v.get("learner"))
+                .and_then(|v| v.as_str())
+                == actor
+    })
+}
+
+/// Whether the caller sees `chat_id` as a Recent row (ENTSEC-2). The scoped
+/// whole workspace and a Recent page both ask this, so the two lists agree.
+pub(crate) fn recent_row_visible(
+    wb: &Workbench,
+    chat_id: &str,
+    vis: &crate::workbench_auth::ProjectVisibility,
+    actor: Option<&str>,
+) -> bool {
+    let authoring = wb.authoring_chat_visible(chat_id, actor);
+    if authoring == Some(false) {
+        return false;
+    }
+    if !wb
+        .library
+        .project_of_chat(chat_id)
+        .is_none_or(|project| own_product_project(wb, project, actor))
+    {
+        return false;
+    }
+    matches!(vis, crate::workbench_auth::ProjectVisibility::All)
+        || authoring.unwrap_or_else(|| wb.chat_visible(chat_id, vis))
 }
 
 /// Build the workspace projection tree (archetypes → edit chats; projects →

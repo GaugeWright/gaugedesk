@@ -7,7 +7,9 @@ import { expect, test, type Page } from "@playwright/test";
 // with server blockers, exact confirmation, fresh passkey authorization,
 // exact retry coordinates, and terminal eviction; embedded payment
 // initialization and cleanup; and the ordered corporate sign-in test,
-// admission, owner-link, and enforcement lifecycle. Authority replies and
+// admission, owner-link, and enforcement lifecycle; and product retire,
+// restore, and reviewed deletion against a server-held ledger that each reload
+// rereads. Authority replies and
 // provider/Stripe ceremonies are isolated fixtures, but the browser-authenticator
 // act is not mocked. Visual states include focused nested editors, balanced
 // narrow-pane action groups, and visibly inactive disabled controls.
@@ -751,6 +753,109 @@ test("new products and proposals appear only after authoritative creation reread
         expect.objectContaining({ command: "commercial-product.create", payload: expect.objectContaining({ revision: expect.objectContaining({ listing_title: "Policy Desk" }) }) }),
         expect.objectContaining({ command: "commercial-engagement.proposal.create", payload: expect.objectContaining({ client_id: "client-a", product_id: expect.stringMatching(/^product-/) }) }),
     ]));
+});
+
+// The ledger is held by the fixture server, so each reload below rereads
+// authority rather than browser signals. Retire and restore apply at once;
+// deletion waits for a reviewed acceptance, is refused once the product has
+// moved under it, and is never offered for a product an engagement references.
+test("product retire, restore, and reviewed delete survive reload as server truth", async ({ page }, info) => {
+    const run = `commercial-products-${info.parallelIndex}-${Date.now()}`;
+    const ledgerUrl = `/__fixture/commercial-products?key=${encodeURIComponent(run)}`;
+    const ledger = async () => await page.evaluate(async (url) => (await fetch(url)).json(), ledgerUrl) as {
+        product_a_status: string; created: { id: string; status: string } | null; pending_delete: { product_id: string } | null;
+    };
+    const products = page.locator(".gaugeapp-catalog-card");
+    const created = products.filter({ hasText: "Archive Desk" });
+    const detail = page.locator(".gaugeapp-product-detail");
+    const pending = page.getByRole("region", { name: "Pending changes" });
+    const reload = async () => {
+        await page.reload();
+        await expect(page.getByRole("heading", { name: "Products", exact: true, level: 1 })).toBeVisible();
+    };
+    await page.goto(`/?app=commercial-operations&commercial-lifecycle=draft&commercial-products=1&run=${encodeURIComponent(run)}`);
+    await expect(page.getByRole("heading", { name: "Products", exact: true, level: 1 })).toBeVisible();
+
+    // The seeded product carries the draft engagement, so it can be retired
+    // but is never offered for deletion.
+    await products.filter({ hasText: "Research" }).getByRole("button", { name: "View", exact: true }).click();
+    await expect(detail).toContainText("cannot be deleted");
+    await expect(detail.getByRole("button", { name: "Delete product", exact: true })).toHaveCount(0);
+
+    await page.getByRole("button", { name: "New product", exact: true }).click();
+    const productEditor = page.locator(".gaugeapp-editor");
+    await productEditor.getByLabel("Listing title", { exact: true }).fill("Archive Desk");
+    await productEditor.getByLabel("Description", { exact: true }).fill("Records review for an admitted team.");
+    await productEditor.getByLabel("Amount", { exact: true }).fill("90");
+    await productEditor.getByRole("button", { name: "Create product", exact: true }).click();
+    await expect(created).toBeVisible();
+    await reload();
+    await expect(created).toBeVisible();
+    const productId = (await ledger()).created?.id;
+    expect(productId).toMatch(/^product-/);
+
+    await created.getByRole("button", { name: "View", exact: true }).click();
+    await detail.getByRole("button", { name: "Retire", exact: true }).click();
+    await expect(created).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Retired (1)", exact: true })).toBeVisible();
+    expect((await ledger()).created?.status).toBe("retired");
+    await reload();
+    await expect(created).toHaveCount(0);
+    await page.getByRole("button", { name: "Retired (1)", exact: true }).click();
+    await created.getByRole("button", { name: "View", exact: true }).click();
+    await expect(detail).toContainText("Retired");
+    await detail.getByRole("button", { name: "Restore", exact: true }).click();
+    await expect(detail.getByRole("button", { name: "Retire", exact: true })).toBeVisible();
+    await reload();
+    await expect(created).toBeVisible();
+    expect((await ledger()).created?.status).toBe("active");
+
+    // Deleting only proposes. The product stays, across a reload, until the
+    // proposal is reviewed, and a discard leaves it exactly where it was.
+    await created.getByRole("button", { name: "View", exact: true }).click();
+    await detail.getByRole("button", { name: "Delete product", exact: true }).click();
+    await expect(pending.getByRole("article", { name: "Delete product" })).toContainText("cannot be undone");
+    await expect(created).toBeVisible();
+    await reload();
+    await expect(created).toBeVisible();
+    await expect(pending.getByRole("article", { name: "Delete product" })).toBeVisible();
+    expect((await ledger()).pending_delete?.product_id).toBe(productId);
+    await pending.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(pending).toHaveCount(0);
+    await reload();
+    await expect(created).toBeVisible();
+    expect(await ledger()).toMatchObject({ created: { id: productId, status: "active" }, pending_delete: null });
+
+    // A deletion prepared before the product moved is not accepted blindly.
+    await created.getByRole("button", { name: "View", exact: true }).click();
+    await detail.getByRole("button", { name: "Delete product", exact: true }).click();
+    await expect(pending.getByRole("article", { name: "Delete product" })).toBeVisible();
+    await detail.getByRole("button", { name: "Retire", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Retired (1)", exact: true })).toBeVisible();
+    await expect(pending.getByRole("button", { name: "Accept", exact: true })).toBeDisabled();
+    await pending.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(pending).toHaveCount(0);
+    expect(await ledger()).toMatchObject({ created: { id: productId, status: "retired" }, pending_delete: null });
+
+    // A retired, unreferenced product is deleted only by an accepted review.
+    await reload();
+    await page.getByRole("button", { name: "Retired (1)", exact: true }).click();
+    await created.getByRole("button", { name: "View", exact: true }).click();
+    await detail.getByRole("button", { name: "Delete product", exact: true }).click();
+    await pending.getByRole("button", { name: "Accept", exact: true }).click();
+    await expect(pending).toHaveCount(0);
+    await expect(created).toHaveCount(0);
+    // The page's call record starts again at each reload, so this is the
+    // accepted deletion alone: one proposal, then its reviewed acceptance.
+    expect(await calls(page)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ command: "commercial-product.delete", scope: "A", payload: { id: productId } }),
+        expect.objectContaining({ review: "A", proposal: expect.stringContaining(`proposal-delete-${productId}-`), decision: "accept" }),
+    ]));
+    await reload();
+    await expect(created).toHaveCount(0);
+    await expect(page.getByRole("button", { name: /^Retired \(/ })).toHaveCount(0);
+    await expect(products.filter({ hasText: "Research" })).toBeVisible();
+    expect(await ledger()).toMatchObject({ product_a_status: "active", created: null, pending_delete: null });
 });
 
 test("proposal discard, revision, resend, and withdrawal follow backend lifecycle semantics", async ({ page }, info) => {

@@ -105,6 +105,8 @@ pub(crate) fn scoped_member_may_reach(method: &axum::http::Method, path: &str) -
             && (exact(&[
                 "/workspace",
                 "/workspace/events",
+                "/workspace/outline",
+                "/workspace/chats",
                 "/chats",
                 "/fork-tree",
                 "/search",

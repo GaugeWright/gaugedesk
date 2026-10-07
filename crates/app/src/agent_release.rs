@@ -538,6 +538,12 @@ pub struct DrainCollectionsRequest {
     /// Only artifacts deposited after this instant are returned.
     #[serde(default)]
     pub after_unix_ms: Option<u64>,
+    /// Resume after a previous page: the `next_after` the edge returned.
+    /// Exclusive with `after_unix_ms`. Unlike an instant, it is a position, so
+    /// a page that ended among artifacts deposited in one millisecond resumes
+    /// at the next of them rather than past all of them.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// Drain a deployment's collections all the way into a project's quarantine in
@@ -555,7 +561,16 @@ pub struct CollectIntoProjectRequest {
     pub binding_id: String,
     #[serde(default)]
     pub after_unix_ms: Option<u64>,
+    /// Resume a drain that stopped at its page bound: the outcome's
+    /// `next_after`. Exclusive with `after_unix_ms`.
+    #[serde(default)]
+    pub after: Option<String>,
 }
+
+/// Most pages one [`collect_into_project`] reads before it stops and hands
+/// back where it stopped. Bounded so one call cannot run unbounded against a
+/// deployment that keeps receiving; fifty artifacts a page.
+const MAX_DRAIN_PAGES: usize = 40;
 
 /// One artifact the drain could not accept, and why. Refusals are reported, not
 /// swallowed, and are never acknowledged — the hosted copy stays until someone
@@ -589,6 +604,9 @@ pub struct CollectIntoProjectOutcome {
     pub retained: u64,
     /// The attention count after this drain: items awaiting the gate.
     pub pending_attention: usize,
+    /// Set when the drain stopped at its page bound with more waiting: pass it
+    /// back as `after` to continue. `None` when the edge had nothing further.
+    pub next_after: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2438,10 +2456,14 @@ fn drain_collections_with(
 ) -> io::Result<serde_json::Value> {
     validate_deployment_id(&request.deployment_id)?;
     let edge = normalized_edge(&request.edge_origin)?;
-    let query = request
-        .after_unix_ms
-        .map(|after| format!("?after={after}"))
-        .unwrap_or_default();
+    let query = match (&request.after, request.after_unix_ms) {
+        (Some(_), Some(_)) => {
+            return Err(invalid("give `after` or `after_unix_ms`, not both"));
+        }
+        (Some(after), None) => format!("?after={}", drain_cursor(after)?),
+        (None, Some(after)) => format!("?after={after}"),
+        (None, None) => String::new(),
+    };
     let response = send_publisher_request_with(
         credential,
         &edge,
@@ -2454,6 +2476,25 @@ fn drain_collections_with(
         "application/json",
     )?;
     serde_json::from_str(&response).map_err(invalid)
+}
+
+/// A drain cursor as the edge issues it, `<ms>:<session id>`, checked before it
+/// goes into a signed query. It is sent verbatim — the publisher signature
+/// covers the query as written — so anything that would need escaping is
+/// refused rather than encoded into a form the edge might read differently.
+fn drain_cursor(cursor: &str) -> io::Result<&str> {
+    let (instant, session) = cursor.split_once(':').unwrap_or((cursor, ""));
+    let instant_ok = !instant.is_empty()
+        && instant.len() <= 16
+        && instant.bytes().all(|byte| byte.is_ascii_digit());
+    let session_ok = session
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.~:".contains(&byte));
+    if instant_ok && session_ok && !(cursor.contains(':') && session.is_empty()) {
+        Ok(cursor)
+    } else {
+        Err(invalid("drain cursor is malformed"))
+    }
 }
 
 fn acknowledge_collections_with(
@@ -2554,138 +2595,178 @@ pub fn collect_into_project(
     };
 
     // Phase two: the network round trip and the crypto, holding nothing.
-    let drained = drain_collections_with(
-        &credential,
-        &DrainCollectionsRequest {
-            deployment_id: binding.hosted_deployment_id.clone(),
-            edge_origin: binding.edge_origin.clone(),
-            after_unix_ms: request.after_unix_ms,
-        },
-    )?;
-    let waiting = drained
-        .get("waiting")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let artifacts = drained
-        .get("artifacts")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
+    //
+    // A page at a time, following the edge's `next_after`, acknowledging each
+    // page before the next is read. The cursor is a position, so what a page
+    // acknowledged and what it refused (which keeps its hosted copy) are both
+    // behind it: a run of refusals no longer pins every later drain to the same
+    // first page, and a deployment with more waiting than one page holds is
+    // drained in one call. An edge that sends no `next_after` ends it after one.
+    let mut cursor = match (&request.after, request.after_unix_ms) {
+        (Some(_), Some(_)) => {
+            return Err(invalid("give `after` or `after_unix_ms`, not both"));
+        }
+        (Some(after), None) => Some(after.clone()),
+        (None, Some(after)) => Some(after.to_string()),
+        (None, None) => None,
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
         .as_millis() as u64;
 
+    let mut waiting = None;
     let mut landed = Vec::new();
     let mut already_held = Vec::new();
     let mut refused = Vec::new();
-    let mut acknowledge = Vec::new();
-
-    for entry in artifacts {
-        let session_id = entry
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let revision = entry
-            .get("revision")
-            .and_then(serde_json::Value::as_u64)
+    let mut acknowledged = 0_u64;
+    let mut retained = 0_u64;
+    let mut pages = 0_usize;
+    let next_after = loop {
+        let drained = drain_collections_with(
+            &credential,
+            &DrainCollectionsRequest {
+                deployment_id: binding.hosted_deployment_id.clone(),
+                edge_origin: binding.edge_origin.clone(),
+                after: cursor.clone(),
+                after_unix_ms: None,
+            },
+        )?;
+        pages += 1;
+        waiting.get_or_insert(
+            drained
+                .get("waiting")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+        );
+        let artifacts = drained
+            .get("artifacts")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
             .unwrap_or_default();
-        let mut refuse = |reason: String| {
-            refused.push(CollectionRefusal {
-                session_id: session_id.clone(),
-                revision,
-                reason,
-            });
-        };
+        let mut acknowledge = Vec::new();
 
-        let Some(sealed_value) = entry.get("sealed").filter(|value| !value.is_null()) else {
-            // The index entry outlived its object. Say so; do not acknowledge
-            // a payload we never received.
-            refuse("the deposit store returned no sealed payload".to_owned());
-            continue;
-        };
-        let sealed: crate::collection_recipient::SealedCollection =
-            match serde_json::from_value(sealed_value.clone()) {
-                Ok(sealed) => sealed,
+        for entry in artifacts {
+            let session_id = entry
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let revision = entry
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let mut refuse = |reason: String| {
+                refused.push(CollectionRefusal {
+                    session_id: session_id.clone(),
+                    revision,
+                    reason,
+                });
+            };
+
+            let Some(sealed_value) = entry.get("sealed").filter(|value| !value.is_null()) else {
+                // The index entry outlived its object. Say so; do not acknowledge
+                // a payload we never received.
+                refuse("the deposit store returned no sealed payload".to_owned());
+                continue;
+            };
+            let sealed: crate::collection_recipient::SealedCollection =
+                match serde_json::from_value(sealed_value.clone()) {
+                    Ok(sealed) => sealed,
+                    Err(error) => {
+                        refuse(format!("sealed artifact is not well formed: {error}"));
+                        continue;
+                    }
+                };
+            let ingested = match crate::collection_recipient::ingest_sealed_collection(
+                &sealed,
+                &seed,
+                &binding.hosted_deployment_id,
+                &schema_ref,
+            ) {
+                Ok(ingested) => ingested,
                 Err(error) => {
-                    refuse(format!("sealed artifact is not well formed: {error}"));
+                    refuse(error.to_string());
                     continue;
                 }
             };
-        let ingested = match crate::collection_recipient::ingest_sealed_collection(
-            &sealed,
-            &seed,
-            &binding.hosted_deployment_id,
-            &schema_ref,
-        ) {
-            Ok(ingested) => ingested,
-            Err(error) => {
-                refuse(error.to_string());
+
+            let artifact_id = crate::quarantine::item_id(&ingested.session_id, ingested.revision);
+            // Custody before disposition: an index entry pointing at bytes we do
+            // not hold is worse than no entry at all.
+            if let Err(error) = payloads.put(&binding.project_id, &artifact_id, &ingested.plaintext)
+            {
+                refuse(format!("collected plaintext could not be held: {error}"));
                 continue;
             }
-        };
-
-        let artifact_id = crate::quarantine::item_id(&ingested.session_id, ingested.revision);
-        // Custody before disposition: an index entry pointing at bytes we do
-        // not hold is worse than no entry at all.
-        if let Err(error) = payloads.put(&binding.project_id, &artifact_id, &ingested.plaintext) {
-            refuse(format!("collected plaintext could not be held: {error}"));
-            continue;
-        }
-        let item = crate::quarantine::QuarantinedItem {
-            item_id: artifact_id.clone(),
-            source: format!("collection:{}", binding.hosted_deployment_id),
-            deployment_binding_id: Some(binding.id.clone()),
-            deployment_id: Some(binding.hosted_deployment_id.clone()),
-            public_session_id: Some(ingested.session_id.clone()),
-            source_id: ingested.session_id.clone(),
-            release_id: ingested.release_id.clone(),
-            revision: ingested.revision,
-            schema_ref: sealed.envelope.schema_ref.clone(),
-            byte_len: ingested.plaintext.len() as u64,
-            produced_at_unix_ms: entry
-                .get("deposited_at_unix_ms")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(sealed.envelope.produced_at_unix_ms),
-            arrived_at_unix_ms: now,
-            status: crate::quarantine::ItemStatus::Pending,
-        };
-        match crate::quarantine::record(&mut store, &binding.project_id, &item) {
-            Ok(true) => landed.push(artifact_id),
-            Ok(false) => already_held.push(artifact_id),
-            Err(error) => {
-                refuse(format!(
-                    "collected artifact could not be recorded: {error:?}"
-                ));
-                continue;
+            let item = crate::quarantine::QuarantinedItem {
+                item_id: artifact_id.clone(),
+                source: format!("collection:{}", binding.hosted_deployment_id),
+                deployment_binding_id: Some(binding.id.clone()),
+                deployment_id: Some(binding.hosted_deployment_id.clone()),
+                public_session_id: Some(ingested.session_id.clone()),
+                source_id: ingested.session_id.clone(),
+                release_id: ingested.release_id.clone(),
+                revision: ingested.revision,
+                schema_ref: sealed.envelope.schema_ref.clone(),
+                byte_len: ingested.plaintext.len() as u64,
+                produced_at_unix_ms: entry
+                    .get("deposited_at_unix_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(sealed.envelope.produced_at_unix_ms),
+                arrived_at_unix_ms: now,
+                status: crate::quarantine::ItemStatus::Pending,
+            };
+            match crate::quarantine::record(&mut store, &binding.project_id, &item) {
+                Ok(true) => landed.push(artifact_id),
+                Ok(false) => already_held.push(artifact_id),
+                Err(error) => {
+                    refuse(format!(
+                        "collected artifact could not be recorded: {error:?}"
+                    ));
+                    continue;
+                }
             }
+            acknowledge.push(ingested.session_id);
         }
-        acknowledge.push(ingested.session_id);
-    }
 
-    // Only what is durably held here. A refusal keeps its hosted copy.
-    let released = if acknowledge.is_empty() {
-        serde_json::json!({ "acknowledged": 0, "retained": 0 })
-    } else {
-        acknowledge_collections_with(
-            &credential,
-            &AcknowledgeCollectionsRequest {
-                deployment_id: binding.hosted_deployment_id.clone(),
-                edge_origin: binding.edge_origin.clone(),
-                acknowledge,
-            },
-        )?
+        // Only what is durably held here. A refusal keeps its hosted copy.
+        let released = if acknowledge.is_empty() {
+            serde_json::json!({ "acknowledged": 0, "retained": 0 })
+        } else {
+            acknowledge_collections_with(
+                &credential,
+                &AcknowledgeCollectionsRequest {
+                    deployment_id: binding.hosted_deployment_id.clone(),
+                    edge_origin: binding.edge_origin.clone(),
+                    acknowledge,
+                },
+            )?
+        };
+        acknowledged += released
+            .get("acknowledged")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        retained += released
+            .get("retained")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+
+        let next = drained
+            .get("next_after")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        match next {
+            // A cursor that does not move would read the same page forever.
+            Some(next) if cursor.as_deref() != Some(next.as_str()) => {
+                if pages >= MAX_DRAIN_PAGES {
+                    break Some(next);
+                }
+                cursor = Some(next);
+            }
+            _ => break None,
+        }
     };
-    let acknowledged = released
-        .get("acknowledged")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let retained = released
-        .get("retained")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
 
     let pending_attention = crate::quarantine::pending_count(&store, &binding.project_id)
         .map_err(|error| io::Error::other(format!("{error:?}")))?;
@@ -2699,13 +2780,14 @@ pub fn collect_into_project(
     Ok(CollectIntoProjectOutcome {
         deployment_id: binding.hosted_deployment_id,
         project_id: binding.project_id,
-        waiting,
+        waiting: waiting.unwrap_or_default(),
         landed,
         already_held,
         refused,
         acknowledged,
         retained,
         pending_attention,
+        next_after,
     })
 }
 
@@ -2909,6 +2991,25 @@ fn not_found(message: &'static str) -> io::Error {
 mod publisher_tests {
     use super::*;
     use gaugedesk_core::signature::{verify_signature, Signature, SigningKey};
+
+    #[test]
+    fn a_drain_cursor_goes_into_the_signed_query_only_as_the_edge_issues_it() {
+        for good in ["1700000000000", "1700000000000:session-a_1.b~c"] {
+            assert_eq!(drain_cursor(good).unwrap(), good);
+        }
+        for bad in [
+            "",
+            "soon",
+            "1700000000000:",
+            ":session",
+            "17000000000000000:s",
+            "1700000000000:a b",
+            "1700000000000:a&after=0",
+            "1700000000000:a%3A",
+        ] {
+            assert!(drain_cursor(bad).is_err(), "accepted {bad:?}");
+        }
+    }
 
     #[test]
     fn authored_snapshot_binds_external_context_without_mutating_the_draft() {

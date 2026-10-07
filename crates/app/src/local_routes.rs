@@ -51,6 +51,14 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             get(crate::console_routes::get_review_count),
         )
         .route("/workspace", get(lr::get_workspace))
+        .route(
+            "/workspace/outline",
+            get(crate::workspace_pages::get_workspace_outline),
+        )
+        .route(
+            "/workspace/chats",
+            get(crate::workspace_pages::get_workspace_chats),
+        )
         .route("/workspace/events", get(er::workspace_events))
         .route("/tasks", get(lr::get_tasks))
         .route("/notices", get(lr::get_notices))

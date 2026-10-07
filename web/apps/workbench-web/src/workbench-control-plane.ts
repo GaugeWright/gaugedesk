@@ -1166,8 +1166,8 @@ export class WorkbenchControlPlane implements ControlPlane {
         return accountClient.resendHomeInvitation(transport.json, id);
     }
 
-    getRun(scope: ScopeId): Promise<RunState> {
-        return workbenchClient.getRun(this.workbenchTransport(), scope);
+    getRunCarriage(scope: ScopeId): Promise<ProjectionCarriage<RunState>> {
+        return workbenchClient.getRunCarriage(this.workbenchTransport(), scope);
     }
 
     listEngagements(): Promise<EngagementId[]> {

@@ -420,6 +420,7 @@ fn main() -> io::Result<()> {
                 CollectIntoProjectRequest {
                     binding_id,
                     after_unix_ms: None,
+                    after: None,
                 },
             )?;
             println!("{}", serde_json::to_string(&collected).map_err(invalid)?);
