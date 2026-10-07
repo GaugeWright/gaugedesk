@@ -1,0 +1,160 @@
+{
+  "producer": "TokenWright 01d13c7: tokenwright.audit.Trail and tokenwright.identity.sign_head under the Ed25519 key whose seed is 32 bytes of 0x07; 'rewritten' is a second trail of the same length, every head re-signed by the same key",
+  "audit_key": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "honest": {
+    "entries": [
+      {
+        "actor": "paired-home",
+        "at": "2026-08-30T12:01:00Z",
+        "base_revision": null,
+        "command_id": "tokenwright.engine.restart",
+        "hash": "8f2e4f8e916f3e97223af6b5e2b37a93debfaeda19e6abf37d587f3f448bd8d0",
+        "outcome": "applied",
+        "prev": "9d66d80271626791b4add0fc15e5c99ac6762909c13bcf4dfba8622fe95de5c9",
+        "receipt_id": "rcpt_0",
+        "seq": 1
+      },
+      {
+        "actor": "paired-home",
+        "at": "2026-08-30T12:02:00Z",
+        "base_revision": "rev-1",
+        "command_id": "tokenwright.engine.restart",
+        "hash": "fc52fe4debc7f4965894e996aebe2452da6273afca5cc9354746b622f5f8d9cc",
+        "outcome": "applied",
+        "prev": "8f2e4f8e916f3e97223af6b5e2b37a93debfaeda19e6abf37d587f3f448bd8d0",
+        "receipt_id": "rcpt_1",
+        "seq": 2
+      },
+      {
+        "actor": "opérateur \"ü\"\n",
+        "at": "2026-08-30T12:03:00Z",
+        "base_revision": "rev-2",
+        "command_id": "tokenwright.engine.restart",
+        "hash": "61139095b6972bf65674d14d9830487c360e0873eccc97b3683cb04f0d388706",
+        "outcome": "applied",
+        "prev": "fc52fe4debc7f4965894e996aebe2452da6273afca5cc9354746b622f5f8d9cc",
+        "receipt_id": "rcpt_2",
+        "seq": 3
+      },
+      {
+        "actor": "paired-home",
+        "at": "2026-08-30T12:04:00Z",
+        "base_revision": "rev-3",
+        "command_id": "tokenwright.engine.restart",
+        "hash": "8d5c5019ea4d391f4e55f0cba231fa2190f82c3eb51cfa327ec974496a06631c",
+        "outcome": "applied",
+        "prev": "61139095b6972bf65674d14d9830487c360e0873eccc97b3683cb04f0d388706",
+        "receipt_id": "rcpt_3",
+        "seq": 4
+      }
+    ],
+    "heads": [
+      {
+        "kind": "tokenwright.audit.head",
+        "count": 1,
+        "head": "8f2e4f8e916f3e97223af6b5e2b37a93debfaeda19e6abf37d587f3f448bd8d0",
+        "at": "2026-08-30T12:01:00Z",
+        "signature": "08c8a4b8ff8dea9d986c8e822bfea30814c118fae4d3bfb2caf5d83121f5e0de4fe04fb5249d683623b3ff43c1d4c9b57088689c9c86aabe2bdfe7c25476770b"
+      },
+      {
+        "kind": "tokenwright.audit.head",
+        "count": 2,
+        "head": "fc52fe4debc7f4965894e996aebe2452da6273afca5cc9354746b622f5f8d9cc",
+        "at": "2026-08-30T12:02:00Z",
+        "signature": "b88eccf99a47808c787d445a292b45849deeff497b55bdab427bbb75669f51c693402d2d9a1747843591a2729fe0ce24844d5a20699045f4b4e6792fde0f6d0e"
+      },
+      {
+        "kind": "tokenwright.audit.head",
+        "count": 3,
+        "head": "61139095b6972bf65674d14d9830487c360e0873eccc97b3683cb04f0d388706",
+        "at": "2026-08-30T12:03:00Z",
+        "signature": "7187e2feb7828c5dc11f5425c5614d7134ad1a31be3aeeea15af33dc9a25471009265c347b6a45ee7577bdee48933c47388c83c97b8d34b6376d6a496b6e1200"
+      },
+      {
+        "kind": "tokenwright.audit.head",
+        "count": 4,
+        "head": "8d5c5019ea4d391f4e55f0cba231fa2190f82c3eb51cfa327ec974496a06631c",
+        "at": "2026-08-30T12:04:00Z",
+        "signature": "e980aa966531f596ef14a39bb8c1bd1c4bedf40cbd7e7290c8bbc27edb8901300ffc9c46dfd6302ea6c6d49660c2a6457cf582dfa41ac364c389664fbe35ce04"
+      }
+    ]
+  },
+  "rewritten": {
+    "entries": [
+      {
+        "actor": "paired-home",
+        "at": "2026-08-30T13:05:00Z",
+        "base_revision": null,
+        "command_id": "tokenwright.engine.restart",
+        "hash": "31323081e95062d4ad303beb847d296a6c15284748173c225cc9afd8821f21ba",
+        "outcome": "applied",
+        "prev": "9d66d80271626791b4add0fc15e5c99ac6762909c13bcf4dfba8622fe95de5c9",
+        "receipt_id": "rcpt_0",
+        "seq": 1
+      },
+      {
+        "actor": "intruder",
+        "at": "2026-08-30T13:06:00Z",
+        "base_revision": "rev-1",
+        "command_id": "tokenwright.engine.restart",
+        "hash": "9359d366b6f06c8742470f10f258f557ad93fbd8fc3f8ea70427e6f70f4edc82",
+        "outcome": "applied",
+        "prev": "31323081e95062d4ad303beb847d296a6c15284748173c225cc9afd8821f21ba",
+        "receipt_id": "rcpt_1",
+        "seq": 2
+      },
+      {
+        "actor": "intruder",
+        "at": "2026-08-30T13:07:00Z",
+        "base_revision": "rev-2",
+        "command_id": "tokenwright.engine.restart",
+        "hash": "a4e6571c0b3b78a964fa0cd8f512c936e088f1d00b2c815c13e74b1cb9993b7f",
+        "outcome": "applied",
+        "prev": "9359d366b6f06c8742470f10f258f557ad93fbd8fc3f8ea70427e6f70f4edc82",
+        "receipt_id": "rcpt_2",
+        "seq": 3
+      },
+      {
+        "actor": "intruder",
+        "at": "2026-08-30T13:08:00Z",
+        "base_revision": "rev-3",
+        "command_id": "tokenwright.engine.restart",
+        "hash": "8d9805b5acb1812327cd11d136803ce986ab99ee61c8f55b059f540f1b787837",
+        "outcome": "applied",
+        "prev": "a4e6571c0b3b78a964fa0cd8f512c936e088f1d00b2c815c13e74b1cb9993b7f",
+        "receipt_id": "rcpt_3",
+        "seq": 4
+      }
+    ],
+    "heads": [
+      {
+        "kind": "tokenwright.audit.head",
+        "count": 1,
+        "head": "31323081e95062d4ad303beb847d296a6c15284748173c225cc9afd8821f21ba",
+        "at": "2026-08-30T13:05:00Z",
+        "signature": "fb68b010b7129d5d3549dae237e2775bfb25003f1a71e86f72a5ed61b4903986d582105a0cd5a40a18a9716ea4642d2865aedef89a4fc087af50eff049ee9102"
+      },
+      {
+        "kind": "tokenwright.audit.head",
+        "count": 2,
+        "head": "9359d366b6f06c8742470f10f258f557ad93fbd8fc3f8ea70427e6f70f4edc82",
+        "at": "2026-08-30T13:06:00Z",
+        "signature": "df8d5bdfff6d6cca33f9485a0cd1ddfae948336143450fef23e4677ac2e363822cb0233fc436558591d1fbe6cdab4bdb92d7ca2daa68cbfd5f740fee7491f00b"
+      },
+      {
+        "kind": "tokenwright.audit.head",
+        "count": 3,
+        "head": "a4e6571c0b3b78a964fa0cd8f512c936e088f1d00b2c815c13e74b1cb9993b7f",
+        "at": "2026-08-30T13:07:00Z",
+        "signature": "aab2c775ef7f3045a03e91a5a1bb1998787fe8855c04c5b878df33d5cb7941cc3a093a46db51ca93e42a80724517113f34ab94d8fab19162dab2ce740b6a5301"
+      },
+      {
+        "kind": "tokenwright.audit.head",
+        "count": 4,
+        "head": "8d9805b5acb1812327cd11d136803ce986ab99ee61c8f55b059f540f1b787837",
+        "at": "2026-08-30T13:08:00Z",
+        "signature": "08d36955c1e528e317077622a741d448f8c5c9a22b827314e33cee8bad4574976550dbfd84a067537f69b4e0b68b8ce24238006babfe1d678c1b0883b8eba401"
+      }
+    ]
+  }
+}

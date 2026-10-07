@@ -683,6 +683,28 @@ fn native_account_path(path: &str, method: &axum::http::Method) -> bool {
         )
 }
 
+/// The office profile's server-side refusal of hosted data routes (WS-426).
+/// Runs after authentication, so it reveals nothing to an anonymous caller,
+/// and on every admission branch, so a stale client's request is refused
+/// whichever of them admitted it.
+fn office_profile_refusal(
+    wb: &Workbench,
+    method: &axum::http::Method,
+    path: &str,
+    org_scope: &str,
+    bearer: Option<&str>,
+) -> Option<axum::response::Response> {
+    let account_scope = wb.account_scope_for(bearer);
+    gaugedesk_app::office_hosted_routes::refusal(
+        wb.store_ref(),
+        method,
+        path,
+        org_scope,
+        Some(&account_scope),
+    )
+    .map(IntoResponse::into_response)
+}
+
 /// ENTSEC-1 middleware ([ADR 0065]): in **enterprise mode** (an `IdentityProvider` is attached
 /// and the directory is provisioned) every consultant route requires an authenticated active
 /// member; **solo / loopback passes through** (the control-plane API is the local operator's own
@@ -708,6 +730,16 @@ pub async fn enterprise_auth(
                 gaugedesk_app::mobile_machine_session::authorize_session(&mut guard, session)
             };
             if let Some(grant) = grant {
+                let refused = office_profile_refusal(
+                    &wb.lock_unpoisoned(),
+                    req.method(),
+                    req.uri().path(),
+                    &req_scope(req.headers()),
+                    None,
+                );
+                if let Some(refused) = refused {
+                    return refused;
+                }
                 req.extensions_mut()
                     .insert(gaugedesk_app::identity::AuthenticatedActor(
                         gaugedesk_core::ids::AuthorityId::new(grant.device.as_str()),
@@ -753,13 +785,25 @@ pub async fn enterprise_auth(
         return next.run(req).await;
     }
     if person_account_path(&path) {
-        let actor = wb.lock_unpoisoned().actor(bearer.as_deref());
+        let (actor, refused) = {
+            let guard = wb.lock_unpoisoned();
+            let actor = guard.actor(bearer.as_deref());
+            let refused = (actor != "anonymous")
+                .then(|| {
+                    office_profile_refusal(&guard, &method, &path, &org_scope, bearer.as_deref())
+                })
+                .flatten();
+            (actor, refused)
+        };
         if actor == "anonymous" {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "authenticate to access your account" })),
             )
                 .into_response();
+        }
+        if let Some(refused) = refused {
+            return refused;
         }
         req.extensions_mut()
             .insert(gaugedesk_app::identity::AuthenticatedActor(
@@ -811,6 +855,11 @@ pub async fn enterprise_auth(
             project.as_deref(),
         ) {
             return (code, Json(json!({ "error": msg }))).into_response();
+        }
+        if let Some(refused) =
+            office_profile_refusal(&guard, &method, &path, &org_scope, bearer.as_deref())
+        {
+            return refused;
         }
         // ENTSEC-4 (ADR 0065): audit data-route *actions* (mutating methods) to the org trail —
         // the "what did this consultant do" record (references only, `INV-10`). `/admin/*` audits

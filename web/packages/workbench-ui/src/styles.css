@@ -171,8 +171,10 @@
     --bad: var(--gw-default-danger);
     /* Two faces (GaugeWright DR-0072), split on whether a person operates a
        string or reads it at length. --serif and --ui alias the chrome face
-       because chrome is most of this app; only the transcript and rendered
-       Markdown take --prose. Code surfaces stay monospace via --mono. */
+       because chrome is most of this app; --prose is used only for message
+       text in the chat log (GaugeWright DR-0229), and a rendered Markdown file
+       is chrome.
+       Code surfaces stay monospace via --mono. */
     --font-chrome: var(--gw-default-font-chrome);
     --font-prose: var(--gw-default-font-prose);
     --serif: var(--font-chrome);
@@ -595,11 +597,18 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 
 /* Rendered markdown (the View tab for .md files). Overrides the .filebody
    plain-text posture: proportional type, document spacing; code spans/blocks
-   drop back to the mono treatment. */
-.filebody.markdown-body { white-space: normal; font-family: var(--font-prose); font-size: var(--fs-body);
+   drop back to the mono treatment. The file view is set in the chrome face —
+   IBM Plex Serif is used only for chat message text (GaugeWright DR-0229) — and
+   the chrome face ships no bold, so its headings, table heads and strong are
+   regular, and headings step by size. */
+.filebody.markdown-body { white-space: normal; font-family: var(--font-chrome); font-size: var(--fs-body);
     line-height: 1.55; max-width: 72ch; }
+.filebody.markdown-body :is(h1, h2, h3, h4, th, strong, b) { font-weight: 400; }
+/* The bare h2 rule further down styles panel titles as letterspaced uppercase
+   labels; a document's own headings are not panel titles. */
 .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
-    margin: 0.9em 0 0.4em; line-height: 1.25; }
+    margin: 0.9em 0 0.4em; line-height: 1.25; font-family: inherit; text-transform: none;
+    letter-spacing: normal; color: inherit; }
 .markdown-body h1 { font-size: 1.45em; } .markdown-body h2 { font-size: 1.25em; }
 .markdown-body h3 { font-size: 1.1em; }
 /* 0.55em put the step across a paragraph break at 1.37x the step within one, so

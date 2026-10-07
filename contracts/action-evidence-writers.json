@@ -1,0 +1,819 @@
+{
+  "schema": "gaugedesk.action-evidence-writers.v1",
+  "coverage": "store-ledger-call-syntax",
+  "packages": [
+    "gaugedesk-app",
+    "gaugedesk-workspace",
+    "gaugedesk-ee"
+  ],
+  "store": "crates/store/src",
+  "classifications": {
+    "seam": "Admits command/effect evidence only inside a fence on current product standing (a dispatch read basis, a claimed command, or a receipt-protected lifecycle transaction); calling it anywhere is the ACTION seam itself.",
+    "ledger": "Writes the command ledger, command-record facts, imported command history or operational observations directly, without a current-standing fence; only a declared seam owner may call it, and every other call is a listed bypass.",
+    "product-fact": "Writes product records, events, scopes or derived projection metadata; not command/effect evidence, though the lifecycle that calls it may still owe an admitted command under ACTION-3 to ACTION-6.",
+    "reference-journal": "Writes the Home reference journal, a separate authority with its own operation, refusal and seal records; its admission is governed by its own lifecycle rather than this ledger.",
+    "configuration": "Configures a handle (codec, deadline, process guard, basis combination) and persists nothing by itself."
+  },
+  "api": [
+    {
+      "declaration": {
+        "owner": "DispatchReadBasis",
+        "name": "combine",
+        "signature": "fn combine (mut self , other : Self) -> Result < Self , AdmitError >"
+      },
+      "classification": "configuration"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchReadBasis",
+        "name": "with_deadline",
+        "signature": "fn with_deadline (mut self , deadline : std :: time :: SystemTime) -> Self"
+      },
+      "classification": "configuration"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchReadBasis",
+        "name": "with_process_guard",
+        "signature": "fn with_process_guard (mut self , guard : impl Fn () -> bool + Send + Sync + 'static) -> Self"
+      },
+      "classification": "configuration"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "admit_with_dispatch_against",
+        "signature": "fn admit_with_dispatch_against < L : Lifecycle > (self , scope_id : & str , idempotency_key : & str , command : L :: Command , dispatch : & CommandDispatch , basis : & DispatchReadBasis ,) -> Result < MaterializedAdmission < L :: State > , AdmitError > where L :: Command : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "commit",
+        "signature": "fn commit (self , command_scope : & str , idempotency_key : & str , snapshot_json : & str , facts : & [crate :: CommandRecordFact] ,) -> Result < crate :: MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "commit_claimed",
+        "signature": "fn commit_claimed (self , command_id : & str , command_scope : & str , idempotency_key : & str , snapshot_json : & str , facts : & [crate :: CommandRecordFact] ,) -> Result < crate :: MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "commit_claimed_lifecycle",
+        "signature": "fn commit_claimed_lifecycle < L : Lifecycle > (self , command_id : & str , command_scope : & str , idempotency_key : & str , snapshot_json : & str , batch : LifecycleBatch < L > , facts : & [crate :: CommandRecordFact] ,) -> Result < crate :: MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "commit_claimed_lifecycle_pair",
+        "signature": "fn commit_claimed_lifecycle_pair < L : Lifecycle , M : Lifecycle > (self , command_id : & str , command_scope : & str , idempotency_key : & str , snapshot_json : & str , first : LifecycleBatch < L > , second : LifecycleBatch < M > , facts : impl FnOnce (i64) -> Result < Vec < crate :: CommandRecordFact > , AdmitError > ,) -> Result < crate :: MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "commit_claimed_lifecycle_prefix",
+        "signature": "fn commit_claimed_lifecycle_prefix < L : Lifecycle > (self , command_id : & str , command_scope : & str , idempotency_key : & str , snapshot_json : & str , phase : & str , batch : LifecycleBatch < L > , facts : & [crate :: CommandRecordFact] ,) -> Result < MaterializedCommandPrefix , AdmitError > where L :: Command : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "commit_dispatch",
+        "signature": "fn commit_dispatch < L : Lifecycle > (self , scope_id : & str , idempotency_key : & str , command : L :: Command , dispatch : & CommandDispatch ,) -> Result < MaterializedAdmission < L :: State > , AdmitError > where L :: Command : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "commit_protected_request",
+        "signature": "fn commit_protected_request < L , I > (self , scope : & str , key : & str , request : & I , authorize : impl FnOnce (& L :: State) -> Result < () , Rejection > , materialize : impl FnOnce (& L :: State) -> Result < L :: Command , Rejection > ,) -> Result < MaterializedAdmission < L :: State > , AdmitError > where L : Lifecycle , L :: Command : serde :: Serialize , I : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "commit_recorded_claimed_lifecycle_pair",
+        "signature": "fn commit_recorded_claimed_lifecycle_pair < L : Lifecycle , M : Lifecycle > (self , command_id : & str , command_scope : & str , key : & str , snapshot : & str , first : LifecycleBatch < L > , second : LifecycleBatch < M > , facts : impl FnOnce (i64) -> Result < Vec < crate :: CommandRecordFact > , AdmitError > ,) -> Result < crate :: MaterializedRecordAdmission , AdmitError > where L :: Command : serde :: Serialize , M :: Command : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
+        "name": "import_command_scopes",
+        "signature": "fn import_command_scopes (self , archive : & crate :: command_scope_archive :: CommandScopeArchive , allowed : impl Fn (& str) -> bool ,) -> Result < Self , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "bind_exact_reference_use",
+        "signature": "fn bind_exact_reference_use < F > (& mut self , home_id : & str , target_store : & str , use_key : & str , version_id : & str , operation_id : & str , verify : F ,) -> Result < ReferenceUsePin , JournalError > where F : FnOnce (& ReferenceOperation) -> Result < ReferenceUseEvidence , String > ,"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "classify_legacy_reference_use_unknown",
+        "signature": "fn classify_legacy_reference_use_unknown (& mut self , home_id : & str , target_store : & str , use_key : & str , version_id : & str ,) -> Result < ReferenceUsePin , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "complete_reference_operation",
+        "signature": "fn complete_reference_operation < F > (& mut self , home_id : & str , operation_id : & str , verify : F ,) -> Result < ReferenceCompletion , JournalError > where F : FnOnce (& ReferenceOperation) -> Result < ReferenceEvidence , String > ,"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "complete_revalidated_reference_operation",
+        "signature": "fn complete_revalidated_reference_operation < F > (& mut self , home_id : & str , operation_id : & str , verify : F ,) -> Result < ReferenceCompletion , JournalError > where F : FnOnce (& ReferenceOperation , i64) -> Result < RevalidatedReferenceEvidence , String > ,"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "finalize_reference_seal",
+        "signature": "fn finalize_reference_seal (& mut self , epoch : i64) -> Result < ReferenceSeal , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "refuse_reference_operation",
+        "signature": "fn refuse_reference_operation (& mut self , home_id : & str , operation_id : & str , reason_code : & str ,) -> Result < ReferenceOperation , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "register_checked_program_request",
+        "signature": "fn register_checked_program_request (& mut self , home_id : & str , target_store : & str , target_store_incarnation : & str , request_key : & str , basis_digest : & str ,) -> Result < ReferenceOperation , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "register_reference_operation",
+        "signature": "fn register_reference_operation (& mut self , home_id : & str , new : & NewReferenceOperation < '_ > ,) -> Result < ReferenceOperation , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "HomeReferenceJournal",
+        "name": "seal_reference_epoch",
+        "signature": "fn seal_reference_epoch (& mut self , home_id : & str , registry_basis : & str , policy_basis : & str , structural_basis : & str ,) -> Result < ReferenceSeal , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "acknowledge_home_reference_use",
+        "signature": "fn acknowledge_home_reference_use (& mut self , journal : & HomeReferenceJournal , target_store : & str , use_key : & str ,) -> Result < HomeReferenceUseAcknowledgment , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit",
+        "signature": "fn admit < L : Lifecycle > (& mut self , scope_id : & str , command : L :: Command ,) -> Result < L :: State , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_materialized",
+        "signature": "fn admit_materialized < L : Lifecycle > (& mut self , scope_id : & str , idempotency_key : & str , command : L :: Command ,) -> Result < MaterializedAdmission < L :: State > , AdmitError > where L :: Command : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_observation",
+        "signature": "fn admit_observation (& mut self , observation_id : & str , scope_id : & str , position : i64 ,) -> Result < bool , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_record_facts",
+        "signature": "fn admit_record_facts (& mut self , command_scope : & str , idempotency_key : & str , snapshot_json : & str , facts : & [CommandRecordFact] ,) -> Result < MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_record_facts_at_scope_head",
+        "signature": "fn admit_record_facts_at_scope_head (& mut self , command_scope : & str , idempotency_key : & str , snapshot_json : & str , facts : & [CommandRecordFact] , expected_scope : & str , expected_position : i64 ,) -> Result < MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_record_facts_chained",
+        "signature": "fn admit_record_facts_chained (& mut self , command_scope : & str , idempotency_key : & str , snapshot_json : & str , facts : & [CommandRecordFact] , chained : Option < ChainedRecordFact < '_ > > ,) -> Result < MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_record_facts_with_claims",
+        "signature": "fn admit_record_facts_with_claims (& mut self , command_scope : & str , idempotency_key : & str , snapshot_json : & str , facts : & [CommandRecordFact] , chained : Option < ChainedRecordFact < '_ > > , claims : & [RecordCommandClaim < '_ >] ,) -> Result < MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_request",
+        "signature": "fn admit_request < L , I > (& mut self , scope : & str , key : & str , request : & I , authorize : impl FnOnce (& L :: State) -> Result < () , Rejection > , materialize : impl FnOnce (& L :: State) -> Result < L :: Command , Rejection > ,) -> Result < MaterializedAdmission < L :: State > , AdmitError > where L : Lifecycle , L :: Command : serde :: Serialize , I : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_with_dispatch",
+        "signature": "fn admit_with_dispatch < L : Lifecycle > (& mut self , scope_id : & str , idempotency_key : & str , command : L :: Command , dispatch : & CommandDispatch ,) -> Result < MaterializedAdmission < L :: State > , AdmitError > where L :: Command : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_with_dispatch_against",
+        "signature": "fn admit_with_dispatch_against < L : Lifecycle > (& mut self , scope_id : & str , idempotency_key : & str , command : L :: Command , dispatch : & CommandDispatch , basis : & DispatchReadBasis ,) -> Result < MaterializedAdmission < L :: State > , AdmitError > where L :: Command : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "admit_with_key",
+        "signature": "fn admit_with_key < L : Lifecycle > (& mut self , scope_id : & str , command_key : & str , command : L :: Command ,) -> Result < L :: State , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "append_chained_record",
+        "signature": "fn append_chained_record (& mut self , scope_id : & str , kind : & str , link : & dyn Fn (Option < & str >) -> String ,) -> Result < (i64 , String) , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "append_record",
+        "signature": "fn append_record (& mut self , scope_id : & str , kind : & str , payload : & str ,) -> Result < i64 , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "append_record_revision",
+        "signature": "fn append_record_revision (& mut self , record_id : & str , scope_id : & str , kind : & str , payload : & str , tombstone : bool ,) -> Result < RecordRevision , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "append_record_with_key",
+        "signature": "fn append_record_with_key (& mut self , scope_id : & str , command_key : & str , kind : & str , payload : & str ,) -> Result < (i64 , bool) , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "append_record_with_linked_record",
+        "signature": "fn append_record_with_linked_record (& mut self , scope : & str , kind : & str , payload : & str , companion_scope : & str , companion_kind : & str , link : impl FnOnce (i64) -> Result < String , AdmitError > ,) -> Result < i64 , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "append_records_atomically",
+        "signature": "fn append_records_atomically (& mut self , records : & [(& str , & str , & str)] ,) -> Result < Vec < i64 > , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "bind_exact_reference_use",
+        "signature": "fn bind_exact_reference_use < F > (& mut self , home_id : & str , target_store : & str , use_key : & str , version_id : & str , operation_id : & str , verify : F ,) -> Result < ReferenceUsePin , JournalError > where F : FnOnce (& ReferenceOperation) -> Result < ReferenceUseEvidence , String > ,"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "claim_command",
+        "signature": "fn claim_command (& mut self , command_id : & str , scope_id : & str , idempotency_key : & str , snapshot_json : & str ,) -> Result < (CommandRecord , bool) , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "claim_command_against",
+        "signature": "fn claim_command_against (& mut self , command_id : & str , scope_id : & str , idempotency_key : & str , snapshot_json : & str , basis : & command_dispatch :: DispatchReadBasis ,) -> Result < (CommandRecord , bool) , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "claim_command_excluding",
+        "signature": "fn claim_command_excluding (& mut self , command_id : & str , scope_key : (& str , & str) , snapshot : & str , basis : Option < & command_dispatch :: DispatchReadBasis > , excluded : & [(& str , & str)] ,) -> Result < (CommandRecord , bool) , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "classify_legacy_reference_use_unknown",
+        "signature": "fn classify_legacy_reference_use_unknown (& mut self , home_id : & str , target_store : & str , use_key : & str , version_id : & str ,) -> Result < ReferenceUsePin , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "committed_dispatch",
+        "signature": "fn committed_dispatch < L : Lifecycle > (& mut self , scope_id : & str , idempotency_key : & str ,) -> Result < Option < CommittedDispatch < L :: Command > > , AdmitError > where L :: Command : serde :: de :: DeserializeOwned ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "complete_reference_operation",
+        "signature": "fn complete_reference_operation < F > (& mut self , home_id : & str , operation_id : & str , verify : F ,) -> Result < ReferenceCompletion , JournalError > where F : FnOnce (& ReferenceOperation) -> Result < ReferenceEvidence , String > ,"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "complete_revalidated_reference_operation",
+        "signature": "fn complete_revalidated_reference_operation < F > (& mut self , home_id : & str , operation_id : & str , verify : F ,) -> Result < ReferenceCompletion , JournalError > where F : FnOnce (& ReferenceOperation , i64) -> Result < RevalidatedReferenceEvidence , String > ,"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "finalize_reference_seal",
+        "signature": "fn finalize_reference_seal (& mut self , epoch : i64) -> Result < ReferenceSeal , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "import_command_scopes",
+        "signature": "fn import_command_scopes (& mut self , archive : & CommandScopeArchive , allowed : impl Fn (& str) -> bool ,) -> Result < () , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "initialize_home_journal",
+        "signature": "fn initialize_home_journal (& mut self , root : & Path , project_id : & str , home_id : & str ,) -> Result < HomeReferenceJournal , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "put_content_metadata",
+        "signature": "fn put_content_metadata (& mut self , content : & ContentMetadata) -> Result < () , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "put_projection_meta",
+        "signature": "fn put_projection_meta (& mut self , meta : & ProjectionMeta) -> Result < () , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "put_scope",
+        "signature": "fn put_scope (& mut self , scope_id : & str , authority : Option < & str > , lifecycle : Option < & str > , subject_id : Option < & str > ,) -> Result < () , AdmitError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "receive_command",
+        "signature": "fn receive_command (& mut self , command_id : & str , scope_id : & str , idempotency_key : & str , snapshot_json : & str ,) -> Result < CommandRecord , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "reconcile_commands",
+        "signature": "fn reconcile_commands (& mut self) -> Result < (usize , usize) , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "record_observation",
+        "signature": "fn record_observation (& mut self , observation_id : & str , run_ref : & str , kind : & str , payload_ref : Option < & str > ,) -> Result < ObservationRecord , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "refuse_reference_operation",
+        "signature": "fn refuse_reference_operation (& mut self , home_id : & str , operation_id : & str , reason_code : & str ,) -> Result < ReferenceOperation , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "register_checked_program_request",
+        "signature": "fn register_checked_program_request (& mut self , home_id : & str , target_store : & str , target_store_incarnation : & str , request_key : & str , basis_digest : & str ,) -> Result < ReferenceOperation , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "register_home_journal",
+        "signature": "fn register_home_journal (& mut self , project_id : & str , home_id : & str ,) -> Result < HomeJournalRegistration , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "register_reference_operation",
+        "signature": "fn register_reference_operation (& mut self , home_id : & str , new : & NewReferenceOperation < '_ > ,) -> Result < ReferenceOperation , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "retain_project_authority_key",
+        "signature": "fn retain_project_authority_key (& mut self , key : & ProjectAuthorityKey ,) -> Result < ProjectAuthorityKey , AuthorityKeyError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "retain_project_authority_key_against",
+        "signature": "fn retain_project_authority_key_against (& mut self , key : & ProjectAuthorityKey , basis : & crate :: command_dispatch :: DispatchReadBasis ,) -> Result < ProjectAuthorityKey , AuthorityKeyError >"
+      },
+      "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "seal_reference_epoch",
+        "signature": "fn seal_reference_epoch (& mut self , home_id : & str , registry_basis : & str , policy_basis : & str , structural_basis : & str ,) -> Result < ReferenceSeal , JournalError >"
+      },
+      "classification": "reference-journal"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "set_command_status",
+        "signature": "fn set_command_status (& mut self , command_id : & str , status : & str ,) -> Result < bool , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "set_unreceipted_command_failure",
+        "signature": "fn set_unreceipted_command_failure (& mut self , command_id : & str , status : & str ,) -> Result < bool , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "with_checked_dispatch_basis",
+        "signature": "fn with_checked_dispatch_basis < T > (& mut self , basis : & DispatchReadBasis , admit_runtime : impl for < 'check > FnOnce (& NativeDispatchCheck < 'check >) -> T ,) -> Result < T , AdmitError >"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "with_codec",
+        "signature": "fn with_codec (mut self , codec : Arc < dyn ContentCodec >) -> Self"
+      },
+      "classification": "configuration"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "with_dispatch_basis",
+        "signature": "fn with_dispatch_basis < T > (& mut self , basis : & DispatchReadBasis , admit_runtime : impl FnOnce () -> T ,) -> Result < T , AdmitError >"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "with_dispatch_record_admission",
+        "signature": "fn with_dispatch_record_admission < T > (& mut self , basis : & DispatchReadBasis , publish : impl for < 'tx > FnOnce (DispatchRecordAdmission < 'tx >) -> T ,) -> Result < T , AdmitError >"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "with_record_admission",
+        "signature": "fn with_record_admission < T > (& mut self , publish : impl for < 'tx > FnOnce (DispatchRecordAdmission < 'tx >) -> T ,) -> Result < T , AdmitError >"
+      },
+      "classification": "ledger"
+    }
+  ],
+  "seam_owners": [
+    {
+      "file": "crates/app/src/command_idempotency.rs",
+      "reason": "Owns the HTTP command envelope: it alone claims, replays and settles the command ledger row for an Idempotency-Key request before and after its handler runs."
+    },
+    {
+      "file": "crates/app/src/host_action_delivery.rs",
+      "reason": "Owns the product action outbox: durable dispatch intent, delivery to the runtime and admission of the returned receipt under stable identities."
+    }
+  ],
+  "profiles": {
+    "unfenced-preparation": {
+      "coverage_id": "ACTION-3",
+      "reason": "Action input binding and policy preparation fall back to an unfenced record writer when the caller supplies no dispatch read basis, so their evidence can land without a current-standing check.",
+      "required_evidence": [
+        "Require a dispatch read basis on every production caller and delete the unfenced branch.",
+        "A caller without current standing is refused before any preparation fact is written."
+      ]
+    },
+    "second-command-envelope": {
+      "coverage_id": "ACTION-4",
+      "reason": "Context-stream uploads claim and fail their own command ledger rows instead of going through the HTTP command envelope, so the ledger has a second state machine for one kind of request.",
+      "required_evidence": [
+        "Route upload claims through the command envelope owner or a fenced admission with the same replay and conflict semantics.",
+        "Keep the Office task fence and legacy-key exclusion the upload claim relies on today."
+      ]
+    },
+    "gaugeapp-command-receipts": {
+      "coverage_id": "ACTION-6",
+      "reason": "GaugeApp host commands, reviews and external review completions admit their receipts and facts as chained record facts outside the dispatch fence and outside the action outbox.",
+      "required_evidence": [
+        "Admit each consequential GaugeApp command through the shared product action admission with its actor, basis and receipt.",
+        "External review outcomes enter as observed results bound to the original command, never as a new author."
+      ]
+    },
+    "agent-exchange": {
+      "coverage_id": "ACTION-5",
+      "reason": "GaugeApp agent exchanges append transcript facts directly; the turn that produced them is not linked to an admitted command, attempt and outcome.",
+      "required_evidence": [
+        "Bind each appended exchange to its admitted turn command and runtime attempt.",
+        "Retain actor, delegation and input taint for the exchange rather than inferring them from the transcript."
+      ]
+    },
+    "transcript-erasure": {
+      "coverage_id": "ACTION-8",
+      "reason": "GaugeApp agent transcript erasure writes its erasure facts directly; erasure must keep the causal record while removing content, and must not reopen access to erased payloads.",
+      "required_evidence": [
+        "Erasure is an admitted command whose record keeps identifiers and causes but no erased content.",
+        "Inspection after erasure shows the erasure and refuses the content."
+      ]
+    },
+    "imported-history": {
+      "coverage_id": "ACTION-8",
+      "reason": "Legacy transcript migration and federated hand-off import command history that GaugeDesk did not mediate; it is evidence observed from elsewhere and must carry that ceiling rather than read as a fully witnessed action.",
+      "required_evidence": [
+        "Mark imported records with their provenance class (legacy, imported, externally observed) and the observer that admitted them.",
+        "Never attribute an imported record to an author or request identity the source did not record."
+      ]
+    }
+  },
+  "bypasses": [
+    {
+      "site": {
+        "file": "crates/app/src/action_input_binding.rs",
+        "callable": "retain_input_binding_at",
+        "capability": "with_record_admission",
+        "expression": "product . with_record_admission (publish)",
+        "count": 1
+      },
+      "profile": "unfenced-preparation"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/action_policy.rs",
+        "callable": "prepare_at",
+        "capability": "admit_record_facts",
+        "expression": "product . admit_record_facts (storage_scope , PREPARATION_KEY , & snapshot , & facts)",
+        "count": 1
+      },
+      "profile": "unfenced-preparation"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/federation_incoming_handoff.rs",
+        "callable": "commit",
+        "capability": "import_command_scopes",
+        "expression": "admission . import_command_scopes (archive , | candidate | { is_project_scope (candidate , & wire . project) })",
+        "count": 1
+      },
+      "profile": "imported-history"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_agent.rs",
+        "callable": "append_agent_exchange",
+        "capability": "admit_record_facts_chained",
+        "expression": "guard . store_mut () . admit_record_facts_chained (& format ! (\"{scope}:append\") , & turn_id , & serde_json :: to_string (& records) . expect (\"agent exchange serializes\") , & facts , audit ,)",
+        "count": 1
+      },
+      "profile": "agent-exchange"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_agent.rs",
+        "callable": "erase_gaugeapp_agent_transcript_inner",
+        "capability": "admit_record_facts",
+        "expression": "guard . store_mut () . admit_record_facts (& format ! (\"{}:erasure\" , gaugeapp_agent_thread_owner_scope (session)) , & erasure_id , & serde_json :: to_string (& erasing) . expect (\"erasure intent serializes\") , & [fact] ,)",
+        "count": 1
+      },
+      "profile": "transcript-erasure"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_agent.rs",
+        "callable": "finish_gaugeapp_agent_erasure",
+        "capability": "admit_record_facts",
+        "expression": "workbench . store_mut () . admit_record_facts (& format ! (\"{}:erasure\" , gaugeapp_agent_thread_owner_scope (session)) , & format ! (\"{erasure_id}:complete\") , & serde_json :: to_string (& active) . expect (\"completed erasure serializes\") , & [fact] ,)",
+        "count": 1
+      },
+      "profile": "transcript-erasure"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_agent.rs",
+        "callable": "migrate_legacy_gaugeapp_agent_transcript",
+        "capability": "admit_record_facts",
+        "expression": "workbench . store_mut () . admit_record_facts (& format ! (\"{scope}:legacy-migration\") , & migration_key , & serde_json :: to_string (& records) . expect (\"migration snapshot serializes\") , & facts ,)",
+        "count": 1
+      },
+      "profile": "imported-history"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_host.rs",
+        "callable": "apply_command_with_services",
+        "capability": "admit_record_facts_chained",
+        "expression": "wb . store_mut () . admit_record_facts_chained (& scope , & envelope . idempotency_key , & serde_json :: to_string (envelope) . expect (\"command serializes\") , & facts , Some (crate :: audit :: chained_in (& audit_scope , & audit_link)) ,)",
+        "count": 1
+      },
+      "profile": "gaugeapp-command-receipts"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_host.rs",
+        "callable": "finish_command_in",
+        "capability": "admit_record_facts_chained",
+        "expression": "wb . store_mut () . admit_record_facts_chained (receipt_scope , key , & snapshot (envelope) , & facts , Some (crate :: audit :: chained_in (& audit_scope , & audit_link)) ,)",
+        "count": 1
+      },
+      "profile": "gaugeapp-command-receipts"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_host.rs",
+        "callable": "prepare_review",
+        "capability": "admit_record_facts_with_claims",
+        "expression": "guard . store_mut () . admit_record_facts_with_claims (& D :: command_scope (& headers) , & key , & serde_json :: to_string (& json ! ({ \"proposal\" : id , \"decision\" : \"reject\" })) . unwrap () , & [change_fact] , Some (crate :: audit :: chained_in (& audit_scope , & audit_link)) , terminal_claim . as_slice () ,)",
+        "count": 1
+      },
+      "profile": "gaugeapp-command-receipts"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_host.rs",
+        "callable": "prepare_review",
+        "capability": "admit_record_facts_with_claims",
+        "expression": "guard . store_mut () . admit_record_facts_with_claims (& D :: command_scope (& headers) , & key , & snapshot (& envelope) , & [conflict_fact] , Some (crate :: audit :: chained_in (& audit_scope , & audit_link)) , terminal_claim . as_slice () ,)",
+        "count": 1
+      },
+      "profile": "gaugeapp-command-receipts"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_host.rs",
+        "callable": "submit_reviewed_command",
+        "capability": "admit_record_facts_chained",
+        "expression": "guard . store_mut () . admit_record_facts_chained (& D :: command_scope (& headers) , & key , & snapshot (& envelope) , & [change_fact] , Some (crate :: audit :: chained_in (& audit_scope , & audit_link)) ,)",
+        "count": 1
+      },
+      "profile": "gaugeapp-command-receipts"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/office_task_authority.rs",
+        "callable": "impl inherent for OfficeTaskAuthority::claim_upload_command",
+        "capability": "claim_command_excluding",
+        "expression": "wb . store_mut () . claim_command_excluding (command_id , (scope , key) , snapshot , Some (& basis) , & excluded ,)",
+        "count": 1
+      },
+      "profile": "second-command-envelope"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/resource_store.rs",
+        "callable": "post_context_stream",
+        "capability": "claim_command",
+        "expression": "wb . lock_unpoisoned () . store_mut () . claim_command (& command_id , & scope , & key , & snapshot)",
+        "count": 1
+      },
+      "profile": "second-command-envelope"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/resource_store.rs",
+        "callable": "post_context_stream",
+        "capability": "set_unreceipted_command_failure",
+        "expression": "wb . lock_unpoisoned () . store_mut () . set_unreceipted_command_failure (& command_id , status)",
+        "count": 1
+      },
+      "profile": "second-command-envelope"
+    },
+    {
+      "site": {
+        "file": "ee/app/src/gaugeapp_external_review.rs",
+        "callable": "begin",
+        "capability": "admit_record_facts_with_claims",
+        "expression": "wb . store_mut () . admit_record_facts_with_claims (& command_scope (headers) , key , & snapshot (command) , & facts , Some (gaugedesk_app :: audit :: chained_in (& audit_scope , & audit)) , & [gaugedesk_store :: RecordCommandClaim { key : & claim_key , snapshot : & approval_snapshot , }] ,)",
+        "count": 1
+      },
+      "profile": "gaugeapp-command-receipts"
+    },
+    {
+      "site": {
+        "file": "ee/app/src/gaugeapp_external_review.rs",
+        "callable": "rejected",
+        "capability": "admit_record_facts_chained",
+        "expression": "wb . store_mut () . admit_record_facts_chained (& completion_scope (headers) , & approved . command . idempotency_key , & snapshot (& approved . command) , & [fact] , Some (gaugedesk_app :: audit :: chained_in (& audit_scope , & audit)) ,)",
+        "count": 1
+      },
+      "profile": "gaugeapp-command-receipts"
+    }
+  ]
+}

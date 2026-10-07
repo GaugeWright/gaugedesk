@@ -74,8 +74,8 @@ section="${1:-all}"
 . scripts/lane-helpers.sh
 
 # Stages 2 and 3 of the Buck2 migration (GaugeWright BUILD.md, DR-0124): every
-# section of every lane is a Buck2 target declaring what it reads, except the
-# two that read the sibling whipplescript checkout, which stage 4 owns. When
+# section of every lane is a Buck2 target declaring what it reads. The two
+# WhippleScript host-action sections have a source-lineage peer edge. When
 # this checkout is a cell of a materialized workspace, a section runs through
 # Buck2, which spares the re-run when nothing the section declares has changed
 # and otherwise runs scripts/section.sh exactly as the direct path does. When
@@ -214,8 +214,7 @@ run_contracts() {
     gate_section action-provenance
 
     echo "== WhippleScript workstream host contract =="
-    node scripts/check-whipplescript-workstream-contract.mjs
-    python3 scripts/check-whipplescript-host-action.py
+    gate_section whipplescript-host-action
 
     # The other direction across the same pin: WhippleScript meters, this
     # repository prices. The runtime's own records say it does not price, so
@@ -418,11 +417,8 @@ run_contracts() {
 }
 
 run_rust() {
-    # Reads the sibling whipplescript checkout, so it is not a target: an input
-    # outside this cell until stage 4 makes it an edge.
     echo "== resolved WhippleScript action contract =="
-    python3 scripts/check-whipplescript-host-action.py --resolved
-    python3 scripts/test-whipplescript-host-action.py
+    gate_section whipplescript-host-action-resolved
 
     echo "== lockfile =="
     gate_section lockfile

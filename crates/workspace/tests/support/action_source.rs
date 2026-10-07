@@ -1,4 +1,6 @@
 //! Syntax inventory, never a substitute for runtime authorization or type checking.
+// Shared by more than one test target; each uses a different part of it.
+#![allow(dead_code)]
 use quote::ToTokens;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -118,6 +120,10 @@ pub struct Scanner {
     root: PathBuf,
     visited: BTreeSet<PathBuf>,
     pub api: BTreeSet<Api>,
+    /// Public mutating methods (`&mut self` or consuming `self`) declared in
+    /// production `impl` blocks under `writer_root`.
+    pub writers: BTreeSet<Api>,
+    writer_root: Option<PathBuf>,
     sites: BTreeMap<(String, String, String, String), usize>,
     capabilities: BTreeSet<String>,
 }
@@ -127,9 +133,17 @@ impl Scanner {
             root: root.canonicalize().expect("source root must exist"),
             visited: BTreeSet::new(),
             api: BTreeSet::new(),
+            writers: BTreeSet::new(),
+            writer_root: None,
             sites: BTreeMap::new(),
             capabilities,
         }
+    }
+    /// Also collect the public mutating interface of every production `impl`
+    /// in files under `root` (ACTION-8's evidence-writer interface check).
+    pub fn with_writer_root(mut self, root: &Path) -> Self {
+        self.writer_root = Some(root.canonicalize().expect("writer root must exist"));
+        self
     }
     pub fn scan(&mut self, path: &Path) -> Result<(), String> {
         self.scan_file(path, true)
@@ -235,6 +249,15 @@ impl Scanner {
                         }
                     }
                 }
+                if let Item::Impl(item) = item {
+                    if self
+                        .writer_root
+                        .as_ref()
+                        .is_some_and(|root| file.starts_with(root))
+                    {
+                        self.collect_writers(item);
+                    }
+                }
                 let relative = file
                     .strip_prefix(&self.root)
                     .unwrap()
@@ -249,6 +272,34 @@ impl Scanner {
             }
         }
         Ok(())
+    }
+    fn collect_writers(&mut self, item: &syn::ItemImpl) {
+        let syn::Type::Path(owner) = item.self_ty.as_ref() else {
+            return;
+        };
+        let Some(owner) = owner.path.segments.last() else {
+            return;
+        };
+        for member in &item.items {
+            let syn::ImplItem::Fn(method) = member else {
+                continue;
+            };
+            if !production(&method.attrs) || !matches!(method.vis, syn::Visibility::Public(_)) {
+                continue;
+            }
+            let Some(receiver) = method.sig.receiver() else {
+                continue;
+            };
+            // `&self` reads; `&mut self` and a consumed `self` can write.
+            if receiver.reference.is_some() && receiver.mutability.is_none() {
+                continue;
+            }
+            self.writers.insert(Api {
+                owner: owner.ident.to_string(),
+                name: capability_name(&method.sig.ident),
+                signature: method.sig.to_token_stream().to_string(),
+            });
+        }
     }
     pub fn sites(&self) -> Vec<Site> {
         self.sites

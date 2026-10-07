@@ -11,9 +11,8 @@
 # and the advisory sweep — which reads two live databases and is therefore a
 # `check_world` target, refusing to run without a nonce naming the run.
 #
-# Two things are still not here, and one stage owns both: the WhippleScript
-# host-action sections read a peer checkout, an input outside this cell until
-# stage 4 makes it an edge.
+# Both WhippleScript host-action sections are stage-4 targets. Their source
+# lineage is a peer edge; resolved validation retains Cargo's exact public SDK.
 #
 # `prerequisites` is check.sh's word for whether a missing tool refuses or
 # skips: `required` when the gate runs a lane directly, `best-effort` under
@@ -44,7 +43,7 @@ recorded_desktop_check() {
     local output="$1" recorder root token="" status=0
     shift
     root="$(cd .. && pwd -P)"
-    recorder="$root/GaugeWright/tools/gate-output-use.mjs"
+    recorder="${GREEN_BAR_OUTPUT_USE_RECORDER:-$root/GaugeWright/tools/gate-output-use.mjs}"
     if [ -f "$recorder" ] && command -v node >/dev/null 2>&1; then
         token="$(node "$recorder" begin "$root" "$output" 2>/dev/null || :)"
     fi
@@ -100,6 +99,12 @@ case "${1:-}" in
     node scripts/check-action-provenance.mjs
     node --test scripts/check-action-provenance.test.mjs ;;
   stats-report-contract)   node scripts/check-whipplescript-stats-report.mjs ;;
+  whipplescript-host-action)
+    node scripts/check-whipplescript-workstream-contract.mjs
+    python3 scripts/check-whipplescript-host-action.py ;;
+  whipplescript-host-action-resolved)
+    python3 scripts/check-whipplescript-host-action.py --resolved
+    python3 scripts/test-whipplescript-host-action.py ;;
   author-skill-pin)        node scripts/check-whipplescript-author-skill.mjs ;;
   tokenwright-metadata)
     node scripts/check-tokenwright-environment.mjs

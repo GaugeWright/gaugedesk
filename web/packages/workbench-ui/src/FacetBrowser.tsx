@@ -16,7 +16,7 @@
  * archetype lists everywhere it is placed.
  */
 
-import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { LoadError } from "./LoadError";
 import { navLoadState } from "./nav-load-state";
@@ -464,6 +464,23 @@ export function FacetBrowser(props: {
     createEffect(() => {
         const ids = [...expanded()];
         try { window.localStorage?.setItem(EXPANDED_KEY, JSON.stringify(ids)); } catch { /* session-only preference */ }
+    });
+    // Drop expansions of nodes the workspace no longer has, so deleted projects and
+    // Agents don't accumulate in storage. Pruned against the whole tree, not the
+    // scoped one, so switching organization keeps another scope's expansions; and
+    // only when the tree changes, so an expansion made just before the refetch that
+    // brings its node is kept.
+    createEffect(() => {
+        const t = fullTree();
+        if (!t) return;
+        const live = new Set<string>([
+            ...t.projects.flatMap((p) => [p.id, ...p.placements.map((pl) => pl.placementId)]),
+            ...t.archetypes.map((a) => a.id),
+        ]);
+        untrack(() => {
+            const current = expanded();
+            if ([...current].some((id) => !live.has(id))) setExpanded(new Set([...current].filter((id) => live.has(id))));
+        });
     });
     const isCollapsed = (id: string) => !expanded().has(id);
     const toggleCollapse = (id: string) =>

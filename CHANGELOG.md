@@ -19,6 +19,23 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- A Panel agent whose visitors may read or create files, or answer questions,
+  now replies to visitors. Every such visitor message was refused before the
+  model ran ("ungoverned handle `workspace.read`"), because the published
+  release did not cover the built-in download and question tools. Publish a new
+  version of an affected Panel agent and update its deployments to pick this up.
+- Previewing a Panel agent now behaves as a deployment does when its
+  instructions write to `outbox/`, `artifacts/` or `work/`.
+- The settings assistants in Agent, Panel and Project Settings, Account
+  Settings, Administration and Commercial Operations understand the names on
+  their pages, and one message can make several changes. Asked to change a
+  Panel agent, the assistant says the change reaches visitors once a new
+  version is published and its deployments are updated.
+- Returning to Browse shows the chat you are in, including an Agent's edit
+  chats and previews in Workshop, instead of collapsed Projects.
+- A collection's result format is documented as a label: it names the
+  collected file's format and is not checked against its contents.
+
 ## [0.8.0] — 2026-10-06
 
 - A project created in GaugeDesk can now be handed off to a paired computer.
@@ -73,6 +90,8 @@ Releases up to and including 0.4.30 are recorded on the
   8,192 output tokens at the model's price plus 20% before it is sent, and the
   turn settles from its usage. A model with no known price is refused, and a
   call whose outcome is unknown keeps its hold rather than being sent again.
+
+- Align the embed browser palette assertion with the current carried GaugeWright navy token.
 
 - Office Home integrations can require encrypted library metadata before startup
   loads or seeds project and chat titles. Missing keys, incompatible history

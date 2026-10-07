@@ -367,8 +367,9 @@ Then("the first embedded user message is in view", async ({ page }) => {
 
 Then("the embedded chat is themed by the workbench palette", async ({ page }) => {
     // The :host theme bridge defines the workbench palette inside the shadow root
-    // (styles.css's :root block is inert there) — the default --gw-bg (#0f1115).
-    await expect(page.locator('gw-chat [part~="panel"]')).toHaveCSS("background-color", "rgb(15, 17, 21)");
+    // (styles.css's :root block is inert there). The carried --gw-default-bg
+    // is #142238, owned by GaugeWright brand/palette.css.
+    await expect(page.locator('gw-chat [part~="panel"]')).toHaveCSS("background-color", "rgb(20, 34, 56)");
 });
 
 Then("a {string} override cascades into the panel's shadow root", async ({ page }, token: string) => {

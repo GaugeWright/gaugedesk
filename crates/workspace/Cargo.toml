@@ -9,9 +9,10 @@ license.workspace = true
 # sources name by relative path, for the native test runs (GaugeWright BUILD.md
 # stages 5 and 6). action_source_inventory runs `cargo metadata` over the whole
 # workspace, scans the app's sources, and compares what it finds with the
-# committed inventory. A run's mount holds only declared files, so a missing
+# committed inventory; action_evidence_writers does the same against the
+# command/effect evidence boundary. A run's mount holds only declared files, so a missing
 # entry fails the test instead of caching a pass it never earned.
-data = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "contracts/workspace-action-sites.json", "crates", "ee/app"]
+data = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "contracts/workspace-action-sites.json", "contracts/action-evidence-writers.json", "crates", "ee/app"]
 
 [dependencies]
 # The versioned-workspace substrate AND the merge engine (SUB-6
