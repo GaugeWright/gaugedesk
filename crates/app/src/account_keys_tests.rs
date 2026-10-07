@@ -65,3 +65,28 @@ fn the_keys_are_readable_by_their_owner_alone() {
         assert_eq!(mode(&account_dir.join(file)), 0o600, "{file}");
     }
 }
+
+#[test]
+fn an_account_id_too_long_for_a_hex_directory_name_mints_and_reloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AccountKeyStore::new(dir.path());
+    // ~130 characters, like an account named by its public key: hex of it is
+    // past the 255-byte file-name limit.
+    let account = format!("acct-{}", "k".repeat(125));
+    let minted = store.mint(&account, NOW).unwrap();
+    let held = AccountKeyStore::new(dir.path())
+        .held(&account, NOW)
+        .unwrap()
+        .expect("the minted keys are held");
+    assert_eq!(held.root.public_key(), minted.root.public_key());
+    assert_eq!(held.account_key, minted.account_key);
+    assert_eq!(held.device.public_key(), minted.device.public_key());
+    let name = store.account_dir(&account);
+    let name = name.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("sha256-"), "{name}");
+    // A short id keeps its hex directory, so keys already held still open.
+    assert_eq!(
+        store.account_dir("acct-a").file_name().unwrap(),
+        hex::encode("acct-a").as_str()
+    );
+}

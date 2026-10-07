@@ -434,9 +434,18 @@ export function DevicesModal(props: {
         try {
             const r = await props.api.inviteAccept(inviteLink().trim());
             if (r.ok) {
+                const name = r.project_name ?? r.project;
                 setStatus(
-                    `accepted — ${r.origin} set up "${r.project_name ?? r.project}" here · code ${r.confirm_code}`,
+                    r.setup === "pending"
+                        ? `accepted — ${r.origin} is still sending "${name}" · code ${r.confirm_code}`
+                        : `accepted — ${r.origin} set up "${name}" here · code ${r.confirm_code}`,
                 );
+                setInviteLink("");
+                setInviteContractAccepted(false);
+                refetchPeers();
+            } else if (r.paired) {
+                // Paired, but this computer refused the project itself.
+                setStatus(`paired with ${r.origin}, but ${r.reason ?? "the project was not set up here"}`);
                 setInviteLink("");
                 setInviteContractAccepted(false);
                 refetchPeers();

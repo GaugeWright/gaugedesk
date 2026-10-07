@@ -1,6 +1,14 @@
 use super::*;
 use gaugedesk_workspace::Instance;
 
+/// Every scope's high-water mark except the incoming-offer outcome, which a
+/// consented admission that fails now records so the accept can report it.
+fn marks_beside_outcome(store: &Store) -> std::collections::BTreeMap<String, i64> {
+    let mut marks = store.scope_high_water_marks().unwrap();
+    marks.remove(HANDOFF_INCOMING_SCOPE);
+    marks
+}
+
 fn fixture() -> (
     SharedWorkbench,
     HandoffWire,
@@ -187,7 +195,7 @@ fn task_correlation_signed_incoming_private_metadata_refuses_before_commit() {
                 "private-metadata-offer",
                 now_secs() + 3600,
             );
-            guard.store_ref().scope_high_water_marks().unwrap()
+            marks_beside_outcome(guard.store_ref())
         };
         assert_eq!(
             admit_handoff(&wb, &wire)["committed"],
@@ -195,7 +203,12 @@ fn task_correlation_signed_incoming_private_metadata_refuses_before_commit() {
             "{scope}/{kind}"
         );
         let guard = wb.lock_unpoisoned();
-        assert_eq!(guard.store_ref().scope_high_water_marks().unwrap(), before);
+        assert_eq!(marks_beside_outcome(guard.store_ref()), before);
+        assert_eq!(
+            incoming_handoff_result(guard.store_ref(), "p1", "alice").map(|(outcome, _)| outcome),
+            Some("failed".to_string()),
+            "a consented offer this Home refuses records why: {scope}/{kind}"
+        );
         assert!(!target.path().join("collaboration-workspaces").exists());
         assert!(guard.store_ref().events(scope).unwrap().is_empty());
     }
@@ -552,15 +565,12 @@ fn one_shot_consent_commits_with_receiving_authority_and_receipt_replays_without
     }
     let probe = rusqlite::Connection::open(wb.lock_unpoisoned().store_ref().path()).unwrap();
     probe.execute_batch("CREATE TRIGGER reject_receive BEFORE INSERT ON command_receipts WHEN NEW.scope_id = 'handoff::p1' AND NEW.command_key = 'receive' BEGIN SELECT RAISE(ABORT, 'receipt fault'); END;").unwrap();
-    let before = wb
-        .lock_unpoisoned()
-        .store_ref()
-        .scope_high_water_marks()
-        .unwrap();
-    assert_eq!(admit_handoff(&wb, &wire)["committed"], false);
+    let before = marks_beside_outcome(wb.lock_unpoisoned().store_ref());
+    let verdict = admit_handoff(&wb, &wire);
+    assert_eq!(verdict["committed"], false, "{verdict}");
     {
         let guard = wb.lock_unpoisoned();
-        assert_eq!(guard.store_ref().scope_high_water_marks().unwrap(), before);
+        assert_eq!(marks_beside_outcome(guard.store_ref()), before);
         assert!(handoff_oneshot_available(guard.store_ref(), "alice", "p1").is_some());
     }
     probe.execute_batch("DROP TRIGGER reject_receive").unwrap();
@@ -1103,7 +1113,7 @@ fn seeded_default_offer() -> (Library, Library, tempfile::TempDir) {
     (current, incoming, root)
 }
 
-fn refusal(result: Result<(), AdmitError>) -> &'static str {
+fn refusal<T: std::fmt::Debug>(result: Result<T, AdmitError>) -> &'static str {
     match result {
         Err(AdmitError::Rejected(rejection)) => rejection.reason,
         other => panic!("expected a refusal, got {other:?}"),
@@ -1113,7 +1123,7 @@ fn refusal(result: Result<(), AdmitError>) -> &'static str {
 #[test]
 fn a_seeded_agent_placement_binds_to_the_receivers_own_seed_at_its_pinned_version() {
     let (current, incoming, _root) = seeded_default_offer();
-    compatible_library(&current, &incoming).unwrap();
+    assert!(compatible_library(&current, &incoming).unwrap().is_empty());
 
     // The receiver's own seed differs from the offered record in what it does
     // not pin — another Home's authoring basis or later version — and still binds.
@@ -1122,16 +1132,7 @@ fn a_seeded_agent_placement_binds_to_the_receivers_own_seed_at_its_pinned_versio
     agent.current_version = 2;
     agent.versions.insert(2, agent.versions[&1].clone());
     moved_on.apply_agent(agent);
-    compatible_library(&moved_on, &incoming).unwrap();
-
-    let mut other_version = incoming.clone();
-    let mut agent = other_version.agents[crate::app_support::DEFAULT_AGENT].clone();
-    agent.versions.get_mut(&1).unwrap().package_ref = "another-release".into();
-    other_version.apply_agent(agent);
-    assert_eq!(
-        refusal(compatible_library(&current, &other_version)),
-        "incoming project pins a built-in Agent version this Home does not hold"
-    );
+    assert!(compatible_library(&moved_on, &incoming).unwrap().is_empty());
 
     let mut unseeded = current.clone();
     unseeded.agents.remove(crate::app_support::DEFAULT_AGENT);
@@ -1243,4 +1244,100 @@ fn a_seeded_agent_travels_only_as_a_reference_to_its_pinned_version() {
     assert!(!log
         .iter()
         .any(|record| record.kind == "work_target" && record.payload.contains("\"archetype\"")));
+}
+
+/// The demo failure (0.8.1): a Home upgraded from before the Default Agent's
+/// task-filing ability holds it as version 2, a fresh install as version 1,
+/// so the sender's placement pins a version the receiver does not hold, or
+/// holds with different content. The receiver binds it to its own current
+/// published version instead of refusing.
+#[test]
+fn a_seeded_agent_placement_at_a_version_this_home_does_not_hold_binds_to_its_own() {
+    let (current, incoming, _root) = seeded_default_offer();
+    let local = current.agents[crate::app_support::DEFAULT_AGENT].current_version;
+
+    // The sender numbers the same built-in one higher.
+    let mut upgraded = Library::default();
+    let mut agent = incoming.agents[crate::app_support::DEFAULT_AGENT].clone();
+    let frozen = agent.versions[&local].clone();
+    agent.versions = BTreeMap::from([(local + 1, frozen)]);
+    agent.current_version = local + 1;
+    upgraded.apply_agent(agent);
+    let mut placement = incoming.instances["inst-general-p1"].clone();
+    placement.version = local + 1;
+    upgraded.apply_instance(placement.clone());
+    assert_eq!(
+        compatible_library(&current, &upgraded).unwrap(),
+        BTreeMap::from([("inst-general-p1".to_string(), local)])
+    );
+
+    // The sender's version at the same number holds another release.
+    let mut other_release = incoming.clone();
+    let mut agent = other_release.agents[crate::app_support::DEFAULT_AGENT].clone();
+    agent.versions.get_mut(&local).unwrap().package_ref = "another-release".into();
+    other_release.apply_agent(agent);
+    assert_eq!(
+        compatible_library(&current, &other_release).unwrap(),
+        BTreeMap::from([("inst-general-p1".to_string(), local)])
+    );
+
+    // The admitted record is the offered one, pinned to this Home's version.
+    let record = HandoffLogRecord {
+        scope: LIBRARY_SCOPE.into(),
+        kind: "instance".into(),
+        payload: serde_json::to_string(&placement).unwrap(),
+    };
+    let rebind = BTreeMap::from([("inst-general-p1".to_string(), local)]);
+    let admitted: crate::library::InstanceRecord =
+        serde_json::from_str(&rebound_placement(&record, &rebind).unwrap()).unwrap();
+    assert_eq!(admitted.version, local);
+    assert_eq!(admitted.agent_id, crate::app_support::DEFAULT_AGENT);
+    assert_eq!(admitted.project_id.as_deref(), Some("p1"));
+    let untouched = HandoffLogRecord {
+        kind: "chat".into(),
+        ..record
+    };
+    assert_eq!(
+        rebound_placement(&untouched, &rebind).unwrap(),
+        untouched.payload
+    );
+
+    // A Home that never seeded the built-in still refuses.
+    let mut unseeded = current.clone();
+    unseeded.agents.remove(crate::app_support::DEFAULT_AGENT);
+    assert_eq!(
+        refusal(compatible_library(&unseeded, &upgraded)),
+        "incoming project uses a built-in Agent this Home has not seeded"
+    );
+}
+
+/// An ordinary Agent is project content, not a seed: one this Home does not
+/// hold is admitted as carried and never rebound, and one whose identity
+/// conflicts with this Home's is refused, as before.
+#[test]
+fn an_ordinary_agent_is_carried_and_a_conflicting_one_still_refused() {
+    let (current, _incoming, _root) = seeded_default_offer();
+    let mut offered = current.agents[crate::app_support::DEFAULT_AGENT].clone();
+    offered.id = "agent-57a3f457d570".into();
+    offered.name = "Organizational Agency Index".into();
+    offered.versions = BTreeMap::from([(7, offered.versions.values().next().unwrap().clone())]);
+    offered.current_version = 7;
+    let mut incoming = Library::default();
+    incoming.apply_agent(offered.clone());
+    let mut placement = current.instances[crate::app_support::DEFAULT_PLACEMENT].clone();
+    placement.id = "inst-oai-p1".into();
+    placement.agent_id = offered.id.clone();
+    placement.project_id = Some("p1".into());
+    placement.version = 7;
+    incoming.apply_instance(placement);
+    assert!(compatible_library(&current, &incoming).unwrap().is_empty());
+
+    let mut held = current.clone();
+    let mut theirs = offered;
+    theirs.name = "Someone else's Agent".into();
+    held.apply_agent(theirs);
+    assert_eq!(
+        refusal(compatible_library(&held, &incoming)),
+        "incoming library identity conflicts with local authority"
+    );
 }

@@ -83,6 +83,8 @@ export interface InviteStatus {
     readonly pending: boolean;
     readonly accepted: boolean;
     readonly accepted_by: string | null;
+    /** Why the relocation this accepted invite started did not complete. */
+    readonly relocation_error: string | null;
     readonly confirm_code: string;
 }
 /** The target's result of accepting a combined invite. */
@@ -93,6 +95,11 @@ export interface InviteAcceptResult {
     readonly origin?: string;
     readonly confirm_code?: string;
     readonly reason?: string;
+    /** The relocation the accept consented to: `committed` once the project is
+     * set up here, `pending` while the origin is still sending it. */
+    readonly setup?: string;
+    /** The two computers paired even though the project was not set up. */
+    readonly paired?: boolean;
 }
 /** A project participant: host (owns data) or operator (owns archetypes), revocable. */
 export interface Participant {
@@ -254,6 +261,7 @@ function parseInviteStatus(raw: unknown): InviteStatus {
         pending: fBool(o, "pending"),
         accepted: fBool(o, "accepted"),
         accepted_by: o.accepted_by == null ? null : fStr(o, "accepted_by"),
+        relocation_error: o.relocation_error == null ? null : fStr(o, "relocation_error"),
         confirm_code: fStr(o, "confirm_code"),
     };
 }
@@ -266,6 +274,8 @@ function parseInviteAcceptResult(raw: unknown): InviteAcceptResult {
         origin: fOptStr(o, "origin"),
         confirm_code: fOptStr(o, "confirm_code"),
         reason: fOptStr(o, "reason"),
+        setup: fOptStr(o, "setup"),
+        paired: o.paired === true,
     };
 }
 function parseParticipant(raw: unknown): Participant {

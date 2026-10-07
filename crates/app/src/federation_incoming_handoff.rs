@@ -347,9 +347,20 @@ fn home_facts(
 }
 
 /// A relocated placement of a built-in Agent binds to this Home's own seed of
-/// it, so this Home must hold that seed at the exact published version the
-/// placement pins. The offered record is a reference and is never admitted.
-fn compatible_seeded_agents(current: &Library, incoming: &Library) -> Result<(), AdmitError> {
+/// it. The offered record is a reference and is never admitted. When this Home
+/// holds the exact published version the placement pins, the placement keeps
+/// it; otherwise it is rebound to this Home's current published version of its
+/// own seed (DR-0449, narrowing DR-0389 §2). Two Homes number the same built-in
+/// differently — one seeded before a built-in migration publishes version 2,
+/// a fresh install seeds the migrated content as version 1 — so an exact pin
+/// across Homes refused every project from an upgraded Home.
+///
+/// Returns the placements to rebind, by id, with the version they now run.
+fn compatible_seeded_agents(
+    current: &Library,
+    incoming: &Library,
+) -> Result<BTreeMap<String, u64>, AdmitError> {
+    let mut rebind = BTreeMap::new();
     for placement in incoming.instances.values() {
         if !crate::app_support::is_builtin_agent(&placement.agent_id) {
             continue;
@@ -365,17 +376,42 @@ fn compatible_seeded_agents(current: &Library, incoming: &Library) -> Result<(),
         match local.versions.get(&placement.version) {
             Some(held) if serde_json::to_value(held)? == serde_json::to_value(offered)? => {}
             _ => {
-                return Err(refused(
-                    "incoming project pins a built-in Agent version this Home does not hold",
-                ))
+                if !local.versions.contains_key(&local.current_version) {
+                    return Err(refused(
+                        "this Home's built-in Agent has no published version to bind",
+                    ));
+                }
+                rebind.insert(placement.id.clone(), local.current_version);
             }
         }
     }
-    Ok(())
+    Ok(rebind)
 }
 
-fn compatible_library(current: &Library, incoming: &Library) -> Result<(), AdmitError> {
-    compatible_seeded_agents(current, incoming)?;
+/// Rewrite an offered placement record of a built-in Agent to run this Home's
+/// own version of it, as [`compatible_seeded_agents`] decided.
+fn rebound_placement(
+    record: &HandoffLogRecord,
+    rebind: &BTreeMap<String, u64>,
+) -> Result<String, AdmitError> {
+    if record.scope != LIBRARY_SCOPE || record.kind != "instance" || rebind.is_empty() {
+        return Ok(record.payload.clone());
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&record.payload)?;
+    match value["id"].as_str().and_then(|id| rebind.get(id)) {
+        Some(version) => {
+            value["version"] = serde_json::json!(version);
+            Ok(value.to_string())
+        }
+        None => Ok(record.payload.clone()),
+    }
+}
+
+fn compatible_library(
+    current: &Library,
+    incoming: &Library,
+) -> Result<BTreeMap<String, u64>, AdmitError> {
+    let rebind = compatible_seeded_agents(current, incoming)?;
     for (id, offered) in &incoming.agents {
         if crate::app_support::is_builtin_agent(id) {
             continue;
@@ -424,7 +460,7 @@ fn compatible_library(current: &Library, incoming: &Library) -> Result<(), Admit
             ));
         }
     }
-    Ok(())
+    Ok(rebind)
 }
 
 /// The offered record of a built-in Agent: checked against this Home's seed by
@@ -556,7 +592,7 @@ pub(super) fn commit(
         HANDOFF_ONESHOT_SCOPE.into(),
         project_participants_scope(&wire.project),
     ]);
-    let ((replayed, oneshot, reused), basis) = writer.read_for_dispatch(
+    let ((replayed, oneshot, reused, rebind), basis) = writer.read_for_dispatch(
         &scopes.iter().map(String::as_str).collect::<Vec<_>>(),
         |store| {
             if let Some(original) = store.committed_record_snapshot(&scope, "receive")? {
@@ -583,7 +619,7 @@ pub(super) fn commit(
                         "receiving receipt has no matching committed Home facts",
                     ));
                 }
-                return Ok((true, None, BTreeSet::new()));
+                return Ok((true, None, BTreeSet::new(), BTreeMap::new()));
             }
             if retained_handoff(store, &wire.project)?.phase != HandoffPhase::Draft
                 || Library::rebuild(store)?
@@ -613,9 +649,9 @@ pub(super) fn commit(
                     )?,
                 ),
             };
-            compatible_library(&Library::rebuild(store)?, &incoming)?;
+            let rebind = compatible_library(&Library::rebuild(store)?, &incoming)?;
             let reused = matching_existing_scopes(store, wire)?;
-            Ok((false, oneshot, reused))
+            Ok((false, oneshot, reused, rebind))
         },
     )?;
     project_authority::receive(guard, wire, replayed)
@@ -658,12 +694,14 @@ pub(super) fn commit(
                     || !is_project_scope(&record.scope, &wire.project))
                 && !is_seeded_agent_reference(record)
         })
-        .map(|record| CommandRecordFact {
-            scope_id: record.scope.clone(),
-            kind: record.kind.clone(),
-            payload: record.payload.clone(),
+        .map(|record| {
+            Ok(CommandRecordFact {
+                scope_id: record.scope.clone(),
+                kind: record.kind.clone(),
+                payload: rebound_placement(record, &rebind)?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, AdmitError>>()?;
     let mut state = HandoffState::default();
     for command in [
         HandoffCommand::OfferHandoff,

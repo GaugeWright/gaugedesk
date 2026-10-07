@@ -250,9 +250,6 @@ fn valid_component(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
-/// The longest file name APFS, ext4 and NTFS all accept.
-const MAX_FILE_NAME_BYTES: usize = 255;
-
 /// A device's recipient keys, one per account signed in on it.
 ///
 /// Each account gets its own key because each is a separate trusted device of
@@ -276,13 +273,10 @@ impl LinkRecipientStore {
     /// instead, under a prefix no hex name can carry; every name that fit
     /// before is kept, so keys already held still open.
     fn path(&self, account: &str) -> PathBuf {
-        let legacy = format!("{}.recipient", hex::encode(account));
-        if legacy.len() <= MAX_FILE_NAME_BYTES {
-            return self.dir.join(legacy);
-        }
-        let digest: [u8; 32] = Sha256::digest(account.as_bytes()).into();
-        self.dir
-            .join(format!("sha256-{}.recipient", hex::encode(digest)))
+        self.dir.join(crate::key_store::fitted_file_name(
+            account.as_bytes(),
+            ".recipient",
+        ))
     }
 
     /// Load or create `account`'s recipient key on this device and return its
@@ -547,7 +541,10 @@ mod tests {
         assert_eq!(store.open(&long).unwrap().public_key(), first);
         let name = store.path(&long);
         let name = name.file_name().unwrap().to_str().unwrap();
-        assert!(name.len() <= MAX_FILE_NAME_BYTES, "{name}");
+        assert!(
+            name.len() <= crate::key_store::MAX_FILE_NAME_BYTES,
+            "{name}"
+        );
         assert!(name.starts_with("sha256-"), "{name}");
         assert_ne!(store.ensure(&format!("{long}0")).unwrap(), first);
 

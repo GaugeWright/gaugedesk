@@ -3540,6 +3540,65 @@ fn resolve_incoming_handoff(store: &mut Store, project: &str, outcome: &str) {
     );
 }
 
+/// A consented offer this Home could not admit. `failed` is already an outcome
+/// the origin's in-doubt reconciliation reads as a no; the reason is what this
+/// Home's own accept surface shows.
+fn resolve_incoming_handoff_failed(store: &mut Store, project: &str, source: &str, reason: &str) {
+    let _ = store.append_record(
+        HANDOFF_INCOMING_SCOPE,
+        "event",
+        &serde_json::json!({
+            "op": "resolved",
+            "project": project,
+            "source": source,
+            "outcome": "failed",
+            "reason": reason,
+        })
+        .to_string(),
+    );
+}
+
+/// The latest outcome of an incoming offer for `project` from `source`, with
+/// the reason a failed one records.
+fn incoming_handoff_result(
+    store: &Store,
+    project: &str,
+    source: &str,
+) -> Option<(String, Option<String>)> {
+    let mut result = None;
+    for payload in store
+        .records(HANDOFF_INCOMING_SCOPE, "event")
+        .unwrap_or_default()
+    {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if v.get("project").and_then(|p| p.as_str()) != Some(project) {
+            continue;
+        }
+        if v.get("source")
+            .and_then(|p| p.as_str())
+            .is_some_and(|recorded| recorded != source)
+        {
+            continue;
+        }
+        match v.get("op").and_then(|o| o.as_str()) {
+            Some("offer") => result = Some(("pending".to_string(), None)),
+            Some("resolved") => {
+                result = Some((
+                    v.get("outcome")
+                        .and_then(|o| o.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    v.get("reason").and_then(|r| r.as_str()).map(str::to_owned),
+                ))
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
 /// What became of an incoming offer for `project`, from this authority's own record.
 ///
 /// `None` means never seen — which is the one negative safe to act on, because it
@@ -3879,22 +3938,51 @@ fn project_commands_match_log(
 #[path = "federation_incoming_handoff.rs"]
 mod incoming_handoff;
 
+/// Why a receiving admission did not commit: `refused` when this Home decided
+/// no (it will decide the same on every retry), with the sentence to show.
+struct ReceivingFailure {
+    refused: bool,
+    reason: String,
+}
+
+impl ReceivingFailure {
+    fn verdict(&self) -> serde_json::Value {
+        let mut verdict = if self.refused {
+            refused_verdict(&self.reason)
+        } else {
+            serde_json::json!({ "ok": false, "reason": self.reason })
+        };
+        verdict["committed"] = false.into();
+        verdict["pending"] = false.into();
+        verdict
+    }
+}
+
 fn commit_incoming_handoff(
     guard: &mut Workbench,
     wire: &HandoffWire,
     consent: incoming_handoff::Consent,
-) -> bool {
+) -> Result<(), ReceivingFailure> {
     match incoming_handoff::commit(guard, wire, consent) {
         Ok(()) => {
             // Folder whips launched on the origin arrive with the project; the
             // Home's supervisor steps them from here under their launchers'
             // standing (DR-0191). Wake it now rather than at the next sweep.
             guard.hint_project_workflows(crate::project_workflow::project_hint(&wire.project));
-            true
+            Ok(())
         }
         Err(error) => {
             tracing::warn!(?error, project = %wire.project, "handoff receiving admission failed");
-            false
+            Err(match error {
+                gaugedesk_store::AdmitError::Rejected(rejection) => ReceivingFailure {
+                    refused: true,
+                    reason: rejection.reason.to_string(),
+                },
+                _ => ReceivingFailure {
+                    refused: false,
+                    reason: "this Home could not admit the project".to_string(),
+                },
+            })
         }
     }
 }
@@ -4053,20 +4141,36 @@ fn admit_handoff(wb: &SharedWorkbench, wire: &HandoffWire) -> serde_json::Value 
                 }
             };
             if preauth || oneshot || received {
-                let committed = commit_incoming_handoff(
+                match commit_incoming_handoff(
                     &mut guard,
                     wire,
                     incoming_handoff::Consent::Preauthorized,
-                );
-                (
-                    serde_json::json!({
-                        "ok": committed,
-                        "committed": committed,
-                        "pending": false,
-                        "home": committed.then(|| guard.federation_home_id()),
-                    }),
-                    committed,
-                )
+                ) {
+                    Ok(()) => (
+                        serde_json::json!({
+                            "ok": true,
+                            "committed": true,
+                            "pending": false,
+                            "home": guard.federation_home_id(),
+                        }),
+                        true,
+                    ),
+                    Err(failure) => {
+                        // Nobody is waiting on a pending offer here: the person
+                        // consented up front, so the refusal is recorded where
+                        // this Home's own surfaces read it, and named to the
+                        // origin, instead of only in a log line.
+                        if !received {
+                            resolve_incoming_handoff_failed(
+                                guard.store_mut(),
+                                &wire.project,
+                                &wire.source,
+                                &failure.reason,
+                            );
+                        }
+                        (failure.verdict(), false)
+                    }
+                }
             } else {
                 // Fail-closed: record a pending offer (log + content) for explicit
                 // consent (INV-13); the bytes wait with the offer until the host accepts.
@@ -4910,21 +5014,30 @@ pub async fn get_invite_status(
     let id = q.get("id").cloned().unwrap_or_default();
     let guard = wb.lock_unpoisoned();
     let pending = pending_invite(guard.store_ref(), &id).is_some();
-    // Surface the latest accepted_by, if any.
+    // Surface the latest accepted_by, if any, and a relocation the accepted
+    // invite did not complete.
     let mut accepted_by: Option<String> = None;
+    let mut relocation_error: Option<String> = None;
     for payload in guard
         .store_ref()
         .records(INVITE_OUTGOING_SCOPE, "event")
         .unwrap_or_default()
     {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-            if v.get("invite_id").and_then(|x| x.as_str()) == Some(id.as_str())
-                && v.get("op").and_then(|o| o.as_str()) == Some("accepted")
-            {
-                accepted_by = v
-                    .get("accepted_by")
-                    .and_then(|a| a.as_str())
-                    .map(str::to_string);
+            if v.get("invite_id").and_then(|x| x.as_str()) != Some(id.as_str()) {
+                continue;
+            }
+            match v.get("op").and_then(|o| o.as_str()) {
+                Some("accepted") => {
+                    accepted_by = v
+                        .get("accepted_by")
+                        .and_then(|a| a.as_str())
+                        .map(str::to_string);
+                }
+                Some("relocation_failed") => {
+                    relocation_error = v.get("error").and_then(|e| e.as_str()).map(str::to_string);
+                }
+                _ => {}
             }
         }
     }
@@ -4935,6 +5048,7 @@ pub async fn get_invite_status(
             "pending": pending,
             "accepted": accepted_by.is_some(),
             "accepted_by": accepted_by,
+            "relocation_error": relocation_error,
             "confirm_code": invite_confirm_code(&id),
         })),
     )
@@ -4997,7 +5111,29 @@ async fn invite_receive_once(
             .unwrap_or_default();
         if !project.is_empty() {
             if disposition == InviteDisposition::Relocate {
-                let (_status, _body) = drive_relocate(wb, &project, &peer).await;
+                let (status, body) = drive_relocate(wb, &project, &peer).await;
+                // The person who sent the invite is watching its status, not
+                // this receiver's return value: record a relocation that did
+                // not happen where that status is read.
+                if !status.is_success() {
+                    let error = body
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("the relocation did not complete")
+                        .to_string();
+                    tracing::warn!(%project, %error, "invited relocation did not complete");
+                    let _ = wb.lock_unpoisoned().store_mut().append_record(
+                        INVITE_OUTGOING_SCOPE,
+                        "event",
+                        &serde_json::json!({
+                            "op": "relocation_failed",
+                            "invite_id": wire.invite_id,
+                            "project": project,
+                            "error": error,
+                        })
+                        .to_string(),
+                    );
+                }
             } else {
                 distribute_authored_home_routes(wb);
             }
@@ -5049,6 +5185,45 @@ fn admit_invite_accept(wb: &SharedWorkbench, wire: &InviteAcceptWire) -> serde_j
     };
     spawn_peer_receivers(wb, AuthorityId::new(wire.ticket.authority.as_str()));
     serde_json::json!({ "ok": true, "project": project, "disposition": disposition })
+}
+
+enum InvitedSetup {
+    Committed,
+    Failed(String),
+    /// Not settled within the wait: the origin is still sending the project.
+    Pending,
+}
+
+/// How long an invite accept follows the relocation it consented to. Content
+/// travels in the offer, so a large project can outlast it; that reads as
+/// `pending`, never as success.
+const INVITED_SETUP_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn await_invited_relocation(
+    wb: &SharedWorkbench,
+    project: &str,
+    origin: &str,
+) -> InvitedSetup {
+    let deadline = tokio::time::Instant::now() + INVITED_SETUP_WAIT;
+    loop {
+        let result = {
+            let guard = wb.lock_unpoisoned();
+            incoming_handoff_result(guard.store_ref(), project, origin)
+        };
+        match result {
+            Some((outcome, _)) if outcome == "committed" => return InvitedSetup::Committed,
+            Some((outcome, reason)) if outcome == "failed" => {
+                return InvitedSetup::Failed(
+                    reason.unwrap_or_else(|| "the project was not admitted".to_string()),
+                )
+            }
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return InvitedSetup::Pending;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -5167,18 +5342,49 @@ pub async fn post_invite_accept(
                 .into_response(),
         };
     match sent {
-        Ok(v) if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "project": invite.project,
-                "project_name": invite.project_name,
-                "origin": origin.as_str(),
-                "disposition": invite.disposition,
-                "confirm_code": invite.confirm_code,
-            })),
-        )
-            .into_response(),
+        Ok(v) if v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) => {
+            // The origin relocates only after it answers, so "the origin
+            // accepted" is not yet "the project is set up here". Follow this
+            // Home's own record of the relocation it consented to, so a project
+            // this Home then refuses is reported here instead of as accepted.
+            let setup = if invite.disposition == InviteDisposition::Relocate {
+                await_invited_relocation(&wb, &invite.project, origin.as_str()).await
+            } else {
+                InvitedSetup::Committed
+            };
+            if let InvitedSetup::Failed(reason) = setup {
+                // The request itself completed — the two computers are now
+                // paired — so this answers `200` with `ok: false`, the shape
+                // the accept surface reads as a sentence to show.
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "paired": true,
+                        "project": invite.project,
+                        "origin": origin.as_str(),
+                        "reason": format!("this computer could not set up the project: {reason}"),
+                    })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "project": invite.project,
+                    "project_name": invite.project_name,
+                    "origin": origin.as_str(),
+                    "disposition": invite.disposition,
+                    "confirm_code": invite.confirm_code,
+                    "setup": match setup {
+                        InvitedSetup::Committed => "committed",
+                        _ => "pending",
+                    },
+                })),
+            )
+                .into_response()
+        }
         // The origin answered and declined. A stale or already-consumed invite,
         // or an acceptance whose key did not sign the invite id, is the origin
         // *deciding* — identically on every retry — so it answers `403` and
@@ -6158,7 +6364,7 @@ pub async fn post_handoff_accept(
     headers: axum::http::HeaderMap,
     Json(req): Json<HandoffConsentRequest>,
 ) -> impl IntoResponse {
-    let (committed, notify) = {
+    let notify = {
         let mut guard = wb.lock_unpoisoned();
         // ITGOV-3(c): accepting a handoff relocates a project's home onto this org — a governance
         // action. In enterprise mode it must be driven by an authenticated **active member**
@@ -6183,17 +6389,19 @@ pub async fn post_handoff_accept(
         if let Err(reason) = verify_handoff(&guard, &wire) {
             return (StatusCode::FORBIDDEN, reason).into_response();
         }
-        let committed =
-            commit_incoming_handoff(&mut guard, &wire, incoming_handoff::Consent::Pending);
-        if committed {
-            guard.take_accepted_project(&headers, &req.project);
+        if let Err(failure) =
+            commit_incoming_handoff(&mut guard, &wire, incoming_handoff::Consent::Pending)
+        {
+            let status = if failure.refused {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return (status, format!("handoff not admitted: {}", failure.reason)).into_response();
         }
-        let notify = handoff_notify_material(&guard, &req.source);
-        (committed, notify)
+        guard.take_accepted_project(&headers, &req.project);
+        handoff_notify_material(&guard, &req.source)
     };
-    if !committed {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "handoff commit failed").into_response();
-    }
     notify_origin(notify, HandoffMsgKind::Committed, &req.project).await;
     let guard = wb.lock_unpoisoned();
     let s = load_handoff(guard.store_ref(), &req.project);
@@ -6261,7 +6469,8 @@ pub async fn post_handoff_accept_all(
                 continue;
             }
             let committed =
-                commit_incoming_handoff(&mut guard, &wire, incoming_handoff::Consent::Pending);
+                commit_incoming_handoff(&mut guard, &wire, incoming_handoff::Consent::Pending)
+                    .is_ok();
             if committed {
                 notifies.push((handoff_notify_material(&guard, &source), project.clone()));
                 accepted.push(project);

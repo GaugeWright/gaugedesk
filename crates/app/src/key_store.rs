@@ -13,6 +13,26 @@ use sha2::{Digest, Sha256};
 
 use crate::workbench_state::Workbench;
 
+/// The longest file name APFS, ext4 and NTFS all accept.
+pub(crate) const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// The file (or directory) name a key store keeps `id`'s key under: `id` in
+/// hex followed by `suffix`. An id longer than about 125 bytes — an account
+/// named by its 65-byte public key, say — makes that name pass the 255-byte
+/// file-name limit, so the key could never be created ("File name too long").
+/// A name that would not fit is the id's SHA-256 instead, under a `sha256-`
+/// prefix no hex name can carry. Every name that fit before is unchanged, so
+/// keys already held still open, and a name that did not fit was never
+/// written, so there is no older long name to read.
+pub(crate) fn fitted_file_name(id: &[u8], suffix: &str) -> String {
+    let plain = format!("{}{suffix}", hex::encode(id));
+    if plain.len() <= MAX_FILE_NAME_BYTES {
+        return plain;
+    }
+    let digest: [u8; 32] = Sha256::digest(id).into();
+    format!("sha256-{}{suffix}", hex::encode(digest))
+}
+
 /// Resolve the signing key for an authority. Real signing paths (the relay
 /// constructing a federated envelope, the challenge/response handshake) take a
 /// `&dyn KeyStore` and never see raw key material beyond the `SigningKey`.
@@ -52,9 +72,9 @@ impl FileKeyStore {
 
     fn path(&self, authority: &AuthorityId) -> PathBuf {
         // authority ids are scope segments (no path separators); hex-namespace to
-        // be safe against odd characters.
+        // be safe against odd characters, hashed when that would not fit.
         self.dir
-            .join(format!("{}.key", hex::encode(authority.as_str())))
+            .join(fitted_file_name(authority.as_str().as_bytes(), ".key"))
     }
 
     /// Enroll a specific key for an authority (overwrites). Used by tests and by
@@ -205,6 +225,29 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(store.existing_signing_key(&authority).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_long_authority_id_gets_a_hashed_name_and_reloads_its_key() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileKeyStore::new(root.path());
+        let short = AuthorityId::new("acme");
+        assert_eq!(
+            store.path(&short).file_name().unwrap(),
+            format!("{}.key", hex::encode("acme")).as_str()
+        );
+        let long = AuthorityId::new("a".repeat(130));
+        let name = store.path(&long);
+        let name = name.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("sha256-") && name.len() <= MAX_FILE_NAME_BYTES,
+            "{name}"
+        );
+        let first = store.random_signing_key(&long).unwrap();
+        let reloaded = FileKeyStore::new(root.path())
+            .existing_signing_key(&long)
+            .unwrap();
+        assert_eq!(first.public_key(), reloaded.public_key());
     }
 
     #[test]

@@ -19,6 +19,21 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- The desktop publishes this computer's directory entry for an account with a
+  long id again. Minting the account's keys failed with "File name too long",
+  because their folder was named after the id in hex; a name that would pass
+  the file-name limit is now the id's SHA-256, and every shorter name is
+  unchanged, so keys already held still open.
+- A project handed off from a computer whose built-in Default Agent is at a
+  different version — one upgraded from an earlier release, sent to a fresh
+  install — is now set up on the receiving computer with its own Default Agent.
+  Since 0.8.0 it was refused with "incoming project pins a built-in Agent
+  version this Home does not hold".
+- Accepting a handoff invitation no longer reports the project as set up when
+  the receiving computer then refuses it. The accept now says why the project
+  was not set up, and the sending computer's project pane shows the same
+  reason instead of waiting.
+
 ## [0.8.3] — 2026-10-07
 
 - A personal account on the desktop can accept a project invite again. The

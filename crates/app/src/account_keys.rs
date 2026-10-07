@@ -12,7 +12,8 @@
 //! - this computer's **device key**, with the root's delegation to it. That
 //!   one is this computer's alone.
 //!
-//! The files sit under `<root>/keys/accounts/<hex(account)>/`, each written
+//! The files sit under `<root>/keys/accounts/<hex(account)>/` (or
+//! `sha256-<digest>/` when the hex name would pass the file-name limit), each written
 //! once with owner-only permissions, as the install's own key store keeps its
 //! keys. A computer holding the root can always delegate to its own device key
 //! again, so a lapsed delegation is renewed here rather than by enrolling.
@@ -54,7 +55,8 @@ impl AccountKeyStore {
     }
 
     fn account_dir(&self, account: &str) -> PathBuf {
-        self.dir.join(hex::encode(account.as_bytes()))
+        self.dir
+            .join(crate::key_store::fitted_file_name(account.as_bytes(), ""))
     }
 
     /// The account's keys, if this computer holds them. A delegation that has

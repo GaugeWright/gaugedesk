@@ -2981,3 +2981,168 @@ async fn delete(app: &Router, uri: &str) -> (StatusCode, Value) {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
 }
+
+/// Republish `id`'s current version on `wb` as `current + 1`, as an upgraded
+/// Home's built-in migration does (the Default Agent's task-filing ability
+/// is version 2 on a Home seeded before it existed, and version 1 on a fresh
+/// install), and pin every placement in `project` to it.
+fn republish_on(wb: &Arc<Mutex<Workbench>>, id: &str, project: &str) -> u64 {
+    let mut agent = library_record(wb, "agent", "id", id).unwrap();
+    let current = agent["current_version"].as_u64().unwrap_or(1);
+    let next = current + 1;
+    let frozen = agent["versions"][current.to_string()].clone();
+    agent["versions"][next.to_string()] = frozen;
+    agent["current_version"] = json!(next);
+    agent["op"] = json!("upsert");
+    let mut guard = wb.lock().unwrap();
+    guard
+        .store_mut()
+        .append_record("library", "agent", &agent.to_string())
+        .unwrap();
+    let placements: Vec<Value> = guard
+        .store_ref()
+        .records("library", "instance")
+        .unwrap()
+        .into_iter()
+        .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
+        .filter(|value| value["project_id"] == project && value["agent_id"] == id)
+        .collect();
+    for mut placement in placements {
+        placement["version"] = json!(next);
+        guard
+            .store_mut()
+            .append_record("library", "instance", &placement.to_string())
+            .unwrap();
+    }
+    guard.rebuild_library();
+    next
+}
+
+/// The demo failure: a project from a Home whose built-in Default Agent is at
+/// version 2, accepted through an invite on a fresh Home holding version 1.
+/// The receiving Home binds the placement to its own seed's current version
+/// instead of refusing, and the accept reports the project set up only once
+/// it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invited_project_pinning_another_built_in_version_binds_to_the_receivers_own() {
+    let (broker, _relay) = start_broker().await;
+    let (alice, alice_wb, _ra) = seeded_instance("alice", &broker);
+    let (bob, bob_wb, _rb) = seeded_instance("bob", &broker);
+
+    let (status, created) = post(&alice, "/projects", json!({ "name": "Acme" })).await;
+    assert!(status.is_success(), "create project: {status} {created}");
+    let project = created["id"].as_str().unwrap().to_owned();
+    let general = format!("inst-general-{project}");
+    let pinned = republish_on(&alice_wb, "agent-default", &project);
+    let bob_default = library_record(&bob_wb, "agent", "id", "agent-default").unwrap();
+    let bob_version = bob_default["current_version"].as_u64().unwrap_or(1);
+    assert_ne!(
+        pinned, bob_version,
+        "the two Homes number the built-in differently"
+    );
+
+    let (status, invite) = post(&alice, "/federation/invite", json!({ "project": project })).await;
+    assert_eq!(status, StatusCode::OK, "{invite}");
+    let (status, accepted) = post(
+        &bob,
+        "/federation/invite/accept",
+        json!({ "invite": invite["invite_url"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    assert_eq!(accepted["setup"], "committed", "{accepted}");
+
+    let placement = library_record(&bob_wb, "instance", "id", &general).unwrap();
+    assert_eq!(placement["agent_id"], "agent-default");
+    assert_eq!(
+        placement["version"].as_u64(),
+        Some(bob_version),
+        "the placement runs bob's own published Default"
+    );
+    assert_eq!(
+        library_record(&bob_wb, "agent", "id", "agent-default").unwrap(),
+        bob_default,
+        "bob's seed is never written over"
+    );
+}
+
+/// A project the receiving Home refuses after the invite is accepted is
+/// reported as refused on both sides — the accept no longer answers success
+/// while the admission fails behind it. An ordinary Agent whose identity
+/// conflicts with the receiver's is still refused, as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invited_project_the_receiver_refuses_is_reported_on_both_sides() {
+    let (broker, _relay) = start_broker().await;
+    let (alice, alice_wb, _ra) = seeded_instance("alice", &broker);
+    let (bob, bob_wb, _rb) = seeded_instance("bob", &broker);
+
+    let (_, created) = post(&alice, "/projects", json!({ "name": "Globex" })).await;
+    let project = created["id"].as_str().unwrap().to_owned();
+    let (status, agent) = post(&alice, "/archetypes", json!({ "name": "Analyst" })).await;
+    assert!(status.is_success(), "create Agent: {status} {agent}");
+    let agent_id = agent["id"].as_str().unwrap().to_owned();
+    let (status, body) = post(
+        &alice,
+        &format!("/projects/{project}/placements"),
+        json!({ "agent_id": agent_id }),
+    )
+    .await;
+    assert!(status.is_success(), "place Agent: {status} {body}");
+    // Bob already holds a different Agent under the same id.
+    let mut conflicting = library_record(&alice_wb, "agent", "id", &agent_id).unwrap();
+    conflicting["name"] = json!("Someone else's Analyst");
+    {
+        let mut guard = bob_wb.lock().unwrap();
+        guard
+            .store_mut()
+            .append_record("library", "agent", &conflicting.to_string())
+            .unwrap();
+        guard.rebuild_library();
+    }
+
+    let (status, invite) = post(&alice, "/federation/invite", json!({ "project": project })).await;
+    assert_eq!(status, StatusCode::OK, "{invite}");
+    let invite_id = invite["invite_id"].as_str().unwrap().to_owned();
+    let (status, accepted) = post(
+        &bob,
+        "/federation/invite/accept",
+        json!({ "invite": invite["invite_url"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(accepted["ok"], false, "{accepted}");
+    assert_eq!(accepted["paired"], true, "{accepted}");
+    let reason = accepted["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("conflicts with local authority"),
+        "the receiver names its refusal: {accepted}"
+    );
+    assert!(library_record(&bob_wb, "project", "id", &project).is_none());
+
+    // The origin rolled back and its invite says why.
+    let mut origin_error = Value::Null;
+    for _ in 0..50 {
+        let (_, status) = get(&alice, &format!("/federation/invite/status?id={invite_id}")).await;
+        if !status["relocation_error"].is_null() {
+            origin_error = status["relocation_error"].clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        origin_error
+            .as_str()
+            .is_some_and(|error| error.contains("conflicts with local authority")),
+        "the owner's pane can name the refusal: {origin_error}"
+    );
+    let (_, handoff) = get(
+        &alice,
+        &format!("/federation/handoff/status?project={project}"),
+    )
+    .await;
+    assert_ne!(
+        handoff["phase"], "committed",
+        "alice stays the project's Home"
+    );
+}

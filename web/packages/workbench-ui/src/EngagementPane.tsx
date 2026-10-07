@@ -120,7 +120,12 @@ export interface EngagementPaneApi {
         events: readonly { action: string; at: number; uses: number; detail: string }[];
     }>;
     invite(project: ProjectId, disposition?: "relocate" | "join"): Promise<EngagementInvite>;
-    inviteStatus(inviteId: string): Promise<{ accepted: boolean; accepted_by: string | null; confirm_code: string }>;
+    inviteStatus(inviteId: string): Promise<{
+        accepted: boolean;
+        accepted_by: string | null;
+        relocation_error?: string | null;
+        confirm_code: string;
+    }>;
     handoffAbort(project: ProjectId): Promise<HandoffStatus>;
     handoffRevoke(project: ProjectId, authority: string, owns: string): Promise<void>;
     placeRun(
@@ -385,6 +390,16 @@ export function EngagementPane(props: {
                     // forever. Follow the durable handoff projection through
                     // commit, which is the state the pane actually promises.
                     for (let settle = 0; settle < 60; settle++) {
+                        // A relocation the client then refused is recorded on
+                        // the invite; say so rather than waiting it out.
+                        const latest = await props.api.inviteStatus(invitation.invite_id);
+                        if (latest.relocation_error) {
+                            setStatus(
+                                `accepted by ${latest.accepted_by ?? "a device"}, but the project did not move: ${latest.relocation_error}`,
+                            );
+                            refetchAll();
+                            return;
+                        }
                         const handoff = await props.api.handoffStatus(props.project);
                         if (handoff.phase === "committed") {
                             await refetchHandoff();
