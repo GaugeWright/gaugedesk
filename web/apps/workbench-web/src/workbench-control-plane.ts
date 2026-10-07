@@ -553,6 +553,19 @@ export class WorkbenchControlPlane implements ControlPlane {
             : this.route;
     }
 
+    /** Federation lives on a Home, never on the blind Hub: the Hub composes no
+     * `/federation/*` route, and in split mode its transport withholds the
+     * Home admission the edge routes on. So in split mode every federation
+     * call goes to the Home serving the open project — over the relay when
+     * that Home is relay-only — with the same expired-admission retry as the
+     * rest of its work. Sent to the Hub, each one failed its CORS preflight on
+     * a 404, and People & sharing read "Loading access…" forever (2026-10-07). */
+    private federationJson(): RouteJson {
+        return this.splitHomes
+            ? (...args) => this.workTransport.json(...args)
+            : this.routeJson();
+    }
+
     private workbenchTransport(): workbenchClient.WorkbenchTransport {
         return this.workTransport;
     }
@@ -2269,11 +2282,11 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     mintPairingTicket(): Promise<federationClient.PairingTicket> {
-        return federationClient.mintPairingTicket(this.routeJson());
+        return federationClient.mintPairingTicket(this.federationJson());
     }
 
     pair(ticket: federationClient.PairingTicket): Promise<federationClient.FederationPeer> {
-        return federationClient.pair(this.routeJson(), ticket);
+        return federationClient.pair(this.federationJson(), ticket);
     }
 
     listPeers(): Promise<federationClient.FederationPeer[]> {
@@ -2282,19 +2295,19 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     revokePeer(authority: string): Promise<void> {
-        return federationClient.revokePeer(this.routeJson(), authority);
+        return federationClient.revokePeer(this.federationJson(), authority);
     }
 
     handoffAbort(project: ProjectId): Promise<federationClient.HandoffStatus> {
-        return federationClient.handoffAbort(this.routeJson(), project);
+        return federationClient.handoffAbort(this.federationJson(), project);
     }
 
     handoffStatus(project: ProjectId): Promise<federationClient.HandoffStatus> {
-        return federationClient.handoffStatus(this.routeJson(), project);
+        return federationClient.handoffStatus(this.federationJson(), project);
     }
 
     handoffRelocate(project: ProjectId, peer: string): Promise<federationClient.HandoffStatus> {
-        return federationClient.handoffRelocate(this.routeJson(), project, peer);
+        return federationClient.handoffRelocate(this.federationJson(), project, peer);
     }
 
     placeRun(
@@ -2306,7 +2319,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         targetChat?: string,
     ): Promise<federationClient.PlacedRun> {
         return federationClient.placeRun(
-            this.routeJson(),
+            this.federationJson(),
             peer,
             project,
             archetype,
@@ -2317,71 +2330,71 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     runQueue(): Promise<federationClient.QueuedRun[]> {
-        return federationClient.runQueue(this.routeJson());
+        return federationClient.runQueue(this.federationJson());
     }
 
     allowRuns(project: ProjectId, operator: string, allow = true): Promise<void> {
-        return federationClient.allowRuns(this.routeJson(), project, operator, allow);
+        return federationClient.allowRuns(this.federationJson(), project, operator, allow);
     }
 
     denyRun(correlation: string): Promise<void> {
-        return federationClient.denyRun(this.routeJson(), correlation);
+        return federationClient.denyRun(this.federationJson(), correlation);
     }
 
     admitRunOnce(correlation: string): Promise<void> {
-        return federationClient.admitRunOnce(this.routeJson(), correlation);
+        return federationClient.admitRunOnce(this.federationJson(), correlation);
     }
 
     runResult(correlation: string): Promise<federationClient.RunResult> {
-        return federationClient.runResult(this.routeJson(), correlation);
+        return federationClient.runResult(this.federationJson(), correlation);
     }
 
     invite(project: ProjectId): Promise<federationClient.EngagementInvite> {
-        return federationClient.invite(this.routeJson(), project);
+        return federationClient.invite(this.federationJson(), project);
     }
 
     inviteAccept(invite: string): Promise<federationClient.InviteAcceptResult> {
-        return federationClient.inviteAccept(this.routeJson(), invite);
+        return federationClient.inviteAccept(this.federationJson(), invite);
     }
 
     inviteStatus(inviteId: string): Promise<federationClient.InviteStatus> {
-        return federationClient.inviteStatus(this.routeJson(), inviteId);
+        return federationClient.inviteStatus(this.federationJson(), inviteId);
     }
 
     handoffIncoming(): Promise<federationClient.IncomingHandoff[]> {
-        return federationClient.handoffIncoming(this.routeJson());
+        return federationClient.handoffIncoming(this.federationJson());
     }
 
     handoffAccept(project: string, source: string): Promise<federationClient.HandoffStatus> {
-        return federationClient.handoffAccept(this.routeJson(), project, source);
+        return federationClient.handoffAccept(this.federationJson(), project, source);
     }
 
     handoffDecline(project: string, source: string): Promise<void> {
-        return federationClient.handoffDecline(this.routeJson(), project, source);
+        return federationClient.handoffDecline(this.federationJson(), project, source);
     }
 
     handoffAcceptAll(): Promise<string[]> {
-        return federationClient.handoffAcceptAll(this.routeJson());
+        return federationClient.handoffAcceptAll(this.federationJson());
     }
 
     handoffPreauth(peer: string, allow = true): Promise<void> {
-        return federationClient.handoffPreauth(this.routeJson(), peer, allow);
+        return federationClient.handoffPreauth(this.federationJson(), peer, allow);
     }
 
     handoffParticipants(project: ProjectId): Promise<federationClient.Participant[]> {
-        return federationClient.handoffParticipants(this.routeJson(), project);
+        return federationClient.handoffParticipants(this.federationJson(), project);
     }
 
     handoffRevoke(project: ProjectId, authority: string, owns: string): Promise<void> {
-        return federationClient.handoffRevoke(this.routeJson(), project, authority, owns);
+        return federationClient.handoffRevoke(this.federationJson(), project, authority, owns);
     }
 
     handoffConnectData(project: ProjectId, handle: string, label?: string): Promise<void> {
-        return federationClient.handoffConnectData(this.routeJson(), project, handle, label);
+        return federationClient.handoffConnectData(this.federationJson(), project, handle, label);
     }
 
     handoffData(project: ProjectId): Promise<federationClient.ConnectedData[]> {
-        return federationClient.handoffData(this.routeJson(), project);
+        return federationClient.handoffData(this.federationJson(), project);
     }
 
     // Account-level facilities + the tenant switcher (ADR 0077 §7/§9) — the hosted

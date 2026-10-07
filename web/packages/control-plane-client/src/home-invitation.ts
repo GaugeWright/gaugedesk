@@ -119,6 +119,23 @@ export async function acceptHomeInvitation(
     return { ...parseHomeInvitation(encoded), admission: value.admission };
 }
 
+/** What a Home with no endpoint of its own — a desktop reached only through
+ * the relay — says when asked to share a project. Its relay admits only the
+ * accounts signed in on that computer, not a project's invited members
+ * (DR-0332, WS-587), so an invitation it minted could never be accepted. The
+ * Home's own refusal carries the same words. */
+export const RELAY_ONLY_INVITATION =
+    "this project is on a computer that others reach only through the relay, which does not "
+    + "yet admit invited people; move the project to a hosted Home to share it";
+
+/** Inviting to a project whose Home has no endpoint to give the invitee. */
+export class RelayOnlyHomeInvitationError extends Error {
+    constructor() {
+        super(RELAY_ONLY_INVITATION);
+        this.name = "RelayOnlyHomeInvitationError";
+    }
+}
+
 /** Owner/admin command. This uses the already-admitted Home transport. It
  * names exactly one recipient: an account chosen from the organization, or an
  * email address the accepting account must hold verified (DR-0332). */
@@ -131,6 +148,7 @@ export async function createHomeInvitation(
         readonly role?: "member" | "viewer";
     },
 ): Promise<CreatedHomeInvitation> {
+    if (!input.endpoint.trim()) throw new RelayOnlyHomeInvitationError();
     const value = (await json("POST", "/home/invitations", {
         ...(input.email !== undefined ? { email: input.email } : { authority: input.authority }),
         project: input.project,

@@ -166,6 +166,9 @@ pub(crate) async fn serve_relay_crossings(
 ) -> std::io::Result<std::net::SocketAddr> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    // The desktop's own broker reaches this Home here too (see
+    // `account_signin::selected_home_transport`).
+    wb.lock_unpoisoned().relay_crossings = Some(address);
     let router = crate::relay_route_stack::relay_control_plane(wb, accounts);
     tokio::spawn(async move {
         // With the peer address, as the operator's listener is served: the
@@ -863,6 +866,70 @@ mod reachability_tests {
         let (status, body) = carried(client, "GET", "/workspace", &admitted).await;
         assert_eq!(status, 401, "a revoked admission does no work: {body}");
         tasks.iter().for_each(|task| task.abort());
+    }
+
+    /// GaugeDesk 0.8.1: the account's only Home was this desktop's own,
+    /// reachable from elsewhere only through the relay, and the desktop's
+    /// broker dialed it through the relay — asking the relay to splice the
+    /// computer to itself — so Panel settings and People & sharing loaded
+    /// forever. The broker reaches its own Home on the crossing listener
+    /// instead, without the Hub's routes or the relay, and the call is served
+    /// as the account, as a crossing is.
+    #[tokio::test]
+    async fn the_broker_reaches_its_own_home_without_the_relay() {
+        let root = tempfile::tempdir().expect("root");
+        let wb = crate::open_workbench(root.path()).expect("workbench");
+        crate::account_signin::store_session_for_test(&wb);
+        crate::home_owner::claim_if_never_claimed(&wb).expect("owner");
+        let home = wb.lock_unpoisoned().home_id().as_str().to_owned();
+        // Nothing answers here: a broker that consulted the Hub's routes, or
+        // dialed a relay, would fail rather than name an address.
+        let hub = "http://127.0.0.1:9";
+        let crossings = serve_relay_crossings(wb.clone(), std::sync::Arc::new(FakeHub))
+            .await
+            .expect("relay router");
+        let (endpoint, other) = {
+            let wb = wb.clone();
+            let home = home.clone();
+            tokio::task::spawn_blocking(move || {
+                let mine = crate::account_signin::selected_home_direct_for_test(
+                    &wb,
+                    hub,
+                    "owner-bearer",
+                    &home,
+                    "account-root",
+                );
+                let other = crate::account_signin::selected_home_direct_for_test(
+                    &wb,
+                    hub,
+                    "owner-bearer",
+                    "home:somewhere-else",
+                    "account-root",
+                );
+                (mine, other)
+            })
+            .await
+            .expect("broker")
+        };
+        assert_eq!(
+            endpoint.expect("its own Home needs no route"),
+            Some(format!("http://{crossings}"))
+        );
+        assert!(other.is_err(), "another Home is still found by its route");
+
+        let owner = [("authorization", "Bearer owner-bearer")];
+        let (status, body) = carried(crossings, "POST", "/home/admissions", &owner).await;
+        assert_eq!(status, 201, "the account is admitted: {body}");
+        let reply: serde_json::Value =
+            serde_json::from_str(body.split("\r\n\r\n").nth(1).expect("a body")).expect("json");
+        assert_eq!(reply["home"], home.as_str());
+        let admission = reply["admission"].as_str().expect("an admission");
+        let admitted = [
+            ("authorization", "Bearer owner-bearer"),
+            ("x-gaugewright-home-admission", admission),
+        ];
+        let (status, body) = carried(crossings, "GET", "/workspace", &admitted).await;
+        assert_eq!(status, 200, "the account works on its own Home: {body}");
     }
 
     /// An account the Hub recognises but that is not signed in on this

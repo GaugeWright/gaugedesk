@@ -358,6 +358,51 @@ describe("hosted Home bootstrap", () => {
         expect(workHeaders.get("x-gaugewright-home-admission")).toBe("home-token");
     });
 
+    it("sends federation to the admitted Home, never to the blind Hub", async () => {
+        // The Hub composes no `/federation/*` route. Sent there without the
+        // Home admission, People & sharing's reads failed their preflight on a
+        // 404 and the page read "Loading access…" forever (2026-10-07).
+        const calls: Array<[string, RequestInit | undefined]> = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            calls.push([url, init]);
+            if (url === "https://hub.example/account/homes") {
+                return new Response(JSON.stringify({
+                    homes: [{ id: "home:cloud", kind: "cloud", endpoint: "https://home.example" }],
+                    selected_home: "home:cloud",
+                }));
+            }
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({ routes: [] }));
+            }
+            if (url === "https://home.example/home/admissions") {
+                return new Response(JSON.stringify({ home: "home:cloud", admission: "home-token" }), { status: 201 });
+            }
+            if (url === "https://home.example/federation/handoff/participants?project=proj-a") {
+                return new Response(JSON.stringify({ participants: [] }));
+            }
+            if (url.startsWith("https://home.example/federation/handoff/status?project=proj-a")) {
+                return new Response(JSON.stringify({ project: "proj-a", phase: "draft", home_origin: true, home_target: false, target_has_log: false }));
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("account-token");
+
+        await api.handoffParticipants("proj-a" as never);
+        await api.handoffStatus("proj-a" as never);
+
+        const federation = calls.filter(([url]) => url.includes("/federation/"));
+        expect(federation.map(([url]) => new URL(url).origin)).toEqual([
+            "https://home.example",
+            "https://home.example",
+        ]);
+        for (const [, init] of federation) {
+            expect(new Headers(init?.headers).get("x-gaugewright-home-admission")).toBe("home-token");
+        }
+        expect(calls.some(([url]) => url.startsWith("https://hub.example/federation/"))).toBe(false);
+    });
+
     it("reuses the selected Home admission when switching unrouted projects", async () => {
         const calls: string[] = [];
         vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

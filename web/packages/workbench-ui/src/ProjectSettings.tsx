@@ -155,10 +155,10 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
     const [pendingCancel, setPendingCancel] = createSignal<string | null>(null);
     const [status, setStatus] = createSignal("");
     const [busy, setBusy] = createSignal(false);
-    const activePeers = () => (peers() ?? []).filter((candidate) => candidate.active);
+    const activePeers = () => ((peers.error ? undefined : peers()) ?? []).filter((candidate) => candidate.active);
     const availableCandidates = createMemo(() => availableProjectShareCandidates(
         shareDirectory()?.candidates ?? [],
-        participants() ?? [],
+        (participants.error ? undefined : participants()) ?? [],
     ));
 
     const run = async (action: () => Promise<void>, success: string) => {
@@ -250,6 +250,7 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
     return <>
         <section class="project-settings-section">
             <ProjectPageHeader title="People with access" description="Access is granted by the Project Host and can be revoked here." />
+            <Show when={!participants.error} fallback={<div class="project-settings-empty project-settings-empty-action" data-access-error><span>Access could not be loaded.</span><button type="button" onClick={() => setRefresh((value) => value + 1)}>Retry</button></div>}>
             <Show when={!participants.loading} fallback={<p class="project-settings-empty">Loading access…</p>}>
                 <div class="project-settings-rows">
                     <For each={(participants() ?? []).filter((participant) => !participant.revoked)} fallback={<p class="project-settings-empty">No additional participants.</p>}>
@@ -266,6 +267,7 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
                         </div>}
                     </For>
                 </div>
+            </Show>
             </Show>
         </section>
 
@@ -335,7 +337,7 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
         </section>
 
         <section class="project-settings-section">
-            <ProjectPageHeader title="Project Host" description={handoff()?.home === "target" ? "This project's Home is held by the destination." : "Move this project's Home to a paired, trusted device."}
+            <ProjectPageHeader title="Project Host" description={(handoff.error ? undefined : handoff())?.home === "target" ? "This project's Home is held by the destination." : "Move this project's Home to a paired, trusted device."}
                 action={props.onOpenEngagement && <button type="button" data-project-engagement onClick={props.onOpenEngagement}>Paired devices…</button>} />
             <Show when={activePeers().length > 0} fallback={<p class="project-settings-empty">No paired device is available for handoff.</p>}>
                 <div class="project-settings-form project-settings-handoff-form">

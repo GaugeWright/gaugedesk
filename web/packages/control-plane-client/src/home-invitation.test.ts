@@ -6,6 +6,8 @@ import {
     emailHomeInvitation,
     listPendingHomeInvitations,
     parseHomeInvitation,
+    RELAY_ONLY_INVITATION,
+    RelayOnlyHomeInvitationError,
     resendHomeInvitation,
 } from "./home-invitation";
 
@@ -88,6 +90,23 @@ describe("ordinary Home invitations", () => {
             authority: "account:invitee",
             project: "proj-1",
         }));
+    });
+
+    it("refuses before asking when the Home is reached only through the relay", async () => {
+        const route = vi.fn();
+        for (const recipient of [{ authority: "account:invitee" }, { email: "alex@example.test" }]) {
+            await expect(createHomeInvitation(route, {
+                ...recipient,
+                project: "proj-1" as never,
+                endpoint: "",
+            })).rejects.toBeInstanceOf(RelayOnlyHomeInvitationError);
+        }
+        await expect(createHomeInvitation(route, {
+            authority: "account:invitee",
+            project: "proj-1" as never,
+            endpoint: "   ",
+        })).rejects.toThrow(RELAY_ONLY_INVITATION);
+        expect(route).not.toHaveBeenCalled();
     });
 
     it("carries an email invitation's address and no account until it is accepted", async () => {

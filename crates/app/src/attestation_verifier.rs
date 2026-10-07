@@ -179,7 +179,8 @@ impl QuoteVerifier for LoopbackVerifier {
 ///
 /// **Test-only (CONF-8).** It is `#[cfg(test)]`-gated so a production build cannot
 /// even name it, let alone select this fail-open verifier; a real placement uses
-/// [`LoopbackVerifier`] or a real TEE verifier (e.g. `SevSnpVerifier`).
+/// [`LoopbackVerifier`] or a real TEE verifier (e.g. `SevSnpVerifier`, in gaugewright-cloud
+/// `attestation/src/sev_snp_verifier.rs`).
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StubVerifier;

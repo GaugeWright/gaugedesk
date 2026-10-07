@@ -19,6 +19,25 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-10-07
+
+- In GaugeDesk in a browser, Project Settings → People & sharing loads again.
+  Its access list, Project Host status and every other federation request went
+  to the Hub, which serves none of them, so the list read "Loading access…"
+  forever. They now go to the Home serving the project, over the relay when
+  that Home is reachable only through it, and a list that cannot be read says
+  so with a Retry.
+- On a desktop whose account's Home is that desktop itself, reachable from
+  elsewhere only through the relay, Panel agent settings and People & sharing
+  no longer load forever: the desktop reaches its own Home directly instead of
+  dialing itself through the relay. Provider links also sync again for an
+  account whose id made its device key's file name too long for macOS.
+- Inviting someone to a project on a desktop that others reach only through
+  the relay now says why it cannot be done yet, instead of failing with
+  "valid invite fields required". That relay admits only the accounts signed
+  in on the computer, so an invitation could never have been accepted. Share
+  the project from a hosted Home instead.
+
 ## [0.8.1] — 2026-10-07
 
 - The mobile app now finds a Machine that is reachable only through the relay.

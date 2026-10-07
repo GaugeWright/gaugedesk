@@ -26,6 +26,13 @@ const INVITATION_VERSION: u32 = 1;
 const DEFAULT_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// Said when the inviting Home has no endpoint and is reached only through the
+/// relay. desk's `RELAY_ONLY_INVITATION` says the same before asking, so a
+/// client that checks first and one that does not read alike.
+const RELAY_ONLY_REFUSAL: &str = "this project is on a computer that others reach only \
+    through the relay, which does not yet admit invited people; move the project to a \
+    hosted Home to share it";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum InvitationStatus {
@@ -260,6 +267,14 @@ async fn create_invitation(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invite either an account or an email address",
         );
+    }
+    // A Home with no endpoint of its own is reached only through the relay,
+    // and the relay admits only accounts signed in on its computer (DR-0328
+    // §6), not a project's invited members (DR-0332, WS-587). An invitation
+    // minted here could never be accepted, so say why instead of sending a
+    // link that fails for the person it is for.
+    if body.endpoint.trim().is_empty() {
+        return json_error(StatusCode::CONFLICT, RELAY_ONLY_REFUSAL);
     }
     if body.project.trim().is_empty()
         || !crate::account_routes::secure_home_endpoint(&body.endpoint)
@@ -1170,6 +1185,36 @@ mod tests {
             let (status, response) = invite(&wb, body.clone(), None).await;
             assert_eq!(status, expected, "{body} -> {response}");
         }
+    }
+
+    /// A desktop Home reached only through its relay sends an empty endpoint.
+    /// The relay does not yet admit invited members (WS-587), so the Home says
+    /// so plainly and mints nothing, rather than a link that cannot be accepted
+    /// or the generic field refusal it used to give.
+    #[tokio::test]
+    async fn a_relay_only_home_refuses_to_mint_an_invitation_it_cannot_honour() {
+        let (_dir, wb) = email_fixture();
+        for body in [
+            json!({ "email": "invitee@example.test", "project": "proj-mine", "endpoint": "" }),
+            json!({ "authority": "invitee", "project": "proj-mine", "endpoint": "  " }),
+        ] {
+            let (status, response) = invite(&wb, body.clone(), None).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body} -> {response}");
+            assert_eq!(response["error"], RELAY_ONLY_REFUSAL, "{body}");
+        }
+        assert!(
+            current_invitations(wb.lock_unpoisoned().store_ref()).is_empty(),
+            "a refused invitation leaves no record behind"
+        );
+        // An endpoint that is present but not secure is still a malformed field.
+        let (status, _) = invite(
+            &wb,
+            json!({ "authority": "invitee", "project": "proj-mine",
+                    "endpoint": "http://owner-home.example" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

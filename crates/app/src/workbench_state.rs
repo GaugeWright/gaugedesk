@@ -136,6 +136,10 @@ pub struct Workbench {
     /// The session each account's relay crossings are served under.
     pub(crate) relay_sessions:
         std::collections::BTreeMap<String, Option<crate::desktop_session::DesktopUiSession>>,
+    /// Where this Home serves the callers its relay leg carries, once it
+    /// serves them. The desktop's broker reaches its own Home here rather than
+    /// dialing itself through the relay, which never completes.
+    pub(crate) relay_crossings: Option<std::net::SocketAddr>,
     /// Opaque Hub sessions authenticate a durable GaugeDesk account before any
     /// organization-specific membership decision.
     pub(crate) account_sessions: Arc<crate::account_session::AccountSessionStore>,
@@ -474,6 +478,7 @@ impl Workbench {
             idp: None,
             desktop_ui_session: None,
             relay_sessions: Default::default(),
+            relay_crossings: None,
             account_sessions: Arc::new(crate::account_session::AccountSessionStore::new()),
             audit_sink: None,
             audit_signer: None,

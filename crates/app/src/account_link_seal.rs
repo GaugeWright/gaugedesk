@@ -250,6 +250,9 @@ fn valid_component(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
+/// The longest file name APFS, ext4 and NTFS all accept.
+const MAX_FILE_NAME_BYTES: usize = 255;
+
 /// A device's recipient keys, one per account signed in on it.
 ///
 /// Each account gets its own key because each is a separate trusted device of
@@ -266,8 +269,20 @@ impl LinkRecipientStore {
         Self { dir: dir.into() }
     }
 
+    /// Where `account`'s key lives. The name was the account id in hex, which
+    /// for an account named by its 65-byte public key is 270 bytes and past
+    /// the 255-byte file-name limit, so the key could never be created
+    /// ("File name too long"). A name that would not fit is the id's SHA-256
+    /// instead, under a prefix no hex name can carry; every name that fit
+    /// before is kept, so keys already held still open.
     fn path(&self, account: &str) -> PathBuf {
-        self.dir.join(format!("{}.recipient", hex::encode(account)))
+        let legacy = format!("{}.recipient", hex::encode(account));
+        if legacy.len() <= MAX_FILE_NAME_BYTES {
+            return self.dir.join(legacy);
+        }
+        let digest: [u8; 32] = Sha256::digest(account.as_bytes()).into();
+        self.dir
+            .join(format!("sha256-{}.recipient", hex::encode(digest)))
     }
 
     /// Load or create `account`'s recipient key on this device and return its
@@ -516,6 +531,31 @@ mod tests {
             assert_eq!(mode(dir.path().join("account-link")), 0o700);
             assert_eq!(mode(store.path("acct-a")), 0o600);
         }
+    }
+
+    /// An account named by its uncompressed P-256 key is 130 hex characters,
+    /// so its key's name in hex was 270 bytes and macOS refused to create it
+    /// ("File name too long", GaugeDesk 0.8.1). It is held under a digest,
+    /// while a short account keeps the name its key was always held under.
+    #[test]
+    fn an_account_with_a_long_id_still_holds_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LinkRecipientStore::new(dir.path().join("account-link"));
+        let long = format!("04{}", "d9".repeat(64));
+        assert_eq!(long.len(), 130);
+        let first = store.ensure(&long).unwrap();
+        assert_eq!(store.open(&long).unwrap().public_key(), first);
+        let name = store.path(&long);
+        let name = name.file_name().unwrap().to_str().unwrap();
+        assert!(name.len() <= MAX_FILE_NAME_BYTES, "{name}");
+        assert!(name.starts_with("sha256-"), "{name}");
+        assert_ne!(store.ensure(&format!("{long}0")).unwrap(), first);
+
+        let short = store.path("acct-a");
+        assert_eq!(
+            short.file_name().unwrap().to_str().unwrap(),
+            format!("{}.recipient", hex::encode("acct-a"))
+        );
     }
 
     /// Writes the Rust half of the cross-language vector. Run with

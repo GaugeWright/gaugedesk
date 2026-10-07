@@ -823,6 +823,40 @@ enum SignedHomeTransport {
     Relay(crate::home::OpaqueRelayLocator),
 }
 
+/// The selected Home may be the one this desktop serves itself: a relay-only
+/// desktop Home is the account's Home, and its route names the relay. Dialing
+/// that route from here asks the relay to splice this computer to itself, which
+/// never completes, and every call to it waited forever (GaugeDesk 0.8.1). The
+/// broker goes straight to the listener the relay leg splices into instead, so
+/// the call is admitted and served exactly as a crossing would be, under the
+/// account the Hub names, without leaving the computer.
+fn own_home_crossings(wb: &SharedWorkbench, home: &str) -> Option<String> {
+    let guard = wb.lock_unpoisoned();
+    if guard.home_id().as_str() != home {
+        return None;
+    }
+    guard
+        .relay_crossings
+        .map(|address| format!("http://{address}"))
+}
+
+/// Where the broker would send work for `home`, when that is an address.
+#[cfg(test)]
+pub(crate) fn selected_home_direct_for_test(
+    wb: &SharedWorkbench,
+    hub: &str,
+    bearer: &str,
+    home: &str,
+    person: &str,
+) -> Result<Option<String>, String> {
+    Ok(
+        match selected_home_transport(wb, hub, bearer, home, person)? {
+            SelectedHomeTransport::Direct(endpoint) => Some(endpoint),
+            SelectedHomeTransport::Relay(_) => None,
+        },
+    )
+}
+
 fn selected_home_transport(
     wb: &SharedWorkbench,
     hub: &str,
@@ -830,6 +864,9 @@ fn selected_home_transport(
     home: &str,
     person: &str,
 ) -> Result<SelectedHomeTransport, String> {
+    if let Some(endpoint) = own_home_crossings(wb, home) {
+        return Ok(SelectedHomeTransport::Direct(endpoint));
+    }
     let signed = match selected_signed_routes(wb, hub, bearer, person) {
         Ok(routes) => {
             let mut selected = None;

@@ -400,64 +400,6 @@ pub struct Admission {
     pub can_manage: bool,
 }
 
-/// Every page a definition serves, for the settings assistant: its model must
-/// carry a `guide` — what the page is, its controls by the labels the person
-/// sees, and for each command it declares what the command does, which control
-/// it stands for and an example payload `validate` admits. Command ids and raw
-/// JSON alone left the assistant guessing what a person meant: asked to "turn
-/// on collect results", it chose an ability. Each definition's tests call this.
-#[cfg(test)]
-pub(crate) fn assert_pages_are_guided<D: GaugeAppDefinition>(pages: &[Page]) {
-    use crate::gaugeapp_contract::{GaugeAppClient, GaugeAppScope};
-    assert!(!pages.is_empty(), "{}: no pages to check", D::LABEL);
-    for page in pages {
-        let guide = &page.model["guide"];
-        let at = format!("{} page {}", D::LABEL, page.id);
-        assert!(
-            guide["page"].as_str().is_some_and(|text| !text.is_empty()),
-            "{at}: guide.page"
-        );
-        assert!(guide["controls"].is_object(), "{at}: guide.controls");
-        let commands = guide["commands"]
-            .as_object()
-            .unwrap_or_else(|| panic!("{at}: guide.commands"));
-        let declared: std::collections::BTreeSet<&str> = page.commands.iter().copied().collect();
-        let described: std::collections::BTreeSet<&str> =
-            commands.keys().map(String::as_str).collect();
-        assert_eq!(
-            declared, described,
-            "{at}: every declared command, and only those, is described"
-        );
-        for (command, entry) in commands {
-            for field in ["does", "control"] {
-                assert!(
-                    entry[field].as_str().is_some_and(|text| !text.is_empty()),
-                    "{at}: {command}.{field}"
-                );
-            }
-            let envelope = GaugeAppCommandEnvelope {
-                session_id: String::new(),
-                generation: String::new(),
-                app: D::APP,
-                scope: GaugeAppScope {
-                    kind: D::SCOPE.into(),
-                    id: String::new(),
-                },
-                page_id: page.id.into(),
-                command_id: command.clone(),
-                expected_basis: String::new(),
-                idempotency_key: String::new(),
-                payload: entry["payload"].clone(),
-                client: GaugeAppClient::Agent,
-            };
-            assert!(
-                D::validate(&envelope).is_ok(),
-                "{at}: {command}'s example payload is refused"
-            );
-        }
-    }
-}
-
 /// One page of a GaugeApp: its read model and the commands it declares.
 pub struct Page {
     pub id: &'static str,
@@ -2041,6 +1983,64 @@ fn publish_terminal(live: &Option<GaugeAppAgentLiveTurn>, reason: &GaugeAppAgent
             GaugeAppAgentLiveEvent::Failed
         };
         let _ = live.publish(event);
+    }
+}
+
+/// Every page a definition serves, for the settings assistant: its model must
+/// carry a `guide` — what the page is, its controls by the labels the person
+/// sees, and for each command it declares what the command does, which control
+/// it stands for and an example payload `validate` admits. Command ids and raw
+/// JSON alone left the assistant guessing what a person meant: asked to "turn
+/// on collect results", it chose an ability. Each definition's tests call this.
+#[cfg(test)]
+pub(crate) fn assert_pages_are_guided<D: GaugeAppDefinition>(pages: &[Page]) {
+    use crate::gaugeapp_contract::{GaugeAppClient, GaugeAppScope};
+    assert!(!pages.is_empty(), "{}: no pages to check", D::LABEL);
+    for page in pages {
+        let guide = &page.model["guide"];
+        let at = format!("{} page {}", D::LABEL, page.id);
+        assert!(
+            guide["page"].as_str().is_some_and(|text| !text.is_empty()),
+            "{at}: guide.page"
+        );
+        assert!(guide["controls"].is_object(), "{at}: guide.controls");
+        let commands = guide["commands"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{at}: guide.commands"));
+        let declared: std::collections::BTreeSet<&str> = page.commands.iter().copied().collect();
+        let described: std::collections::BTreeSet<&str> =
+            commands.keys().map(String::as_str).collect();
+        assert_eq!(
+            declared, described,
+            "{at}: every declared command, and only those, is described"
+        );
+        for (command, entry) in commands {
+            for field in ["does", "control"] {
+                assert!(
+                    entry[field].as_str().is_some_and(|text| !text.is_empty()),
+                    "{at}: {command}.{field}"
+                );
+            }
+            let envelope = GaugeAppCommandEnvelope {
+                session_id: String::new(),
+                generation: String::new(),
+                app: D::APP,
+                scope: GaugeAppScope {
+                    kind: D::SCOPE.into(),
+                    id: String::new(),
+                },
+                page_id: page.id.into(),
+                command_id: command.clone(),
+                expected_basis: String::new(),
+                idempotency_key: String::new(),
+                payload: entry["payload"].clone(),
+                client: GaugeAppClient::Agent,
+            };
+            assert!(
+                D::validate(&envelope).is_ok(),
+                "{at}: {command}'s example payload is refused"
+            );
+        }
     }
 }
 

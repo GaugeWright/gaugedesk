@@ -172,7 +172,7 @@
     /* Two faces (GaugeWright DR-0072), split on whether a person operates a
        string or reads it at length. --serif and --ui alias the chrome face
        because chrome is most of this app; --prose is used only for message
-       text in the chat log (GaugeWright DR-0229), and a rendered Markdown file
+       text in the chat log (GaugeWright DR-0245), and a rendered Markdown file
        is chrome.
        Code surfaces stay monospace via --mono. */
     --font-chrome: var(--gw-default-font-chrome);
@@ -598,7 +598,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* Rendered markdown (the View tab for .md files). Overrides the .filebody
    plain-text posture: proportional type, document spacing; code spans/blocks
    drop back to the mono treatment. The file view is set in the chrome face —
-   IBM Plex Serif is used only for chat message text (GaugeWright DR-0229) — and
+   IBM Plex Serif is used only for chat message text (GaugeWright DR-0245) — and
    the chrome face ships no bold, so its headings, table heads and strong are
    regular, and headings step by size. */
 .filebody.markdown-body { white-space: normal; font-family: var(--font-chrome); font-size: var(--fs-body);
