@@ -68,6 +68,7 @@ fn office_action_identity_needs_no_local_account_session_and_never_changes_actor
     assert!(crate::account_session::durable_evidence(
         &store,
         "source",
+        "alice",
         crate::account::session_now_ms()
     )
     .unwrap()

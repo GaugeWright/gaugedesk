@@ -16,6 +16,7 @@ import { createEffect, createMemo, createResource, createSignal, Show } from "so
 import { PanelContractEditor } from "./PanelContractEditor";
 import { Option } from "./PanelAgentControls";
 import { AbilityPresets, defaultModelLabel, ModelSelect, optionalAbilities } from "./agent-controls";
+import { PUBLIC_ABILITY_CHOICES } from "./panel-agent-presentation";
 import type { ModelOption } from "./model-picker";
 
 export { AGENT_ABILITY_PRESETS, optionalAbilities, presetAbilities } from "./agent-controls";
@@ -31,6 +32,12 @@ import {
  *  plain sentence (#2). The raw JSON is only the Advanced surface now, so we tell
  *  the user *what's wrong* in their terms rather than leaking the parser's object. */
 export function plainConfigError(raw: string): string {
+    const ungranted = /public ability `([^`]+)` is not granted to the authored agent/.exec(raw);
+    if (ungranted) {
+        const name = PUBLIC_ABILITY_CHOICES.find((choice) => choice.value === ungranted[1])?.name ?? ungranted[1];
+        return `Visitors can't be given “${name}” because the agent itself doesn't have it. `
+            + "Give the agent that ability under Abilities, or untick it for visitors.";
+    }
     if (/package-owned|\.whipple\/draft/i.test(raw)) {
         return "Behavior and tools are package-owned — change them in an edit chat, then publish.";
     }
@@ -161,12 +168,18 @@ export function AgentSettings(props: AgentSettingsProps) {
 
     async function save() {
         try {
-            if (props.kind === "panel") {
-                const profile = panel();
-                if (!profile) throw new Error("Panel profile is still loading.");
-                await props.api.setPanelProfile(props.id, profile);
-            }
-            await props.api.setArchetypeAbilities(props.id, abilities());
+            // A Panel profile's public abilities must be within the agent's own
+            // abilities as saved. When this save widens the agent to make room
+            // for a visitor ability, the agent's abilities go first; otherwise
+            // the profile does, so narrowing both at once is admitted too.
+            const profile = props.kind === "panel" ? panel() : null;
+            if (props.kind === "panel" && !profile) throw new Error("Panel profile is still loading.");
+            const saved = loadedAbilities() ?? [];
+            const abilitiesFirst = profile !== null
+                && profile.public_abilities.some((ability) => !saved.includes(ability));
+            if (abilitiesFirst) await props.api.setArchetypeAbilities(props.id, abilities());
+            if (profile) await props.api.setPanelProfile(props.id, profile);
+            if (!abilitiesFirst) await props.api.setArchetypeAbilities(props.id, abilities());
             await props.api.setArchetypeConfig(props.id, text());
             setPanelDirty(false);
             setRaw(null);

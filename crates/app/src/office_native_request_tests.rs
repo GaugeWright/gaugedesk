@@ -171,6 +171,7 @@ async fn native_staff_share_one_home_and_outage_neither_admits_new_staff_nor_ren
     assert!(crate::account_session::durable_evidence(
         guard.store_ref(),
         &crate::account_session::session_id(ALICE),
+        "alice",
         crate::account::session_now_ms()
     )
     .unwrap()

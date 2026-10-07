@@ -445,6 +445,30 @@ impl AccountAuth {
         Ok(state)
     }
 
+    /// [`rebuild_current`](Self::rebuild_current) restricted to one account,
+    /// read in proportion to that account rather than to every account the
+    /// store holds (WS-849). The catalog is read strictly, so an unreadable
+    /// fence refuses. A migrated account's standing comes from its own scope
+    /// alone, which is why the legacy scope is not read for it; a fenced
+    /// account projects nothing, exactly as the full rebuild removes it.
+    pub fn rebuild_for_account(store: &Store, account_id: &str) -> Result<Self, AdmitError> {
+        let catalog =
+            crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild_retained(store)?;
+        let custody = catalog.account(account_id);
+        let mut state = Self::default();
+        if custody.reads_account_scope() {
+            if custody.may_authenticate() {
+                let scope = crate::account_auth_custody::account_auth_scope(account_id)
+                    .map_err(|_| AdmitError::Codec("invalid account-auth scope identity".into()))?;
+                state.fold_scope(store, &scope)?;
+            }
+        } else {
+            state.fold_scope(store, ACCOUNT_AUTH_SCOPE)?;
+        }
+        state.retain_account(account_id);
+        Ok(state)
+    }
+
     fn fold_scope(&mut self, store: &Store, scope: &str) -> Result<(), AdmitError> {
         for row in store.records(scope, ROOT_CUSTODY_KIND)? {
             let record: CustodiedAccountRootRecord = serde_json::from_str(&row)?;
@@ -504,6 +528,24 @@ impl AccountAuth {
             fold(&mut self.sessions, record.id.clone(), record.op, record);
         }
         Ok(())
+    }
+
+    fn retain_account(&mut self, account_id: &str) {
+        self.roots.retain(|_, record| record.id == account_id);
+        self.emails
+            .retain(|_, record| record.account_id == account_id);
+        self.webauthn_methods
+            .retain(|_, record| record.account_id == account_id);
+        self.external_subjects
+            .retain(|_, record| record.account_id == account_id);
+        self.recovery_batches
+            .retain(|_, record| record.account_id == account_id);
+        self.recovery_codes
+            .retain(|_, record| record.account_id == account_id);
+        self.recovery_attempts
+            .retain(|_, record| record.account_id.as_deref() == Some(account_id));
+        self.sessions
+            .retain(|_, record| record.account_id == account_id);
     }
 
     fn remove_account(&mut self, account_id: &str) {
@@ -1778,6 +1820,17 @@ mod tests {
         assert_eq!(after_erasure.methods_for("bob").emails.len(), 1);
     }
 
+    /// WS-849: one account's narrow projection is exactly the full projection
+    /// restricted to that account, whatever its custody standing.
+    fn assert_narrow_rebuild_matches(store: &Store, account_ids: &[&str]) {
+        for account_id in account_ids {
+            let mut full = AccountAuth::rebuild_current(store).unwrap();
+            full.retain_account(account_id);
+            let narrow = AccountAuth::rebuild_for_account(store, account_id).unwrap();
+            assert_eq!(format!("{narrow:?}"), format!("{full:?}"), "{account_id}");
+        }
+    }
+
     #[test]
     fn custody_catalog_selects_current_reads_and_writes_per_account() {
         use crate::account_auth_custody::{
@@ -1840,6 +1893,7 @@ mod tests {
             BTreeSet::from(["alice".to_owned(), "bob".to_owned()])
         );
         let bob_email_count = current.methods_for("bob").emails.len();
+        assert_narrow_rebuild_matches(&store, &["alice", "bob", "nobody"]);
 
         let copying = crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild(&store)
             .unwrap()
@@ -1859,6 +1913,7 @@ mod tests {
                 .append_record(&fact.scope_id, &fact.kind, &fact.payload)
                 .unwrap();
         }
+        assert_narrow_rebuild_matches(&store, &["alice", "bob"]);
         let migrated = crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild(&store)
             .unwrap()
             .account("alice");
@@ -1891,6 +1946,12 @@ mod tests {
             1
         );
         let fenced = AccountAuth::rebuild_current(&store).unwrap();
+        assert_narrow_rebuild_matches(&store, &["alice", "bob"]);
+        assert!(AccountAuth::rebuild_for_account(&store, "alice")
+            .unwrap()
+            .methods_for("alice")
+            .emails
+            .is_empty());
         assert!(fenced.methods_for("alice").emails.is_empty());
         assert_eq!(fenced.methods_for("bob").emails.len(), bob_email_count);
         assert!(!fenced.account_ids().contains("alice"));

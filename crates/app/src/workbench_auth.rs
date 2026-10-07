@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
+use crate::app_support::LockUnpoisoned;
 use crate::{identity, net_http, org, resource_store, throttle, Workbench};
 
 /// Whether this deployment is the hosted **web account** (`ADR 0077`) — the control-plane hub at
@@ -278,24 +279,55 @@ impl Workbench {
         .ok()?;
         let issuer = claims.get("iss")?.as_str()?;
         let subject = claims.get("sub")?.as_str()?;
-        let state = crate::account_auth::AccountAuth::rebuild(self.store_ref()).ok()?;
         // The link names its connection, and the identifier it is stored under
         // covers connection, issuer and subject together, so trying each consumer
         // connection cannot match one identity to another's account.
-        crate::auth_oidc::CONSUMER_PROVIDERS
-            .iter()
-            .find_map(|provider| {
-                let link = state.active_external_subject(
-                    provider.connection_id,
-                    issuer,
-                    subject,
-                    crate::account_auth::ExternalSubjectKind::ConsumerOidc,
-                )?;
-                state
-                    .roots
-                    .contains_key(&link.account_id)
-                    .then(|| link.account_id.clone())
-            })
+        let linked = |state: &crate::account_auth::AccountAuth| {
+            crate::auth_oidc::CONSUMER_PROVIDERS
+                .iter()
+                .find_map(|provider| {
+                    let link = state.active_external_subject(
+                        provider.connection_id,
+                        issuer,
+                        subject,
+                        crate::account_auth::ExternalSubjectKind::ConsumerOidc,
+                    )?;
+                    state
+                        .roots
+                        .contains_key(&link.account_id)
+                        .then(|| link.account_id.clone())
+                })
+        };
+        let key = (issuer.to_owned(), subject.to_owned());
+        let hinted = self
+            .linked_subject_hints
+            .lock_unpoisoned()
+            .get(&key)
+            .cloned();
+        if let Some(account_id) = hinted {
+            let confirmed = crate::account_auth::AccountAuth::rebuild_for_account(
+                self.store_ref(),
+                &account_id,
+            )
+            .ok()
+            .and_then(|state| linked(&state))
+            .filter(|linked| *linked == account_id);
+            if confirmed.is_some() {
+                return confirmed;
+            }
+        }
+        let state = crate::account_auth::AccountAuth::rebuild(self.store_ref()).ok()?;
+        let found = linked(&state);
+        let mut hints = self.linked_subject_hints.lock_unpoisoned();
+        match &found {
+            Some(account_id) => {
+                hints.insert(key, account_id.clone());
+            }
+            None => {
+                hints.remove(&key);
+            }
+        }
+        found
     }
 
     /// Resolve an opaque account session and enforce its durable trusted-device
@@ -325,9 +357,13 @@ impl Workbench {
         let (account_id, method, cache_expires_secs) =
             self.account_sessions.resolve_bounds(token)?;
         let session_ref = crate::account_session::session_id(token);
-        let (durable_account, mut evidence) =
-            crate::account_session::durable_evidence(self.store_ref(), &session_ref, now_ms)
-                .ok()??;
+        let (durable_account, mut evidence) = crate::account_session::durable_evidence(
+            self.store_ref(),
+            &session_ref,
+            &account_id,
+            now_ms,
+        )
+        .ok()??;
         if durable_account != account_id || evidence.method != method {
             return None;
         }
@@ -2386,6 +2422,43 @@ mod id_token_bearer_tests {
             true,
         );
         assert_eq!(who(&wb, &token).as_deref(), Some("account-root-key"));
+    }
+
+    /// WS-849: the remembered account for an identity is only a candidate.
+    /// Revoking the link ends it at once, and relinking it to another account
+    /// moves it, whatever the hint last named.
+    #[test]
+    fn a_remembered_link_is_rechecked_on_every_use() {
+        let token = id_token(GOOGLE, "google-subject-1");
+        let (_root, wb) = hub(&[&token]);
+        link(
+            &wb,
+            "first",
+            "google-subject-1",
+            AuthMethodStatus::Active,
+            true,
+        );
+        assert_eq!(who(&wb, &token).as_deref(), Some("first"));
+        assert_eq!(who(&wb, &token).as_deref(), Some("first"));
+
+        link(
+            &wb,
+            "second",
+            "google-subject-1",
+            AuthMethodStatus::Active,
+            true,
+        );
+        assert_eq!(who(&wb, &token).as_deref(), Some("second"));
+        assert_eq!(who(&wb, &token).as_deref(), Some("second"));
+
+        link(
+            &wb,
+            "second",
+            "google-subject-1",
+            AuthMethodStatus::Revoked,
+            true,
+        );
+        assert_eq!(who(&wb, &token).as_deref(), Some(EMAIL));
     }
 
     /// Task reads and governed actions use the authenticated action context.

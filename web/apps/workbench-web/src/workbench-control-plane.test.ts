@@ -46,6 +46,31 @@ describe("desktop-only route placement (WS-675)", () => {
     });
 });
 
+describe("engagement invites", () => {
+    afterEach(() => vi.unstubAllGlobals());
+    it.each(["relocate", "join"] as const)("sends the %s disposition the pane asked for", async (disposition) => {
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        const bodies: unknown[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            if (url !== "http://127.0.0.1:4919/federation/invite") throw new Error(`unexpected fetch ${url}`);
+            bodies.push(JSON.parse(String(init?.body)));
+            return new Response(JSON.stringify({
+                invite_id: "invite-1",
+                invite_url: "gaugewright://invite?d=00",
+                confirm_code: "1-2-3",
+                project: "proj-a",
+                disposition,
+            }));
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919");
+        await api.invite("proj-a" as ProjectId, disposition);
+        // "Add an operator" once minted a relocating invite: the wrapper
+        // dropped the disposition and the Home defaulted to relocate.
+        expect(bodies).toEqual([{ project: "proj-a", disposition }]);
+    });
+});
+
 describe("unpublished directory discovery (WS-675)", () => {
     afterEach(() => setDirectoryModuleLoader(null));
     it("reads once per route resolution, reusing the fallback until the project or account changes", async () => {

@@ -273,8 +273,20 @@ export function SettingsMenu(props: {
             ];
         }
         const supplied = props.gaugeAppActions;
+        // The Devices modal holds "Have an invite link?", the only way to accept
+        // a pasted gaugewright://invite besides an OS deep link, so it stays
+        // reachable whether or not GaugeApp pages replace local Settings.
+        const devices: AccountMenuItem = {
+            id: "devices",
+            label: "Add a device or party",
+            submenu: true,
+            run: () => {
+                setMenuOpen(false);
+                setDevicesOpen(true);
+            },
+        };
         const rows: AccountMenuItem[] = supplied
-            ? supplied().map((action) => ({
+            ? [...supplied().map((action) => ({
                 id: `gaugeapp-${action.id}`,
                 label: action.label,
                 submenu: true,
@@ -282,7 +294,7 @@ export function SettingsMenu(props: {
                     setMenuOpen(false);
                     action.open();
                 },
-            }))
+            })), devices]
             : [
                 {
                     id: "settings",
@@ -293,15 +305,7 @@ export function SettingsMenu(props: {
                         openSettingsAt("account");
                     },
                 },
-                {
-                    id: "devices",
-                    label: "Add a device or party",
-                    submenu: true,
-                    run: () => {
-                        setMenuOpen(false);
-                        setDevicesOpen(true);
-                    },
-                },
+                devices,
             ];
         if (accountAvailable() && props.analyticsAvailable && props.analyticsTenant?.()
             && props.api.productAnalyticsPolicy && props.api.productAnalyticsSetTenantDisabled) {

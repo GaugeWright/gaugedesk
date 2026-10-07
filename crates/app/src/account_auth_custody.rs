@@ -111,6 +111,24 @@ impl AccountAuthCustodyCatalog {
         Ok(catalog)
     }
 
+    /// [`rebuild`](Self::rebuild) for an authority decision: an unavailable
+    /// catalog row refuses the read, so an erasure fence cannot vanish and
+    /// leave its account able to authenticate.
+    pub fn rebuild_retained(store: &Store) -> Result<Self, AdmitError> {
+        let mut catalog = Self::default();
+        for row in store.retained_records(
+            crate::account_auth::ACCOUNT_AUTH_SCOPE,
+            ACCOUNT_AUTH_CUSTODY_KIND,
+        )? {
+            let record: AccountAuthCustodyRecord = serde_json::from_str(&row)?;
+            evolve(
+                catalog.accounts.entry(record.account_id).or_default(),
+                &record.event,
+            );
+        }
+        Ok(catalog)
+    }
+
     pub fn account(&self, account_id: &str) -> AccountAuthCustody {
         self.accounts.get(account_id).cloned().unwrap_or_default()
     }
@@ -190,6 +208,16 @@ impl AccountAuthCustody {
     /// Authentication fails closed as soon as the erasure fence is admitted.
     pub fn may_authenticate(&self) -> bool {
         matches!(self.erasure, ErasureStanding::Available)
+    }
+
+    /// Whether this account's independently keyed scope, not the legacy
+    /// global scope, is authoritative (the predicate behind
+    /// [`AccountAuthCustodyCatalog::account_scoped_account_ids`]).
+    pub fn reads_account_scope(&self) -> bool {
+        matches!(
+            self.migration,
+            MigrationStanding::Copying { .. } | MigrationStanding::Migrated { .. }
+        )
     }
 
     pub fn is_migrated(&self) -> bool {

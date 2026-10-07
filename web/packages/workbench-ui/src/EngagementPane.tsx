@@ -151,6 +151,7 @@ export function EngagementPane(props: {
     // while waiting for the client to accept on a fresh device.
     const [invite, setInvite] = createSignal<EngagementInvite | null>(null);
     const [accepted, setAccepted] = createSignal(false);
+    const [minting, setMinting] = createSignal(false);
     // The folder a non-Tauri (browser/e2e) host connects, since there is no native
     // picker there — an inline field stands in for the dialog.
     const [folder, setFolder] = createSignal("");
@@ -337,6 +338,16 @@ export function EngagementPane(props: {
     // Mint a combined invite for a *new* device (first contact, no prior pairing) and
     // poll until the client accepts — one link that pairs and hands off (ADR 0047).
     const inviteNewDevice = async (disposition: "relocate" | "join") => {
+        if (minting()) return;
+        // In hosted split mode this call crosses the relay to the project's
+        // Home, which can take several seconds. Say so at once: a click with
+        // no visible effect reads as a dead button (2026-10-07).
+        setMinting(true);
+        setStatus(
+            disposition === "join"
+                ? "creating the operator invite on this project's Home…"
+                : "creating the handoff invite on this project's Home…",
+        );
         try {
             const inv = await props.api.invite(props.project, disposition);
             setInvite(inv);
@@ -349,11 +360,16 @@ export function EngagementPane(props: {
             void pollInvite(inv);
         } catch (e) {
             setStatus(describeFailure("create the invite", e));
+        } finally {
+            setMinting(false);
         }
     };
     const pollInvite = async (invitation: EngagementInvite) => {
-        for (let i = 0; i < 60 && !accepted(); i++) {
-            await new Promise((r) => setTimeout(r, 1000));
+        // The origin's receiver waits for the invite's whole lifetime (an
+        // hour), and the client may take minutes to paste the link; stop
+        // following only when it is accepted or the invite is replaced.
+        for (let i = 0; i < 3600 && !accepted() && invite() === invitation; i++) {
+            await new Promise((r) => setTimeout(r, i < 60 ? 1000 : 3000));
             try {
                 const s = await props.api.inviteStatus(invitation.invite_id);
                 if (s.accepted) {
@@ -707,6 +723,7 @@ export function EngagementPane(props: {
                                                 type="button"
                                                 class="tree-action"
                                                 data-engagement-invite
+                                                disabled={minting()}
                                                 onClick={() => void inviteNewDevice("relocate")}
                                             >
                                                 Move Home to a new device
@@ -715,6 +732,7 @@ export function EngagementPane(props: {
                                                 type="button"
                                                 class="tree-action"
                                                 data-engagement-join
+                                                disabled={minting()}
                                                 onClick={() => void inviteNewDevice("join")}
                                             >
                                                 Add an operator

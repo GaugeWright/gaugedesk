@@ -19,6 +19,31 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-10-07
+
+- A personal account on the desktop can accept a project invite again. The
+  Devices window said the engagement did not satisfy "your organization's
+  placement policy" and kept Accept disabled, although no organization governs
+  a personal account: a route the desktop does not serve answered without the
+  header the window needs to read the answer, and the window took the failed
+  read as an organization policy it could not load.
+- The account menu offers "Add a device or party" again when signed in to
+  GaugeApps, so a client can paste a project invite link instead of relying
+  on the OS opening it.
+- In a project's Engagement pane, "Move Home to a new device" and "Add an
+  operator" now say at once that the invite is being created, and stay
+  disabled until it arrives, instead of appearing to do nothing while the
+  request crosses the relay to the project's Home. "Add an operator" now mints
+  an invite that keeps the Home where it is; it previously minted a handoff.
+  The pane keeps watching for the client's acceptance for the invite's whole
+  hour rather than giving up after a minute.
+
+- In Agent Settings, a Panel agent's visitor abilities can no longer fail to
+  save with a raw "not granted to the authored agent" error. An ability the
+  agent itself lacks is shown disabled with a note to give it to the agent
+  first; raising the agent's abilities and the visitors' together now saves;
+  and a refusal reads as a plain sentence.
+
 ## [0.8.2] — 2026-10-07
 
 - In GaugeDesk in a browser, Project Settings → People & sharing loads again.

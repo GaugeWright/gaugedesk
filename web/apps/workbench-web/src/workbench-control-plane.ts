@@ -2349,8 +2349,11 @@ export class WorkbenchControlPlane implements ControlPlane {
         return federationClient.runResult(this.federationJson(), correlation);
     }
 
-    invite(project: ProjectId): Promise<federationClient.EngagementInvite> {
-        return federationClient.invite(this.federationJson(), project);
+    invite(
+        project: ProjectId,
+        disposition: "relocate" | "join" = "relocate",
+    ): Promise<federationClient.EngagementInvite> {
+        return federationClient.invite(this.federationJson(), project, disposition);
     }
 
     inviteAccept(invite: string): Promise<federationClient.InviteAcceptResult> {

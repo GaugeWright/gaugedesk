@@ -40,13 +40,23 @@ pub struct AccountSessionEvidence {
 /// request authentication and retained action read bases consult this authority.
 /// Callers fence the legacy catalog, exact account-auth and account scopes in
 /// their dispatch basis. Unreadable authority rows never reveal older standing.
+///
+/// Only a session of `account_id` — the account the caller already holds for
+/// this bearer — is answered, and only that account's authority is read: both
+/// callers refuse a session of any other account, so reading every account's
+/// to find it would decide nothing more (WS-849).
 pub(crate) fn durable_evidence(
     store: &gaugedesk_store::Store,
     session_ref: &str,
+    account_id: &str,
     now_ms: u64,
 ) -> Result<Option<(String, AccountSessionEvidence)>, gaugedesk_store::AdmitError> {
-    store.retained_events(crate::account_auth::ACCOUNT_AUTH_SCOPE)?;
-    let auth = crate::account_auth::AccountAuth::rebuild(store)?;
+    let custody = crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild_retained(store)?
+        .account(account_id);
+    if !custody.reads_account_scope() {
+        store.retained_events(crate::account_auth::ACCOUNT_AUTH_SCOPE)?;
+    }
+    let auth = crate::account_auth::AccountAuth::rebuild_for_account(store, account_id)?;
     let Some(record) = auth.sessions.get(session_ref) else {
         return Ok(None);
     };

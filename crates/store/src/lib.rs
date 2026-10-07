@@ -2244,6 +2244,32 @@ impl Store {
         Ok(out)
     }
 
+    /// The decoded records of one `kind` for an authority fold. Like
+    /// [`Self::retained_events`], an unavailable record refuses the read instead
+    /// of disappearing, but only the named kind is read and decoded.
+    pub fn retained_records(&self, scope_id: &str, kind: &str) -> Result<Vec<String>, AdmitError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
+        )?;
+        let rows = stmt.query_map(params![scope_id, kind], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let payload = row?;
+            match &self.codec {
+                Some(codec) => match codec.decode(scope_id, kind, &payload) {
+                    Some(plain) => out.push(plain),
+                    None => {
+                        return Err(AdmitError::Codec(
+                            "authority history contains an unavailable record".into(),
+                        ))
+                    }
+                },
+                None => out.push(payload),
+            }
+        }
+        Ok(out)
+    }
+
     /// All decoded records of one `kind`, paired with the exact scope that owns
     /// each row. This is deliberately narrower than a general event scan: it is
     /// used by erasure cascades that must discover independently keyed child

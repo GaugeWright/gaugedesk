@@ -43,9 +43,12 @@ export function optionalAbilities(abilities: readonly AgentAbility[]): AgentAbil
     return abilities.filter((ability) => OPTIONAL_ABILITIES.includes(ability));
 }
 
+/** Why an option beyond the agent's own abilities is disabled. */
+export const BEYOND_AGENT_ABILITIES = "Give the agent this ability under its own Abilities first.";
+
 /** The four presets as one radio group. A preset beyond `ceiling` is
- *  disabled unless it is the current one. `children` adds the page's own
- *  optional abilities beneath. */
+ *  disabled unless it is the current one, and says why. `children` adds the
+ *  page's own optional abilities beneath. */
 export function AbilityPresets(props: {
     name: string;
     abilities: readonly AgentAbility[];
@@ -59,8 +62,11 @@ export function AbilityPresets(props: {
     return <div class="pa-options" role="radiogroup" aria-label="Abilities">
         <For each={AGENT_ABILITY_PRESETS}>{(preset) => {
             const checked = () => current() === JSON.stringify([...preset.value].sort());
+            const beyond = () => !checked() && !withinCeiling(preset.value);
             return <Option type="radio" name={props.name} checked={checked()}
-                disabled={!checked() && !withinCeiling(preset.value)}
+                disabled={beyond()}
+                title={beyond() ? BEYOND_AGENT_ABILITIES : undefined}
+                detail={beyond() ? BEYOND_AGENT_ABILITIES : undefined}
                 label={preset.name}
                 onChange={() => props.onChange([...preset.value])} />;
         }}</For>

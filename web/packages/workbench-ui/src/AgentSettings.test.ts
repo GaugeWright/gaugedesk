@@ -76,6 +76,15 @@ describe("plainConfigError", () => {
         );
     });
 
+    it("explains a visitor ability the agent itself does not have", () => {
+        const message = plainConfigError(
+            'Error: PUT /archetypes/agent-1/panel-profile: 422 {"error":"public ability `workspace.read` is not granted to the authored agent"}',
+        );
+        expect(message).toContain("“Read files”");
+        expect(message).toContain("Give the agent that ability under Abilities");
+        expect(message).not.toContain("422");
+    });
+
     it("routes package authority to the authored draft", () => {
         expect(plainConfigError("`policy` is package-owned; edit `.whipple/draft/package.json`")).toMatch(
             /package-owned/,

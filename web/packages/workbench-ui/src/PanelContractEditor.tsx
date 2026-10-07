@@ -25,7 +25,7 @@
 import { For, Show, type JSX } from "solid-js";
 import type { AgentAbility, PanelPublicProfile, PublicPanelComponent } from "@gaugewright/control-plane-client";
 import { Option } from "./PanelAgentControls";
-import { AbilityPresets, ModelSelect } from "./agent-controls";
+import { AbilityPresets, BEYOND_AGENT_ABILITIES, ModelSelect } from "./agent-controls";
 import {
     collectionPathProblem,
     DEFAULT_COLLECTED_PATH,
@@ -109,6 +109,8 @@ export function PanelContractEditor(props: {
 
     const abilityUnavailable = (ability: AgentAbility) =>
         props.authoredAbilities !== undefined && !props.authoredAbilities.includes(ability);
+    const askUnavailable = () =>
+        abilityUnavailable("question.ask") && !profile().public_abilities.includes("question.ask");
     const retentionProblem = () => profile().retention.absolute_ttl_seconds < profile().retention.idle_ttl_seconds
         ? "A conversation can't be deleted before it stops being resumable. Make the second number at least the first."
         : "";
@@ -148,13 +150,15 @@ export function PanelContractEditor(props: {
                     public_abilities: [...preset, ...current.public_abilities.filter((ability) => ability === "question.ask")],
                 }))}>
                 <Option type="checkbox" checked={profile().public_abilities.includes("question.ask")}
-                    disabled={abilityUnavailable("question.ask") && !profile().public_abilities.includes("question.ask")}
+                    disabled={askUnavailable()}
+                    title={askUnavailable() ? BEYOND_AGENT_ABILITIES : undefined}
+                    detail={askUnavailable() ? BEYOND_AGENT_ABILITIES : undefined}
                     label="Ask questions"
                     onChange={(next) => toggleAbility("question.ask", next)} />
             </AbilityPresets>
             <Show when={props.authoredAbilities !== undefined
                 && profile().public_abilities.some((ability) => !props.authoredAbilities!.includes(ability))}>
-                <p class="pa-error">Something ticked here is beyond what the agent itself can do, so saving will be refused. Untick it.</p>
+                <p class="pa-error">Something ticked here is beyond what the agent itself can do, so saving will be refused. Untick it, or give the agent that ability under its own Abilities.</p>
             </Show>
         </section>
 

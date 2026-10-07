@@ -814,6 +814,7 @@ fn retained_dispatch_keeps_its_original_idle_ceiling_after_provider_refresh() {
     let source = crate::account_session::durable_evidence(
         wb.store_ref(),
         &session_ref,
+        "alice",
         crate::account::session_now_ms(),
     )
     .unwrap()
@@ -837,6 +838,7 @@ fn retained_dispatch_keeps_its_original_idle_ceiling_after_provider_refresh() {
     let fresh = crate::account_session::durable_evidence(
         wb.store_ref(),
         &session_ref,
+        "alice",
         crate::account::session_now_ms(),
     )
     .unwrap()

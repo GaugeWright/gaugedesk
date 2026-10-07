@@ -198,6 +198,7 @@ pub(crate) fn revalidate_action_context(
             let (actor, evidence) = crate::account_session::durable_evidence(
                 store,
                 session_ref,
+                context.actor().as_str(),
                 crate::account::session_now_ms(),
             )?
             .ok_or_else(|| invalid("account action session is not durably active"))?;

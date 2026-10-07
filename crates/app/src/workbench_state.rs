@@ -143,6 +143,11 @@ pub struct Workbench {
     /// Opaque Hub sessions authenticate a durable GaugeDesk account before any
     /// organization-specific membership decision.
     pub(crate) account_sessions: Arc<crate::account_session::AccountSessionStore>,
+    /// The account each recently verified provider identity `(issuer, subject)`
+    /// resolved to. A candidate only, never authority: every use re-checks the
+    /// link against that one account's current authority and falls back to the
+    /// full projection, so a request reads one account instead of all (WS-849).
+    pub(crate) linked_subject_hints: Mutex<BTreeMap<(String, String), String>>,
     /// Optional streaming audit sink (`AUD-4`).
     pub(crate) audit_sink: Option<Arc<dyn audit::AuditSink>>,
     /// Governance key store used to sign audit checkpoints (`SECAUD-2`).
@@ -480,6 +485,7 @@ impl Workbench {
             relay_sessions: Default::default(),
             relay_crossings: None,
             account_sessions: Arc::new(crate::account_session::AccountSessionStore::new()),
+            linked_subject_hints: Mutex::default(),
             audit_sink: None,
             audit_signer: None,
             content_vault: None,

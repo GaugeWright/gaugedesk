@@ -9,19 +9,24 @@ use crate::{federation, open_control_plane, open_workbench, LockUnpoisoned};
 /// refused here. The relay uses its own listener and its own admission.
 /// The desktop serves this behind [`crate::local_operator::guard`], so only its
 /// own window, holding the per-launch secret, reaches it at all (DR-0269).
+///
+/// The Home broker is added as a route, not merged in as a second router:
+/// merging replaced the stack's CORS-layered fallback with a bare one, so a
+/// route this Home does not serve answered `404` without
+/// `Access-Control-Allow-Origin`. The window's `fetch` then rejected instead
+/// of seeing the `404`, and the enterprise workbench read the absent
+/// `/admin/placement-policy` — whose `404` is its "no organization governs
+/// this" signal — as a governed plane whose policy could not be read, so
+/// every engagement invite was refused for a personal account.
 pub(crate) fn desktop_operator_plane(wb: crate::SharedWorkbench) -> axum::Router {
-    let home_broker = axum::Router::new()
-        .route(
-            "/account/hub-session/home/{home}/{*path}",
-            axum::routing::any(crate::account_signin::proxy_selected_home),
-        )
-        .with_state(wb.clone());
+    let home_broker =
+        axum::routing::any(crate::account_signin::proxy_selected_home).with_state(wb.clone());
     open_control_plane(wb.clone())
         .layer(axum::middleware::from_fn_with_state(
             wb.clone(),
             crate::project_owner::account_project_gate,
         ))
-        .merge(home_broker)
+        .route("/account/hub-session/home/{home}/{*path}", home_broker)
         .layer(axum::Extension(crate::account_signin::DesktopOperatorPlane))
 }
 
@@ -1015,5 +1020,60 @@ mod control_plane_failure_tests {
             "{}",
             failure.message
         );
+    }
+}
+
+#[cfg(test)]
+mod desktop_operator_plane_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    fn desktop() -> axum::Router {
+        let wb = crate::Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap());
+        super::desktop_operator_plane(Arc::new(Mutex::new(wb)))
+    }
+
+    /// The desktop serves no organization governance, and its window must be
+    /// able to read that `404` as such. Without `Access-Control-Allow-Origin`
+    /// the webview's `fetch` rejects, and the client fails closed: a personal
+    /// account could accept no engagement invite (2026-10-07).
+    #[tokio::test]
+    async fn an_unserved_route_is_a_404_the_window_can_read() {
+        for tenant in [None, Some("personal:account")] {
+            let mut request =
+                Request::get("/admin/placement-policy").header("origin", "tauri://localhost");
+            if let Some(tenant) = tenant {
+                request = request.header("x-gaugewright-tenant", tenant);
+            }
+            let response = desktop()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{tenant:?}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("access-control-allow-origin")
+                    .map(|value| value.to_str().unwrap()),
+                Some("tauri://localhost"),
+                "{tenant:?}"
+            );
+        }
+    }
+
+    /// Adding the Home broker as a route keeps it reachable.
+    #[tokio::test]
+    async fn the_home_broker_is_still_mounted() {
+        let response = desktop()
+            .oneshot(
+                Request::get("/account/hub-session/home/h/workspace")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
     }
 }
