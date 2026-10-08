@@ -222,10 +222,125 @@ const PENDING_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
 /// so without this a caller can mint pending state faster than it ages out.
 const PENDING_AUTH_MAX: usize = 512;
 
+/// How long a spent, expired or evicted `state` or handoff code is remembered,
+/// by digest, so that presenting it again is logged as what it is rather than
+/// as one never issued (WS-869). It authorizes nothing.
+const RETIRED_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// A ceiling on the remembered ones, for the same reason as [`PENDING_AUTH_MAX`].
+const RETIRED_MAX: usize = 4096;
+
+/// What became of a `state` or a handoff code that can no longer be redeemed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    /// Redeemed, once.
+    Spent,
+    /// Presented with a verifier of another attempt, which consumes it.
+    Refused,
+    /// Never presented before it expired.
+    Expired,
+    /// Dropped under [`PENDING_AUTH_MAX`] before it was presented.
+    Evicted,
+}
+
+impl Fate {
+    fn label(self) -> &'static str {
+        match self {
+            Fate::Spent => "redeemed",
+            Fate::Refused => "pkce_mismatch",
+            Fate::Expired => "expired",
+            Fate::Evicted => "evicted",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Retired {
+    fate: Fate,
+    issued_at: Instant,
+    retired_at: Instant,
+    /// The handoff challenge it was bound to, where there was one.
+    challenge: Option<String>,
+}
+
+/// Retired `state`s or codes, keyed by full SHA-256 so the value itself is not
+/// kept. Bounded by [`RETIRED_WINDOW`] and [`RETIRED_MAX`].
+#[derive(Default)]
+struct RetiredLedger {
+    by_digest: BTreeMap<String, Retired>,
+}
+
+impl RetiredLedger {
+    fn key(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(value.as_bytes()))
+    }
+
+    fn retire(&mut self, value: &str, retired: Retired) {
+        let now = retired.retired_at;
+        self.by_digest
+            .retain(|_, entry| now.saturating_duration_since(entry.retired_at) < RETIRED_WINDOW);
+        while self.by_digest.len() >= RETIRED_MAX {
+            let oldest = self
+                .by_digest
+                .iter()
+                .min_by_key(|(_, entry)| entry.retired_at)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    self.by_digest.remove(&key);
+                }
+                None => break,
+            }
+        }
+        self.by_digest.insert(Self::key(value), retired);
+    }
+
+    fn get(&self, value: &str) -> Option<&Retired> {
+        self.by_digest.get(&Self::key(value))
+    }
+}
+
 /// One login leg's [`PendingAuth`] and the moment it stops being redeemable.
 struct PendingEntry {
     pending: PendingAuth,
+    begun_at: Instant,
     expires_at: Instant,
+}
+
+/// Why a callback's `state` found no pending login.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StateRefusal {
+    /// Never minted here — forged, from another Hub process, or retired long
+    /// enough ago to be forgotten.
+    Unknown,
+    /// Minted, but its callback came after [`PENDING_AUTH_TTL`].
+    Expired { outstanding: Duration },
+    /// Already consumed by an earlier callback.
+    AlreadyUsed { outstanding: Duration },
+    /// Dropped under [`PENDING_AUTH_MAX`] before its callback.
+    Evicted { outstanding: Duration },
+}
+
+impl StateRefusal {
+    /// The machine-readable reason the callback logs.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            StateRefusal::Unknown => "unknown_state",
+            StateRefusal::Expired { .. } => "expired_state",
+            StateRefusal::AlreadyUsed { .. } => "state_already_used",
+            StateRefusal::Evicted { .. } => "evicted_state",
+        }
+    }
+
+    fn outstanding(&self) -> Option<Duration> {
+        match self {
+            StateRefusal::Unknown => None,
+            StateRefusal::Expired { outstanding }
+            | StateRefusal::AlreadyUsed { outstanding }
+            | StateRefusal::Evicted { outstanding } => Some(*outstanding),
+        }
+    }
 }
 
 /// In-flight `/auth/login` → `/auth/callback` PKCE state, keyed by CSRF `state`
@@ -242,9 +357,14 @@ struct PendingEntry {
 /// scaffold: a real multi-node deployment backs this with shared, TTL-bounded
 /// storage behind the same seam (mirroring
 /// [`SessionStore`](crate::session::SessionStore)).
+///
+/// What leaves the store is remembered by digest for [`RETIRED_WINDOW`], so a
+/// refused callback can say whether its `state` was spent, expired, evicted or
+/// never minted (WS-869). The memory authorizes nothing.
 #[derive(Default)]
 pub struct PendingAuthStore {
     by_state: BTreeMap<String, PendingEntry>,
+    retired: RetiredLedger,
 }
 
 impl PendingAuthStore {
@@ -256,7 +376,15 @@ impl PendingAuthStore {
     /// Record the pending PKCE state a login leg minted, keyed by its CSRF
     /// `state`, and drop whatever has expired by `now`.
     pub fn begin(&mut self, state: impl Into<String>, pending: PendingAuth, now: Instant) {
-        self.by_state.retain(|_, entry| entry.expires_at > now);
+        let expired: Vec<String> = self
+            .by_state
+            .iter()
+            .filter(|(_, entry)| entry.expires_at <= now)
+            .map(|(state, _)| state.clone())
+            .collect();
+        for state in expired {
+            self.retire(&state, Fate::Expired, now);
+        }
         // Drop the oldest, never the newest: evicting the entry just minted
         // would break the person who has only this moment clicked sign in.
         while self.by_state.len() >= PENDING_AUTH_MAX {
@@ -266,9 +394,7 @@ impl PendingAuthStore {
                 .min_by_key(|(_, entry)| entry.expires_at)
                 .map(|(state, _)| state.clone());
             match oldest {
-                Some(state) => {
-                    self.by_state.remove(&state);
-                }
+                Some(state) => self.retire(&state, Fate::Evicted, now),
                 None => break,
             }
         }
@@ -276,16 +402,79 @@ impl PendingAuthStore {
             state.into(),
             PendingEntry {
                 pending,
+                begun_at: now,
                 expires_at: now + PENDING_AUTH_TTL,
             },
         );
     }
 
+    fn retire(&mut self, state: &str, fate: Fate, now: Instant) {
+        if let Some(entry) = self.by_state.remove(state) {
+            self.retired.retire(
+                state,
+                Retired {
+                    fate,
+                    issued_at: entry.begun_at,
+                    retired_at: now,
+                    challenge: entry.pending.native_handoff_challenge,
+                },
+            );
+        }
+    }
+
     /// Consume the pending state for a callback's `state` (single-use). `None` for an
     /// unknown / already-redeemed / forged / expired `state` — the CSRF guard.
     pub fn take(&mut self, state: &str, now: Instant) -> Option<PendingAuth> {
-        let entry = self.by_state.remove(state)?;
-        (entry.expires_at > now).then_some(entry.pending)
+        self.take_explained(state, now)
+            .ok()
+            .map(|(pending, _)| pending)
+    }
+
+    /// [`take`](Self::take), saying how long the state was outstanding when
+    /// it is redeemed and why it could not be when it is not.
+    pub fn take_explained(
+        &mut self,
+        state: &str,
+        now: Instant,
+    ) -> Result<(PendingAuth, Duration), StateRefusal> {
+        let Some(entry) = self.by_state.remove(state) else {
+            return Err(match self.retired.get(state) {
+                None => StateRefusal::Unknown,
+                Some(retired) => {
+                    let outstanding = now.saturating_duration_since(retired.issued_at);
+                    match retired.fate {
+                        Fate::Expired => StateRefusal::Expired { outstanding },
+                        Fate::Evicted => StateRefusal::Evicted { outstanding },
+                        Fate::Spent | Fate::Refused => StateRefusal::AlreadyUsed { outstanding },
+                    }
+                }
+            });
+        };
+        let outstanding = now.saturating_duration_since(entry.begun_at);
+        let fate = if entry.expires_at > now {
+            Fate::Spent
+        } else {
+            Fate::Expired
+        };
+        self.retired.retire(
+            state,
+            Retired {
+                fate,
+                issued_at: entry.begun_at,
+                retired_at: now,
+                challenge: entry.pending.native_handoff_challenge.clone(),
+            },
+        );
+        if fate == Fate::Expired {
+            return Err(StateRefusal::Expired { outstanding });
+        }
+        Ok((entry.pending, outstanding))
+    }
+
+    /// The handoff challenge of a retired `state`, to name its attempt in a
+    /// refusal. Not authority.
+    fn retired_challenge(&self, state: &str) -> Option<&str> {
+        self.retired.get(state)?.challenge.as_deref()
     }
 
     /// How many logins are awaiting their callback.
@@ -523,6 +712,12 @@ pub fn auth_routes(state: AuthShellState) -> axum::Router<SharedWorkbench> {
         // with an expired/absent session so logout is always idempotent cleanup.
         .route("/auth/logout", post(post_logout))
         .merge(crate::account_auth_ceremony::routes())
+        // Every refused sign-in step is logged with its reason (WS-869). The
+        // handlers name theirs; this names the rest, and sits inside the error
+        // page so it reads the handler's own response.
+        .layer(axum::middleware::from_fn(
+            crate::signin_log::log_unclassified_refusals,
+        ))
         // A refusal on a browser navigation gets a page with a way back to
         // GaugeDesk and a way out of the account, not a bare line of text.
         .layer(axum::middleware::from_fn(
@@ -659,6 +854,20 @@ impl AuthShellState {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Issue a one-time native handoff code and log that `route` issued it,
+    /// with the attempt it is bound to and the code's digest.
+    fn issue_native_handoff(
+        &self,
+        route: &'static str,
+        issue: NativeHandoffIssue,
+        trace: crate::signin_log::Trace,
+    ) -> String {
+        let trace = trace.attempt(&issue.challenge);
+        let code = self.native_handoffs_mut().issue(issue, Instant::now());
+        crate::signin_log::completed(route, "handoff_issued", &trace.code(&code));
+        code
+    }
+
     /// Issue the same one-time native handoff an ordinary provider login issues,
     /// for a desktop signup that finished its passkey ceremony in the system
     /// browser. The account is already resolved — this mints no identity, and
@@ -673,7 +882,8 @@ impl AuthShellState {
         refresh_token: Option<String>,
         challenge: String,
     ) -> String {
-        self.native_handoffs_mut().issue(
+        self.issue_native_handoff(
+            crate::signin_log::PASSKEY_REGISTER_FINISH,
             NativeHandoffIssue {
                 account_id: account_id.to_owned(),
                 session_method: session_method.to_owned(),
@@ -682,7 +892,7 @@ impl AuthShellState {
                 refresh_token,
                 challenge,
             },
-            Instant::now(),
+            crate::signin_log::Trace::new(),
         )
     }
 
@@ -727,6 +937,7 @@ struct NativeHandoff {
     /// have tombstoned. `None` when the OP granted no refresh token.
     refresh_token: Option<crate::secret::Secret>,
     challenge: String,
+    issued_at: Instant,
     expires_at: Instant,
 }
 
@@ -738,6 +949,78 @@ struct RedeemedHandoff {
     label: String,
     provider_expires_at_ms: u64,
     refresh_token: Option<String>,
+    /// The challenge the code was bound to, naming its attempt in the log.
+    challenge: String,
+    /// How long the code was outstanding when it was redeemed.
+    outstanding: Duration,
+}
+
+/// Why a native handoff code was not redeemed. Each is logged as its own
+/// reason; the client is told the same thing for all of them.
+#[derive(Debug, PartialEq, Eq)]
+enum HandoffRefusal {
+    /// Never issued by this Hub process. Codes live in memory, so one issued
+    /// before a Hub restart is unknown after it.
+    Unknown,
+    /// Issued, but presented after its five minutes.
+    Expired {
+        challenge: Option<String>,
+        outstanding: Duration,
+    },
+    /// Already presented once — redeemed, or refused for another attempt's
+    /// verifier, which consumes it too. `previous` says which.
+    AlreadyUsed {
+        previous: &'static str,
+        challenge: Option<String>,
+        outstanding: Duration,
+    },
+    /// The verifier hashes to a challenge other than the one the code was
+    /// issued to: the verifier of a different sign-in attempt, typically one
+    /// started by a second press of Sign in.
+    PkceMismatch {
+        challenge: String,
+        presented_challenge: String,
+        outstanding: Duration,
+    },
+}
+
+impl HandoffRefusal {
+    fn reason(&self) -> &'static str {
+        match self {
+            HandoffRefusal::Unknown => "unknown_code",
+            HandoffRefusal::Expired { .. } => "expired_code",
+            HandoffRefusal::AlreadyUsed { .. } => "code_already_used",
+            HandoffRefusal::PkceMismatch { .. } => "pkce_mismatch",
+        }
+    }
+
+    fn trace(&self, trace: crate::signin_log::Trace) -> crate::signin_log::Trace {
+        match self {
+            HandoffRefusal::Unknown => trace,
+            HandoffRefusal::Expired {
+                challenge,
+                outstanding,
+            } => trace
+                .maybe_attempt(challenge.as_deref())
+                .outstanding(*outstanding),
+            HandoffRefusal::AlreadyUsed {
+                previous,
+                challenge,
+                outstanding,
+            } => trace
+                .maybe_attempt(challenge.as_deref())
+                .outstanding(*outstanding)
+                .detail(previous),
+            HandoffRefusal::PkceMismatch {
+                challenge,
+                presented_challenge,
+                outstanding,
+            } => trace
+                .attempt(challenge)
+                .presented_attempt(presented_challenge)
+                .outstanding(*outstanding),
+        }
+    }
 }
 
 struct NativeHandoffIssue {
@@ -766,11 +1049,14 @@ pub struct EnterpriseLoginDelivery {
 #[derive(Default)]
 struct NativeHandoffStore {
     by_code: BTreeMap<String, NativeHandoff>,
+    /// Codes that can no longer be redeemed, by digest, so presenting one again
+    /// is logged as spent or expired rather than as never issued (WS-869).
+    retired: RetiredLedger,
 }
 
 impl NativeHandoffStore {
     fn issue(&mut self, issue: NativeHandoffIssue, now: Instant) -> String {
-        self.by_code.retain(|_, handoff| handoff.expires_at > now);
+        self.retire_expired(now);
         let code = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(crate::session::random_bytes::<32>());
         self.by_code.insert(
@@ -782,20 +1068,80 @@ impl NativeHandoffStore {
                 provider_expires_at_ms: issue.provider_expires_at_ms,
                 refresh_token: issue.refresh_token.map(Into::into),
                 challenge: issue.challenge,
+                issued_at: now,
                 expires_at: now + Duration::from_secs(5 * 60),
             },
         );
         code
     }
 
-    fn redeem(&mut self, code: &str, verifier: &str, now: Instant) -> Option<RedeemedHandoff> {
-        let handoff = self.by_code.remove(code)?;
-        if handoff.expires_at <= now
-            || crate::identity_oidc::s256_challenge(verifier) != handoff.challenge
-        {
-            return None;
+    fn retire_expired(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .by_code
+            .iter()
+            .filter(|(_, handoff)| handoff.expires_at <= now)
+            .map(|(code, _)| code.clone())
+            .collect();
+        for code in expired {
+            if let Some(handoff) = self.by_code.remove(&code) {
+                self.retire(&code, &handoff, Fate::Expired, now);
+            }
         }
-        Some(RedeemedHandoff {
+    }
+
+    fn retire(&mut self, code: &str, handoff: &NativeHandoff, fate: Fate, now: Instant) {
+        self.retired.retire(
+            code,
+            Retired {
+                fate,
+                issued_at: handoff.issued_at,
+                retired_at: now,
+                challenge: Some(handoff.challenge.clone()),
+            },
+        );
+    }
+
+    fn redeem(
+        &mut self,
+        code: &str,
+        verifier: &str,
+        now: Instant,
+    ) -> Result<RedeemedHandoff, HandoffRefusal> {
+        self.retire_expired(now);
+        let Some(handoff) = self.by_code.remove(code) else {
+            return Err(match self.retired.get(code) {
+                None => HandoffRefusal::Unknown,
+                Some(retired) => {
+                    let challenge = retired.challenge.clone();
+                    let outstanding = now.saturating_duration_since(retired.issued_at);
+                    match retired.fate {
+                        Fate::Expired | Fate::Evicted => HandoffRefusal::Expired {
+                            challenge,
+                            outstanding,
+                        },
+                        Fate::Spent | Fate::Refused => HandoffRefusal::AlreadyUsed {
+                            previous: retired.fate.label(),
+                            challenge,
+                            outstanding,
+                        },
+                    }
+                }
+            });
+        };
+        let outstanding = now.saturating_duration_since(handoff.issued_at);
+        let presented_challenge = crate::identity_oidc::s256_challenge(verifier);
+        if presented_challenge != handoff.challenge {
+            // A failed proof consumes the code, as it always has: a verifier
+            // may not be guessed at against one code.
+            self.retire(code, &handoff, Fate::Refused, now);
+            return Err(HandoffRefusal::PkceMismatch {
+                challenge: handoff.challenge,
+                presented_challenge,
+                outstanding,
+            });
+        }
+        self.retire(code, &handoff, Fate::Spent, now);
+        Ok(RedeemedHandoff {
             account_id: handoff.account_id,
             session_method: handoff.session_method,
             label: handoff.label,
@@ -804,6 +1150,8 @@ impl NativeHandoffStore {
                 .refresh_token
                 .as_ref()
                 .map(|token| token.expose().to_string()),
+            challenge: handoff.challenge,
+            outstanding,
         })
     }
 }
@@ -829,6 +1177,12 @@ impl AuthShellState {
         } = delivery;
         let account_id = resolution.account_id;
         let session_method = resolution.session_method;
+        use crate::signin_log::{completed, refuse, Trace};
+        let route = match login_context.protocol {
+            SsoProtocol::Oidc => crate::signin_log::CALLBACK,
+            SsoProtocol::Saml => crate::signin_log::SAML_ACS,
+        };
+        let trace = Trace::new().maybe_attempt(native_handoff_challenge.as_deref());
 
         {
             let mut guard = wb.lock_unpoisoned();
@@ -844,13 +1198,16 @@ impl AuthShellState {
 
         if let Some(native_return) = native_return {
             let Some(challenge) = native_handoff_challenge else {
-                return (
+                return refuse(
+                    route,
+                    "native_challenge_lost",
+                    &trace,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "native handoff challenge was lost",
-                )
-                    .into_response();
+                );
             };
-            let code = self.native_handoffs_mut().issue(
+            let code = self.issue_native_handoff(
+                route,
                 NativeHandoffIssue {
                     account_id,
                     session_method,
@@ -859,7 +1216,7 @@ impl AuthShellState {
                     refresh_token,
                     challenge,
                 },
-                Instant::now(),
+                trace,
             );
             return Redirect::to(&format!("{native_return}#code={code}")).into_response();
         }
@@ -871,11 +1228,13 @@ impl AuthShellState {
                 &session_method,
                 crate::account::SESSION_ABSOLUTE_LIFETIME_MS / 1000,
             ) else {
-                return (
+                return refuse(
+                    route,
+                    "session_mint_failed",
+                    &trace,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "could not create the account session",
-                )
-                    .into_response();
+                );
             };
             if web_account_mode() {
                 if let Some(refresh_token) = refresh_token.as_deref() {
@@ -907,13 +1266,23 @@ impl AuthShellState {
             );
             let wallet = match wallet {
                 Ok(wallet) => wallet,
-                Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+                Err(error) => {
+                    return refuse(
+                        route,
+                        "browser_wallet_failed",
+                        &trace,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error,
+                    )
+                }
             };
             append_session_cookies(&mut response, &token);
             crate::browser_wallet::append_wallet_cookie(&mut response, Some(&wallet));
+            completed(route, "browser_session_minted", &trace);
             return response;
         }
 
+        completed(route, "account_session_minted", &trace);
         if let Some(url) = gaugedesk_env::var("OIDC_POST_LOGIN_URL") {
             if !url.trim().is_empty() {
                 return Redirect::to(&format!("{url}#id_token={token}&token_type=Bearer"))
@@ -1052,6 +1421,9 @@ pub enum CallbackError {
     Jwks(String),
     /// The returned id-token failed signature / claim verification (fail-closed).
     NotVerified,
+    /// The id-token verified, but its `nonce` is not the one this login minted:
+    /// a token from another login leg (fail-closed).
+    NonceMismatch,
 }
 
 /// Complete the flow: redeem `code` at the token endpoint with the stashed PKCE
@@ -1111,7 +1483,7 @@ pub fn finish_callback_verified(
     // verified the signature, so the payload is authentic — reading `nonce` off it is
     // safe. A missing or mismatched nonce is fail-closed (replay/injection, `INV-20`).
     if id_token_nonce(&id_token).as_deref() != Some(pending.nonce.as_str()) {
-        return Err(CallbackError::NotVerified);
+        return Err(CallbackError::NonceMismatch);
     }
     let attributes = idp.claims(&authority);
     // The refresh token (present only on an offline-access consent grant) rides back so the
@@ -2569,7 +2941,17 @@ pub fn request_public_base(headers: &HeaderMap) -> String {
     format!("{scheme}://{host}")
 }
 
-fn login_err(e: LoginError) -> axum::response::Response {
+fn login_err(
+    route: &'static str,
+    trace: &crate::signin_log::Trace,
+    e: LoginError,
+) -> axum::response::Response {
+    let reason = match &e {
+        LoginError::NotConfigured => "sso_not_configured",
+        LoginError::NoIssuer => "sso_no_issuer",
+        LoginError::Discovery(_) => "oidc_discovery_failed",
+        LoginError::Pkce(_) => "pkce_generation_failed",
+    };
     let (code, msg) = match e {
         LoginError::NotConfigured => (
             StatusCode::CONFLICT,
@@ -2589,7 +2971,7 @@ fn login_err(e: LoginError) -> axum::response::Response {
             format!("PKCE generation failed: {m}"),
         ),
     };
-    (code, msg).into_response()
+    crate::signin_log::refuse(route, reason, trace, code, msg)
 }
 
 /// Resolve an untrusted work-email routing hint to exactly one configured
@@ -2666,7 +3048,9 @@ pub fn organization_oidc_client_secret(
     Ok(Some(crate::secret::Secret::new(secret)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn begin_enterprise_browser_login(
+    route: &'static str,
     auth: AuthShellState,
     headers: &HeaderMap,
     connection: SsoConnectionRecord,
@@ -2682,6 +3066,7 @@ async fn begin_enterprise_browser_login(
                 headers,
                 connection,
                 OidcBrowserOptions {
+                    route,
                     authority: OidcConnectionAuthority::Enterprise {
                         login_context,
                         client_secret,
@@ -2697,6 +3082,9 @@ async fn begin_enterprise_browser_login(
             .await
         }
         SsoProtocol::Saml => {
+            let trace = crate::signin_log::Trace::new()
+                .maybe_attempt(native_handoff_challenge.as_deref())
+                .detail("enterprise_saml");
             let request = EnterpriseSamlStartRequest {
                 connection,
                 login_context,
@@ -2709,8 +3097,17 @@ async fn begin_enterprise_browser_login(
                     .map(crate::secret::Secret::new),
             };
             match auth.begin_enterprise_saml(request) {
-                Ok(url) => Redirect::to(&url).into_response(),
-                Err(message) => (StatusCode::SERVICE_UNAVAILABLE, message).into_response(),
+                Ok(url) => {
+                    crate::signin_log::completed(route, "redirected_to_provider", &trace);
+                    Redirect::to(&url).into_response()
+                }
+                Err(message) => crate::signin_log::refuse(
+                    route,
+                    "saml_start_unavailable",
+                    &trace,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    message,
+                ),
             }
         }
     }
@@ -2725,6 +3122,8 @@ enum OidcConnectionAuthority {
 }
 
 struct OidcBrowserOptions {
+    /// The route that began this login, for its log lines.
+    route: &'static str,
     authority: OidcConnectionAuthority,
     native_return: Option<String>,
     native_handoff_challenge: Option<String>,
@@ -2760,6 +3159,13 @@ async fn prepare_oidc_browser_login(
         OidcConnectionAuthority::Consumer(provider) => provider.offline_grant,
         OidcConnectionAuthority::Enterprise { .. } => OfflineGrant::AccessTypeOffline,
     };
+    let route = options.route;
+    let trace = crate::signin_log::Trace::new()
+        .maybe_attempt(options.native_handoff_challenge.as_deref())
+        .detail(match &options.authority {
+            OidcConnectionAuthority::Consumer(provider) => provider.slug,
+            OidcConnectionAuthority::Enterprise { .. } => "enterprise_oidc",
+        });
 
     // Discovery touches the network — run it off the async runtime (ureq is blocking).
     let started = tokio::task::spawn_blocking(move || {
@@ -2774,9 +3180,15 @@ async fn prepare_oidc_browser_login(
             (with_account_chooser(&url), state, pending)
         }
         Ok(Ok(value)) => value,
-        Ok(Err(error)) => return Err(login_err(error)),
+        Ok(Err(error)) => return Err(login_err(route, &trace, error)),
         Err(_) => {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "login task panicked").into_response())
+            return Err(crate::signin_log::refuse(
+                route,
+                "internal_error",
+                &trace,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "login task panicked",
+            ))
         }
     };
     // Consumer login retains the deployment-level credential of the provider it
@@ -2801,6 +3213,7 @@ async fn prepare_oidc_browser_login(
     pending.native_handoff_challenge = options.native_handoff_challenge;
     pending.login_context = enterprise_login;
     pending.purpose = options.purpose;
+    crate::signin_log::completed(route, "redirected_to_provider", &trace.state(&state));
     auth.pending_auth_mut()
         .begin(state, pending, Instant::now());
     Ok(url)
@@ -2815,14 +3228,28 @@ pub async fn get_login(
     headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> impl IntoResponse {
+    use crate::signin_log::{completed, refuse, Trace, LOGIN};
     let native_return = match native_return_uri(
         query.return_to.as_deref(),
         query.handoff_challenge.as_deref(),
         dev_web_return_enabled(),
     ) {
         Ok(value) => value,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(message) => {
+            return refuse(
+                LOGIN,
+                return_refusal_reason(message),
+                &Trace::new(),
+                StatusCode::BAD_REQUEST,
+                message,
+            )
+        }
     };
+    let trace = Trace::new().maybe_attempt(
+        native_return
+            .as_ref()
+            .and(query.handoff_challenge.as_deref()),
+    );
     // Hosted web account: a browser that already carries a still-valid session (the shared
     // `.gaugewright.com` cookie) needs no new ceremony — bounce it straight to the post-login
     // surface. The public site's "Sign in" entry lands here, so without this every visit
@@ -2839,6 +3266,7 @@ pub async fn get_login(
                 .unwrap_or_else(|| "/".to_string());
             let mut resp = Redirect::to(&post_login).into_response();
             append_session_hint_cookie(&mut resp);
+            completed(LOGIN, "already_signed_in", &trace);
             return resp;
         }
     }
@@ -2850,12 +3278,26 @@ pub async fn get_login(
                 Some(connection) => match organization_oidc_client_secret(&wb, &org, &connection) {
                     Ok(secret) => Some((connection, secret)),
                     Err(message) => {
-                        return (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+                        return refuse(
+                            LOGIN,
+                            "organization_secret_unavailable",
+                            &trace,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            message,
+                        )
                     }
                 },
                 None => None,
             },
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")).into_response(),
+            Err(e) => {
+                return refuse(
+                    LOGIN,
+                    "sso_state_unavailable",
+                    &trace,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{e:?}"),
+                )
+            }
         }
     };
     if let Some((connection, client_secret)) = stored_sso {
@@ -2866,6 +3308,7 @@ pub async fn get_login(
             protocol: connection.protocol,
         };
         return begin_enterprise_browser_login(
+            LOGIN,
             auth,
             &headers,
             connection,
@@ -2892,24 +3335,33 @@ pub async fn get_login(
             {
                 Some(found) => Some(found.clone()),
                 None => {
-                    return (
+                    return refuse(
+                        LOGIN,
+                        "provider_not_configured",
+                        &trace,
                         StatusCode::CONFLICT,
                         format!("{slug} sign-in is not configured on this server"),
                     )
-                        .into_response()
                 }
             }
         }
         _ => configured.first().cloned(),
     };
     let Some((provider, sso)) = selected else {
-        return (StatusCode::CONFLICT, "no SSO connection configured").into_response();
+        return refuse(
+            LOGIN,
+            "no_sso_connection",
+            &trace,
+            StatusCode::CONFLICT,
+            "no SSO connection configured",
+        );
     };
     begin_oidc_browser_login(
         auth,
         &headers,
         sso,
         OidcBrowserOptions {
+            route: LOGIN,
             authority: OidcConnectionAuthority::Consumer(provider),
             native_return,
             native_handoff_challenge: query.handoff_challenge,
@@ -3099,8 +3551,9 @@ enum ConsumerCallbackDecision {
     /// is not satisfied and cannot be by anything in the token (DR-0189 §4).
     /// The address the provider asserted may seed the field and proves nothing.
     SignupNeedsEmailProof { asserted_email: Option<String> },
-    /// The bounded product message the browser receives.
-    Refuse(StatusCode, String),
+    /// The bounded product message the browser receives, and the reason the
+    /// log records.
+    Refuse(StatusCode, String, &'static str),
 }
 
 /// The verified facts one consumer callback decides on.
@@ -3159,6 +3612,7 @@ fn decide_consumer_callback(
             format!(
                 "this {label} sign-in was removed from a GaugeDesk account; sign in with your passkey or a recovery code, then link {label} again in Account Settings"
             ),
+            "subject_link_removed",
         );
     }
     match provider.email_proof {
@@ -3169,6 +3623,7 @@ fn decide_consumer_callback(
                     format!(
                         "{label} did not return a verified email address for this account, so GaugeDesk cannot create one. Create your account with a passkey instead."
                     ),
+                    "provider_email_unverified",
                 );
             };
             let Some(attested_email) =
@@ -3177,6 +3632,7 @@ fn decide_consumer_callback(
                 return ConsumerCallbackDecision::Refuse(
                     StatusCode::BAD_REQUEST,
                     format!("{label} returned an email address GaugeDesk cannot use"),
+                    "provider_email_unusable",
                 );
             };
             if account_auth
@@ -3188,6 +3644,7 @@ fn decide_consumer_callback(
                     format!(
                         "a GaugeDesk account already uses this email address; sign in with your passkey or a recovery code, then link {label} in Account Settings"
                     ),
+                    "email_already_on_account",
                 );
             }
             ConsumerCallbackDecision::Signup {
@@ -3206,6 +3663,25 @@ fn decide_consumer_callback(
                 .and_then(crate::account_auth::normalize_email_contact),
         },
     }
+}
+
+/// Log what [`begin_consumer_signup`] answered a callback with: a refusal when
+/// signup could not be offered, and otherwise the redirect into it.
+fn signup_outcome(
+    response: axum::response::Response,
+    trace: &crate::signin_log::Trace,
+) -> axum::response::Response {
+    let status = response.status();
+    if status.is_client_error() || status.is_server_error() {
+        return crate::signin_log::refused(
+            crate::signin_log::CALLBACK,
+            "signup_unavailable",
+            trace,
+            response,
+        );
+    }
+    crate::signin_log::completed(crate::signin_log::CALLBACK, "signup_started", trace);
+    response
 }
 
 /// A provider callback whose subject resolves to no account: park the verified
@@ -3471,6 +3947,7 @@ pub async fn post_consumer_oidc_link_start(
         &headers,
         connection,
         OidcBrowserOptions {
+            route: crate::signin_log::CONSUMER_LINK_START,
             authority: OidcConnectionAuthority::Consumer(provider),
             native_return: None,
             native_handoff_challenge: None,
@@ -3573,6 +4050,7 @@ pub async fn post_consumer_oidc_avatar_start(
         &headers,
         connection,
         OidcBrowserOptions {
+            route: crate::signin_log::CONSUMER_AVATAR_START,
             authority: OidcConnectionAuthority::Consumer(provider),
             native_return: None,
             native_handoff_challenge: None,
@@ -3626,14 +4104,28 @@ pub async fn post_work_email_login(
     headers: HeaderMap,
     Form(form): Form<WorkEmailLoginForm>,
 ) -> impl IntoResponse {
+    use crate::signin_log::{refuse, Trace, WORK_EMAIL};
     let native_return = match native_return_uri(
         form.return_to.as_deref(),
         form.handoff_challenge.as_deref(),
         dev_web_return_enabled(),
     ) {
         Ok(value) => value,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(message) => {
+            return refuse(
+                WORK_EMAIL,
+                return_refusal_reason(message),
+                &Trace::new(),
+                StatusCode::BAD_REQUEST,
+                message,
+            )
+        }
     };
+    let trace = Trace::new().maybe_attempt(
+        native_return
+            .as_ref()
+            .and(form.handoff_challenge.as_deref()),
+    );
     let discovered = {
         let guard = wb.lock_unpoisoned();
         match enterprise_sso_for_work_email(guard.store_ref(), &form.email) {
@@ -3651,23 +4143,28 @@ pub async fn post_work_email_login(
     let Some((connection, context, client_secret)) = (match discovered {
         Ok(value) => value,
         Err(_) => {
-            return (
+            return refuse(
+                WORK_EMAIL,
+                "discovery_unavailable",
+                &trace,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "corporate sign-in discovery is unavailable",
             )
-                .into_response()
         }
     }) else {
         // One response covers invalid, absent, incomplete, unsupported, and
         // ambiguous matches. Discovery is routing, not an organization or
         // invitation enumeration surface.
-        return (
+        return refuse(
+            WORK_EMAIL,
+            "no_organization_for_email",
+            &trace,
             StatusCode::NOT_FOUND,
             "corporate sign-in is not available for that work email",
-        )
-            .into_response();
+        );
     };
     begin_enterprise_browser_login(
+        WORK_EMAIL,
         auth,
         &headers,
         connection,
@@ -3781,6 +4278,18 @@ fn js_string(raw: &str) -> String {
         .replace('/', "\\/")
 }
 
+const INVALID_HANDOFF_CHALLENGE: &str = "native login requires a valid handoff challenge";
+const UNSUPPORTED_RETURN: &str = "unsupported login return URI";
+
+/// The logged reason for a [`native_return_uri`] refusal.
+fn return_refusal_reason(message: &str) -> &'static str {
+    if message == INVALID_HANDOFF_CHALLENGE {
+        "invalid_handoff_challenge"
+    } else {
+        "unsupported_return_uri"
+    }
+}
+
 fn native_return_uri(
     raw: Option<&str>,
     challenge: Option<&str>,
@@ -3797,20 +4306,18 @@ fn native_return_uri(
         (Some("gaugewright://auth/callback"), Some(challenge)) if challenge_ok(challenge) => {
             Ok(Some("gaugewright://auth/callback".to_string()))
         }
-        (Some("gaugewright://auth/callback"), _) => {
-            Err("native login requires a valid handoff challenge")
-        }
+        (Some("gaugewright://auth/callback"), _) => Err(INVALID_HANDOFF_CHALLENGE),
         (Some(raw), Some(challenge)) if dev_web_return && loopback_web_return(raw) => {
             if challenge_ok(challenge) {
                 Ok(Some(raw.to_string()))
             } else {
-                Err("native login requires a valid handoff challenge")
+                Err(INVALID_HANDOFF_CHALLENGE)
             }
         }
         (Some(raw), None) if dev_web_return && loopback_web_return(raw) => {
-            Err("native login requires a valid handoff challenge")
+            Err(INVALID_HANDOFF_CHALLENGE)
         }
-        _ => Err("unsupported login return URI"),
+        _ => Err(UNSUPPORTED_RETURN),
     }
 }
 
@@ -3909,7 +4416,18 @@ pub struct CallbackQuery {
     error_description: Option<String>,
 }
 
-fn callback_err(e: CallbackError) -> axum::response::Response {
+fn callback_err(e: CallbackError, trace: &crate::signin_log::Trace) -> axum::response::Response {
+    let (reason, trace) = match &e {
+        CallbackError::Exchange(message) => (
+            "oidc_token_exchange_failed",
+            trace
+                .clone()
+                .detail(crate::signin_log::oauth_error_in(message)),
+        ),
+        CallbackError::Jwks(_) => ("oidc_jwks_failed", trace.clone()),
+        CallbackError::NotVerified => ("id_token_not_verified", trace.clone()),
+        CallbackError::NonceMismatch => ("nonce_mismatch", trace.clone()),
+    };
     let (code, msg) = match e {
         CallbackError::Exchange(m) => (
             StatusCode::BAD_GATEWAY,
@@ -3919,12 +4437,12 @@ fn callback_err(e: CallbackError) -> axum::response::Response {
             StatusCode::BAD_GATEWAY,
             format!("JWKS fetch/parse failed: {m}"),
         ),
-        CallbackError::NotVerified => (
+        CallbackError::NotVerified | CallbackError::NonceMismatch => (
             StatusCode::UNAUTHORIZED,
             "the id-token did not verify".to_string(),
         ),
     };
-    (code, msg).into_response()
+    crate::signin_log::refuse(crate::signin_log::CALLBACK, reason, &trace, code, msg)
 }
 
 /// `GET /auth/callback` — finish OIDC login: match the CSRF `state`, redeem the code,
@@ -3937,6 +4455,12 @@ pub async fn get_callback(
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> impl IntoResponse {
+    use crate::signin_log::{completed, refuse, refused, Trace, CALLBACK};
+    let trace = Trace::new();
+    let trace = match q.state.as_deref() {
+        Some(state) => trace.state(state),
+        None => trace,
+    };
     // SECAUD-8: per-**client-IP** failed-callback lockout (429 when locked) — defense-in-depth
     // behind the edge rate-limit, mirroring the SCIM guard. A bad/replayed state or a failed
     // token exchange records a failure; a completed login clears the IP's count. The key is the
@@ -3953,41 +4477,72 @@ pub async fn get_callback(
     let now = throttle.now_ms();
     if let Some(key) = &throttle_key {
         if !throttle.allowed(key, now) {
-            return (
+            return refuse(
+                CALLBACK,
+                "callback_throttled",
+                &trace,
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many failed SSO callbacks; retry later",
-            )
-                .into_response();
+            );
         }
     }
     if let Some(err) = q.error {
         let desc = q.error_description.unwrap_or_default();
-        return (
+        return refuse(
+            CALLBACK,
+            "oidc_error",
+            &trace.clone().detail(crate::signin_log::oauth_error(&err)),
             StatusCode::UNAUTHORIZED,
             format!("the IdP denied the login: {err} {desc}")
                 .trim()
                 .to_string(),
-        )
-            .into_response();
+        );
     }
     let (Some(code), Some(state)) = (q.code, q.state) else {
         if let Some(key) = &throttle_key {
             throttle.record_failure(key, now);
         }
-        return (StatusCode::BAD_REQUEST, "missing code or state").into_response();
+        return refuse(
+            CALLBACK,
+            "missing_code_or_state",
+            &trace,
+            StatusCode::BAD_REQUEST,
+            "missing code or state",
+        );
     };
 
     // Single-use take: an unknown / replayed / expired `state` finds nothing
     // (CSRF guard).
-    let pending = auth.pending_auth_mut().take(&state, Instant::now());
-    let Some(pending) = pending else {
-        if let Some(key) = &throttle_key {
-            throttle.record_failure(key, now);
+    let taken = {
+        let mut store = auth.pending_auth_mut();
+        let taken = store.take_explained(&state, Instant::now());
+        let retired_challenge = store.retired_challenge(&state).map(str::to_owned);
+        taken.map_err(|refusal| (refusal, retired_challenge))
+    };
+    let (pending, state_outstanding) = match taken {
+        Ok(taken) => taken,
+        Err((refusal, challenge)) => {
+            if let Some(key) = &throttle_key {
+                throttle.record_failure(key, now);
+            }
+            let mut trace = trace.maybe_attempt(challenge.as_deref());
+            if let Some(outstanding) = refusal.outstanding() {
+                trace = trace.outstanding(outstanding);
+            }
+            return refuse(
+                CALLBACK,
+                refusal.reason(),
+                &trace,
+                StatusCode::BAD_REQUEST,
+                "unknown or expired state",
+            );
         }
-        return (StatusCode::BAD_REQUEST, "unknown or expired state").into_response();
     };
     let native_return = pending.native_return.clone();
     let native_handoff_challenge = pending.native_handoff_challenge.clone();
+    let trace = trace
+        .maybe_attempt(native_handoff_challenge.as_deref())
+        .outstanding(state_outstanding);
 
     let purpose = pending.purpose.clone();
     let enterprise_login = pending.login_context.clone();
@@ -4005,10 +4560,16 @@ pub async fn get_callback(
             if let Some(key) = &throttle_key {
                 throttle.record_failure(key, now);
             }
-            return callback_err(e);
+            return callback_err(e, &trace);
         }
         Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "callback task panicked").into_response()
+            return refuse(
+                CALLBACK,
+                "internal_error",
+                &trace,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "callback task panicked",
+            )
         }
     };
 
@@ -4028,23 +4589,27 @@ pub async fn get_callback(
         // returning to this leg with different input.
         let Some((provider, connection)) = configured_consumer_connection(&context.connection_id)
         else {
-            return (
+            return refuse(
+                CALLBACK,
+                "link_not_configured",
+                &trace,
                 StatusCode::CONFLICT,
                 "that account linking is no longer configured",
-            )
-                .into_response();
+            );
         };
         if connection.current_revision() != context.connection_revision
             || !connection_still_accepts(&connection, &pending_issuer, &pending_audiences)
         {
-            return (
+            return refuse(
+                CALLBACK,
+                "link_connection_changed",
+                &trace,
                 StatusCode::CONFLICT,
                 format!(
                     "{} sign-in changed while you were linking it; return to GaugeDesk and start again",
                     provider.label
                 ),
-            )
-                .into_response();
+            );
         }
 
         let linked = {
@@ -4052,11 +4617,13 @@ pub async fn get_callback(
             let account_auth = match crate::account_auth::AccountAuth::rebuild(guard.store_ref()) {
                 Ok(state) => state,
                 Err(_) => {
-                    return (
+                    return refuse(
+                        CALLBACK,
+                        "account_auth_unavailable",
+                        &trace,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "account authentication state is unavailable",
                     )
-                        .into_response()
                 }
             };
             if !durable_independent_session(
@@ -4065,18 +4632,22 @@ pub async fn get_callback(
                 &context.account_id,
                 crate::account::session_now_ms(),
             ) {
-                return (
+                return refuse(
+                    CALLBACK,
+                    "link_session_not_current",
+                    &trace,
                     StatusCode::UNAUTHORIZED,
                     "the independent account session that started this link is no longer current",
-                )
-                    .into_response();
+                );
             }
             let Some(token_issuer) = id_token_issuer(&verified.id_token) else {
-                return (
+                return refuse(
+                    CALLBACK,
+                    "unreadable_id_token",
+                    &trace,
                     StatusCode::FORBIDDEN,
                     "the sign-in result could not be read",
-                )
-                    .into_response();
+                );
             };
             let record = match crate::account_auth::ExternalSubjectRecord::new(
                 &context.account_id,
@@ -4088,34 +4659,45 @@ pub async fn get_callback(
             ) {
                 Ok(record) => record,
                 Err(_) => {
-                    return (
+                    return refuse(
+                        CALLBACK,
+                        "link_record_invalid",
+                        &trace,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "the Google sign-in result could not be linked",
                     )
-                        .into_response()
                 }
             };
             let facts =
                 match crate::account_auth::decide_link_external_subject(&account_auth, record) {
                     Ok(facts) => facts,
                     Err(crate::account_auth::AuthRejection::SubjectAlreadyLinked) => {
-                        return (
+                        return refuse(
+                            CALLBACK,
+                            "subject_already_linked",
+                            &trace,
                             StatusCode::CONFLICT,
                             "this Google account is already linked to another GaugeDesk account",
                         )
-                            .into_response()
                     }
                     Err(_) => {
-                        return (StatusCode::CONFLICT, "this Google account cannot be linked")
-                            .into_response()
+                        return refuse(
+                            CALLBACK,
+                            "link_refused",
+                            &trace,
+                            StatusCode::CONFLICT,
+                            "this Google account cannot be linked",
+                        )
                     }
                 };
             if crate::account_auth::append_facts(guard.store_mut(), &facts).is_err() {
-                return (
+                return refuse(
+                    CALLBACK,
+                    "link_save_failed",
+                    &trace,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "the Google account link could not be saved",
-                )
-                    .into_response();
+                );
             }
             crate::audit::record_in(
                 &mut guard,
@@ -4148,21 +4730,25 @@ pub async fn get_callback(
     // because that is what the person asked for (DR-0195 §3).
     if let PendingAuthPurpose::ConsumerOidcAvatar(context) = &purpose {
         let Some((_, connection)) = configured_consumer_connection(&context.connection_id) else {
-            return (
+            return refuse(
+                CALLBACK,
+                "avatar_not_configured",
+                &trace,
                 StatusCode::CONFLICT,
                 "Google sign-in is no longer configured",
-            )
-                .into_response();
+            );
         };
         {
             let guard = wb.lock_unpoisoned();
             let Ok(account_auth) = crate::account_auth::AccountAuth::rebuild(guard.store_ref())
             else {
-                return (
+                return refuse(
+                    CALLBACK,
+                    "account_auth_unavailable",
+                    &trace,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "account authentication state is unavailable",
-                )
-                    .into_response();
+                );
             };
             let token_issuer = id_token_issuer(&verified.id_token);
             if let Err(refusal) = admit_consumer_avatar_refresh(
@@ -4177,7 +4763,12 @@ pub async fn get_callback(
                 },
                 crate::account::session_now_ms(),
             ) {
-                return refusal.into_response();
+                return refused(
+                    CALLBACK,
+                    "avatar_refresh_refused",
+                    &trace,
+                    refusal.into_response(),
+                );
             }
         }
         let Some(picture) = id_token_picture(&verified.id_token) else {
@@ -4223,11 +4814,7 @@ pub async fn get_callback(
                 "Photo updated",
                 "Your Google photo is now your GaugeDesk photo. You can close this window and return to GaugeDesk.",
             ),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the photo could not be saved",
-            )
-                .into_response(),
+            Err(_) => refuse(CALLBACK, "avatar_save_failed", &trace, StatusCode::INTERNAL_SERVER_ERROR, "the photo could not be saved"),
         };
     }
 
@@ -4237,22 +4824,20 @@ pub async fn get_callback(
     // refresh token, or returns the external token to the browser.
     if let PendingAuthPurpose::EnterpriseConnectionTest(context) = &purpose {
         let Some(fold) = &auth.enterprise_test_fold else {
-            return (
+            return refuse(
+                CALLBACK,
+                "connection_test_unavailable",
+                &trace,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "enterprise connection-test callback is not configured",
-            )
-                .into_response();
+            );
         };
         let folded = {
             let mut guard = wb.lock_unpoisoned();
             fold(&mut guard, context, &verified)
         };
         if folded.is_err() {
-            return (
-                StatusCode::CONFLICT,
-                "this corporate sign-in test is no longer current; return to GaugeDesk and start again",
-            )
-                .into_response();
+            return refuse(CALLBACK, "connection_test_stale", &trace, StatusCode::CONFLICT, "this corporate sign-in test is no longer current; return to GaugeDesk and start again");
         }
         return (
             StatusCode::OK,
@@ -4268,11 +4853,13 @@ pub async fn get_callback(
     // are never GaugeDesk account identity.
     let resolution = if let Some(context) = enterprise_login.as_ref() {
         let Some(fold) = &auth.login_fold else {
-            return (
+            return refuse(
+                CALLBACK,
+                "login_fold_unavailable",
+                &trace,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "corporate account admission is not configured",
-            )
-                .into_response();
+            );
         };
         let corporate_identity = VerifiedEnterpriseIdentity {
             authority: verified.authority.clone(),
@@ -4311,25 +4898,31 @@ pub async fn get_callback(
                 );
             }
             Err(LoginFoldRefusal::NotAdmitted) => {
-                return (
+                return refuse(
+                    CALLBACK,
+                    "not_admitted",
+                    &trace,
                     StatusCode::FORBIDDEN,
                     "this corporate account is not admitted to the organization",
                 )
-                    .into_response()
             }
             Err(LoginFoldRefusal::StaleConnection) => {
-                return (
+                return refuse(
+                    CALLBACK,
+                    "stale_connection",
+                    &trace,
                     StatusCode::CONFLICT,
                     "corporate sign-in changed while you were signing in; start again",
                 )
-                    .into_response()
             }
             Err(LoginFoldRefusal::Unavailable) => {
-                return (
+                return refuse(
+                    CALLBACK,
+                    "admission_unavailable",
+                    &trace,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "corporate account admission is unavailable",
                 )
-                    .into_response()
             }
         }
     } else {
@@ -4337,29 +4930,35 @@ pub async fn get_callback(
             .as_deref()
             .and_then(configured_consumer_connection)
         else {
-            return (
+            return refuse(
+                CALLBACK,
+                "consumer_not_configured",
+                &trace,
                 StatusCode::CONFLICT,
                 "consumer sign-in is no longer configured",
-            )
-                .into_response();
+            );
         };
         if !connection_still_accepts(&connection, &pending_issuer, &pending_audiences) {
-            return (
+            return refuse(
+                CALLBACK,
+                "consumer_connection_changed",
+                &trace,
                 StatusCode::CONFLICT,
                 "consumer sign-in changed while you were signing in; start again",
-            )
-                .into_response();
+            );
         }
         let account_auth = {
             let guard = wb.lock_unpoisoned();
             match crate::account_auth::AccountAuth::rebuild(guard.store_ref()) {
                 Ok(state) => state,
                 Err(_) => {
-                    return (
+                    return refuse(
+                        CALLBACK,
+                        "account_auth_unavailable",
+                        &trace,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "account authentication state is unavailable",
                     )
-                        .into_response()
                 }
             }
         };
@@ -4373,11 +4972,13 @@ pub async fn get_callback(
         // The concrete issuer this token claims, which the verifier has already
         // bound to the pinned rule. Durable state keys on it, not on the rule.
         let Some(token_issuer) = id_token_issuer(&verified.id_token) else {
-            return (
+            return refuse(
+                CALLBACK,
+                "unreadable_id_token",
+                &trace,
                 StatusCode::FORBIDDEN,
                 "the sign-in result could not be read",
-            )
-                .into_response();
+            );
         };
         match decide_consumer_callback(
             &account_auth,
@@ -4393,7 +4994,7 @@ pub async fn get_callback(
         ) {
             ConsumerCallbackDecision::Login(resolution) => resolution,
             ConsumerCallbackDecision::Signup { verified_email } => {
-                return begin_consumer_signup(
+                let response = begin_consumer_signup(
                     &auth,
                     ConsumerSignupEmail::Attested(verified_email),
                     &connection,
@@ -4402,11 +5003,12 @@ pub async fn get_callback(
                     native_return,
                     native_handoff_challenge,
                 );
+                return signup_outcome(response, &trace);
             }
             // Same ticket, same browser binding, same single spend — the person
             // just has one more thing to do before anything is created.
             ConsumerCallbackDecision::SignupNeedsEmailProof { asserted_email } => {
-                return begin_consumer_signup(
+                let response = begin_consumer_signup(
                     &auth,
                     ConsumerSignupEmail::Unproved {
                         prefill: asserted_email,
@@ -4417,8 +5019,9 @@ pub async fn get_callback(
                     native_return,
                     native_handoff_challenge,
                 );
+                return signup_outcome(response, &trace);
             }
-            ConsumerCallbackDecision::Refuse(status, message) => {
+            ConsumerCallbackDecision::Refuse(status, message, reason) => {
                 // The provider answered for an account this refusal is about,
                 // so the page can offer the provider's chooser for another.
                 let mut response = (status, message).into_response();
@@ -4427,7 +5030,12 @@ pub async fn get_callback(
                         .headers_mut()
                         .insert(crate::auth_error_page::CHOOSE_ACCOUNT_HEADER, slug);
                 }
-                return response;
+                return refused(
+                    CALLBACK,
+                    reason,
+                    &trace.clone().detail(provider.slug),
+                    response,
+                );
             }
         }
     };
@@ -4501,11 +5109,13 @@ pub async fn get_callback(
         }
     }
     if account_session_required && account_session_token.is_none() {
-        return (
+        return refuse(
+            CALLBACK,
+            "session_mint_failed",
+            &trace,
             StatusCode::INTERNAL_SERVER_ERROR,
             "could not create the account session",
-        )
-            .into_response();
+        );
     }
 
     // The custom-scheme redirect carries only a one-time opaque code. The app
@@ -4513,17 +5123,20 @@ pub async fn get_callback(
     // state; an app that intercepts the scheme cannot obtain the id-token.
     if let Some(native_return) = native_return {
         let Some(challenge) = native_handoff_challenge else {
-            return (
+            return refuse(
+                CALLBACK,
+                "native_challenge_lost",
+                &trace,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "native handoff challenge was lost",
-            )
-                .into_response();
+            );
         };
         let now_ms = crate::account::session_now_ms();
         let label = id_token_display_label(&id_token).unwrap_or_else(|| account_id.clone());
         let provider_expires_at_ms =
             id_token_expiry_ms(&id_token).unwrap_or_else(|| now_ms.saturating_add(60 * 60 * 1000));
-        let code = auth.native_handoffs_mut().issue(
+        let code = auth.issue_native_handoff(
+            CALLBACK,
             NativeHandoffIssue {
                 account_id: account_id.clone(),
                 session_method,
@@ -4532,7 +5145,7 @@ pub async fn get_callback(
                 refresh_token: refresh_token.clone(),
                 challenge,
             },
-            Instant::now(),
+            trace,
         );
         return native_return_response(&native_return, &code);
     }
@@ -4562,11 +5175,20 @@ pub async fn get_callback(
             };
             let wallet = match wallet {
                 Ok(wallet) => wallet,
-                Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+                Err(error) => {
+                    return refuse(
+                        CALLBACK,
+                        "browser_wallet_failed",
+                        &trace,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error,
+                    )
+                }
             };
             append_session_cookies(&mut resp, token);
             crate::browser_wallet::append_wallet_cookie(&mut resp, Some(&wallet));
         }
+        completed(CALLBACK, "browser_session_minted", &trace);
         return resp;
     }
 
@@ -4574,12 +5196,15 @@ pub async fn get_callback(
     // With a configured client URL, deliver it in the URL fragment (never a
     // query parameter or Referer-visible value).
     let Some(delivered_token) = account_session_token else {
-        return (
+        return refuse(
+            CALLBACK,
+            "session_delivery_failed",
+            &trace,
             StatusCode::INTERNAL_SERVER_ERROR,
             "could not deliver the account session",
-        )
-            .into_response();
+        );
     };
+    completed(CALLBACK, "account_session_minted", &trace);
     if let Some(url) = gaugedesk_env::var("OIDC_POST_LOGIN_URL") {
         if !url.trim().is_empty() {
             // Both JWT and opaque session alphabets are base64url and fragment-safe.
@@ -4821,7 +5446,12 @@ pub async fn post_native_refresh(
 
 #[derive(Deserialize)]
 pub struct NativeHandoffExchange {
+    /// Defaulted, like the verifier, so that a request missing either reaches
+    /// the handler and is logged as what it lacks rather than refused by the
+    /// extractor (WS-869).
+    #[serde(default)]
     code: String,
+    #[serde(default)]
     verifier: String,
     /// Optional device label (LOGIN-3, ADR 0123 §4): a client that names
     /// itself gets that name in the trusted-devices registry. Absent on
@@ -4911,114 +5541,180 @@ pub fn native_device_admitted(wb: &Workbench, person: &str, device_id: &str) -> 
 pub async fn post_native_exchange(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
-    Json(request): Json<NativeHandoffExchange>,
+    request: Result<Json<NativeHandoffExchange>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if !web_account_mode() {
-        return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
+    native_exchange(&wb, &auth, request, web_account_mode())
+}
+
+/// [`post_native_exchange`] with the deployment mode passed in, so a test need
+/// not set the process environment. Every refusal names its reason in the log
+/// (WS-869); the client is told the same thing it always was.
+fn native_exchange(
+    wb: &SharedWorkbench,
+    auth: &AuthShellState,
+    request: Result<Json<NativeHandoffExchange>, axum::extract::rejection::JsonRejection>,
+    web_account: bool,
+) -> axum::response::Response {
+    use crate::signin_log::{completed, refuse, refused, Trace, EXCHANGE};
+    if !web_account {
+        return refuse(
+            EXCHANGE,
+            "not_web_account",
+            &Trace::new(),
+            StatusCode::NOT_FOUND,
+            "not a web-account deployment",
+        );
+    }
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            return refused(
+                EXCHANGE,
+                "malformed_request",
+                &Trace::new(),
+                rejection.into_response(),
+            )
+        }
+    };
+    if request.code.is_empty() {
+        return refuse(
+            EXCHANGE,
+            "missing_code",
+            &Trace::new(),
+            StatusCode::BAD_REQUEST,
+            "the native handoff code is missing",
+        );
+    }
+    let trace = Trace::new().code(&request.code);
+    if request.verifier.is_empty() {
+        return refuse(
+            EXCHANGE,
+            "missing_verifier",
+            &trace,
+            StatusCode::BAD_REQUEST,
+            "the native handoff verifier is missing",
+        );
     }
     let redeemed =
         auth.native_handoffs_mut()
             .redeem(&request.code, &request.verifier, Instant::now());
-    match redeemed {
-        Some(RedeemedHandoff {
-            account_id,
-            session_method,
-            label,
-            provider_expires_at_ms,
-            refresh_token,
-        }) => {
-            let now_ms = crate::account::session_now_ms();
-            let has_refresh_grant = refresh_token.is_some();
-            let lifetime_ms = if has_refresh_grant {
-                crate::account::SESSION_ABSOLUTE_LIFETIME_MS
-            } else {
-                provider_expires_at_ms
-                    .saturating_sub(now_ms)
-                    .min(crate::account::SESSION_ABSOLUTE_LIFETIME_MS)
-            };
-            if lifetime_ms < 1000 {
-                return (StatusCode::UNAUTHORIZED, "the native handoff expired").into_response();
-            }
-            let lifetime_secs = (lifetime_ms / 1000).max(1);
-            let account_session = {
-                let mut guard = wb.lock_unpoisoned();
-                guard.mint_account_session(&account_id, &session_method, lifetime_secs)
-            };
-            let Some(account_session) = account_session else {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not create the account session",
-                )
-                    .into_response();
-            };
-            let device_label = request
-                .device_label
-                .as_deref()
-                .map(str::trim)
-                .filter(|label| !label.is_empty())
-                .unwrap_or("Native device");
-            let Some(device_id) = record_native_device(&wb, &account_id, device_label) else {
-                wb.lock_unpoisoned()
-                    .revoke_account_session(&account_session);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not enroll the native device",
-                )
-                    .into_response();
-            };
-            let session_id = crate::account_session::session_id(&account_session);
-            let bound_session = wb.lock_unpoisoned().bind_account_session_device(
-                &session_id,
-                &account_id,
-                &device_id,
-            );
-            if !bound_session
-                || !bind_native_refresh_grant(
-                    &wb,
-                    &account_id,
-                    &session_id,
-                    &device_id,
-                    refresh_token.as_deref(),
-                )
-            {
-                let mut guard = wb.lock_unpoisoned();
-                let scope = crate::account::account_scope(&account_id);
-                let _ = guard.revoke_account_device_in(&scope, &device_id);
-                guard.revoke_account_session(&account_session);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not bind the native account session",
-                )
-                    .into_response();
-            }
-            let expires_at_ms = now_ms.saturating_add(lifetime_secs.saturating_mul(1000));
-            let refresh_after_ms = if has_refresh_grant {
-                provider_expires_at_ms
-                    .saturating_sub(10 * 60 * 1000)
-                    .max(now_ms)
-            } else {
-                0
-            };
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "account_id": account_id,
-                    "account_session": account_session,
-                    "token_type": "Bearer",
-                    "device_id": device_id,
-                    "label": label,
-                    "expires_at_ms": expires_at_ms,
-                    "refresh_after_ms": refresh_after_ms,
-                })),
+    let RedeemedHandoff {
+        account_id,
+        session_method,
+        label,
+        provider_expires_at_ms,
+        refresh_token,
+        challenge,
+        outstanding,
+    } = match redeemed {
+        Ok(redeemed) => redeemed,
+        Err(refusal) => {
+            return refuse(
+                EXCHANGE,
+                refusal.reason(),
+                &refusal.trace(trace),
+                StatusCode::UNAUTHORIZED,
+                "unknown, expired, or incorrectly bound native handoff",
             )
-                .into_response()
         }
-        None => (
+    };
+    let trace = trace.attempt(&challenge).outstanding(outstanding);
+    let now_ms = crate::account::session_now_ms();
+    let has_refresh_grant = refresh_token.is_some();
+    let lifetime_ms = if has_refresh_grant {
+        crate::account::SESSION_ABSOLUTE_LIFETIME_MS
+    } else {
+        provider_expires_at_ms
+            .saturating_sub(now_ms)
+            .min(crate::account::SESSION_ABSOLUTE_LIFETIME_MS)
+    };
+    if lifetime_ms < 1000 {
+        return refuse(
+            EXCHANGE,
+            "provider_token_expired",
+            &trace,
             StatusCode::UNAUTHORIZED,
-            "unknown, expired, or incorrectly bound native handoff",
-        )
-            .into_response(),
+            "the native handoff expired",
+        );
     }
+    let lifetime_secs = (lifetime_ms / 1000).max(1);
+    let account_session = {
+        let mut guard = wb.lock_unpoisoned();
+        guard.mint_account_session(&account_id, &session_method, lifetime_secs)
+    };
+    let Some(account_session) = account_session else {
+        return refuse(
+            EXCHANGE,
+            "session_mint_failed",
+            &trace,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create the account session",
+        );
+    };
+    let device_label = request
+        .device_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or("Native device");
+    let Some(device_id) = record_native_device(wb, &account_id, device_label) else {
+        wb.lock_unpoisoned()
+            .revoke_account_session(&account_session);
+        return refuse(
+            EXCHANGE,
+            "device_enroll_failed",
+            &trace,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not enroll the native device",
+        );
+    };
+    let session_id = crate::account_session::session_id(&account_session);
+    let bound_session =
+        wb.lock_unpoisoned()
+            .bind_account_session_device(&session_id, &account_id, &device_id);
+    if !bound_session
+        || !bind_native_refresh_grant(
+            wb,
+            &account_id,
+            &session_id,
+            &device_id,
+            refresh_token.as_deref(),
+        )
+    {
+        let mut guard = wb.lock_unpoisoned();
+        let scope = crate::account::account_scope(&account_id);
+        let _ = guard.revoke_account_device_in(&scope, &device_id);
+        guard.revoke_account_session(&account_session);
+        return refuse(
+            EXCHANGE,
+            "session_bind_failed",
+            &trace,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not bind the native account session",
+        );
+    }
+    let expires_at_ms = now_ms.saturating_add(lifetime_secs.saturating_mul(1000));
+    let refresh_after_ms = if has_refresh_grant {
+        provider_expires_at_ms
+            .saturating_sub(10 * 60 * 1000)
+            .max(now_ms)
+    } else {
+        0
+    };
+    completed(EXCHANGE, "handoff_redeemed", &trace);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "account_id": account_id,
+            "account_session": account_session,
+            "token_type": "Bearer",
+            "device_id": device_id,
+            "label": label,
+            "expires_at_ms": expires_at_ms,
+            "refresh_after_ms": refresh_after_ms,
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /auth/logout` — end the browser's hosted account session. Opaque GaugeDesk account
@@ -5520,8 +6216,9 @@ iqlTEKVISscuchxZtKQJ4k8=
             },
         );
         match decision {
-            ConsumerCallbackDecision::Refuse(status, message) => {
+            ConsumerCallbackDecision::Refuse(status, message, reason) => {
                 assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(reason, "subject_link_removed");
                 assert!(message.contains("Microsoft"), "{message}");
                 assert!(!message.contains("Google"), "{message}");
             }
@@ -5898,30 +6595,56 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(!body.contains("</script><script>"));
     }
 
-    #[test]
-    fn native_handoff_is_pkce_bound_single_use_and_expires() {
-        let verifier = "0123456789012345678901234567890123456789012";
-        let challenge = crate::identity_oidc::s256_challenge(verifier);
-        let now = Instant::now();
-        let mut store = NativeHandoffStore::default();
-        let issue = |refresh_token: Option<&str>, challenge: String| NativeHandoffIssue {
+    fn handoff_issue(refresh_token: Option<&str>, challenge: String) -> NativeHandoffIssue {
+        NativeHandoffIssue {
             account_id: "account-7".to_string(),
             session_method: "oidc".to_string(),
             label: "alice@example.test".to_string(),
             provider_expires_at_ms: 4_102_444_800_000,
             refresh_token: refresh_token.map(str::to_string),
             challenge,
-        };
-        let code = store.issue(issue(Some("rt-native"), challenge.clone()), now);
-        assert!(store.redeem(&code, "wrong-verifier", now).is_none());
-        assert!(
-            store.redeem(&code, verifier, now).is_none(),
-            "a failed proof consumes the code"
-        );
+        }
+    }
 
-        let code = store.issue(issue(Some("rt-native"), challenge.clone()), now);
+    const HANDOFF_VERIFIER: &str = "0123456789012345678901234567890123456789012";
+
+    #[test]
+    fn native_handoff_is_pkce_bound_single_use_and_expires() {
+        let verifier = HANDOFF_VERIFIER;
+        let challenge = crate::identity_oidc::s256_challenge(verifier);
+        let now = Instant::now();
+        let mut store = NativeHandoffStore::default();
+        let code = store.issue(handoff_issue(Some("rt-native"), challenge.clone()), now);
+        let later = now + Duration::from_secs(3);
+        let refusal = store
+            .redeem(&code, "wrong-verifier", later)
+            .err()
+            .expect("another attempt's verifier is refused");
+        assert_eq!(refusal.reason(), "pkce_mismatch");
+        assert_eq!(
+            refusal,
+            HandoffRefusal::PkceMismatch {
+                challenge: challenge.clone(),
+                presented_challenge: crate::identity_oidc::s256_challenge("wrong-verifier"),
+                outstanding: Duration::from_secs(3),
+            }
+        );
+        let refusal = store
+            .redeem(&code, verifier, later)
+            .err()
+            .expect("a failed proof consumes the code");
+        assert_eq!(refusal.reason(), "code_already_used");
+        assert!(matches!(
+            refusal,
+            HandoffRefusal::AlreadyUsed {
+                previous: "pkce_mismatch",
+                ..
+            }
+        ));
+
+        let code = store.issue(handoff_issue(Some("rt-native"), challenge.clone()), now);
         let redeemed = store
-            .redeem(&code, verifier, now)
+            .redeem(&code, verifier, later)
             .expect("redeemed handoff");
         // The handoff carries account/session metadata and the server-held
         // refresh grant, never the external token the native client used to get.
@@ -5930,15 +6653,60 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert_eq!(redeemed.label, "alice@example.test");
         assert_eq!(redeemed.provider_expires_at_ms, 4_102_444_800_000);
         assert_eq!(redeemed.refresh_token.as_deref(), Some("rt-native"));
-        assert!(
-            store.redeem(&code, verifier, now).is_none(),
-            "a redeemed code is single-use"
+        assert_eq!(redeemed.challenge, challenge);
+        assert_eq!(redeemed.outstanding, Duration::from_secs(3));
+        let refusal = store
+            .redeem(&code, verifier, later)
+            .err()
+            .expect("a redeemed code is single-use");
+        assert_eq!(refusal.reason(), "code_already_used");
+        assert!(matches!(
+            refusal,
+            HandoffRefusal::AlreadyUsed {
+                previous: "redeemed",
+                ..
+            }
+        ));
+
+        let code = store.issue(handoff_issue(None, challenge.clone()), now);
+        let refusal = store
+            .redeem(&code, verifier, now + Duration::from_secs(301))
+            .err()
+            .expect("an expired code is refused");
+        assert_eq!(refusal.reason(), "expired_code");
+        assert_eq!(
+            refusal,
+            HandoffRefusal::Expired {
+                challenge: Some(challenge),
+                outstanding: Duration::from_secs(301),
+            }
         );
 
-        let code = store.issue(issue(None, challenge), now);
-        assert!(store
-            .redeem(&code, verifier, now + Duration::from_secs(301))
-            .is_none());
+        let refusal = store
+            .redeem("never-issued", verifier, now)
+            .err()
+            .expect("a code never issued is refused");
+        assert_eq!(refusal, HandoffRefusal::Unknown);
+        assert_eq!(refusal.reason(), "unknown_code");
+    }
+
+    #[test]
+    fn a_code_that_expired_unpresented_is_still_named_expired() {
+        // Issuing sweeps what has expired. A code swept that way is remembered,
+        // so presenting it afterwards is not mistaken for one never issued.
+        let challenge = crate::identity_oidc::s256_challenge(HANDOFF_VERIFIER);
+        let now = Instant::now();
+        let mut store = NativeHandoffStore::default();
+        let stale = store.issue(handoff_issue(None, challenge.clone()), now);
+        store.issue(
+            handoff_issue(None, challenge),
+            now + Duration::from_secs(400),
+        );
+        let refusal = store
+            .redeem(&stale, HANDOFF_VERIFIER, now + Duration::from_secs(410))
+            .err()
+            .unwrap();
+        assert_eq!(refusal.reason(), "expired_code");
     }
 
     #[test]
@@ -5946,6 +6714,299 @@ iqlTEKVISscuchxZtKQJ4k8=
         let mut store = PendingAuthStore::new();
         // The CSRF guard: a forged `state` the server never minted finds no verifier.
         assert!(store.take("forged", Instant::now()).is_none());
+    }
+
+    fn pending_login() -> PendingAuth {
+        let (_url, _state, pending) = start_login(
+            &oidc_sso(),
+            "http://x/cb",
+            "openid",
+            ClaimMapping::default(),
+            &mock_op(String::new()),
+        )
+        .unwrap();
+        pending
+    }
+
+    #[test]
+    fn a_refused_state_says_which_refusal_it_was() {
+        let now = Instant::now();
+        let mut store = PendingAuthStore::new();
+        assert_eq!(
+            store.take_explained("forged", now).err(),
+            Some(StateRefusal::Unknown)
+        );
+        assert_eq!(StateRefusal::Unknown.reason(), "unknown_state");
+
+        store.begin("spent", pending_login(), now);
+        let (_, outstanding) = store
+            .take_explained("spent", now + Duration::from_secs(9))
+            .expect("a fresh state is redeemed");
+        assert_eq!(outstanding, Duration::from_secs(9));
+        let refusal = store
+            .take_explained("spent", now + Duration::from_secs(10))
+            .err()
+            .unwrap();
+        assert_eq!(refusal.reason(), "state_already_used");
+        assert_eq!(
+            refusal,
+            StateRefusal::AlreadyUsed {
+                outstanding: Duration::from_secs(10)
+            }
+        );
+
+        // Presented late, and swept before it was ever presented: both expired.
+        store.begin("late", pending_login(), now);
+        store.begin("swept", pending_login(), now);
+        let after = now + PENDING_AUTH_TTL + Duration::from_secs(1);
+        assert_eq!(
+            store
+                .take_explained("late", after)
+                .err()
+                .map(|r| r.reason()),
+            Some("expired_state")
+        );
+        store.begin("fresh", pending_login(), after);
+        assert_eq!(
+            store
+                .take_explained("swept", after)
+                .err()
+                .map(|r| r.reason()),
+            Some("expired_state")
+        );
+    }
+
+    #[test]
+    fn an_evicted_state_is_named_evicted() {
+        let now = Instant::now();
+        let mut store = PendingAuthStore::new();
+        store.begin("first", pending_login(), now);
+        for n in 0..PENDING_AUTH_MAX {
+            store.begin(
+                format!("flood-{n}"),
+                pending_login(),
+                now + Duration::from_millis(1 + n as u64),
+            );
+        }
+        assert_eq!(
+            store
+                .take_explained("first", now + Duration::from_secs(1))
+                .err()
+                .map(|r| r.reason()),
+            Some("evicted_state")
+        );
+    }
+
+    fn refusal_reason(response: &axum::response::Response) -> Option<&'static str> {
+        response
+            .extensions()
+            .get::<crate::signin_log::SigninRefusal>()
+            .map(|refusal| refusal.reason)
+    }
+
+    fn exchange_request(
+        code: &str,
+        verifier: &str,
+    ) -> Result<Json<NativeHandoffExchange>, axum::extract::rejection::JsonRejection> {
+        Ok(Json(NativeHandoffExchange {
+            code: code.to_string(),
+            verifier: verifier.to_string(),
+            device_label: Some("Test Mac".to_string()),
+        }))
+    }
+
+    /// The 2026-10-07 report, step by step: each refusal of the exchange is
+    /// logged as its own reason although the client is told the same thing.
+    #[test]
+    fn every_refused_exchange_names_its_reason() {
+        let wb: SharedWorkbench = Arc::new(Mutex::new(Workbench::new(
+            gaugedesk_store::Store::open_in_memory().unwrap(),
+        )));
+        let auth = AuthShellState::new();
+        let challenge = crate::identity_oidc::s256_challenge(HANDOFF_VERIFIER);
+        let exchange = |code: &str, verifier: &str| {
+            native_exchange(&wb, &auth, exchange_request(code, verifier), true)
+        };
+
+        let response = native_exchange(&wb, &auth, exchange_request("c", "v"), false);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(refusal_reason(&response), Some("not_web_account"));
+
+        let response = exchange("", HANDOFF_VERIFIER);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("missing_code"));
+
+        let response = exchange("some-code", "");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("missing_verifier"));
+
+        let response = exchange("never-issued", HANDOFF_VERIFIER);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(refusal_reason(&response), Some("unknown_code"));
+
+        // A second press of Sign in: the code was issued to the first attempt,
+        // and the desktop presents the second attempt's verifier.
+        let code = auth
+            .native_handoffs_mut()
+            .issue(handoff_issue(None, challenge.clone()), Instant::now());
+        let text = crate::signin_log::capture::lines(|| {
+            let response = exchange(&code, "the-second-attempt-verifier-0000000000000000");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(refusal_reason(&response), Some("pkce_mismatch"));
+        });
+        assert!(text.contains("reason=\"pkce_mismatch\""), "{text}");
+        assert!(
+            text.contains(&format!(
+                "attempt=\"{}\"",
+                crate::signin_log::digest(&challenge)
+            )),
+            "{text}"
+        );
+        assert!(text.contains("presented_attempt="), "{text}");
+        assert!(!text.contains(&code), "the code is never logged: {text}");
+        assert!(!text.contains("the-second-attempt-verifier"), "{text}");
+
+        let response = exchange(&code, HANDOFF_VERIFIER);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(refusal_reason(&response), Some("code_already_used"));
+
+        // The provider token behind a handoff without a refresh grant has
+        // already lapsed, so there is no session to give.
+        let code = auth.native_handoffs_mut().issue(
+            NativeHandoffIssue {
+                provider_expires_at_ms: 1,
+                ..handoff_issue(None, challenge)
+            },
+            Instant::now(),
+        );
+        let response = exchange(&code, HANDOFF_VERIFIER);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(refusal_reason(&response), Some("provider_token_expired"));
+    }
+
+    #[test]
+    fn a_redeemed_exchange_logs_how_long_its_code_was_outstanding() {
+        let wb: SharedWorkbench = Arc::new(Mutex::new(Workbench::new(
+            gaugedesk_store::Store::open_in_memory().unwrap(),
+        )));
+        let auth = AuthShellState::new();
+        let challenge = crate::identity_oidc::s256_challenge(HANDOFF_VERIFIER);
+        let code = auth.native_handoffs_mut().issue(
+            handoff_issue(Some("rt-native"), challenge.clone()),
+            Instant::now(),
+        );
+        let mut status = StatusCode::IM_A_TEAPOT;
+        let text = crate::signin_log::capture::lines(|| {
+            let response =
+                native_exchange(&wb, &auth, exchange_request(&code, HANDOFF_VERIFIER), true);
+            status = response.status();
+        });
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(text.contains(" INFO "), "{text}");
+        assert!(text.contains("outcome=\"handoff_redeemed\""), "{text}");
+        assert!(text.contains("outstanding_ms="), "{text}");
+        assert!(
+            text.contains(&format!("code=\"{}\"", crate::signin_log::digest(&code))),
+            "{text}"
+        );
+        assert!(!text.contains(&code), "{text}");
+        assert!(!text.contains("rt-native"), "{text}");
+        assert!(!text.contains("alice@example.test"), "{text}");
+    }
+
+    async fn callback(
+        auth: &AuthShellState,
+        wb: &SharedWorkbench,
+        query: CallbackQuery,
+    ) -> axum::response::Response {
+        get_callback(
+            State(wb.clone()),
+            Extension(auth.clone()),
+            crate::workbench_auth::PeerIp(None),
+            HeaderMap::new(),
+            Query(query),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn every_refused_callback_before_the_provider_exchange_names_its_reason() {
+        let wb: SharedWorkbench = Arc::new(Mutex::new(Workbench::new(
+            gaugedesk_store::Store::open_in_memory().unwrap(),
+        )));
+        let auth = AuthShellState::new();
+        let query = |code: Option<&str>, state: Option<&str>, error: Option<&str>| CallbackQuery {
+            code: code.map(str::to_string),
+            state: state.map(str::to_string),
+            error: error.map(str::to_string),
+            error_description: None,
+        };
+
+        let response = callback(&auth, &wb, query(None, Some("s"), Some("access_denied"))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(refusal_reason(&response), Some("oidc_error"));
+
+        let response = callback(&auth, &wb, query(None, Some("s"), None)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("missing_code_or_state"));
+
+        let response = callback(&auth, &wb, query(Some("c"), Some("forged"), None)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("unknown_state"));
+
+        // A second callback for one login leg: a reloaded tab, or a provider
+        // redirect followed twice.
+        auth.pending_auth_mut()
+            .begin("spent", pending_login(), Instant::now());
+        assert!(auth
+            .pending_auth_mut()
+            .take("spent", Instant::now())
+            .is_some());
+        let response = callback(&auth, &wb, query(Some("c"), Some("spent"), None)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("state_already_used"));
+    }
+
+    #[tokio::test]
+    async fn a_login_without_a_valid_handoff_challenge_names_its_reason() {
+        let wb: SharedWorkbench = Arc::new(Mutex::new(Workbench::new(
+            gaugedesk_store::Store::open_in_memory().unwrap(),
+        )));
+        let response = get_login(
+            State(wb),
+            Extension(AuthShellState::new()),
+            HeaderMap::new(),
+            Query(LoginQuery {
+                return_to: Some("gaugewright://auth/callback".to_string()),
+                handoff_challenge: Some("short".to_string()),
+                provider: None,
+                select_account: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("invalid_handoff_challenge"));
+    }
+
+    #[test]
+    fn a_nonce_from_another_login_is_its_own_reason() {
+        let response = callback_err(
+            CallbackError::NonceMismatch,
+            &crate::signin_log::Trace::new(),
+        );
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(refusal_reason(&response), Some("nonce_mismatch"));
+        let response = callback_err(
+            CallbackError::Exchange("HTTP 400: {\"error\":\"invalid_grant\"}".into()),
+            &crate::signin_log::Trace::new(),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            refusal_reason(&response),
+            Some("oidc_token_exchange_failed")
+        );
     }
 
     #[test]
@@ -6673,7 +7734,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         let op = mock_op(json!({ "id_token": id_token }).to_string());
         assert!(matches!(
             finish_callback(&pending, "code", &op),
-            Err(CallbackError::NotVerified)
+            Err(CallbackError::NonceMismatch)
         ));
     }
 
@@ -7694,7 +8755,7 @@ iqlTEKVISscuchxZtKQJ4k8=
         );
         assert!(matches!(
             decision,
-            ConsumerCallbackDecision::Refuse(StatusCode::FORBIDDEN, message)
+            ConsumerCallbackDecision::Refuse(StatusCode::FORBIDDEN, message, "provider_email_unverified")
                 if message.contains("did not return a verified email"),
         ));
 
@@ -7762,7 +8823,7 @@ iqlTEKVISscuchxZtKQJ4k8=
                 "google-subject-7",
                 Some("alice@example.com".to_string()),
             ),
-            ConsumerCallbackDecision::Refuse(StatusCode::FORBIDDEN, message)
+            ConsumerCallbackDecision::Refuse(StatusCode::FORBIDDEN, message, "subject_link_removed")
                 if message.contains("was removed from a GaugeDesk account"),
         ));
     }
@@ -7795,8 +8856,9 @@ iqlTEKVISscuchxZtKQJ4k8=
             Some(" Alice@Example.com ".to_string()),
         );
         match decision {
-            ConsumerCallbackDecision::Refuse(status, message) => {
+            ConsumerCallbackDecision::Refuse(status, message, reason) => {
                 assert_eq!(status, StatusCode::CONFLICT);
+                assert_eq!(reason, "email_already_on_account");
                 assert!(message.contains("already uses this email address"));
                 assert!(message.contains("passkey or a recovery code"));
             }

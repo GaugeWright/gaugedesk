@@ -37,10 +37,10 @@ const MAX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Said when the inviting Home has no endpoint and no relay locator either: a
 /// desktop that is not reachable from elsewhere at all, so nobody could reach
-/// it to accept. desk shows the words as they are.
-const RELAY_ONLY_REFUSAL: &str = "this computer cannot be reached from elsewhere yet, so \
-    nobody could accept an invitation to it; turn on reaching it from your other devices, \
-    then invite again";
+/// it to accept. desk shows the words as they are, on the invite form, so they
+/// speak of sharing and send the person to no hosting setting (DR-0455).
+const RELAY_ONLY_REFUSAL: &str = "invitations to projects on this computer aren't available \
+    until it can be reached from elsewhere";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

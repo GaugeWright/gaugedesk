@@ -22,8 +22,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::at_rest::{Encryptor, LocalAeadEncryptor};
+use crate::key_store::{fitted_file_name, HASHED_FILE_NAME_PREFIX};
 
 const COLLECTION_KDF_DOMAIN: &[u8] = b"gaugewright/collection/ecies/v1";
+
+/// A recipient's seed file ends in this.
+const SEED_SUFFIX: &str = ".recipient";
+
+/// Appended to a hashed seed's file name to name the file holding its id.
+const ID_SUFFIX: &str = ".id";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollectionOpenError {
@@ -226,9 +233,20 @@ impl CollectionRecipientStore {
         Self { dir: dir.into() }
     }
 
+    /// Where `recipient_id`'s seed lives: the id in hex, or its SHA-256 for an
+    /// id of more than 122 characters, whose hex would pass the file-name limit.
     fn path(&self, recipient_id: &str) -> PathBuf {
         self.dir
-            .join(format!("{}.recipient", hex::encode(recipient_id)))
+            .join(fitted_file_name(recipient_id.as_bytes(), SEED_SUFFIX))
+    }
+
+    /// Where a hashed seed's id is written down, so [`Self::list`] can name a
+    /// keyring whose file name does not spell it. A hex name spells its own id
+    /// and has none.
+    fn id_path(&self, recipient_id: &str) -> Option<PathBuf> {
+        let name = fitted_file_name(recipient_id.as_bytes(), SEED_SUFFIX);
+        name.starts_with(HASHED_FILE_NAME_PREFIX)
+            .then(|| self.dir.join(format!("{name}{ID_SUFFIX}")))
     }
 
     /// Load or create the recipient for `recipient_id`, returning its public half.
@@ -258,9 +276,15 @@ impl CollectionRecipientStore {
             .filter_map(|entry| {
                 let name = entry.file_name();
                 let name = name.to_str()?;
-                let encoded = name.strip_suffix(".recipient")?;
-                let bytes = hex::decode(encoded).ok()?;
-                let id = String::from_utf8(bytes).ok()?;
+                let encoded = name.strip_suffix(SEED_SUFFIX)?;
+                let id = if encoded.starts_with(HASHED_FILE_NAME_PREFIX) {
+                    let id = std::fs::read_to_string(self.dir.join(format!("{name}{ID_SUFFIX}")))
+                        .ok()?;
+                    // An id that does not hash to this name names another keyring.
+                    (fitted_file_name(id.as_bytes(), SEED_SUFFIX) == name).then_some(id)?
+                } else {
+                    String::from_utf8(hex::decode(encoded).ok()?).ok()?
+                };
                 valid_recipient_id(&id).then_some(id)
             })
             .collect();
@@ -293,6 +317,20 @@ impl CollectionRecipientStore {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        if let Some(id_path) = self.id_path(recipient_id) {
+            // Before the seed, so no hashed seed is ever missing from the list.
+            // Every writer writes the same bytes, so a race needs no winner.
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&id_path)?;
+            file.write_all(recipient_id.as_bytes())?;
+            file.sync_all()?;
         }
         let seed = loop {
             let mut candidate = [0_u8; 32];
@@ -354,6 +392,42 @@ mod tests {
             recipient.public_key_hex,
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_recipient_id_too_long_for_a_hex_name_is_created_reused_and_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CollectionRecipientStore::new(dir.path());
+        // The longest id the store admits: hex of it plus the suffix is past
+        // the 255-byte file-name limit.
+        let long = format!("proj-{}", "a".repeat(123));
+        assert!(valid_recipient_id(&long));
+        let first = store.ensure(&long).expect("recipient is created");
+        let second = CollectionRecipientStore::new(dir.path())
+            .ensure(&long)
+            .expect("recipient is reused");
+        assert_eq!(first, second);
+        let seed = store.open_seed(&long).expect("seed is readable");
+        let secret = SecretKey::from_slice(&seed).expect("seed is a valid scalar");
+        assert_eq!(
+            hex::encode(secret.public_key().to_sec1_point(false).as_bytes()),
+            first.public_key_hex,
+        );
+        let path = store.path(&long);
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(HASHED_FILE_NAME_PREFIX)
+                && name.len() <= crate::key_store::MAX_FILE_NAME_BYTES,
+            "{name}"
+        );
+        // A short id keeps its hex name, so keyrings already held still open,
+        // and both are listed by id.
+        store.ensure("theory-a").expect("recipient is created");
+        assert_eq!(
+            store.path("theory-a").file_name().unwrap(),
+            format!("{}.recipient", hex::encode("theory-a")).as_str()
+        );
+        assert_eq!(store.list(), vec![long, "theory-a".to_owned()]);
     }
 
     #[test]

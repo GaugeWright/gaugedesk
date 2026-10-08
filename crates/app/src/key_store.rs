@@ -16,13 +16,17 @@ use crate::workbench_state::Workbench;
 /// The longest file name APFS, ext4 and NTFS all accept.
 pub(crate) const MAX_FILE_NAME_BYTES: usize = 255;
 
-/// The file (or directory) name a key store keeps `id`'s key under: `id` in
-/// hex followed by `suffix`. An id longer than about 125 bytes — an account
-/// named by its 65-byte public key, say — makes that name pass the 255-byte
-/// file-name limit, so the key could never be created ("File name too long").
-/// A name that would not fit is the id's SHA-256 instead, under a `sha256-`
-/// prefix no hex name can carry. Every name that fit before is unchanged, so
-/// keys already held still open, and a name that did not fit was never
+/// What begins a [`fitted_file_name`] that is a digest rather than hex. No hex
+/// name can begin with it, so a store that reads names back can tell them apart.
+pub(crate) const HASHED_FILE_NAME_PREFIX: &str = "sha256-";
+
+/// The file (or directory) name a store keeps `id`'s key or payload under:
+/// `id` in hex followed by `suffix`. An id longer than about 125 bytes — an
+/// account named by its 65-byte public key, say — makes that name pass the
+/// 255-byte file-name limit, so the file could never be created ("File name
+/// too long"). A name that would not fit is the id's SHA-256 instead, under a
+/// [`HASHED_FILE_NAME_PREFIX`]. Every name that fit before is unchanged, so
+/// files already held still open, and a name that did not fit was never
 /// written, so there is no older long name to read.
 pub(crate) fn fitted_file_name(id: &[u8], suffix: &str) -> String {
     let plain = format!("{}{suffix}", hex::encode(id));
@@ -30,7 +34,7 @@ pub(crate) fn fitted_file_name(id: &[u8], suffix: &str) -> String {
         return plain;
     }
     let digest: [u8; 32] = Sha256::digest(id).into();
-    format!("sha256-{}{suffix}", hex::encode(digest))
+    format!("{HASHED_FILE_NAME_PREFIX}{}{suffix}", hex::encode(digest))
 }
 
 /// Resolve the signing key for an authority. Real signing paths (the relay

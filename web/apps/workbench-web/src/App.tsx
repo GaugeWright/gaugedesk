@@ -3426,11 +3426,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         project={e().id}
                         projectName={e().name}
                         onClose={() => setEngagement(null)}
-                        onOpenPeopleAndSharing={() => {
-                            setEngagement(null);
-                            setProjectSettings({ id: e().id, name: e().name });
-                            setProjectSettingsPage("people");
-                        }}
                     />
                 )}
             </Show>

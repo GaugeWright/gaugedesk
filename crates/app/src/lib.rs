@@ -155,6 +155,7 @@ pub mod secret;
 pub mod session;
 pub mod session_activity;
 pub mod shipped_tutorials;
+pub mod signin_log;
 pub mod stream;
 pub mod target_adapter;
 pub(crate) mod target_change_set;

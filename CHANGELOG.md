@@ -19,6 +19,32 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.9] — 2026-10-08
+
+- A collecting Panel agent can be placed on a project when the project's and
+  the agent's ids together run past 122 characters. Creating its recipient key
+  failed with "File name too long", because the key was named after the id in
+  hex; a name that would pass the file-name limit is now the id's SHA-256,
+  with the id written beside it so the key is still listed. Every shorter
+  name is unchanged, so keys already held still open.
+- Collected answers from a session with a long id reach quarantine. Holding
+  one failed with "File name too long" for the same reason, and its name is
+  now fitted the same way.
+- A sign-in that fails now says why in the log, on the computer and on the
+  account service alike. Each step — starting the sign-in, the return from
+  Google, Microsoft or your organization, and redeeming the one-time code —
+  writes one line naming the exact reason it was refused: a code that was
+  never issued, had expired, or was already used; a code presented with the
+  proof of a different attempt, as a second press of Sign in causes; a return
+  for a sign-in this computer did not start or had already completed. Every
+  line names the attempt, so the two sides can be read together, and none
+  contains a code, a token, a cookie or an email address.
+- Inviting someone to a project no longer answers "No reachable Home is
+  selected". The invitation now comes from the computer or Home that holds
+  the project, whichever Home your account has selected, so GaugeDesk invites
+  from its own Home. Moving a project to another device is now its own
+  **Hosting** page in Project Settings, apart from **People & sharing**.
+
 ## [0.8.8] — 2026-10-08
 
 - Starting a chat works again in GaugeDesk when you are signed in. The

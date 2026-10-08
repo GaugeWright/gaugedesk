@@ -146,6 +146,15 @@ export interface SoftwareUpdatePolicy {
 
 class NoSelectedHomeError extends Error {}
 
+/** Whether this client reaches its control plane on this computer's loopback. */
+function isLoopbackBase(base: string): boolean {
+    try {
+        return ["localhost", "127.0.0.1", "[::1]"].includes(new URL(base).hostname);
+    } catch {
+        return false;
+    }
+}
+
 /** The single-Home rollout can expose its private Home origin before a
  * tenant-owned Home is provisioned. That is an onboarding state, not an
  * authorization failure: return the ordinary setup surface instead of showing
@@ -1248,21 +1257,47 @@ export class WorkbenchControlPlane implements ControlPlane {
         return { kind: "connected", home };
     }
 
+    /** The Home that holds a project, which is the one that invites to it, and
+     * the address its invitation names. Sharing a project is not a choice of
+     * Home: which Home the account has selected plays no part (DR-0455). An
+     * empty address is a Home reached through its relay, whose invitation
+     * carries that route instead (DR-0451). */
+    private async projectInvitationHome(project: ProjectId): Promise<{ json: RouteJson; endpoint: string }> {
+        if (!this.usesRemoteHome()) {
+            // This client is served by the Home itself. On loopback that is this
+            // computer, which nobody else can reach at that address.
+            return { json: this.route, endpoint: isLoopbackBase(this.base) ? "" : this.base };
+        }
+        try {
+            const transport = await this.connectRoutedProject(project);
+            return { json: transport.json, endpoint: (await this.homePool()).routeFor(project).endpoint };
+        } catch (error) {
+            // A project that predates route authorship is served by the
+            // account's selected Home (DESK-5a), so that Home is the one that
+            // holds it, as for every other call about the project.
+            if (!String(error).includes("no granted Home route")) throw error;
+            const transport = await this.connectSelectedHome();
+            const reach = this.nativeRemote
+                ? await accountClient.hubSessionReach(this.route)
+                : await accountClient.accountHomes(this.route);
+            const selected = reach.homes.find((home) => home.id === reach.selectedHome);
+            if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
+            return { json: transport.json, endpoint: selected.endpoint };
+        }
+    }
+
     async createHomeInvitation(
         recipient: string | { readonly email: string },
         project: ProjectId,
         role: "member" | "viewer" = "member",
     ): Promise<CreatedHomeInvitation> {
-        const state = await accountClient.accountHomes(this.route);
-        const selected = state.homes.find((home) => home.id === state.selectedHome);
-        if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
-        const transport = await this.requireHomeTransport();
-        return accountClient.createHomeInvitation(transport.json, {
+        const home = await this.projectInvitationHome(project);
+        return accountClient.createHomeInvitation(home.json, {
             ...(typeof recipient === "string"
                 ? { authority: recipient.trim() }
                 : { email: recipient.email.trim() }),
             project,
-            endpoint: selected.endpoint,
+            endpoint: home.endpoint,
             role,
         });
     }
@@ -1273,18 +1308,18 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async pendingHomeInvitations(project: ProjectId): Promise<PendingHomeInvitation[]> {
-        const transport = await this.requireHomeTransport();
-        return accountClient.listPendingHomeInvitations(transport.json, project);
+        const home = await this.projectInvitationHome(project);
+        return accountClient.listPendingHomeInvitations(home.json, project);
     }
 
-    async cancelHomeInvitation(id: string): Promise<void> {
-        const transport = await this.requireHomeTransport();
-        await accountClient.cancelHomeInvitation(transport.json, id);
+    async cancelHomeInvitation(project: ProjectId, id: string): Promise<void> {
+        const home = await this.projectInvitationHome(project);
+        await accountClient.cancelHomeInvitation(home.json, id);
     }
 
-    async resendHomeInvitation(id: string): Promise<CreatedHomeInvitation> {
-        const transport = await this.requireHomeTransport();
-        return accountClient.resendHomeInvitation(transport.json, id);
+    async resendHomeInvitation(project: ProjectId, id: string): Promise<CreatedHomeInvitation> {
+        const home = await this.projectInvitationHome(project);
+        return accountClient.resendHomeInvitation(home.json, id);
     }
 
     getRunCarriage(scope: ScopeId): Promise<ProjectionCarriage<RunState>> {

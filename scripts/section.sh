@@ -118,6 +118,7 @@ case "${1:-}" in
                                       scripts/check-updater-signature.test.mjs \
                                       scripts/release-updater-manifest.test.mjs \
                                       scripts/release-chat-acceptance.test.mjs \
+                                      scripts/release-canary-gate.test.mjs \
                                       scripts/release-ios-workspace.test.mjs ;;
   codex-login-helper)      node --test sidecar/codex-oauth-login.test.mjs ;;
   production-canary-contract)

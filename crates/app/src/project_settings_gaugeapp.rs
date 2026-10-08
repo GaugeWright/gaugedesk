@@ -76,7 +76,7 @@ impl GaugeAppDefinition for ProjectSettings {
                     "project": id,
                     "participants": crate::federation::participants_of(wb.store_ref(), id),
                     "guide": {
-                        "page": "People & sharing: who has access to the project, and invitations waiting to be accepted. Inviting, revoking and handing off are done in the page's own controls; not here.",
+                        "page": "People & sharing: who has access to the project, and invitations waiting to be accepted. Which computer holds the project is Hosting, not this page. Inviting and revoking are done in the page's own controls; not here.",
                         "controls": { "People with access": "participants", "Invite to this project": "the person's own invitation flow" },
                         "commands": {},
                     },
@@ -110,6 +110,19 @@ impl GaugeAppDefinition for ProjectSettings {
                     },
                 }),
                 &[ISOLATION_SET, TARGET_NAME_SET],
+            ),
+            page(
+                "hosting",
+                json!({
+                    "project": id,
+                    "home_id": project.home_id,
+                    "guide": {
+                        "page": "Hosting: which computer holds the project, and moving it to a paired, trusted device. Who may open the project is People & sharing, not this page. Handing off is done in the page's own controls; not here.",
+                        "controls": { "Project Host": "home_id", "Hand off": "the person's own handoff flow" },
+                        "commands": {},
+                    },
+                }),
+                &[],
             ),
             page(
                 "agents",
@@ -572,7 +585,14 @@ mod tests {
                 .iter()
                 .map(|page| page.id.as_str())
                 .collect::<Vec<_>>(),
-            ["overview", "people", "work-data", "agents", "model-access"]
+            [
+                "overview",
+                "people",
+                "work-data",
+                "hosting",
+                "agents",
+                "model-access"
+            ]
         );
         let envelope = GaugeAppCommandEnvelope {
             session_id: first_session.id.clone(),

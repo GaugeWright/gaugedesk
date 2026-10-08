@@ -1893,3 +1893,77 @@ describe("account change releases event stream connections (WS-581)", () => {
         }
     });
 });
+
+describe("a project is shared by the Home that holds it (DR-0455)", () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    /** An invitation as a Home answers one: hex of its JSON envelope. */
+    function minted(envelope: Record<string, unknown>) {
+        const invite = Array.from(
+            new TextEncoder().encode(JSON.stringify({
+                version: 1, invitation: "hinv-1", invited_authority: "",
+                invited_email: "alex@example.test", home_id: "home:d", secret: "s", ...envelope,
+            })),
+            (byte) => byte.toString(16).padStart(2, "0"),
+        ).join("");
+        return new Response(JSON.stringify({ invite, url: `https://desk.example/invite?d=${invite}`, expires_at: 9 }), { status: 201 });
+    }
+
+    it("invites from this computer's own Home without asking which Home is selected", async () => {
+        // The founder's desktop answered "No reachable Home is selected" here
+        // (2026-10-07): inviting read the account's Home selection first.
+        const asked: Array<[string, unknown]> = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            asked.push([url, init?.body ? JSON.parse(String(init.body)) : undefined]);
+            if (url === "http://127.0.0.1:7878/home/invitations" && init?.method === "POST") {
+                return minted({
+                    project: "proj-a", endpoint: "",
+                    relay: {
+                        endpoint: "wss://relay.example.test", handle: "a".repeat(43), proof: "b".repeat(43),
+                        route_epoch: 3, home_fingerprint: "c".repeat(64),
+                    },
+                    placement: { project_key: "k", host_key: "h", placement_signature: "p", locator_signature: "l" },
+                    owner_root: "root",
+                });
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:7878");
+
+        await expect(api.createHomeInvitation({ email: "alex@example.test" }, "proj-a" as never))
+            .resolves.toMatchObject({ project: "proj-a", endpoint: "" });
+        // Nobody else reaches this computer at its loopback address, so the
+        // Home is asked for an invitation that carries its relay route.
+        expect(asked).toEqual([["http://127.0.0.1:7878/home/invitations", expect.objectContaining({ endpoint: "" })]]);
+    });
+
+    it("asks the project's own Home, whichever Home the account has selected", async () => {
+        const asked: string[] = [];
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            asked.push(url);
+            if (url === "https://hub.example/account/home-routes") {
+                return new Response(JSON.stringify({
+                    routes: [{ project: "proj-direct", home_id: "home:d", endpoint: "https://d.example" }],
+                }));
+            }
+            if (url === "https://d.example/home/admissions" && init?.method === "POST") {
+                return new Response(JSON.stringify({ home: "home:d", admission: "t" }), { status: 201 });
+            }
+            if (url === "https://d.example/home/invitations" && init?.method === "POST") {
+                expect(JSON.parse(String(init.body))).toMatchObject({ project: "proj-direct", endpoint: "https://d.example" });
+                return minted({ project: "proj-direct", endpoint: "https://d.example" });
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("person-token");
+
+        // No project is open and no Home selection is read: the invitation's
+        // project alone decides which Home is asked.
+        await expect(api.createHomeInvitation({ email: "alex@example.test" }, "proj-direct" as never))
+            .resolves.toMatchObject({ homeId: "home:d", endpoint: "https://d.example" });
+        expect(asked).not.toContain("https://hub.example/account/homes");
+    });
+});

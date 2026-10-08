@@ -77,9 +77,9 @@ async function openEngagement(page: Page, projectName: string): Promise<void> {
     await page
         .locator(".tree-node.project", { hasText: projectName })
         .click({ button: "right" });
-    // The Engagement pane opens from project settings' People & sharing page.
+    // The Engagement pane opens from project settings' Hosting page.
     await page.locator(".menu-item", { hasText: "project settings…" }).click();
-    await page.locator(".project-settings-overview-grid button", { hasText: "People & sharing" }).click();
+    await page.locator(".project-settings-overview-grid button", { hasText: "Hosting" }).click();
     await page.locator("[data-project-engagement]").click();
     await expect(page.locator("[data-engagement-pane]")).toBeVisible();
 }

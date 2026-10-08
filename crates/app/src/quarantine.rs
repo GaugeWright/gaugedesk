@@ -215,11 +215,17 @@ impl QuarantineStore {
             return Err(io::Error::other("project id is invalid"));
         }
         // Hex, not the raw id: a source id is producer-shaped and a revision
-        // separator is not a path separator anywhere we get to choose.
+        // separator is not a path separator anywhere we get to choose. Nothing
+        // bounds its length either, so an id whose hex would pass the
+        // file-name limit is named by its SHA-256. Nothing reads this
+        // directory back into ids, so the name need not spell one.
         Ok(self
             .dir
             .join(project_id)
-            .join(format!("{}.item", hex::encode(item_id))))
+            .join(crate::key_store::fitted_file_name(
+                item_id.as_bytes(),
+                ".item",
+            )))
     }
 
     pub fn put(&self, project_id: &str, item_id: &str, payload: &[u8]) -> io::Result<()> {
@@ -454,6 +460,32 @@ mod tests {
         assert_eq!(store.read("proj", "s1:1").unwrap(), b"{\"a\":1}");
         assert!(store.exists("proj", "s1:1"));
         assert!(!store.exists("other", "s1:1"));
+    }
+
+    #[test]
+    fn custody_holds_an_item_whose_id_is_too_long_for_a_hex_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::new(dir.path());
+        // A producer-shaped session id nothing bounds: hex of this item id is
+        // past the 255-byte file-name limit.
+        let long = item_id(&format!("ps-{}", "s".repeat(150)), 1);
+        store.put("proj", &long, b"{\"a\":1}").unwrap();
+        assert_eq!(store.read("proj", &long).unwrap(), b"{\"a\":1}");
+        assert!(store.exists("proj", &long));
+        let path = store.path("proj", &long).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(crate::key_store::HASHED_FILE_NAME_PREFIX)
+                && name.len() <= crate::key_store::MAX_FILE_NAME_BYTES,
+            "{name}"
+        );
+        store.discard("proj", &long).unwrap();
+        assert!(!store.exists("proj", &long));
+        // A short id keeps its hex name, so payload already held still opens.
+        assert_eq!(
+            store.path("proj", "s1:1").unwrap().file_name().unwrap(),
+            format!("{}.item", hex::encode("s1:1")).as_str()
+        );
     }
 
     #[test]

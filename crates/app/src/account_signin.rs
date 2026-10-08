@@ -1169,6 +1169,12 @@ struct PendingRecord {
     provider: String,
     #[serde(default)]
     selection_revision: usize,
+    /// The PKCE challenge the attempt was started with, which is public — it
+    /// rides the login URL — and kept so that the log can name the attempt a
+    /// callback found, even after the verifier is consumed (WS-869). Empty on
+    /// a record written before it existed.
+    #[serde(default)]
+    challenge: String,
 }
 
 fn write_pending(wb: &SharedWorkbench, record: &PendingRecord) -> Result<(), String> {
@@ -1182,53 +1188,111 @@ fn write_pending(wb: &SharedWorkbench, record: &PendingRecord) -> Result<(), Str
         .map_err(|error| format!("could not store the sign-in attempt: {error:?}"))
 }
 
-fn latest_pending(wb: &SharedWorkbench) -> Option<PendingRecord> {
+/// The latest stored attempt, the consumed tombstone included.
+fn latest_pending_row(wb: &SharedWorkbench) -> Option<PendingRecord> {
     let workbench = wb.lock_unpoisoned();
     let rows = workbench
         .store_ref()
         .records(ACCOUNT_SCOPE, RECORD_KIND_PENDING)
         .ok()?;
-    let record: PendingRecord = serde_json::from_str(rows.last()?).ok()?;
-    if record.sealed.is_empty() {
-        return None;
-    }
-    Some(record)
+    serde_json::from_str(rows.last()?).ok()
 }
 
-/// Why a stored sign-in could not be used, kept apart from "there was none" so
-/// the person is told which of the two happened.
+/// The latest attempt that has not been consumed.
+fn latest_pending(wb: &SharedWorkbench) -> Option<PendingRecord> {
+    latest_pending_row(wb).filter(|record| !record.sealed.is_empty())
+}
+
+/// What a callback found where it looked for the attempt it completes.
 enum PendingOutcome {
-    Ready(String, usize),
+    /// The verifier, the selection revision the attempt began under, and when
+    /// it began.
+    Ready(String, usize, i64),
+    Refused {
+        refusal: PendingRefusal,
+        started_ms: Option<i64>,
+        challenge: Option<String>,
+    },
+}
+
+/// Why a callback found no attempt it could complete. The person is told only
+/// whether it expired or was never started; the log is told which of these
+/// it was (WS-869).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingRefusal {
+    /// No sign-in was ever started on this device.
+    NeverStarted,
+    /// The latest attempt was already taken by an earlier callback: a second
+    /// browser tab's code, a deep link delivered twice, or a retry after an
+    /// expiry or a refusal consumed it.
+    AlreadyUsed,
+    /// Started more than [`PENDING_TTL`] ago.
     Expired,
-    None,
+    /// Sealed under a key this workbench no longer holds.
+    Unsealable,
+    /// The attempt could not be marked consumed, so it was not redeemed.
+    ConsumeFailed,
+}
+
+impl PendingRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            PendingRefusal::NeverStarted => "no_pending_sign_in",
+            PendingRefusal::AlreadyUsed => "pending_already_used",
+            PendingRefusal::Expired => "pending_expired",
+            PendingRefusal::Unsealable => "pending_unsealable",
+            PendingRefusal::ConsumeFailed => "pending_consume_failed",
+        }
+    }
+
+    /// Whether the person is told the attempt expired, rather than that none
+    /// was started.
+    fn reads_as_expired(self) -> bool {
+        matches!(self, PendingRefusal::Expired | PendingRefusal::Unsealable)
+    }
 }
 
 /// Single-use take: clear the record first, then unseal, so a second callback
 /// or a replay finds the tombstone whatever happens next.
 fn take_pending(wb: &SharedWorkbench) -> PendingOutcome {
-    let Some(record) = latest_pending(wb) else {
-        return PendingOutcome::None;
+    let Some(record) = latest_pending_row(wb) else {
+        return PendingOutcome::Refused {
+            refusal: PendingRefusal::NeverStarted,
+            started_ms: None,
+            challenge: None,
+        };
     };
+    let refused = |refusal| PendingOutcome::Refused {
+        refusal,
+        started_ms: Some(record.started_ms),
+        challenge: Some(record.challenge.clone()).filter(|challenge| !challenge.is_empty()),
+    };
+    if record.sealed.is_empty() {
+        return refused(PendingRefusal::AlreadyUsed);
+    }
     let cleared = PendingRecord {
         id: PENDING_RECORD_ID.to_string(),
         sealed: String::new(),
         started_ms: record.started_ms,
         provider: record.provider.clone(),
         selection_revision: record.selection_revision,
+        challenge: record.challenge.clone(),
     };
     if let Err(error) = write_pending(wb, &cleared) {
         // Refuse rather than redeem what could be redeemed twice.
         tracing::warn!("could not consume the sign-in attempt: {error}");
-        return PendingOutcome::None;
+        return refused(PendingRefusal::ConsumeFailed);
     }
     if now_ms().saturating_sub(record.started_ms) > PENDING_TTL.as_millis() as i64 {
-        return PendingOutcome::Expired;
+        return refused(PendingRefusal::Expired);
     }
     match wb.lock_unpoisoned().unseal_account_secret(&record.sealed) {
-        Some(verifier) => PendingOutcome::Ready(verifier, record.selection_revision),
+        Some(verifier) => {
+            PendingOutcome::Ready(verifier, record.selection_revision, record.started_ms)
+        }
         // Sealed under a key this workbench no longer holds: the attempt is
         // unusable, and it is not the same fact as never having started one.
-        None => PendingOutcome::Expired,
+        None => refused(PendingRefusal::Unsealable),
     }
 }
 
@@ -1698,7 +1762,40 @@ struct RedeemedHubSession {
     device: String,
 }
 
-fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<RedeemedHubSession, String> {
+/// Why the Hub's exchange did not yield a session. Its text is what the
+/// desktop's callback answers with; its kind is what the log records.
+#[derive(Debug)]
+enum HubRedeemError {
+    Unreachable(String),
+    Refused(u16),
+    Malformed,
+}
+
+impl HubRedeemError {
+    fn reason(&self) -> &'static str {
+        match self {
+            HubRedeemError::Unreachable(_) => "hub_unreachable",
+            HubRedeemError::Refused(_) => "hub_refused_handoff",
+            HubRedeemError::Malformed => "hub_malformed_response",
+        }
+    }
+}
+
+impl std::fmt::Display for HubRedeemError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HubRedeemError::Unreachable(error) => write!(f, "the Hub was unreachable: {error}"),
+            HubRedeemError::Refused(status) => write!(f, "the Hub refused the handoff ({status})"),
+            HubRedeemError::Malformed => f.write_str("malformed Hub response"),
+        }
+    }
+}
+
+fn redeem_at_hub(
+    hub: &str,
+    code: &str,
+    verifier: &str,
+) -> Result<RedeemedHubSession, HubRedeemError> {
     let http = HttpClient::new();
     let body = json!({
         "code": code,
@@ -1716,24 +1813,23 @@ fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<RedeemedHubSes
     )];
     let (status, response) = http
         .post_json_headers(&format!("{hub}/auth/mobile/exchange"), &idempotency, &body)
-        .map_err(|error| format!("the Hub was unreachable: {error}"))?;
+        .map_err(|error| HubRedeemError::Unreachable(error.to_string()))?;
     if status != 200 {
-        return Err(format!("the Hub refused the handoff ({status})"));
+        return Err(HubRedeemError::Refused(status));
     }
-    let parsed: Value =
-        serde_json::from_str(&response).map_err(|_| "malformed Hub response".to_string())?;
+    let parsed: Value = serde_json::from_str(&response).map_err(|_| HubRedeemError::Malformed)?;
     let account_session = parsed
         .get("account_session")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "malformed Hub response".to_string())?;
+        .ok_or(HubRedeemError::Malformed)?;
     let person = parsed
         .get("account_id")
         .and_then(Value::as_str)
         .filter(|person| !person.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "malformed Hub response".to_string())?;
+        .ok_or(HubRedeemError::Malformed)?;
     let label = parsed
         .get("label")
         .and_then(Value::as_str)
@@ -1744,7 +1840,7 @@ fn redeem_at_hub(hub: &str, code: &str, verifier: &str) -> Result<RedeemedHubSes
         .get("expires_at_ms")
         .and_then(Value::as_i64)
         .filter(|expires| *expires > 0)
-        .ok_or_else(|| "malformed Hub response".to_string())?;
+        .ok_or(HubRedeemError::Malformed)?;
     let refresh_after = parsed
         .get("refresh_after_ms")
         .and_then(Value::as_i64)
@@ -1916,21 +2012,51 @@ pub async fn post_signin_start(
     State(wb): State<SharedWorkbench>,
     body: Option<Json<SigninStart>>,
 ) -> impl IntoResponse {
+    use crate::signin_log::{completed, refuse, Trace, DESKTOP_START};
     let body = body.map(|Json(body)| body).unwrap_or_default();
     let Some(hub) = hub_base() else {
-        return (
+        return refuse(
+            DESKTOP_START,
+            "sign_in_not_configured",
+            &Trace::new(),
             StatusCode::CONFLICT,
             "account sign-in is not configured for this runtime",
-        )
-            .into_response();
+        );
     };
     let web_return = match web_return_from_env() {
         Ok(value) => value,
-        Err(message) => return (StatusCode::CONFLICT, message).into_response(),
+        Err(message) => {
+            return refuse(
+                DESKTOP_START,
+                "invalid_web_return",
+                &Trace::new(),
+                StatusCode::CONFLICT,
+                message,
+            )
+        }
     };
     let selection_revision = selected_revision(&wb);
     let verifier = new_verifier();
     let challenge = challenge_for(&verifier);
+    let mut trace = Trace::new()
+        .attempt(&challenge)
+        .detail(if body.work_email.is_some() {
+            "work_email"
+        } else {
+            body.provider
+                .as_deref()
+                .and_then(crate::auth_oidc::consumer_provider_by_slug)
+                .map_or("default", |provider| provider.slug)
+        });
+    // A second press of Sign in replaces the attempt the first one began, so
+    // the first browser tab's code can no longer be redeemed. Say so here,
+    // where the two attempts can be told apart.
+    if let Some(previous) = latest_pending(&wb).filter(|previous| {
+        !previous.challenge.is_empty()
+            && now_ms().saturating_sub(previous.started_ms) <= PENDING_TTL.as_millis() as i64
+    }) {
+        trace = trace.previous_attempt(&previous.challenge);
+    }
     let url = if let Some(email) = body.work_email {
         let hub = hub.clone();
         let challenge = challenge.clone();
@@ -1943,13 +2069,18 @@ pub async fn post_signin_start(
         .await
         {
             Ok(Ok(Some(url))) => url,
-            Ok(Ok(None)) => return Json(json!({ "organization": false })).into_response(),
+            Ok(Ok(None)) => {
+                completed(DESKTOP_START, "no_organization_for_email", &trace);
+                return Json(json!({ "organization": false })).into_response();
+            }
             _ => {
-                return (
+                return refuse(
+                    DESKTOP_START,
+                    "organization_discovery_failed",
+                    &trace,
                     StatusCode::BAD_GATEWAY,
                     "organization sign-in could not be started; try again",
                 )
-                    .into_response()
             }
         }
     } else {
@@ -1964,11 +2095,13 @@ pub async fn post_signin_start(
     // browser but not the store is a sign-in that cannot complete, so fail
     // here — where it can still be reported — rather than at the callback.
     let Some(sealed) = wb.lock_unpoisoned().seal_account_secret(&verifier) else {
-        return (
+        return refuse(
+            DESKTOP_START,
+            "seal_failed",
+            &trace,
             StatusCode::INTERNAL_SERVER_ERROR,
             "could not seal the sign-in attempt",
-        )
-            .into_response();
+        );
     };
     let record = PendingRecord {
         id: PENDING_RECORD_ID.to_string(),
@@ -1976,10 +2109,18 @@ pub async fn post_signin_start(
         started_ms: now_ms(),
         provider: body.provider.clone().unwrap_or_default(),
         selection_revision,
+        challenge,
     };
     if let Err(message) = write_pending(&wb, &record) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+        return refuse(
+            DESKTOP_START,
+            "pending_write_failed",
+            &trace,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        );
     }
+    completed(DESKTOP_START, "attempt_started", &trace);
     Json(json!({
         "url": url,
         "return": web_return.as_deref().unwrap_or(NATIVE_RETURN),
@@ -2035,56 +2176,106 @@ pub struct SigninCallback {
 /// the session. The token itself never rides this route's request or response.
 pub async fn post_signin_callback(
     State(wb): State<SharedWorkbench>,
-    Json(request): Json<SigninCallback>,
+    request: Result<Json<SigninCallback>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    use crate::signin_log::{completed, refuse, refused, Trace, DESKTOP_CALLBACK};
     let Some(hub) = hub_base() else {
-        return (
+        return refuse(
+            DESKTOP_CALLBACK,
+            "sign_in_not_configured",
+            &Trace::new(),
             StatusCode::CONFLICT,
             "account sign-in is not configured for this runtime",
-        )
-            .into_response();
+        );
+    };
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            return refused(
+                DESKTOP_CALLBACK,
+                "malformed_request",
+                &Trace::new(),
+                rejection.into_response(),
+            )
+        }
     };
     if request.code.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "missing handoff code").into_response();
+        return refuse(
+            DESKTOP_CALLBACK,
+            "missing_code",
+            &Trace::new(),
+            StatusCode::BAD_REQUEST,
+            "missing handoff code",
+        );
     }
+    let code = request.code.trim().to_string();
+    let trace = Trace::new().code(&code);
     // Single-use take, like the Hub's own state store: a second callback (or a
     // replay) finds the tombstone. Unlike the Hub's, this one is at rest, so a
     // restart during the browser leg no longer discards it (DR-0198).
-    let (verifier, selection_revision) = match take_pending(&wb) {
-        PendingOutcome::Ready(verifier, revision) => (verifier, revision),
-        PendingOutcome::Expired => {
-            tracing::warn!("hub-session callback refused: the sign-in attempt expired");
-            return (
+    let (verifier, selection_revision, started_ms) = match take_pending(&wb) {
+        PendingOutcome::Ready(verifier, revision, started_ms) => (verifier, revision, started_ms),
+        PendingOutcome::Refused {
+            refusal,
+            started_ms,
+            challenge,
+        } => {
+            let mut trace = trace.maybe_attempt(challenge.as_deref());
+            if let Some(started_ms) = started_ms {
+                trace = trace.outstanding_ms(
+                    u64::try_from(now_ms().saturating_sub(started_ms)).unwrap_or(0),
+                );
+            }
+            let message = if refusal.reads_as_expired() {
+                "the sign-in attempt expired; start again"
+            } else {
+                "no sign-in was started on this device"
+            };
+            return refuse(
+                DESKTOP_CALLBACK,
+                refusal.reason(),
+                &trace,
                 StatusCode::BAD_REQUEST,
-                "the sign-in attempt expired; start again",
-            )
-                .into_response();
-        }
-        PendingOutcome::None => {
-            tracing::warn!("hub-session callback refused: no sign-in was started on this device");
-            return (
-                StatusCode::BAD_REQUEST,
-                "no sign-in was started on this device",
-            )
-                .into_response();
+                message,
+            );
         }
     };
-    let code = request.code.trim().to_string();
-    let redeemed = tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &verifier)).await;
+    let trace = trace
+        .attempt(&challenge_for(&verifier))
+        .outstanding_ms(u64::try_from(now_ms().saturating_sub(started_ms)).unwrap_or(0));
+    let redeemed = {
+        let code = code.clone();
+        tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &verifier)).await
+    };
     let session = match redeemed {
         Ok(Ok(session)) => session,
-        Ok(Err(message)) => {
-            tracing::warn!("hub-session exchange failed: {message}");
-            return (StatusCode::BAD_GATEWAY, message).into_response();
+        Ok(Err(error)) => {
+            let trace = match &error {
+                HubRedeemError::Refused(status) => trace.upstream_status(*status),
+                _ => trace,
+            };
+            return refuse(
+                DESKTOP_CALLBACK,
+                error.reason(),
+                &trace,
+                StatusCode::BAD_GATEWAY,
+                error.to_string(),
+            );
         }
         Err(_) => {
-            tracing::warn!("hub-session exchange task panicked");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "sign-in task panicked").into_response();
+            return refuse(
+                DESKTOP_CALLBACK,
+                "internal_error",
+                &trace,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "sign-in task panicked",
+            );
         }
     };
     let superseded = superseded_device(&wb, &session);
     match store_session_with_selection(&wb, &session, Some(selection_revision)) {
         Ok((record, selected)) => {
+            completed(DESKTOP_CALLBACK, "session_sealed", &trace);
             // This desktop signing in to an account again is the same device,
             // so it retires the trusted device its previous session made.
             // Otherwise every sign-in leaves one more device in the person's
@@ -2112,10 +2303,13 @@ pub async fn post_signin_callback(
             crate::account_publish::spawn_publish(&wb, &record.person);
             Json(status_json(Some(&record), true)).into_response()
         }
-        Err(message) => {
-            tracing::warn!("hub-session seal failed: {message}");
-            (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
-        }
+        Err(message) => refuse(
+            DESKTOP_CALLBACK,
+            "session_seal_failed",
+            &trace,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        ),
     }
 }
 
@@ -3931,6 +4125,7 @@ mod tests {
                 started_ms,
                 provider: "google".to_string(),
                 selection_revision: selected_revision(wb),
+                challenge: challenge_for(verifier),
             },
         )
         .expect("store the attempt");
@@ -3948,7 +4143,7 @@ mod tests {
         // lands. A second workbench over the same root is that restart.
         let wb = crate::open_workbench(root.path()).unwrap();
         match take_pending(&wb) {
-            PendingOutcome::Ready(taken, _) => assert_eq!(taken, verifier),
+            PendingOutcome::Ready(taken, ..) => assert_eq!(taken, verifier),
             _ => panic!("the attempt did not survive the restart"),
         }
     }
@@ -4093,9 +4288,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
         start_pending(&wb, &new_verifier(), now_ms());
-        assert!(matches!(take_pending(&wb), PendingOutcome::Ready(_, _)));
-        // A replay, or a second deep link, finds the tombstone.
-        assert!(matches!(take_pending(&wb), PendingOutcome::None));
+        assert!(matches!(take_pending(&wb), PendingOutcome::Ready(..)));
+        // A replay, or a second deep link, finds the tombstone — and is told
+        // apart from a device where nothing was ever started.
+        assert!(matches!(
+            take_pending(&wb),
+            PendingOutcome::Refused {
+                refusal: PendingRefusal::AlreadyUsed,
+                ..
+            }
+        ));
         assert!(latest_pending(&wb).is_none());
     }
 
@@ -4104,13 +4306,164 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(root.path()).unwrap();
         // Nothing was ever started here.
-        assert!(matches!(take_pending(&wb), PendingOutcome::None));
+        assert!(matches!(
+            take_pending(&wb),
+            PendingOutcome::Refused {
+                refusal: PendingRefusal::NeverStarted,
+                ..
+            }
+        ));
         // One was, but the person left it in the browser for too long.
         let stale = now_ms() - PENDING_TTL.as_millis() as i64 - 1;
         start_pending(&wb, &new_verifier(), stale);
-        assert!(matches!(take_pending(&wb), PendingOutcome::Expired));
+        assert!(matches!(
+            take_pending(&wb),
+            PendingOutcome::Refused {
+                refusal: PendingRefusal::Expired,
+                ..
+            }
+        ));
         // Expiry consumes it too, so the stale code cannot be retried.
-        assert!(matches!(take_pending(&wb), PendingOutcome::None));
+        assert!(matches!(
+            take_pending(&wb),
+            PendingOutcome::Refused {
+                refusal: PendingRefusal::AlreadyUsed,
+                ..
+            }
+        ));
+    }
+
+    fn refusal_reason(response: &Response) -> Option<&'static str> {
+        response
+            .extensions()
+            .get::<crate::signin_log::SigninRefusal>()
+            .map(|refusal| refusal.reason)
+    }
+
+    async fn deliver_callback(wb: &SharedWorkbench, code: &str) -> Response {
+        post_signin_callback(
+            State(wb.clone()),
+            Ok(Json(SigninCallback {
+                code: code.to_string(),
+            })),
+        )
+        .await
+        .into_response()
+    }
+
+    /// The 2026-10-07 report's 400: each way a callback can find no attempt to
+    /// complete is logged as its own reason, though the person reads one of
+    /// two sentences.
+    #[tokio::test]
+    async fn every_refused_desktop_callback_names_its_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+
+        let response = deliver_callback(&wb, "  ").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("missing_code"));
+
+        let response = deliver_callback(&wb, "a-code").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("no_pending_sign_in"));
+
+        // The second of two browser tabs: the first callback consumed the
+        // attempt, so this one finds its tombstone.
+        let verifier = new_verifier();
+        start_pending(&wb, &verifier, now_ms());
+        assert!(matches!(take_pending(&wb), PendingOutcome::Ready(..)));
+        let text = std::cell::RefCell::new(String::new());
+        let response = {
+            let captured = crate::signin_log::capture::Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let response = deliver_callback(&wb, "the-second-tab-code").await;
+            *text.borrow_mut() = captured.text();
+            response
+        };
+        let text = text.into_inner();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("pending_already_used"));
+        assert!(
+            text.contains(&format!(
+                "attempt=\"{}\"",
+                crate::signin_log::digest(&challenge_for(&verifier))
+            )),
+            "the consumed attempt is named: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "code=\"{}\"",
+                crate::signin_log::digest("the-second-tab-code")
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("the-second-tab-code"), "{text}");
+        assert!(!text.contains(&verifier), "{text}");
+
+        let stale = now_ms() - PENDING_TTL.as_millis() as i64 - 1;
+        start_pending(&wb, &new_verifier(), stale);
+        let response = deliver_callback(&wb, "a-code").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refusal_reason(&response), Some("pending_expired"));
+    }
+
+    /// A double click on Sign in is two attempts, and the second line says it
+    /// replaced the first, by the same attempt id the Hub logs.
+    #[tokio::test]
+    async fn a_second_start_names_the_attempt_it_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let captured = crate::signin_log::capture::Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let start = || async {
+            let response = post_signin_start(State(wb.clone()), None)
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            let url = body["url"].as_str().unwrap().to_string();
+            url.split("handoff_challenge=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let first = start().await;
+        let second = start().await;
+        let text = captured.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("sign-in step completed"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(!lines[0].contains("previous_attempt="), "{text}");
+        assert!(
+            lines[1].contains(&format!(
+                "previous_attempt=\"{}\"",
+                crate::signin_log::digest(&first)
+            )),
+            "{text}"
+        );
+        assert!(
+            lines[1].contains(&format!(
+                " attempt=\"{}\"",
+                crate::signin_log::digest(&second)
+            )),
+            "{text}"
+        );
     }
 
     #[test]
@@ -4122,7 +4475,7 @@ mod tests {
         start_pending(&wb, &first, now_ms());
         start_pending(&wb, &second, now_ms());
         match take_pending(&wb) {
-            PendingOutcome::Ready(taken, _) => assert_eq!(taken, second, "latest wins"),
+            PendingOutcome::Ready(taken, ..) => assert_eq!(taken, second, "latest wins"),
             _ => panic!("the second attempt should be redeemable"),
         }
     }

@@ -93,3 +93,56 @@ it("lists Background work among a project's settings pages", () => {
     }), host);
     expect([...host.querySelectorAll("nav button")].map((button) => button.textContent)).toContain("Background work");
 });
+
+// Who may open a project and which computer holds it are separate decisions,
+// on separate pages, and neither waits on the other (DR-0455).
+function mountPage(page: "people" | "hosting") {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const api = {
+        handoffParticipants: vi.fn(async () => []),
+        handoffStatus: vi.fn(async () => ({ home: "origin" })),
+        listPeers: vi.fn(async () => [{ authority: "peer:studio", active: true }]),
+        pendingHomeInvitations: vi.fn(async () => []),
+        createHomeInvitation: vi.fn(),
+    };
+    const project = { id: "p", name: "Research", isPersonal: false, organization: null, targets: [], placements: [] } as unknown as ProjectNode;
+    dispose = render(() => createComponent(ProjectSettingsContent, {
+        api: api as unknown as ProjectSettingsApi, project, library: [], page,
+        onSelectPage: vi.fn(), onClose: vi.fn(), onChanged: vi.fn(), onOpenEngagement: vi.fn(),
+    }), host);
+    return { host, api };
+}
+
+it("shares a project on People & sharing without any word about where it is hosted", async () => {
+    const { host, api } = mountPage("people");
+    await vi.waitFor(() => expect(host.querySelector("[data-invite-by-email]")).not.toBeNull());
+    expect(host.textContent).not.toMatch(/Project Host|Hand off|handoff|Paired devices/i);
+    expect(host.querySelector("[data-project-engagement]")).toBeNull();
+    expect(api.handoffStatus).not.toHaveBeenCalled();
+    expect(api.listPeers).not.toHaveBeenCalled();
+});
+
+it("moves a project on its own Hosting page, apart from who it is shared with", async () => {
+    const { host, api } = mountPage("hosting");
+    await vi.waitFor(() => expect(host.querySelector(".project-settings-handoff-form")).not.toBeNull());
+    expect(host.querySelector("[data-project-engagement]")).not.toBeNull();
+    expect(host.textContent).not.toMatch(/Invite|People with access/);
+    expect(api.handoffParticipants).not.toHaveBeenCalled();
+});
+
+it("lists Hosting apart from People & sharing, and neither for Personal", () => {
+    const pages = (isPersonal: boolean) => {
+        const host = document.createElement("div");
+        document.body.append(host);
+        const unmount = render(() => createComponent(ProjectSettingsMenu, {
+            projectName: "Research", isPersonal, page: "overview", onSelect: vi.fn(), onClose: vi.fn(),
+        }), host);
+        const labels = [...host.querySelectorAll("nav button")].map((button) => button.textContent);
+        unmount();
+        return labels;
+    };
+    expect(pages(false)).toEqual(expect.arrayContaining(["People & sharing", "Hosting"]));
+    expect(pages(true)).not.toContain("People & sharing");
+    expect(pages(true)).not.toContain("Hosting");
+});

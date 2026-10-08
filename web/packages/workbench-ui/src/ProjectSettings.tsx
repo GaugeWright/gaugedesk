@@ -23,12 +23,13 @@ import type { DeploymentSelection } from "./DeploymentPanel";
 import { availableProjectShareCandidates } from "./project-sharing";
 import "./project-settings.css";
 
-export type ProjectSettingsPage = "overview" | "people" | "work-data" | "agents" | "model-access" | "background-work";
+export type ProjectSettingsPage = "overview" | "people" | "work-data" | "hosting" | "agents" | "model-access" | "background-work";
 
 const PAGE_LABELS: Readonly<Record<ProjectSettingsPage, string>> = {
     overview: "Overview",
     people: "People & sharing",
     "work-data": "Work & data",
+    hosting: "Hosting",
     agents: "Agents & placements",
     "model-access": "Model access",
     "background-work": "Background work",
@@ -54,8 +55,8 @@ export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi 
     /** The project's invitations still waiting to be accepted, with a way to
      *  withdraw one or replace its link (DR-0332). */
     pendingHomeInvitations?(project: ProjectId): Promise<PendingHomeInvitation[]>;
-    cancelHomeInvitation?(id: string): Promise<void>;
-    resendHomeInvitation?(id: string): Promise<CreatedHomeInvitation>;
+    cancelHomeInvitation?(project: ProjectId, id: string): Promise<void>;
+    resendHomeInvitation?(project: ProjectId, id: string): Promise<CreatedHomeInvitation>;
     setProjectNetworkIsolated(project: ProjectId, isolated: boolean): Promise<void>;
     /** Rename a work target for the whole project (DR-0248): its name is the
      *  folder every chat and Agent sees it as. */
@@ -128,11 +129,6 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
     const [refresh, setRefresh] = createSignal(0);
     const source = () => props.project.isPersonal ? false : [props.project.id, refresh()] as const;
     const [participants] = createResource(source, ([project]) => props.api.handoffParticipants(project));
-    const [handoff] = createResource(source, ([project]) => props.api.handoffStatus(project));
-    const [peers] = createResource(
-        () => props.api.desktopFederationAvailable !== false && source(),
-        () => props.api.listPeers(),
-    );
     // Only an organization's project has a roster or a policy to read; a
     // project an account owns is shared by email alone (DR-0332).
     const organizationProject = () => !props.project.isPersonal && props.project.organization !== null;
@@ -145,7 +141,6 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
     const [authority, setAuthority] = createSignal("");
     const [email, setEmail] = createSignal("");
     const [role, setRole] = createSignal<"member" | "viewer">("member");
-    const [peer, setPeer] = createSignal("");
     const [invite, setInvite] = createSignal<CreatedHomeInvitation | null>(null);
     const [pendingRevoke, setPendingRevoke] = createSignal<Participant | null>(null);
     const [pendingInvites] = createResource(
@@ -155,7 +150,6 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
     const [pendingCancel, setPendingCancel] = createSignal<string | null>(null);
     const [status, setStatus] = createSignal("");
     const [busy, setBusy] = createSignal(false);
-    const activePeers = () => ((peers.error ? undefined : peers()) ?? []).filter((candidate) => candidate.active);
     const availableCandidates = createMemo(() => availableProjectShareCandidates(
         shareDirectory()?.candidates ?? [],
         (participants.error ? undefined : participants()) ?? [],
@@ -231,7 +225,7 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
         setBusy(true);
         setStatus("");
         try {
-            setInvite(await props.api.resendHomeInvitation(id));
+            setInvite(await props.api.resendHomeInvitation(props.project.id, id));
             setStatus("New link ready. The earlier link no longer works.");
             setRefresh((value) => value + 1);
         } catch (error) {
@@ -249,7 +243,7 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
 
     return <>
         <section class="project-settings-section">
-            <ProjectPageHeader title="People with access" description="Access is granted by the Project Host and can be revoked here." />
+            <ProjectPageHeader title="People with access" description="Everyone who can open this project. Revoking ends their access." />
             <Show when={!participants.error} fallback={<div class="project-settings-empty project-settings-empty-action" data-access-error><span>Access could not be loaded.</span><button type="button" onClick={() => setRefresh((value) => value + 1)}>Retry</button></div>}>
             <Show when={!participants.loading} fallback={<p class="project-settings-empty">Loading access…</p>}>
                 <div class="project-settings-rows">
@@ -326,7 +320,7 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
                                 </div>
                             }>
                                 <div class="project-settings-inline-actions"><button type="button" onClick={() => setPendingCancel(null)}>Keep</button><button type="button" class="danger" disabled={busy()} onClick={() => void run(async () => {
-                                    await props.api.cancelHomeInvitation?.(pending.id);
+                                    await props.api.cancelHomeInvitation?.(props.project.id, pending.id);
                                     setPendingCancel(null);
                                 }, "Invitation cancelled. Its link no longer works.")}>Cancel invitation</button></div>
                             </Show>
@@ -336,13 +330,46 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
             </Show>
         </section>
 
+        <Show when={status()}>{(message) => <p class="project-settings-status" role="status">{message()}</p>}</Show>
+    </>;
+}
+
+/** Where the project runs, and moving it. Kept apart from People & sharing:
+ *  who may open a project and which computer holds it are separate decisions,
+ *  and neither waits on the other (DR-0455). */
+function Hosting(props: ProjectSettingsProps): JSX.Element {
+    const source = () => props.project.isPersonal ? false : props.project.id;
+    const [handoff, { refetch: refetchHandoff }] = createResource(source, (project) => props.api.handoffStatus(project));
+    const [peers] = createResource(
+        () => props.api.desktopFederationAvailable !== false && source(),
+        () => props.api.listPeers(),
+    );
+    const [peer, setPeer] = createSignal("");
+    const [status, setStatus] = createSignal("");
+    const [busy, setBusy] = createSignal(false);
+    const activePeers = () => ((peers.error ? undefined : peers()) ?? []).filter((candidate) => candidate.active);
+    const handOff = async () => {
+        setBusy(true);
+        setStatus("");
+        try {
+            await props.api.handoffRelocate(props.project.id, peer());
+            setStatus("Handoff started. The destination must accept before the Home moves.");
+            void refetchHandoff();
+            await props.onChanged();
+        } catch (error) {
+            setStatus(describeError(error));
+        } finally {
+            setBusy(false);
+        }
+    };
+    return <>
         <section class="project-settings-section">
             <ProjectPageHeader title="Project Host" description={(handoff.error ? undefined : handoff())?.home === "target" ? "This project's Home is held by the destination." : "Move this project's Home to a paired, trusted device."}
                 action={props.onOpenEngagement && <button type="button" data-project-engagement onClick={props.onOpenEngagement}>Paired devices…</button>} />
             <Show when={activePeers().length > 0} fallback={<p class="project-settings-empty">No paired device is available for handoff.</p>}>
                 <div class="project-settings-form project-settings-handoff-form">
                     <label><span>Destination</span><select value={peer()} onChange={(event) => setPeer(event.currentTarget.value)}><option value="">Choose device</option><For each={activePeers()}>{(candidate) => <option value={candidate.authority}>{compactAuthority(candidate.authority)}</option>}</For></select></label>
-                    <button type="button" disabled={busy() || !peer()} onClick={() => void run(async () => { await props.api.handoffRelocate(props.project.id, peer()); }, "Handoff started. The destination must accept before the Home moves.")}>Hand off</button>
+                    <button type="button" disabled={busy() || !peer()} onClick={() => void handOff()}>Hand off</button>
                 </div>
             </Show>
         </section>
@@ -668,6 +695,9 @@ export function ProjectSettingsContent(props: ProjectSettingsProps): JSX.Element
                             <button type="button" onClick={() => props.onSelectPage("people")}><strong>People & sharing</strong><span>Participants and project access</span></button>
                         </Show>
                         <button type="button" onClick={() => props.onSelectPage("work-data")}><strong>Work & data</strong><span>{props.project.upstream ? "forked · pull from the original · " : ""}{props.project.targets.length} work {props.project.targets.length === 1 ? "target" : "targets"} · {props.project.networkIsolated ? "network isolated" : "network open"}</span></button>
+                        <Show when={!props.project.isPersonal}>
+                            <button type="button" onClick={() => props.onSelectPage("hosting")}><strong>Hosting</strong><span>Where this project runs, and moving it</span></button>
+                        </Show>
                         <button type="button" onClick={() => props.onSelectPage("agents")}><strong>Agents & placements</strong><span>{props.project.placements.filter((placement) => !placement.isDefault).length} placed</span></button>
                         <button type="button" onClick={() => props.onSelectPage("model-access")}><strong>Model access</strong><span>Connections, models, and usage</span></button>
                         <button type="button" onClick={() => props.onSelectPage("background-work")}><strong>Background work</strong><span>What runs while nobody is here, and the keys it holds</span></button>
@@ -676,6 +706,7 @@ export function ProjectSettingsContent(props: ProjectSettingsProps): JSX.Element
             </Show>
             <Show when={props.page === "people"}><PeopleAndSharing {...props} /></Show>
             <Show when={props.page === "work-data"}><ForkedFrom {...props} /><WorkAndData {...props} /></Show>
+            <Show when={props.page === "hosting" && !props.project.isPersonal}><Hosting {...props} /></Show>
             <Show when={props.page === "agents"}><AgentsAndPlacements {...props} /></Show>
             <Show when={props.page === "model-access"}>
                 <section class="project-settings-section project-settings-model"><ProjectModelAccessContent api={props.api} project={props.project.id} projectName={props.project.name} /></section>
@@ -701,7 +732,7 @@ export function ProjectSettingsMenu(props: {
         ? []
         : props.isPersonal
             ? ["overview", "work-data", "agents", "model-access", "background-work"]
-            : ["overview", "people", "work-data", "agents", "model-access", "background-work"];
+            : ["overview", "people", "work-data", "hosting", "agents", "model-access", "background-work"];
     if (props.compact) return <nav class="project-settings-menu project-settings-menu-compact" aria-label={`Settings for ${props.projectName}`}>
         <button type="button" class="project-settings-menu-close" onClick={props.onClose}>{props.closeLabel ?? "Back to files"}</button>
         <label>

@@ -334,11 +334,11 @@ export class MobileControlPlane implements FacetBrowserApi {
         return workbenchClient.listPendingHomeInvitations(this.routeJson(), project);
     }
 
-    cancelHomeInvitation(id: string): Promise<void> {
+    cancelHomeInvitation(_project: ProjectId, id: string): Promise<void> {
         return workbenchClient.cancelHomeInvitation(this.routeJson(), id);
     }
 
-    resendHomeInvitation(id: string): Promise<CreatedHomeInvitation> {
+    resendHomeInvitation(_project: ProjectId, id: string): Promise<CreatedHomeInvitation> {
         return workbenchClient.resendHomeInvitation(this.routeJson(), id);
     }
 

@@ -148,7 +148,6 @@ export function EngagementPane(props: {
     project: ProjectId;
     projectName: string;
     onClose: () => void;
-    onOpenPeopleAndSharing?: () => void;
 }): JSX.Element {
     const [status, setStatus] = createSignal("");
     const [peer, setPeer] = createSignal("");
@@ -831,14 +830,6 @@ export function EngagementPane(props: {
                             </button>
                         </div>
                     </Show>
-                </Show>
-
-                <Show when={props.onOpenPeopleAndSharing}>
-                    <div class="pair-device-actions">
-                        <button type="button" class="tree-action" onClick={props.onOpenPeopleAndSharing}>
-                            Manage people &amp; sharing
-                        </button>
-                    </div>
                 </Show>
 
                 {/* Participants & ownership (revoke = licensing, not secrecy). */}

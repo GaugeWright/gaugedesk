@@ -139,13 +139,13 @@ describe("ordinary Home invitations", () => {
         }));
         // A Home nobody can reach says so itself, and that is what is shown.
         const refused = vi.fn(async () => {
-            throw new Error("this computer cannot be reached from elsewhere yet");
+            throw new Error("invitations to projects on this computer aren't available until it can be reached from elsewhere");
         });
         await expect(createHomeInvitation(refused, {
             email: "alex@example.test",
             project: "proj-1" as never,
             endpoint: "",
-        })).rejects.toThrow(/cannot be reached from elsewhere/);
+        })).rejects.toThrow(/aren't available until it can be reached from elsewhere/);
     });
 
     it("reads a relay-only invitation's route and refuses one that carries none", () => {
