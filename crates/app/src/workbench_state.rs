@@ -163,6 +163,9 @@ pub struct Workbench {
     pub(crate) audit_reads: bool,
     /// In-process failed-attempt lockout for SCIM bearer checks (`SECAUD-8`).
     pub(crate) scim_throttle: Arc<throttle::Throttle>,
+    /// Installed only by a hosted composition. The product never constructs
+    /// or selects a remote member-standing authority from a request.
+    pub(crate) member_standing_fence: Option<crate::membership_fence::InstalledMemberStandingFence>,
     /// In-process failed-attempt lockout for OIDC callback processing (`SECAUD-8`) — a
     /// per-tenant brute-force guard on the SSO callback, separate from SCIM's counter.
     pub(crate) oidc_throttle: Arc<throttle::Throttle>,
@@ -212,6 +215,19 @@ impl Workbench {
         authority: Option<crate::managed_funding::FundingAuthority>,
     ) {
         self.managed_funding_authority = authority;
+    }
+
+    pub fn install_member_standing_fence(
+        &mut self,
+        fence: crate::membership_fence::InstalledMemberStandingFence,
+    ) {
+        self.member_standing_fence = Some(fence);
+    }
+
+    pub fn member_standing_fence(
+        &self,
+    ) -> Option<crate::membership_fence::InstalledMemberStandingFence> {
+        self.member_standing_fence.clone()
     }
 }
 
@@ -499,6 +515,7 @@ impl Workbench {
             // SECAUD-8: 10 failed SCIM auths within 60s locks the tenant's SCIM endpoint
             // for the rest of the window (defense-in-depth; edge is the primary control).
             scim_throttle: Arc::new(throttle::Throttle::new(10, 60_000)),
+            member_standing_fence: None,
             // SECAUD-8: 10 failed OIDC callbacks within 60s locks the tenant's SSO callback
             // for the rest of the window (defense-in-depth behind the edge rate-limit).
             oidc_throttle: Arc::new(throttle::Throttle::new(10, 60_000)),

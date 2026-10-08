@@ -131,8 +131,6 @@ Feature: The archetype & project library
 
   # Fork lineage (ADR 0038): a fork shares its source's git history, shows the lineage,
   # and can pull the source's improvements down via a real 3-way merge.
-  # quarantined (WS-910): a folded fork hides its lineage (product bug)
-  @quarantine
   Scenario: a fork shows its source and can pull updates
     Given the workbench is open
     When I create an archetype named "base"

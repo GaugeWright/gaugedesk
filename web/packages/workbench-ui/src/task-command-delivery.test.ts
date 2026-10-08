@@ -1,5 +1,6 @@
 import { createRoot, createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
+import { Rejected, TurnStopped } from "@gaugewright/control-plane-client";
 import { createMemoryOutboxStore } from "./composer-outbox";
 import { attachTaskCommandAttempt, createTaskCommandLedger, createSessionComposerController,
     BASIC_COMPOSER_CAPABILITIES, UNIVERSAL_COMPOSER_CAPABILITIES, sameTaskAddress, taskCommandAddress, type TaskCommandScope, type SessionComposerControllerOptions, type TaskCommandAttempt } from "./session-composer-controller";
@@ -227,4 +228,84 @@ describe("task delivery where no queue is shown", () => {
         expect(h.controller.draft()).toBe("");
         expect(h.send).not.toHaveBeenCalled(); h.dispose();
     });
+});
+
+// Signed-out local work: the Home admits the request as its local account and
+// names no verified requester, so no observation will ever confirm the command.
+// Waiting for one held every message that had run, and kept its echo beside the
+// admitted line, for good (WS-871).
+describe("task delivery nothing can confirm (WS-871)", () => {
+    const unbound: TaskCommandScope = { home: {}, chat: "chat-one" };
+    function signedOut(ending: "ran" | "stopped" | "failed" | "applied", store = createMemoryOutboxStore()) {
+        const [busy, setBusy] = createSignal(false);
+        let ledger!: ReturnType<typeof createTaskCommandLedger>;
+        let dispose!: () => void;
+        const send = vi.fn(async (text: string, _images: unknown, id: string,
+            bindTask?: (attempt: TaskCommandAttempt) => Promise<void>) => {
+            const attempt = ledger.begin(unbound, id, text, 0);
+            if (bindTask) await bindTask(attempt);
+            if (ending === "stopped") throw attachTaskCommandAttempt(new TurnStopped(), attempt);
+            if (ending === "failed") throw attachTaskCommandAttempt(new Error("the model refused"), attempt);
+            if (ending === "applied") throw attachTaskCommandAttempt(new Rejected("already applied", "applied"), attempt);
+            return attempt;
+        });
+        const controller = createRoot((cleanup) => {
+            dispose = cleanup;
+            ledger = createTaskCommandLedger();
+            return createSessionComposerController({ scope: () => "chat-one", busy,
+                capabilities: () => UNIVERSAL_COMPOSER_CAPABILITIES, send, outbox: store,
+                taskCommands: ledger, taskScope: () => unbound, appliesComposedIdOnce: () => true });
+        });
+        return { controller, send, store, setBusy, dispose, ledger: () => ledger };
+    }
+    it("marks an attempt in a scope with no verified requester as one nothing can confirm", () => createRoot((dispose) => {
+        const ledger = createTaskCommandLedger();
+        expect(ledger.begin(unbound, "signed-out", "hello", 0).confirmable).toBe(false);
+        expect(ledger.begin(addressed, "addressed", "hello", 0).confirmable).toBe(true);
+        expect(ledger.begin({ home: {}, chat: "chat-one", publicSession: true }, "visitor", "hello", 0).confirmable).toBe(true);
+        dispose();
+    }));
+    it("retires a message whose turn ran, binding no address to it", async () => {
+        const h = signedOut("ran"); await flush();
+        h.controller.setDraft("hello"); h.controller.submit(); await flush();
+        expect(await h.store.load("chat-one")).toEqual([]);
+        expect(h.controller.queue()).toEqual([]);
+        expect(h.controller.error()).toBe("");
+        h.setBusy(true); h.setBusy(false); await flush();
+        expect(h.send).toHaveBeenCalledTimes(1); h.dispose();
+    });
+    it("lets the next queued message run once the one in front of it has", async () => {
+        const h = signedOut("ran"); await flush();
+        h.setBusy(true);
+        h.controller.setDraft("first"); h.controller.submit();
+        h.controller.setDraft("second"); h.controller.submit(); await flush();
+        expect(h.controller.queue().map((item) => item.text)).toEqual(["first", "second"]);
+        h.setBusy(false); await flush();
+        expect(h.send.mock.calls.map((call) => call[0])).toEqual(["first", "second"]);
+        expect(h.controller.queue()).toEqual([]);
+        expect(await h.store.load("chat-one")).toEqual([]); h.dispose();
+    });
+    it.each(["stopped", "applied"] as const)("retires a message whose turn was %s, and reports nothing", async (ending) => {
+        const h = signedOut(ending); await flush();
+        h.controller.setDraft("hello"); h.controller.submit(); await flush();
+        expect(await h.store.load("chat-one")).toEqual([]);
+        expect(h.controller.error()).toBe(""); h.dispose();
+    });
+    it("sets a failed message aside for the reader to release", async () => {
+        const h = signedOut("failed"); await flush();
+        h.controller.setDraft("hello"); h.controller.submit(); await flush();
+        expect(await h.store.load("chat-one")).toMatchObject([{ text: "hello", held: true, dispatched: false }]);
+        expect(h.controller.error()).toMatch(/the model refused/);
+        h.setBusy(true); h.setBusy(false); await flush();
+        expect(h.send).toHaveBeenCalledTimes(1); h.dispose();
+    });
+    it("releases only an echo nothing can confirm", () => createRoot((dispose) => {
+        const ledger = createTaskCommandLedger();
+        ledger.begin(unbound, "signed-out", "one", 0);
+        ledger.begin(addressed, "addressed", "two", 0);
+        ledger.release(unbound, "signed-out");
+        ledger.release(addressed, "addressed");
+        expect(ledger.pending().map((command) => command.id)).toEqual(["addressed"]);
+        dispose();
+    }));
 });

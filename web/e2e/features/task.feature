@@ -37,8 +37,6 @@ Feature: Tasking the agent
 
   # Stopping your own turn is not a fault and not a failed delivery: no error on
   # the composer, and the cancelled message is not handed back to be run again.
-  # quarantined (WS-903): signed-out sends show twice and stay held (WS-888)
-  @quarantine
   Scenario: a stopped turn leaves no error, and what was queued behind it runs
     Given a new engagement
     When I start tasking the agent with "[hold] until I stop it"

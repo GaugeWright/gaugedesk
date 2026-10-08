@@ -603,9 +603,20 @@ export function createSessionComposerController(
             return;
         }
         let bound: TaskCommandAttempt | undefined;
+        // The transport learns whether its scope can be confirmed only once it
+        // has resolved that scope, which is why it says so here rather than in
+        // `correlatesTask`. An attempt nothing can confirm is not bound to an
+        // address: waiting for an observation that will never come is how every
+        // message sent signed out came back held after it had run (WS-871). It
+        // settles the way an uncorrelated host's send does, on the composed id.
+        let unconfirmable = false;
         const bindTask = correlated ? async (attempt: TaskCommandAttempt) => {
             if (disposed) throw new Error("Task controller closed before submission");
             if (attempt.id !== next.id) throw new Error("Task attempt identity does not match the saved message");
+            if (attempt.confirmable === false) {
+                unconfirmable = true;
+                return;
+            }
             const addressedRow = { ...next, dispatched: true, task_correlated: true, task_address: attempt.address };
             const saved = await persist(addressedRow);
             if (!saved) throw new Error("This task was not submitted because its original address could not be saved");
@@ -618,11 +629,11 @@ export function createSessionComposerController(
         const delivery = correlated ? options.send(next.text, next.images, next.id, bindTask)
             : options.send(next.text, next.images, next.id);
         void delivery.then((attempt) => {
-                if (correlated) observeDelivery(next, bound === attempt ? attempt || undefined : undefined);
+                if (correlated && !unconfirmable) observeDelivery(next, bound === attempt ? attempt || undefined : undefined);
                 else drop(next.id);
             })
             .catch((cause) => {
-                if (correlated) {
+                if (correlated && !unconfirmable) {
                     observeDelivery(next, bound ?? taskCommandAttemptForError(cause));
                     if (!turnStopped(cause)) report(failureMessage(cause));
                     return;
@@ -1019,9 +1030,22 @@ export function sameTaskAddress(a: TaskCommandAddress | undefined, b: TaskComman
     return !!a && !!b && a.home_id === b.home_id && a.actor_id === b.actor_id
         && a.project_id === b.project_id && a.chat_id === b.chat_id;
 }
+/** Can any observation ever confirm a command sent in this scope?
+ *
+ *  A Home mints correlation facts only for a verified requester, and the public
+ *  Session for its own visitor. A scope with neither — signed-out local work,
+ *  whose requests the Home admits as its local account without verifying anyone
+ *  — is answered with none, so a command there is not addressed at all: it keeps
+ *  the composed-id contract of DR-0137 instead (WS-871). */
+export function taskCommandConfirmable(scope: TaskCommandScope | undefined): boolean {
+    return Boolean(scope?.authority) || scope?.publicSession === true;
+}
 export interface TaskCommandAttempt {
     readonly id: string;
     readonly address?: TaskCommandAddress;
+    /** `false` when nothing can ever confirm this attempt
+     *  ({@link taskCommandConfirmable}). Absent is read as confirmable. */
+    readonly confirmable?: boolean;
     readonly outcome: () => "accepted" | "settled" | "refused" | undefined;
     readonly subscribe: (listener: () => void) => () => void;
 }
@@ -1047,6 +1071,10 @@ export interface TaskCommandLedger {
     begin(scope: TaskCommandScope, id: string, text: string, baselineLines: number): TaskCommandAttempt;
     observe(scope: TaskCommandScope, fact: unknown): void;
     uncertain(scope: TaskCommandScope, id: string): void;
+    /** Retire the echo of a command nothing can confirm, once its transport has
+     *  re-read the durable transcript after the turn. A confirmable command is
+     *  never released here: only an exact observation retires one. */
+    release(scope: TaskCommandScope, id: string): void;
 }
 export function createTaskCommandLedger(): TaskCommandLedger {
     const [pending, setPending] = createSignal<readonly PendingTaskCommand[]>([]);
@@ -1063,7 +1091,8 @@ export function createTaskCommandLedger(): TaskCommandLedger {
                 && command.scope.authority?.actor_id === scope.authority?.actor_id);
             if (existing) return existing.attempt;
             const state: { outcome?: "accepted" | "settled" | "refused"; listeners: Set<() => void> } = { listeners: new Set() };
-            const attempt: TaskCommandAttempt = Object.freeze({ id, address: taskCommandAddress(scope), outcome: () => state.outcome,
+            const attempt: TaskCommandAttempt = Object.freeze({ id, address: taskCommandAddress(scope),
+                confirmable: taskCommandConfirmable(scope), outcome: () => state.outcome,
                 subscribe: (listener: () => void) => {
                     state.listeners.add(listener);
                     if (state.outcome) listener();
@@ -1093,5 +1122,7 @@ export function createTaskCommandLedger(): TaskCommandLedger {
         },
         uncertain: (scope, id) => setPending((current) => current.map((command) =>
             matches(command, scope, id) ? { ...command, uncertain: true } : command)),
+        release: (scope, id) => setPending((current) => current.filter((command) =>
+            !matches(command, scope, id) || taskCommandConfirmable(command.scope))),
     };
 }

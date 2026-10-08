@@ -5,8 +5,6 @@ Feature: Send queue & steering
   composer. Queued messages are reorderable, editable, and cancellable, and they
   drain in order when each turn settles. Steering sends now, jumping the queue.
 
-  # quarantined (WS-896): signed-out sends show twice and stay held (WS-888)
-  @quarantine
   Scenario: queued messages stack, then edit, cancel, and drain in order
     Given a new engagement
     When I start tasking the agent with "[slow] alpha"
@@ -23,8 +21,6 @@ Feature: Send queue & steering
     Then the diff shows "alpha"
     And the diff shows "gamma-edited"
 
-  # quarantined (WS-897): signed-out sends show twice and stay held (WS-888)
-  @quarantine
   Scenario: queued messages reorder by drag
     Given a new engagement
     When I start tasking the agent with "[slow] one"
@@ -36,8 +32,6 @@ Feature: Send queue & steering
     Then queued message 1 is "three"
     And the agent finishes
 
-  # quarantined (WS-898): signed-out sends show twice and stay held (WS-888)
-  @quarantine
   Scenario: steering jumps the queue and runs now
     Given a new engagement
     When I start tasking the agent with "[slow] original"
@@ -50,8 +44,6 @@ Feature: Send queue & steering
     When I reload the workbench
     Then the transcript echoes my message "redirect"
 
-  # quarantined (WS-899): signed-out sends show twice and stay held (WS-888)
-  @quarantine
   Scenario: queue mode is set before the turn it governs, and holds through it
     Given a new engagement
     When I set the composer mode to "queue"
@@ -62,8 +54,6 @@ Feature: Send queue & steering
     And the agent finishes
     And the run phase is "Completed"
 
-  # quarantined (WS-900): signed-out sends show twice and stay held (WS-888)
-  @quarantine
   Scenario: stash mode puts what Enter sends into the queue, held (#24)
     Given a new engagement
     When I set the composer mode to "stash"
@@ -76,8 +66,6 @@ Feature: Send queue & steering
     And the agent finishes
     Then the run phase is "Completed"
 
-  # quarantined (WS-901): signed-out sends show twice and stay held (WS-888)
-  @quarantine
   Scenario: a held message does not hold up the ones meant to run
     Given a new engagement
     When I stash the message "jotted for later"
@@ -87,8 +75,6 @@ Feature: Send queue & steering
     Then the queue shows 2 messages
     And the queue settles to 1 held message
 
-  # quarantined (WS-902): signed-out sends show twice and stay held (WS-888)
-  @quarantine
   Scenario: send now runs one held message immediately, ahead of the rest
     Given a new engagement
     When I stash the message "held-one"

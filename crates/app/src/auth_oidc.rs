@@ -3322,6 +3322,16 @@ pub async fn get_login(
         )
         .await;
     }
+    // A desktop's passkey (DR-0457). Not a consumer connection: the ceremony
+    // runs at the account's own WebAuthn origin, which a desktop window is not.
+    if query
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|slug| slug.eq_ignore_ascii_case(PASSKEY_ENTRANCE))
+    {
+        return begin_passkey_browser_login(&auth, native_return, query.handoff_challenge, trace);
+    }
     // Hosted web account: fall back to a consumer connection from env, so the hub
     // offers "Continue with Google" or "Continue with Microsoft" without a stored
     // /admin/sso record (ADR 0077, DR-0189 §1).
@@ -3373,6 +3383,50 @@ pub async fn get_login(
         },
     )
     .await
+}
+
+/// The `provider` a desktop names for its passkey entrance (DR-0457).
+const PASSKEY_ENTRANCE: &str = "passkey";
+
+/// Send a browser to the account's own sign-in card for a passkey ceremony
+/// (DR-0457).
+///
+/// A desktop cannot run one: its window is not the WebAuthn origin, and its
+/// control plane has no account ceremony runtime. So it opens this, and the
+/// card at that origin runs the ceremony bound to the desktop's return and
+/// handoff challenge, which ride the fragment — public values, never sent to a
+/// server or kept in a `Referer` — and which the ceremony's start validates
+/// again. Its finish answers the one-time code instead of signing this browser
+/// in. A browser that asks without a native return is sent to the card as it
+/// is.
+fn begin_passkey_browser_login(
+    auth: &AuthShellState,
+    native_return: Option<String>,
+    challenge: Option<String>,
+    trace: crate::signin_log::Trace,
+) -> axum::response::Response {
+    use crate::signin_log::{completed, refuse, LOGIN};
+    let trace = trace.detail(PASSKEY_ENTRANCE);
+    let Some(runtime) = auth.account_auth() else {
+        return refuse(
+            LOGIN,
+            "passkey_not_configured",
+            &trace,
+            StatusCode::CONFLICT,
+            "passkey sign-in is not configured on this server",
+        );
+    };
+    let origin = runtime.origin().trim_end_matches('/');
+    let target = match (native_return, challenge) {
+        (Some(native_return), Some(challenge)) => format!(
+            "{origin}/#passkey_return={}&handoff_challenge={}",
+            url::form_urlencoded::byte_serialize(native_return.as_bytes()).collect::<String>(),
+            url::form_urlencoded::byte_serialize(challenge.as_bytes()).collect::<String>(),
+        ),
+        _ => format!("{origin}/"),
+    };
+    completed(LOGIN, "redirected_to_passkey_card", &trace);
+    Redirect::to(&target).into_response()
 }
 
 fn independent_account_method(method: &str) -> bool {
@@ -7089,6 +7143,89 @@ iqlTEKVISscuchxZtKQJ4k8=
         .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(refusal_reason(&response), Some("invalid_handoff_challenge"));
+    }
+
+    async fn passkey_login(
+        auth: AuthShellState,
+        return_to: Option<&str>,
+        challenge: Option<&str>,
+    ) -> axum::response::Response {
+        let wb: SharedWorkbench = Arc::new(Mutex::new(Workbench::new(
+            gaugedesk_store::Store::open_in_memory().unwrap(),
+        )));
+        get_login(
+            State(wb),
+            Extension(auth),
+            HeaderMap::new(),
+            Query(LoginQuery {
+                return_to: return_to.map(str::to_string),
+                handoff_challenge: challenge.map(str::to_string),
+                provider: Some("passkey".to_string()),
+                select_account: None,
+            }),
+        )
+        .await
+        .into_response()
+    }
+
+    /// DR-0457: a desktop's passkey sign-in is sent to the WebAuthn origin's
+    /// card, carrying the desktop's return and challenge in the fragment.
+    #[tokio::test]
+    async fn a_desktop_passkey_login_is_sent_to_the_account_card_with_its_challenge() {
+        struct NoMail;
+        impl crate::account_auth_ceremony::EmailChallengeSender for NoMail {
+            fn send_verification(&self, _: &str, _: &str, _: u64) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let runtime = crate::account_auth_ceremony::AccountAuthRuntime::new(
+            crate::account_auth_ceremony::AccountAuthConfig::new(
+                "example.test",
+                "GaugeDesk",
+                "https://desk.example.test",
+            )
+            .unwrap(),
+            Arc::new(NoMail),
+        )
+        .unwrap();
+        let auth = AuthShellState::new().with_account_auth(Arc::new(runtime));
+        let challenge = crate::identity_oidc::s256_challenge(HANDOFF_VERIFIER);
+
+        let response = passkey_login(
+            auth.clone(),
+            Some("gaugewright://auth/callback"),
+            Some(&challenge),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[axum::http::header::LOCATION],
+            format!(
+                "https://desk.example.test/#passkey_return=gaugewright%3A%2F%2Fauth%2Fcallback&handoff_challenge={challenge}"
+            ),
+        );
+
+        // A browser asking for its own passkey sign-in gets the card as it is.
+        let response = passkey_login(auth.clone(), None, None).await;
+        assert_eq!(
+            response.headers()[axum::http::header::LOCATION],
+            "https://desk.example.test/"
+        );
+
+        // The return is validated exactly as for every other entrance.
+        let response =
+            passkey_login(auth, Some("gaugewright://auth/callback"), Some("short")).await;
+        assert_eq!(refusal_reason(&response), Some("invalid_handoff_challenge"));
+
+        // And a server with no account ceremony says so.
+        let response = passkey_login(
+            AuthShellState::new(),
+            Some("gaugewright://auth/callback"),
+            Some(&challenge),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(refusal_reason(&response), Some("passkey_not_configured"));
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! deprovision via DELETE — asserting the offboarding marks the member
 //! deprovisioned and SCIM-managed.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -13,8 +13,13 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+use gaugedesk_app::membership_fence::{
+    HostedMemberStandingFence, InstalledMemberStandingFence, StandingFenceError,
+    StandingFenceOutcome, COMMITTED_ACTIVATION_KIND, COMMITTED_DENIAL_KIND,
+};
 use gaugedesk_app::org::{tenant_scope, MembershipRecord, MembershipStatus, RecordOp, ORG_ID};
-use gaugedesk_app::Workbench;
+use gaugedesk_app::{SharedWorkbench, Workbench};
+use gaugedesk_core::ids::ScopeId;
 use gaugedesk_ee::org_routes::enterprise_control_plane;
 use gaugedesk_store::Store;
 use gaugedesk_workspace::Instance;
@@ -22,7 +27,7 @@ use gaugedesk_workspace::Instance;
 mod support;
 use support::{administration_command, administration_document};
 
-fn workbench() -> (tempfile::TempDir, Router) {
+fn workbench_with_shared() -> (tempfile::TempDir, SharedWorkbench, Router) {
     let dir = tempfile::tempdir().unwrap();
     let instance = Instance::init(dir.path().join("repo"), dir.path().join("wt")).unwrap();
     let mut store = Store::open_in_memory().unwrap();
@@ -46,8 +51,117 @@ fn workbench() -> (tempfile::TempDir, Router) {
             )
             .unwrap();
     }
-    let wb = Workbench::with_target("inst-test", instance, store);
-    (dir, enterprise_control_plane(Arc::new(Mutex::new(wb))))
+    let wb = Arc::new(Mutex::new(Workbench::with_target(
+        "inst-test",
+        instance,
+        store,
+    )));
+    let app = enterprise_control_plane(wb.clone());
+    (dir, wb, app)
+}
+
+fn workbench() -> (tempfile::TempDir, Router) {
+    let (dir, _, app) = workbench_with_shared();
+    (dir, app)
+}
+
+struct TestStandingFence {
+    wb: Weak<Mutex<Workbench>>,
+    calls: Mutex<Vec<&'static str>>,
+    denial_operations: Mutex<Vec<String>>,
+    fail_begin: AtomicBool,
+    interleave_begin: AtomicBool,
+    fail_admit: AtomicBool,
+}
+
+impl TestStandingFence {
+    fn assert_unlocked(&self) -> SharedWorkbench {
+        let wb = self.wb.upgrade().expect("Workbench still exists");
+        assert!(
+            wb.try_lock().is_ok(),
+            "remote standing call held Workbench lock"
+        );
+        wb
+    }
+}
+
+impl HostedMemberStandingFence for TestStandingFence {
+    fn observe_activation(&self, _: &ScopeId, _: &str) -> Result<Value, StandingFenceError> {
+        self.assert_unlocked();
+        self.calls.lock().unwrap().push("observe");
+        Ok(json!({"revision": 7}))
+    }
+
+    fn admit_if_unchanged(
+        &self,
+        owner: &ScopeId,
+        member: &str,
+        observed: &Value,
+    ) -> Result<StandingFenceOutcome, StandingFenceError> {
+        let wb = self.assert_unlocked();
+        assert_eq!(observed, &json!({"revision": 7}));
+        let guard = wb.lock().unwrap();
+        let command_scope = format!("gaugevault:membership:{}", owner.as_str());
+        assert!(!guard
+            .store_ref()
+            .retained_records(&command_scope, COMMITTED_ACTIVATION_KIND)
+            .unwrap()
+            .is_empty());
+        let org = gaugedesk_app::org::Org::rebuild_in(guard.store_ref(), owner.as_str()).unwrap();
+        assert_eq!(org.members[member].status, MembershipStatus::Active);
+        self.calls.lock().unwrap().push("admit");
+        if self.fail_admit.load(Ordering::Relaxed) {
+            Err(StandingFenceError::Unavailable)
+        } else {
+            Ok(StandingFenceOutcome::Committed)
+        }
+    }
+
+    fn begin_denial(
+        &self,
+        owner: &ScopeId,
+        _: &str,
+        operation: &str,
+    ) -> Result<StandingFenceOutcome, StandingFenceError> {
+        let wb = self.assert_unlocked();
+        self.calls.lock().unwrap().push("begin");
+        self.denial_operations
+            .lock()
+            .unwrap()
+            .push(operation.to_owned());
+        if self.fail_begin.load(Ordering::Relaxed) {
+            Err(StandingFenceError::Unavailable)
+        } else {
+            if self.interleave_begin.swap(false, Ordering::Relaxed) {
+                wb.lock()
+                    .unwrap()
+                    .store_mut()
+                    .append_record(owner.as_str(), "competing", "other write")
+                    .unwrap();
+            }
+            Ok(StandingFenceOutcome::Committed)
+        }
+    }
+
+    fn complete_denial(
+        &self,
+        owner: &ScopeId,
+        member: &str,
+        _: &str,
+    ) -> Result<StandingFenceOutcome, StandingFenceError> {
+        let wb = self.assert_unlocked();
+        let guard = wb.lock().unwrap();
+        let command_scope = format!("gaugevault:membership:{}", owner.as_str());
+        assert!(!guard
+            .store_ref()
+            .retained_records(&command_scope, COMMITTED_DENIAL_KIND)
+            .unwrap()
+            .is_empty());
+        let org = gaugedesk_app::org::Org::rebuild_in(guard.store_ref(), owner.as_str()).unwrap();
+        assert_eq!(org.members[member].status, MembershipStatus::Deprovisioned);
+        self.calls.lock().unwrap().push("complete");
+        Ok(StandingFenceOutcome::Committed)
+    }
 }
 
 async fn scim_credential(app: &Router, tenant: Option<&str>, command: &str) -> (StatusCode, Value) {
@@ -277,6 +391,139 @@ async fn scim_tokens_are_tenant_isolated() {
     )
     .await;
     assert_eq!(s, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn hosted_scim_stages_denial_and_activation_with_committed_receipts() {
+    let (_dir, wb, app) = workbench_with_shared();
+    let token = issue_token(&app, Some("acme")).await.1["result"]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    {
+        let mut guard = wb.lock().unwrap();
+        guard
+            .store_mut()
+            .append_record(
+                &tenant_scope("acme"),
+                "membership",
+                &serde_json::to_string(&MembershipRecord {
+                    id: "alice".into(),
+                    op: RecordOp::Upsert,
+                    org_id: ORG_ID.into(),
+                    authority: "alice".into(),
+                    email: "alice@example.test".into(),
+                    role: "member".into(),
+                    status: MembershipStatus::Active,
+                    managed_by_scim: true,
+                    team: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+    }
+    let fence = Arc::new(TestStandingFence {
+        wb: Arc::downgrade(&wb),
+        calls: Mutex::new(Vec::new()),
+        denial_operations: Mutex::new(Vec::new()),
+        fail_begin: AtomicBool::new(true),
+        interleave_begin: AtomicBool::new(false),
+        fail_admit: AtomicBool::new(false),
+    });
+    wb.lock()
+        .unwrap()
+        .install_member_standing_fence(InstalledMemberStandingFence(fence.clone()));
+
+    let (status, _) = send_t(
+        &app,
+        "DELETE",
+        "/scim/v2/Users/alice",
+        "acme",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    {
+        let guard = wb.lock().unwrap();
+        let org =
+            gaugedesk_app::org::Org::rebuild_in(guard.store_ref(), &tenant_scope("acme")).unwrap();
+        assert_eq!(org.members["alice"].status, MembershipStatus::Active);
+    }
+
+    fence.fail_begin.store(false, Ordering::Relaxed);
+    fence.interleave_begin.store(true, Ordering::Relaxed);
+    let (status, _) = send_t(
+        &app,
+        "DELETE",
+        "/scim/v2/Users/alice",
+        "acme",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    {
+        let guard = wb.lock().unwrap();
+        let org =
+            gaugedesk_app::org::Org::rebuild_in(guard.store_ref(), &tenant_scope("acme")).unwrap();
+        assert_eq!(org.members["alice"].status, MembershipStatus::Active);
+    }
+
+    let (status, _) = send_t(
+        &app,
+        "DELETE",
+        "/scim/v2/Users/alice",
+        "acme",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_t(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        "acme",
+        Some(&token),
+        Some(r#"{"userName":"bob"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    fence.fail_admit.store(true, Ordering::Relaxed);
+    let (status, _) = send_t(
+        &app,
+        "POST",
+        "/scim/v2/Users",
+        "acme",
+        Some(&token),
+        Some(r#"{"userName":"charlie"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    {
+        let guard = wb.lock().unwrap();
+        let org =
+            gaugedesk_app::org::Org::rebuild_in(guard.store_ref(), &tenant_scope("acme")).unwrap();
+        assert_eq!(org.members["charlie"].status, MembershipStatus::Active);
+        let command_scope = format!("gaugevault:membership:{}", tenant_scope("acme"));
+        assert_eq!(
+            guard
+                .store_ref()
+                .retained_records(&command_scope, COMMITTED_ACTIVATION_KIND)
+                .unwrap()
+                .len(),
+            2,
+        );
+    }
+    assert_eq!(
+        *fence.calls.lock().unwrap(),
+        vec!["begin", "begin", "begin", "complete", "observe", "admit", "observe", "admit"]
+    );
+    let operations = fence.denial_operations.lock().unwrap();
+    assert_eq!(operations.len(), 3);
+    assert_eq!(operations[0], operations[1]);
+    assert_eq!(operations[1], operations[2]);
 }
 
 #[tokio::test]

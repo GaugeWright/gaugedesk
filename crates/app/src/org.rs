@@ -500,6 +500,7 @@ pub enum ScimSyncError {
     UnsupportedChange,
     UnknownUser,
     SeatCapacity,
+    Storage,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

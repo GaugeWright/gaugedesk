@@ -667,6 +667,14 @@
         "Mark imported records with their provenance class (legacy, imported, externally observed) and the observer that admitted them.",
         "Never attribute an imported record to an author or request identity the source did not record."
       ]
+    },
+    "scim-command-receipts": {
+      "coverage_id": "ACTION-6",
+      "reason": "SCIM provisioning retains its own token-authenticated membership command and standing receipt directly in the product ledger, before the shared product action admission covers hosted identity adapters.",
+      "required_evidence": [
+        "Admit SCIM membership changes through the shared product action admission with exact actor, tenant, request identity, and outcome.",
+        "Keep the hosted GaugeVault standing fence and its exact denial or activation receipt in the same committed product effect."
+      ]
     }
   },
   "bypasses": [
@@ -839,6 +847,16 @@
         "count": 1
       },
       "profile": "gaugeapp-command-receipts"
+    },
+    {
+      "site": {
+        "file": "ee/app/src/scim_routes.rs",
+        "callable": "commit_scim_membership",
+        "capability": "admit_record_facts_at_scope_head",
+        "expression": "guard . store_mut () . admit_record_facts_at_scope_head (& command_scope , & key , & snapshot , & [membership_fact , receipt] , & scope , scope_head ,)",
+        "count": 1
+      },
+      "profile": "scim-command-receipts"
     }
   ]
 }

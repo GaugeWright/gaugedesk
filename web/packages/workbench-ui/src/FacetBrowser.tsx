@@ -2387,15 +2387,17 @@ export function FacetBrowser(props: {
                                                 menuItems: () => archetypeMenuItems(a),
                                             })}
                                         </div>
-                                        <Show when={!isCollapsed(a.id)}>
                                         {/* Fork lineage (ADR 0038): a fork shows its source so you know it
                                             tracks an upstream method — "pull updates from source" (its menu)
-                                            merges the source's improvements down. */}
+                                            merges the source's improvements down. It describes the Agent
+                                            itself, so it stays visible while the caret folds the Agent's
+                                            children; a fork with no chats has no caret to unfold it. */}
                                         <Show when={a.forkedFrom}>
                                             <div class="fork-lineage muted" data-forked-from={a.forkedFrom!}>
                                                 ↰ forked from {a.forkedFromName ?? "another method"}
                                             </div>
                                         </Show>
+                                        <Show when={!isCollapsed(a.id)}>
                                         {/* Workshop is where you EDIT and TEST a method: edit is the row's
                                             primary action; test and the shared-line create live in the row
                                             menu (ADR 0112) — several edit chats can be open at once, and

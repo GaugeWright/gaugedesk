@@ -98,19 +98,64 @@ type DocumentParser = (
     },
 ) => Promise<{ toText(): string }>;
 
+/** One page's text from pdf.js text content: each run's string, with a line
+ *  break wherever pdf.js marks the end of a line. Marked-content entries carry
+ *  no text and contribute nothing. */
+export function pdfPageText(items: readonly unknown[]): string {
+    let text = "";
+    for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const run = item as { str?: unknown; hasEOL?: unknown };
+        if (typeof run.str !== "string") continue;
+        text += run.str;
+        if (run.hasEOL === true) text += "\n";
+    }
+    return text;
+}
+
+/** PDF text comes from the workbench's own pdf.js, the release the PDF viewer
+ *  uses, against the worker emitted from that same package. officeparser's
+ *  browser build embeds its own older pdf.js API (6.1.200), which the npm
+ *  override cannot reach and which refuses any worker that is not exactly its
+ *  version, so a PDF routed through it fails in every browser. Reading stops
+ *  once the text cap is reached; the caller marks the truncation. */
+async function parsePdf(bytes: ArrayBuffer, workerSrc: string): Promise<{ toText(): string }> {
+    const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
+    GlobalWorkerOptions.workerSrc = workerSrc;
+    const task = getDocument({ data: new Uint8Array(bytes) });
+    try {
+        const document = await task.promise;
+        const pages: string[] = [];
+        let length = 0;
+        for (let number = 1; number <= document.numPages && length <= MAX_DOCUMENT_TEXT_CHARS; number++) {
+            const page = await document.getPage(number);
+            const text = pdfPageText((await page.getTextContent()).items);
+            page.cleanup();
+            pages.push(text);
+            length += text.length;
+        }
+        const text = pages.join("\n\n");
+        return { toText: () => text };
+    } finally {
+        await task.destroy();
+    }
+}
+
 async function parseDocument(
     bytes: ArrayBuffer,
     config: Parameters<DocumentParser>[1],
 ): Promise<{ toText(): string }> {
-    // A dynamic import keeps the sizeable Office/PDF parser out of the initial
-    // workbench bundle. The PDF worker URL is emitted as a local Vite asset; no
-    // CDN fetch or document upload is needed.
+    // Dynamic imports keep the sizeable parsers out of the initial workbench
+    // bundle. The PDF worker URL is emitted as a local Vite asset; no CDN fetch
+    // or document upload is needed.
+    if (config.fileType === "pdf") return parsePdf(bytes, config.pdfWorkerSrc);
     const { parseOffice } = await import("officeparser/slim");
     return parseOffice(bytes, config);
 }
 
 /** Extract PDF/docx/xlsx/pptx text entirely in the client. The optional parser is
- *  a narrow test seam; production always uses the lazy `officeparser/slim` build. */
+ *  a narrow test seam; production reads PDFs with the workbench's pdf.js and
+ *  Office documents with the lazy `officeparser/slim` build. */
 export async function extractDocumentAttachment(
     f: Blob & { name: string; type: string },
     parser: DocumentParser = parseDocument,

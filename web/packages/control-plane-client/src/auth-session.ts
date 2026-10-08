@@ -153,6 +153,40 @@ export function consumeAccountSignupTicket(): string | null {
     return ticket;
 }
 
+/** A desktop's passkey sign-in, continued in this browser (DR-0457): where the
+ *  one-time code goes back to, and the desktop's PKCE handoff challenge. Both
+ *  are public — the code is redeemable only with the verifier the desktop
+ *  kept — and the Hub validates them again when the ceremony begins. */
+export interface NativePasskeyReturn {
+    readonly returnTo: string;
+    readonly challenge: string;
+}
+
+/** Read a desktop's passkey sign-in out of the URL fragment, where the Hub's
+ *  `/auth/login?provider=passkey` put it, and take it out of the address bar. */
+export function consumeNativePasskeyReturn(): NativePasskeyReturn | null {
+    if (typeof window === "undefined") return null;
+    let found: NativePasskeyReturn | null = null;
+    try {
+        const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+        const returnTo = fragment.get("passkey_return");
+        const challenge = fragment.get("handoff_challenge");
+        if (!returnTo || !challenge) return null;
+        found = { returnTo, challenge };
+        fragment.delete("passkey_return");
+        fragment.delete("handoff_challenge");
+        const remaining = fragment.toString();
+        history.replaceState(
+            null,
+            "",
+            `${window.location.pathname}${window.location.search}${remaining ? `#${remaining}` : ""}`,
+        );
+    } catch {
+        /* a return that cannot be cleaned out of the URL is still usable */
+    }
+    return found;
+}
+
 /**
  * Begin OIDC login: navigate the browser to the control plane's `/auth/login`, which
  * redirects to the configured IdP. After the IdP, `/auth/callback` returns to this
@@ -301,6 +335,7 @@ export async function finishPasskeyAccountCreation(
     code: string,
     displayName: string,
     credentials: CredentialContainer = navigator.credentials,
+    native?: NativePasskeyReturn,
 ): Promise<PasskeyAccountCreated> {
     const verified = await accountAuthJson(
         controlPlaneBase,
@@ -314,7 +349,12 @@ export async function finishPasskeyAccountCreation(
     const started = await accountAuthJson(
         controlPlaneBase,
         "/auth/account/passkey/register/start",
-        { email_verification: verified.email_verification, display_name: displayName },
+        {
+            email_verification: verified.email_verification,
+            display_name: displayName,
+            // A desktop's: the finish hands back its code, not a session here.
+            ...(native ? { return_to: native.returnTo, handoff_challenge: native.challenge } : {}),
+        },
         "Could not start passkey creation. Request a new email code and try again.",
     );
     if (typeof started.ceremony_id !== "string" || !started.ceremony_id) {
@@ -579,6 +619,42 @@ export async function signInWithPasskey(
         throw new Error("Account authentication response is malformed.");
     }
     return finished.account_id;
+}
+
+/** Sign a desktop in with a passkey from this browser (DR-0457). The ceremony
+ *  is bound to the desktop's handoff challenge when it begins, and its finish
+ *  sets no session here: it answers the `gaugewright://` return carrying the
+ *  one-time code, which this resolves with for the page to follow. */
+export async function signInWithPasskeyForDesktop(
+    controlPlaneBase: string,
+    email: string,
+    native: NativePasskeyReturn,
+    credentials: CredentialContainer = navigator.credentials,
+): Promise<string> {
+    const started = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/passkey/login/start",
+        { email, return_to: native.returnTo, handoff_challenge: native.challenge },
+        "No passkey account could be opened for that address.",
+    );
+    if (typeof started.ceremony_id !== "string" || !started.ceremony_id) {
+        throw new Error("Account authentication response is malformed.");
+    }
+    const credential = await credentials.get({ publicKey: publicKeyRequestOptions(started.public_key) });
+    if (!credential || credential.type !== "public-key") throw new Error("Passkey sign-in was cancelled.");
+    const finished = await accountAuthJson(
+        controlPlaneBase,
+        "/auth/account/passkey/login/finish",
+        {
+            ceremony_id: started.ceremony_id,
+            credential: accountAuthenticationResponse(credential as PublicKeyCredential),
+        },
+        "That passkey was not accepted. Try again.",
+    );
+    if (typeof finished.native_return !== "string" || !finished.native_return) {
+        throw new Error("GaugeDesk's sign-in was not handed back. Start again from GaugeDesk.");
+    }
+    return finished.native_return;
 }
 
 /** Begin the verified-email half of account recovery. The email and challenge

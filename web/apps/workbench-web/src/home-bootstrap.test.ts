@@ -1,6 +1,7 @@
 import { HomeTunnelError } from "@gaugewright/control-plane-client";
 import { describe, expect, it } from "vitest";
 import {
+    accountWorkReplacesHomeGate,
     captureHomeDiscovery,
     isHomeAuthenticationFailure,
     isRelayClosedRefusal,
@@ -81,4 +82,32 @@ describe("hosted Home bootstrap failure", () => {
         expect(result).toMatchObject({ kind: "failure", homeConnection: false });
     });
 
+});
+
+describe("account work in place of the Home gate", () => {
+    const gate = { finding: false, findingSlow: false, failed: false, noHome: false };
+
+    it("shows an open GaugeApp while a slow discovery is still finding the Home", () => {
+        expect(accountWorkReplacesHomeGate(true, { ...gate, finding: true, findingSlow: true })).toBe(true);
+    });
+
+    it("keeps the finding card while discovery has not yet been slow", () => {
+        expect(accountWorkReplacesHomeGate(true, { ...gate, finding: true })).toBe(false);
+    });
+
+    it("shows an open GaugeApp in place of the failure card and of no Home", () => {
+        expect(accountWorkReplacesHomeGate(true, { ...gate, failed: true })).toBe(true);
+        expect(accountWorkReplacesHomeGate(true, { ...gate, noHome: true })).toBe(true);
+    });
+
+    it("leaves a found Home to the workbench, and every gate alone when nothing is open", () => {
+        expect(accountWorkReplacesHomeGate(true, gate)).toBe(false);
+        for (const state of [
+            { ...gate, finding: true, findingSlow: true },
+            { ...gate, failed: true },
+            { ...gate, noHome: true },
+        ]) {
+            expect(accountWorkReplacesHomeGate(false, state)).toBe(false);
+        }
+    });
 });

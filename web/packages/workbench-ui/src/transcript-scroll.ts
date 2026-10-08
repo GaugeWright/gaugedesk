@@ -45,6 +45,14 @@ export const INTENT_WINDOW_MS = 3000;
  *  it produces before position is judged again. */
 export const GLIDE_WINDOW_MS = 1000;
 
+/** How far a wheel event asks to move, in pixels, whatever unit the device
+ *  reported it in (`WheelEvent.deltaMode`: pixels, lines, or pages). */
+export function wheelTravel(deltaY: number, deltaMode: number, linePx: number, pagePx: number): number {
+    if (deltaMode === 1) return deltaY * linePx;
+    if (deltaMode === 2) return deltaY * pagePx;
+    return deltaY;
+}
+
 export function distanceFromBottom(m: ScrollMetrics): number {
     return Math.max(0, m.scrollHeight - m.clientHeight - m.scrollTop);
 }
@@ -179,6 +187,8 @@ export function createTranscriptScroll(): TranscriptScroll {
     let glideUntil = 0;
     let tickQueued = false;
     let anchorQueued = false;
+    /** The element `onGlideWheel` is attached to while a glide may run. */
+    let glideWheelEl: HTMLElement | undefined;
     const observers: ResizeObserver[] = [];
     const removeListeners: (() => void)[] = [];
 
@@ -274,9 +284,54 @@ export function createTranscriptScroll(): TranscriptScroll {
      *  its old target and the gesture feels ignored. An instant same-position
      *  write is the documented way to cancel the animation. */
     const haltGlide = () => {
+        disarmGlideWheel();
         if (glideUntil === 0) return;
         glideUntil = 0;
         transcriptEl?.scrollTo({ top: transcriptEl.scrollTop, behavior: "auto" });
+    };
+    /** Chrome drops a wheel's own scroll while a programmatic smooth scroll is
+     *  running. The glide carries on to its target, or, once halted, stops
+     *  where it was, and either way the reader's wheel moves nothing. Measured
+     *  2026-10-07 (WS-871): a wheel that lands in a send's glide left the
+     *  viewport frozen mid-glide. So while a glide may still be running the
+     *  panel takes the wheel over. It cancels the browser's handling, halts
+     *  the glide, and moves by the wheel's own travel, which lands the gesture
+     *  exactly once. The listener cannot be passive, so it is attached only for
+     *  a glide's window and ordinary scrolling never waits on it. It listens in
+     *  the capture phase so it runs before `onWheel`, whose halt would
+     *  otherwise close the window first. */
+    const onGlideWheel = (event: WheelEvent) => {
+        const el = transcriptEl;
+        if (!el || now() >= glideUntil) {
+            disarmGlideWheel();
+            return;
+        }
+        // A pinch-zoom or a sideways scroll is not a move through the log.
+        if (event.ctrlKey || event.deltaY === 0 || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+        event.preventDefault();
+        const line = parseFloat(getComputedStyle(el).lineHeight) || 16;
+        const top = el.scrollTop + wheelTravel(event.deltaY, event.deltaMode, line, el.clientHeight);
+        disarmGlideWheel();
+        glideUntil = 0;
+        el.scrollTo({ top, behavior: "auto" });
+    };
+    function disarmGlideWheel() {
+        glideWheelEl?.removeEventListener("wheel", onGlideWheel, { capture: true });
+        glideWheelEl = undefined;
+    }
+    /** Glide smoothly to `top`. The glide owns the scroll events it produces
+     *  for its window, and a wheel within that window is the reader's. */
+    const glideTo = (el: HTMLElement, top: number) => {
+        glideUntil = now() + GLIDE_WINDOW_MS;
+        if (glideWheelEl !== el) {
+            disarmGlideWheel();
+            el.addEventListener("wheel", onGlideWheel, { capture: true, passive: false });
+            glideWheelEl = el;
+        }
+        setTimeout(() => {
+            if (now() >= glideUntil) disarmGlideWheel();
+        }, GLIDE_WINDOW_MS + 10);
+        el.scrollTo({ top, behavior: "smooth" });
     };
     // Wheel-up and touch drags release the latch directly: during streaming the
     // latch rewrites scrollTop every frame, so waiting for the scroll event to
@@ -338,8 +393,7 @@ export function createTranscriptScroll(): TranscriptScroll {
                 return;
             }
             anchored = true;
-            glideUntil = now() + GLIDE_WINDOW_MS;
-            el.scrollTo({ top: Math.max(0, topWithin(target) - ANCHOR_GAP), behavior: "smooth" });
+            glideTo(el, Math.max(0, topWithin(target) - ANCHOR_GAP));
             // The glide is only the entry animation — a settle can swap the
             // line list mid-flight and the browser abandons the animation, so
             // the hold in tick() re-pins once the glide window closes.
@@ -378,8 +432,7 @@ export function createTranscriptScroll(): TranscriptScroll {
             if (!el) return;
             following = true;
             anchored = false;
-            glideUntil = now() + GLIDE_WINDOW_MS;
-            el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+            glideTo(el, el.scrollHeight);
         },
         jumpToUser: (index) => {
             const el = transcriptEl;
@@ -395,8 +448,7 @@ export function createTranscriptScroll(): TranscriptScroll {
                 target.scrollIntoView({ behavior: "smooth", block: "start" });
                 return;
             }
-            glideUntil = now() + GLIDE_WINDOW_MS;
-            el.scrollTo({ top: Math.max(0, topWithin(target) - ANCHOR_GAP), behavior: "smooth" });
+            glideTo(el, Math.max(0, topWithin(target) - ANCHOR_GAP));
         },
         observeLines: (lines) => {
             const next = gaugeLines(lines);
@@ -421,10 +473,12 @@ export function createTranscriptScroll(): TranscriptScroll {
             anchored = false;
             intentUntil = 0;
             glideUntil = 0;
+            disarmGlideWheel();
             setSpacer(0);
             setPill(false);
         },
         dispose: () => {
+            disarmGlideWheel();
             for (const observer of observers) observer.disconnect();
             observers.length = 0;
             for (const remove of removeListeners) remove();

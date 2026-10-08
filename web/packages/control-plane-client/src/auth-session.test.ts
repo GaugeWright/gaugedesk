@@ -22,6 +22,8 @@ import {
     startPasskeyAccountCreation,
     finishPasskeyAccountCreation,
     workEmailLoginTarget,
+    consumeNativePasskeyReturn,
+    signInWithPasskeyForDesktop,
 } from "./auth-session";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -550,6 +552,78 @@ describe("provider-neutral passkey account entry", () => {
 
         vi.stubGlobal("window", { location: { hash: "#id_token=x", pathname: "/", search: "" } });
         expect(consumeAccountSignupTicket()).toBeNull();
+    });
+
+    it("reads a desktop's passkey return out of the fragment and the address bar", () => {
+        const replaceState = vi.fn();
+        vi.stubGlobal("window", {
+            location: {
+                hash: "#passkey_return=gaugewright%3A%2F%2Fauth%2Fcallback&handoff_challenge=c-1&other=keep",
+                pathname: "/",
+                search: "",
+            },
+        });
+        vi.stubGlobal("history", { replaceState });
+
+        expect(consumeNativePasskeyReturn()).toEqual({
+            returnTo: "gaugewright://auth/callback",
+            challenge: "c-1",
+        });
+        expect(replaceState).toHaveBeenCalledWith(null, "", "/#other=keep");
+
+        vi.stubGlobal("window", { location: { hash: "#passkey_return=x", pathname: "/", search: "" } });
+        expect(consumeNativePasskeyReturn()).toBeNull();
+    });
+
+    it("signs a desktop in with a passkey, bound to its challenge, and takes no session here", async () => {
+        setBearer(null);
+        const fetch = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                ceremony_id: "authentication-1",
+                public_key: {
+                    challenge: "DQ4",
+                    rpId: "auth.example",
+                    allowCredentials: [{ type: "public-key", id: "DxA" }],
+                    userVerification: "required",
+                },
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                account_id: "person-one",
+                native_return: "gaugewright://auth/callback#code=one-time",
+            }), { status: 200, headers: { "content-type": "application/json" } }));
+        vi.stubGlobal("fetch", fetch);
+        const get = vi.fn(async (_options: CredentialRequestOptions): Promise<Credential | null> =>
+            authenticationCredential);
+
+        await expect(signInWithPasskeyForDesktop(
+            "https://auth.example/",
+            "person@example.test",
+            { returnTo: "gaugewright://auth/callback", challenge: "challenge-1" },
+            { create: vi.fn(), get },
+        )).resolves.toBe("gaugewright://auth/callback#code=one-time");
+        expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({
+            email: "person@example.test",
+            return_to: "gaugewright://auth/callback",
+            handoff_challenge: "challenge-1",
+        });
+        expect(bearer()).toBeNull();
+
+        // A Hub that answers a session instead is not a desktop sign-in.
+        fetch
+            .mockResolvedValueOnce(new Response(JSON.stringify({
+                ceremony_id: "authentication-2",
+                public_key: { challenge: "DQ4", allowCredentials: [], userVerification: "required" },
+            }), { status: 200, headers: { "content-type": "application/json" } }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ account_id: "person-one" }), {
+                status: 200,
+                headers: { "content-type": "application/json" },
+            }));
+        await expect(signInWithPasskeyForDesktop(
+            "https://auth.example/",
+            "person@example.test",
+            { returnTo: "gaugewright://auth/callback", challenge: "challenge-1" },
+            { create: vi.fn(), get },
+        )).rejects.toThrow("Start again from GaugeDesk");
     });
 
     it("signs in with a passkey through a fresh server ceremony", async () => {

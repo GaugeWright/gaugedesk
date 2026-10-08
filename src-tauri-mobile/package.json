@@ -1,6 +1,6 @@
 {
   "name": "@gaugewright/mobile-shell",
-  "version": "0.8.9",
+  "version": "0.8.10",
   "private": true,
   "license": "AGPL-3.0-only",
   "description": "GaugeDesk native mobile shell build tooling.",

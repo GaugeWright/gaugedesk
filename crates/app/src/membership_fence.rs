@@ -2,13 +2,148 @@
 //! (DR-0460). No remote authority is called while a Workbench is locked.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use gaugedesk_core::{ids::ScopeId, Rejection};
 use gaugedesk_store::{AdmitError, CommandRecordFact, Store};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::org::{
     tenant_scope, MembershipRecord, MembershipStatus, OrgRecord, RecordOp, ORG_SCOPE,
 };
+
+/// The hosted composition's remote member-standing authority. Implementations
+/// must perform network I/O only after the caller releases its Workbench lock.
+/// The observation is opaque to the product and is durably retained with the
+/// exact activation command for recovery. Only the authority may interpret it.
+pub trait HostedMemberStandingFence: Send + Sync {
+    fn observe_activation(
+        &self,
+        owner_scope: &ScopeId,
+        member: &str,
+    ) -> Result<serde_json::Value, StandingFenceError>;
+
+    fn admit_if_unchanged(
+        &self,
+        owner_scope: &ScopeId,
+        member: &str,
+        observed: &serde_json::Value,
+    ) -> Result<StandingFenceOutcome, StandingFenceError>;
+
+    fn begin_denial(
+        &self,
+        owner_scope: &ScopeId,
+        member: &str,
+        operation: &str,
+    ) -> Result<StandingFenceOutcome, StandingFenceError>;
+
+    fn complete_denial(
+        &self,
+        owner_scope: &ScopeId,
+        member: &str,
+        operation: &str,
+    ) -> Result<StandingFenceOutcome, StandingFenceError>;
+}
+
+#[derive(Clone)]
+pub struct InstalledMemberStandingFence(pub Arc<dyn HostedMemberStandingFence>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandingFenceOutcome {
+    Committed,
+    Conflict,
+    Uncertain,
+}
+
+/// Closed refusal vocabulary: provider bodies and credentials never enter a
+/// product response, audit record, or log through an authority error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandingFenceError {
+    Unavailable,
+    Denied,
+    Invalid,
+}
+
+pub const COMMITTED_DENIAL_KIND: &str = "gaugevault-committed-member-denial-v1";
+pub const COMMITTED_ACTIVATION_KIND: &str = "gaugevault-committed-member-activation-v1";
+
+fn digest(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+pub fn denial_operation(command_scope: &str, key: &str, snapshot: &str) -> String {
+    digest(&format!("{command_scope}\n{key}\n{snapshot}"))
+}
+
+/// Atomically retain this with the membership fact in the exact Store
+/// command. The host may complete only the matching pending Cosmos denial.
+pub fn committed_denial_fact(
+    command_scope: &str,
+    key: &str,
+    snapshot: &str,
+    owner_scope: &ScopeId,
+    member: &str,
+) -> CommandRecordFact {
+    let receipt = CommittedDenial {
+        command_scope: command_scope.to_owned(),
+        key: key.to_owned(),
+        snapshot_digest: digest(snapshot),
+        operation: denial_operation(command_scope, key, snapshot),
+        owner_scope: owner_scope.clone(),
+        member: member.to_owned(),
+    };
+    CommandRecordFact {
+        scope_id: command_scope.to_owned(),
+        kind: COMMITTED_DENIAL_KIND.to_owned(),
+        payload: serde_json::to_string(&receipt).expect("standing denial receipt serializes"),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CommittedDenial {
+    command_scope: String,
+    key: String,
+    snapshot_digest: String,
+    operation: String,
+    owner_scope: ScopeId,
+    member: String,
+}
+
+/// Retain the *original* pre-Store observation. Recovery cannot take a fresh
+/// observation that could reopen a newer denial.
+pub fn committed_activation_fact(
+    command_scope: &str,
+    key: &str,
+    snapshot: &str,
+    owner_scope: &ScopeId,
+    member: &str,
+    observed: serde_json::Value,
+) -> CommandRecordFact {
+    let receipt = CommittedActivation {
+        command_scope: command_scope.to_owned(),
+        key: key.to_owned(),
+        snapshot_digest: digest(snapshot),
+        owner_scope: owner_scope.clone(),
+        member: member.to_owned(),
+        observed,
+    };
+    CommandRecordFact {
+        scope_id: command_scope.to_owned(),
+        kind: COMMITTED_ACTIVATION_KIND.to_owned(),
+        payload: serde_json::to_string(&receipt).expect("standing activation receipt serializes"),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CommittedActivation {
+    command_scope: String,
+    key: String,
+    snapshot_digest: String,
+    owner_scope: ScopeId,
+    member: String,
+    observed: serde_json::Value,
+}
 
 fn invalid_owner() -> AdmitError {
     AdmitError::Rejected(Rejection {
@@ -327,5 +462,44 @@ mod tests {
             payload: live_facts[0].payload.clone(),
         }];
         assert!(membership_transitions(&store, &live, &malformed_scope).is_err());
+    }
+
+    #[test]
+    fn committed_denial_receipt_is_bound_to_the_exact_command_and_member_fact() {
+        let owner = ScopeId::from("org::organization:tenant");
+        let command_scope = "gaugevault:membership:tenant";
+        let key = "request-one";
+        let snapshot = r#"{"action":"deprovision","member":"alice"}"#;
+        let member_fact = CommandRecordFact {
+            scope_id: owner.as_str().into(),
+            kind: "membership".into(),
+            payload: record("alice", MembershipStatus::Deprovisioned, RecordOp::Upsert),
+        };
+        let receipt = committed_denial_fact(command_scope, key, snapshot, &owner, "alice");
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .admit_record_facts(
+                command_scope,
+                key,
+                snapshot,
+                &[member_fact.clone(), receipt.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.committed_record_snapshot(command_scope, key).unwrap(),
+            Some(snapshot.to_owned())
+        );
+        assert_eq!(
+            store.committed_record_facts(command_scope, key).unwrap(),
+            Some(vec![member_fact, receipt.clone()])
+        );
+        let payload: serde_json::Value = serde_json::from_str(&receipt.payload).unwrap();
+        assert_eq!(
+            payload["operation"],
+            denial_operation(command_scope, key, snapshot)
+        );
+        assert_eq!(payload["snapshot_digest"], digest(snapshot));
+        assert_eq!(payload["owner_scope"], owner.as_str());
+        assert_eq!(payload["member"], "alice");
     }
 }

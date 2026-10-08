@@ -12,6 +12,7 @@ import {
     scrollable,
     spacerAfterReflow,
     spacerHeight,
+    wheelTravel,
 } from "./transcript-scroll";
 import { type TranscriptLine } from "./transcript";
 
@@ -41,6 +42,16 @@ describe("bottom detection", () => {
         // bottom; if the gap left the band, the anchored reader would count as
         // scrolled away the moment they arrived.
         expect(ANCHOR_GAP).toBeLessThanOrEqual(BOTTOM_SLACK);
+    });
+});
+
+describe("a wheel's travel", () => {
+    it("reads pixel deltas as they are", () => {
+        expect(wheelTravel(-120, 0, 18, 600)).toBe(-120);
+    });
+    it("scales line deltas by the line height and page deltas by the viewport", () => {
+        expect(wheelTravel(3, 1, 18, 600)).toBe(54);
+        expect(wheelTravel(-1, 2, 18, 600)).toBe(-600);
     });
 });
 

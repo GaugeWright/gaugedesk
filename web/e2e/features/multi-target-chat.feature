@@ -1,8 +1,6 @@
 @transport
 Feature: One chat spans several work targets
 
-  # quarantined (WS-911): an empty selected target is missing from Files (product bug)
-  @quarantine
   Scenario: target selection is explicit and remains visible
     Given a project with two eligible work targets
     When I start a chat in that multi-target project

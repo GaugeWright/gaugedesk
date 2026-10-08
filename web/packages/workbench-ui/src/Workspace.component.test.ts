@@ -4,11 +4,11 @@ import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { EngagementId, FileEntry } from "@gaugewright/control-plane-client";
 import { SessionProvider, type Session } from "./session-context";
-import { Workspace } from "./Workspace";
+import { Workspace, type WorkspaceProps } from "./Workspace";
 
 let dispose: (() => void) | undefined;
 afterEach(() => { dispose?.(); document.body.replaceChildren(); });
-function mount(getTree: (id: EngagementId) => Promise<FileEntry[]>) {
+function mount(getTree: (id: EngagementId) => Promise<FileEntry[]>, roots?: WorkspaceProps["roots"]) {
     const host = document.createElement("div");
     document.body.append(host);
     const [revision, setRevision] = createSignal(0);
@@ -18,7 +18,7 @@ function mount(getTree: (id: EngagementId) => Promise<FileEntry[]>) {
         selectFile: () => {},
     } as unknown as Session;
     dispose = render(() => createComponent(SessionProvider, {
-        value: session, get children() { return createComponent(Workspace, {}); },
+        value: session, get children() { return createComponent(Workspace, { roots }); },
     }), host);
     return { host, setRevision };
 }
@@ -55,5 +55,30 @@ describe("mounted Workshop files pane", () => {
         (host.querySelector("[data-load-retry]") as HTMLButtonElement).click();
         await vi.waitFor(() => expect(host.querySelector('[data-file-path="agent"]')).not.toBeNull());
         expect(getTree).toHaveBeenCalledTimes(3);
+    });
+
+    // A chat across several targets shows each as a root folder named after
+    // it, even a target that holds no file yet (DR-0248, navigation.md Files).
+    it("names every selected target's root, including an empty one", async () => {
+        const roots = [
+            { path: "targets/main", name: "Project files", writable: true },
+            { path: "targets/ref", name: "Reference target", writable: true },
+        ];
+        const listed: FileEntry[] = [
+            { path: "targets", isDir: true },
+            { path: "targets/main", isDir: true },
+            { path: "targets/main/notes.md", isDir: false },
+        ];
+        const { host } = mount(() => Promise.resolve(listed), roots);
+        await vi.waitFor(() => expect(host.querySelector('[data-file-path="targets/ref"]')).not.toBeNull());
+        const names = [...host.querySelectorAll<HTMLElement>('[data-file-path^="targets/"] > .file')]
+            .map((row) => row.getAttribute("aria-label"));
+        expect(names).toEqual(["Project files", "notes.md", "Reference target"]);
+    });
+
+    it("keeps the empty state for a chat with one empty target", async () => {
+        const { host } = mount(() => Promise.resolve([]), [{ path: "targets/main", name: "Project files", writable: true }]);
+        await vi.waitFor(() => expect(host.textContent).toContain("No files yet"));
+        expect(host.querySelector('[data-file-path="targets/main"]')).toBeNull();
     });
 });

@@ -88,12 +88,29 @@ const benchProviderSignup = {
     },
 } as const;
 
+/** The two halves of a desktop's passkey sign-in (DR-0457): the desktop's own
+ *  card, whose passkey continues in the system browser, and the card that
+ *  browser opens at the account's origin, which offers the passkey alone and
+ *  hands the code back to the desktop instead of signing the browser in. */
+const benchDesktopPasskey = {
+    ...benchPasskey,
+    inBrowser: async () => {
+        await new Promise((r) => setTimeout(r, 260));
+    },
+};
+
+type Stage = "none" | "attested" | "code" | "desktop" | "desktop-browser";
+
 function Lab(): JSX.Element {
     const [nonce, setNonce] = createSignal(0);
-    const [signup, setSignup] = createSignal<"none" | "attested" | "code">("none");
-    const restage = (next: "none" | "attested" | "code") => {
+    const [signup, setSignup] = createSignal<Stage>("none");
+    const restage = (next: Stage) => {
         setSignup(next);
         setNonce(nonce() + 1);
+    };
+    const providerSignup = () => {
+        const stage = signup();
+        return stage === "attested" || stage === "code" ? benchProviderSignup[stage] : undefined;
     };
     return (
         <div class="lab">
@@ -126,11 +143,23 @@ function Lab(): JSX.Element {
                             Microsoft return
                         </button>
                     </label>
+                    <label class="lab-toggle">
+                        <button class="lab-reset" type="button" onClick={() => restage("desktop")}>
+                            Desktop
+                        </button>
+                    </label>
+                    <label class="lab-toggle">
+                        <button class="lab-reset" type="button" onClick={() => restage("desktop-browser")}>
+                            Desktop passkey, in the browser
+                        </button>
+                    </label>
                     <span class="lab-note">
                         Try an address at <code>acme.com</code> or <code>wanamaker.org</code> for
                         the organization branch; anything else takes the personal one. The two
                         provider returns stage what a first-time signup sees — Google attests the
-                        address, Microsoft does not, so that one asks for a code (DR-0189).
+                        address, Microsoft does not, so that one asks for a code (DR-0189). The
+                        desktop stages are a passkey sign-in on GaugeDesk, which continues in the
+                        system browser, and the card that browser opens (DR-0457).
                     </span>
                 </div>
             </header>
@@ -140,6 +169,21 @@ function Lab(): JSX.Element {
                     step rather than reaching into its internals. */}
                 {(() => {
                     nonce();
+                    if (signup() === "desktop-browser") {
+                        return (
+                            <div class="homegate-scrim">
+                                <section class="homegate-card">
+                                    <SignInCard
+                                        title="Sign in to GaugeDesk"
+                                        lede="Use your passkey to finish signing in to GaugeDesk on your computer. This browser stays signed out."
+                                        resolve={async () => ({ kind: "personal" })}
+                                        passkey={benchPasskey}
+                                        providers={[]}
+                                    />
+                                </section>
+                            </div>
+                        );
+                    }
                     return (
                         <div class="homegate-scrim">
                             <section class="homegate-card">
@@ -147,11 +191,9 @@ function Lab(): JSX.Element {
                                     title="Sign in"
                                     lede="Sign in to your account. Projects on this computer stay local unless you choose to claim it."
                                     resolve={benchResolve}
-                                    passkey={benchPasskey}
+                                    passkey={signup() === "desktop" ? benchDesktopPasskey : benchPasskey}
                                     recovery={benchRecovery}
-                                    providerSignup={
-                                        signup() === "none" ? undefined : benchProviderSignup[signup() as "attested" | "code"]
-                                    }
+                                    providerSignup={providerSignup()}
                                     providers={[
                                         { id: "google", label: "Continue with Google", begin: () => restage("attested") },
                                         { id: "microsoft", label: "Continue with Microsoft", begin: () => restage("code") },

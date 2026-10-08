@@ -34,6 +34,7 @@ import {
     selectBrowserAccount,
     claimConsumerSignup,
     consumeAccountSignupTicket,
+    consumeNativePasskeyReturn,
     consumeCallbackToken,
     endSession,
     completeConsumerSignup,
@@ -48,6 +49,7 @@ import {
     startAccountRecovery,
     startPasskeyAccountCreation,
     signInWithPasskey,
+    signInWithPasskeyForDesktop,
     type ArchetypeId,
     type ArchetypeNode,
     type AgentKind,
@@ -81,7 +83,7 @@ import {
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { ManagementChat } from "./ManagementChat";
-import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstrap";
+import { accountWorkReplacesHomeGate, captureHomeDiscovery, HOME_DISCOVERY_SLOW_MS, type HomeDiscoveryFailure } from "./home-bootstrap";
 import { desktopUpdateOffer, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, withDesktopUpdateTimeout, DESKTOP_UPDATE_CHECK_TIMEOUT_MS, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
 import { chatAcceptanceEvidence } from "./chat-acceptance-observation";
@@ -223,6 +225,12 @@ consumeCallbackToken();
 /// create accounts. Read out of the fragment at load, with the rest of the
 /// callback material, so the ticket never survives in the address bar.
 const accountSignupTicket = consumeAccountSignupTicket();
+/// A desktop's passkey sign-in, continued in this browser (DR-0457). The
+/// desktop opened the Hub's `/auth/login?provider=passkey` with its handoff
+/// challenge, and the Hub sent the browser here, to the origin a passkey
+/// belongs to. This page runs the ceremony and hands the one-time code back
+/// over `gaugewright://`; it is not signed in by it.
+const nativePasskey = consumeNativePasskeyReturn();
 api.setBearer(bearer());
 // Hosted Console (ADR 0077): keep the `.gaugewright.com` cookie session alive by pinging
 // `/auth/refresh` on a timer under the id-token's ~1h life. No-op on the loopback desktop.
@@ -1233,7 +1241,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // A person returning from Google with a signup ticket is, by definition,
     // signed out and mid-ceremony. Open the card for them rather than leaving
     // them on a shell with the one step they still owe hidden behind a menu.
-    const [signInOpen, setSignInOpen] = createSignal(accountSignupTicket !== null);
+    // So is a person continuing a desktop's passkey sign-in here.
+    const [signInOpen, setSignInOpen] = createSignal(accountSignupTicket !== null || nativePasskey !== null);
+    /// The `gaugewright://` return this page handed a desktop its code on, once
+    /// it has. The card gives way to a page that says so.
+    const [desktopHandedOff, setDesktopHandedOff] = createSignal<string | null>(null);
+    const handOffToDesktop = (nativeReturn: string | undefined) => {
+        if (!nativeReturn) return;
+        setDesktopHandedOff(nativeReturn);
+        window.location.assign(nativeReturn);
+    };
     const [signInReturnError, setSignInReturnError] = createSignal("");
     // The non-secret projection of that ticket: the address Google attested and
     // the name it offered, so the card can say whose account it is about to
@@ -2286,6 +2303,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const context = await api.taskContext(id);
         const attempt = taskCommands.begin(context.scope, rid, prompt, snapshot().lines.length);
         const unsubscribeCorrelation = context.subscribe((event) => taskCommands.observe(context.scope, event));
+        // Re-read the durable transcript. Where nothing can confirm this command
+        // (signed-out local work names no verified requester), the re-read is
+        // what retires its echo, as it was before exact correlation: released in
+        // the same step that shows the admitted line, so the two never sit side
+        // by side (WS-871). An addressed command is untouched by the release.
+        const repair = () => loadSnapshot(id, context).then(() => taskCommands.release(context.scope, rid));
         setRunTone(id, "working");
         if (isCurrent()) {
             setActivity("thinking…");
@@ -2294,7 +2317,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // transcript the instant the turn starts — only when this chat is the one
             // on screen, else we'd inject it into the displayed chat's transcript. The
             // echo is an operational pending command, retired only by an exact
-            // addressed command observation, including durable snapshot repair.
+            // addressed command observation, including durable snapshot repair —
+            // or, where nothing can confirm it, by `repair` below.
             setVisibleTaskScope(context.scope);
         }
         setPendingApprovals([]); // a fresh turn clears the prior turn's pending approvals
@@ -2321,7 +2345,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         ? `turn failed${res?.error ? ` — ${res.error}` : ""}`
                         : "turn complete",
                 );
-                await Promise.all([loadSnapshot(id, context), refetchRun(), refetchDiff(), refetchMerge()]);
+                await Promise.all([repair(), refetchRun(), refetchDiff(), refetchMerge()]);
                 // A default clean turn has already synchronized by the time the
                 // projections refresh, so the branch-vs-line diff is empty. Keep
                 // the response's turn diff on screen for this settled turn: it is
@@ -2346,7 +2370,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 // A rejection (INV-2) surfaces its reason; either way repair from the
                 // durable snapshot so a failed turn leaves no dangling optimistic echo.
                 setStatus(stopped ? "stopped" : describeFailure("run that turn", e));
-                await loadSnapshot(id, context);
+                await repair();
                 // Repair can confirm only exact addressed authority observations;
                 // otherwise the pending command remains non-standing.
                 setLive(empty);
@@ -2354,6 +2378,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             throw attachTaskCommandAttempt(e, attempt);
         } finally {
             unsubscribeCorrelation();
+            // Off screen there was no re-read to wait for; the chat's next one
+            // shows the durable line.
+            taskCommands.release(context.scope, rid);
             if (isCurrent()) {
                 setActivity("");
             }
@@ -2791,6 +2818,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     /// desktop is its own Home and its discovery does not fail.
     let pendingNativeReturn: string | undefined;
     const signInCard = (footnote?: JSX.Element): JSX.Element => (
+        <Show when={!desktopHandedOff()} fallback={desktopHandOffPanel()}>
+        <Show when={!nativePasskey} fallback={desktopPasskeyCard()}>
         <SignInCard
             footnote={footnote}
             notice={signInReturnError() || undefined}
@@ -2886,6 +2915,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 signIn: async (email) => {
                     await signInWithPasskey(controlPlaneBase(), email);
                 },
+                // A desktop's own control plane runs no passkey ceremony, and
+                // its window is not the origin a passkey belongs to: both
+                // ceremonies continue in the system browser and come back
+                // over gaugewright:// like the providers' (DR-0457).
+                inBrowser: oidcRedirectAvailable ? undefined : () => beginAccountAdmission("passkey"),
                 beginCreation: (email) => startPasskeyAccountCreation(controlPlaneBase(), email),
                 finishCreation: async (challengeId, code, name) => {
                     const created = await finishPasskeyAccountCreation(
@@ -2951,6 +2985,63 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 },
             }}
         />
+        </Show>
+        </Show>
+    );
+
+    /// The card for a desktop's passkey sign-in continued here (DR-0457):
+    /// the passkey and nothing else, because every other way in begins on the
+    /// desktop, and each ceremony ends by handing the desktop its code rather
+    /// than signing this browser in.
+    const desktopPasskeyCard = (): JSX.Element => (
+        <SignInCard
+            title="Sign in to GaugeDesk"
+            lede="Use your passkey to finish signing in to GaugeDesk on your computer. This browser stays signed out."
+            resolve={async () => ({ kind: "personal" })}
+            passkey={{
+                signIn: async (email) => {
+                    pendingNativeReturn = await signInWithPasskeyForDesktop(
+                        controlPlaneBase(),
+                        email,
+                        nativePasskey!,
+                    );
+                },
+                beginCreation: (email) => startPasskeyAccountCreation(controlPlaneBase(), email),
+                finishCreation: async (challengeId, code, name) => {
+                    const created = await finishPasskeyAccountCreation(
+                        controlPlaneBase(),
+                        challengeId,
+                        code,
+                        name,
+                        navigator.credentials,
+                        nativePasskey!,
+                    );
+                    pendingNativeReturn = created.nativeReturn;
+                    return created.recoveryCodes;
+                },
+                // After sign-in at once; after creation only once the person
+                // has said they saved the codes, which this page alone holds.
+                complete: () => handOffToDesktop(pendingNativeReturn),
+            }}
+            providers={[]}
+        />
+    );
+
+    /// What this page says once it has handed a desktop its code: the same
+    /// words the Hub's own return page uses (DR-0203), and a link for the
+    /// browser that did not open GaugeDesk by itself.
+    const desktopHandOffPanel = (): JSX.Element => (
+        <div class="signin" data-signin-handed-off>
+            <header class="signin__head">
+                <span class="signin__headtext">
+                    <h1 class="signin__title">You're signed in</h1>
+                </span>
+            </header>
+            <p class="signin__lede">GaugeDesk is finishing up. You can close this tab.</p>
+            <a class="signin__quiet" href={desktopHandedOff() ?? "#"}>
+                Open GaugeDesk if it did not come to the front
+            </a>
+        </div>
     );
 
     const retainedAccountChoices = (showLocal = true): JSX.Element => (
@@ -3664,6 +3755,27 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const state = homeState();
         return state?.kind === "none" ? state : null;
     });
+    // Whether "Finding your Home…" has stood for longer than a Home found at
+    // once ever takes. Only then does it offer account work, or give way to
+    // a GaugeApp the person opened (accountWorkReplacesHomeGate).
+    const [homeFindingSlow, setHomeFindingSlow] = createSignal(false);
+    createEffect(() => {
+        if (!homeState.loading) {
+            setHomeFindingSlow(false);
+            return;
+        }
+        const timer = setTimeout(() => setHomeFindingSlow(true), HOME_DISCOVERY_SLOW_MS);
+        onCleanup(() => clearTimeout(timer));
+    });
+    const accountWorkInPlaceOfHomeGate = createMemo(() => accountWorkReplacesHomeGate(
+        Boolean(props.gaugeApps?.active()),
+        {
+            finding: homeState.loading,
+            findingSlow: homeFindingSlow(),
+            failed: homeFailure() !== null,
+            noHome: noHomeState() !== null,
+        },
+    ));
     // A desktop does not ask a signed-in account with no Home where its
     // projects run (DR-0264): a fresh computer is claimed for it. Tried once;
     // a failed claim leaves the card, with its error, rather than retrying
@@ -3783,9 +3895,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         </p>
         {retainedAccountChoices(showLocal)}
     </>);
-    /** Account work for a person with no Home yet (DR-0260): the open
-     * GaugeApp's pages, page and management conversation, without the
-     * workbench around them, whose navigation and chat read a Home. */
+    /** Account work without a Home (DR-0260): the open GaugeApp's pages, page
+     * and management conversation, without the workbench around them, whose
+     * navigation and chat read a Home. For a person with no Home yet, and for
+     * one whose Home desk is still finding or could not reach. */
     const NoHomeAccountSurface = (): JSX.Element => {
         const apps = props.gaugeApps!;
         return (
@@ -4246,12 +4359,18 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // inactive layout never builds (no double-mounted FacetBrowser / Workspace).
     return (
         <>
-            <Show when={homeState.loading}>
+            <Show when={homeState.loading && !accountWorkInPlaceOfHomeGate()}>
                 <div class="homegate-scrim" data-tauri-drag-region data-home-loading>
-                    <section class="homegate-card"><p class="homegate-lede">Finding your Home…</p></section>
+                    <section class="homegate-card">
+                        <p class="homegate-lede">Finding your Home…</p>
+                        {/* Finding a Home can take most of a minute, and account
+                            work needs none (DR-0260): a person here to link or
+                            revoke a Trusted Device need not wait for it. */}
+                        <Show when={homeFindingSlow() && menuIdentity()}>{signedInNote(false)}</Show>
+                    </section>
                 </div>
             </Show>
-            <Show when={homeFailure()}>
+            <Show when={homeFailure() && !accountWorkInPlaceOfHomeGate()}>
                 <div class="homegate-scrim" data-tauri-drag-region data-home-error>
                     <section class="homegate-card">
                         <Show
@@ -4307,13 +4426,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     </section>
                 </div>
             </Show>
-            <Show when={!homeState.loading && !homeFailure()}>
-                {/* A GaugeApp or proposal opened by a person with no Home replaces
-                    the first-run card rather than waiting behind it: the account
-                    service answers all of it (DR-0260). */}
-                <Show when={!(noHomeState() && props.gaugeApps?.active())} fallback={<NoHomeAccountSurface />}>
-                    <HomeSetup />
-                </Show>
+            {/* A GaugeApp or proposal the person opened replaces the Home gate
+                rather than waiting behind it — the finding card once it is slow,
+                the failure card, the first-run card: the account service answers
+                all of it (DR-0260). One mount for all three, so a discovery that
+                ends while it is open does not rebuild it. */}
+            <Show when={accountWorkInPlaceOfHomeGate()}>
+                <NoHomeAccountSurface />
+            </Show>
+            <Show when={!homeState.loading && !homeFailure() && !accountWorkInPlaceOfHomeGate()}>
+                <HomeSetup />
             </Show>
             {/* First-run gate (ADR 0075 Phase 0): overlays both shells until
                 there is a working app, then dismisses itself. Either half is

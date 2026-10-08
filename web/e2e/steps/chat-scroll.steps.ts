@@ -47,6 +47,53 @@ When("I wheel the chat log to the top", async ({ page }) => {
     await expect.poll(async () => (await metrics(page)).scrollTop).toBe(0);
 });
 
+When(
+    "I send {string} and wheel the chat log to the top as it glides",
+    async ({ page }, text: string) => {
+        const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
+        await composer.fill(text);
+        await transcript(page).hover();
+        const from = (await metrics(page)).scrollTop;
+        await composer.press("Enter");
+        // The send anchors its message with a glide. Wheel in the glide's first
+        // frame of movement, so the gesture lands while the glide is running.
+        await transcript(page).evaluate(
+            (el, start) =>
+                new Promise<void>((resolve, reject) => {
+                    const deadline = performance.now() + 10_000;
+                    const watch = () => {
+                        if (el.scrollTop !== start) resolve();
+                        else if (performance.now() > deadline) reject(new Error("the send never glided"));
+                        else requestAnimationFrame(watch);
+                    };
+                    watch();
+                }),
+            from,
+        );
+        await page.mouse.wheel(0, -100_000);
+    },
+);
+
+Then("the chat log stays at the top", async ({ page }) => {
+    await expect.poll(async () => (await metrics(page)).scrollTop).toBe(0);
+    // And it stays there past the glide's window while the turn settles: once
+    // the reader has moved, nothing the panel does may move the log back.
+    const seen = await transcript(page).evaluate(
+        (el) =>
+            new Promise<number[]>((resolve) => {
+                const samples: number[] = [];
+                const until = performance.now() + 1_500;
+                const sample = () => {
+                    samples.push(el.scrollTop);
+                    if (performance.now() < until) requestAnimationFrame(sample);
+                    else resolve(samples);
+                };
+                sample();
+            }),
+    );
+    expect(Math.max(...seen)).toBe(0);
+});
+
 Then("a jump-to-latest button is offered", async ({ page }) => {
     await expect(page.locator("[data-jump-latest]")).toBeVisible();
 });

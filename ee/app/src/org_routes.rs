@@ -894,12 +894,99 @@ fn write_org(wb: &mut Workbench, scope: &str, r: &OrgRecord) {
     wb.notify_library_changed("org", &r.id, op);
 }
 
-pub(crate) fn write_membership(wb: &mut Workbench, scope: &str, r: &MembershipRecord) {
+pub(crate) fn write_membership(
+    wb: &mut Workbench,
+    scope: &str,
+    r: &MembershipRecord,
+) -> Result<(), gaugedesk_store::AdmitError> {
+    if wb.member_standing_fence().is_some() {
+        return Err(gaugedesk_store::AdmitError::Rejected(
+            gaugedesk_core::Rejection {
+                reason: "hosted member standing requires a staged command",
+            },
+        ));
+    }
     let op = op_str(r.op);
-    let _ = wb
-        .store_mut()
-        .append_record(scope, "membership", &serde_json::to_string(r).unwrap());
+    wb.store_mut()
+        .append_record(scope, "membership", &serde_json::to_string(r).unwrap())?;
     wb.notify_library_changed("membership", &r.id, op);
+    Ok(())
+}
+
+#[cfg(test)]
+mod membership_writer_tests {
+    use std::sync::Arc;
+
+    use gaugedesk_app::membership_fence::{
+        HostedMemberStandingFence, InstalledMemberStandingFence, StandingFenceError,
+        StandingFenceOutcome,
+    };
+    use gaugedesk_core::ids::ScopeId;
+    use gaugedesk_store::Store;
+
+    use super::*;
+
+    struct InstalledFence;
+
+    impl HostedMemberStandingFence for InstalledFence {
+        fn observe_activation(
+            &self,
+            _: &ScopeId,
+            _: &str,
+        ) -> Result<serde_json::Value, StandingFenceError> {
+            Err(StandingFenceError::Unavailable)
+        }
+
+        fn admit_if_unchanged(
+            &self,
+            _: &ScopeId,
+            _: &str,
+            _: &serde_json::Value,
+        ) -> Result<StandingFenceOutcome, StandingFenceError> {
+            Err(StandingFenceError::Unavailable)
+        }
+
+        fn begin_denial(
+            &self,
+            _: &ScopeId,
+            _: &str,
+            _: &str,
+        ) -> Result<StandingFenceOutcome, StandingFenceError> {
+            Err(StandingFenceError::Unavailable)
+        }
+
+        fn complete_denial(
+            &self,
+            _: &ScopeId,
+            _: &str,
+            _: &str,
+        ) -> Result<StandingFenceOutcome, StandingFenceError> {
+            Err(StandingFenceError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn a_direct_membership_append_refuses_when_the_host_installs_a_fence() {
+        let mut wb = Workbench::new(Store::open_in_memory().unwrap());
+        wb.install_member_standing_fence(InstalledMemberStandingFence(Arc::new(InstalledFence)));
+        let record = MembershipRecord {
+            id: "person".into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: "person".into(),
+            email: "person@example.test".into(),
+            role: "member".into(),
+            status: MembershipStatus::Active,
+            managed_by_scim: true,
+            team: None,
+        };
+        assert!(write_membership(&mut wb, "org::tenant", &record).is_err());
+        assert!(wb
+            .store_ref()
+            .retained_records("org::tenant", "membership")
+            .unwrap()
+            .is_empty());
+    }
 }
 
 fn write_policy(wb: &mut Workbench, scope: &str, r: &PolicyRecord) {
@@ -1036,7 +1123,13 @@ pub async fn post_member(
             return (StatusCode::CONFLICT, "purchased seat capacity is full").into_response();
         }
     }
-    write_membership(&mut wb, &scope, &record);
+    if write_membership(&mut wb, &scope, &record).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "membership write unavailable",
+        )
+            .into_response();
+    }
     let actor = wb.actor(bearer(&headers));
     gaugedesk_app::audit::record(&mut wb, &actor, "member.invite", &record.id);
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
@@ -1096,7 +1189,13 @@ pub async fn post_member_role(
     let mut record = existing.clone();
     record.op = RecordOp::Upsert;
     record.role = body.role;
-    write_membership(&mut wb, &req_scope(&headers), &record);
+    if write_membership(&mut wb, &req_scope(&headers), &record).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "membership write unavailable",
+        )
+            .into_response();
+    }
     let actor = wb.actor(bearer(&headers));
     gaugedesk_app::audit::record(&mut wb, &actor, "member.role", &record.id);
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
@@ -1136,7 +1235,13 @@ pub async fn post_member_deactivate(
     let mut record = existing.clone();
     record.op = RecordOp::Upsert;
     record.status = MembershipStatus::Deprovisioned;
-    write_membership(&mut wb, &req_scope(&headers), &record);
+    if write_membership(&mut wb, &req_scope(&headers), &record).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "membership write unavailable",
+        )
+            .into_response();
+    }
     let actor = wb.actor(bearer(&headers));
     gaugedesk_app::audit::record(&mut wb, &actor, "member.deactivate", &record.id);
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
@@ -1404,7 +1509,13 @@ pub async fn post_auto_join(
     if !org.seat_available_for(&record.id) {
         return (StatusCode::CONFLICT, "purchased seat capacity is full").into_response();
     }
-    write_membership(&mut wb, &req_scope(&headers), &record);
+    if write_membership(&mut wb, &req_scope(&headers), &record).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "membership write unavailable",
+        )
+            .into_response();
+    }
     (StatusCode::OK, Json(json!({ "member": record }))).into_response()
 }
 
@@ -2187,7 +2298,8 @@ mod enterprise_connection_test_tests {
                 managed_by_scim: false,
                 team: None,
             },
-        );
+        )
+        .unwrap();
         let mut connection = SsoConnectionRecord {
             id: ORG_ID.into(),
             protocol: SsoProtocol::Oidc,
@@ -2379,7 +2491,8 @@ mod authenticated_actor_tests {
                 managed_by_scim: false,
                 team: None,
             },
-        );
+        )
+        .unwrap();
         let shared = Arc::new(Mutex::new(workbench));
         let app = Router::new()
             .route("/whoami", get(who_am_i))
@@ -2424,7 +2537,8 @@ mod authenticated_actor_tests {
                 managed_by_scim: false,
                 team: None,
             },
-        );
+        )
+        .unwrap();
         let mut connection = SsoConnectionRecord {
             id: ORG_ID.to_owned(),
             op: RecordOp::Upsert,

@@ -232,11 +232,17 @@ export function ProjectTrackerPanel(props: {
                                                     void act(issue(), { kind: "assign", expectedAssignee: issue().assignedTo, assignedTo: to },
                                                         to ? `Assigned to ${personName(to)}.` : "Unassigned.");
                                                 }}>
-                                                <option value="">Unassigned</option>
+                                                {/* Each option says whether it is the assignee. The roster
+                                                    arrives beside the backlog, and its option for the assignee
+                                                    replaces the provisional one below; the select's own value
+                                                    does not follow a removed option, so without this the picker
+                                                    fell back to "Unassigned" for an assigned task. */}
+                                                <option value="" selected={!issue().assignedTo}>Unassigned</option>
                                                 <Show when={issue().assignedTo && !roster()?.some(person => person.authority === issue().assignedTo)}>
-                                                    <option value={issue().assignedTo!}>{personName(issue().assignedTo)}</option>
+                                                    <option value={issue().assignedTo!} selected>{personName(issue().assignedTo)}</option>
                                                 </Show>
-                                                <For each={roster() ?? []}>{person => <option value={person.authority}>
+                                                <For each={roster() ?? []}>{person => <option value={person.authority}
+                                                    selected={person.authority === issue().assignedTo}>
                                                     {person.authority === me() ? `You (${person.display})` : person.display}
                                                 </option>}</For>
                                             </select>

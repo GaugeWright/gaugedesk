@@ -7,6 +7,7 @@ import {
     documentFileType,
     extractDocumentAttachment,
     MAX_DOCUMENT_TEXT_CHARS,
+    pdfPageText,
 } from "./attachments";
 
 function pickedFile(name: string, type: string, bytes: BlobPart = "content"): Blob & { name: string; type: string } {
@@ -151,6 +152,21 @@ describe("extractDocumentAttachment", () => {
             );
             expect(attachment.text).toBe(sample.expected);
         }
+    });
+});
+
+describe("pdfPageText", () => {
+    it("joins a page's text runs and keeps the line ends pdf.js marks", () => {
+        expect(pdfPageText([
+            { str: "hello ", hasEOL: false },
+            { str: "from PDF", hasEOL: true },
+            { type: "beginMarkedContent", id: "mc0" },
+            { str: "second line", hasEOL: false },
+        ])).toBe("hello from PDF\nsecond line");
+    });
+
+    it("ignores entries that are not text runs", () => {
+        expect(pdfPageText([null, 7, { type: "endMarkedContent" }, { str: 3 }])).toBe("");
     });
 });
 

@@ -31,7 +31,7 @@ wasm = [{ package = "gaugedesk-relay-transport" }, { package = "gaugedesk-direct
 
 [workspace.package]
 edition = "2021"
-version = "0.8.9"
+version = "0.8.10"
 # The platform default (ADR 0121 / company DR-0056).
 license = "AGPL-3.0-only"
 

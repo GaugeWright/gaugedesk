@@ -606,10 +606,17 @@ When("I task the agent with {string}", async ({ page }, prompt: string) => {
     // "task the agent…" but an edit chat reads "Describe what to change about …", so
     // a placeholder match silently fails in edit chats (the composer surface).
     const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
+    const sent = page.locator(".run .transcript .line.user");
+    const before = await sent.count();
     await composer.fill(prompt);
     await sendDraft(composer);
     // Fake agent returns instantly; a real-model (@live) turn can take ~20s. The turn's
-    // completion shows on the chat-status badge reaching the terminal run phase.
+    // completion shows on the chat-status badge reaching the terminal run phase. That
+    // badge still reads the previous turn's Completed until this one is reported, so a
+    // second message would be "done" before its turn began: first wait for this
+    // message to be taken (its line appears) and its send to settle (no pending send).
+    await expect.poll(() => sent.count(), { timeout: 45_000 }).toBeGreaterThan(before);
+    await expect(page.locator(".run .transcript[data-pending-send]")).toHaveCount(0, { timeout: 45_000 });
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Completed", { timeout: 45_000 });
 });
 

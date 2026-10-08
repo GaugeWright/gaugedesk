@@ -19,6 +19,15 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.10] — 2026-10-08
+
+- On desk.gaugewright.com, Account Settings and Trusted Devices open while desk
+  is still finding your Home, and when it could not reach it. A Trusted Devices
+  link used to show only "Finding your Home…" for as long as that took, up to
+  45 seconds, and **Account settings** on "We couldn't load your Homes" showed
+  nothing. After a few seconds the finding card also offers **Account
+  settings**.
+
 - Accepting an Administration proposal rebuilds the session once instead of
   twice. On hosted GaugeWright that halves the time a review holds up other
   requests for an organization with a hosted Project Host.
@@ -54,7 +63,12 @@ Releases up to and including 0.4.30 are recorded on the
   "this invitation is for an email address your account has not verified"
   however often it signed in. Sign out and back in with Google once. An
   address another account already holds is left with that account.
-
+- You can sign in to GaugeDesk with a passkey. Continue with a passkey, and
+  Create an account with a passkey, open your browser at your account's sign-in
+  page, and GaugeDesk signs in when you finish there, as it does after Google or
+  Microsoft. Both used to fail in the app with "No passkey account could be
+  opened for that address", so an account made with a passkey could not sign in
+  to the desktop at all. You type your address again in the browser.
 - GaugeDesk keeps its connections to the GaugeWright account service open
   between calls instead of starting a new secure connection for each one.
   Every account call after the first skips the handshake, which on a slow
@@ -78,6 +92,27 @@ Releases up to and including 0.4.30 are recorded on the
   there instead, where they timed out.
 - A Panel agent's row in Projects and the Workshop shows no hover text. Its
   ⋯ menu and "update available" badge keep theirs.
+- Signed out, a message you send — typed, queued or sent now — no longer comes
+  back as a held message in the queue once it has run, and it shows once in the
+  chat instead of twice.
+- Files in a chat that works across several targets lists every selected
+  target as a folder, including one that holds no files yet. An empty target
+  used to be missing from Files.
+- A forked Agent in the Workshop again shows which Agent it was forked from.
+  Since Agent rows start folded, a fork with no chats hid that line and had no
+  caret to unfold it.
+- Attaching a PDF to a message works again. Every PDF was refused with an
+  "API version does not match the Worker version" notice, because the Office
+  parser carries its own older PDF reader, which refused the one GaugeDesk
+  ships. GaugeDesk now reads a PDF's text with its own PDF
+  reader, the one its PDF viewer uses, still entirely on your computer. Word,
+  Excel and PowerPoint attachments are unchanged.
+- A task in a project's backlog keeps showing who it is assigned to. When the
+  list of people arrived after the task was opened, the "Assigned to" picker
+  fell back to "Unassigned" for a task that was assigned.
+- Scrolling the chat while it glides your just-sent message into place now
+  moves it the first time. That first turn of the wheel used to be ignored and
+  left the chat stopped partway.
 
 ## [0.8.9] — 2026-10-08
 

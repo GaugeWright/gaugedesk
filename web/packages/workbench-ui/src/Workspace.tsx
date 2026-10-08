@@ -78,7 +78,21 @@ export function Workspace(props: WorkspaceProps = {}) {
     // A rejected Solid resource throws when read. These projections run before
     // the rendered error branch, so never read the failed resource here: doing
     // so aborts the update and leaves the pane displaying its loading fallback.
-    const allEntries = () => (tree.error ? [] : tree() ?? []).filter((entry) => leafOf(entry.path) !== FOLDER_MARKER);
+    // A memo, so an added root keeps one identity across the reads below.
+    const allEntries = createMemo(() => {
+        const listed = (tree.error ? [] : tree() ?? []).filter((entry) => leafOf(entry.path) !== FOLDER_MARKER);
+        // The tree lists what the workspace view materializes, and a target
+        // with no files yet materializes nothing. A chat across several
+        // targets names each as a root folder (DR-0248) whether or not it
+        // holds a file, so a selected target never vanishes from Files; a
+        // chat with one target names no partition and keeps its empty state.
+        if (!props.roots || props.roots.length < 2) return listed;
+        const present = new Set(listed.map((entry) => entry.path));
+        const empty = props.roots
+            .filter((root) => root.path && !present.has(root.path))
+            .map((root): FileEntry => ({ path: root.path, isDir: true }));
+        return empty.length ? [...listed, ...empty] : listed;
+    });
     const allFiles = () => allEntries().filter((entry) => !entry.isDir);
     const visibleEntries = createMemo(() => {
         const order = (path: string) => {

@@ -1,6 +1,6 @@
 {
   "name": "gaugedesk-web",
-  "version": "0.8.9",
+  "version": "0.8.10",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -40,7 +40,7 @@
     "qrcode-generator": "^2.0.4",
     "solid-js": "^1.9.15"
   },
-  "_overrides": "officeparser pins pdfjs-dist at exactly 6.1.200, which GHSA-hq66-cqwq-w95j reports as high severity: a malicious PDF can execute arbitrary JavaScript. Every published officeparser through 7.5.1 pins that same version, so no upgrade resolves it, and `npm audit fix --force` would downgrade officeparser to 6.0.7 and an older pdfjs still. 6.2.108 is the first fixed release and is the same major, which is why forcing it here is safe. Remove this once officeparser ships a pin at or above 6.2.108.",
+  "_overrides": "officeparser pins pdfjs-dist at exactly 6.1.200, which GHSA-hq66-cqwq-w95j reports as high severity: a malicious PDF can execute arbitrary JavaScript. Every published officeparser through 7.5.1 pins that same version, so no upgrade resolves it, and `npm audit fix --force` would downgrade officeparser to 6.0.7 and an older pdfjs still. 6.2.108 is the first fixed release and is the same major, which is why forcing it here is safe. Remove this once officeparser ships a pin at or above 6.2.108. The override reaches only the pdfjs-dist officeparser resolves from node_modules: its browser bundle (officeparser/slim) embeds pdf.js 6.1.200 itself, so the workbench never hands it a PDF and reads PDF text with its own pdfjs-dist instead (web/packages/workbench-ui/src/attachments.ts).",
   "overrides": {
     "officeparser": {
       "pdfjs-dist": "6.2.108"

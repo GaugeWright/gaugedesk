@@ -45,6 +45,13 @@ export type SignInRoute =
 
 export interface SignInPasskeyActions {
     signIn(email: string): Promise<void>;
+    /** Present on a desktop, and then the card runs neither ceremony itself
+     *  (DR-0457). A passkey belongs to the account's own web origin, which a
+     *  desktop window is not, so signing in with one — and creating an account
+     *  with one — continues in the system browser, at the account's sign-in
+     *  card, and the desktop signs in when the browser hands back over
+     *  `gaugewright://`. This opens it; the card then says where to finish. */
+    inBrowser?: () => Promise<void>;
     beginCreation(email: string): Promise<{ readonly challengeId: string; readonly expiresIn: number }>;
     /** Resolves with the account's recovery codes — the only copy there will
      *  ever be, which is why {@link complete} is not called until the person has
@@ -150,7 +157,10 @@ type Step =
     // browser one reloads. The one thing they share is that neither may run
     // until the codes have been read.
     | { at: "codes"; email: string; codes: readonly string[]; done: () => void }
-    | { at: "recover"; email: string; challenge?: { id: string; expiresIn: number } };
+    | { at: "recover"; email: string; challenge?: { id: string; expiresIn: number } }
+    // A desktop's passkey ceremony, continued in the system browser. Nothing is
+    // left to do here but say so, and offer the browser again.
+    | { at: "browser"; email: string };
 
 
 
@@ -286,9 +296,19 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
         });
 
     const signInWithPasskey = (address: string) =>
-        void run("sign in with that passkey", async () => {
-            await props.passkey!.signIn(address);
-            props.passkey!.complete();
+        props.passkey?.inBrowser
+            ? continueInBrowser(address)
+            : void run("sign in with that passkey", async () => {
+                await props.passkey!.signIn(address);
+                props.passkey!.complete();
+            });
+
+    /** A desktop's passkey ceremonies, signing in and creating an account
+     *  alike, open the same page in the system browser. */
+    const continueInBrowser = (address: string) =>
+        void run("open your browser", async () => {
+            await props.passkey!.inBrowser!();
+            setStep({ at: "browser", email: address });
         });
 
     const startCreation = (address: string) =>
@@ -454,6 +474,10 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                             disabled={busy()}
                             onClick={() => {
                                 const address = email().trim();
+                                if (props.passkey?.inBrowser) {
+                                    continueInBrowser(address);
+                                    return;
+                                }
                                 if (!address) {
                                     setStatus("Enter your email address first.");
                                     return;
@@ -504,20 +528,51 @@ export function SignInCard(props: SignInCardProps): JSX.Element {
                                     disabled={busy()}
                                     onClick={() => signInWithPasskey(current().email)}
                                 >
-                                    {busy() ? "Waiting for your passkey…" : "Continue with a passkey"}
+                                    {busy()
+                                        ? props.passkey?.inBrowser ? "Opening your browser…" : "Waiting for your passkey…"
+                                        : "Continue with a passkey"}
                                 </button>
                                 <button
                                     class="signin__quiet"
                                     data-signin-create
                                     type="button"
                                     disabled={busy()}
-                                    onClick={() => startCreation(current().email)}
+                                    onClick={() => props.passkey?.inBrowser
+                                        ? continueInBrowser(current().email)
+                                        : startCreation(current().email)}
                                 >
                                     Create an account with a passkey
                                 </button>
                             </Show>
                         </div>
                     )}
+            </Show>
+
+            <Show when={at('browser')}>
+                {(current) => (
+                    <div class="signin__act" data-signin-browser>
+                        <Show when={current().email}>
+                            <p class="signin__resolved">
+                                <span>{current().email}</span>
+                                <button class="signin__change" type="button" onClick={restart}>Change</button>
+                            </p>
+                        </Show>
+                        <p class="signin__status">
+                            Finish in your browser. Your passkey belongs to your account's
+                            web sign-in, so it opens there: sign in, or create your account,
+                            and GaugeDesk signs you in here when you are done.
+                        </p>
+                        <button
+                            class="signin__quiet"
+                            data-signin-browser-again
+                            type="button"
+                            disabled={busy()}
+                            onClick={() => continueInBrowser(current().email)}
+                        >
+                            Open the browser again
+                        </button>
+                    </div>
+                )}
             </Show>
 
             <Show when={at('create')}>
