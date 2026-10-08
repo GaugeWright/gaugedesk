@@ -72,6 +72,15 @@ Which scenarios a lane runs is stated once, in `lanes.mjs`; `run.mjs` hands it t
 bddgen as a tag expression. To run the per-change job's selection locally:
 `GW_E2E_CORE=1 npm run e2e` (and again with `GW_E2E_COMPOSITION=enterprise`).
 
+On a pull request `gaugewright/bar/e2e` runs only the `@core` features the change
+can reach, chosen by `scripts/e2e-impact.mjs` from the diff against the base
+(WS-1013): nothing for a docs-only change, a feature file itself, `quick-start` as
+a smoke test for a surface no `@core` journey opens, and every `@core` feature for
+shared plumbing or any path the map does not name. A head of `main` always runs
+every one. The repository guide (`AGENTS.md`, §2) has the map; when you add a
+`@core` feature or a surface, check where its paths fall:
+`node scripts/e2e-job.mjs core --base=origin/main --plan`.
+
 `scripts/check-product-contracts.mjs` accepts a scenario as a contract's evidence
 only when one of those lanes runs it, so a scenario nothing runs proves nothing.
 
