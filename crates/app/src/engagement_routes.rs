@@ -781,6 +781,13 @@ impl Workbench {
         chat_id: &str,
         path: &str,
     ) -> Option<Result<String, WorkspaceError>> {
+        // The method boundary below is a path comparison; it must see the
+        // spelling the read resolves (WS-997).
+        let path = match gaugedesk_workspace::canonical_relative_path(path) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
+        let path = path.as_str();
         if self.installed_method_read_requires_grant(chat_id, path) {
             return Some(Err(WorkspaceError {
                 message: "installed Agent method requires a current resource grant".to_owned(),
@@ -818,6 +825,18 @@ impl Workbench {
         viewer: Option<&str>,
         account_backed_viewer: bool,
     ) -> Option<Result<Option<Vec<u8>>, WorkspaceError>> {
+        // Every check below compares paths as strings: the method boundary,
+        // the authoring surfaces, and the import claims a source grant
+        // protects. The worktree read resolves `dir/./f`, `dir//f` and
+        // `dir/f/` to `dir/f`, so each check and the read itself take the one
+        // canonical spelling, computed here once. Otherwise a second spelling
+        // of another person's upload reads as unclaimed (WS-997).
+        let path = match gaugedesk_workspace::canonical_relative_path(path) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
+        let path = path.as_str();
+        let workspace_path = self.engagement_workspace_path(chat_id, path);
         if (self.installed_method_read_requires_grant(chat_id, path)
             || (account_backed_viewer && self.is_installed_method_path(chat_id, path)))
             && !viewer.is_some_and(|viewer| {
@@ -839,7 +858,7 @@ impl Workbench {
                     self,
                     chat_id,
                     viewer,
-                    &self.engagement_workspace_path(chat_id, path),
+                    &workspace_path,
                     None,
                 )
             })
@@ -851,10 +870,9 @@ impl Workbench {
         if let Some(bytes) = self.installed_agent_file(chat_id, path) {
             return Some(Ok((bytes.len() <= max_bytes).then_some(bytes)));
         }
-        let path = self.engagement_workspace_path(chat_id, path);
         self.engagements
             .get(chat_id)
-            .map(|eng| eng.read_file_bytes_capped(&path, max_bytes))
+            .map(|eng| eng.read_file_bytes_capped(&workspace_path, max_bytes))
     }
 
     /// A retained immutable revision matching the exact bytes served. Reading
@@ -1988,6 +2006,18 @@ fn current_workspace_file_source(wb: &Workbench, chat_id: &str, source: &str) ->
     )
 }
 
+/// The Raw context projection's answer for one file source, as an
+/// account-backed viewer asks it.
+#[cfg(test)]
+pub(crate) fn viewer_workspace_file_source(
+    wb: &Workbench,
+    chat_id: &str,
+    source: &str,
+    viewer: &str,
+) -> bool {
+    current_workspace_file_source_with_grants(wb, chat_id, source, true, Some(viewer), true)
+}
+
 fn current_workspace_file_source_with_grants(
     wb: &Workbench,
     chat_id: &str,
@@ -2003,6 +2033,12 @@ fn current_workspace_file_source_with_grants(
     else {
         return false;
     };
+    // The witness carries whatever spelling the read used. Scope, claims and
+    // the bytes are all judged under its one canonical spelling (WS-997).
+    let Ok(path) = gaugedesk_workspace::canonical_relative_path(path) else {
+        return false;
+    };
+    let path = path.as_str();
     if !current_workspace_source_scope(wb, chat_id, path, contexts_current) {
         return false;
     }
@@ -2061,6 +2097,10 @@ fn current_workspace_directory_source_with_grants(
     let Some(path) = source.strip_prefix(&prefix) else {
         return false;
     };
+    let Ok(path) = gaugedesk_workspace::canonical_relative_path(path) else {
+        return false;
+    };
+    let path = path.as_str();
     current_workspace_source_scope(wb, chat_id, path, contexts_current)
         && (!account_backed
             || viewer.is_some_and(|viewer| {
@@ -3969,9 +4009,14 @@ pub(crate) async fn get_file(
         Err(error) => return error.into_response(),
     };
     let account_backed = crate::method_access::account_backed_chat(&wb, &id, &headers);
+    // One spelling for the guarded read and for the cut it names (WS-997).
+    let path = match gaugedesk_workspace::canonical_relative_path(&q.path) {
+        Ok(path) => path,
+        Err(error) => return (StatusCode::BAD_REQUEST, format!("{error}")).into_response(),
+    };
     let Some(content) = wb.read_engagement_file_bytes_for_viewer(
         &id,
-        &q.path,
+        &path,
         MAX_VIEWABLE_FILE_BYTES,
         Some(&viewer),
         account_backed,
@@ -3984,8 +4029,7 @@ pub(crate) async fn get_file(
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
-                    "{} is larger than the {} MiB this viewer opens",
-                    q.path,
+                    "{path} is larger than the {} MiB this viewer opens",
                     MAX_VIEWABLE_FILE_BYTES / (1024 * 1024)
                 ),
             )
@@ -3997,7 +4041,7 @@ pub(crate) async fn get_file(
     // A transient working-copy edit remains viewable without becoming history;
     // unavailable evidence omits the cut instead of importing or repairing it.
     let cut = wb
-        .engagement_recorded_file_cut(&id, &q.path, &bytes)
+        .engagement_recorded_file_cut(&id, &path, &bytes)
         .and_then(|result| result.ok())
         .flatten();
     let mut response = match String::from_utf8(bytes) {

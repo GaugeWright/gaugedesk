@@ -13,6 +13,7 @@ use gaugedesk_core::{
     resource::{ResourceId, ResourceKind, ResourceRecord},
     resource_access::{AccessCommand, AccessPhase, AccessState},
 };
+use gaugedesk_workspace::canonical_relative_path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -53,7 +54,7 @@ fn source_basis(wb: &Workbench, chat_id: &str, rid: &str, reader: &str) -> Optio
     let import = resource_store::context_imports(wb.store_ref(), chat_id)
         .ok()?
         .remove(rid)?;
-    if !import.complete || import.files.is_empty() {
+    if !bounded(&import) || import.files.is_empty() {
         return None;
     }
     let required = record.stakeholders;
@@ -92,6 +93,20 @@ pub(crate) fn source_granted(wb: &Workbench, chat_id: &str, rid: &str, reader: &
         .is_ok_and(|state| state.phase == AccessPhase::Granted && state.required == basis.required)
 }
 
+/// Whether an import's recorded path set bounds what it supplied. It must be
+/// complete, and every path in it must already be the canonical spelling that
+/// every read below is keyed on (WS-997). The import side records only that
+/// spelling; a recorded path in any other could claim bytes that no lookup
+/// would find, so its import counts as one whose path set is unknown.
+fn bounded(import: &resource_store::ContextImport) -> bool {
+    import.complete
+        && import
+            .files
+            .keys()
+            .all(|path| canonical_relative_path(path).is_ok_and(|canonical| &canonical == path))
+}
+
+/// The current imports claiming `path`, which must be canonical.
 fn current_claims(wb: &Workbench, chat_id: &str, path: &str) -> Vec<(ResourceRecord, String)> {
     let Ok(imports) = resource_store::context_imports(wb.store_ref(), chat_id) else {
         return Vec::new();
@@ -106,7 +121,7 @@ fn current_claims(wb: &Workbench, chat_id: &str, path: &str) -> Vec<(ResourceRec
         record.resource.kind == ResourceKind::context()
             && imports
                 .get(record.resource.id.as_str())
-                .is_none_or(|import| !import.complete)
+                .is_none_or(|import| !bounded(import))
     }) {
         return Vec::new();
     }
@@ -123,9 +138,23 @@ fn current_claims(wb: &Workbench, chat_id: &str, path: &str) -> Vec<(ResourceRec
         .collect()
 }
 
+/// [`granted_file_readable`] for any spelling of `path`.
+#[cfg(test)]
+pub(crate) fn file_readable(
+    wb: &Workbench,
+    chat_id: &str,
+    viewer: &str,
+    path: &str,
+    expected_hash: Option<&str>,
+) -> bool {
+    canonical_relative_path(path)
+        .is_ok_and(|path| granted_file_readable(wb, chat_id, viewer, &path, expected_hash))
+}
+
 /// Exact import ownership, current source grant and retained bytes all hold at
 /// the time of a viewer read. A path claimed by two current imports is unknown.
-pub(crate) fn file_readable(
+/// `path` must be canonical.
+fn granted_file_readable(
     wb: &Workbench,
     chat_id: &str,
     viewer: &str,
@@ -166,7 +195,12 @@ pub(crate) fn file_readable(
 /// no one but the reader has a stake in — the agent's output, the reader's own
 /// edits, the reader's own upload — is the chat's own work, readable by whoever
 /// may read the chat, as it is in every other chat (DR-0317). Everything else is
-/// read under [`file_readable`]'s exact source grant.
+/// read under [`granted_file_readable`]'s exact source grant.
+///
+/// Every entry point here puts `path` in its one canonical spelling before
+/// anything consults a claim, and the bytes are then read under that same
+/// spelling, so no other spelling of a claimed path reads as unclaimed
+/// (WS-997). A path with no canonical form is never readable.
 pub(crate) fn worktree_file_readable(
     wb: &Workbench,
     chat_id: &str,
@@ -174,15 +208,27 @@ pub(crate) fn worktree_file_readable(
     path: &str,
     expected_hash: Option<&str>,
 ) -> bool {
+    canonical_relative_path(path).is_ok_and(|path| {
+        canonical_worktree_file_readable(wb, chat_id, viewer, &path, expected_hash)
+    })
+}
+
+fn canonical_worktree_file_readable(
+    wb: &Workbench,
+    chat_id: &str,
+    viewer: &str,
+    path: &str,
+    expected_hash: Option<&str>,
+) -> bool {
     !others_have_a_stake(wb, chat_id, viewer, path)
-        || file_readable(wb, chat_id, viewer, path, expected_hash)
+        || granted_file_readable(wb, chat_id, viewer, path, expected_hash)
 }
 
 /// Whether anyone but `viewer` may have supplied `path`, or erasure closed it:
 /// an import that claims it for another person, or claims it for content since
 /// erased, or another person's import whose path set is unknown and so might
 /// have supplied any path. An unreadable resource store answers yes, so the
-/// read falls to the grant.
+/// read falls to the grant. `path` must be canonical.
 fn others_have_a_stake(wb: &Workbench, chat_id: &str, viewer: &str, path: &str) -> bool {
     let (Ok(imports), Ok(resources)) = (
         resource_store::context_imports(wb.store_ref(), chat_id),
@@ -200,7 +246,7 @@ fn others_have_a_stake(wb: &Workbench, chat_id: &str, viewer: &str, path: &str) 
                     .iter()
                     .all(|party| party.as_str() == viewer);
             match imports.get(record.resource.id.as_str()) {
-                Some(import) if import.complete => {
+                Some(import) if bounded(import) => {
                     import.files.contains_key(path) && (record.tombstoned || !readers_alone)
                 }
                 _ => !readers_alone,
@@ -215,18 +261,25 @@ pub(crate) fn file_readable_from_resource(
     rid: &str,
     path: &str,
 ) -> bool {
-    let claims = current_claims(wb, chat_id, path);
+    let Ok(path) = canonical_relative_path(path) else {
+        return false;
+    };
+    let claims = current_claims(wb, chat_id, &path);
     let [(record, _)] = claims.as_slice() else {
         return false;
     };
-    record.resource.id.as_str() == rid && worktree_file_readable(wb, chat_id, viewer, path, None)
+    record.resource.id.as_str() == rid
+        && canonical_worktree_file_readable(wb, chat_id, viewer, &path, None)
 }
 
 /// A directory witness includes negative facts, so every current entry below
 /// it must have an authorized file source. Empty directories have no owner
 /// proof yet and remain redacted.
 pub(crate) fn directory_readable(wb: &Workbench, chat_id: &str, viewer: &str, path: &str) -> bool {
-    if !crate::engagement_routes::current_workspace_source_scope(wb, chat_id, path, true) {
+    let Ok(path) = canonical_relative_path(path) else {
+        return false;
+    };
+    if !crate::engagement_routes::current_workspace_source_scope(wb, chat_id, &path, true) {
         return false;
     }
     let Some(Ok(entries)) = wb.engagement_tree(chat_id) else {
@@ -257,6 +310,9 @@ pub(crate) fn directory_readable(wb: &Workbench, chat_id: &str, viewer: &str, pa
 /// could account for it. This does not authorize a Raw directory listing's
 /// negative facts.
 pub(crate) fn directory_visible(wb: &Workbench, chat_id: &str, viewer: &str, path: &str) -> bool {
+    let Ok(path) = canonical_relative_path(path) else {
+        return false;
+    };
     let Some(Ok(entries)) = wb.engagement_tree(chat_id) else {
         return false;
     };
@@ -266,7 +322,7 @@ pub(crate) fn directory_visible(wb: &Workbench, chat_id: &str, viewer: &str, pat
         .filter(|entry| !entry.is_dir && entry.path.starts_with(&prefix))
         .peekable();
     if files.peek().is_none() {
-        return !others_have_a_stake(wb, chat_id, viewer, path);
+        return !others_have_a_stake(wb, chat_id, viewer, &path);
     }
     files.any(|entry| worktree_file_readable(wb, chat_id, viewer, &entry.path, None))
 }
@@ -719,6 +775,96 @@ mod tests {
         ));
     }
 
+    /// Every spelling the worktree read resolves to `path`: the plain one,
+    /// `dir/./f`, `dir//f`, `./dir/f` and `dir/f/` (WS-997).
+    fn spellings(path: &str) -> Vec<String> {
+        let (folder, file) = path.rsplit_once('/').unwrap();
+        vec![
+            path.to_owned(),
+            format!("{folder}/./{file}"),
+            format!("{folder}//{file}"),
+            format!("./{path}"),
+            format!("{path}/"),
+        ]
+    }
+
+    /// The Raw context source a native read of `path` would carry.
+    fn raw_source_opens(wb: &Workbench, chat_id: &str, viewer: &str, path: &str) -> bool {
+        let digest = whipplescript_store::stable_hash_bytes_hex(b"secret");
+        crate::engagement_routes::viewer_workspace_file_source(
+            wb,
+            chat_id,
+            &format!("workspace-file:{chat_id}:{digest}:{path}"),
+            viewer,
+        )
+    }
+
+    #[test]
+    fn every_spelling_of_a_claimed_path_is_read_under_its_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        let chat = wb
+            .create_default_engagement("alias-chat".into(), "Alias".into())
+            .unwrap_or_else(|_| panic!("create alias chat"));
+        let (rid, upload) = imported(&mut wb, &chat.id, "alice", "alice-upload", b"secret");
+        let (_, file) = upload.rsplit_once('/').unwrap();
+        // The Files viewer also takes a path relative to the chat's one target.
+        let viewer_paths = spellings(&upload)
+            .into_iter()
+            .chain([
+                file.to_owned(),
+                format!("./{file}"),
+                format!(".//{file}"),
+                format!("{file}/"),
+            ])
+            .collect::<Vec<_>>();
+
+        for path in &viewer_paths {
+            assert!(!opens(&wb, &chat.id, "bob", path), "bob opened {path}");
+            assert!(opens(&wb, &chat.id, "alice", path), "alice refused {path}");
+        }
+        for path in &spellings(&upload) {
+            for (viewer, readable) in [("bob", false), ("alice", true)] {
+                assert_eq!(
+                    worktree_file_readable(&wb, &chat.id, viewer, path, None),
+                    readable,
+                    "{viewer} {path}"
+                );
+                assert_eq!(
+                    raw_source_opens(&wb, &chat.id, viewer, path),
+                    readable,
+                    "{viewer} raw {path}"
+                );
+            }
+        }
+
+        grant(&mut wb, &chat.id, &rid, "bob");
+        for path in &viewer_paths {
+            assert!(
+                opens(&wb, &chat.id, "bob", path),
+                "approved bob refused {path}"
+            );
+        }
+        for path in &spellings(&upload) {
+            assert!(file_readable(&wb, &chat.id, "bob", path, None), "{path}");
+            assert!(raw_source_opens(&wb, &chat.id, "bob", path), "raw {path}");
+        }
+        assert!(!opens(&wb, &chat.id, "carol", &upload));
+
+        // A spelling that leaves the worktree has no canonical form at all.
+        for escape in [
+            format!("{upload}/../report.txt"),
+            format!("/{upload}"),
+            ".".to_owned(),
+        ] {
+            assert!(!opens(&wb, &chat.id, "alice", &escape), "{escape}");
+            assert!(!worktree_file_readable(
+                &wb, &chat.id, "alice", &escape, None
+            ));
+        }
+    }
+
     #[test]
     fn another_persons_unbounded_import_keeps_unclaimed_files_closed() {
         let root = tempfile::tempdir().unwrap();
@@ -765,11 +911,11 @@ mod tests {
         assert!(!opens(&wb, &chat.id, "alice", &output));
     }
 
-    #[tokio::test]
-    async fn source_owner_approves_only_the_requested_reader() {
-        let root = tempfile::tempdir().unwrap();
-        let shared = crate::open_workbench(root.path()).unwrap();
-        let (chat_id, rid, path) = {
+    /// A hosted chat bob owns, holding alice's upload: alice and bob are
+    /// admitted readers, carol is not. Returns the chat, the upload's resource
+    /// and its workspace path.
+    fn hosted_upload(shared: &crate::SharedWorkbench) -> (String, String, String) {
+        {
             let mut wb = shared.lock_unpoisoned();
             let chat = wb
                 .create_default_engagement("source-route-chat".into(), "Source route".into())
@@ -831,7 +977,14 @@ mod tests {
                     ),
             )));
             (chat.id, rid, path)
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn source_owner_approves_only_the_requested_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let (chat_id, rid, path) = hosted_upload(&shared);
         assert!(crate::method_access::chat_reader(
             &shared.lock_unpoisoned(),
             &chat_id,
@@ -913,5 +1066,71 @@ mod tests {
             &path,
             None
         ));
+    }
+
+    /// What the Files viewer's read and the resource content route answer.
+    async fn served(
+        shared: &crate::SharedWorkbench,
+        chat_id: &str,
+        rid: Option<&str>,
+        token: &str,
+        path: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        let query = serde_json::json!({ "path": path });
+        let response = match rid {
+            None => crate::engagement_routes::get_file(
+                State(shared.clone()),
+                Path(chat_id.to_owned()),
+                axum::extract::Query(serde_json::from_value(query).unwrap()),
+                bearer(token),
+            )
+            .await
+            .into_response(),
+            Some(rid) => crate::resource_store::get_resource_content(
+                State(shared.clone()),
+                Path((chat_id.to_owned(), rid.to_owned())),
+                axum::extract::Query(serde_json::from_value(query).unwrap()),
+                bearer(token),
+            )
+            .await
+            .into_response(),
+        };
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn the_hosted_file_routes_read_every_spelling_under_its_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::open_workbench(root.path()).unwrap();
+        let (chat_id, rid, path) = hosted_upload(&shared);
+        for route in [None, Some(rid.as_str())] {
+            for spelling in spellings(&path) {
+                let (status, body) = served(&shared, &chat_id, route, "bob-token", &spelling).await;
+                assert_ne!(status, StatusCode::OK, "bob read {spelling} via {route:?}");
+                assert_ne!(body, b"secret", "bob read {spelling} via {route:?}");
+                let (status, body) =
+                    served(&shared, &chat_id, route, "alice-token", &spelling).await;
+                assert_eq!(
+                    (status, body.as_slice()),
+                    (StatusCode::OK, &b"secret"[..]),
+                    "alice {spelling} via {route:?}"
+                );
+            }
+        }
+        grant(&mut shared.lock_unpoisoned(), &chat_id, &rid, "bob");
+        for route in [None, Some(rid.as_str())] {
+            for spelling in spellings(&path) {
+                let (status, body) = served(&shared, &chat_id, route, "bob-token", &spelling).await;
+                assert_eq!(
+                    (status, body.as_slice()),
+                    (StatusCode::OK, &b"secret"[..]),
+                    "approved bob {spelling} via {route:?}"
+                );
+            }
+        }
     }
 }

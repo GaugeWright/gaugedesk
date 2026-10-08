@@ -9,6 +9,52 @@ fn dispatch() -> CommandDispatch {
     }
 }
 
+#[test]
+fn relocation_preserves_exact_cross_scope_command_fact_provenance() {
+    let mut source = Store::open_in_memory().unwrap();
+    let facts = vec![
+        CommandRecordFact {
+            scope_id: "org::tenant".into(),
+            kind: "org".into(),
+            payload: r#"{"id":"org","op":"tombstone"}"#.into(),
+        },
+        CommandRecordFact {
+            scope_id: "command:close".into(),
+            kind: "member-denial".into(),
+            payload: r#"{"member":"person:one"}"#.into(),
+        },
+    ];
+    source
+        .admit_record_facts("command:close", "close-one", "exact closure", &facts)
+        .unwrap();
+    assert!(source
+        .export_command_scopes(|scope| scope == "command:close")
+        .is_err());
+    let archive = source.export_command_scopes(|_| true).unwrap();
+    let mut destination = Store::open_in_memory().unwrap();
+    destination
+        .import_command_scopes(&archive, |_| true)
+        .unwrap();
+    assert_eq!(
+        destination
+            .committed_record_facts("command:close", "close-one")
+            .unwrap(),
+        Some(facts)
+    );
+    let mut damaged = archive;
+    damaged
+        .scopes
+        .iter_mut()
+        .find(|scope| scope.id == "command:close")
+        .unwrap()
+        .fact_refs
+        .pop();
+    assert!(Store::open_in_memory()
+        .unwrap()
+        .import_command_scopes(&damaged, |_| true)
+        .is_err());
+}
+
 fn seed(store: &mut Store, scope: &str) {
     store
         .admit_with_dispatch::<RunState>(scope, "launch", RunCommand::RequestRun, &dispatch())

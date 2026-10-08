@@ -7,7 +7,7 @@
 //! transaction before any Key Vault `set`. A replay can only reconcile the original attempt; it
 //! must never issue another `set` under the same marker.
 
-use gaugedesk_core::gaugevault::{self, Binding, Capability, Command, Operation};
+use gaugedesk_core::gaugevault::{self, Binding, Capability, Command, CredentialKind, Operation};
 use gaugedesk_core::ids::{
     VaultCandidateId, VaultIntakeMarkerId, VaultStorageNameId, VaultSubjectId,
 };
@@ -21,6 +21,7 @@ pub struct BeginCandidateRequest {
     pub binding: Binding,
     pub actor: VaultSubjectId,
     pub candidate: VaultCandidateId,
+    pub kind: CredentialKind,
     pub request_key: String,
     pub lifetime_secs: u64,
     pub now: u64,
@@ -46,6 +47,7 @@ struct StableIntent<'a> {
     binding: &'a Binding,
     actor: &'a VaultSubjectId,
     candidate: &'a VaultCandidateId,
+    kind: CredentialKind,
     lifetime_secs: u64,
 }
 
@@ -70,10 +72,11 @@ pub fn admit_candidate_begin(
         }));
     }
     let intent = StableIntent {
-        v: 1,
+        v: 2,
         binding: &request.binding,
         actor: &request.actor,
         candidate: &request.candidate,
+        kind: request.kind,
         lifetime_secs: request.lifetime_secs,
     };
     let admission = store.admit_request::<gaugevault::State, _>(
@@ -119,6 +122,7 @@ pub fn admit_candidate_begin(
                 now: request.now,
                 operation: Operation::BeginCandidate {
                     id: request.candidate.clone(),
+                    kind: request.kind,
                     marker: VaultIntakeMarkerId::from(hex::encode(marker_bytes)),
                     storage_name: VaultStorageNameId::from(format!(
                         "gv-{}-{}",
@@ -136,6 +140,11 @@ pub fn admit_candidate_begin(
         .get(&request.candidate)
         .cloned()
         .ok_or_else(|| AdmitError::Codec("GaugeVault intake receipt has no marker".into()))?;
+    if admission.state.candidate_kinds.get(&request.candidate) != Some(&request.kind) {
+        return Err(AdmitError::Codec(
+            "GaugeVault intake receipt has no matching kind".into(),
+        ));
+    }
     let storage_name = admission
         .state
         .candidate_storage_names
@@ -175,6 +184,7 @@ mod tests {
             binding: binding(),
             actor: VaultSubjectId::from("manager-one"),
             candidate: VaultCandidateId::from("candidate-one"),
+            kind: CredentialKind::Raw,
             request_key: "request-one".into(),
             lifetime_secs: 300,
             now,
@@ -249,9 +259,23 @@ mod tests {
             state.candidate_storage_names[&VaultCandidateId::from("candidate-one")],
             storage_name
         );
+        assert_eq!(
+            state.candidate_kinds[&VaultCandidateId::from("candidate-one")],
+            CredentialKind::Raw
+        );
+
+        let changed_kind = BeginCandidateRequest {
+            kind: CredentialKind::Bearer,
+            ..request(21)
+        };
+        assert!(matches!(
+            admit_candidate_begin(&mut store, &changed_kind, 600, |_| Ok(())),
+            Err(AdmitError::Rejected(_))
+        ));
 
         let changed = BeginCandidateRequest {
             candidate: VaultCandidateId::from("candidate-two"),
+            kind: CredentialKind::Raw,
             ..request(21)
         };
         assert!(matches!(

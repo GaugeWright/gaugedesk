@@ -5,7 +5,8 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
-const PROTOCOL: &str = "gaugedesk.command-scope-archive.v1";
+const PROTOCOL: &str = "gaugedesk.command-scope-archive.v2";
+const LEGACY_PROTOCOL: &str = "gaugedesk.command-scope-archive.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +22,10 @@ struct Scope {
     events: Vec<(i64, String, String)>,
     commands: Vec<Command>,
     receipts: Vec<(String, i64)>,
+    #[serde(default)]
+    fact_sets: Vec<(String, i64)>,
+    #[serde(default)]
+    fact_refs: Vec<(String, i64, String, i64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,8 +64,18 @@ impl CommandScopeArchive {
     }
 
     fn validate(&self, allowed: impl Fn(&str) -> bool) -> Result<(), AdmitError> {
-        if self.protocol != PROTOCOL {
+        if self.protocol != PROTOCOL && self.protocol != LEGACY_PROTOCOL {
             return Err(refused("unsupported command scope archive"));
+        }
+        if self.protocol == LEGACY_PROTOCOL
+            && self
+                .scopes
+                .iter()
+                .any(|scope| !scope.fact_sets.is_empty() || !scope.fact_refs.is_empty())
+        {
+            return Err(refused(
+                "legacy command archive carries newer fact coordinates",
+            ));
         }
         let mut previous: Option<&str> = None;
         for scope in &self.scopes {
@@ -116,6 +131,69 @@ impl CommandScopeArchive {
                     return Err(refused("applied command is missing its original receipt"));
                 }
             }
+            if scope
+                .fact_sets
+                .windows(2)
+                .any(|pair| pair[0].0 >= pair[1].0)
+                || scope
+                    .fact_refs
+                    .windows(2)
+                    .any(|pair| (&pair[0].0, pair[0].1) >= (&pair[1].0, pair[1].1))
+            {
+                return Err(refused("command archive has noncanonical fact coordinates"));
+            }
+            let sets = scope
+                .fact_sets
+                .iter()
+                .map(|(key, count)| (key.as_str(), *count))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            for (key, count) in &scope.fact_sets {
+                if *count < 0 || !receipts.contains(key) {
+                    return Err(refused("command archive has an unreceipted fact set"));
+                }
+                let refs = scope
+                    .fact_refs
+                    .iter()
+                    .filter(|(candidate, _, _, _)| candidate == key)
+                    .collect::<Vec<_>>();
+                if refs.len() as i64 != *count
+                    || refs
+                        .iter()
+                        .enumerate()
+                        .any(|(index, reference)| reference.1 != index as i64)
+                {
+                    return Err(refused("command archive has incomplete fact coordinates"));
+                }
+            }
+            if scope
+                .fact_refs
+                .iter()
+                .any(|(key, _, _, _)| !sets.contains_key(key.as_str()))
+            {
+                return Err(refused("command archive has an orphaned fact coordinate"));
+            }
+        }
+        let events = self
+            .scopes
+            .iter()
+            .flat_map(|scope| {
+                scope
+                    .events
+                    .iter()
+                    .map(move |(position, _, _)| (scope.id.as_str(), *position))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut linked = std::collections::BTreeSet::new();
+        for scope in &self.scopes {
+            for (_, _, event_scope, event_position) in &scope.fact_refs {
+                if !events.contains(&(event_scope.as_str(), *event_position))
+                    || !linked.insert((event_scope.as_str(), *event_position))
+                {
+                    return Err(refused(
+                        "command archive has a missing or repeated fact event",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -164,11 +242,30 @@ fn read_scope(
     let receipts = conn.prepare_cached("SELECT command_key, applied_at FROM command_receipts WHERE scope_id = ?1 ORDER BY command_key",
     )?.query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
+    let fact_sets = conn
+        .prepare_cached(
+            "SELECT command_key, fact_count FROM record_command_fact_sets
+             WHERE command_scope = ?1 ORDER BY command_key",
+        )?
+        .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let fact_refs = conn
+        .prepare_cached(
+            "SELECT command_key, fact_index, event_scope, event_position
+             FROM record_command_fact_refs WHERE command_scope = ?1
+             ORDER BY command_key, fact_index",
+        )?
+        .query_map([id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Scope {
         id: id.into(),
         events,
         commands,
         receipts,
+        fact_sets,
+        fact_refs,
     })
 }
 
@@ -184,7 +281,9 @@ impl Store {
         let ids = tx
             .prepare_cached(
                 "SELECT scope_id FROM events UNION SELECT scope_id FROM commands
-             UNION SELECT scope_id FROM command_receipts ORDER BY scope_id",
+             UNION SELECT scope_id FROM command_receipts
+             UNION SELECT command_scope FROM record_command_fact_sets
+             UNION SELECT command_scope FROM record_command_fact_refs ORDER BY scope_id",
             )?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -237,6 +336,8 @@ pub(crate) fn import_into(
         if !existing.events.is_empty()
             || !existing.commands.is_empty()
             || !existing.receipts.is_empty()
+            || !existing.fact_sets.is_empty()
+            || !existing.fact_refs.is_empty()
         {
             return Err(refused(
                 "command scope import conflicts with existing authority",
@@ -262,6 +363,21 @@ pub(crate) fn import_into(
         for (key, position) in &scope.receipts {
             tx.prepare_cached("INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)")?.execute(
                 params![scope.id, key, position])?;
+        }
+        for (key, count) in &scope.fact_sets {
+            tx.prepare_cached(
+                "INSERT INTO record_command_fact_sets (command_scope, command_key, fact_count)
+                 VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![scope.id, key, count])?;
+        }
+        for (key, index, event_scope, event_position) in &scope.fact_refs {
+            tx.prepare_cached(
+                "INSERT INTO record_command_fact_refs
+                 (command_scope, command_key, fact_index, event_scope, event_position)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![scope.id, key, index, event_scope, event_position])?;
         }
     }
     Ok(())

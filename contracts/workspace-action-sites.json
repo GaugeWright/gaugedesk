@@ -1207,7 +1207,7 @@
         "callable": "impl inherent for Workbench::read_engagement_file_bytes_for_viewer",
         "capability": "read_file_bytes_capped",
         "count": 1,
-        "expression": "eng . read_file_bytes_capped (& path , max_bytes)",
+        "expression": "eng . read_file_bytes_capped (& workspace_path , max_bytes)",
         "file": "crates/app/src/engagement_routes.rs"
       },
       "profile": "editor-and-import"

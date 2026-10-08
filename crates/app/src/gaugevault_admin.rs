@@ -327,6 +327,7 @@ mod tests {
                 binding: active.clone(),
                 actor: VaultSubjectId::from("manager"),
                 candidate: VaultCandidateId::from("candidate-one"),
+                kind: gaugedesk_core::gaugevault::CredentialKind::Raw,
                 request_key: "begin-one".into(),
                 lifetime_secs: 300,
                 now: 2,

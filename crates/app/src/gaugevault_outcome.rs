@@ -229,6 +229,7 @@ mod tests {
             Capability::Manage,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-one"),
+                kind: gaugedesk_core::gaugevault::CredentialKind::Raw,
                 marker: VaultIntakeMarkerId::from("abcdef0123456789abcdef0123456789"),
                 storage_name: storage("abcdef0123456789abcdef0123456789"),
                 deadline: 100,

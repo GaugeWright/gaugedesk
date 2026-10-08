@@ -92,6 +92,22 @@ pub enum UseMode {
     DeliverMaterial,
 }
 
+/// The declared format of one candidate's opaque value. This vocabulary
+/// matches WhippleScript custody; accepting a kind here does not authorize a
+/// final effect, which still needs kind-specific custodian admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialKind {
+    Bearer,
+    Basic,
+    Raw,
+    HmacSha256,
+    Ed25519,
+    AwsSigv4,
+    JwtRs256,
+    MtlsClient,
+}
+
 /// Secret-free identity of the exact final effect. The admitting shell checks
 /// its canonical request, target, subject and operation against a current grant.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -140,6 +156,9 @@ pub struct State {
     pub tenant_prefix: Option<VaultTenantPrefixId>,
     /// Bound before `set` and retained through cleanup and recovery.
     pub candidate_storage_names: BTreeMap<VaultCandidateId, VaultStorageNameId>,
+    /// A missing kind on a restored legacy snapshot never admits final use.
+    #[serde(default)]
+    pub candidate_kinds: BTreeMap<VaultCandidateId, CredentialKind>,
     pub candidates: BTreeMap<VaultCandidateId, Candidate>,
     /// Retained through cleanup so an ambiguous write always reconciles under
     /// the marker durably bound to its original candidate before the PUT.
@@ -169,12 +188,26 @@ pub struct AdministrationStatus {
 }
 
 impl State {
+    /// The current candidate's declared kind, never inferred from the Azure
+    /// value. An older snapshot with no kind cannot authorize final use.
+    pub fn active_kind(&self) -> Option<CredentialKind> {
+        if self.status != Status::Active {
+            return None;
+        }
+        let current = self.current.as_ref()?;
+        if !matches!(self.candidates.get(current)?, Candidate::Active { .. }) {
+            return None;
+        }
+        self.candidate_kinds.get(current).copied()
+    }
+
     /// Metadata standing only. A use also needs current grant, dispatch and
     /// recovery-fence checks at the final boundary.
     pub fn active_reference(&self) -> Option<&VaultBackingVersionId> {
         if self.status != Status::Active {
             return None;
         }
+        self.active_kind()?;
         match self.candidates.get(self.current.as_ref()?)? {
             Candidate::Active { reference } => Some(reference),
             _ => None,
@@ -248,6 +281,7 @@ pub enum Operation {
     },
     BeginCandidate {
         id: VaultCandidateId,
+        kind: CredentialKind,
         marker: VaultIntakeMarkerId,
         storage_name: VaultStorageNameId,
         deadline: u64,
@@ -308,6 +342,7 @@ pub enum Change {
     },
     CandidateBegun {
         id: VaultCandidateId,
+        kind: CredentialKind,
         marker: VaultIntakeMarkerId,
         storage_name: VaultStorageNameId,
         deadline: u64,
@@ -401,6 +436,7 @@ pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> 
         }
         Operation::BeginCandidate {
             id,
+            kind,
             marker,
             storage_name,
             deadline,
@@ -421,6 +457,7 @@ pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> 
         {
             Change::CandidateBegun {
                 id,
+                kind,
                 marker,
                 storage_name,
                 deadline,
@@ -428,6 +465,7 @@ pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> 
         }
         Operation::RecordStored { id, reference }
             if command.capability == Capability::IntakeReceipt
+                && state.candidate_kinds.contains_key(&id)
                 && matches!(
                     state.candidates.get(&id),
                     Some(
@@ -453,6 +491,7 @@ pub fn decide(state: &State, command: Command) -> Result<Vec<Event>, Rejection> 
         }
         Operation::Activate { id }
             if command.capability == Capability::Manage
+                && state.candidate_kinds.contains_key(&id)
                 && matches!(state.status, Status::Pending | Status::Active)
                 && matches!(
                     state.candidates.get(&id),
@@ -607,6 +646,7 @@ pub fn evolve(state: &State, event: Event) -> State {
         }
         Change::CandidateBegun {
             id,
+            kind,
             marker,
             storage_name,
             deadline,
@@ -614,6 +654,7 @@ pub fn evolve(state: &State, event: Event) -> State {
             next.intake_markers.insert(id.clone(), marker);
             next.candidate_storage_names
                 .insert(id.clone(), storage_name);
+            next.candidate_kinds.insert(id.clone(), kind);
             next.candidates
                 .insert(id, Candidate::AwaitingStore { deadline });
         }
@@ -662,6 +703,7 @@ pub fn evolve(state: &State, event: Event) -> State {
                 .get(&id)
                 .and_then(Candidate::reference)
                 .cloned();
+            next.candidate_kinds.remove(&id);
             next.candidates.insert(
                 id,
                 Candidate::Cleaned {
@@ -748,7 +790,7 @@ impl Lifecycle for State {
     /// Checkpointed (SCALE-1). Raise the version with any change to `evolve`
     /// or to the state's shape.
     fn snapshot_codec() -> Option<crate::SnapshotCodec<Self::State>> {
-        Some(crate::SnapshotCodec::serde("gaugevault_credential", 1))
+        Some(crate::SnapshotCodec::serde("gaugevault_credential", 2))
     }
 }
 
@@ -802,6 +844,7 @@ mod tests {
             2,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
+                kind: CredentialKind::Raw,
                 marker: marker(1),
                 storage_name: name(1),
                 deadline: 20,
@@ -836,6 +879,7 @@ mod tests {
             5,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("pending-candidate"),
+                kind: CredentialKind::Raw,
                 marker: marker(2),
                 storage_name: name(2),
                 deadline: 20,
@@ -847,6 +891,7 @@ mod tests {
             6,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("cleanup-candidate"),
+                kind: CredentialKind::Raw,
                 marker: marker(3),
                 storage_name: name(3),
                 deadline: 20,
@@ -946,6 +991,7 @@ mod tests {
     #[test]
     fn stored_candidate_is_not_active_and_rotation_selects_exact_version() {
         let mut state = active();
+        assert_eq!(state.active_kind(), Some(CredentialKind::Raw));
         assert_eq!(
             state.active_reference().unwrap().as_str(),
             "exact-version-1"
@@ -956,6 +1002,7 @@ mod tests {
             5,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
+                kind: CredentialKind::Bearer,
                 marker: marker(2),
                 storage_name: name(2),
                 deadline: 30,
@@ -974,6 +1021,7 @@ mod tests {
             state.active_reference().unwrap().as_str(),
             "exact-version-1"
         );
+        assert_eq!(state.active_kind(), Some(CredentialKind::Raw));
         apply(
             &mut state,
             Capability::Manage,
@@ -986,6 +1034,7 @@ mod tests {
             state.active_reference().unwrap().as_str(),
             "exact-version-2"
         );
+        assert_eq!(state.active_kind(), Some(CredentialKind::Bearer));
         assert_ne!(
             state.candidate_storage_names[&VaultCandidateId::from("candidate-1")],
             state.candidate_storage_names[&VaultCandidateId::from("candidate-2")]
@@ -994,6 +1043,50 @@ mod tests {
             state.candidates[&VaultCandidateId::from("candidate-1")],
             Candidate::Retired { .. }
         ));
+    }
+
+    #[test]
+    fn a_restored_snapshot_without_the_declared_kind_cannot_resolve_material() {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&active(), &mut bytes).unwrap();
+        let mut encoded: ciborium::Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let ciborium::Value::Map(fields) = &mut encoded else {
+            panic!("GaugeVault state was not encoded as a map");
+        };
+        fields.retain(|(key, _)| key != &ciborium::Value::Text("candidate_kinds".into()));
+        let mut legacy = Vec::new();
+        ciborium::into_writer(&encoded, &mut legacy).unwrap();
+        let restored: State = ciborium::from_reader(legacy.as_slice()).unwrap();
+        assert_eq!(restored.status, Status::Active);
+        assert!(restored.candidate_kinds.is_empty());
+        assert!(restored.active_kind().is_none());
+        assert!(restored.active_reference().is_none());
+    }
+
+    #[test]
+    fn an_unrecognized_kind_cannot_enter_a_candidate_event() {
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&"p256-signing", &mut encoded).unwrap();
+        assert!(ciborium::from_reader::<CredentialKind, _>(encoded.as_slice()).is_err());
+    }
+
+    #[test]
+    fn declared_kind_labels_match_the_custodian_vocabulary() {
+        for (kind, label) in [
+            (CredentialKind::Bearer, "bearer"),
+            (CredentialKind::Basic, "basic"),
+            (CredentialKind::Raw, "raw"),
+            (CredentialKind::HmacSha256, "hmac-sha256"),
+            (CredentialKind::Ed25519, "ed25519"),
+            (CredentialKind::AwsSigv4, "aws-sigv4"),
+            (CredentialKind::JwtRs256, "jwt-rs256"),
+            (CredentialKind::MtlsClient, "mtls-client"),
+        ] {
+            let mut encoded = Vec::new();
+            ciborium::into_writer(&kind, &mut encoded).unwrap();
+            let decoded: String = ciborium::from_reader(encoded.as_slice()).unwrap();
+            assert_eq!(decoded, label);
+        }
     }
 
     #[test]
@@ -1016,6 +1109,7 @@ mod tests {
                 now: 2,
                 operation: Operation::BeginCandidate {
                     id: VaultCandidateId::from("candidate-1"),
+                    kind: CredentialKind::Raw,
                     marker: marker(1),
                     storage_name: name(1),
                     deadline: 20,
@@ -1035,6 +1129,10 @@ mod tests {
         assert_eq!(
             state.candidate_storage_names[&VaultCandidateId::from("candidate-1")],
             name(1)
+        );
+        assert_eq!(
+            state.candidate_kinds[&VaultCandidateId::from("candidate-1")],
+            CredentialKind::Raw
         );
         apply(
             &mut state,
@@ -1061,6 +1159,9 @@ mod tests {
             state.candidate_storage_names[&VaultCandidateId::from("candidate-1")],
             name(1)
         );
+        assert!(!state
+            .candidate_kinds
+            .contains_key(&VaultCandidateId::from("candidate-1")));
         for reused in [marker(1), VaultIntakeMarkerId::from("invalid-marker")] {
             assert!(decide(
                 &state,
@@ -1071,6 +1172,7 @@ mod tests {
                     now: 5,
                     operation: Operation::BeginCandidate {
                         id: VaultCandidateId::from("candidate-2"),
+                        kind: CredentialKind::Raw,
                         marker: reused,
                         storage_name: name(2),
                         deadline: 20,
@@ -1092,6 +1194,7 @@ mod tests {
                     now: 5,
                     operation: Operation::BeginCandidate {
                         id: VaultCandidateId::from("candidate-2"),
+                        kind: CredentialKind::Raw,
                         marker: marker(2),
                         storage_name: invalid_name,
                         deadline: 20,
@@ -1115,6 +1218,7 @@ mod tests {
             now: 6,
             operation: Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
+                kind: CredentialKind::Raw,
                 marker: marker(2),
                 storage_name: name(2),
                 deadline: 30,
@@ -1160,6 +1264,7 @@ mod tests {
             2,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
+                kind: CredentialKind::Raw,
                 marker: marker(1),
                 storage_name: name(1),
                 deadline: 5,
@@ -1211,6 +1316,7 @@ mod tests {
             2,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-1"),
+                kind: CredentialKind::Raw,
                 marker: marker(1),
                 storage_name: name(1),
                 deadline: 10,
@@ -1322,6 +1428,7 @@ mod tests {
             5,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
+                kind: CredentialKind::Raw,
                 marker: marker(2),
                 storage_name: name(2),
                 deadline: 10,
@@ -1366,6 +1473,7 @@ mod tests {
             12,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-3"),
+                kind: CredentialKind::Raw,
                 marker: marker(3),
                 storage_name: name(3),
                 deadline: 20,
@@ -1460,6 +1568,7 @@ mod tests {
             6,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-2"),
+                kind: CredentialKind::Raw,
                 marker: marker(2),
                 storage_name: name(2),
                 deadline: 20,

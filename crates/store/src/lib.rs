@@ -256,7 +256,7 @@ fn journal_mode(setting: Option<&str>) -> &'static str {
 /// ledger records a greater version: that database was written by a newer build,
 /// and opening it anyway could misread or drop data this build does not know
 /// about (DR-0054 Phase B — the downgrade guard).
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 13;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 14;
 
 /// One numbered, idempotent schema migration (DR-0054 Phase C). Applied in
 /// `version` order inside a single immediate transaction and recorded in
@@ -682,6 +682,25 @@ const MIGRATIONS: &[Migration] = &[
         version: 13,
         name: "home-product-bindings",
         sql: home_product::CATALOG_SCHEMA,
+    },
+    Migration {
+        version: 14,
+        name: "record-command-fact-provenance",
+        sql: "CREATE TABLE IF NOT EXISTS record_command_fact_sets (
+                 command_scope TEXT NOT NULL,
+                 command_key TEXT NOT NULL,
+                 fact_count INTEGER NOT NULL CHECK (fact_count >= 0),
+                 PRIMARY KEY (command_scope, command_key)
+             );
+             CREATE TABLE IF NOT EXISTS record_command_fact_refs (
+                 command_scope TEXT NOT NULL,
+                 command_key TEXT NOT NULL,
+                 fact_index INTEGER NOT NULL CHECK (fact_index >= 0),
+                 event_scope TEXT NOT NULL,
+                 event_position INTEGER NOT NULL,
+                 PRIMARY KEY (command_scope, command_key, fact_index),
+                 UNIQUE (event_scope, event_position)
+             );",
     },
 ];
 
@@ -1420,6 +1439,19 @@ impl Store {
         self.admit_record_facts_chained(command_scope, idempotency_key, snapshot_json, facts, None)
     }
 
+    /// The committed head used as the basis for a staged record mutation.
+    /// An empty scope has head `-1`. A caller that releases its lock for a
+    /// remote authority call must pass this position back to
+    /// [`admit_record_facts_at_scope_head`](Self::admit_record_facts_at_scope_head)
+    /// after reauthenticating and replanning; this read grants no write lease.
+    pub fn record_scope_head(&self, scope_id: &str) -> Result<i64, AdmitError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) FROM events WHERE scope_id = ?1",
+            params![scope_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Atomically admit record facts only when `expected_scope` still has the
     /// exact committed head observed by the caller. An empty scope has head
     /// `-1`. The comparison and every append share one immediate transaction,
@@ -1492,6 +1524,78 @@ impl Store {
             return Ok(None);
         };
         record_admission::validate_snapshot(command_scope, idempotency_key, id, snapshot).map(Some)
+    }
+
+    /// Read exactly the events appended by one receipted record command,
+    /// including facts in other scopes and its chained audit fact. Legacy
+    /// receipts without an event map refuse instead of being matched to a
+    /// similar historical payload. An unavailable decoded fact also refuses.
+    pub fn committed_record_facts(
+        &self,
+        command_scope: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<Vec<CommandRecordFact>>, AdmitError> {
+        if self
+            .committed_record_snapshot(command_scope, idempotency_key)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let invalid = || {
+            AdmitError::Rejected(Rejection {
+                reason: "committed command fact provenance is missing or inconsistent",
+            })
+        };
+        let expected: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT fact_count FROM record_command_fact_sets
+                 WHERE command_scope = ?1 AND command_key = ?2",
+            )?
+            .query_row(params![command_scope, idempotency_key], |row| row.get(0))
+            .optional()?
+            .ok_or_else(invalid)?;
+        let mut query = self.conn.prepare_cached(
+            "SELECT refs.fact_index, refs.event_scope, events.kind, events.payload
+             FROM record_command_fact_refs AS refs
+             LEFT JOIN events ON events.scope_id = refs.event_scope
+               AND events.position = refs.event_position
+             WHERE refs.command_scope = ?1 AND refs.command_key = ?2
+             ORDER BY refs.fact_index",
+        )?;
+        let rows = query.query_map(params![command_scope, idempotency_key], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut facts = Vec::new();
+        for row in rows {
+            let (index, scope_id, kind, payload) = row?;
+            if index != facts.len() as i64 {
+                return Err(invalid());
+            }
+            let (Some(kind), Some(payload)) = (kind, payload) else {
+                return Err(invalid());
+            };
+            let payload = match &self.codec {
+                Some(codec) => codec.decode(&scope_id, &kind, &payload).ok_or_else(|| {
+                    AdmitError::Codec("committed command contains an unavailable fact".into())
+                })?,
+                None => payload,
+            };
+            facts.push(CommandRecordFact {
+                scope_id,
+                kind,
+                payload,
+            });
+        }
+        if facts.len() as i64 != expected {
+            return Err(invalid());
+        }
+        Ok(Some(facts))
     }
 
     /// Enumerate receipted record commands in one scope without trusting or
@@ -1728,6 +1832,18 @@ impl Store {
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
             )?
             .execute(params![fact.scope_id, position, fact.kind, fact.payload])?;
+            tx.prepare_cached(
+                "INSERT INTO record_command_fact_refs
+                 (command_scope, command_key, fact_index, event_scope, event_position)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![
+                command_scope,
+                idempotency_key,
+                positions.len() as i64,
+                fact.scope_id,
+                position,
+            ])?;
             positions.push(position);
         }
         // Resolve the chain link against the head visible to *this* transaction and
@@ -1753,10 +1869,31 @@ impl Store {
                 "INSERT INTO events (scope_id, position, kind, payload) VALUES (?1, ?2, ?3, ?4)",
             )?
             .execute(params![chained.scope_id, position, chained.kind, encoded])?;
+            tx.prepare_cached(
+                "INSERT INTO record_command_fact_refs
+                 (command_scope, command_key, fact_index, event_scope, event_position)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![
+                command_scope,
+                idempotency_key,
+                positions.len() as i64,
+                chained.scope_id,
+                position,
+            ])?;
             positions.push(position);
             chained_payload = Some(payload);
         }
         let applied_at = positions.first().copied().unwrap_or(0);
+        tx.prepare_cached(
+            "INSERT INTO record_command_fact_sets (command_scope, command_key, fact_count)
+             VALUES (?1, ?2, ?3)",
+        )?
+        .execute(params![
+            command_scope,
+            idempotency_key,
+            positions.len() as i64
+        ])?;
         tx.prepare_cached(
             "INSERT INTO command_receipts (scope_id, command_key, applied_at) VALUES (?1, ?2, ?3)",
         )?
@@ -3576,9 +3713,11 @@ mod tests {
     #[test]
     fn scope_head_bound_record_admission_is_atomic_and_replayable() {
         let mut store = Store::open_in_memory().unwrap();
+        assert_eq!(store.record_scope_head("account-auth").unwrap(), -1);
         store
             .append_record("account-auth", "legacy", r#"{"id":"alice"}"#)
             .unwrap();
+        assert_eq!(store.record_scope_head("account-auth").unwrap(), 0);
         let facts = vec![
             CommandRecordFact {
                 scope_id: "account-auth".into(),
@@ -3604,6 +3743,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.positions, vec![1, 0]);
         assert!(!first.replayed);
+        assert_eq!(store.record_scope_head("account-auth").unwrap(), 1);
 
         let replay = store
             .admit_record_facts_at_scope_head(
@@ -3634,6 +3774,53 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn committed_command_facts_name_only_their_exact_cross_scope_events() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .append_record("org::tenant", "org", r#"{"op":"tombstone","id":"older"}"#)
+            .unwrap();
+        let facts = vec![
+            CommandRecordFact {
+                scope_id: "org::tenant".into(),
+                kind: "org".into(),
+                payload: r#"{"op":"tombstone","id":"current"}"#.into(),
+            },
+            CommandRecordFact {
+                scope_id: "command:closure".into(),
+                kind: "member-denial".into(),
+                payload: r#"{"member":"person:one"}"#.into(),
+            },
+        ];
+        assert!(store
+            .committed_record_facts("command:closure", "close-one")
+            .unwrap()
+            .is_none());
+        store
+            .admit_record_facts("command:closure", "close-one", "closure snapshot", &facts)
+            .unwrap();
+        store
+            .append_record("org::tenant", "org", r#"{"op":"upsert","id":"later"}"#)
+            .unwrap();
+        assert_eq!(
+            store
+                .committed_record_facts("command:closure", "close-one")
+                .unwrap(),
+            Some(facts)
+        );
+        store
+            .conn
+            .execute(
+                "DELETE FROM record_command_fact_refs WHERE command_scope = ?1 AND command_key = ?2 AND fact_index = 0",
+                params!["command:closure", "close-one"],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.committed_record_facts("command:closure", "close-one"),
+            Err(AdmitError::Rejected(_))
+        ));
     }
 
     #[test]

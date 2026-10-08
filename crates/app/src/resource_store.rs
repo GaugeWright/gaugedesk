@@ -118,12 +118,34 @@ fn begin_context_import(
     Ok(())
 }
 
+/// A complete binding claims each path under the one canonical spelling a
+/// viewer's read is keyed on (WS-997). The import paths are built from file
+/// names and target roots and are canonical already, so this rewrites
+/// nothing today; it refuses a path with no canonical form, or two spellings
+/// of one path, rather than record a claim no read could find.
+fn canonical_import_files(
+    files: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, AdmitError> {
+    let mut canonical = BTreeMap::new();
+    for (path, hash) in files {
+        let key = gaugedesk_workspace::canonical_relative_path(&path)
+            .map_err(|error| AdmitError::Codec(format!("context import path: {error}")))?;
+        if canonical.insert(key, hash).is_some() {
+            return Err(AdmitError::Codec(format!(
+                "context import names {path} twice under different spellings"
+            )));
+        }
+    }
+    Ok(canonical)
+}
+
 pub(crate) fn bind_context_import(
     store: &mut Store,
     chat_id: &str,
     resource_id: &ResourceId,
     files: BTreeMap<String, String>,
 ) -> Result<(), AdmitError> {
+    let files = canonical_import_files(files)?;
     let Some(mut current) = current_context_import(store, chat_id, resource_id.as_str())? else {
         return Ok(());
     };
@@ -353,6 +375,7 @@ fn prepare_streamed_context(
     files: BTreeMap<String, String>,
     authority_basis: Option<DispatchReadBasis>,
 ) -> Result<(Vec<CommandRecordFact>, DispatchReadBasis), AdmitError> {
+    let files = canonical_import_files(files)?;
     let access = access_scope(chat, &rec.resource.id);
     let (facts, basis) = store.read_for_dispatch(&[chat, &access], |reader| {
         reader.retained_events(chat)?;
@@ -2567,7 +2590,12 @@ pub(crate) async fn get_resource_content(
             Some(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
         }
     } else {
-        if account_backed && wb.is_installed_method_path(&id, &q.path) {
+        // One spelling for the method boundary, the claim and the read (WS-997).
+        let path = match gaugedesk_workspace::canonical_relative_path(&q.path) {
+            Ok(path) => path,
+            Err(error) => return (StatusCode::BAD_REQUEST, format!("{error}")).into_response(),
+        };
+        if account_backed && wb.is_installed_method_path(&id, &path) {
             return (
                 StatusCode::FORBIDDEN,
                 "method inspection requires its own grant",
@@ -2580,12 +2608,12 @@ pub(crate) async fn get_resource_content(
                 &id,
                 &viewer,
                 res_id.as_str(),
-                &wb.engagement_workspace_path(&id, &q.path),
+                &wb.engagement_workspace_path(&id, &path),
             )
         {
             return (StatusCode::FORBIDDEN, "source inspection grant required").into_response();
         }
-        match wb.read_engagement_file(&id, &q.path) {
+        match wb.read_engagement_file(&id, &path) {
             None => (StatusCode::NOT_FOUND, "no such engagement").into_response(),
             Some(Ok(content)) => (StatusCode::OK, content).into_response(),
             Some(Err(e)) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
@@ -3355,6 +3383,48 @@ mod tests {
             snapshot: "exact-body-and-meaning",
             office: None,
         }
+    }
+
+    #[test]
+    fn an_import_claims_each_path_under_its_one_canonical_spelling() {
+        let mut store = Store::open_in_memory().unwrap();
+        let rec = new_context_record(
+            "doctor",
+            "uploaded: 1 file(s)",
+            "cut-one",
+            ResourceAttributes::default(),
+        );
+        begin_context_import(&mut store, "chat", rec.resource.id.as_str()).unwrap();
+        // Two spellings of one path, or one that leaves the worktree, would
+        // record a claim no read is keyed on. Nothing is recorded.
+        for files in [
+            BTreeMap::from([
+                ("dir/take.wav".into(), "a".into()),
+                ("dir//take.wav".into(), "b".into()),
+            ]),
+            BTreeMap::from([("../take.wav".into(), "a".into())]),
+            BTreeMap::from([("/dir/take.wav".into(), "a".into())]),
+        ] {
+            assert!(bind_context_import(&mut store, "chat", &rec.resource.id, files).is_err());
+        }
+        let current = current_context_import(&store, "chat", rec.resource.id.as_str())
+            .unwrap()
+            .unwrap();
+        assert!(!current.complete);
+        bind_context_import(
+            &mut store,
+            "chat",
+            &rec.resource.id,
+            BTreeMap::from([("./dir/./take.wav/".into(), "hash".into())]),
+        )
+        .unwrap();
+        let import = current_context_import(&store, "chat", rec.resource.id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            import.files,
+            BTreeMap::from([("dir/take.wav".to_owned(), "hash".to_owned())])
+        );
     }
 
     #[test]

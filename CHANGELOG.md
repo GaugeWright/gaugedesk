@@ -19,6 +19,17 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Accepting an Administration proposal rebuilds the session once instead of
+  twice. On hosted GaugeWright that halves the time a review holds up other
+  requests for an organization with a hosted Project Host.
+
+- A file someone else uploaded to a shared chat stays closed to you until they
+  approve your inspection, however its path is spelled. A request for
+  `folder/./file`, `folder//file` or `./file` used to miss the upload's record
+  and read as a file nobody had imported, so Files served it without the
+  owner's approval. Every viewer read now resolves one spelling of the path
+  and checks the upload's record under that same spelling.
+
 - A project someone shared with you is reachable from all your devices once
   you accept it on a desktop: that computer, which holds your account's keys,
   vouches for the project's key in your own signed directory entries, so your

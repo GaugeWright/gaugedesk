@@ -4224,6 +4224,40 @@ fn write_substrate_stamp(root: &Path) -> Result<()> {
     .map_err(WorkspaceError::io)
 }
 
+/// The one spelling of a workspace-relative path: its normal components, as
+/// this platform's path parser finds them, joined by `/` (WS-997).
+///
+/// The parser that resolves a read drops `.` and empty components, so
+/// `dir/./f`, `dir//f`, `./dir/f` and `dir/f/` all open `dir/f`. Anything that
+/// records a fact under a path — an import's claim, a grant, a method boundary
+/// — and anything that consults one before reading bytes must key both on
+/// this form, computed once, or a second spelling reaches the same bytes
+/// under a key nothing was recorded for. A parent component, a root or drive
+/// prefix, or a path naming no component has no canonical form and is
+/// refused, as [`safe_path`] refuses it.
+pub fn canonical_relative_path(relative: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str().ok_or_else(|| {
+                WorkspaceError::msg(format!("path {relative} is not valid UTF-8"))
+            })?),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(WorkspaceError::msg(format!(
+                    "path {relative} escapes the worktree"
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(WorkspaceError::msg(format!(
+            "path {relative} names no file in the worktree"
+        )));
+    }
+    Ok(parts.join("/"))
+}
+
 fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
     let path = Path::new(relative);
     if path.is_absolute()
@@ -4370,6 +4404,38 @@ mod tests {
         )
         .expect("init");
         (directory, instance)
+    }
+
+    #[test]
+    fn every_spelling_of_a_path_has_one_canonical_form() {
+        for alias in [
+            "dir/f",
+            "dir/./f",
+            "dir//f",
+            "./dir/f",
+            "dir/f/",
+            ".//dir/./f/.",
+        ] {
+            assert_eq!(canonical_relative_path(alias).unwrap(), "dir/f", "{alias}");
+        }
+        assert_eq!(canonical_relative_path("f").unwrap(), "f");
+        for refused in ["", ".", "./", "/dir/f", "dir/../f", "../f", "dir/f/.."] {
+            assert!(canonical_relative_path(refused).is_err(), "{refused}");
+        }
+        // The canonical form is a fixed point, and it is what a read resolves.
+        let canonical = canonical_relative_path("dir//./f/").unwrap();
+        assert_eq!(canonical_relative_path(&canonical).unwrap(), canonical);
+        let root = Path::new("/root");
+        assert_eq!(
+            safe_path(root, "dir//./f/")
+                .unwrap()
+                .components()
+                .collect::<Vec<_>>(),
+            safe_path(root, &canonical)
+                .unwrap()
+                .components()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

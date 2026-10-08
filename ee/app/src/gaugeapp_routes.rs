@@ -4866,6 +4866,22 @@ async fn verify_domain_review_evidence(
     }
     let domain = {
         let guard = wb.lock_unpoisoned();
+        // Only a domain verification has evidence to check, so read the
+        // proposal before rebuilding anything. Every other review is decided
+        // by the review that follows, which rebuilds and checks the session
+        // itself; rebuilding it here too projected every page twice under the
+        // lock, and the second build no longer had the composition's
+        // prefetched Home, which only one projection may take (WS-851).
+        let changes =
+            fold_gaugeapp_changes(guard.store_ref(), &req_scope(headers)).map_err(internal)?;
+        let Some(change) = changes.get(id) else {
+            return Ok(());
+        };
+        if change.status != GaugeAppChangeStatus::Proposed
+            || change.command_id != "organization.domain.verify"
+        {
+            return Ok(());
+        }
         let (session, _) = build_session_prefetched(&guard, headers, extension, prefetched)?;
         if body.session_id != session.id
             || body.generation != session.generation
@@ -4877,16 +4893,6 @@ async fn verify_domain_review_evidence(
                 Json(json!({ "error": "GaugeApp session is stale or cross-scope" })),
             )
                 .into_response());
-        }
-        let changes =
-            fold_gaugeapp_changes(guard.store_ref(), &req_scope(headers)).map_err(internal)?;
-        let Some(change) = changes.get(id) else {
-            return Ok(());
-        };
-        if change.status != GaugeAppChangeStatus::Proposed
-            || change.command_id != "organization.domain.verify"
-        {
-            return Ok(());
         }
         parse::<DomainPayload>(&change.payload)?.domain
     };
@@ -5318,6 +5324,8 @@ mod tests {
         handed: Handed,
         /// Projections made with nothing read before the lock.
         unprefetched: Arc<Mutex<usize>>,
+        /// Every projection, prefetched or not.
+        projections: Arc<Mutex<usize>>,
     }
 
     impl CommandPrefetchingExtension {
@@ -5385,6 +5393,7 @@ mod tests {
             _capabilities: &[Capability],
         ) -> Result<Vec<AdministrationExtensionPage>, AdministrationExtensionError> {
             *self.unprefetched.lock().unwrap() += 1;
+            *self.projections.lock().unwrap() += 1;
             let mut page = prefetch_page(json!({}));
             page.commands = ["backup.check", "backup.enable", "backup.external"]
                 .into_iter()
@@ -5483,6 +5492,7 @@ mod tests {
                 reads: reads.clone(),
                 handed: handed.clone(),
                 unprefetched: unprefetched.clone(),
+                projections: Arc::new(Mutex::new(0)),
             });
         let app = routes()
             .layer(Extension(extension))
@@ -5605,6 +5615,73 @@ mod tests {
         assert!(handed
             .iter()
             .any(|(phase, command, _)| phase == "apply" && command == "backup.check"));
+    }
+
+    /// A review projects the session's pages once. The domain-evidence step
+    /// rebuilt it first for every command, which projected every page twice
+    /// under the lock, and the second projection found the composition's
+    /// prefetched Home already taken and opened it again cold (WS-851).
+    #[tokio::test]
+    async fn a_review_projects_the_session_once() {
+        let (_dir, shared, _app) = test_app();
+        let projections = Arc::new(Mutex::new(0));
+        let extension: AdministrationGaugeAppExtensionHandle =
+            Arc::new(CommandPrefetchingExtension {
+                hub: shared.clone(),
+                reads: Arc::new(Mutex::new(Vec::new())),
+                handed: Arc::new(Mutex::new(Vec::new())),
+                unprefetched: Arc::new(Mutex::new(0)),
+                projections: projections.clone(),
+            });
+        let app = routes()
+            .layer(Extension(extension))
+            .with_state(shared.clone());
+        let session = open(&app).await;
+        let basis = session["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|page| page["id"] == "backups")
+            .unwrap()["resource_basis"]
+            .clone();
+        let (status, proposed) = request(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/commands",
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "page_id": "backups", "command_id": "backup.enable",
+                "expected_basis": basis, "idempotency_key": "review-once",
+                "payload": {}, "client": "web",
+            }),
+            Some("review-once"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        *projections.lock().unwrap() = 0;
+        let (status, applied) = request(
+            &app,
+            Method::POST,
+            &format!(
+                "/gaugeapps/administration/proposals/{}/review",
+                proposed["proposal"]["id"].as_str().unwrap()
+            ),
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "decision": "accept", "client": "web",
+            }),
+            Some("review-once-review"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        assert_eq!(applied["receipt"]["status"], "applied", "{applied}");
+        assert_eq!(
+            *projections.lock().unwrap(),
+            1,
+            "the review rebuilt the session more than once"
+        );
     }
 
     struct TestModelProviderExtension(Arc<Mutex<Value>>);

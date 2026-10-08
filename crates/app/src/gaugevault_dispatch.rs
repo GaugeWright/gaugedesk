@@ -232,6 +232,7 @@ mod tests {
             2,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-one"),
+                kind: gaugedesk_core::gaugevault::CredentialKind::Raw,
                 marker: VaultIntakeMarkerId::from("0123456789abcdef0123456789abcdef"),
                 storage_name: storage("0123456789abcdef0123456789abcdef"),
                 deadline: 100,
@@ -379,6 +380,7 @@ mod tests {
             5,
             Operation::BeginCandidate {
                 id: VaultCandidateId::from("candidate-two"),
+                kind: gaugedesk_core::gaugevault::CredentialKind::Raw,
                 marker: VaultIntakeMarkerId::from("fedcba9876543210fedcba9876543210"),
                 storage_name: storage("fedcba9876543210fedcba9876543210"),
                 deadline: 100,
