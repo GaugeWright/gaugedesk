@@ -473,6 +473,7 @@ impl Workbench {
                 None => "Test of the draft".to_owned(),
             };
             self.create_chat_in_instance(&placement, &title)
+                .map_err(String::from)
         })();
         match built {
             Ok(chat) => Ok(chat),

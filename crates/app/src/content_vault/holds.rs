@@ -155,8 +155,8 @@ impl ContentVault {
             .lock()
             .unwrap()
             .cache
-            .keys()
-            .filter_map(|scope| self.scope_projects.project_of(scope))
+            .values()
+            .filter_map(|key| key.original_project.clone())
             .collect()
     }
 
@@ -216,8 +216,8 @@ impl ContentVault {
             let state = self.key_state.lock().unwrap();
             state
                 .cache
-                .keys()
-                .filter_map(|scope| self.scope_projects.project_of(scope))
+                .values()
+                .filter_map(|key| key.original_project.clone())
                 .collect()
         };
         let now = now_ms();
@@ -239,7 +239,7 @@ impl ContentVault {
             .lock()
             .unwrap()
             .cache
-            .retain(|scope, _| self.scope_projects.project_of(scope).as_deref() != Some(project));
+            .retain(|_, key| key.original_project.as_deref() != Some(project));
         self.project_keys.forget(project);
     }
 }
@@ -547,5 +547,143 @@ mod tests {
         assert!(!v.project_keys.is_empty());
         v.release_unheld();
         assert!(v.project_keys.is_empty());
+    }
+
+    #[test]
+    fn cached_keys_release_under_their_opening_project_after_move_or_removal() {
+        for existing in [false, true] {
+            for changed in [Some("proj-b"), None] {
+                let dir = tempfile::tempdir().unwrap();
+                let v = vault(dir.path());
+                let a = if existing {
+                    Some(sealed(&v, "chat-a", "alpha"))
+                } else {
+                    None
+                };
+                let a_hold = v.hold("proj-a");
+                let b_hold = v.hold("proj-b");
+                let a = a.unwrap_or_else(|| v.encode("chat-a", "transcript", "alpha").unwrap());
+                assert_eq!(
+                    v.decode("chat-a", "transcript", &a).as_deref(),
+                    Some("alpha")
+                );
+                let b = v.encode("chat-b", "transcript", "beta").unwrap();
+                v.scope_index().record_instance("place-a", changed);
+                assert!(
+                    v.decode("chat-a", "transcript", &a).is_none(),
+                    "current custody must still refuse"
+                );
+                assert!(v.key_state.lock().unwrap().cache.contains_key("chat-a"));
+                assert_eq!(
+                    v.opened_projects(),
+                    BTreeSet::from(["proj-a".into(), "proj-b".into()])
+                );
+                drop(a_hold);
+                assert!(
+                    !v.key_state.lock().unwrap().cache.contains_key("chat-a"),
+                    "original project release left moved key cached"
+                );
+                assert!(v.key_state.lock().unwrap().cache.contains_key("chat-b"));
+                assert_eq!(v.opened_projects(), BTreeSet::from(["proj-b".into()]));
+                assert_eq!(v.open_project_keys(), 1);
+                assert_eq!(
+                    v.decode("chat-b", "transcript", &b).as_deref(),
+                    Some("beta")
+                );
+                v.scope_index().record_instance("place-a", Some("proj-a"));
+                let restored = v.hold("proj-a");
+                assert_eq!(
+                    v.decode("chat-a", "transcript", &a).as_deref(),
+                    Some("alpha"),
+                    "release must not erase durable original content"
+                );
+                drop(restored);
+                drop(b_hold);
+                assert!(v.opened_projects().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn moved_scope_cache_lingers_only_for_its_original_project() {
+        for changed in [Some("proj-b"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let v = vault(dir.path());
+            let a_hold = v.hold("proj-a");
+            a_hold.linger();
+            let b_hold = v.hold("proj-b");
+            let a = v.encode("chat-a", "transcript", "alpha").unwrap();
+            let b = v.encode("chat-b", "transcript", "beta").unwrap();
+            v.scope_index().record_instance("place-a", changed);
+            drop(a_hold);
+            assert_eq!(v.release_idle(now_ms()), 0);
+            assert!(v.key_state.lock().unwrap().cache.contains_key("chat-a"));
+            assert_eq!(v.release_idle(now_ms() + LINGER_MS + 1), 1);
+            assert!(
+                !v.key_state.lock().unwrap().cache.contains_key("chat-a"),
+                "expired original linger left moved key cached"
+            );
+            assert!(v.decode("chat-a", "transcript", &a).is_none());
+            assert_eq!(
+                v.decode("chat-b", "transcript", &b).as_deref(),
+                Some("beta")
+            );
+            drop(b_hold);
+        }
+    }
+
+    #[test]
+    fn maintenance_and_background_release_find_removed_scope_opening_projects() {
+        for maintenance in [false, true] {
+            for changed in [Some("proj-b"), None] {
+                let dir = tempfile::tempdir().unwrap();
+                let v = vault(dir.path());
+                let a = sealed(&v, "chat-a", "alpha");
+                let b_hold = v.hold("proj-b");
+                let b = v.encode("chat-b", "transcript", "beta").unwrap();
+                let declared = BTreeSet::from(["chat-a".to_owned()]);
+                let (read, refused) = super::super::act_for("proj-a", &declared, || {
+                    v.decode("chat-a", "transcript", &a)
+                });
+                assert_eq!(read.as_deref(), Some("alpha"));
+                assert!(refused.is_empty());
+                v.scope_index().record_instance("place-a", changed);
+                if maintenance {
+                    v.release_unheld();
+                } else {
+                    v.release_unless_held("proj-a");
+                }
+                assert!(
+                    !v.key_state.lock().unwrap().cache.contains_key("chat-a"),
+                    "unheld original key hidden by changed placement"
+                );
+                assert_eq!(v.opened_projects(), BTreeSet::from(["proj-b".into()]));
+                assert_eq!(v.open_project_keys(), 1);
+                assert_eq!(
+                    v.decode("chat-b", "transcript", &b).as_deref(),
+                    Some("beta")
+                );
+                drop(b_hold);
+            }
+        }
+    }
+
+    #[test]
+    fn project_release_preserves_install_custody_scope_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = vault(dir.path());
+        let account = v
+            .encode("account", "credential", "synthetic account content")
+            .unwrap();
+        let hold = v.hold("proj-a");
+        v.encode("chat-a", "transcript", "alpha").unwrap();
+        drop(hold);
+        v.release_unheld();
+        assert!(v.key_state.lock().unwrap().cache.contains_key("account"));
+        assert_eq!(
+            v.decode("account", "credential", &account).as_deref(),
+            Some("synthetic account content")
+        );
+        assert!(v.opened_projects().is_empty());
     }
 }

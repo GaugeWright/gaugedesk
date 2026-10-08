@@ -106,6 +106,40 @@ pub struct MaterializedCommandPrefix {
     pub replayed: bool,
 }
 
+/// Exact original Office HTTP body coordinate for the fixed task-input companion.
+/// This is linkage metadata, not an authentication or execution grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskInputLink {
+    pub body_digest: String,
+}
+
+/// Retained actual scope-local positions from the same original startup transaction.
+/// `prefix` ends with the separately scoped companion; its position must not be
+/// compared with the preceding chat positions. Use the explicit User position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedTaskInputPrefix {
+    pub prefix: MaterializedCommandPrefix,
+    pub user_position: i64,
+    pub companion_position: i64,
+}
+impl MaterializedTaskInputPrefix {
+    fn from_prefix(prefix: MaterializedCommandPrefix) -> Result<Self, AdmitError> {
+        let count = prefix.positions.len();
+        if count < 2 {
+            return Err(AdmitError::Rejected(Rejection {
+                reason: "task input has no retained paired positions",
+            }));
+        }
+        let user_position = prefix.positions[count - 2];
+        let companion_position = prefix.positions[count - 1];
+        Ok(Self {
+            prefix,
+            user_position,
+            companion_position,
+        })
+    }
+}
+
 /// One product commit while its current-authority writer transaction is held.
 /// The evidence publisher consumes this inside its retention callback. Dropping
 /// it rolls back; a successful commit remains durable if the callback then fails.
@@ -484,6 +518,131 @@ impl DispatchRecordAdmission<'_> {
             )?;
             check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
             Ok(positions)
+        })();
+        if result.is_err() {
+            self.native_ended.set(true);
+        }
+        result
+    }
+
+    /// Publish exactly one original task User and its derived attempt/body link.
+    /// Identity fields are supplied by the authenticated embedding; this parses
+    /// no authority and exposes no arbitrary linked scope, kind or writer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_claimed_task_input_prefix<L: Lifecycle>(
+        self,
+        command_id: &str,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        phase: &str,
+        batch: LifecycleBatch<L>,
+        facts: &[crate::CommandRecordFact],
+        link: &TaskInputLink,
+    ) -> Result<MaterializedTaskInputPrefix, AdmitError>
+    where
+        L::Command: serde::Serialize,
+    {
+        check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+        crate::record_admission_task_input::commit(
+            self.tx,
+            self.codec,
+            command_id,
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            phase,
+            batch,
+            facts,
+            link,
+            || check_latched_validity(self.deadline, &self.process_guards, &self.native_ended),
+        )
+        .and_then(MaterializedTaskInputPrefix::from_prefix)
+    }
+
+    /// Verify an existing exact original phase without consuming this writer.
+    /// This stages/repairs nothing and returns only original positions. The
+    /// same original authority and retained key must govern subsequent use;
+    /// every refusal terminally ends this handle for native work and commit.
+    #[allow(clippy::too_many_arguments)] // Same original pending parent and full phase meaning.
+    pub fn require_claimed_task_input_prefix<L: Lifecycle>(
+        &self,
+        command_id: &str,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        phase: &str,
+        batch: &LifecycleBatch<L>,
+        facts: &[crate::CommandRecordFact],
+        link: &TaskInputLink,
+    ) -> Result<MaterializedTaskInputPrefix, AdmitError>
+    where
+        L::Command: serde::Serialize,
+    {
+        let result = (|| {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            let positions = crate::record_admission_task_input::verify(
+                &self.tx,
+                self.codec.as_ref(),
+                command_id,
+                command_scope,
+                idempotency_key,
+                snapshot_json,
+                phase,
+                batch,
+                facts,
+                link,
+            )?;
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            MaterializedTaskInputPrefix::from_prefix(MaterializedCommandPrefix {
+                positions,
+                replayed: true,
+            })
+        })();
+        if result.is_err() {
+            self.native_ended.set(true);
+        }
+        result
+    }
+
+    /// Verify an original pre-result phase under this current reader's writer.
+    /// Rechecks the exact recorded pair and phase bytes without pending task
+    /// authority, reducers or repair. Positions grant no recipient access.
+    /// Every refusal ends this handle for subsequent native work or commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn require_recorded_task_input_prefix<P: Lifecycle, L: Lifecycle, M: Lifecycle>(
+        &self,
+        command_id: &str,
+        command_scope: &str,
+        key: &str,
+        snapshot: &str,
+        phase: &str,
+        batch: &LifecycleBatch<P>,
+        facts: &[crate::CommandRecordFact],
+        link: &TaskInputLink,
+    ) -> Result<MaterializedTaskInputPrefix, AdmitError>
+    where
+        P::Command: serde::Serialize,
+    {
+        let result = (|| {
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            let positions = crate::record_admission_task_input::verify_recorded::<P, L, M>(
+                &self.tx,
+                self.codec.as_ref(),
+                command_id,
+                command_scope,
+                key,
+                snapshot,
+                phase,
+                batch,
+                facts,
+                link,
+            )?;
+            check_latched_validity(self.deadline, &self.process_guards, &self.native_ended)?;
+            MaterializedTaskInputPrefix::from_prefix(MaterializedCommandPrefix {
+                positions,
+                replayed: true,
+            })
         })();
         if result.is_err() {
             self.native_ended.set(true);

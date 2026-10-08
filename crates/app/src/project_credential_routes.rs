@@ -35,6 +35,28 @@ pub async fn get_project_credentials(
     (StatusCode::OK, Json(json!({ "credentials": providers }))).into_response()
 }
 
+/// `GET /projects/:id/models` — what the caller's turns in this project can run on:
+/// the providers the turn resolver chooses among (the caller's own credentials on
+/// this Home, then the project's), the model ids the caller declared for those that
+/// ship no catalog, and what an unpinned turn runs (WS-1026). Names only, never a
+/// token.
+///
+/// It is the composer's model picker for a project, read from the Home that holds
+/// the project. A member of a project shared from this computer reaches nothing
+/// host-wide here, `/account/default-model` included (DR-0451 §2), and keeps no
+/// credentials of its own, so this answers it the project's own credentials, which
+/// are what its turns spend (DR-0451, DR-0453 §5).
+pub async fn get_project_models(
+    State(wb): State<SharedWorkbench>,
+    Path(project): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let wb = wb.lock_unpoisoned();
+    let scope = wb.credential_scope_for(crate::net_http::bearer(&headers));
+    let access = wb.project_model_access_in(&scope, &project);
+    (StatusCode::OK, Json(access)).into_response()
+}
+
 #[derive(Deserialize)]
 pub struct LinkBody {
     provider: String,

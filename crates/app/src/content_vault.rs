@@ -424,6 +424,8 @@ struct VaultKeyState {
 struct CachedScopeKey {
     key: [u8; 32],
     wrapped_fingerprint: Vec<u8>,
+    /// Project whose custody admitted this opening; later placement is not eviction identity.
+    original_project: Option<String>,
 }
 
 impl ContentVault {

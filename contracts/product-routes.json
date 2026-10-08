@@ -10294,6 +10294,42 @@
       }
     },
     {
+      "id": "home.project-models.read",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/projects/:id/models",
+      "producer": "gaugedesk-app project_credential_routes",
+      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
+      "authentication": "account-session-and-home-admission",
+      "scope": "person-home-project",
+      "capability": "read-project-runnable-models",
+      "requestSchema": "http/path-project-id",
+      "responseSchema": "rust:gaugedesk-app/account/ProjectModelAccess",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/project_owner_tests.rs#a_members_composer_is_offered_the_projects_models_and_not_the_owners"
+        ],
+        "authority": [
+          "crates/app/src/project_owner_tests.rs#a_members_composer_is_offered_the_projects_models_and_not_the_owners"
+        ],
+        "journey": [
+          "crates/app/src/project_owner_tests.rs#a_members_composer_is_offered_the_projects_models_and_not_the_owners"
+        ],
+        "deployed": [],
+        "property": [
+          "web/apps/workbench-web/src/workbench-control-plane.test.ts#reads what the project's key runs from the owner's desktop (own Home %s)"
+        ]
+      }
+    },
+    {
       "id": "home.project-credential.link",
       "jurisdiction": "private-home",
       "transport": "http-json",

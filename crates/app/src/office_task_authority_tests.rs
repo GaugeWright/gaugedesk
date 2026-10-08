@@ -7,6 +7,8 @@ mod answers;
 mod payloads;
 #[path = "office_turn_result_tests.rs"]
 mod result_publication;
+#[path = "office_task_correlation_tests.rs"]
+mod task_correlation;
 
 fn chat(wb: &SharedWorkbench) -> String {
     // Direct workbench calls in this fixture are an admitted session on shared.

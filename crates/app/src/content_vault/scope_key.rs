@@ -324,7 +324,7 @@ impl ContentVault {
                 let _exclusive = exclusive(&root, &key_id).ok()?;
                 available(&root, &key_id).ok()?;
                 let wrapped = self.existing_or_new_key(&root, scope, &key_id, true).ok()?;
-                self.require_scope_custody(scope, &wrapped).ok()?;
+                let original_project = self.scope_custody_project(scope, &wrapped).ok()?;
                 let key = self.unwrap_dek(&wrapped).ok()?;
                 {
                     // The fence and the cache share a lock so a writer either
@@ -339,6 +339,7 @@ impl ContentVault {
                         CachedScopeKey {
                             key,
                             wrapped_fingerprint: fingerprint(&wrapped),
+                            original_project,
                         },
                     );
                 }
@@ -346,7 +347,7 @@ impl ContentVault {
             }
             Err(_) => return None,
         };
-        self.require_scope_custody(scope, &wrapped).ok()?;
+        let original_project = self.scope_custody_project(scope, &wrapped).ok()?;
         let cached = self.key_state.lock().unwrap().cache.get(scope).cloned();
         if let Some(cached) = cached {
             if cached.wrapped_fingerprint != fingerprint(&wrapped) {
@@ -365,6 +366,7 @@ impl ContentVault {
                 CachedScopeKey {
                     key,
                     wrapped_fingerprint: fingerprint(&wrapped),
+                    original_project,
                 },
             );
         }

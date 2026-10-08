@@ -290,6 +290,38 @@ pub(crate) enum CreateArchetypeChatError {
     Create(String),
 }
 
+/// Why no chat was made under a placement. A refusal is the caller's to
+/// change or wait out; a failure is the Home's own, and is never answered as
+/// a bad request (WS-1051).
+#[derive(Debug)]
+pub(crate) enum CreateChatError {
+    NoSuchPlacement,
+    /// The placement, its targets, or the requested target set refuse a chat.
+    Refused(String),
+    /// Storage the chat would live in is not open on this Home.
+    StorageNotOpen(String),
+    /// The Home could not read or write what a new chat needs: its records,
+    /// its collaboration storage, or the Agent's published package.
+    Failed(String),
+}
+
+impl std::fmt::Display for CreateChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchPlacement => f.write_str("no such instance"),
+            Self::Refused(reason) | Self::StorageNotOpen(reason) | Self::Failed(reason) => {
+                f.write_str(reason)
+            }
+        }
+    }
+}
+
+impl From<CreateChatError> for String {
+    fn from(error: CreateChatError) -> Self {
+        error.to_string()
+    }
+}
+
 pub(crate) struct CreatedArchetype {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -5147,7 +5179,7 @@ impl Workbench {
         &mut self,
         inst_id: &str,
         title: &str,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, CreateChatError> {
         self.create_chat_in_instance_on_target(inst_id, title, None)
     }
 
@@ -5156,7 +5188,7 @@ impl Workbench {
         inst_id: &str,
         title: &str,
         requested_target_id: Option<&str>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, CreateChatError> {
         let requested = requested_target_id
             .into_iter()
             .map(str::to_owned)
@@ -5169,34 +5201,42 @@ impl Workbench {
         inst_id: &str,
         title: &str,
         requested_target_ids: &[String],
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, CreateChatError> {
         let Some(inst_rec) = self.library.instances.get(inst_id).cloned() else {
-            return Err("no such instance".into());
+            return Err(CreateChatError::NoSuchPlacement);
         };
         if inst_rec
             .project_id
             .as_deref()
             .is_some_and(|project| self.project_moving(project))
         {
-            return Err(crate::federation::PAUSED_FOR_MOVE.into());
+            return Err(CreateChatError::Refused(
+                crate::federation::PAUSED_FOR_MOVE.into(),
+            ));
         }
         if inst_rec.kind == InstanceKind::Using && inst_rec.placement_kind == PlacementKind::Panel {
-            return Err("panel placements do not host work chats".into());
+            return Err(CreateChatError::Refused(
+                "panel placements do not host work chats".into(),
+            ));
         }
         // APPROVE-1 (ADR 0064): a placement hosts work chats only while active. A pending
         // placement (approved-but-not-yet-accepted under an approval-required policy) is
         // refused up front — fail closed until the project owner accepts it.
         if inst_rec.admission == Admission::Pending {
-            return Err("placement is pending approval — accept it before starting a chat".into());
+            return Err(CreateChatError::Refused(
+                "placement is pending approval — accept it before starting a chat".into(),
+            ));
         }
         let kind = inst_rec.kind.chat_kind();
-        if !self
+        let runnable = self
             .store_ref()
             .fold::<InstanceState>(inst_id)
-            .map(|s| s.runnable)
-            .unwrap_or(false)
-        {
-            return Err("instance is not runnable (suspended or torn down)".into());
+            .map_err(|error| CreateChatError::Failed(format!("{error:?}")))?
+            .runnable;
+        if !runnable {
+            return Err(CreateChatError::Refused(
+                "instance is not runnable (suspended or torn down)".into(),
+            ));
         }
         let targets = match inst_rec.kind {
             InstanceKind::Using => {
@@ -5209,8 +5249,16 @@ impl Workbench {
                         .unwrap_or_default();
                     match eligible {
                         [only] => vec![only.clone()],
-                        [] => return Err("placement has no work target".to_owned()),
-                        _ => return Err("select one or more work targets".to_owned()),
+                        [] => {
+                            return Err(CreateChatError::Refused(
+                                "placement has no work target".to_owned(),
+                            ))
+                        }
+                        _ => {
+                            return Err(CreateChatError::Refused(
+                                "select one or more work targets".to_owned(),
+                            ))
+                        }
                     }
                 } else {
                     requested_target_ids.to_vec()
@@ -5219,9 +5267,14 @@ impl Workbench {
                 let mut targets = Vec::with_capacity(requested.len());
                 for target_id in requested {
                     if !seen.insert(target_id.clone()) {
-                        return Err(format!("target set repeats stable target id {target_id}"));
+                        return Err(CreateChatError::Refused(format!(
+                            "target set repeats stable target id {target_id}"
+                        )));
                     }
-                    targets.push(self.resolve_placement_target(inst_id, Some(&target_id))?);
+                    targets.push(
+                        self.resolve_placement_target(inst_id, Some(&target_id))
+                            .map_err(CreateChatError::Refused)?,
+                    );
                 }
                 targets
             }
@@ -5230,20 +5283,29 @@ impl Workbench {
                     .library
                     .authoring_target_for(&inst_rec.agent_id)
                     .cloned()
-                    .ok_or_else(|| "archetype authoring target is unresolved".to_owned())?;
+                    .ok_or_else(|| {
+                        CreateChatError::Failed(
+                            "archetype authoring target is unresolved".to_owned(),
+                        )
+                    })?;
                 if requested_target_ids
                     .iter()
                     .any(|requested| requested != &target.id)
                     || requested_target_ids.len() > 1
                 {
-                    return Err("edit chat target does not belong to this archetype".to_owned());
+                    return Err(CreateChatError::Refused(
+                        "edit chat target does not belong to this archetype".to_owned(),
+                    ));
                 }
                 vec![target]
             }
         };
         for target in &targets {
             if !target.capabilities.read {
-                return Err(format!("work target {} does not grant read", target.id));
+                return Err(CreateChatError::Refused(format!(
+                    "work target {} does not grant read",
+                    target.id
+                )));
             }
         }
         for (index, left) in targets.iter().enumerate() {
@@ -5254,58 +5316,69 @@ impl Workbench {
                     &left.path_scope,
                     right,
                     &right.path_scope,
-                )? {
-                    return Err(format!(
+                )
+                .map_err(CreateChatError::Failed)?
+                {
+                    return Err(CreateChatError::Refused(format!(
                         "targets {} and {} have overlapping physical scopes",
                         left.id, right.id
-                    ));
+                    )));
                 }
             }
         }
         let target_id = targets[0].id.clone();
         let (storage_id, sparse_roots) = match inst_rec.kind {
             InstanceKind::Using => {
-                let project_id = inst_rec
-                    .project_id
-                    .as_deref()
-                    .ok_or_else(|| "work placement has no project".to_owned())?;
+                let project_id = inst_rec.project_id.as_deref().ok_or_else(|| {
+                    CreateChatError::Failed("work placement has no project".to_owned())
+                })?;
                 for target in &targets {
-                    self.ensure_collaboration_target_partition(project_id, &target.id)?;
+                    self.ensure_collaboration_target_partition(project_id, &target.id)
+                        .map_err(CreateChatError::Failed)?;
                 }
                 let workspace = self
                     .library
                     .project_collaboration_workspaces
                     .get(project_id)
-                    .ok_or_else(|| "project collaboration workspace is unresolved".to_owned())?;
+                    .ok_or_else(|| {
+                        CreateChatError::Failed(
+                            "project collaboration workspace is unresolved".to_owned(),
+                        )
+                    })?;
                 let roots = crate::target_names::chat_target_roots(
                     targets.iter().map(|target| target.id.as_str()),
-                )?;
+                )
+                .map_err(CreateChatError::Failed)?;
                 (workspace.workspace_id.clone(), Some(roots))
             }
             InstanceKind::Authoring => (target_id.clone(), None),
         };
         let Some(storage) = self.workspace_by_storage_id(&storage_id) else {
-            return Err("chat collaboration storage is not open".into());
+            return Err(CreateChatError::StorageNotOpen(
+                "chat collaboration storage is not open".into(),
+            ));
         };
         let chat_id = library::gen_id("chat");
         let eng = match &sparse_roots {
             Some(roots) => storage.create_engagement_subset(&chat_id, storage.mainline(), roots),
             None => storage.create_engagement(&chat_id),
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| CreateChatError::Failed(e.to_string()))?;
         if inst_rec.kind == InstanceKind::Using {
             for root in ["artifacts", "work"] {
                 std::fs::create_dir_all(eng.path().join(root))
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| CreateChatError::Failed(error.to_string()))?;
             }
         }
         // Pin the exact standing target basis. Runtime config and discipline
         // are control/materialized state and never mint target cuts.
-        let _candidate = eng.boundary_cut().map_err(|error| error.to_string())?.0;
-        let basis = targets[0]
-            .current_basis
-            .clone()
-            .ok_or_else(|| "work target has no exact standing basis".to_owned())?;
+        let _candidate = eng
+            .boundary_cut()
+            .map_err(|error| CreateChatError::Failed(error.to_string()))?
+            .0;
+        let basis = targets[0].current_basis.clone().ok_or_else(|| {
+            CreateChatError::Failed("work target has no exact standing basis".to_owned())
+        })?;
         let rec = ChatRecord {
             owner: None,
             schema: crate::library::LIBRARY_RECORD_SCHEMA,
@@ -5362,9 +5435,11 @@ impl Workbench {
             created_position: 0,
             schema: LIBRARY_RECORD_SCHEMA,
             extra: Default::default(),
-        })?;
+        })
+        .map_err(CreateChatError::Failed)?;
         self.register_engagement(chat_id.clone(), storage_id, eng);
-        self.refresh_chat_discipline_mount(&chat_id)?;
+        self.refresh_chat_discipline_mount(&chat_id)
+            .map_err(CreateChatError::Failed)?;
         for target in &targets {
             self.record_target_act(
                 Some(&chat_id),
@@ -5375,7 +5450,8 @@ impl Workbench {
                 None,
                 crate::target_adapter::TargetActStatus::Completed,
                 None,
-            )?;
+            )
+            .map_err(CreateChatError::Failed)?;
         }
         Ok(serde_json::json!({
             "id": chat_id,
@@ -6976,7 +7052,7 @@ impl Workbench {
             return Err(CreateArchetypeChatError::ArchetypeNotFound);
         };
         self.create_chat_in_instance(&agent.instance_id, title)
-            .map_err(CreateArchetypeChatError::Create)
+            .map_err(|error| CreateArchetypeChatError::Create(error.into()))
     }
 
     pub(crate) fn use_archetype_chat(
@@ -7022,7 +7098,7 @@ impl Workbench {
             .is_some_and(|record| record.target_ids.contains(&personal_files))
             .then_some(personal_files.as_str());
         self.create_chat_in_instance_on_target(&placement_id, title, requested)
-            .map_err(CreateArchetypeChatError::Create)
+            .map_err(|error| CreateArchetypeChatError::Create(error.into()))
     }
 
     fn compensate_failed_chat_fork(

@@ -293,11 +293,19 @@ impl ContentVault {
 
     /// Stored project custody must agree with the scope's current placement.
     pub(crate) fn require_scope_custody(&self, scope: &str, stored: &[u8]) -> std::io::Result<()> {
+        self.scope_custody_project(scope, stored).map(|_| ())
+    }
+
+    /// Retain the same placement snapshot that the stored-custody check admits.
+    /// This is cache lifetime identity, not authority for a later key use.
+    pub(super) fn scope_custody_project(
+        &self,
+        scope: &str,
+        stored: &[u8],
+    ) -> std::io::Result<Option<String>> {
+        let original_project = self.scope_projects.project_of(scope);
         if let DekCustody::Project(key_id) = decode_dek(stored)?.0 {
-            let expected = self
-                .scope_projects
-                .project_of(scope)
-                .map(|project| crate::org::sha256_hex(&project));
+            let expected = original_project.as_deref().map(crate::org::sha256_hex);
             if expected.as_deref() != Some(key_id.as_str()) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -305,7 +313,7 @@ impl ContentVault {
                 ));
             }
         }
-        Ok(())
+        Ok(original_project)
     }
 
     /// Unwrap a stored data key with whichever key its header names.

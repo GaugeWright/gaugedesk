@@ -34,7 +34,14 @@ When("I start a chat in project {string} and send {string} at once", async ({ pa
     const opened = page.url();
     await page.locator("[data-project]", { hasText: name }).locator("[data-create='new-project-chat']").click();
     // Selected: the address names the new chat. Its project is not known yet.
-    await page.waitForURL((url) => url.searchParams.has("chat") && url.toString() !== opened);
+    // A start that failed says why in an action notice; say what it said, not
+    // only that the address never moved (WS-966).
+    const notice = page.locator("[data-action-error] > span");
+    await expect.poll(async () => {
+        if (await notice.count()) return `the workbench said: ${(await notice.first().textContent({ timeout: 1_000 }))?.trim()}`;
+        const url = new URL(page.url());
+        return url.searchParams.has("chat") && url.toString() !== opened ? "selected" : "no chat selected";
+    }, { message: "the new chat is selected", timeout: 30_000 }).toBe("selected");
     const composer = page.locator('[data-desktop-composer] textarea[aria-label="Message"]');
     await composer.fill(prompt);
     await composer.press("Enter");

@@ -593,6 +593,40 @@ export async function defaultModel(
     return { provider: o.provider ?? null, model: o.model ?? null };
 }
 
+/** What a turn in one project can run on for the caller, as the Home that holds the
+ *  project answers it (`GET /projects/:id/models`, WS-1026): the providers the turn
+ *  chooses among — the caller's own credentials there, then the project's — the model
+ *  ids the caller declared for those that ship no catalog, and what an unpinned turn
+ *  runs. Names only, never a credential. */
+export interface ProjectModels {
+    readonly providers: readonly string[];
+    readonly endpointModels: Readonly<Record<string, readonly string[]>>;
+    readonly defaultModel: { readonly provider: string | null; readonly model: string | null };
+}
+
+export async function projectModels(json: RouteJson, project: string): Promise<ProjectModels> {
+    const o = (await json("GET", `/projects/${encodeURIComponent(project)}/models`)) as {
+        providers?: unknown;
+        endpoint_models?: unknown;
+        default_provider?: string | null;
+        default_model?: string | null;
+    };
+    const strings = (value: unknown): string[] =>
+        Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+    const endpointModels: Record<string, readonly string[]> = {};
+    if (o.endpoint_models && typeof o.endpoint_models === "object") {
+        for (const [provider, ids] of Object.entries(o.endpoint_models as Record<string, unknown>)) {
+            const clean = strings(ids);
+            if (clean.length) endpointModels[provider] = clean;
+        }
+    }
+    return {
+        providers: strings(o.providers),
+        endpointModels,
+        defaultModel: { provider: o.default_provider ?? null, model: o.default_model ?? null },
+    };
+}
+
 /** Start the codex OAuth link; returns the authorize URL to open in a browser. The
  *  server's helper runs the callback server and writes the credential on success —
  *  poll {@link codexStatus} to see it land. */

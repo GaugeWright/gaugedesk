@@ -337,6 +337,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             delete(project_credential_routes::delete_project_credential),
         )
         .route(
+            "/projects/{id}/models",
+            get(project_credential_routes::get_project_models),
+        )
+        .route(
             "/projects/{id}/organization-model-selection",
             get(project_model_selection::get_selection)
                 .put(project_model_selection::put_selection)

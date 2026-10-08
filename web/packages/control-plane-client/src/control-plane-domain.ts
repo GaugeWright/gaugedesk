@@ -287,6 +287,9 @@ export interface ProjectNode {
     readonly upstream?: ProjectId | null;
     readonly targets: readonly WorkTargetNode[];
     readonly placements: PlacementNode[];
+    /** Set by desk, never on the wire: a project someone else shared with this
+     *  person, listed from its own Home through its pin (DR-0451, WS-1036). */
+    readonly sharedWithYou?: boolean;
 }
 
 export interface PublicDeploymentInput {

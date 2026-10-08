@@ -35,6 +35,7 @@ mod record_admission;
 mod record_admission_pair;
 pub use record_admission_pair::RecordedLifecyclePair;
 mod record_admission_prefix;
+mod record_admission_task_input;
 #[cfg(test)]
 mod record_claim_tests;
 mod request_admission;

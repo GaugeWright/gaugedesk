@@ -29,6 +29,14 @@ let raw = "";
 function transport(base: string, token: string | null): WorkbenchTransport {
     return { base, json: browserRouteJson(base, { bearer: () => token }) };
 }
+// The fixture opens a fresh workbench before it answers, which writes and
+// syncs a new state root. On the Legion the whole file takes about 3 s. On
+// elitemini, whose synchronous writes are five times slower at rest and far
+// slower beside another bar's build, a passing file took 21 to 32 s, and the
+// start alone overran the old 20 s bound in five of its last twelve bars
+// (WS-1050). The bound is the one the e2e harness gives a control plane to
+// start, which elitemini's disk once held for over 40 s (WS-871).
+const FIXTURE_READY_MS = 120_000;
 async function within<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout>;
     try {
@@ -74,7 +82,7 @@ beforeAll(async () => {
         closed.then((result) => reject(new Error(`fixture closed before ready: ${JSON.stringify(result)}\n${raw}`)), reject);
     });
     try {
-        ready = await within(line, 20000, "native fixture readiness timed out");
+        ready = await within(line, FIXTURE_READY_MS, "native fixture readiness timed out");
         expect(ready.protocol).toBe("gaugedesk.panel-authoring-fixture.v1");
         expect(new URL(ready.base).hostname).toBe("127.0.0.1");
         expect(ready.owner).not.toBe(ready.other);
@@ -88,7 +96,7 @@ beforeAll(async () => {
         }
         throw error;
     }
-}, 30000);
+}, FIXTURE_READY_MS + 30_000);
 afterAll(stop, 15000);
 
 describe("Panel authoring real production-client transport", () => {

@@ -627,7 +627,14 @@ mod tests {
         let error = workbench
             .create_chat_in_instance_on_targets(DEFAULT_PLACEMENT, "ambiguous", &target_ids)
             .unwrap_err();
-        assert!(error.contains("overlapping physical scopes"), "{error}");
+        assert!(
+            matches!(
+                &error,
+                crate::library_state::CreateChatError::Refused(reason)
+                    if reason.contains("overlapping physical scopes")
+            ),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -664,7 +671,14 @@ mod tests {
         let error = workbench
             .create_chat_in_instance_on_targets(DEFAULT_PLACEMENT, "hard-link alias", &target_ids)
             .unwrap_err();
-        assert!(error.contains("overlapping physical scopes"), "{error}");
+        assert!(
+            matches!(
+                &error,
+                crate::library_state::CreateChatError::Refused(reason)
+                    if reason.contains("overlapping physical scopes")
+            ),
+            "{error}"
+        );
     }
 
     #[test]

@@ -254,6 +254,55 @@ export interface SharedProjectWorkspace {
     readonly workspace: Workspace;
 }
 
+/** What a shared project brings into the person's workspace from its Home: the
+ * project, its chats, workstreams and targets, and the Agents placed in it with
+ * their authoring chats, previews and targets (DR-0453). */
+interface SharedProjectParts {
+    readonly project: ProjectId;
+    readonly node: Workspace["projects"][number];
+    readonly archetypes: Workspace["archetypes"];
+    readonly recent: Workspace["recent"];
+    readonly workstreams: Workspace["workstreams"];
+    readonly workTargets: Workspace["workTargets"];
+}
+
+/** Each shared project's parts, leaving out what `own` already lists: a project
+ * `own` lists stays as `own` lists it, and an Agent `own` lists by the same id
+ * (every Home's default Agent is `agent-default`) stays the person's own. A
+ * Personal project is each Home's own and is never taken from another's. */
+function sharedProjectParts(own: Workspace, shared: readonly SharedProjectWorkspace[]): SharedProjectParts[] {
+    const listed = new Set<string>(own.projects.map((project) => project.id));
+    const ownAgents = new Set<string>(own.archetypes.map((agent) => agent.id));
+    const parts: SharedProjectParts[] = [];
+    for (const { project, workspace } of shared) {
+        if (listed.has(project)) continue;
+        const node = workspace.projects.find((candidate) => candidate.id === project && !candidate.isPersonal);
+        if (!node) continue;
+        listed.add(project);
+        const archetypes = workspace.archetypes.filter((agent) =>
+            agent.sharedThrough.includes(project) && !ownAgents.has(agent.id));
+        const placements = new Set<string>([
+            ...node.placements.map((placement) => placement.placementId),
+            ...archetypes.map((agent) => agent.instanceId),
+        ]);
+        const targets = new Set<string>([
+            ...node.targets.map((target) => target.id),
+            ...node.placements.flatMap((placement) => placement.targetIds),
+            ...archetypes.map((agent) => agent.authoringTargetId),
+        ]);
+        parts.push({
+            project,
+            node,
+            archetypes,
+            recent: workspace.recent.filter((chat) => chat.placement !== null && placements.has(chat.placement)),
+            workstreams: workspace.workstreams.filter((line) =>
+                line.projectId === project || placements.has(line.placementId)),
+            workTargets: workspace.workTargets.filter((target) => targets.has(target.id)),
+        });
+    }
+    return parts;
+}
+
 /**
  * `own` with every project shared with this person beside its own projects,
  * each as the Home that holds it lists it, with its chats, workstreams, work
@@ -261,10 +310,9 @@ export interface SharedProjectWorkspace {
  *
  * Sharing a project is not a choice of Home (DR-0455), and a shared project is
  * reached through its pin (DR-0451), so it is listed whichever Home serves the
- * person's own work, or none. A project `own` already lists stays as `own`
- * lists it, and only the pinned project is taken from its Home's workspace:
- * nothing else that Home shows is read into the person's own. A Personal
- * project is each Home's own and is never taken from another's.
+ * person's own work, or none. Only what the pinned project brings is taken from
+ * its Home's workspace: nothing else that Home shows is read into the person's
+ * own.
  */
 export function withSharedProjects(
     own: Workspace,
@@ -275,7 +323,6 @@ export function withSharedProjects(
     const recent = [...own.recent];
     const workstreams = [...own.workstreams];
     const workTargets = [...own.workTargets];
-    const listed = new Set<string>(projects.map((project) => project.id));
     const add = <T extends { readonly id: string }>(into: T[], items: readonly T[]) => {
         const held = new Set(into.map((item) => item.id));
         for (const item of items) {
@@ -284,22 +331,44 @@ export function withSharedProjects(
             into.push(item);
         }
     };
-    for (const { project, workspace } of shared) {
-        if (listed.has(project)) continue;
-        const node = workspace.projects.find((candidate) => candidate.id === project && !candidate.isPersonal);
-        if (!node) continue;
-        listed.add(project);
-        projects.push(node);
-        const placements = new Set<string>(node.placements.map((placement) => placement.placementId));
-        const targets = new Set<string>([
-            ...node.targets.map((target) => target.id),
-            ...node.placements.flatMap((placement) => placement.targetIds),
-        ]);
-        add(archetypes, workspace.archetypes.filter((agent) => agent.sharedThrough.includes(project)));
-        add(recent, workspace.recent.filter((chat) => chat.placement !== null && placements.has(chat.placement)));
-        add(workstreams, workspace.workstreams.filter((line) =>
-            line.projectId === project || placements.has(line.placementId)));
-        add(workTargets, workspace.workTargets.filter((target) => targets.has(target.id)));
+    for (const part of sharedProjectParts(own, shared)) {
+        projects.push({ ...part.node, sharedWithYou: true });
+        add(archetypes, part.archetypes);
+        add(recent, part.recent);
+        add(workstreams, part.workstreams);
+        add(workTargets, part.workTargets);
     }
     return { ...own, projects, archetypes, recent, workstreams, workTargets };
+}
+
+/**
+ * Which shared project holds each thing `withSharedProjects` takes from a
+ * shared project's Home, keyed as a work route names it — `archetypes/<id>`,
+ * `placements/<id>`, `chats/<id>`, `workstreams/<id>`, `targets/<id>` — so an
+ * act on any of them reaches that project's Home through its pin, whichever
+ * project is open (DR-0451, DR-0453).
+ */
+export function sharedProjectHoldings(
+    own: Workspace,
+    shared: readonly SharedProjectWorkspace[],
+): Array<readonly [string, ProjectId]> {
+    const held: Array<readonly [string, ProjectId]> = [];
+    for (const part of sharedProjectParts(own, shared)) {
+        const hold = (kind: string, id: string) => held.push([`${kind}/${id}`, part.project]);
+        hold("projects", part.project);
+        for (const placement of part.node.placements) {
+            hold("placements", placement.placementId);
+            for (const chat of placement.chats) hold("chats", chat.id);
+        }
+        for (const agent of part.archetypes) {
+            hold("archetypes", agent.id);
+            hold("placements", agent.instanceId);
+            for (const chat of agent.chats) hold("chats", chat.id);
+            for (const preview of agent.previews) hold("chats", preview.chat.id);
+        }
+        for (const chat of part.recent) hold("chats", chat.id);
+        for (const line of part.workstreams) hold("workstreams", line.id);
+        for (const target of part.workTargets) hold("targets", target.id);
+    }
+    return held;
 }

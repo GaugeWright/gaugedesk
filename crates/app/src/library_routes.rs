@@ -23,8 +23,9 @@ use crate::library::{
 };
 use crate::library_state::{
     AgentDeleteError, BindPlacementError, BoundaryAcceptError, BoundaryAttestationInput,
-    CreateArchetypeChatError, CreateArchetypeError, ForkArchetypeError, ForkChatError,
-    ForkDestination, PublishArchetypeError, PullArchetypeError, UpgradePlacementError,
+    CreateArchetypeChatError, CreateArchetypeError, CreateChatError, ForkArchetypeError,
+    ForkChatError, ForkDestination, PublishArchetypeError, PullArchetypeError,
+    UpgradePlacementError,
 };
 use crate::{net_http, LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT, DEFAULT_PROJECT};
 use gaugedesk_store::AdmitError;
@@ -46,7 +47,7 @@ fn create_chat_in(
     inst_id: &str,
     title: &str,
     target_ids: &[String],
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, CreateChatError> {
     wb.create_chat_in_instance_on_targets(inst_id, title, target_ids)
 }
 
@@ -2058,15 +2059,17 @@ pub async fn create_chat_under_instance(
             }
             (StatusCode::CREATED, Json(v)).into_response()
         }
-        Err(e) => {
-            let status = if e == "no such instance" {
-                StatusCode::NOT_FOUND
-            } else if e == "work target storage is not open" {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
+        Err(error) => {
+            // Only a refusal blames the request. The Home's own failure is
+            // a 5xx with its reason, so a broken state root never tells the
+            // composer its message was bad (WS-1051).
+            let status = match &error {
+                CreateChatError::NoSuchPlacement => StatusCode::NOT_FOUND,
+                CreateChatError::Refused(_) => StatusCode::BAD_REQUEST,
+                CreateChatError::StorageNotOpen(_) => StatusCode::SERVICE_UNAVAILABLE,
+                CreateChatError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            (status, Json(json!({ "error": e }))).into_response()
+            (status, Json(json!({ "error": error.to_string() }))).into_response()
         }
     }
 }

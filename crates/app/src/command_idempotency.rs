@@ -423,7 +423,7 @@ pub async fn guard(State(wb): State<SharedWorkbench>, request: Request, next: Ne
                     crate::engine::task_correlation(
                         guard.store_ref(),
                         chat,
-                        intent.key(),
+                        &raw_key,
                         &author,
                         Some(&TaskAttempt {
                             command_id: command_id.clone(),

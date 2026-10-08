@@ -88,6 +88,51 @@ struct StartupSnapshot {
     phase: RunPhase,
     reads_before: Vec<String>,
     fork: Option<TurnForkSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client: Option<StartupClient>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartupClient {
+    home_id: String,
+    actor_id: String,
+    client_request_id: String,
+    chat_id: String,
+    attempt: crate::command_idempotency::TaskAttempt,
+}
+impl StartupClient {
+    fn capture(
+        client: &super::ClientTaskContext,
+        original: &ClaimedHttpCommand,
+        chat: &str,
+    ) -> Result<Self, AdmitError> {
+        let captured = Self {
+            home_id: client.author.home_id.clone(),
+            actor_id: client.author.actor_id.clone(),
+            client_request_id: client.client_request_id.clone(),
+            chat_id: client.chat_id.clone(),
+            attempt: client.attempt.clone().ok_or_else(snapshot_refused)?,
+        };
+        let body: serde_json::Value = serde_json::from_str(original.snapshot())?;
+        if captured.home_id.is_empty()
+            || captured.actor_id.is_empty()
+            || captured.chat_id != chat
+            || crate::command_idempotency::office_retry_key(&captured.client_request_id)
+                != original.key()
+            || captured.attempt.command_id != original.command_id()
+            || body.get("body_sha256").and_then(serde_json::Value::as_str)
+                != Some(captured.attempt.body_digest.as_str())
+        {
+            return Err(snapshot_refused());
+        }
+        Ok(captured)
+    }
+    fn link(&self) -> gaugedesk_store::command_dispatch::TaskInputLink {
+        gaugedesk_store::command_dispatch::TaskInputLink {
+            body_digest: self.attempt.body_digest.clone(),
+        }
+    }
 }
 
 impl StartupSnapshot {
@@ -109,10 +154,10 @@ impl StartupSnapshot {
                 kind: "transcript".into(),
                 payload: ServerEvent::User {
                     text: self.task.clone(),
-                    client_request_id: None,
-                    chat_id: None,
-                    home_id: None,
-                    actor_id: None,
+                    client_request_id: self.client.as_ref().map(|c| c.client_request_id.clone()),
+                    chat_id: self.client.as_ref().map(|c| c.chat_id.clone()),
+                    home_id: self.client.as_ref().map(|c| c.home_id.clone()),
+                    actor_id: self.client.as_ref().map(|c| c.actor_id.clone()),
                 }
                 .to_json(),
             },
@@ -124,18 +169,33 @@ impl StartupSnapshot {
         writer: &gaugedesk_store::command_dispatch::DispatchRecordAdmission<'_>,
         original: &ClaimedHttpCommand,
     ) -> Result<(), AdmitError> {
-        writer.require_claimed_lifecycle_prefix(
-            original.command_id(),
-            original.scope(),
-            original.key(),
-            original.snapshot(),
-            STARTUP_PHASE,
-            &LifecycleBatch::<RunState> {
-                scope: self.chat.clone(),
-                commands: commands(self.phase),
-            },
-            &self.facts()?,
-        )?;
+        let batch = LifecycleBatch::<RunState> {
+            scope: self.chat.clone(),
+            commands: commands(self.phase),
+        };
+        let facts = self.facts()?;
+        if let Some(client) = &self.client {
+            writer.require_claimed_task_input_prefix(
+                original.command_id(),
+                original.scope(),
+                original.key(),
+                original.snapshot(),
+                STARTUP_PHASE,
+                &batch,
+                &facts,
+                &client.link(),
+            )?;
+        } else {
+            writer.require_claimed_lifecycle_prefix(
+                original.command_id(),
+                original.scope(),
+                original.key(),
+                original.snapshot(),
+                STARTUP_PHASE,
+                &batch,
+                &facts,
+            )?;
+        }
         Ok(())
     }
 
@@ -145,8 +205,10 @@ impl StartupSnapshot {
         chat: &str,
         task: &str,
     ) -> Result<(), AdmitError> {
-        if self.revision != "office-turn-startup/v3"
-            || self.actor != authority.actor()
+        if !matches!(
+            (self.revision.as_str(), self.client.as_ref()),
+            ("office-turn-startup/v3", None) | ("office-turn-startup/v4", Some(_))
+        ) || self.actor != authority.actor()
             || self.standing != authority.original_binding()?
             || self.chat != chat
             || self.task != task
@@ -317,6 +379,7 @@ fn retention_error(error: gaugedesk_store::AdmitError) -> whipplescript_store::S
     whipplescript_store::StoreError::Conflict(format!("office startup refused: {error:?}"))
 }
 
+#[cfg(test)]
 pub(crate) fn admit_startup(
     office: &OfficeTurnContext<'_>,
     engagement: &dyn ChatWorkspace,
@@ -324,9 +387,10 @@ pub(crate) fn admit_startup(
     task: &str,
     fork_snapshot: &mut Option<TurnForkSnapshot>,
 ) -> Result<OfficeTurnStartup, EngineError> {
-    startup(office, engagement, scope, task, fork_snapshot, false)
+    startup(office, engagement, scope, task, fork_snapshot, false, None)
 }
 
+#[cfg(test)]
 pub(crate) fn admit_retained_startup(
     office: &OfficeTurnContext<'_>,
     engagement: &dyn ChatWorkspace,
@@ -334,9 +398,39 @@ pub(crate) fn admit_retained_startup(
     task: &str,
     fork_snapshot: &mut Option<TurnForkSnapshot>,
 ) -> Result<OfficeTurnStartup, EngineError> {
-    startup(office, engagement, scope, task, fork_snapshot, true)
+    startup(office, engagement, scope, task, fork_snapshot, true, None)
 }
 
+pub(super) fn admit_startup_with_client(
+    office: &OfficeTurnContext<'_>,
+    engagement: &dyn ChatWorkspace,
+    scope: &str,
+    task: &str,
+    fork_snapshot: &mut Option<TurnForkSnapshot>,
+    client: Option<&super::ClientTaskContext>,
+) -> Result<OfficeTurnStartup, EngineError> {
+    startup(
+        office,
+        engagement,
+        scope,
+        task,
+        fork_snapshot,
+        false,
+        client,
+    )
+}
+pub(super) fn admit_retained_startup_with_client(
+    office: &OfficeTurnContext<'_>,
+    engagement: &dyn ChatWorkspace,
+    scope: &str,
+    task: &str,
+    fork_snapshot: &mut Option<TurnForkSnapshot>,
+    client: Option<&super::ClientTaskContext>,
+) -> Result<OfficeTurnStartup, EngineError> {
+    startup(office, engagement, scope, task, fork_snapshot, true, client)
+}
+
+#[allow(clippy::too_many_arguments)] // Exact original phase plus independently admitted requester.
 fn startup(
     office: &OfficeTurnContext<'_>,
     engagement: &dyn ChatWorkspace,
@@ -344,6 +438,7 @@ fn startup(
     task: &str,
     fork_snapshot: &mut Option<TurnForkSnapshot>,
     require_retained: bool,
+    client: Option<&super::ClientTaskContext>,
 ) -> Result<OfficeTurnStartup, EngineError> {
     if office.authority.chat() != scope {
         return Err(EngineError::Message(
@@ -353,6 +448,9 @@ fn startup(
     let mut wb = office.wb.lock_unpoisoned();
     let authority = office.authority.prepare_basis(&wb)?;
     let original = office.original;
+    let current_client = client
+        .map(|c| StartupClient::capture(c, original, scope))
+        .transpose()?;
     let phase_scope = Store::claimed_lifecycle_prefix_scope(original.command_id(), STARTUP_PHASE);
     // Original phase presence and snapshot are observed under the same product
     // basis. Neither locator nor snapshot is an execution grant.
@@ -380,6 +478,9 @@ fn startup(
                 };
                 if let Some(snapshot) = &retained {
                     snapshot.validate(office.authority, scope, task)?;
+                    if snapshot.client.is_some() && snapshot.client != current_client {
+                        return Err(snapshot_refused());
+                    }
                 }
                 Ok((
                     retained,
@@ -396,7 +497,7 @@ fn startup(
     }
     let basis = authority.combine(observed)?;
     let recovered = retained.is_some();
-    let (native_base, prefix, snapshot) =
+    let (native_base, user_entry_id, snapshot) =
         wb.store_mut()
             .with_dispatch_record_admission(&basis, |writer| {
                 writer.require_pending_claim(
@@ -430,7 +531,12 @@ fn startup(
                 })??;
                 let original_binding = office.authority.original_binding()?;
                 let snapshot = retained.unwrap_or_else(|| StartupSnapshot {
-                    revision: "office-turn-startup/v3".into(),
+                    revision: if current_client.is_some() {
+                        "office-turn-startup/v4"
+                    } else {
+                        "office-turn-startup/v3"
+                    }
+                    .into(),
                     command: original.command_id().into(),
                     actor: office.authority.actor().into(),
                     standing: original_binding,
@@ -444,38 +550,63 @@ fn startup(
                     phase,
                     reads_before,
                     fork: fork_snapshot.clone(),
+                    client: current_client.clone(),
                 });
                 snapshot.validate(office.authority, scope, task)?;
                 let facts = snapshot.facts()?;
                 let publish = || {
-                    writer
-                        .commit_claimed_lifecycle_prefix(
-                            original.command_id(),
-                            original.scope(),
-                            original.key(),
-                            original.snapshot(),
-                            STARTUP_PHASE,
-                            LifecycleBatch::<RunState> {
-                                scope: scope.into(),
-                                commands: commands(snapshot.phase),
-                            },
-                            &facts,
-                        )
-                        .map_err(retention_error)
+                    let batch = LifecycleBatch::<RunState> {
+                        scope: scope.into(),
+                        commands: commands(snapshot.phase),
+                    };
+                    if let Some(client) = &snapshot.client {
+                        writer
+                            .commit_claimed_task_input_prefix(
+                                original.command_id(),
+                                original.scope(),
+                                original.key(),
+                                original.snapshot(),
+                                STARTUP_PHASE,
+                                batch,
+                                &facts,
+                                &client.link(),
+                            )
+                            .map(|p| p.user_position)
+                            .map_err(retention_error)
+                    } else {
+                        writer
+                            .commit_claimed_lifecycle_prefix(
+                                original.command_id(),
+                                original.scope(),
+                                original.key(),
+                                original.snapshot(),
+                                STARTUP_PHASE,
+                                batch,
+                                &facts,
+                            )
+                            .and_then(|p| p.positions.last().copied().ok_or_else(snapshot_refused))
+                            .map_err(retention_error)
+                    }
                 };
-                let prefix = if recovered {
+                let user_position = if recovered {
                     native_base.publish_base_retained(publish)
                 } else {
                     native_base.publish_startup_lineage_retained(publish)
                 }
                 .map_err(WorkspaceError::from)?;
-                Ok::<_, EngineError>((native_base, prefix, snapshot))
+                Ok::<_, EngineError>((native_base, user_position, snapshot))
             })??;
     let reads_before = snapshot.reads_before;
     *fork_snapshot = snapshot.fork;
-    let user_entry_id = *prefix.positions.last().ok_or_else(|| {
-        EngineError::Message("office startup has no retained input position".into())
-    })?;
+    // Only a new committed correlated input is broadcast. Legacy retries retain
+    // their original unbound bytes and are never retroactively addressed.
+    if !recovered && snapshot.client.is_some() {
+        if let Some(client) = client {
+            if let Some(sender) = &client.sender {
+                let _ = sender.send(client.user(task));
+            }
+        }
+    }
 
     // The process refers to the position assigned above. Publish its exact
     // meaning in a second phase under fresh checks of the SAME original task.
@@ -882,4 +1013,38 @@ pub(crate) fn recorded_startup(
             )
         })??;
     Ok(recorded)
+}
+
+/// Fixture adapter; the test must obtain the requester and attempt through the
+/// actual Home/HTTP boundaries. This does not construct authentication.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn test_admit_startup_with_client(
+    office: &OfficeTurnContext<'_>,
+    engagement: &dyn ChatWorkspace,
+    scope: &str,
+    task: &str,
+    fork: &mut Option<TurnForkSnapshot>,
+    author: &crate::stream::TaskAuthor,
+    attempt: &crate::command_idempotency::TaskAttempt,
+    key: &str,
+    sender: Option<tokio::sync::broadcast::Sender<ServerEvent>>,
+    retained: bool,
+) -> Result<OfficeTurnStartup, EngineError> {
+    let client = super::ClientTaskContext {
+        author: author.clone(),
+        attempt: Some(attempt.clone()),
+        client_request_id: key.into(),
+        chat_id: scope.into(),
+        sender,
+    };
+    startup(
+        office,
+        engagement,
+        scope,
+        task,
+        fork,
+        retained,
+        Some(&client),
+    )
 }

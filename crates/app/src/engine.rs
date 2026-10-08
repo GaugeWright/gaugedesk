@@ -1208,12 +1208,13 @@ fn run_task_streaming_billed<G: EgressGate>(
         None => office
             .as_ref()
             .map(|office| {
-                office_turn_startup::admit_startup(
+                office_turn_startup::admit_startup_with_client(
                     office,
                     engagement,
                     scope,
                     task,
                     &mut fork_snapshot,
+                    client,
                 )
             })
             .transpose()?,
@@ -2286,6 +2287,17 @@ fn run_claimed_engagement_turn(
         account_bearer,
     )?;
     task_checkpoint(wb, id, office_authority.as_ref())?;
+    let client_context =
+        client_request_id
+            .zip(client_author)
+            .map(|(key, author)| ClientTaskContext {
+                author: author.clone(),
+                attempt: client_attempt.cloned(),
+                client_request_id: key.to_owned(),
+                chat_id: id.to_owned(),
+                sender: Some(sender.clone()),
+            });
+    let client = client_context.as_ref();
     // Recover the original turn before any package, policy, provider, credential,
     // catalogue or ordinary runtime construction. Absence never falls back to work.
     if let Some(authority) = office_authority.as_ref() {
@@ -2310,12 +2322,13 @@ fn run_claimed_engagement_turn(
                     .boxed_clone()
             };
             let mut fork = None;
-            let startup = office_turn_startup::admit_retained_startup(
+            let startup = office_turn_startup::admit_retained_startup_with_client(
                 &office,
                 engagement.as_ref(),
                 id,
                 task,
                 &mut fork,
+                client,
             )?;
             let preparation =
                 office_turn_startup::recorded_runtime(&office, &startup, fork.as_ref())?;
@@ -2436,17 +2449,6 @@ fn run_claimed_engagement_turn(
         )
     };
 
-    let client_context =
-        client_request_id
-            .zip(client_author)
-            .map(|(key, author)| ClientTaskContext {
-                author: author.clone(),
-                attempt: client_attempt.cloned(),
-                client_request_id: key.to_owned(),
-                chat_id: id.to_owned(),
-                sender: Some(sender.clone()),
-            });
-    let client = client_context.as_ref();
     let (package_root, package_version_ref) = match mode {
         ChatMode::Edit => (None, None),
         ChatMode::Use => package_selection
@@ -3939,7 +3941,7 @@ fn drive_persistent_turn(
                 )?;
                 (engagement, fork)
             };
-            let startup = office_turn_startup::admit_retained_startup(
+            let startup = office_turn_startup::admit_retained_startup_with_client(
                 &office_turn_startup::OfficeTurnContext {
                     wb,
                     authority,
@@ -3949,6 +3951,7 @@ fn drive_persistent_turn(
                 id,
                 task,
                 &mut fork,
+                client,
             )?;
             if startup.recovered {
                 return Err(EngineError::Message(

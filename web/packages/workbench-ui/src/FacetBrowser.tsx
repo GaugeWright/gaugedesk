@@ -51,6 +51,7 @@ import { groupChatsByWorkstream } from "./workstream-grouping";
 import { Icon, type IconName } from "./icons";
 import { canTransferToMain, canTransferToWorkstream } from "./workstream-transfer";
 import { scopeWorkspace, type NavigatorScope } from "./workspace-scope";
+import { noReadableTargetReason, readableTargets } from "./placement-targets";
 import {
     archetypeVisible,
     childrenFor,
@@ -245,6 +246,10 @@ export function FacetBrowser(props: {
     /** The selected organization (DR-0325). Projects and Recent show only the
      *  work it owns; absent, the navigator shows everything this Home lists. */
     scope?: NavigatorScope;
+    /** Why a new project cannot be made now — no Home of the person's own, or
+     *  one that is not answering (WS-1036). "+ project" is then shown disabled,
+     *  with this as its title. */
+    createProjectUnavailable?: string;
 }) {
     // Projects remains the structural default. Recent is a read-only current-first
     // selection lens whose rows spell out their roots; it never hosts workstream
@@ -924,16 +929,7 @@ export function FacetBrowser(props: {
     // A WORK chat is rooted on a placement (do the job).
     function targetsForPlacement(placementId: PlacementId): WorkTargetNode[] {
         const workspace = tree();
-        if (!workspace) return [];
-        const authoring = workspace.archetypes.find((archetype) => archetype.instanceId === placementId);
-        const targetIds = authoring
-            ? [authoring.authoringTargetId]
-            : workspace.projects
-                  .flatMap((project) => project.placements)
-                  .find((placement) => placement.placementId === placementId)?.targetIds ?? [];
-        return targetIds
-            .map((id) => workspace.workTargets.find((target) => target.id === id))
-            .filter((target): target is WorkTargetNode => !!target && target.status === "available" && target.capabilities.read);
+        return workspace ? readableTargets(workspace, placementId) : [];
     }
 
     async function newWorkChat(pid: ProjectId, placementId: PlacementId, targetIds?: readonly WorkTargetId[]) {
@@ -944,7 +940,12 @@ export function FacetBrowser(props: {
         }
         const selected = targetIds ?? (targets.length === 1 ? [targets[0].id] : []);
         if (selected.length === 0) {
-            props.onStatus("no available work target can be read");
+            // Said where it was asked for: the status alone is not on screen,
+            // and "new chat" read as a control that did nothing (WS-965).
+            const workspace = tree();
+            (props.onFailure ?? props.onStatus)(`couldn't start a chat — ${workspace
+                ? noReadableTargetReason(workspace, placementId)
+                : "the navigator has not loaded this project yet"}`);
             return;
         }
         await withRefresh(async () => {
@@ -1110,7 +1111,7 @@ export function FacetBrowser(props: {
     // "+ create" action — same size/colour/padding, grouped on a single row at the top
     // of a facet or right under a container's title. `createBtn` is the atom; `wsCreate`
     // pairs the "+ workstream" button with its inline name editor for a placement target.
-    type BtnOpts = { testid?: string; wsRoot?: PlacementId; data?: string; title?: string };
+    type BtnOpts = { testid?: string; wsRoot?: PlacementId; data?: string; title?: string; disabled?: boolean };
     const createBtn = (label: string, onClick: () => void, opts?: BtnOpts) => (
         <button
             type="button"
@@ -1119,6 +1120,7 @@ export function FacetBrowser(props: {
             data-ws-new={opts?.wsRoot}
             data-create={opts?.data}
             title={opts?.title}
+            disabled={opts?.disabled}
             onClick={(e) => { e.stopPropagation(); onClick(); }}
         >
             {label}
@@ -2022,7 +2024,11 @@ export function FacetBrowser(props: {
             </div>
             <div class="facet-toolbar" data-facet-toolbar={facet()}>
                 <Show when={facet() === "projects" && canCreateProject()}>
-                    {createBtn("+ project", () => { setStatus("active"); startEdit({ kind: "new-project" }); }, { title: "Create a new project" })}
+                    {createBtn("+ project", () => { setStatus("active"); startEdit({ kind: "new-project" }); }, {
+                        title: props.createProjectUnavailable ?? "Create a new project",
+                        disabled: props.createProjectUnavailable !== undefined,
+                        data: "new-project",
+                    })}
                 </Show>
                 <Show when={facet() === "library"}>
                     {createBtn("+ agent", openCreateAgent, { title: "Create an Agent or Panel agent" })}
@@ -2174,6 +2180,10 @@ export function FacetBrowser(props: {
                                                 fallback={<span class="node-label">{mark(p.name)}</span>}
                                             >
                                                 {renameInput()}
+                                            </Show>
+                                            <Show when={p.sharedWithYou}>
+                                                <span class="shared-badge" data-project-shared
+                                                    title="Shared with you. It stays on its owner’s computer.">shared</span>
                                             </Show>
                                             {rowActions({
                                                 primary: p.product?.kind !== "tutorials" && canStartProjectChat(p)

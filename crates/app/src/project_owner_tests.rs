@@ -2284,6 +2284,130 @@ async fn a_members_authoring_and_settings_assistant_spend_the_projects_credentia
     assert!(token(OTHER, "project", "p-shared").is_err());
 }
 
+/// A member's composer is offered the models the shared project's own
+/// credentials run, read from the Home that holds the project, and none of the
+/// owner's: the owner's key and the models the owner declared stay the
+/// owner's (DR-0451 §2), while the member's turns spend the project's
+/// (DR-0453 §5). Before this, the picker read only `/account/*`, which a
+/// member is refused over the relay and which holds nothing of its own here,
+/// so a member's composer offered no model at all (WS-1026).
+#[tokio::test]
+async fn a_members_composer_is_offered_the_projects_models_and_not_the_owners() {
+    let (_root, wb) = open();
+    shared_project_with_member_and_viewer(&wb);
+    let app = gated(&wb);
+    let owner = session(&wb, CLAIMANT);
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/account/credentials",
+            serde_json::json!({ "provider": "openai", "token": "sk-owner-key" }),
+        ),
+        (
+            "PUT",
+            "/account/settings/model_picker.endpoint_models",
+            serde_json::json!({ "value": r#"{"openai-generic":["owner-model"]}"# }),
+        ),
+        (
+            "POST",
+            "/projects/p-shared/credentials",
+            serde_json::json!({ "provider": "anthropic", "token": "sk-project-key" }),
+        ),
+    ] {
+        let (status, response) = send(&app, method, uri, Some(&owner), Some(body)).await;
+        assert!(status.is_success(), "{method} {uri}: {status} {response}");
+    }
+
+    let (status, member) = send(
+        &app,
+        "GET",
+        "/projects/p-shared/models",
+        Some(&session(&wb, MEMBER)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{member}");
+    assert_eq!(
+        member,
+        serde_json::json!({
+            "providers": ["anthropic"],
+            "endpoint_models": {},
+            "default_provider": "anthropic",
+            "default_model": "claude-opus-5-5",
+        }),
+        "the project's key and the model an unpinned turn runs on it"
+    );
+
+    // The owner's turns there choose between its own key and the project's.
+    let (status, owners) = send(&app, "GET", "/projects/p-shared/models", Some(&owner), None).await;
+    assert_eq!(status, StatusCode::OK, "{owners}");
+    assert_eq!(
+        owners["providers"],
+        serde_json::json!(["openai", "anthropic"])
+    );
+
+    // An account the project is not shared with learns nothing about it.
+    let (status, _) = send(
+        &app,
+        "GET",
+        "/projects/p-shared/models",
+        Some(&session(&wb, OTHER)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// A provider that ships no catalog runs the models its declarer named, and a
+/// member declares none on someone else's computer: the project's endpoint is
+/// offered with no model, exactly as a member's unpinned turn resolves it.
+#[tokio::test]
+async fn a_members_composer_names_no_model_the_member_did_not_declare() {
+    let (_root, wb) = open();
+    shared_project_with_member_and_viewer(&wb);
+    let app = gated(&wb);
+    let owner = session(&wb, CLAIMANT);
+    for (method, uri, body) in [
+        (
+            "PUT",
+            "/account/settings/model_picker.endpoint_models",
+            serde_json::json!({ "value": r#"{"openai-generic":["owner-model"]}"# }),
+        ),
+        (
+            "POST",
+            "/projects/p-shared/credentials",
+            serde_json::json!({
+                "provider": "openai-generic",
+                "token": "sk-project-key",
+                "base_url": "https://models.example.test/v1",
+            }),
+        ),
+    ] {
+        let (status, response) = send(&app, method, uri, Some(&owner), Some(body)).await;
+        assert!(status.is_success(), "{method} {uri}: {status} {response}");
+    }
+    let (status, owners) = send(&app, "GET", "/projects/p-shared/models", Some(&owner), None).await;
+    assert_eq!(status, StatusCode::OK, "{owners}");
+    assert_eq!(
+        owners["endpoint_models"],
+        serde_json::json!({ "openai-generic": ["owner-model"] })
+    );
+    assert_eq!(owners["default_model"], "owner-model");
+    let (status, member) = send(
+        &app,
+        "GET",
+        "/projects/p-shared/models",
+        Some(&session(&wb, MEMBER)),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{member}");
+    assert_eq!(member["providers"], serde_json::json!(["openai-generic"]));
+    assert_eq!(member["endpoint_models"], serde_json::json!({}));
+    assert_eq!(member["default_provider"], "openai-generic");
+    assert_eq!(member["default_model"], serde_json::Value::Null);
+}
+
 /// The desktop window calls its control plane from another origin, so every
 /// request with a session is preceded by a CORS preflight that carries none.
 /// Driven through the composition the shell serves — the window's secret,

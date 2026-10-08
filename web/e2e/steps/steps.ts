@@ -168,6 +168,22 @@ async function placeArchetypeOnFreshProject(page: Page): Promise<string> {
     return name;
 }
 
+// A chat started from the navigator is selected — its chat-status badge carries
+// the raw run phase as data-run-phase, Init for a new chat (its visible text is
+// the plain-language label) — or the workbench says why it is not: a failed
+// start shows in an action notice (action-failure.feature). The step names that
+// notice rather than only that no badge appeared, so a red transcript carries
+// the cause; the browser trace does not outlive the slot's next run (WS-965).
+async function expectNewChatSelected(page: Page): Promise<void> {
+    const notice = page.locator("[data-action-error] > span");
+    const phase = page.getByTestId("run-phase");
+    await expect.poll(async () => {
+        if (await notice.count()) return `the workbench said: ${(await notice.first().textContent({ timeout: 1_000 }))?.trim()}`;
+        if (!await phase.count()) return "no chat selected";
+        return await phase.getAttribute("data-run-phase", { timeout: 1_000 });
+    }, { message: "a new chat is selected" }).toBe("Init");
+}
+
 // The place picker (#1): pick the first listed method (an `[data-picker-archetype]`
 // row, not the "+ create a new method" row).
 async function pickFirstMethod(page: import("@playwright/test").Page) {
@@ -581,9 +597,7 @@ Given("a new engagement", async ({ page }) => {
     const project = await placeArchetypeOnFreshProject(page);
     const group = page.locator(`.tree-group[data-project]`, { hasText: project });
     await group.locator(".tree-subgroup[data-placement] [data-create='new-placement-chat']").first().click();
-    // selected → the chat-status badge carries the raw run phase as data-run-phase
-    // (its visible text is the plain-language label).
-    await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
+    await expectNewChatSelected(page);
     // wait for the live SSE stream to connect before any task — the fake agent is
     // faster than the connection, so an early task would stream into the void.
     await expect(page.getByTestId("stream-ready")).toBeAttached();
@@ -1226,7 +1240,7 @@ When("I add a work chat in project {string}", async ({ page }, name: string) => 
     await page.locator(".facet", { hasText: "Projects" }).click();
     await ensureArchetypeLens(page, name);
     await page.locator("[data-project]", { hasText: name }).locator(".tree-subgroup[data-placement] [data-create='new-placement-chat']").first().click();
-    await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
+    await expectNewChatSelected(page);
 });
 
 Then("the placement in project {string} shows a chat", async ({ page }, name: string) => {
@@ -2721,7 +2735,7 @@ Given("a placement I can open more chats under", async ({ page }) => {
     concProject = await placeArchetypeOnFreshProject(page);
     const group = page.locator(`.tree-group[data-project]`, { hasText: concProject });
     await group.locator(".tree-subgroup[data-placement] [data-create='new-placement-chat']").first().click();
-    await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
+    await expectNewChatSelected(page);
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 

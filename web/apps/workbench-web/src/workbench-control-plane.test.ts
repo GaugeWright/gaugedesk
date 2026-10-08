@@ -6,6 +6,8 @@ import {
     setTunnelModuleLoader,
     type RawTunnelFacade,
 } from "@gaugewright/control-plane-client";
+import { modelKey, modelOptions } from "@gaugewright/workbench-ui";
+import { composerModelSource, type OwnModelAccess } from "./composer-model-source";
 import { MINE, OWNERS, releaseSharedMember, sharedMember } from "./shared-member.fixture";
 import { WorkbenchControlPlane } from "./workbench-control-plane";
 
@@ -2228,7 +2230,7 @@ describe("projects shared with a member, beside their own (DR-0451, DR-0455, WS-
         const { api, dialed, carried, hubWrites, projects } = member("signed out");
         // Not "no reachable Home is selected": the workbench opens.
         await expect(api.bootstrapHome()).resolves.toMatchObject({
-            kind: "connected", home: { id: "home:local-user", endpoint: "" },
+            kind: "connected", home: { id: "home:local-user", endpoint: "" }, withoutOwnHome: true,
         });
         expect(await projects()).toEqual(["proj-shared"]);
         api.setCurrentProject("proj-shared" as ProjectId);
@@ -2238,5 +2240,199 @@ describe("projects shared with a member, beside their own (DR-0451, DR-0455, WS-
         expect(dialed).toEqual([OWNERS]);
         expect(carried.every((entry) => entry.home === OWNERS)).toBe(true);
         expect(hubWrites).toEqual([]);
+    });
+});
+
+describe("a member whose own Home is not answering keeps their shared projects (WS-1036)", () => {
+    afterEach(releaseSharedMember);
+
+    it("opens on the shared projects, says which Home is silent, and does not dial it again", async () => {
+        const { api, dialed, carried, hubWrites, projects } = sharedMember("not answering");
+        // Not the "is not responding" gate: the workbench opens, saying so.
+        await expect(api.bootstrapHome()).resolves.toMatchObject({
+            kind: "connected",
+            silent: { home: "home:local-user", homes: [expect.objectContaining({ id: "home:local-user" })] },
+        });
+        expect(await projects()).toEqual(["proj-shared"]);
+        api.setCurrentProject("proj-shared" as ProjectId);
+        await expect(api.getTranscript("chat-shared" as never)).resolves.toEqual([]);
+        // The silent desktop was dialed once, by bootstrap, and not on every read.
+        expect(dialed.filter((home) => home === MINE)).toHaveLength(1);
+        expect(carried.every((entry) => entry.home === OWNERS)).toBe(true);
+        expect(hubWrites).toEqual([]);
+    });
+
+    it("keeps the gate for a member with nothing shared with them", async () => {
+        const { api } = sharedMember("not answering");
+        vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => undefined });
+        await expect(api.bootstrapHome()).resolves.toMatchObject({
+            kind: "none", selectedHome: "home:local-user",
+        });
+    });
+});
+
+describe("a shared project's Agent is authored at that project's Home (DR-0453, WS-1048)", () => {
+    afterEach(releaseSharedMember);
+
+    /** From the Workshop, with no project open: make an authoring chat, send
+     * it a message, and read it back, as the navigator and the chat do. */
+    async function authorTheSharedAgent(api: ReturnType<typeof sharedMember>["api"]) {
+        const listed = (await api.getWorkspaceCarriage()).value;
+        expect(listed.archetypes.map((agent) => agent.id)).toEqual(["agent-shared"]);
+        api.setCurrentProject(null);
+        const chat = await api.createChatUnderArchetype("agent-shared" as ArchetypeId, "edit chat");
+        expect(chat).toBe("chat-edit");
+        // Before anything has routed the chat by its project.
+        await expect(api.runTask(chat, "make it shorter")).resolves.toEqual({ accepted: true });
+        await expect(api.getTranscript(chat)).resolves.toEqual([]);
+        return chat;
+    }
+
+    it("reaches the owner's desktop for a member with no Home of their own", async () => {
+        const { api, carried, dialed, hubWrites } = sharedMember("signed out");
+        await expect(api.bootstrapHome()).resolves.toMatchObject({ kind: "connected" });
+        await authorTheSharedAgent(api);
+        // Not "No reachable Home is selected": every call went to the owner's.
+        expect(carried.filter((entry) => entry.call.includes("agent-shared") || entry.call.includes("chat-edit")))
+            .toEqual([
+                { home: OWNERS, call: "POST /archetypes/agent-shared/chats" },
+                { home: OWNERS, call: "POST /chats/chat-edit/task" },
+                { home: OWNERS, call: "GET /chats/chat-edit/transcript" },
+            ]);
+        expect(dialed).toEqual([OWNERS]);
+        expect(hubWrites).toEqual([]);
+    });
+
+    it.each(["signed out", "selected"] as const)(
+        "renames, previews and publishes it at the owner's desktop (own Home %s)",
+        async (own) => {
+            const { api, carried } = sharedMember(own);
+            await api.bootstrapHome();
+            await api.getWorkspaceCarriage();
+            api.setCurrentProject(null);
+            await api.renameArchetype("agent-shared" as ArchetypeId, "Shorter writer");
+            const preview = await api.previewAgent("agent-shared" as ArchetypeId);
+            expect(preview).toBe("chat-preview");
+            // The preview it made is the owner's Home's at once.
+            await expect(api.getTranscript(preview)).resolves.toEqual([]);
+            await api.publishArchetype("agent-shared" as ArchetypeId);
+            expect(carried.filter((entry) => /agent-shared|chat-preview/.test(entry.call))).toEqual([
+                { home: OWNERS, call: "PUT /archetypes/agent-shared" },
+                { home: OWNERS, call: "POST /archetypes/agent-shared/preview" },
+                { home: OWNERS, call: "GET /chats/chat-preview/transcript" },
+                { home: OWNERS, call: "POST /archetypes/agent-shared/publish" },
+            ]);
+        },
+    );
+
+    it("reaches the owner's desktop, not the member's own, when the member's Home is selected", async () => {
+        const { api, carried, hubWrites } = sharedMember("selected");
+        await api.bootstrapHome();
+        await authorTheSharedAgent(api);
+        // The member's own desktop carries the same Home id and never answers
+        // for the owner's Agent.
+        expect(carried.filter((entry) => entry.home === MINE && /agent-shared|chat-edit/.test(entry.call))).toEqual([]);
+        expect(carried.filter((entry) => entry.home === OWNERS && /agent-shared|chat-edit/.test(entry.call)))
+            .toHaveLength(3);
+        // While the shared project is open, a new project is still the
+        // member's own, made on their own desktop.
+        api.setCurrentProject("proj-shared" as ProjectId);
+        await expect(api.createProject("next")).resolves.toBe("proj-new");
+        expect(carried).toContainEqual({ home: MINE, call: "POST /projects" });
+        expect(carried).not.toContainEqual({ home: OWNERS, call: "POST /projects" });
+        expect(hubWrites).toEqual([]);
+    });
+});
+
+describe("a member's composer offers the shared project's models (WS-1026)", () => {
+    afterEach(releaseSharedMember);
+
+    /** What the composer's picker lists, as `provider:id` keys, with the
+     * default row as its label. */
+    const offered = (source: ReturnType<typeof composerModelSource>) =>
+        modelOptions(source.providers, source.enabled, undefined, source.catalog, source.resolvedDefault)
+            .map((option) => (option.id ? modelKey(option) : option.label));
+
+    /** What the person's own account answers the picker, as App reads it. */
+    async function ownAccount(api: ReturnType<typeof sharedMember>["api"]): Promise<OwnModelAccess> {
+        return {
+            credentials: await api.accountCredentials().catch(() => []),
+            codexLinked: false,
+            settings: {},
+            resolvedDefault: await api.defaultModel().catch(() => null),
+        };
+    }
+
+    it.each(["signed out", "selected"] as const)(
+        "reads what the project's key runs from the owner's desktop (own Home %s)",
+        async (own) => {
+            const { api, carried } = sharedMember(own);
+            await api.bootstrapHome();
+            await api.getWorkspaceCarriage();
+            // An authoring chat of the shared Agent names no project: none is open.
+            api.setCurrentProject(null);
+            const account = await ownAccount(api);
+            // What the composer offered: the member's own account's models —
+            // none with no Home of their own, their own key's on their own
+            // desktop, which no turn on the owner's computer can spend.
+            expect(offered(composerModelSource(null, account))).not.toContain("anthropic:claude-opus-5-5");
+
+            const shared = await api.sharedProjectModels("proj-shared" as ProjectId);
+            const models = offered(composerModelSource(shared, account));
+            expect(models[0]).toBe("Claude Opus 5.5 (default)");
+            expect(models).toContain("anthropic:claude-opus-5-5");
+            expect(models.filter((key) => key.startsWith("openai"))).toEqual([]);
+            expect(carried).toContainEqual({ home: OWNERS, call: "GET /projects/proj-shared/models" });
+            expect(carried.filter((entry) => entry.home === MINE && entry.call.includes("proj-shared"))).toEqual([]);
+        },
+    );
+
+    it("reads them from the owner's desktop with the shared project open", async () => {
+        const { api } = sharedMember("selected");
+        await api.bootstrapHome();
+        await api.getWorkspaceCarriage();
+        api.setCurrentProject("proj-shared" as ProjectId);
+        const account = await ownAccount(api);
+        // The open project's Home refuses the member its account routes.
+        expect(account.credentials).toEqual([]);
+        const shared = await api.sharedProjectModels("proj-shared" as ProjectId);
+        expect(offered(composerModelSource(shared, account))).toContain("anthropic:claude-opus-5-5");
+    });
+
+    it("offers the project's credentials from an owner's desktop that predates the route", async () => {
+        const { api, carried } = sharedMember("signed out", { ownerHome: "before project models" });
+        await api.bootstrapHome();
+        await api.getWorkspaceCarriage();
+        const shared = await api.sharedProjectModels("proj-shared" as ProjectId);
+        expect(shared).toEqual({
+            providers: ["anthropic"],
+            endpointModels: {},
+            defaultModel: { provider: null, model: null },
+        });
+        const models = offered(composerModelSource(shared, await ownAccount(api)));
+        expect(models).toContain("anthropic:claude-opus-5-5");
+        expect(models[0]).not.toMatch(/\(default\)$/);
+        expect(carried).toContainEqual({ home: OWNERS, call: "GET /projects/proj-shared/credentials" });
+    });
+
+    it("leaves the person's own project to their own account", async () => {
+        const { api } = sharedMember("selected");
+        await api.bootstrapHome();
+        await api.getWorkspaceCarriage();
+        await expect(api.sharedProjectModels("proj-mine" as ProjectId)).resolves.toBeNull();
+        api.setCurrentProject("proj-mine" as ProjectId);
+        const models = offered(composerModelSource(null, await ownAccount(api)));
+        expect(models[0]).toBe("GPT-6.1 Sol (default)");
+        expect(models).toContain("openai:gpt-6.1-sol");
+    });
+
+    it("offers nothing of the person's own while the project's answer is outstanding", () => {
+        const own: OwnModelAccess = {
+            credentials: [{ provider: "openai", linked: true }],
+            codexLinked: true,
+            settings: {},
+            resolvedDefault: { provider: "openai-codex", model: "gpt-6.1-sol" },
+        };
+        expect(offered(composerModelSource(undefined, own))).toEqual([]);
     });
 });

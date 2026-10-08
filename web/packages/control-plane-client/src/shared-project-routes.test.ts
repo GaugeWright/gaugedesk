@@ -5,6 +5,7 @@ import {
     pinSharedProject,
     sharedProjectPins,
     sharedProjectRoutes,
+    sharedProjectHoldings,
     withSharedProjects,
     withSharedRoutes,
     type SharedProjectPin,
@@ -189,6 +190,8 @@ describe("a member's workspace lists the projects shared with them (DR-0451, DR-
     it("adds the pinned project from its Home, and nothing else that Home shows", () => {
         const listed = withSharedProjects(own, [{ project: "proj-shared" as ProjectId, workspace: ownersHome }]);
         expect(listed.projects.map((p) => p.id)).toEqual(["proj-mine", "proj-shared"]);
+        // So the navigator can say why it is there.
+        expect(listed.projects.map((p) => p.sharedWithYou ?? false)).toEqual([false, true]);
         expect(listed.archetypes.map((a) => a.id)).toEqual(["agent-shared"]);
         expect(listed.recent.map((c) => c.id)).toEqual(["chat-shared"]);
         expect(listed.workstreams.map((w) => w.id)).toEqual(["ws-shared"]);
@@ -218,3 +221,53 @@ describe("a member's workspace lists the projects shared with them (DR-0451, DR-
         expect(listed.projects.map((p) => p.id)).toEqual(["proj-mine"]);
     });
 });
+
+describe("what a shared project brings is held to that project (WS-1048)", () => {
+    const empty = {
+        archetypes: [], projects: [], recent: [], workstreams: [], workTargets: [],
+        personalPlacement: null, homeOrganization: null,
+    };
+    const agent = (id: string, sharedThrough: string[], chats: string[]) => ({
+        id, instanceId: `inst-${id}`, authoringTargetId: `target-${id}`, sharedThrough,
+        chats: chats.map((chat) => ({ id: chat })), previews: [{ chat: { id: `preview-${id}` } }],
+    });
+    const ownersHome = {
+        ...empty,
+        projects: [{
+            id: "proj-shared", isPersonal: false, targets: [{ id: "t-shared" }],
+            placements: [{ placementId: "pl-shared", targetIds: ["t-shared"], chats: [{ id: "chat-work" }] }],
+        }],
+        archetypes: [
+            agent("agent-shared", ["proj-shared"], ["chat-edit"]),
+            agent("agent-default", ["proj-shared"], ["chat-default-edit"]),
+            agent("agent-owners", [], ["chat-owners"]),
+        ],
+        recent: [{ id: "chat-edit", placement: "inst-agent-shared" }, { id: "chat-owners", placement: "inst-agent-owners" }],
+        workstreams: [{ id: "ws-edit", projectId: null, placementId: "inst-agent-shared" }],
+        workTargets: [{ id: "t-shared" }, { id: "target-agent-shared" }, { id: "target-agent-owners" }],
+    } as never;
+    const mine = { ...empty, archetypes: [agent("agent-default", [], [])] } as never;
+
+    it("names the project, its placements and chats, and the Agents placed in it with their chats", () => {
+        const held = new Map(sharedProjectHoldings(mine, [{ project: "proj-shared" as ProjectId, workspace: ownersHome }]));
+        expect([...held.keys()].sort()).toEqual([
+            "archetypes/agent-shared",
+            "chats/chat-edit",
+            "chats/chat-work",
+            "chats/preview-agent-shared",
+            "placements/inst-agent-shared",
+            "placements/pl-shared",
+            "projects/proj-shared",
+            "targets/t-shared",
+            "targets/target-agent-shared",
+            "workstreams/ws-edit",
+        ]);
+        expect(new Set(held.values())).toEqual(new Set(["proj-shared"]));
+        // An Agent the person's own Home lists by the same id stays theirs,
+        // and lists as theirs.
+        const listed = withSharedProjects(mine, [{ project: "proj-shared" as ProjectId, workspace: ownersHome }]);
+        expect(listed.archetypes.map((a) => a.id)).toEqual(["agent-default", "agent-shared"]);
+        expect(listed.recent.map((c) => c.id)).toEqual(["chat-edit"]);
+    });
+});
+

@@ -19,6 +19,35 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- On desk.gaugewright.com, a chat in a project shared with you offers the models
+  that project's own provider key runs, and names the default, in the composer's
+  model picker. It offered no model at all: the picker asked your own account,
+  which the owner's computer refuses you and which holds none of the project's
+  keys, and with your own desktop selected it offered your own keys, which a turn
+  on the owner's computer cannot spend. The Home answers this at
+  `GET /projects/:id/models`; against an owner's GaugeDesk from before it, desk
+  offers the project's linked providers without naming a default.
+
+- When a Home cannot start a chat because of its own fault — its storage will
+  not open, or the Agent's package is missing from disk — it now answers with
+  a server error (500, or 503 while the chat's storage is not open) and the
+  reason. It used to answer 400, as if the request had been wrong. A refusal,
+  such as a placement still awaiting approval or a target set that cannot be
+  used, is still a 400. The composer keeps your message either way.
+
+- Office task messages retain the verified requester's identity and request ID
+  with their original admission. A repeated request can recover its original
+  outcome without creating another message; older uncorrelated messages keep
+  their original records.
+
+- On desk.gaugewright.com, a new authoring chat with an Agent in a project shared
+  with you opens, and replies. Started from the Workshop it said "No reachable Home
+  is selected" when you had no Home of your own, and with your own desktop
+  selected it went to your desktop instead of the owner's and never opened. Every
+  act on a shared project's Agents, placements and chats now reaches the owner's
+  computer, whichever project is open, and a new project or Agent you make while
+  one is open is still made on your own Home.
+
 - Signed in to desk.gaugewright.com with a passkey, you can accept a project
   invitation and reach a Home that answers only through the relay. Accepting
   used to fail with "sign in to reach this Home", and every reload with such a
@@ -35,6 +64,20 @@ Releases up to and including 0.4.30 are recorded on the
   422 valid Home id and secure endpoint or relay required". Registering the
   owner's computer instead replaced your own desktop in your account, because
   every desktop carries the same Home id, and the project still never appeared.
+
+- When your own Home isn't answering — your computer is asleep, or GaugeDesk on
+  it is signed out — desk.gaugewright.com still opens on the projects shared
+  with you, with a notice above the navigator that names your Home and offers
+  **Try again** or your other Homes. It used to stop at "not responding" and
+  keep you out of the shared projects too. A project shared with you carries a
+  **shared** tag, and **+ project** is disabled, saying why, while no Home of
+  your own is serving you.
+
+- Starting a chat in a project whose work targets are all unavailable or
+  unreadable — an external folder that is offline, say — now says why, naming
+  each target, where you asked. The navigator's new-chat button used to do
+  nothing visible, and sending from the empty chat pane with an organization
+  selected dropped the message.
 
 ## [0.8.10] — 2026-10-08
 

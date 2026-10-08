@@ -3276,6 +3276,48 @@ async fn placement_routes_reject_a_mismatched_project_path_without_mutation() {
     );
 }
 
+/// A Home that cannot read what a new chat needs says the failure is its own.
+/// Here the placement's Agent package is gone from disk: nothing about the
+/// request is wrong, so the answer is a 5xx naming the reason, not the 400
+/// that tells the caller to change its request (WS-1051).
+#[tokio::test]
+async fn chat_creation_answers_a_missing_agent_package_as_the_homes_failure() {
+    let (_d, wb) = lean_workbench();
+    let inspect = wb.clone();
+    let app = open_control_plane(wb);
+    let (status, body) = send(&app, "POST", "/projects", Some(r#"{"name":"acme"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    let placement_id = project["placement"].as_str().unwrap();
+    let target_id = project["target_id"].as_str().unwrap();
+
+    let package_root = {
+        let wb = inspect.lock_unpoisoned();
+        let placement = &wb.library.instances[placement_id];
+        let authoring = wb
+            .library
+            .authoring_target_for(&placement.agent_id)
+            .expect("the placement's Agent has an authoring target");
+        crate::library_state::published_package_root(
+            &wb.targets_dir(),
+            &authoring.id,
+            placement.version,
+        )
+    };
+    std::fs::remove_dir_all(&package_root).unwrap();
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/projects/{project_id}/placements/{placement_id}/chats"),
+        Some(&format!(r#"{{"title":"go","target_id":"{target_id}"}}"#)),
+    )
+    .await;
+    assert!(status.is_server_error(), "{status}: {body}");
+    assert!(body.contains("cannot open agent package"), "{body}");
+}
+
 /// The mutation response is the same redacted target projection consumed by
 /// `GET /workspace`; returning a partial record here makes the shipped
 /// `parseWorkTarget` client throw after the durable attach has already happened.

@@ -59,6 +59,7 @@ import {
     type LiveModelContext,
     type MethodInspectionStatus,
     type ProjectId,
+    type ProjectModels,
     type ProjectNode,
     type PlacementNode,
     type ProjectShareDirectory,
@@ -83,11 +84,13 @@ import {
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { ManagementChat } from "./ManagementChat";
+import { homeDescription, SilentHomeNotice } from "./SilentHomeNotice";
 import { accountWorkReplacesHomeGate, captureHomeDiscovery, HOME_DISCOVERY_SLOW_MS, type HomeDiscoveryFailure } from "./home-bootstrap";
 import { desktopUpdateOffer, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, withDesktopUpdateTimeout, DESKTOP_UPDATE_CHECK_TIMEOUT_MS, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
 import { chatAcceptanceEvidence } from "./chat-acceptance-observation";
 import { chatRouted } from "./chat-route-wait";
+import { composerModelSource, NO_PROJECT_MODELS, type OwnModelAccess } from "./composer-model-source";
 import { CHAT_NOTIFICATION_EVENT, deliverChatNotice, personIsLooking } from "./chat-notification-delivery";
 import "@gaugewright/gw-embed";
 import {
@@ -111,10 +114,6 @@ import {
     emptyTranscript as empty,
     EngagementPane,
     Environment,
-    ENABLED_MODELS_SETTING,
-    ENDPOINT_MODELS_SETTING,
-    catalogWithEndpointModels,
-    parseEndpointModels,
     fileFromSearch,
     freshnessEventForMarker,
     FacetBrowser,
@@ -149,7 +148,6 @@ import {
     ProjectSettingsContent,
     ProjectSettingsMenu,
     type ProjectSettingsPage,
-    parseEnabledModels,
     panelManifest,
     withPendingTasks,
     readChatModel,
@@ -189,6 +187,8 @@ import {
     scopeProjects,
     scopeTasks,
     quickStartPlacement,
+    readableTargets,
+    noReadableTargetReason,
     ApproveThisComputerDialog,
 } from "@gaugewright/workbench-ui";
 import { isMobileHarness, MobileApp } from "@gaugewright/mobile-web";
@@ -467,6 +467,34 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             await refetchHome();
         } catch (error) {
             setHomeError(error instanceof Error ? error.message : String(error));
+        } finally {
+            setHomeBusy(false);
+        }
+    };
+    // The selected Home did not answer and desk opened on the projects shared
+    // with the person instead (WS-1036).
+    const silentHome = createMemo(() => {
+        const state = homeState();
+        return state?.kind === "connected" ? state.silent ?? null : null;
+    });
+    // A new project is made on the person's own Home, so with none serving
+    // them "+ project" says why it cannot (WS-1036).
+    const createProjectUnavailable = createMemo(() => {
+        const state = homeState();
+        if (state?.kind !== "connected") return undefined;
+        const silent = state.silent;
+        if (silent) {
+            const home = homeDescription(silent.homes.find((candidate) => candidate.id === silent.home));
+            return `New projects are made on your own Home, and ${home} isn’t responding`;
+        }
+        if (state.withoutOwnHome) return "New projects are made on a Home of your own, and you have none yet";
+        return undefined;
+    });
+    const retrySilentHome = async () => {
+        setHomeBusy(true);
+        try {
+            await refetchHome();
+            bumpNav();
         } finally {
             setHomeBusy(false);
         }
@@ -1319,25 +1347,40 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // The operator's curated "which models show" preference (managed in the Account panel,
     // persisted in the account-settings KV). `null` = never curated → default-visible subset.
     const [acctSettings, { refetch: refetchAcctSettings }] = createResource(() => selected() ?? "startup", () => api.accountSettings().catch((): Record<string, string> => ({})));
-    const linkedAccounts = createMemo(() => {
-        const ps = (linkedCreds() ?? []).filter((c) => c.linked).map((c) => c.provider);
-        if (codexCred()?.linked) ps.push("openai-codex");
-        return ps;
-    });
-    const enabledModels = createMemo(() => parseEnabledModels(acctSettings()?.[ENABLED_MODELS_SETTING]));
-    // The providers GaugeDesk ships no catalog for — an OpenAI-compatible endpoint with no
-    // listing (ADR 0083), OpenRouter with one too large and too short-lived to snapshot
-    // (ADR 0148) — contribute the models the operator declared in Settings. They join the
-    // catalog here rather than at each call below, so the picker, the effort toggle and the
-    // vision check all see one set.
-    const modelCatalog = createMemo(() =>
-        catalogWithEndpointModels(parseEndpointModels(acctSettings()?.[ENDPOINT_MODELS_SETTING])),
-    );
     // The engine's resolved no-pin default (provider + model), so the picker's
     // first row names what "Default" actually runs. It follows the linked
     // credentials, so it is re-read with them; a failed probe degrades to no
     // default row ("Select model") rather than blocking the picker.
     const [resolvedDefault, { refetch: refetchResolvedDefault }] = createResource(() => api.defaultModel().catch(() => null));
+    // What the person's own account offers: its linked credentials and Codex
+    // sign-in, the endpoint models declared in Settings, the curated set and
+    // the resolved default (`composerModelSource`).
+    const ownModelAccess = (): OwnModelAccess => ({
+        credentials: linkedCreds(),
+        codexLinked: Boolean(codexCred()?.linked),
+        settings: acctSettings(),
+        resolvedDefault: resolvedDefault() ?? null,
+    });
+    const ownModels = createMemo(() => composerModelSource(null, ownModelAccess()));
+    const linkedAccounts = createMemo(() => ownModels().providers);
+    const enabledModels = createMemo(() => ownModels().enabled);
+    const modelCatalog = createMemo(() => ownModels().catalog);
+    // The project someone shared with this person that the open chat is in,
+    // set once the chat's place is known (below). Its chats run on that
+    // project's credentials at the Home that holds it (DR-0451, DR-0453 §5),
+    // so the composer offers what that Home answers for the project, never
+    // the person's own account's models (WS-1026).
+    const [sharedModelProject, setSharedModelProject] = createSignal<ProjectId | null>(null);
+    const [sharedModels, { refetch: refetchSharedModels }] = createResource(
+        () => [sharedModelProject()] as const,
+        ([project]): Promise<ProjectModels | null> | null => project
+            ? api.sharedProjectModels(project).catch(() => NO_PROJECT_MODELS)
+            : null,
+    );
+    const composerModels = createMemo(() => composerModelSource(
+        sharedModelProject() === null ? null : sharedModels.loading ? undefined : sharedModels() ?? null,
+        ownModelAccess(),
+    ));
     // Everything the composer projects from the account, re-read after Settings
     // or the first-run overlay changes it. Keyed resources refresh on a chat
     // switch by themselves; a credential linked with a chat open never caused
@@ -1347,6 +1390,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         void refetchCodexCred();
         void refetchAcctSettings();
         void refetchResolvedDefault();
+        void refetchSharedModels();
     };
     // A pulse the composer bumps to open Settings at Model access when nothing
     // is pickable: "Add a model…" opens where one comes from.
@@ -1370,11 +1414,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             : pendingPin() ?? { id: "", provider: "" };
     const modelChoices = createMemo<ModelOption[]>(() =>
         modelOptions(
-            linkedAccounts(),
-            enabledModels(),
+            composerModels().providers,
+            composerModels().enabled,
             paneModel(),
-            modelCatalog(),
-            resolvedDefault() ?? null,
+            composerModels().catalog,
+            composerModels().resolvedDefault,
         ),
     );
     // What an Agent's preferred model may be: the same reachable models, unpinned.
@@ -1385,7 +1429,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // The reasoning-effort options follow the pinned model; the toggle only shows when the
     // model supports thinking (more than just "off"). "" = the model's own default effort.
     const effortLevels = createMemo(() =>
-        thinkingLevelsFor(linkedAccounts(), paneModel().id, paneModel().provider, modelCatalog()));
+        thinkingLevelsFor(composerModels().providers, paneModel().id, paneModel().provider, composerModels().catalog));
     const showEffort = createMemo(() => effortLevels().some((l) => l !== "off"));
     // Pin a model for this chat: the picker's option value is `provider:id` (empty =
     // Default → clear the override). Writes `model`+`provider`, preserving every other key.
@@ -1480,6 +1524,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         acts: c.availableActs,
                         // Only a project-rooted work chat has a project here.
                         project: { id: p.id, name: p.name, networkIsolated: p.networkIsolated },
+                        // A project someone shared with this person, whose own
+                        // Home answers what its chats run on (WS-1026).
+                        sharedProject: p.sharedWithYou ? p.id : null,
                         chat: id,
                         route: chatRouteProject(p, readUnder),
                     };
@@ -1642,6 +1689,20 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         api.setCurrentProject(project);
         setTaskRouteProject(project);
         setRoutedChat(info?.chat ?? null);
+    });
+    // A chat in a project shared with this person, or an edit chat or
+    // preview of an Agent authored through one, offers what that project's
+    // Home answers for it (`sharedProjectModels`); any other chat offers the
+    // person's own account's models.
+    // Held until the chat's place is read, so switching chats does not flash
+    // the person's own models into a shared project's composer.
+    createEffect(() => {
+        const chat = selected();
+        const info = chatInfo();
+        if (!chat) setSharedModelProject(null);
+        else if (info?.chat === chat) {
+            setSharedModelProject((info.sharedProject ?? info.authoringProject ?? null) as ProjectId | null);
+        }
     });
     // The transcript is a projection of durable truth: a **snapshot** of admitted
     // records (refetched per engagement, survives reloads) concatenated with the
@@ -2155,16 +2216,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             // (DR-0325).
             const scope = navigatorScope(props.gaugeApps?.selectedTenant());
             const start = quickStartPlacement(workspace, scope);
-            if (scope && !start) {
-                setStatus("there is no project here to start a chat in");
-                return;
-            }
+            // Each refusal below throws, like a refused create: the composer
+            // keeps the message and says why (WS-965).
+            if (scope && !start) throw new Error("there is no project here to start a chat in");
             const placementId = start?.placementId ?? workspace.personalPlacement;
             const project = start?.project;
-            const placement = project?.placements.find((candidate) => candidate.placementId === placementId);
-            const targets = (placement?.targetIds ?? [])
-                .map((targetId) => workspace.workTargets.find((target) => target.id === targetId))
-                .filter((target): target is WorkTargetNode => !!target && target.status === "available" && target.capabilities.read);
+            const targets = project && placementId ? readableTargets(workspace, placementId) : [];
             if (project && placementId && targets.length > 1) {
                 setQuickTargetChoice({ projectId: project.id, placementId, targets, selected: [], prompt, images });
                 return;
@@ -2174,10 +2231,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 await finishNewChat(id, prompt, images);
                 return;
             }
-            if (scope) {
-                setStatus("no available work target can be read");
-                return;
-            }
+            if (scope && placementId) throw new Error(noReadableTargetReason(workspace, placementId));
             const eng = await api.createEngagement();
             await finishNewChat(eng.id, prompt, images);
         } catch (e) {
@@ -2649,9 +2703,21 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // one is on screen.
     const navPane = () => (<>
         {failureNotice("nav")}
+        <Show when={silentHome()}>
+            {(silent) => (
+                <SilentHomeNotice
+                    home={silent().home}
+                    homes={silent().homes}
+                    busy={homeBusy()}
+                    onRetry={() => void retrySilentHome()}
+                    onSelect={(id) => void selectAccountHome(id).then(bumpNav)}
+                />
+            )}
+        </Show>
         <FacetBrowser
             api={api}
             selected={selected()}
+            createProjectUnavailable={createProjectUnavailable()}
             onSelect={openChat}
             onOpenArchetypeSettings={(id, name, kind, project) => openAgentSettings(id, name, kind, project)}
             openedArchetype={agentSettings()?.id ?? null}

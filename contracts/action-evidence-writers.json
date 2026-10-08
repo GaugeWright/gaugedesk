@@ -91,6 +91,14 @@
     {
       "declaration": {
         "owner": "DispatchRecordAdmission",
+        "name": "commit_claimed_task_input_prefix",
+        "signature": "fn commit_claimed_task_input_prefix < L : Lifecycle > (self , command_id : & str , command_scope : & str , idempotency_key : & str , snapshot_json : & str , phase : & str , batch : LifecycleBatch < L > , facts : & [crate :: CommandRecordFact] , link : & TaskInputLink ,) -> Result < MaterializedTaskInputPrefix , AdmitError > where L :: Command : serde :: Serialize ,"
+      },
+      "classification": "seam"
+    },
+    {
+      "declaration": {
+        "owner": "DispatchRecordAdmission",
         "name": "commit_dispatch",
         "signature": "fn commit_dispatch < L : Lifecycle > (self , scope_id : & str , idempotency_key : & str , command : L :: Command , dispatch : & CommandDispatch ,) -> Result < MaterializedAdmission < L :: State > , AdmitError > where L :: Command : serde :: Serialize ,"
       },

@@ -32,30 +32,59 @@ const locator = (fingerprint: string) => ({
 const project = (id: string) => ({
     id, home_id: "home:local-user", name: id, is_personal: false, targets: [], placements: [],
 });
-const workspace = (...projects: string[]) => ({
-    archetypes: [], projects: projects.map(project), recent: [], workstreams: [],
+const workspace = (projects: string[], archetypes: unknown[] = []) => ({
+    archetypes, projects: projects.map(project), recent: [], workstreams: [],
     work_targets: [], personal_placement: null,
+});
+/** An Agent on the owner's Home: placed in the shared project, so a member
+ * authors it (DR-0453), or the owner's alone. */
+const agent = (id: string, sharedThrough: string[], chats: string[]) => ({
+    id, name: id, kind: "work", instance_id: `inst-${id}`, authoring_target_id: `target-${id}`,
+    is_default: false, shared_through: sharedThrough,
+    chats: chats.map((chat) => ({
+        id: chat, title: "edit chat", kind: "edit", placement: `inst-${id}`,
+        workspace_root: `root-${chat}`, candidate_revision: "rev-1", available_acts: [],
+        targets: [{
+            target_id: `target-${id}`, root: `targets/target-${id}`, name: id, kind: "managed",
+            adapter: "managed", adapter_family: "managed", basis: "main", path_scope: ["."],
+            capability_ceiling: { read: true, propose: true, apply: true, publish: false, release: false },
+            participation: "writable",
+        }],
+    })),
 });
 
 /** A member who accepted an invitation to `proj-shared` on the owner's
  * desktop, so this browser pins it. `own` is the member's own desktop:
- * registered and selected, serving `proj-mine`; or signed out, with its
- * root-signed entry still routing their Personal project to
- * `home:local-user` through its own locator, and nothing answering it. */
-export function sharedMember(own: "selected" | "signed out") {
+ * registered and selected, serving `proj-mine`; registered and selected but
+ * not answering; or signed out, with its root-signed entry still routing their
+ * Personal project to `home:local-user` through its own locator, and nothing
+ * answering it. */
+export function sharedMember(
+    own: "selected" | "not answering" | "signed out",
+    options: { readonly ownerHome?: "current" | "before project models" } = {},
+) {
     const dialed: string[] = [];
     const carried: Array<{ home: string; call: string }> = [];
     const hubWrites: string[] = [];
+    // The member's authoring chats with the shared Agent, as the owner's Home
+    // lists them to the member once made.
+    const editChats: string[] = [];
     const homes = {
-        [MINE]: workspace("proj-mine"),
+        [MINE]: () => workspace(["proj-mine"]),
         // The owner's Home lists only what the member may see, but a
-        // second project here shows that nothing else is taken from it.
-        [OWNERS]: workspace("proj-shared", "proj-owners-other"),
-    } as Record<string, unknown>;
+        // second project and Agent here show that nothing else is taken from it.
+        [OWNERS]: () => workspace(["proj-shared", "proj-owners-other"], [
+            agent("agent-shared", ["proj-shared"], editChats),
+            agent("agent-owners", [], []),
+        ]),
+    } as Record<string, () => unknown>;
     class Tunnel implements RawTunnelFacade {
         private reply: { status: number; body: string } | null = null;
         constructor(private readonly fingerprint: string) {
             dialed.push(fingerprint);
+            // A desktop that is off parks no leg at the relay: its tunnel
+            // never opens.
+            if (own !== "selected" && fingerprint === MINE) throw new Error("the relay holds no leg for this Home");
         }
         sendRequestHead(): void { this.reply = { status: 404, body: "" }; }
         sendBody(): void {}
@@ -78,18 +107,51 @@ export function sharedMember(own: "selected" | "signed out") {
             const fingerprint = this.fingerprint;
             carried.push({ home: fingerprint, call });
             const minted = `minted-${fingerprint.slice(0, 2)}`;
-            if (own === "signed out" && fingerprint === MINE) {
-                this.reply = { status: 502, body: '{"error":"no Home leg is parked"}' };
-            } else if (call === "POST /home/admissions") {
+            if (call === "POST /home/admissions") {
                 this.reply = { status: 201, body: JSON.stringify({ home: "home:local-user", admission: minted }) };
             } else if (headers?.["x-gaugewright-home-admission"] !== minted) {
                 this.reply = { status: 401, body: '{"error":"present the Home admission"}' };
             } else if (call === "GET /workspace") {
-                this.reply = { status: 200, body: JSON.stringify(homes[fingerprint]) };
+                this.reply = { status: 200, body: JSON.stringify(homes[fingerprint]!()) };
             } else if (call === "GET /projections/library/workspace?freshness=live") {
                 this.reply = { status: 200, body: JSON.stringify({
-                    value: homes[fingerprint], freshness: { marker: "live", generated_at: 1 },
+                    value: homes[fingerprint]!(), freshness: { marker: "live", generated_at: 1 },
                 }) };
+            } else if (fingerprint === OWNERS && call === "POST /archetypes/agent-shared/chats") {
+                editChats.push("chat-edit");
+                this.reply = { status: 201, body: '{"id":"chat-edit"}' };
+            } else if (fingerprint === OWNERS && call === "GET /chats/chat-edit/transcript") {
+                this.reply = { status: 200, body: "[]" };
+            } else if (fingerprint === OWNERS && call === "POST /chats/chat-edit/task") {
+                this.reply = { status: 202, body: '{"accepted":true}' };
+            } else if (fingerprint === OWNERS && call === "PUT /archetypes/agent-shared") {
+                this.reply = { status: 204, body: "" };
+            } else if (fingerprint === OWNERS && call === "POST /archetypes/agent-shared/preview") {
+                this.reply = { status: 201, body: '{"id":"chat-preview"}' };
+            } else if (fingerprint === OWNERS && call === "GET /chats/chat-preview/transcript") {
+                this.reply = { status: 200, body: "[]" };
+            } else if (fingerprint === OWNERS && call === "POST /archetypes/agent-shared/publish") {
+                this.reply = { status: 200, body: '{"version":2,"auto_upgraded":0}' };
+            } else if (fingerprint === OWNERS && call.startsWith("GET /account/")) {
+                // A member reaches nothing host-wide on the owner's computer
+                // (DR-0451 §2): the relay refuses it before any route runs.
+                this.reply = { status: 403, body: '{"error":"only the projects shared with you on this computer are reached from elsewhere"}' };
+            } else if (fingerprint === OWNERS && call === "GET /projects/proj-shared/models"
+                && options.ownerHome !== "before project models") {
+                // What a member's turn there runs on: the project's own key.
+                this.reply = { status: 200, body: JSON.stringify({
+                    providers: ["anthropic"], endpoint_models: {},
+                    default_provider: "anthropic", default_model: "claude-opus-5-5",
+                }) };
+            } else if (fingerprint === OWNERS && call === "GET /projects/proj-shared/credentials") {
+                this.reply = { status: 200, body: '{"credentials":[{"provider":"anthropic","linked":true}]}' };
+            } else if (fingerprint === MINE && call === "GET /account/credentials") {
+                // The member's own key, on their own desktop.
+                this.reply = { status: 200, body: '{"credentials":[{"provider":"openai","linked":true}]}' };
+            } else if (fingerprint === MINE && call === "GET /account/default-model") {
+                this.reply = { status: 200, body: '{"provider":"openai","model":"gpt-6.1-sol"}' };
+            } else if (fingerprint === MINE && call === "POST /projects") {
+                this.reply = { status: 201, body: '{"id":"proj-new"}' };
             } else if (call === "POST /projects/proj-shared/placements/pl-shared/chats") {
                 this.reply = { status: 201, body: '{"id":"chat-shared"}' };
             } else if (call === "GET /chats/chat-shared/transcript") {
@@ -136,7 +198,7 @@ export function sharedMember(own: "selected" | "signed out") {
         setItem: (key: string, value: string) => void held.set(key, value),
     });
     // The member's account record: their own desktop, as it registered itself.
-    const accountHomes = own === "selected"
+    const accountHomes = own !== "signed out"
         ? { homes: [{ id: "home:local-user", kind: "registered", endpoint: "", relay: locator(MINE) }],
             selected_home: "home:local-user" }
         : { homes: [], selected_home: null };
@@ -154,7 +216,7 @@ export function sharedMember(own: "selected" | "signed out") {
             return Response.json({ version: 1, puts: [JSON.stringify({ entry: { directory: {
                 root_pubkey: "ed25519:member",
                 home_routes: [{
-                    project: own === "selected" ? "proj-mine" : "proj-default",
+                    project: own !== "signed out" ? "proj-mine" : "proj-default",
                     home_id: "home:local-user", endpoint: "", relay: locator(MINE),
                 }],
             } } })] });

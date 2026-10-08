@@ -768,6 +768,21 @@ pub(crate) fn provider_declares_models(provider: &str) -> bool {
     matches!(provider, "openai-generic" | "openrouter")
 }
 
+/// What the composer may offer for work in one project
+/// ([`crate::Workbench::project_model_access_in`]): provider names and model
+/// ids only, never a credential.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProjectModelAccess {
+    /// The providers a turn there chooses among, in the order the turn
+    /// resolver reads them.
+    pub providers: Vec<String>,
+    /// The declared model ids of those providers that ship no catalog.
+    pub endpoint_models: BTreeMap<String, Vec<String>>,
+    /// What an unpinned turn there runs on; `None` when nothing resolves.
+    pub default_provider: Option<String>,
+    pub default_model: Option<String>,
+}
+
 /// The declared ids for `provider` from the raw setting value: trimmed,
 /// non-empty, deduped, in declared order. Absent, blank, or malformed → none,
 /// so an unreadable value never becomes a model the engine cannot bind.
@@ -1433,10 +1448,22 @@ impl Workbench {
     /// unpinned Panel agent publishes with (DR-0272).
     pub fn work_chat_default_model_in(&self, scope: &str) -> (Option<String>, Option<String>) {
         let linked = self.linked_providers_in_class(scope, self.model_execution_class());
+        self.default_model_over(scope, &linked)
+    }
+
+    /// The provider and model an unpinned turn runs on over `linked`, with
+    /// the models declared in `scope` standing in for a provider that ships
+    /// no catalog: the host override, then what `linked` makes unambiguous,
+    /// then that provider's own default model, then the first declared one.
+    fn default_model_over(
+        &self,
+        scope: &str,
+        linked: &[String],
+    ) -> (Option<String>, Option<String>) {
         let provider = crate::engine::resolve_default_provider(
             gaugedesk_env::var("MODEL_PROVIDER"),
             None,
-            &linked,
+            linked,
         );
         let model = provider.as_deref().and_then(|provider| {
             crate::engine::resolve_turn_model(gaugedesk_env::var("MODEL"), None)
@@ -1448,6 +1475,44 @@ impl Workbench {
                 .or_else(|| self.declared_default_model_in(scope, provider))
         });
         (provider, model)
+    }
+
+    /// What a turn in `project_id` can run on for the account whose
+    /// credentials and model settings live in `scope`: the providers the turn
+    /// resolver chooses among — that account's credentials here, then the
+    /// project's own ([`Self::linked_providers_for_chat_in_class`]) — the
+    /// models that account declared for those of them that ship no catalog,
+    /// and the provider and model an unpinned turn runs on.
+    ///
+    /// This is the composer's model picker for work in a project, and it is
+    /// what a project member reads from the Home that holds a project shared
+    /// with it (WS-1026). A member keeps no credentials or settings on that
+    /// computer (DR-0451 §2), so it is offered exactly the project's own
+    /// credentials, which its turns spend (DR-0451, DR-0453 §5), and never the
+    /// owner's.
+    pub fn project_model_access_in(&self, scope: &str, project_id: &str) -> ProjectModelAccess {
+        let class = self.model_execution_class();
+        let mut providers = self.linked_providers_in_class(scope, class);
+        for provider in self.linked_providers_in_class(&project_scope(project_id), class) {
+            if !providers.contains(&provider) {
+                providers.push(provider);
+            }
+        }
+        let settings = self.account_settings_in(scope).unwrap_or_default();
+        let declared = settings.get(ENDPOINT_MODELS_SETTING).map(String::as_str);
+        let endpoint_models = providers
+            .iter()
+            .filter(|provider| provider_declares_models(provider))
+            .map(|provider| (provider.clone(), declared_models(declared, provider)))
+            .filter(|(_, ids)| !ids.is_empty())
+            .collect();
+        let (default_provider, default_model) = self.default_model_over(scope, &providers);
+        ProjectModelAccess {
+            providers,
+            endpoint_models,
+            default_provider,
+            default_model,
+        }
     }
 
     /// [`declared_default_model_in`](Self::declared_default_model_in) for the

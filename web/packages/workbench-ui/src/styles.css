@@ -1849,7 +1849,7 @@ input {
 
 /* A placement carrying client-specific config/notes (config-only customization, no
    fork) — a quiet badge so a customized client placement reads at a glance. */
-.cfg-badge { margin-left: 6px; font-size: var(--fs-label); padding: 1px 6px; border-radius: 8px;
+.cfg-badge, .shared-badge { margin-left: 6px; font-size: var(--fs-label); padding: 1px 6px; border-radius: 8px;
     border: 1px solid var(--muted); color: var(--muted); background: transparent;
     text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
 /* The placement-customization editor fields (config overlay + notes). */
@@ -1869,6 +1869,9 @@ input {
 .tree-group:hover .action-row .create-btn, .tree-group:focus-within .action-row .create-btn {
     opacity: 1; border-color: var(--edge); }
 .create-btn:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+/* Nowhere to make it right now; its title says why (WS-1036). */
+.create-btn:disabled, .create-btn:disabled:hover { color: var(--muted); background: transparent;
+    border-color: transparent; cursor: not-allowed; opacity: 0.6; }
 .create-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* Creating an Agent needs room to explain the two permanent kinds. Keep the
@@ -2393,6 +2396,12 @@ mark.search-hit { background: var(--accent-soft, rgba(255, 214, 102, 0.32)); col
 .action-error span { flex: 1 1 auto; min-width: 0; }
 .action-error button { flex: 0 0 auto; border: 0; background: none; padding: 0 2px;
     color: inherit; cursor: pointer; }
+
+/* The selected Home did not answer, and the navigator lists only the projects
+   shared with the person (WS-1036, SilentHomeNotice). */
+.silent-home-notice { display: flex; flex-wrap: wrap; align-items: baseline;
+    gap: 4px 12px; flex: 0 0 auto; margin: 0 6px 8px; font-size: var(--fs-small); }
+.silent-home-notice span { flex: 1 1 100%; overflow-wrap: anywhere; }
 
 /* --- durable resource listings (RF-E1: context sources + output catalog) --- */
 .context-drawer .resource-list, .output-catalog .resource-list { display: flex;

@@ -4438,6 +4438,21 @@ pub(crate) async fn post_task(
             &format!("/chats/{id}/task"),
         )
     };
+    // An original Office HTTP request needs its independently verified
+    // requester. A staff/runtime extension is not a substitute for that proof.
+    if authenticated.as_ref().is_some_and(|context| {
+        matches!(
+            context.authentication(),
+            crate::identity::ActorAuthentication::OfficeStaff { .. }
+        )
+    }) && author.is_none()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "office task requires verified HTTP requester",
+        )
+            .into_response();
+    }
     let attempt = attempt.map(|axum::extract::Extension(attempt)| attempt);
     let refused = || {
         author
