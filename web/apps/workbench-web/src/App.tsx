@@ -187,6 +187,7 @@ import {
     scopeProjects,
     scopeTasks,
     quickStartPlacement,
+    ApproveThisComputerDialog,
 } from "@gaugewright/workbench-ui";
 import { isMobileHarness, MobileApp } from "@gaugewright/mobile-web";
 
@@ -639,6 +640,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             () => void checkDesktopUpdate(false)));
     }
     const [claimPromptOpen, setClaimPromptOpen] = createSignal(false);
+    // Another computer holds the selected account's keys, so this one is not
+    // reachable for it until it is approved from there (DR-0359, DR-0361).
+    const [approvalOpen, setApprovalOpen] = createSignal(false);
+    const needsApproval = () => hubSession()?.linked === true
+        && hubSession()?.expired !== true
+        && hubSession()?.reach === "needs_approval";
     const [claimBusy, setClaimBusy] = createSignal(false);
     const [claimError, setClaimError] = createSignal("");
     const canClaimThisComputer = () => hubSession()?.linked === true
@@ -823,6 +830,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const account = (session?.person === offer.account ? session.label : null) || offer.account;
         return { account, projects: offer.projects };
     };
+    // This computer holds the account's own keys once it has published under
+    // them, so it can show the account's recovery code (DR-0361 §3).
+    const recoveryCodeHeld = () => api.desktopSessionAvailable && Boolean(menuIdentity())
+        && !localAccount() && hubSession()?.reach === "published";
     const transferLocalProjects = async (projects: readonly string[]) => {
         await api.transferLocalProjects(projects as ProjectId[]);
         bumpNav();
@@ -2705,6 +2716,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     Claim this computer
                 </button>
             </Show>
+            <Show when={needsApproval()}>
+                <button
+                    type="button"
+                    data-open-device-approval
+                    title="Another computer holds this account's keys. Approve this one from there to reach your work on it from elsewhere."
+                    onClick={() => setApprovalOpen(true)}
+                >
+                    Approve this computer
+                </button>
+            </Show>
             <SettingsMenu
                 api={api}
                 placementPolicy={props.placementPolicy}
@@ -2723,6 +2744,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 analyticsAvailable={Boolean(props.gaugeApps)}
                 analyticsTenant={props.gaugeApps?.selectedTenant}
                 openInvite={inviteDeepLink}
+                onShowRecoveryCode={recoveryCodeHeld() ? () => api.recoveryCode() : undefined}
                 // Never `undefined` on a core build any more. A desktop signs
                 // in against its own control plane through the card; only the
                 // hosted GaugeApps shell takes the admission handoff instead.
@@ -4617,6 +4639,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             </Show>
             <Show when={claimPromptOpen() && canClaimThisComputer()}>
                 <div class="homegate-scrim" data-home-claim-prompt>{claimCard()}</div>
+            </Show>
+            <Show when={approvalOpen() && needsApproval()}>
+                <ApproveThisComputerDialog
+                    account={hubSession()?.label ?? "this account"}
+                    api={api}
+                    onApproved={() => {
+                        setApprovalOpen(false);
+                        void refetchHubSession();
+                    }}
+                    onClose={() => setApprovalOpen(false)}
+                />
             </Show>
         </>
     );

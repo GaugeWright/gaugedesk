@@ -142,6 +142,65 @@ fn standing(
     })
 }
 
+/// The relay route this Home is parked at now, once one has parked.
+fn current_route() -> &'static std::sync::Mutex<Option<gaugedesk_relay_transport::RelayRoute>> {
+    static ROUTE: std::sync::OnceLock<
+        std::sync::Mutex<Option<gaugedesk_relay_transport::RelayRoute>>,
+    > = std::sync::OnceLock::new();
+    ROUTE.get_or_init(Default::default)
+}
+
+/// Register this computer as one of `account`'s Homes at `route`, under that
+/// account's own session (DR-0359 §3).
+fn register_for(
+    wb: &SharedWorkbench,
+    route: &gaugedesk_relay_transport::RelayRoute,
+    account: &str,
+) {
+    let (Some(hub), Some(bearer)) = (
+        crate::account_signin::hub_base(),
+        crate::account_signin::hub_session_token_for(wb, account),
+    ) else {
+        return;
+    };
+    let s = {
+        let guard = wb.lock_unpoisoned();
+        Standing {
+            owner: account.to_owned(),
+            hub,
+            bearer,
+            home_id: guard.home_id().as_str().to_owned(),
+            root_pubkey: String::new(),
+            locator: crate::home_reachability::locator_of(route),
+        }
+    };
+    match register_home(&HttpClient::new(), &s) {
+        Ok(true) => eprintln!(
+            "[first-home] registered {} for a signed-in account at epoch {}",
+            s.home_id, s.locator.route_epoch,
+        ),
+        Ok(false) => {}
+        Err(error) => eprintln!("[first-home] {error}"),
+    }
+}
+
+/// A sign-in registers this computer for the account at once, at the route it
+/// is parked at, rather than at the next rotation. Runs in the background.
+pub fn register_after_signin(wb: &SharedWorkbench, account: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(route) = current_route()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    else {
+        return;
+    };
+    let (wb, account) = (wb.clone(), account.to_owned());
+    std::thread::spawn(move || register_for(&wb, &route, &account));
+}
+
 fn auth(bearer: &str) -> Vec<(String, String)> {
     vec![("Authorization".to_owned(), format!("Bearer {bearer}"))]
 }
@@ -290,6 +349,20 @@ fn publish_directory(wb: &SharedWorkbench, s: &Standing) -> Result<bool, String>
 /// would be worse — an unreachable Home with a silent cause is the exact state
 /// this whole decision exists to end.
 pub fn reconcile(wb: &SharedWorkbench, route: &gaugedesk_relay_transport::RelayRoute) {
+    *current_route()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(route.clone());
+    // Every account signed in here registers this computer as one of its
+    // Homes and publishes its own entry from it (DR-0359 §3), whoever owns
+    // the install.
+    let owner = wb.lock_unpoisoned().home_owner_account();
+    for account in crate::account_signin::signed_in_accounts(wb) {
+        if Some(&account) != owner.as_ref() && !cfg!(test) {
+            let (wb, route, account) = (wb.clone(), route.clone(), account.clone());
+            std::thread::spawn(move || register_for(&wb, &route, &account));
+        }
+        crate::account_publish::spawn_publish(wb, &account);
+    }
     let Some(s) = standing(wb, route) else {
         return;
     };

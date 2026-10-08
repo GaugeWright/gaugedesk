@@ -4026,6 +4026,114 @@
       }
     },
     {
+      "id": "desktop.account-recovery-code.read",
+      "jurisdiction": "local-desktop-workbench",
+      "transport": "http-json-over-loopback",
+      "method": "GET",
+      "path": "/account/recovery-code",
+      "producer": "gaugedesk-app open_control_plane",
+      "consumer": "GaugeDesk desktop account menu and approval dialog via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "authentication": "local-desktop-process-authority",
+      "scope": "desktop-window-signed-in-account-keys",
+      "capability": "show-own-account-recovery-code",
+      "requestSchema": "http/empty",
+      "responseSchema": "gw://schemas/desktop/account-recovery-code/v1",
+      "sideEffect": "none",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/features/approve-this-computer.feature#the account menu shows the recovery code"
+        ],
+        "authority": [
+          "crates/app/src/account_recovery.rs#only_the_window_with_a_signed_in_account_sees_its_recovery_code"
+        ],
+        "journey": [
+          "crates/app/src/account_keys_tests.rs#the_recovery_code_restores_the_root_and_the_account_key"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_recovery.rs#a_code_restores_only_the_account_the_hub_names"
+        ]
+      }
+    },
+    {
+      "id": "desktop.account-recovery-code.restore",
+      "jurisdiction": "local-desktop-workbench",
+      "transport": "http-json-over-loopback",
+      "method": "POST",
+      "path": "/account/recovery-code/restore",
+      "producer": "gaugedesk-app open_control_plane",
+      "consumer": "GaugeDesk desktop account menu and approval dialog via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "authentication": "local-desktop-process-authority",
+      "scope": "desktop-window-signed-in-account-keys",
+      "capability": "restore-own-account-keys-from-recovery-code",
+      "requestSchema": "rust:gaugedesk-app/account_recovery/RestoreFromCode",
+      "responseSchema": "gw://schemas/desktop/account-recovery-code-restore/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/e2e/features/approve-this-computer.feature#a computer that needs approval restores the keys from the recovery code"
+        ],
+        "authority": [
+          "crates/app/src/account_recovery.rs#only_the_window_with_a_signed_in_account_sees_its_recovery_code"
+        ],
+        "journey": [
+          "crates/app/src/account_keys_tests.rs#the_recovery_code_restores_the_root_and_the_account_key"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_recovery.rs#a_code_restores_only_the_account_the_hub_names"
+        ]
+      }
+    },
+    {
+      "id": "desktop.shared-project-pin.keep",
+      "jurisdiction": "local-desktop-workbench",
+      "transport": "http-json-over-loopback",
+      "method": "POST",
+      "path": "/account/shared-projects",
+      "producer": "gaugedesk-app open_control_plane",
+      "consumer": "GaugeDesk desktop invitation acceptance via WorkbenchControlPlane and @gaugewright/control-plane-client",
+      "authentication": "local-desktop-process-authority",
+      "scope": "desktop-window-signed-in-account-shared-projects",
+      "capability": "vouch-for-an-accepted-shared-projects-key",
+      "requestSchema": "rust:gaugedesk-app/shared_project_pins/PinBody",
+      "responseSchema": "gw://schemas/desktop/shared-project-pin/v1",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "web/packages/control-plane-client/src/control-plane-account.test.ts#hands the computer exactly the pin the invitation carried"
+        ],
+        "authority": [
+          "crates/app/src/shared_project_pins_tests.rs#only_the_window_with_a_signed_in_account_keeps_a_pin"
+        ],
+        "journey": [
+          "crates/app/src/shared_project_pins_tests.rs#only_a_route_the_pinned_key_placed_is_vouched_for_newest_first"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/shared_project_pins_tests.rs#a_pin_is_kept_per_account_and_never_moves_to_another_key"
+        ]
+      }
+    },
+    {
       "id": "account.boxes.claim",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",

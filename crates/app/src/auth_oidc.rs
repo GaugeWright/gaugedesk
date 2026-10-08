@@ -3668,6 +3668,66 @@ fn decide_consumer_callback(
     }
 }
 
+/// The address a consumer sign-in may record on the account it signed in to:
+/// the one the provider attested, and only from a provider whose attestation
+/// proves control of it. Microsoft's does not (DR-0189 §4), so a Microsoft
+/// sign-in records nothing; its addresses are proved by an emailed code.
+fn consumer_login_email(provider: ConsumerProvider, id_token: &str) -> Option<String> {
+    match provider.email_proof {
+        EmailProof::ProviderAttested => id_token_verified_email(id_token),
+        EmailProof::EmailedCode => None,
+    }
+}
+
+/// Record on the account a sign-in resolved to the address its provider
+/// attested, when that account does not hold it and no other account does
+/// (WS-937). Returns the outcome's bounded reason.
+///
+/// `attested_email` comes only from a verified id-token's attested claim, never
+/// from a request. It is decided here against a projection rebuilt under the
+/// caller's workbench lock, not the one the callback resolved the account from,
+/// because uniqueness is a fact about the moment of the append. The sign-in has
+/// already succeeded and does not depend on this: a record the store could not
+/// take is written by the next sign-in instead.
+pub(crate) fn record_login_email(
+    wb: &mut Workbench,
+    account_id: &str,
+    attested_email: Option<&str>,
+    route: &'static str,
+    trace: &crate::signin_log::Trace,
+) -> &'static str {
+    use crate::account_auth::{append_facts, decide_login_email, AccountAuth, LoginEmail};
+    use crate::signin_log::{email_not_recorded, email_recorded};
+    const UNAVAILABLE: &str = "verified_email_unavailable";
+    if attested_email.is_none() {
+        return LoginEmail::Unattested.reason();
+    }
+    let Ok(state) = AccountAuth::rebuild(wb.store_ref()) else {
+        email_not_recorded(route, UNAVAILABLE, trace);
+        return UNAVAILABLE;
+    };
+    let decision = decide_login_email(
+        &state,
+        account_id,
+        attested_email,
+        crate::account_session::unix_now(),
+    );
+    match &decision {
+        LoginEmail::Record(facts) => {
+            if append_facts(wb.store_mut(), facts).is_err() {
+                email_not_recorded(route, UNAVAILABLE, trace);
+                return UNAVAILABLE;
+            }
+            email_recorded(route, trace);
+        }
+        LoginEmail::HeldByAnotherAccount | LoginEmail::WithdrawnByAccount => {
+            email_not_recorded(route, decision.reason(), trace);
+        }
+        LoginEmail::AlreadyHeld | LoginEmail::Unattested => {}
+    }
+    decision.reason()
+}
+
 /// Log what [`begin_consumer_signup`] answered a callback with: a refusal when
 /// signup could not be offered, and otherwise the redirect into it.
 fn signup_outcome(
@@ -4870,7 +4930,21 @@ pub async fn get_callback(
         };
         let folded = {
             let mut guard = wb.lock_unpoisoned();
-            fold(&mut guard, context, &corporate_identity)
+            let folded = fold(&mut guard, context, &corporate_identity);
+            // The fold records the attested address on an account it creates.
+            // An account it only signs in to comes to hold it here, from the
+            // same `email_verified` claim. The SAML ACS does not do this: its
+            // address is a mapped attribute or NameID, which nothing attests.
+            if let Ok(resolution) = &folded {
+                record_login_email(
+                    &mut guard,
+                    &resolution.account_id,
+                    corporate_identity.verified_email.as_deref(),
+                    CALLBACK,
+                    &trace,
+                );
+            }
+            folded
         };
         match folded {
             Ok(resolution) => {
@@ -4995,7 +5069,19 @@ pub async fn get_callback(
                 asserted_email: id_token_asserted_email(&verified.id_token),
             },
         ) {
-            ConsumerCallbackDecision::Login(resolution) => resolution,
+            ConsumerCallbackDecision::Login(resolution) => {
+                // Signup recorded the attested address on a new account; an
+                // account that existed before must come to hold it the same
+                // way, or it can never accept an invitation sent to it.
+                record_login_email(
+                    &mut wb.lock_unpoisoned(),
+                    &resolution.account_id,
+                    consumer_login_email(provider, &verified.id_token).as_deref(),
+                    CALLBACK,
+                    &trace.clone().detail(provider.slug),
+                );
+                resolution
+            }
             ConsumerCallbackDecision::Signup { verified_email } => {
                 let response = begin_consumer_signup(
                     &auth,
@@ -8691,6 +8777,69 @@ iqlTEKVISscuchxZtKQJ4k8=
             "an existing account with the same email must still be refused \
              rather than merged into (ADR 0146 section 1)",
         );
+    }
+
+    /// WS-937, structurally and for the reason the test above states: there is
+    /// no harness that drives `get_callback` with a signed id-token. Both OIDC
+    /// sign-in branches must hand the account they resolved, and the address
+    /// only a verified token attests, to `record_login_email`. Without it an
+    /// older account signs in and still never holds its own address, and every
+    /// invitation sent to that address is refused.
+    #[test]
+    fn both_oidc_sign_in_branches_record_the_attested_address() {
+        let source = include_str!("auth_oidc.rs");
+        let production = source
+            .split_once("\nmod tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+        let code: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        assert!(
+            code.contains(
+                "ConsumerCallbackDecision::Login(resolution)=>{record_login_email(\
+                 &mutwb.lock_unpoisoned(),&resolution.account_id,\
+                 consumer_login_email(provider,&verified.id_token).as_deref(),"
+            ),
+            "a consumer sign-in to an existing account records its attested address",
+        );
+        assert!(
+            code.contains(
+                "record_login_email(&mutguard,&resolution.account_id,\
+                 corporate_identity.verified_email.as_deref(),"
+            ),
+            "a corporate OIDC sign-in to an existing account records its attested address",
+        );
+        assert!(
+            code.contains("verified_email:id_token_verified_email(&verified.id_token)"),
+            "the corporate address is the id-token's attested claim, never request input",
+        );
+    }
+
+    #[test]
+    fn only_an_attesting_provider_lets_a_sign_in_record_an_address() {
+        let attested = unsigned_id_token(json!({
+            "email": "person@example.com",
+            "email_verified": true,
+        }));
+        assert_eq!(
+            consumer_login_email(CONSUMER_GOOGLE, &attested).as_deref(),
+            Some("person@example.com")
+        );
+        // Google's claim without `email_verified` attests nothing.
+        assert_eq!(
+            consumer_login_email(
+                CONSUMER_GOOGLE,
+                &unsigned_id_token(json!({"email": "person@example.com"}))
+            ),
+            None
+        );
+        // Microsoft's addresses are proved by an emailed code, never by a
+        // token claim, even one that says it is verified (DR-0189 §4).
+        assert_eq!(consumer_login_email(CONSUMER_MICROSOFT, &attested), None);
     }
 
     #[test]

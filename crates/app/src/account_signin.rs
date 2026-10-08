@@ -1999,6 +1999,14 @@ fn desktop_status_json(
             }
         }
     }
+    // Whether this computer is reachable for the account under its own keys,
+    // so the account surfaces can ask for an approval from another computer
+    // (DR-0359, DR-0361).
+    if let Some(reach) =
+        record.and_then(|record| crate::account_publish::reach_of(wb, &record.person))
+    {
+        status["reach"] = json!(reach);
+    }
     if local_operator_selected(wb) {
         status["local"] = Value::Bool(true);
     } else if wb.lock_unpoisoned().home_owner_account().is_some()
@@ -2353,6 +2361,9 @@ pub async fn post_signin_callback(
             // Signing in makes this computer reachable for the account, with
             // nothing further to choose (DR-0359 §3).
             crate::account_publish::spawn_publish(&wb, &record.person);
+            crate::first_home::register_after_signin(&wb, &record.person);
+            // A first sign-in parks this computer's relay leg (DR-0359 §3).
+            wb.lock_unpoisoned().signal_publication_changed();
             Json(status_json(Some(&record), true)).into_response()
         }
         Err(message) => refuse(
@@ -2959,7 +2970,11 @@ pub async fn post_signin_logout(State(wb): State<SharedWorkbench>) -> impl IntoR
         write_session(&wb, &cleared)
     } {
         Ok(()) => match write_selected(&wb, "") {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Ok(()) => {
+                // The last account signing out releases the leg.
+                wb.lock_unpoisoned().signal_publication_changed();
+                StatusCode::NO_CONTENT.into_response()
+            }
             Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
         },
         Err(message) => (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),

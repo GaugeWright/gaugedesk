@@ -32,6 +32,7 @@ const CLASSES: &[&str] = &[
     "seam",
     "ledger",
     "product-fact",
+    "home-storage",
     "reference-journal",
     "configuration",
 ];

@@ -347,3 +347,69 @@ async fn no_project_moves_off_an_enrolled_project_host() {
         before
     );
 }
+
+/// Capture a relocation's offer of `project`, as `drive_relocate` does before it
+/// sends it.
+fn offer_move(wb: &mut Workbench, project: &str) {
+    wb.store_mut()
+        .append_record(
+            &crate::federation::handoff_scope(project),
+            "event",
+            &serde_json::to_string(&gaugedesk_core::handoff::HandoffEvent::HandoffOffered).unwrap(),
+        )
+        .unwrap();
+}
+
+/// WS-963: a move offered before the enrollment cannot leave after it. The
+/// target admits a moved project before this Home records the commit, so no
+/// check at the commit could stop it; the enrollment waits for the move instead.
+#[test]
+fn an_enrollment_waits_for_a_move_already_offered() {
+    let (_root, shared) = open();
+    let mut wb = shared.lock_unpoisoned();
+    member(&mut wb, "dr-admin", "admin");
+    crate::library_routes::create_named_project(&mut wb, "proj-clinic", "Clinic").unwrap();
+    let home = wb.home_id().as_str().to_owned();
+
+    offer_move(&mut wb, "proj-clinic");
+    let (status, message) = wb
+        .plan_office_profile_enrollment(ORG_SCOPE, ORG_ID, &home, "dr-admin", 7)
+        .unwrap_err();
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(message.contains("moving"), "{message}");
+    assert!(wb.office_profile().unwrap().is_none());
+    assert!(wb.project_moving("proj-clinic"));
+
+    // Once the move is cancelled the enrollment is recorded, and the project
+    // cannot start moving again.
+    crate::federation::abort_handoff(&mut wb, "proj-clinic").unwrap();
+    let record = wb
+        .plan_office_profile_enrollment(ORG_SCOPE, ORG_ID, &home, "dr-admin", 7)
+        .unwrap();
+    append(&mut wb, &record);
+    assert!(wb.relocation_capture_refusal("proj-clinic").is_some());
+}
+
+/// WS-963: a relocation checks the binding when it starts, then releases the
+/// lock before it captures its offer. An enrollment recorded in between is
+/// refused where the offer is captured.
+#[test]
+fn an_enrollment_after_a_relocation_starts_refuses_its_capture() {
+    let (_root, shared) = open();
+    let mut wb = shared.lock_unpoisoned();
+    crate::library_routes::create_named_project(&mut wb, "proj-clinic", "Clinic").unwrap();
+    assert!(wb.office_profile_exit_refusal().is_none());
+    assert!(wb.relocation_capture_refusal("proj-clinic").is_none());
+
+    wb.enroll_office_profile_for_test("dr-admin");
+    let (status, body) = wb.relocation_capture_refusal("proj-clinic").unwrap();
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("office-controlled profile"),
+        "{body}"
+    );
+    assert!(!wb.project_moving("proj-clinic"));
+}

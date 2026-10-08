@@ -16,12 +16,20 @@ import type {
     ProjectShareDirectory,
     ProjectUpstream,
 } from "@gaugewright/control-plane-client";
-import { parseHomeInvitation } from "@gaugewright/control-plane-client";
+import { homeInvitationId, parseHomeInvitation } from "@gaugewright/control-plane-client";
 import { ProjectModelAccessContent, type ProjectModelAccessApi } from "./ProjectModelAccessPanel";
 import { WhipCostsSection, type WhipCostsApi } from "./WhipCosts";
 import type { DeploymentSelection } from "./DeploymentPanel";
 import { availableProjectShareCandidates } from "./project-sharing";
 import "./project-settings.css";
+
+function invitationIdOf(encoded: string): string | null {
+    try {
+        return homeInvitationId(encoded);
+    } catch {
+        return null;
+    }
+}
 
 export type ProjectSettingsPage = "overview" | "people" | "work-data" | "hosting" | "agents" | "model-access" | "background-work";
 
@@ -322,6 +330,13 @@ function PeopleAndSharing(props: ProjectSettingsProps): JSX.Element {
                                 <div class="project-settings-inline-actions"><button type="button" onClick={() => setPendingCancel(null)}>Keep</button><button type="button" class="danger" disabled={busy()} onClick={() => void run(async () => {
                                     await props.api.cancelHomeInvitation?.(props.project.id, pending.id);
                                     setPendingCancel(null);
+                                    // The link above is dead now; offering to copy or email it
+                                    // would hand someone a link that no longer works.
+                                    const shown = invite();
+                                    if (shown && invitationIdOf(shown.invite) === pending.id) {
+                                        setInvite(null);
+                                        setEmailed(null);
+                                    }
                                 }, "Invitation cancelled. Its link no longer works.")}>Cancel invitation</button></div>
                             </Show>
                         </div>}

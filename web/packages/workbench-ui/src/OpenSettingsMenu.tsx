@@ -16,6 +16,7 @@ import { SettingsPanel, type SettingsPanelApi } from "./SettingsPanel";
 import type { SettingsRoom } from "./SettingsSurface";
 import { DevicesModal, type DevicesModalApi } from "./DevicesModal";
 import { LocalProjectTransferDialog, localProjectTransferLabel, type LocalProjectTransferOffer } from "./LocalProjectTransferDialog";
+import { RecoveryCodeDialog } from "./RecoveryCodeDialog";
 
 export interface SettingsMenuApi extends SettingsPanelApi, DevicesModalApi {
     productAnalyticsPolicy?(tenant: string): Promise<ProductAnalyticsPolicy>;
@@ -110,6 +111,9 @@ export function SettingsMenu(props: {
     /** FED-7: an OS-delivered `gaugewright://invite` deep link. Each non-empty value opens the
      *  Devices modal seeded with that link, so its consent preview renders immediately. */
     openInvite?: Accessor<string>;
+    /** Read the signed-in account's recovery code, on a desktop that holds the
+     *  account's keys (DR-0361 §3). The menu offers it only while set. */
+    onShowRecoveryCode?: () => Promise<string>;
     /** End the authenticated account session. Omitted on surfaces without account login. */
     onSignOut?: () => void | Promise<void>;
     /** Begin the composition-owned account ceremony. GaugeApp compositions use
@@ -149,6 +153,7 @@ export function SettingsMenu(props: {
     const [settingsOpen, setSettingsOpen] = createSignal(false);
     const [privacyOpen, setPrivacyOpen] = createSignal(false);
     const [transferOpen, setTransferOpen] = createSignal(false);
+    const [recoveryOpen, setRecoveryOpen] = createSignal(false);
     const transferOffer = () => (props.onTransferLocalProjects && !props.localAccount?.()
         ? props.localProjectTransfer?.() ?? null
         : null);
@@ -331,6 +336,17 @@ export function SettingsMenu(props: {
                 },
             });
         }
+        if (props.onShowRecoveryCode && !props.localAccount?.()) {
+            rows.push({
+                id: "recovery-code",
+                label: "Recovery code",
+                submenu: true,
+                run: () => {
+                    setMenuOpen(false);
+                    setRecoveryOpen(true);
+                },
+            });
+        }
         const offer = transferOffer();
         if (offer && offer.projects.length > 0) {
             rows.push({
@@ -500,6 +516,17 @@ export function SettingsMenu(props: {
                             offer={offer()}
                             onMove={(projects) => props.onTransferLocalProjects!(projects)}
                             onClose={() => setTransferOpen(false)}
+                        />
+                    </SettingsModalBoundary>
+                )}
+            </Show>
+            <Show when={recoveryOpen() && props.onShowRecoveryCode}>
+                {(load) => (
+                    <SettingsModalBoundary surface="Recovery code" onClose={() => setRecoveryOpen(false)}>
+                        <RecoveryCodeDialog
+                            account={props.identity?.()?.email || props.identity?.()?.name || "This account"}
+                            load={load()}
+                            onClose={() => setRecoveryOpen(false)}
                         />
                     </SettingsModalBoundary>
                 )}

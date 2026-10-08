@@ -10,6 +10,7 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
+use crate::home_reference_journal::{HomeReferenceJournal, JournalError};
 use crate::Store;
 
 pub(crate) const CATALOG_SCHEMA: &str = "
@@ -73,6 +74,52 @@ pub struct HomeProductRegistration {
     pub binding: HomeProductBinding,
     /// Storage initialized, not populated, migrated or activated.
     pub ready: bool,
+}
+
+/// Storage prepared for one exact project Home. This grants no membership,
+/// migrated population, use authority, or Home-wide coverage.
+pub struct PreparedHomeStorage {
+    pub product: Store,
+    pub journal: HomeReferenceJournal,
+}
+
+#[derive(Debug)]
+pub enum HomeStoragePreparationError {
+    Product(HomeProductError),
+    Journal(JournalError),
+    Conflict(&'static str),
+}
+
+impl From<HomeProductError> for HomeStoragePreparationError {
+    fn from(error: HomeProductError) -> Self {
+        Self::Product(error)
+    }
+}
+
+impl From<JournalError> for HomeStoragePreparationError {
+    fn from(error: JournalError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+impl std::fmt::Display for HomeStoragePreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Product(error) => error.fmt(f),
+            Self::Journal(error) => error.fmt(f),
+            Self::Conflict(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for HomeStoragePreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Product(error) => Some(error),
+            Self::Journal(error) => Some(error),
+            Self::Conflict(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -371,6 +418,37 @@ fn registration(
 }
 
 impl Store {
+    /// Prepare both files beneath one retained project/Home identity. The host
+    /// catalog binds the product store; that exact product store then binds its
+    /// own journal. An interrupted preparation resumes only those same
+    /// bindings; missing or partial ready files never become empty replacements.
+    /// Product readiness before journal readiness remains inert: the caller
+    /// must independently authenticate, migrate and activate the Home.
+    pub fn prepare_project_home_storage(
+        &mut self,
+        root: &Path,
+        project: &str,
+        home: &str,
+    ) -> Result<PreparedHomeStorage, HomeStoragePreparationError> {
+        if self.home_product.is_some() || project.trim().is_empty() || home.trim().is_empty() {
+            return Err(HomeStoragePreparationError::Conflict(
+                "Home storage preparation requires a host catalog and exact identities",
+            ));
+        }
+        let product_registration = self.home_product_registration(project)?;
+        if product_registration
+            .as_ref()
+            .is_some_and(|registered| registered.binding.home_id != home)
+        {
+            return Err(HomeStoragePreparationError::Conflict(
+                "project Home storage is already bound to another identity",
+            ));
+        }
+        let mut product = self.initialize_home_product(root, project, home)?;
+        let journal = product.initialize_home_journal(root, project, home)?;
+        Ok(PreparedHomeStorage { product, journal })
+    }
+
     /// Exact identity of this bound connection; absent for the install prototype
     /// and host catalog. This is not the project's current hosting assignment.
     pub fn home_product_binding(&self) -> Option<&HomeProductBinding> {

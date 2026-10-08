@@ -146,3 +146,36 @@ it("lists Hosting apart from People & sharing, and neither for Personal", () => 
     expect(pages(true)).not.toContain("People & sharing");
     expect(pages(true)).not.toContain("Hosting");
 });
+
+// Cancelling the invitation whose link the page is showing takes the link
+// away with it; leaving Copy and "Email it" on a dead link invited someone to
+// send it (founder, 2026-10-08).
+it("drops the shown link when its own invitation is cancelled", async () => {
+    const hex = (value: unknown) => Array.from(new TextEncoder().encode(JSON.stringify(value)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const encoded = hex({
+        version: 1, invitation: "hinv-shown", invited_authority: "", invited_email: "alex@example.test",
+        project: "p", home_id: "home:owner", endpoint: "https://home.example/", secret: "s",
+    });
+    const { host, api } = mountPage("people");
+    const sharing = {
+        createHomeInvitation: vi.fn(async () => ({ invite: encoded, url: `https://desk.example/invite?d=${encoded}`, homeId: "home:owner", project: "p", endpoint: "https://home.example/", expiresAt: 4_102_444_800 })),
+        pendingHomeInvitations: vi.fn(async () => [{ id: "hinv-shown", email: "alex@example.test", authority: "", role: "member", expiresAt: 4_102_444_800 }]),
+        cancelHomeInvitation: vi.fn(async () => undefined),
+        emailHomeInvitation: vi.fn(async () => "alex@example.test"),
+    };
+    Object.assign(api, sharing);
+    await vi.waitFor(() => expect(host.querySelector("[data-invite-by-email]")).not.toBeNull());
+    const input = host.querySelector<HTMLInputElement>("[data-invite-by-email] input[type=email], [data-invite-by-email] input")!;
+    input.value = "alex@example.test";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const button = (label: RegExp) => [...host.querySelectorAll("button")].find((b) => label.test(b.textContent ?? ""));
+    button(/^Create invite$/)!.click();
+    await vi.waitFor(() => expect(host.textContent).toContain("Invitation link"));
+    await vi.waitFor(() => expect(button(/^Cancel$/)).toBeDefined());
+    button(/^Cancel$/)!.click();
+    await vi.waitFor(() => expect(button(/^Cancel invitation$/)).toBeDefined());
+    button(/^Cancel invitation$/)!.click();
+    await vi.waitFor(() => expect(sharing.cancelHomeInvitation).toHaveBeenCalledWith("p", "hinv-shown"));
+    await vi.waitFor(() => expect(host.textContent).not.toContain("Invitation link"));
+    expect(button(/^Email it to/)).toBeUndefined();
+});

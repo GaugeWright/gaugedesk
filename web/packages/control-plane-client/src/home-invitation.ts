@@ -126,6 +126,13 @@ export function parseHomeInvitation(encoded: string): HomeInvitationPreview {
     return { authority, ...(email ? { email } : {}), project, homeId, endpoint };
 }
 
+/** The invitation's own id, which the project's pending list names it by. Not
+ * a capability: it lets an inviter's page match a link it is showing to the
+ * pending row they cancel. */
+export function homeInvitationId(encoded: string): string {
+    return envelope(encoded).invitation;
+}
+
 /** Accept directly on the owner's Home using ordinary account authentication.
  * The opaque capability is used only in this request body, never a header, log,
  * or Home registry entry. The one place it rests is the invitee's own tab

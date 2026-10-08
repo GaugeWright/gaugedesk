@@ -375,3 +375,96 @@ fn the_claimant_moves_off_the_install_key_under_a_hand_over_it_signs() {
         &hub.transitions
     ));
 }
+
+#[test]
+fn the_account_surfaces_see_what_publishing_last_managed() {
+    let (_root, wb) = computer();
+    assert_eq!(reach_of(&wb, "acct-a"), None, "nothing tried yet");
+    record_reach(&wb, "acct-a", &Ok(Published::NeedsEnrollment));
+    assert_eq!(reach_of(&wb, "acct-a"), Some(Reach::NeedsApproval));
+    record_reach(&wb, "acct-a", &Err("refused".into()));
+    assert_eq!(reach_of(&wb, "acct-a"), Some(Reach::Failed));
+    record_reach(
+        &wb,
+        "acct-a",
+        &Ok(Published::Entry {
+            root: "r".into(),
+            generation: 1,
+            announced: true,
+        }),
+    );
+    assert_eq!(reach_of(&wb, "acct-a"), Some(Reach::Published));
+    assert_eq!(reach_of(&wb, "acct-b"), None, "per account");
+    assert_eq!(
+        serde_json::to_value(Reach::NeedsApproval).unwrap(),
+        "needs_approval"
+    );
+}
+
+#[test]
+fn a_members_entry_vouches_for_the_shared_project_its_pin_names() {
+    use gaugedesk_core::signature::SigningKey;
+    let world = World::default();
+    let base = serve(&world);
+
+    // The owner's computer publishes the project's route, placed by the
+    // project's own key, under the owner's root.
+    let (owner_root, project_key, host) = (
+        SigningKey::from_seed(&[31; 32]).unwrap(),
+        SigningKey::from_seed(&[32; 32]).unwrap(),
+        SigningKey::from_seed(&[33; 32]).unwrap(),
+    );
+    let placed = gaugedesk_directory_protocol::sign_placement(
+        crate::home::OpaqueHomeRoute {
+            project: "p-shared".into(),
+            home_id: gaugedesk_core::ids::HomeId::new("home:owner"),
+            endpoint: "https://owner.example".into(),
+            relay: None,
+            author_authority: String::new(),
+            author_root_pubkey: String::new(),
+            author_signature: None,
+            placement: None,
+        },
+        &project_key,
+        &host,
+    )
+    .unwrap();
+    let mut owner_entry =
+        gaugedesk_directory_protocol::retraction_entry(owner_root.public_key().as_str().into(), 1);
+    owner_entry.retracted = false;
+    owner_entry.directory.home_routes = vec![placed];
+    owner_entry.device = "owner-laptop".into();
+    let owner_put = gaugedesk_directory_protocol::sign_entry(owner_entry, &owner_root).unwrap();
+    world
+        .directory
+        .lock()
+        .unwrap()
+        .entries
+        .insert(owner_root.public_key().as_str().into(), vec![owner_put]);
+
+    // The member accepted the invitation here and keeps its pin.
+    let (_root, wb) = computer();
+    wb.lock_unpoisoned()
+        .keep_shared_project_pin(
+            "acct-member",
+            &crate::shared_project_pins::SharedProjectPin {
+                id: "p-shared".into(),
+                home_id: "home:owner".into(),
+                project_key: project_key.public_key().as_str().into(),
+                owner_root: owner_root.public_key().as_str().into(),
+            },
+        )
+        .unwrap();
+    let Published::Entry { root, .. } =
+        publish_from_here(&wb, "acct-member", &base, "bearer", &base).unwrap()
+    else {
+        panic!("the member's computer publishes");
+    };
+    let directory = world.directory.lock().unwrap();
+    let routes = &directory.entries[&root][0].entry.directory.home_routes;
+    assert_eq!(routes.len(), 1, "the shared project's route, vouched for");
+    assert!(gaugedesk_directory_protocol::placement_verifies(
+        &routes[0],
+        project_key.public_key().as_str()
+    ));
+}

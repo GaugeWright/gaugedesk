@@ -300,6 +300,84 @@ mod tests {
         );
     }
 
+    /// WS-937: an account that existed before verified contacts were kept signs
+    /// in with a provider that attests its address, and from then on the Hub
+    /// vouches that it holds it — which is what accepting an email invitation
+    /// asks (DR-0332 §5). Another account signing in with the same attested
+    /// address takes nothing, and the log names neither address nor account.
+    #[test]
+    fn a_sign_in_records_the_address_the_hub_then_vouches_for() {
+        use crate::auth_oidc::record_login_email;
+        use crate::signin_log::{capture, Trace, CALLBACK};
+        let mut wb = hub();
+        assert!(!holds_verified_email(
+            &wb,
+            "older-account",
+            "jack@example.test"
+        ));
+
+        let mut outcomes = Vec::new();
+        let text = capture::lines(|| {
+            for (account, attested) in [
+                ("older-account", Some(" Jack@Example.TEST ")),
+                ("older-account", Some("jack@example.test")),
+                ("another-account", Some("jack@example.test")),
+                ("unattested-account", None),
+            ] {
+                outcomes.push(record_login_email(
+                    &mut wb,
+                    account,
+                    attested,
+                    CALLBACK,
+                    &Trace::new().state("state").detail("google"),
+                ));
+            }
+        });
+        assert_eq!(
+            outcomes,
+            [
+                "verified_email_recorded",
+                "verified_email_already_held",
+                "verified_email_held_by_another_account",
+                "no_verified_email",
+            ]
+        );
+        assert!(holds_verified_email(
+            &wb,
+            "older-account",
+            "jack@example.test"
+        ));
+        assert!(!holds_verified_email(
+            &wb,
+            "another-account",
+            "jack@example.test"
+        ));
+        assert!(!holds_verified_email(
+            &wb,
+            "unattested-account",
+            "jack@example.test"
+        ));
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "only a record and a refusal are logged: {text}"
+        );
+        assert!(lines[0].contains(" INFO ") && lines[0].contains("verified_email_recorded"));
+        assert!(
+            lines[1].contains(" WARN ")
+                && lines[1].contains("verified_email_held_by_another_account")
+        );
+        for line in &lines {
+            assert!(line.contains("route=\"/auth/callback\""), "{line}");
+            assert!(line.contains("detail=\"google\""), "{line}");
+        }
+        for secret in ["@", "jack", "older-account", "another-account"] {
+            assert!(!text.contains(secret), "{secret} reached the log: {text}");
+        }
+    }
+
     #[test]
     fn an_identity_asked_nothing_about_email_says_nothing_about_it() {
         let identity: AccountIdentity =

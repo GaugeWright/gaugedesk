@@ -118,10 +118,13 @@ const FACETS: { id: Facet; label: string }[] = [
     { id: "library", label: "Workshop" },
 ];
 
+// A Panel agent's row carries no hover text anywhere — not on the row, its
+// name or this mark. Its row says `title=""`, which stops the hover help from
+// climbing to an ancestor's title (tooltips.ts).
 function AgentKindMark(props: { kind: AgentKind; settings?: boolean }) {
     const label = () => props.kind === "panel" ? "Panel agent" : "Agent";
     return (
-        <span class="agent-kind-mark" data-agent-kind={props.kind} title={label()} aria-label={label()}>
+        <span class="agent-kind-mark" data-agent-kind={props.kind} title={props.kind === "panel" ? undefined : label()} aria-label={label()}>
             <Icon name={props.kind === "panel" ? "panel" : "chat-bubble"} />
             <Show when={props.settings}><Icon name="gear" class="agent-settings-corner" /></Show>
         </span>
@@ -1339,7 +1342,7 @@ export function FacetBrowser(props: {
                 role="treeitem"
                 tabindex="0"
                 aria-label={`Panel agent ${pl.archetypeName} on ${p.name}`}
-                title="Open this placement: pinned contract, deployments, Inbox"
+                title=""
                 onClick={() => openPanelPlacement(p, pl)}
                 onKeyDown={(event) => {
                     if (event.key !== "Enter" && event.key !== " ") return;
@@ -2252,7 +2255,7 @@ export function FacetBrowser(props: {
                                                                 ? `Agent ${pl.archetypeName} on ${p.name} — open its chats`
                                                                 : `Agent ${pl.archetypeName} on ${p.name} — start a chat`
                                                         }
-                                                        title={pl.kind === "panel" ? "Open this placement: pinned contract, deployments, Inbox" : activeChatCount(pl.chats) > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
+                                                        title={pl.kind === "panel" ? "" : activeChatCount(pl.chats) > 0 ? "open this Agent's chats" : "start a chat with this Agent"}
                                                         // Clicking the row is the obvious "start working" path: with no
                                                         // chats yet it opens a new work chat; otherwise it reveals the
                                                         // existing ones (the `+ chat` button always adds another).
@@ -2282,7 +2285,7 @@ export function FacetBrowser(props: {
                                                             already nested under its project, so the "· project"
                                                             half of the old lineage was redundant noise. Keep a
                                                             stable hook for the pivot via the data attribute. */}
-                                                        <span class="node-label" data-lineage-archetype={pl.archetypeId} title="the Agent this placement runs">{mark(pl.archetypeName)}</span>
+                                                        <span class="node-label" data-lineage-archetype={pl.archetypeId} title={pl.kind === "panel" ? undefined : "the Agent this placement runs"}>{mark(pl.archetypeName)}</span>
                                                         {/* This placement carries client-specific config/notes
                                                             (config-only customization, no fork). */}
                                                         <Show when={pl.hasConfig}>
@@ -2359,7 +2362,7 @@ export function FacetBrowser(props: {
                                             tabindex="0"
                                             aria-expanded={archetypeHasChildren(a) ? !isCollapsed(a.id) : undefined}
                                             aria-label={`${a.kind === "panel" ? "Panel agent" : "Agent"} ${a.name}`}
-                                            title={`Open ${a.name} settings`}
+                                            title={a.kind === "panel" ? "" : `Open ${a.name} settings`}
                                             onClick={() => {
                                                 if (!editingIs("rename-archetype", a.id)) props.onOpenArchetypeSettings(a.id, a.name, a.kind, sharedAgentProject(a));
                                             }}

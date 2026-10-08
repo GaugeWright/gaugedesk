@@ -290,8 +290,8 @@ pub(crate) async fn supervise_home_reachability(
         .subscribe();
     let mut parked: Option<ParkedLeg> = None;
     loop {
-        // An already claimed computer may need its reachability attachment
-        // reconciled from state. An unclaimed computer remains local-only.
+        // An already claimed computer may need its library sync attachment
+        // reconciled from state.
         match crate::first_home::attach_if_never_offered(&wb, &root) {
             Ok(true) => tracing::info!(
                 "[first-home] library sync attached; this computer is now publishing its reachability"
@@ -323,7 +323,11 @@ pub(crate) async fn supervise_home_reachability(
         }
         // Read and release: this is a std mutex, and holding it across the wait
         // below would stop every request this Home serves.
-        let publishes = wb.lock_unpoisoned().library_sync_active();
+        // Signing in makes this computer reachable for the account, with
+        // nothing further to choose (DR-0359 §3), so any signed-in account
+        // parks a leg as library sync does.
+        let signed_in = !crate::account_signin::signed_in_accounts(&wb).is_empty();
+        let publishes = signed_in || wb.lock_unpoisoned().library_sync_active();
         match (publishes, parked.is_some()) {
             (true, false) => match start_home_relay(&wb, crossings, &root, &endpoint) {
                 Ok(leg) => parked = Some(leg),

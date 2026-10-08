@@ -212,11 +212,14 @@ impl Workbench {
 
     /// This computer's entry for `account` at `generation`, signed by the
     /// account's root, its state sealed under the account's own key.
+    /// `vouched` are the routes of shared projects the account reaches, which
+    /// this computer vouches for under the account's root (DR-0458).
     pub fn account_signed_entry(
         &self,
         account: &str,
         keys: &AccountKeys,
         generation: u64,
+        vouched: Vec<crate::home::OpaqueHomeRoute>,
     ) -> Option<SignedDirectoryPut> {
         let scope = self.desktop_account_store_scope(account);
         let state = crate::account::Account::rebuild_in(self.store_ref(), &scope).ok()?;
@@ -226,7 +229,10 @@ impl Workbench {
             &state,
             generation,
             Vec::new(),
-            self.account_routes_served_here(account),
+            self.account_routes_served_here(account)
+                .into_iter()
+                .chain(vouched)
+                .collect(),
         )?
         .entry;
         entry.device = device_name(keys);
@@ -352,11 +358,15 @@ pub fn publish_from_here(
     let device = device_name(&keys);
     let generation = next_generation(&root_entries(&http, directory, &root)?, &device)
         .ok_or_else(|| "this computer's directory generation is exhausted".to_owned())?;
+    // The shared projects the account reaches, as their owners publish them,
+    // read off the lock (DR-0458).
+    let pins = wb.lock_unpoisoned().shared_project_pins(account);
+    let vouched = crate::shared_project_pins::vouched_routes(&http, directory, &pins);
     let put = {
         let mut guard = wb.lock_unpoisoned();
         guard.ensure_served_project_authorities(account);
         guard
-            .account_signed_entry(account, &keys, generation)
+            .account_signed_entry(account, &keys, generation, vouched)
             .ok_or_else(|| "this computer's entry could not be signed".to_owned())?
     };
     crate::directory_sync::publish(&http, directory, &put)?;
@@ -455,6 +465,64 @@ pub fn withdraw_from_here(
     Ok(true)
 }
 
+/// What this computer last managed for an account's reach, as the account
+/// surfaces show it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// This computer's entry is published under the account's root.
+    Published,
+    /// Another computer holds the account's root: approve this one from it.
+    NeedsApproval,
+    /// The account is still on this computer's install key, until the Hub
+    /// keeps hand-overs.
+    WaitingForHub,
+    /// The last attempt failed; the next sign-in or change tries again.
+    Failed,
+}
+
+type ReachKey = (std::path::PathBuf, String);
+
+fn reaches() -> &'static std::sync::Mutex<std::collections::HashMap<ReachKey, Reach>> {
+    static REACHES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<ReachKey, Reach>>,
+    > = std::sync::OnceLock::new();
+    REACHES.get_or_init(Default::default)
+}
+
+fn reach_key(wb: &SharedWorkbench, account: &str) -> ReachKey {
+    (
+        wb.lock_unpoisoned().root_path().to_path_buf(),
+        account.to_owned(),
+    )
+}
+
+/// What this computer last managed for `account`'s reach, if it has tried
+/// since it started.
+pub fn reach_of(wb: &SharedWorkbench, account: &str) -> Option<Reach> {
+    let key = reach_key(wb, account);
+    reaches()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .copied()
+}
+
+/// Record the outcome of a publish attempt for the account surfaces.
+pub fn record_reach(wb: &SharedWorkbench, account: &str, outcome: &Result<Published, String>) {
+    let reach = match outcome {
+        Ok(Published::Entry { .. }) => Reach::Published,
+        Ok(Published::NeedsEnrollment) => Reach::NeedsApproval,
+        Ok(Published::HubPredatesHandOvers) => Reach::WaitingForHub,
+        Err(_) => Reach::Failed,
+    };
+    let key = reach_key(wb, account);
+    reaches()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, reach);
+}
+
 /// Publish `account`'s entry from this computer in the background, after it
 /// signs in or what it serves changes. Each outcome is logged by its kind
 /// alone. Unit tests drive [`publish_from_here`] against a stand-in instead,
@@ -472,7 +540,9 @@ pub fn spawn_publish(wb: &SharedWorkbench, account: &str) {
     let (wb, account) = (wb.clone(), account.to_owned());
     std::thread::spawn(move || {
         let directory = crate::directory_sync::directory_url_from_env();
-        match publish_from_here(&wb, &account, &hub, &bearer, &directory) {
+        let outcome = publish_from_here(&wb, &account, &hub, &bearer, &directory);
+        record_reach(&wb, &account, &outcome);
+        match outcome {
             Ok(Published::Entry { generation, .. }) => {
                 tracing::info!("published this computer's entry for an account at generation {generation}")
             }

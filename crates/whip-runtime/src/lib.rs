@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod home_import;
 pub mod host_actions;
 use std::fmt;
 use std::io::{self, Read};

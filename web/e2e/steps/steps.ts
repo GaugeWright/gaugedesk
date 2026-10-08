@@ -846,7 +846,11 @@ When("I create a Panel agent named {string}", async ({ page }, name: string) => 
 Then("the Panel agent {string} is in the Workshop", async ({ page }, name: string) => {
     const row = page.locator("[data-archetype]", { hasText: name });
     await expect(row.locator(".node-label", { hasText: new RegExp(`^${name}$`) })).toBeVisible();
-    await expect(row.locator('[data-agent-kind="panel"]')).toHaveAttribute("title", "Panel agent");
+    const mark = row.locator('[data-agent-kind="panel"]');
+    await expect(mark).toHaveAttribute("aria-label", "Panel agent");
+    // A Panel agent's row has no hover text.
+    await expect(mark).not.toHaveAttribute("title");
+    await expect(row.locator(".tree-node.archetype")).toHaveAttribute("title", "");
 });
 
 // Opening a Panel agent puts its draft across the chat and content panes.

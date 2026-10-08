@@ -444,6 +444,138 @@ fn home_product_store_requires_its_own_journal_registration_and_separate_operati
 }
 
 #[test]
+fn paired_home_storage_recovers_the_exact_product_and_journal_after_interruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Store::open(dir.path().join("host.sqlite").to_str().unwrap()).unwrap();
+    let mut staged = catalog
+        .initialize_home_product(dir.path(), "project", "home:project")
+        .unwrap();
+    let product_binding = staged.home_product_binding().unwrap().clone();
+    staged
+        .append_record("original:scope", "fact", "retained")
+        .unwrap();
+    let journal_binding = staged
+        .register_home_journal("project", "home:project")
+        .unwrap()
+        .binding;
+    let mut interrupted_journal = HomeReferenceJournal::create(
+        &crate::home_reference_journal::home_reference_journal_path(dir.path(), "project"),
+        journal_binding.clone(),
+    )
+    .unwrap();
+    let pending = interrupted_journal
+        .register_checked_program_request(
+            "home:project",
+            "runtime:one",
+            &"a".repeat(32),
+            "request:one",
+            "basis:one",
+        )
+        .unwrap();
+    drop(interrupted_journal);
+    drop(staged);
+
+    let prepared = catalog
+        .prepare_project_home_storage(dir.path(), "project", "home:project")
+        .unwrap();
+    assert_eq!(
+        prepared.product.home_product_binding(),
+        Some(&product_binding)
+    );
+    assert_eq!(prepared.journal.binding(), &journal_binding);
+    assert_eq!(
+        prepared
+            .journal
+            .reference_operation(&pending.operation_id)
+            .unwrap(),
+        Some(pending)
+    );
+    assert_eq!(
+        prepared.product.records("original:scope", "fact").unwrap(),
+        ["retained"]
+    );
+    assert!(
+        prepared
+            .product
+            .home_journal_registration("project")
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+    assert!(catalog
+        .home_journal_registration("project")
+        .unwrap()
+        .is_none());
+    drop(prepared);
+
+    let retried = catalog
+        .prepare_project_home_storage(dir.path(), "project", "home:project")
+        .unwrap();
+    assert_eq!(
+        retried.product.home_product_binding(),
+        Some(&product_binding)
+    );
+    assert_eq!(retried.journal.binding(), &journal_binding);
+    assert!(catalog
+        .prepare_project_home_storage(dir.path(), "project", "home:other")
+        .is_err());
+    assert!(catalog
+        .prepare_project_home_storage(dir.path(), "other", "home:project")
+        .is_err());
+    let other = catalog
+        .prepare_project_home_storage(dir.path(), "other", "home:other")
+        .unwrap();
+    assert_ne!(
+        other.product.home_product_binding().unwrap().home_id,
+        product_binding.home_id
+    );
+    assert_ne!(
+        home_product_path(dir.path(), "project"),
+        home_product_path(dir.path(), "other")
+    );
+}
+
+#[test]
+fn paired_home_storage_refuses_a_lost_journal_without_replacing_either_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut catalog = Store::open(dir.path().join("host.sqlite").to_str().unwrap()).unwrap();
+    let mut prepared = catalog
+        .prepare_project_home_storage(dir.path(), "project", "home:project")
+        .unwrap();
+    let product_binding = prepared.product.home_product_binding().unwrap().clone();
+    let journal_binding = prepared.journal.binding().clone();
+    prepared
+        .product
+        .append_record("original:scope", "fact", "retained")
+        .unwrap();
+    drop(prepared);
+    let journal_path =
+        crate::home_reference_journal::home_reference_journal_path(dir.path(), "project");
+    std::fs::remove_file(&journal_path).unwrap();
+
+    assert!(catalog
+        .prepare_project_home_storage(dir.path(), "project", "home:project")
+        .is_err());
+    assert!(!journal_path.exists());
+    let product = catalog
+        .open_registered_home_product(dir.path(), "project")
+        .unwrap();
+    assert_eq!(product.home_product_binding(), Some(&product_binding));
+    assert_eq!(
+        product.records("original:scope", "fact").unwrap(),
+        ["retained"]
+    );
+    assert_eq!(
+        product
+            .home_journal_registration("project")
+            .unwrap()
+            .unwrap()
+            .binding,
+        journal_binding
+    );
+}
+
+#[test]
 fn dispatch_basis_refuses_replacement_even_at_the_same_path_and_heads() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("product.sqlite");

@@ -644,6 +644,11 @@ async fn join_handshake(
         wb.upsert_account_device_in(scope, &record)
             .map_err(|e| format!("record device: {e:?}"))?;
     }
+    // An account's own keys arrived: this computer is reachable for the
+    // account now, so it publishes its entry without waiting for a change.
+    if !account.is_empty() {
+        crate::account_publish::spawn_publish(wb, account);
+    }
     leg.set_phase(EnrollPhase::Completed);
     Ok(())
 }

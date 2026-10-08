@@ -13,6 +13,7 @@ const session = (homeClaim: HubSessionStatus["homeClaim"], extra: Partial<HubSes
     expired: false,
     device: null,
     homeClaim,
+    reach: null,
     ...extra,
 });
 

@@ -300,8 +300,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                     && reason?.status === 401
                     && reason.detail === "target Home admission required"
                 ) {
-                    this.homeAdmission = null;
-                    await this.admitHome();
+                    await this.readmitHome();
                 }
             },
         });
@@ -640,6 +639,19 @@ export class WorkbenchControlPlane implements ControlPlane {
         return result.home;
     }
 
+    /** Admit again after the co-resident Home refused a request that carried
+     * no admission. The admission held now is replaced when the new one
+     * arrives and is never cleared first: the refused request was built
+     * before it was minted, so it is not the one at fault. A desktop window's
+     * first message proves the chat's Home actor several times at once — for
+     * its snapshot, its stream and its turn — and each refusal used to clear
+     * the admission another caller had just minted for the length of its own
+     * renewal. Whatever was built meanwhile went out with none, the turn's
+     * own actor check included, and the turn failed (WS-936). */
+    private async readmitHome(): Promise<void> {
+        await this.admitHome();
+    }
+
     private routeJson(): RouteJson {
         return this.nativeRemote
             ? (...args) => this.requireHomeTransport().then((transport) => transport.json(...args))
@@ -665,6 +677,13 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     private async runtimeAccountJson(): Promise<RouteJson> {
         return this.usesRemoteHome() ? (await this.requireHomeTransport()).json : this.route;
+    }
+
+    /** Device enrollment hands this computer's keys over, so on a desktop it is
+     * this computer's own plane under the window's account session, whichever
+     * Home the window shows (DR-0361 §1). */
+    private enrollmentJson(): RouteJson {
+        return this.desktopSessionAvailable ? this.route : this.routeJson();
     }
 
     private async desktopSessionJson(): Promise<RouteJson> {
@@ -1371,6 +1390,14 @@ export class WorkbenchControlPlane implements ControlPlane {
         // over the relay like the person's own relay-only Homes (DR-0370).
         if (accepted.shared) {
             await accountClient.pinSharedProject({ subject: await this.pinSubject() }, accepted.shared);
+            // On a desktop, this computer holds the account's keys and vouches
+            // for the project's key under the account's own entry, so the
+            // account's other devices trust it too (DR-0458). Reaching the
+            // project here does not wait on that.
+            if (this.desktopSessionAvailable) {
+                await accountClient.keepSharedProjectPin(this.route, accepted.shared).catch((error) =>
+                    console.warn("this computer could not vouch for the shared project's key", error));
+            }
         }
         await accountClient.accountRegisterHome(this.route, home, true);
         await accountClient.accountPublishHomeRoute(this.route, {
@@ -2056,8 +2083,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                 // admission refusal. Actor preflight precedes opening that stream.
                 if (remote || !(error instanceof RouteHttpError) || error.status !== 401 || !isExpiredHomeAdmission(error)) throw error;
                 assertProject();
-                this.homeAdmission = null;
-                await this.admitHome();
+                await this.readmitHome();
                 assertProject();
                 proof = await identity(transport);
             }
@@ -2105,8 +2131,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                     catch (error) {
                         if (remote || !(error instanceof RouteHttpError) || error.status !== 401 || !isExpiredHomeAdmission(error)) throw error;
                         assertProject();
-                        this.homeAdmission = null;
-                        await this.admitHome();
+                        await this.readmitHome();
                         await verify(transport);
                     }
                     // One reconnect owner: localWorkTransport.events already
@@ -2118,10 +2143,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                     assertProject();
                     if (reason?.status === 401 && /target Home admission required/.test(reason.detail ?? "")) {
                         if (remote) await this.invalidateHomeTransport(project);
-                        else {
-                            this.homeAdmission = null;
-                            await this.admitHome();
-                        }
+                        else await this.readmitHome();
                     }
                 },
             });
@@ -2753,7 +2775,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     enrollHost(): Promise<accountClient.EnrollmentTicket> {
-        return accountClient.enrollHost(this.routeJson());
+        return accountClient.enrollHost(this.enrollmentJson());
     }
 
     mintMachineControllerInvitation(
@@ -2783,19 +2805,19 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     enrollHostStatus(session: string): Promise<accountClient.EnrollmentStatus> {
-        return accountClient.enrollHostStatus(this.routeJson(), session);
+        return accountClient.enrollHostStatus(this.enrollmentJson(), session);
     }
 
     enrollAuthorize(session: string): Promise<void> {
-        return accountClient.enrollAuthorize(this.routeJson(), session);
+        return accountClient.enrollAuthorize(this.enrollmentJson(), session);
     }
 
     enrollJoin(ticket: accountClient.EnrollmentTicket): Promise<string> {
-        return accountClient.enrollJoin(this.routeJson(), ticket);
+        return accountClient.enrollJoin(this.enrollmentJson(), ticket);
     }
 
     enrollJoinStatus(session: string): Promise<accountClient.EnrollmentStatus> {
-        return accountClient.enrollJoinStatus(this.routeJson(), session);
+        return accountClient.enrollJoinStatus(this.enrollmentJson(), session);
     }
 
     accountSettings(): Promise<Record<string, string>> {
@@ -2963,6 +2985,16 @@ export class WorkbenchControlPlane implements ControlPlane {
      *  never a remote Home: only the window holds the local account's work. */
     localProjects(): Promise<accountClient.LocalProjects> {
         return this.desktopSessionJson().then((json) => accountClient.localProjects(json));
+    }
+
+    /** This account's recovery code, while this computer holds its keys (DR-0361 §3). */
+    recoveryCode(): Promise<string> {
+        return this.desktopSessionJson().then((json) => accountClient.recoveryCode(json));
+    }
+
+    /** Restore this account's keys on this computer from its recovery code. */
+    restoreFromRecoveryCode(code: string): Promise<void> {
+        return this.desktopSessionJson().then((json) => accountClient.restoreFromRecoveryCode(json, code));
     }
 
     transferLocalProjects(projects: readonly ProjectId[]): Promise<{ readonly moved: readonly ProjectId[] }> {

@@ -930,6 +930,75 @@ pub fn decide_verify_email(
     Ok(vec![AccountAuthFact::Email(record)])
 }
 
+/// What signing in to an existing account does with the address the provider
+/// attested on a signature-verified id-token (WS-937).
+///
+/// Signup records that address on the account it creates. Signing in recorded
+/// nothing, so an account made before verified contacts were kept, or through
+/// an entrance that kept none, signed in every day and still never held its own
+/// address — and could never accept an invitation sent to it, because the
+/// account authority vouches only for an active verified contact (DR-0332 §5).
+/// The proof a sign-in carries is the one signup already accepts (DR-0177), so
+/// the same record follows from it, under the same uniqueness rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginEmail {
+    /// Record the address on the account that signed in.
+    Record(Vec<AccountAuthFact>),
+    /// The account already holds it.
+    AlreadyHeld,
+    /// Another account holds it. An address is never moved between accounts:
+    /// email is a contact, not a merge key (ADR 0146 §1).
+    HeldByAnotherAccount,
+    /// This account let the address go. Signing in does not restore it, as a
+    /// removed provider link is not restored by signing in with it either.
+    WithdrawnByAccount,
+    /// The token attested no usable address.
+    Unattested,
+}
+
+impl LoginEmail {
+    /// The bounded reason a sign-in log records. Never the address.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Record(_) => "verified_email_recorded",
+            Self::AlreadyHeld => "verified_email_already_held",
+            Self::HeldByAnotherAccount => "verified_email_held_by_another_account",
+            Self::WithdrawnByAccount => "verified_email_withdrawn_by_account",
+            Self::Unattested => "no_verified_email",
+        }
+    }
+}
+
+/// Decide what a sign-in to `account_id` records from `attested_email`, which
+/// the caller must take only from a verified id-token's attested claim — never
+/// from anything a request supplied.
+pub fn decide_login_email(
+    state: &AccountAuth,
+    account_id: &str,
+    attested_email: Option<&str>,
+    verified_at: u64,
+) -> LoginEmail {
+    let Some(record) = attested_email
+        .and_then(|email| VerifiedEmailRecord::new(account_id, email, verified_at).ok())
+    else {
+        return LoginEmail::Unattested;
+    };
+    if let Some(existing) = state
+        .emails
+        .get(&record.id)
+        .filter(|existing| existing.account_id == record.account_id)
+    {
+        return match existing.status {
+            AuthMethodStatus::Active => LoginEmail::AlreadyHeld,
+            AuthMethodStatus::Revoked => LoginEmail::WithdrawnByAccount,
+        };
+    }
+    match decide_verify_email(state, record) {
+        Ok(facts) => LoginEmail::Record(facts),
+        Err(_) => LoginEmail::HeldByAnotherAccount,
+    }
+}
+
 pub fn decide_add_webauthn(
     state: &AccountAuth,
     record: WebAuthnMethodRecord,
@@ -1695,6 +1764,89 @@ mod tests {
             decide_verify_email(&state, bob_email),
             Err(AuthRejection::CredentialAlreadyLinked)
         );
+    }
+
+    // ---- what a sign-in records from its attested address (WS-937) --------
+
+    #[test]
+    fn a_sign_in_to_an_account_without_its_address_records_it() {
+        let mut state = AccountAuth::default();
+        let decision = decide_login_email(&state, "older-account", Some(" Jack@Example.COM "), 7);
+        let LoginEmail::Record(facts) = &decision else {
+            panic!("expected the address to be recorded, got {decision:?}");
+        };
+        assert_eq!(
+            facts,
+            &vec![AccountAuthFact::Email(
+                VerifiedEmailRecord::new("older-account", "jack@example.com", 7).unwrap()
+            )]
+        );
+        apply(&mut state, facts);
+        assert_eq!(
+            state.account_holding_active_email("jack@example.com"),
+            Some("older-account")
+        );
+        // The next sign-in finds it held and writes nothing.
+        assert_eq!(
+            decide_login_email(&state, "older-account", Some("jack@example.com"), 8),
+            LoginEmail::AlreadyHeld
+        );
+    }
+
+    #[test]
+    fn a_sign_in_never_takes_an_address_another_account_holds() {
+        let mut state = AccountAuth::default();
+        apply(
+            &mut state,
+            &[AccountAuthFact::Email(
+                VerifiedEmailRecord::new("first-account", "shared@example.com", 1).unwrap(),
+            )],
+        );
+        assert_eq!(
+            decide_login_email(&state, "second-account", Some("Shared@Example.com"), 2),
+            LoginEmail::HeldByAnotherAccount
+        );
+        assert_eq!(
+            state.account_holding_active_email("shared@example.com"),
+            Some("first-account")
+        );
+    }
+
+    #[test]
+    fn a_sign_in_without_an_attested_address_records_nothing() {
+        let state = AccountAuth::default();
+        assert_eq!(
+            decide_login_email(&state, "account", None, 1),
+            LoginEmail::Unattested
+        );
+        assert_eq!(
+            decide_login_email(&state, "account", Some("not an address"), 1),
+            LoginEmail::Unattested
+        );
+    }
+
+    #[test]
+    fn a_sign_in_does_not_restore_an_address_its_account_let_go() {
+        let mut state = AccountAuth::default();
+        let mut withdrawn = VerifiedEmailRecord::new("account", "old@example.com", 1).unwrap();
+        withdrawn.status = AuthMethodStatus::Revoked;
+        apply(&mut state, &[AccountAuthFact::Email(withdrawn)]);
+        assert_eq!(
+            decide_login_email(&state, "account", Some("old@example.com"), 2),
+            LoginEmail::WithdrawnByAccount
+        );
+    }
+
+    #[test]
+    fn an_address_another_account_let_go_is_free_to_record() {
+        let mut state = AccountAuth::default();
+        let mut released = VerifiedEmailRecord::new("previous", "free@example.com", 1).unwrap();
+        released.status = AuthMethodStatus::Revoked;
+        apply(&mut state, &[AccountAuthFact::Email(released)]);
+        assert!(matches!(
+            decide_login_email(&state, "current", Some("free@example.com"), 2),
+            LoginEmail::Record(_)
+        ));
     }
 
     #[test]

@@ -90,3 +90,35 @@ fn an_account_id_too_long_for_a_hex_directory_name_mints_and_reloads() {
         hex::encode("acct-a").as_str()
     );
 }
+
+#[test]
+fn the_recovery_code_restores_the_root_and_the_account_key() {
+    let first = tempfile::tempdir().unwrap();
+    let minted = AccountKeyStore::new(first.path())
+        .mint("acct-a", NOW)
+        .unwrap();
+    assert_eq!(minted.account_key, account_key_from_root(&minted.root));
+    let code = AccountKeyStore::new(first.path())
+        .recovery_code("acct-a", NOW)
+        .unwrap()
+        .expect("a computer holding the keys shows the code");
+
+    let second = tempfile::tempdir().unwrap();
+    let store = AccountKeyStore::new(second.path());
+    assert_eq!(store.recovery_code("acct-a", NOW).unwrap(), None);
+    let root = gaugedesk_core::recovery::import_recovery(&code).unwrap();
+    let restored = store.restore("acct-a", root, NOW).unwrap();
+    assert_eq!(restored.root.public_key(), minted.root.public_key());
+    assert_eq!(restored.account_key, minted.account_key);
+    assert_ne!(
+        restored.device.public_key(),
+        minted.device.public_key(),
+        "the restored computer has a device key of its own"
+    );
+    assert!(restored.delegation.verify(NOW).is_ok());
+    let again = gaugedesk_core::recovery::import_recovery(&code).unwrap();
+    assert!(
+        store.restore("acct-a", again, NOW).is_err(),
+        "never over held keys"
+    );
+}

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { accountDevices, accountDirectory, hubSessionSelectLocal, parseAccountDevice } from "./control-plane-account";
+import { accountDevices, accountDirectory, hubSessionSelectLocal, keepSharedProjectPin, parseAccountDevice } from "./control-plane-account";
 import type { RouteJson } from "./control-plane-transport";
 
 describe("explicit local desktop posture", () => {
@@ -11,6 +11,24 @@ describe("explicit local desktop posture", () => {
         expect(selected).toHaveBeenCalledWith("POST", "/account/hub-session/select-local", {});
         const refused = vi.fn(async () => ({ available: true, linked: false })) as unknown as RouteJson;
         await expect(hubSessionSelectLocal(refused)).rejects.toThrow("not selected");
+    });
+});
+
+describe("a shared project's pin on this computer (DR-0458)", () => {
+    it("hands the computer exactly the pin the invitation carried", async () => {
+        const json = vi.fn(async () => ({ project: "p-shared" })) as unknown as RouteJson;
+        await keepSharedProjectPin(json, {
+            project: "p-shared",
+            homeId: "home:owner",
+            projectKey: "project-key",
+            ownerRoot: "owner-root",
+        });
+        expect(json).toHaveBeenCalledWith("POST", "/account/shared-projects", {
+            project: "p-shared",
+            home_id: "home:owner",
+            project_key: "project-key",
+            owner_root: "owner-root",
+        });
     });
 });
 

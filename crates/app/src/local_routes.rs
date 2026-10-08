@@ -223,6 +223,22 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             "/local-projects/transfer",
             post(crate::project_transfer::transfer_local_projects),
         )
+        // An account's recovery code, shown and used from the window alone
+        // (DR-0361 §3).
+        .route(
+            "/account/recovery-code",
+            get(crate::account_recovery::get_recovery_code),
+        )
+        .route(
+            "/account/recovery-code/restore",
+            post(crate::account_recovery::post_restore_from_code),
+        )
+        // A shared project's pin, which this computer then vouches for under
+        // the account's own entry (DR-0458).
+        .route(
+            "/account/shared-projects",
+            post(crate::shared_project_pins::post_shared_project_pin),
+        )
         .route(
             "/organizations/{tenant}/shared-project/materialize",
             post(lr::post_materialize_organization_shared_project),

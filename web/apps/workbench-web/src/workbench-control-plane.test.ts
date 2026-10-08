@@ -1934,6 +1934,68 @@ describe("co-resident task author preflight", () => {
             { path: "/file-actions/actor", method: "GET", bearer: "Bearer alice-login", admission: "renewed" },
         ]);
     });
+
+    it("keeps the admission in use while a late refusal renews it (WS-936)", async () => {
+        // A desktop window's first message proves the chat's Home actor more
+        // than once at a time — its snapshot, its stream and its turn each
+        // take a task context — and each is refused before the first admission
+        // lands. One refusal can arrive after another caller has re-admitted
+        // and gone on to its turn.
+        vi.stubGlobal("window", { __TAURI_INTERNALS__: {} });
+        const gate = () => {
+            let open!: () => void;
+            const opened = new Promise<void>((resolve) => { open = resolve; });
+            return { open, opened };
+        };
+        const lateRefusal = gate();
+        const renewalAsked = gate();
+        const renewal = gate();
+        const sent: string[] = [];
+        let admissions = 0;
+        let unadmittedActorReads = 0;
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const path = new URL(String(input)).pathname;
+            const admission = new Headers(init?.headers).get("x-gaugewright-home-admission");
+            sent.push(`${init?.method ?? "GET"} ${path} ${admission ?? "(none)"}`);
+            if (path === "/home/admissions") {
+                const minted = `admission-${++admissions}`;
+                if (admissions === 2) {
+                    renewalAsked.open();
+                    await renewal.opened;
+                }
+                return Response.json({ home: "home:a", admission: minted }, { status: 201 });
+            }
+            if (path === "/file-actions/actor") {
+                if (admission) return Response.json({ home: "home:a", actor: "alice" });
+                if (++unadmittedActorReads === 2) await lateRefusal.opened;
+                return Response.json({ error: "target Home admission required" }, { status: 401 });
+            }
+            if (path === "/chats/chat-a/task") return Response.json({ run_phase: "Settled" });
+            throw new Error(`unexpected route ${path}`);
+        }));
+        const api = new WorkbenchControlPlane("http://127.0.0.1:4919", { splitHomes: false });
+        api.setBearer("alice-session");
+        const turn = api.taskContext("chat-a" as never);
+        const stream = api.taskContext("chat-a" as never);
+        const context = await turn;
+        // The stream's refusal arrives now, and it renews while the turn runs.
+        lateRefusal.open();
+        await renewalAsked.opened;
+        await expect(context.runTask("hello", [], "request-a")).resolves.toEqual({ run_phase: "Settled" });
+        renewal.open();
+        expect((await stream).scope.authority).toEqual({ home_id: "home:a", actor_id: "alice" });
+        expect(sent).toEqual([
+            "GET /file-actions/actor (none)",
+            "GET /file-actions/actor (none)",
+            "POST /home/admissions (none)",
+            "GET /file-actions/actor admission-1",
+            "POST /home/admissions admission-1",
+            "GET /file-actions/actor admission-1",
+            "POST /chats/chat-a/task admission-1",
+            "GET /file-actions/actor admission-1",
+            "GET /file-actions/actor admission-2",
+        ]);
+    });
 });
 
 describe("scoped task stream lifetime", () => {

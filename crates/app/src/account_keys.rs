@@ -12,6 +12,10 @@
 //! - this computer's **device key**, with the root's delegation to it. That
 //!   one is this computer's alone.
 //!
+//! The account key follows from the root, so the account's recovery code,
+//! which is its root in transcribable form, restores both on a computer that
+//! holds neither (DR-0361 §3).
+//!
 //! The files sit under `<root>/keys/accounts/<hex(account)>/` (or
 //! `sha256-<digest>/` when the hex name would pass the file-name limit), each written
 //! once with owner-only permissions, as the install's own key store keeps its
@@ -101,9 +105,7 @@ impl AccountKeyStore {
     /// Refuses when this computer already holds the account's keys.
     pub fn mint(&self, account: &str, now: u64) -> io::Result<AccountKeys> {
         let root = random_signing_key()?;
-        let mut account_key = [0_u8; 32];
-        getrandom::getrandom(&mut account_key)
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let account_key = account_key_from_root(&root);
         let device = random_signing_key()?;
         let delegation =
             DeviceDelegation::issue(&root, device.public_key(), now + DEVICE_DELEGATION_TTL_SECS);
@@ -115,6 +117,32 @@ impl AccountKeyStore {
         };
         self.write(account, &keys)?;
         Ok(keys)
+    }
+
+    /// Restore an account's keys from its root, recovered from its recovery
+    /// code (DR-0361 §3): the account key follows from the root, and this
+    /// computer gets a device key of its own with the root's delegation.
+    /// Refuses when this computer already holds the account's keys.
+    pub fn restore(&self, account: &str, root: SigningKey, now: u64) -> io::Result<AccountKeys> {
+        let device = random_signing_key()?;
+        let delegation =
+            DeviceDelegation::issue(&root, device.public_key(), now + DEVICE_DELEGATION_TTL_SECS);
+        let keys = AccountKeys {
+            account_key: account_key_from_root(&root),
+            root,
+            device,
+            delegation,
+        };
+        self.write(account, &keys)?;
+        Ok(keys)
+    }
+
+    /// The account's recovery code, while this computer holds its keys. It is
+    /// the root in transcribable form, and as sensitive as the root.
+    pub fn recovery_code(&self, account: &str, now: u64) -> io::Result<Option<String>> {
+        Ok(self
+            .held(account, now)?
+            .map(|keys| gaugedesk_core::recovery::export_recovery(&keys.root)))
     }
 
     /// Keep keys this computer received through enrollment. Refuses when it
@@ -144,6 +172,16 @@ impl AccountKeyStore {
         )?;
         replace_file(&dir.join(ROOT_FILE), &keys.root.to_seed_bytes())
     }
+}
+
+/// An account's account key, which follows from its root, so the root's
+/// recovery code restores both (DR-0361 §3).
+pub fn account_key_from_root(root: &SigningKey) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"gaugedesk-account-key-from-root:v1");
+    hasher.update(root.to_seed_bytes());
+    hasher.finalize().into()
 }
 
 fn random_signing_key() -> io::Result<SigningKey> {

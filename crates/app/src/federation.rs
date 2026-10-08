@@ -2247,6 +2247,44 @@ impl Workbench {
         require_project_writes_available(self.store_ref(), project).is_err()
     }
 
+    /// Why `project`'s offer cannot be captured now. `drive_relocate` asks under
+    /// the lock it captures the offer under, so nothing checked here can change
+    /// before the capture.
+    ///
+    /// - An office-profile enrollment recorded since the relocation started
+    ///   (DR-0371). Enrollment refuses while a move is pending, so between them
+    ///   an enrollment is either before the capture, and refused here, or after
+    ///   the move has finished. A later check could not take its place: the
+    ///   target admits a moved project before this Home records the commit, and
+    ///   the project's state left with the offer (WS-963).
+    /// - An editor save still being written, which stays on the Home that
+    ///   admitted it (DR-0202).
+    pub(crate) fn relocation_capture_refusal(
+        &mut self,
+        project: &str,
+    ) -> Option<(StatusCode, serde_json::Value)> {
+        if let Some(refusal) = self.office_profile_exit_refusal() {
+            return Some((
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": refusal }),
+            ));
+        }
+        match self.project_has_unwritten_editor_save(project) {
+            Ok(false) => None,
+            Ok(true) => Some((
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": UNWRITTEN_SAVE_BLOCKS_MOVE }),
+            )),
+            Err(error) => {
+                tracing::warn!(%error, %project, "outstanding editor saves could not be read");
+                Some((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({ "error": "this project's pending saves could not be checked; try again" }),
+                ))
+            }
+        }
+    }
+
     /// Whether `project` is known here and bound to another Home: it has moved
     /// away, and the Home it moved to serves and steps it. A project this Home
     /// does not know at all is not "elsewhere"; its absence is its own answer.
@@ -4467,7 +4505,7 @@ async fn drive_relocate(
         let guard = wb.lock_unpoisoned();
         // A project on an office-profile Home never moves to another Home
         // (WS-424). Every relocation, by route or by an accepted invitation,
-        // starts here.
+        // starts here, and is checked again where its offer is captured.
         if let Some(refusal) = guard.office_profile_exit_refusal() {
             return (
                 StatusCode::CONFLICT,
@@ -4524,24 +4562,8 @@ async fn drive_relocate(
     let _in_flight = OfferInFlight::mark(peer.as_str(), project);
     let (log, content, credential_key, project_commands, project_authority) = {
         let mut guard = wb.lock_unpoisoned();
-        // An editor save stays on the Home that admitted it, so a project with
-        // one still being written does not start moving (DR-0202). Checked under the same
-        // lock the offer is captured under, so no save can slip in between.
-        match guard.project_has_unwritten_editor_save(project) {
-            Ok(false) => {}
-            Ok(true) => {
-                return (
-                    StatusCode::CONFLICT,
-                    serde_json::json!({ "error": UNWRITTEN_SAVE_BLOCKS_MOVE }),
-                )
-            }
-            Err(error) => {
-                tracing::warn!(%error, %project, "outstanding editor saves could not be read");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    serde_json::json!({ "error": "this project's pending saves could not be checked; try again" }),
-                );
-            }
+        if let Some(refused) = guard.relocation_capture_refusal(project) {
+            return refused;
         }
         let workflow = match workflow_keys::prepare(&guard, project, peer.as_str(), &peer_key) {
             Ok(workflow) => workflow,

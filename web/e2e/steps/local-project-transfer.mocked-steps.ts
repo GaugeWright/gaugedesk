@@ -67,8 +67,8 @@ When("I open the account menu", async ({ page }) => {
 });
 
 When("I choose {string} in the account menu", async ({ page }, label: string) => {
-    const item = page.locator('[data-account-menu-item="move-local-projects"]');
-    await expect(item).toContainText(label);
+    const item = page.locator("[data-account-menu-item]").filter({ hasText: label });
+    await expect(item).toHaveCount(1);
     await item.click();
 });
 

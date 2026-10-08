@@ -11,6 +11,7 @@
     "seam": "Admits command/effect evidence only inside a fence on current product standing (a dispatch read basis, a claimed command, or a receipt-protected lifecycle transaction); calling it anywhere is the ACTION seam itself.",
     "ledger": "Writes the command ledger, command-record facts, imported command history or operational observations directly, without a current-standing fence; only a declared seam owner may call it, and every other call is a listed bypass.",
     "product-fact": "Writes product records, events, scopes, Home product-store registration and readiness, or derived projection metadata; not command/effect evidence, though the lifecycle that calls it may still owe an admitted command under ACTION-3 to ACTION-6.",
+    "home-storage": "Stages both a project Home product-store binding and its separate operation-journal binding and files; this preparation writes no command/effect evidence and grants no Home activation or reference-coverage authority.",
     "reference-journal": "Writes the Home reference journal, a separate authority with its own operation, refusal and seal records; its admission is governed by its own lifecycle rather than this ledger.",
     "configuration": "Configures a handle (codec, deadline, process guard, basis combination) and persists nothing by itself."
   },
@@ -430,6 +431,14 @@
         "signature": "fn initialize_home_product (& mut self , root : & Path , project : & str , home : & str ,) -> Result < Store , HomeProductError >"
       },
       "classification": "product-fact"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
+        "name": "prepare_project_home_storage",
+        "signature": "fn prepare_project_home_storage (& mut self , root : & Path , project : & str , home : & str ,) -> Result < PreparedHomeStorage , HomeStoragePreparationError >"
+      },
+      "classification": "home-storage"
     },
     {
       "declaration": {

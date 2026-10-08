@@ -19,6 +19,31 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- A project someone shared with you is reachable from all your devices once
+  you accept it on a desktop: that computer, which holds your account's keys,
+  vouches for the project's key in your own signed directory entries, so your
+  phone and other browsers trust its route without opening the invitation
+  again.
+
+- On the desktop, a message sent as soon as a signed-in window opens starts
+  its turn instead of sometimes failing with "couldn't run that turn — GET
+  /file-actions/actor: 401 target Home admission required". The window's
+  first chat asked this computer's Home for its admission several times at
+  once, and each new request dropped the one already granted while it
+  waited, so the turn could go out with none.
+- A desktop signed in to an account whose keys another computer holds now
+  offers **Approve this computer**: paste the ticket from a computer that
+  holds them, compare the 6-digit code, and confirm there. If no such computer
+  is left, the account's recovery code restores the keys instead, and the
+  account menu shows that code on any computer that holds them.
+
+- An account that signs in with Google now holds the address Google verified
+  for it, so it can accept a project invitation sent to that address. Only a
+  new account used to be given its address, so an older one was refused with
+  "this invitation is for an email address your account has not verified"
+  however often it signed in. Sign out and back in with Google once. An
+  address another account already holds is left with that account.
+
 - GaugeDesk keeps its connections to the GaugeWright account service open
   between calls instead of starting a new secure connection for each one.
   Every account call after the first skips the handshake, which on a slow
@@ -40,6 +65,8 @@ Releases up to and including 0.4.30 are recorded on the
 - A Personal chat's turns go to the Home the chat was created on. A route
   another of the account's Homes published for its Personal project sent them
   there instead, where they timed out.
+- A Panel agent's row in Projects and the Workshop shows no hover text. Its
+  ⋯ menu and "update available" badge keep theirs.
 
 ## [0.8.9] — 2026-10-08
 

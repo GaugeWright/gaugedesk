@@ -149,6 +149,22 @@ impl Workbench {
             }
             Ok(None) => {}
         }
+        // A move offered before the enrollment would otherwise leave after it:
+        // the target admits a moved project before this Home records the
+        // commit, so nothing here could refuse it then. So the enrollment waits
+        // for every move of a project on this Home to finish, and a relocation
+        // checks the binding again where it captures its offer (WS-963).
+        if self
+            .library
+            .projects
+            .keys()
+            .any(|project| self.project_moving(project))
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "a project on this Home is moving to another Home; enroll once the move finishes or is cancelled",
+            ));
+        }
         if requested_home != self.home_id().as_str() {
             return Err((
                 StatusCode::CONFLICT,

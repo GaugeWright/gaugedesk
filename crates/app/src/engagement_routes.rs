@@ -5186,17 +5186,13 @@ pub(crate) struct ForceConflictBody {
     on: bool,
 }
 
-/// Test-only (`UX-7`): arm/disarm merge-conflict injection so a browser BDD can drive the
-/// `INV-24` conflict-repair path. Inert unless `GAUGEDESK_TEST_RESET` is set, like
-/// [`post_test_reset`]; `POST /test/reset` also clears it. Debug builds only
-/// (DR-0054 Phase A), like the reset route it accompanies.
-#[cfg(debug_assertions)]
 /// Remove the debug harness's state root for a reset.
 ///
 /// A thread the previous scenario started can still be finishing a write
 /// into the root while it is removed — on Linux the browser suite met
 /// `Directory not empty` here about once a run (WS-871) — so a removal that
 /// loses that race is retried briefly before the reset is refused.
+#[cfg(debug_assertions)]
 fn wipe_state_root(root: &std::path::Path) -> std::io::Result<()> {
     let mut attempt = 0;
     loop {
@@ -5212,6 +5208,11 @@ fn wipe_state_root(root: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// Test-only (`UX-7`): arm/disarm merge-conflict injection so a browser BDD can drive the
+/// `INV-24` conflict-repair path. Inert unless `GAUGEDESK_TEST_RESET` is set, like
+/// [`post_test_reset`]; `POST /test/reset` also clears it. Debug builds only
+/// (DR-0054 Phase A), like the reset route it accompanies.
+#[cfg(debug_assertions)]
 pub(crate) async fn post_test_force_conflict(
     Json(body): Json<ForceConflictBody>,
 ) -> impl IntoResponse {

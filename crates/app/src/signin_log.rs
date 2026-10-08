@@ -236,6 +236,35 @@ pub(crate) fn completed(route: &'static str, outcome: &'static str, trace: &Trac
     );
 }
 
+/// Log that a sign-in recorded the address its provider attested on the
+/// account it signed in to, which had not held it (WS-937). Like every line
+/// here it names neither the address nor the account.
+pub(crate) fn email_recorded(route: &'static str, trace: &Trace) {
+    tracing::info!(
+        route,
+        outcome = "verified_email_recorded",
+        attempt = trace.attempt.as_deref(),
+        state = trace.state.as_deref(),
+        detail = trace.detail,
+        "sign-in recorded the provider's verified email"
+    );
+}
+
+/// Log why a sign-in did not record the address its provider attested
+/// (WS-937). The sign-in itself succeeded; this is the line that explains why
+/// the account still cannot accept an invitation sent to that address. It says
+/// that another account holds the address without saying which, or whose.
+pub(crate) fn email_not_recorded(route: &'static str, reason: &'static str, trace: &Trace) {
+    tracing::warn!(
+        route,
+        reason,
+        attempt = trace.attempt.as_deref(),
+        state = trace.state.as_deref(),
+        detail = trace.detail,
+        "sign-in did not record the provider's verified email"
+    );
+}
+
 /// Log any refusal on a Hub sign-in step that its handler did not name. The
 /// handlers name every refusal they write; this catches the ones axum writes
 /// before a handler runs — a body or query that does not parse — and any

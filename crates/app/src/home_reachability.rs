@@ -148,11 +148,6 @@ pub fn republish(workbench: &SharedWorkbench, route: &RelayRoute) {
             route.epoch
         );
         crate::federation::distribute_authored_home_routes(workbench);
-        // Every account signed in here publishes its routes again from this
-        // computer (DR-0359 §2).
-        for account in crate::account_signin::signed_in_accounts(workbench) {
-            crate::account_publish::spawn_publish(workbench, &account);
-        }
     }
 }
 

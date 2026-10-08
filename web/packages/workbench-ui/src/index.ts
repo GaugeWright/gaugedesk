@@ -223,6 +223,8 @@ export type { BrowserRecoveryHolder, OpaqueBackupWrap } from "./backup-recovery"
 export { availabilityLabel, availabilityOf, contextSources, exportPhaseLabel, isContextSource, isOutput, kindLabel, outputProtectionLabel, outputs, resourceTitle, reviewPhaseLabel } from "./resource-catalog";
 export type { Availability } from "./resource-catalog";
 export { DevicesModal } from "./DevicesModal";
+export { ApproveThisComputerDialog } from "./ApproveThisComputerDialog";
+export type { ApproveThisComputerApi } from "./ApproveThisComputerDialog";
 export type { DevicesModalApi } from "./DevicesModal";
 export { DeploymentPanel } from "./DeploymentPanel";
 export type {

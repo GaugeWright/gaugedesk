@@ -102,6 +102,7 @@ describe("hub session wrappers", () => {
             expired: false,
             device: null,
             homeClaim: null,
+            reach: null,
         });
         expect(calls[0].path).toBe("/account/hub-session");
 
@@ -117,7 +118,19 @@ describe("hub session wrappers", () => {
             expired: false,
             device: null,
             homeClaim: null,
+            reach: null,
         });
+    });
+
+    it("reads whether this computer needs approval from one holding the account's keys", async () => {
+        const status = await hubSessionStatus(jsonReturning({
+            linked: true, person: "alice", reach: "needs_approval",
+        }, []));
+        expect(status.reach).toBe("needs_approval");
+        const unknown = await hubSessionStatus(jsonReturning({
+            linked: true, person: "alice", reach: "anything-else",
+        }, []));
+        expect(unknown.reach).toBeNull();
     });
 
     it("shows the unclaimed local project count and sends the exact selected account to claim", async () => {

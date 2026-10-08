@@ -683,6 +683,10 @@ export interface HubSessionStatus {
         | { state: "claimed"; owner: string }
         | { state: "governed" }
         | null;
+    /** Whether this computer is reachable for the account under its own keys
+     *  (DR-0359, DR-0361): `needs_approval` when another computer holds the
+     *  account's root and must approve this one. `null` before it has tried. */
+    reach: "published" | "needs_approval" | "waiting_for_hub" | "failed" | null;
 }
 
 function hubSessionStatusFrom(value: unknown): HubSessionStatus {
@@ -705,6 +709,10 @@ function hubSessionStatusFrom(value: unknown): HubSessionStatus {
         expired: Boolean(o?.expired),
         device: typeof o?.device === "string" && o.device ? o.device : null,
         homeClaim,
+        reach: o?.reach === "published" || o?.reach === "needs_approval"
+            || o?.reach === "waiting_for_hub" || o?.reach === "failed"
+            ? o.reach
+            : null,
     };
 }
 
@@ -769,6 +777,40 @@ export async function transferLocalProjects(
         account: typeof o?.account === "string" ? o.account : "",
         moved: (o?.moved ?? []) as ProjectId[],
     };
+}
+
+/** The window's signed-in account's recovery code, while this computer holds
+ * its keys (DR-0361 §3). It is the account's root in transcribable form, as
+ * sensitive as the root itself: show it, never keep it. */
+export async function recoveryCode(json: RouteJson): Promise<string> {
+    const o = await json("GET", "/account/recovery-code") as { code?: unknown } | null;
+    if (typeof o?.code !== "string" || !o.code) throw new Error("No recovery code is held here");
+    return o.code;
+}
+
+/** Restore the window's signed-in account's keys on this computer from its
+ * recovery code. Refused unless the code is that account's. */
+export async function restoreFromRecoveryCode(json: RouteJson, code: string): Promise<void> {
+    if (!code.trim()) throw new Error("Enter the recovery code");
+    const o = await json("POST", "/account/recovery-code/restore", { code }) as {
+        restored?: unknown;
+    } | null;
+    if (o?.restored !== true) throw new Error("The recovery code was not taken");
+}
+
+/** Keep a shared project's pin on this computer for the window's signed-in
+ * account, which then vouches for its key under that account's own entry, so
+ * the account's other devices trust it too (DR-0458). */
+export async function keepSharedProjectPin(
+    json: RouteJson,
+    pin: { readonly project: string; readonly homeId: string; readonly projectKey: string; readonly ownerRoot?: string },
+): Promise<void> {
+    await json("POST", "/account/shared-projects", {
+        project: pin.project,
+        home_id: pin.homeId,
+        project_key: pin.projectKey,
+        owner_root: pin.ownerRoot ?? "",
+    });
 }
 
 /** Native roster is a non-secret projection. Retaining a session does not
