@@ -57,6 +57,26 @@ fn the_hub_names_the_account_and_is_asked_once_per_bearer() {
     );
 }
 
+/// Each lookup the cache cannot answer goes to the Hub over a connection the
+/// last one left open, not a new TCP connection and TLS handshake (WS-919).
+#[test]
+fn identity_lookups_reuse_one_connection_to_the_hub() {
+    let hub = crate::test_support::keep_alive_server(r#"{"account":"account-root"}"#);
+    let accounts = HubBearerAccounts::at(Some(hub.url.clone()));
+    assert_eq!(accounts.account_for("b"), Ok(Some("account-root".into())));
+    assert_eq!(
+        accounts.account_for("another"),
+        Ok(Some("account-root".into()))
+    );
+    let fresh = HubBearerAccounts::at(Some(hub.url.clone()));
+    assert_eq!(
+        fresh.account_for("a third"),
+        Ok(Some("account-root".into()))
+    );
+    assert_eq!(hub.requests(), 3, "each bearer asked the Hub");
+    assert_eq!(hub.connections(), 1, "over one connection");
+}
+
 #[test]
 fn a_bearer_the_hub_refuses_is_nobody_and_is_not_remembered() {
     let (url, asked) = hub(401, r#"{"error":"this bearer is not recognised"}"#);

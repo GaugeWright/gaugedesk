@@ -504,7 +504,8 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             get(life::get_workspace_delta),
         )
         .route("/projections/{scope}/{kind}", get(life::get_projection));
-    // The destructive BDD-only surface (state-root reset, conflict injection)
+    // The destructive BDD-only surface (state-root reset, conflict injection,
+    // the desktop window's Home session the shell otherwise hands over IPC)
     // compiles only into debug builds, so no released artifact carries a route
     // that can delete persisted user data (DR-0054 Phase A). The debug/test
     // harness binaries that need it are always debug builds (`web/e2e/*.sh`),
@@ -513,6 +514,10 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
     #[cfg(debug_assertions)]
     let routes = routes
         .route("/test/reset", post(er::post_test_reset))
-        .route("/test/force-conflict", post(er::post_test_force_conflict));
+        .route("/test/force-conflict", post(er::post_test_force_conflict))
+        .route(
+            "/test/desktop-home-session",
+            post(er::post_test_desktop_home_session),
+        );
     routes
 }

@@ -21,6 +21,14 @@ Feature: Administration GaugeApp
     Given the enterprise workbench is open for an administered tenant
     Then the supporting enterprise routes expose capability, integration, audit, policy, and SSO diagnostics
 
+  # WS-916
+  @authenticated
+  Scenario: the workbench loads without admitting Account Settings
+    Given a signed-in account opens the enterprise workbench at work
+    Then the organization selector and account identity are shown without admitting Account Settings
+    When I open Account Settings from the account menu
+    Then Account Settings is admitted and shows the Account page
+
   Scenario: Administration is absent without an admitted organization
     Given the authenticated enterprise tenant is reset
     When I open the enterprise workbench without identity

@@ -3,7 +3,7 @@
  * conversation inside the ordinary capability-gated GaugeDesk composition.
  */
 
-import { expect, type APIRequestContext } from "@playwright/test";
+import { expect, type APIRequestContext, type Page } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
 import { enterpriseAppURL, enterpriseCP } from "../ports.mjs";
 import { mutationHeaders } from "./idempotency";
@@ -35,7 +35,9 @@ async function resetAuthenticatedEnterprise(request: APIRequestContext, administ
     }
 }
 
-Given("the enterprise workbench is open for an administered tenant", async ({ page, request }) => {
+/** Sign the administered owner in to both the tenant and the account
+ *  authority, without opening the workbench. */
+async function signInAdministeredOwner(page: Page, request: APIRequestContext): Promise<void> {
     // ADMIN-ENV-2: provision the local enterprise operator as an active owner. A
     // configured `?cp=` is intentionally insufficient; the Home's capability route
     // must admit this actor before the deep link can open Administration.
@@ -61,6 +63,10 @@ Given("the enterprise workbench is open for an administered tenant", async ({ pa
         httpOnly: true,
         sameSite: "Lax",
     }]);
+}
+
+Given("the enterprise workbench is open for an administered tenant", async ({ page, request }) => {
+    await signInAdministeredOwner(page, request);
     await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}&gaugeapp=administration&page=people&tenant=org`);
     await expect(page.locator('[data-gaugeapp-page="people"]')).toBeVisible();
     // Management pages may open with their agent pane collapsed. Establish
@@ -68,6 +74,46 @@ Given("the enterprise workbench is open for an administered tenant", async ({ pa
     if (!await page.getByPlaceholder("ask administration…").isVisible()) {
         await page.getByRole("button", { name: /Administration agent/ }).click();
     }
+});
+
+// WS-916: every page load used to admit Account Settings, which builds all
+// four of its pages on the Hub, only to fill the menus. The workbench now reads
+// the account summary instead and admits Account Settings when it is opened.
+const accountAdmissions = new WeakMap<Page, string[]>();
+
+Given("a signed-in account opens the enterprise workbench at work", async ({ page, request }) => {
+    await signInAdministeredOwner(page, request);
+    const admissions: string[] = [];
+    accountAdmissions.set(page, admissions);
+    page.on("request", (sent) => {
+        if (sent.method() === "POST" && new URL(sent.url()).pathname === "/gaugeapps/account-settings/sessions") {
+            admissions.push(sent.url());
+        }
+    });
+    await page.goto(`${enterpriseAppURL}?cp=${encodeURIComponent(enterpriseCP)}&tenant=org`);
+});
+
+Then("the organization selector and account identity are shown without admitting Account Settings", async ({ page }) => {
+    await expect(page.locator(".organization-trigger")).toBeVisible();
+    // The display name is the summary's; the native projection knows only
+    // the address.
+    await expect(page.locator("[data-account-menu-trigger]")).toContainText("E2E Person");
+    await openAccountMenu(page);
+    await expect(page.locator("[data-account-menu]")).toContainText("e2e-person@example.test");
+    await expect(page.locator('[data-account-menu-item="gaugeapp-account"]')).toBeVisible();
+    expect(accountAdmissions.get(page)).toEqual([]);
+});
+
+When("I open Account Settings from the account menu", async ({ page }) => {
+    await openAccountMenu(page);
+    await page.locator('[data-account-menu-item="gaugeapp-account"]').click();
+});
+
+Then("Account Settings is admitted and shows the Account page", async ({ page }) => {
+    await expect(page).toHaveURL(/gaugeapp=account-settings/);
+    await expect(page).toHaveURL(/page=account/);
+    await expect(page.locator(".gaugeapp-content h1")).toContainText("Account Settings");
+    expect(accountAdmissions.get(page)?.length).toBe(1);
 });
 
 Given("the authenticated enterprise tenant is reset", async ({ page, request }) => {
@@ -612,13 +658,27 @@ Then("the admin console shows the active sessions roster", async ({ page }) => {
     await expect(page.getByRole("heading", { name: "Organization sessions", exact: true })).toBeVisible();
 });
 
-When("I reload the administered workbench as a desktop client", async ({ page }) => {
-    await page.addInitScript(() => {
+When("I reload the administered workbench as a desktop client", async ({ page, request }) => {
+    // The desktop shell hands its window a Home session for the signed-in
+    // owner over IPC (DR-0188). A window handed none while signed in reaches
+    // its Home remotely through the account plane (`followDesktopHomeSession`),
+    // which here is the stand-in Hub's unreachable registered Home, so an IPC
+    // stand-in answering null to everything never reads this Home's policy.
+    // Take the session the shell's `home_session` would answer (a debug-only
+    // fixture route; the real handover never crosses HTTP) and answer that
+    // command with it, as signed-in-desktop-steps.ts does.
+    const handed = await request.post(`${enterpriseCP}/test/desktop-home-session`, {
+        headers: mutationHeaders(),
+    });
+    expect(handed.status(), await handed.text()).toBe(200);
+    const { token } = (await handed.json()) as { token: string | null };
+    expect(token, "the owner's desktop shell hands its window a Home session").toBeTruthy();
+    await page.addInitScript((session) => {
         Object.defineProperty(window, "__TAURI_INTERNALS__", {
             configurable: true,
-            value: { invoke: async () => null },
+            value: { invoke: async (command: string) => (command === "home_session" ? session : null) },
         });
-    });
+    }, token);
     const responsePromise = page.waitForResponse((response) =>
         new URL(response.url()).pathname === "/admin/software-policy"
         && response.request().method() === "GET"

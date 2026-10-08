@@ -28,15 +28,17 @@ Feature: A whip program's Structure and Instances views
     Then the run phase is "Completed"
     When I select the file "gates/inbound.whip" in the workspace
     And I open the "structure" tab
-    Then the structure view names the rule "implement_ready_ticket"
-    And the rule graph couples "table_workspaces" to "implement_ready_ticket" by "schema:WorkspaceReady"
-    # The coupling a resource read makes, which the compiler's own rule graph
-    # could not see until DR-0085 taught it to carry a resource edge.
-    And the rule graph couples "file_ticket" to "implement_ready_ticket" by "tracker:backlog"
-    # And the one that makes the workflow go round: a rule matching a fact it
-    # writes itself. DR-0081 admits the cycle when it is paced, so this is a
-    # shape to draw, not an error to report.
-    And the rule graph shows "implement_ready_ticket" feeding itself
+    # The program is the project's own inbound gate, the human review gate
+    # GaugeDesk seeds (crates/app/src/gate.rs, REVIEW_BY_HAND_GATE): an arrival
+    # is read, a reviewer is asked through the tracker, and the verdict settles
+    # it. Each step is a rule, and the fact one records is what the next one's
+    # `when` picks up. Resource edges and a paced self-feeding rule are shapes
+    # this gate does not have; the layout tests draw them from a sample that does.
+    Then the structure view names the rule "read_item"
+    And the structure view names the rule "ask_reviewer"
+    And the structure view names the rule "settle"
+    And the rule graph couples "read_item" to "ask_reviewer" by "schema:ItemBody"
+    And the rule graph couples "ask_reviewer" to "settle" by "schema:Pending"
 
   Scenario: Instances is honest about a program nothing has run
     Given a new engagement

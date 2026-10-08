@@ -1,4 +1,4 @@
-@transport
+@transport @core
 Feature: Multi-turn conversation
 
   An engagement is a persistent conversation, not one-shot tasks: it holds one

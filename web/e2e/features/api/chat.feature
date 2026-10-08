@@ -1,4 +1,4 @@
-@api @contract
+@api @contract @core
 Feature: Rename a chat
   Scenario: renaming a chat persists in the library
     Given an engagement "ren1"

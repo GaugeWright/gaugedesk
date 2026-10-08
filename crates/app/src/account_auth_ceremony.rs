@@ -288,6 +288,53 @@ struct RegistrationOutcome {
     session: String,
     recovery_codes: Vec<String>,
     consumer_signup: Option<ConsumerSignupContext>,
+    /// The email entrance begun for a native client (DR-0457). The provider
+    /// entrance carries its own in `consumer_signup`.
+    native: Option<NativeReturn>,
+}
+
+/// Where a passkey ceremony begun for a native client hands back (DR-0457):
+/// the return `/auth/login` admits, the PKCE challenge the client pinned, and
+/// the label its session is shown under. The code the ceremony ends with is
+/// redeemable only with the verifier whose challenge this is, so carrying it
+/// through a browser gives that browser nothing it can use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeReturn {
+    return_to: String,
+    challenge: String,
+    /// The account's verified address, which the person just typed.
+    label: String,
+}
+
+/// A native return as a request asked for it, validated exactly as
+/// `/auth/login` validates its own (`native_return_uri`): the fixed
+/// `gaugewright://auth/callback` with a well-formed S256 challenge, or a
+/// loopback web return where the deployment admits one. Absent both is a
+/// browser ceremony.
+fn requested_native_return(
+    return_to: Option<&str>,
+    challenge: Option<&str>,
+) -> Result<Option<(String, String)>, &'static str> {
+    let admitted = crate::auth_oidc::native_return_uri(
+        return_to,
+        challenge,
+        crate::auth_oidc::dev_web_return_enabled(),
+    )?;
+    Ok(admitted.zip(challenge.map(str::to_owned)))
+}
+
+/// How a passkey sign-in ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PasskeyLogin {
+    /// A browser sign-in, and the session the route sets as its cookie.
+    Session { account_id: String, session: String },
+    /// A native sign-in. No browser session is minted, by the rule a desktop
+    /// OIDC login follows (`requires_account_session`): the route issues the
+    /// one-time code, and the session is minted where it is redeemed.
+    Native {
+        account_id: String,
+        native: NativeReturn,
+    },
 }
 
 struct PendingRegistration {
@@ -298,6 +345,8 @@ struct PendingRegistration {
     /// Present only for the provider entrance. `None` is the email-code
     /// entrance, which links no subject.
     consumer_signup: Option<ConsumerSignupContext>,
+    /// The email entrance begun for a native client (DR-0457).
+    native: Option<NativeReturn>,
     expires_at: u64,
 }
 
@@ -305,6 +354,9 @@ struct PendingAuthentication {
     account_id: String,
     state: AuthenticationState,
     credentials: BTreeMap<String, PasskeyCredential>,
+    /// Bound when the ceremony began, so the finish cannot be redirected to
+    /// another client's challenge (DR-0457).
+    native: Option<NativeReturn>,
     expires_at: u64,
 }
 
@@ -645,6 +697,7 @@ impl AccountAuthRuntime {
         &self,
         email_ticket: &str,
         display_name: &str,
+        native: Option<(String, String)>,
         now: u64,
     ) -> Result<(String, serde_json::Value), CeremonyError> {
         let ticket = self
@@ -653,7 +706,12 @@ impl AccountAuthRuntime {
             .remove(email_ticket)
             .filter(|ticket| ticket.expires_at > now)
             .ok_or(CeremonyError::UnknownOrExpired)?;
-        self.start_registration_for_verified_email(&ticket.email, display_name, None, now)
+        let native = native.map(|(return_to, challenge)| NativeReturn {
+            return_to,
+            challenge,
+            label: ticket.email.clone(),
+        });
+        self.start_registration_for_verified_email(&ticket.email, display_name, None, native, now)
     }
 
     /// Begin passkey registration for an address whose control is already
@@ -670,6 +728,7 @@ impl AccountAuthRuntime {
         email: &str,
         display_name: &str,
         consumer_signup: Option<ConsumerSignupContext>,
+        native: Option<NativeReturn>,
         now: u64,
     ) -> Result<(String, serde_json::Value), CeremonyError> {
         let email = normalize_email_contact(email).ok_or(CeremonyError::InvalidEmail)?;
@@ -698,6 +757,7 @@ impl AccountAuthRuntime {
                 root_seed,
                 state,
                 consumer_signup,
+                native,
                 expires_at: now.saturating_add(CEREMONY_TTL_SECS),
             },
         );
@@ -810,6 +870,7 @@ impl AccountAuthRuntime {
             session,
             recovery_codes,
             consumer_signup: pending.consumer_signup,
+            native: pending.native,
         })
     }
 
@@ -907,6 +968,7 @@ impl AccountAuthRuntime {
             session,
             recovery_codes,
             consumer_signup: Some(signup),
+            native: None,
         })
     }
 
@@ -914,6 +976,7 @@ impl AccountAuthRuntime {
         &self,
         state: &AccountAuth,
         email: &str,
+        native: Option<(String, String)>,
         now: u64,
     ) -> Result<(String, serde_json::Value), CeremonyError> {
         let email = normalize_email_contact(email).ok_or(CeremonyError::InvalidEmail)?;
@@ -955,6 +1018,11 @@ impl AccountAuthRuntime {
                 account_id: contact.account_id.clone(),
                 state: auth_state,
                 credentials: credential_map,
+                native: native.map(|(return_to, challenge)| NativeReturn {
+                    return_to,
+                    challenge,
+                    label: email.clone(),
+                }),
                 expires_at: now.saturating_add(CEREMONY_TTL_SECS),
             },
         );
@@ -967,7 +1035,7 @@ impl AccountAuthRuntime {
         ceremony_id: &str,
         response: &AuthenticationResponse,
         now: u64,
-    ) -> Result<(String, String), CeremonyError> {
+    ) -> Result<PasskeyLogin, CeremonyError> {
         let pending = self
             .lock()
             .authentications
@@ -998,10 +1066,27 @@ impl AccountAuthRuntime {
         updated.verifier_json = verifier_json;
         append_facts(wb.store_mut(), &[AccountAuthFact::WebAuthn(updated)])
             .map_err(|_| CeremonyError::Unavailable)?;
+        if let Some(native) = pending.native {
+            return Ok(PasskeyLogin::Native {
+                account_id: pending.account_id,
+                native,
+            });
+        }
         let session = wb
             .mint_account_session(&pending.account_id, "passkey", self.session_ttl_secs)
             .ok_or(CeremonyError::Unavailable)?;
-        Ok((pending.account_id, session))
+        Ok(PasskeyLogin::Session {
+            account_id: pending.account_id,
+            session,
+        })
+    }
+
+    /// How long a native session from a passkey ceremony may last: as long as
+    /// the browser session the same ceremony would have minted. A passkey
+    /// carries no provider refresh grant, so the desktop signs in again after
+    /// it rather than renewing.
+    fn native_session_expires_at_ms(&self) -> u64 {
+        crate::account::session_now_ms().saturating_add(self.session_ttl_secs.saturating_mul(1000))
     }
 
     /// Begin a user-verifying passkey ceremony for one named destructive
@@ -1276,6 +1361,20 @@ pub enum CeremonyError {
 }
 
 impl CeremonyError {
+    /// The machine-readable reason a sign-in step logs (WS-869).
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::InvalidEmail => "invalid_email",
+            Self::InvalidProof => "invalid_proof",
+            Self::UnknownOrExpired => "unknown_or_expired_ceremony",
+            Self::AlreadyExists => "already_exists",
+            Self::DeliveryFailed => "delivery_failed",
+            Self::RateLimited => "rate_limited",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
     pub fn response(self) -> Response {
         let (status, message) = match self {
             Self::NotConfigured => (
@@ -1317,6 +1416,13 @@ struct StartRegistrationRequest {
     email_verification: String,
     #[serde(default)]
     display_name: String,
+    /// A native client's return and PKCE challenge, exactly as `/auth/login`
+    /// takes them, when the account is being created for a desktop in its
+    /// system browser (DR-0457). Absent is a browser signup.
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    handoff_challenge: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1344,6 +1450,13 @@ struct StartConsumerSignupRegistrationRequest {
 #[derive(Deserialize)]
 struct StartAuthenticationRequest {
     email: String,
+    /// A native client's return and PKCE challenge, exactly as `/auth/login`
+    /// takes them, when the person is signing a desktop in from its system
+    /// browser (DR-0457). Absent is a browser sign-in.
+    #[serde(default)]
+    return_to: Option<String>,
+    #[serde(default)]
+    handoff_challenge: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1421,11 +1534,31 @@ async fn post_registration_start(
     Extension(auth): Extension<AuthShellState>,
     Json(body): Json<StartRegistrationRequest>,
 ) -> Response {
+    use crate::signin_log::{refuse, Trace, PASSKEY_REGISTER_START};
     let runtime = match runtime(&auth) {
         Ok(runtime) => runtime,
         Err(error) => return error.response(),
     };
-    match runtime.start_registration(&body.email_verification, &body.display_name, unix_now()) {
+    let native =
+        match requested_native_return(body.return_to.as_deref(), body.handoff_challenge.as_deref())
+        {
+            Ok(native) => native,
+            Err(message) => {
+                return refuse(
+                    PASSKEY_REGISTER_START,
+                    crate::auth_oidc::return_refusal_reason(message),
+                    &Trace::new(),
+                    StatusCode::BAD_REQUEST,
+                    message,
+                )
+            }
+        };
+    match runtime.start_registration(
+        &body.email_verification,
+        &body.display_name,
+        native,
+        unix_now(),
+    ) {
         Ok((ceremony_id, public_key)) => Json(StartCeremonyResponse {
             ceremony_id,
             public_key,
@@ -1568,6 +1701,7 @@ async fn post_consumer_signup_registration_start(
         &attested,
         &display_name,
         Some(context),
+        None,
         unix_now(),
     ) {
         Ok((ceremony_id, public_key)) => Json(StartCeremonyResponse {
@@ -1788,38 +1922,100 @@ fn adopt_signup_picture(wb: &SharedWorkbench, result: &Result<RegistrationOutcom
     }
 }
 
+/// `POST /auth/account/passkey/login/start` — begin a passkey sign-in.
+///
+/// With a native return and handoff challenge (DR-0457), the ceremony is bound
+/// to that desktop's attempt: its finish mints no browser session and issues
+/// the same one-time code a desktop's Google sign-in ends with, redeemable at
+/// `/auth/mobile/exchange` only with the verifier the desktop holds.
 async fn post_authentication_start(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
     Json(body): Json<StartAuthenticationRequest>,
 ) -> Response {
+    use crate::signin_log::{completed, refuse, refused, Trace, PASSKEY_LOGIN_START};
+    let native =
+        match requested_native_return(body.return_to.as_deref(), body.handoff_challenge.as_deref())
+        {
+            Ok(native) => native,
+            Err(message) => {
+                return refuse(
+                    PASSKEY_LOGIN_START,
+                    crate::auth_oidc::return_refusal_reason(message),
+                    &Trace::new(),
+                    StatusCode::BAD_REQUEST,
+                    message,
+                )
+            }
+        };
+    let trace = Trace::new()
+        .maybe_attempt(native.as_ref().map(|(_, challenge)| challenge.as_str()))
+        .detail(if native.is_some() {
+            "native"
+        } else {
+            "browser"
+        });
     let runtime = match runtime(&auth) {
         Ok(runtime) => runtime,
-        Err(error) => return error.response(),
+        Err(error) => {
+            return refused(
+                PASSKEY_LOGIN_START,
+                error.reason(),
+                &trace,
+                error.response(),
+            )
+        }
     };
     let state = match AccountAuth::rebuild(wb.lock_unpoisoned().store_ref()) {
         Ok(state) => state,
-        Err(_) => return CeremonyError::Unavailable.response(),
+        Err(_) => {
+            let error = CeremonyError::Unavailable;
+            return refused(
+                PASSKEY_LOGIN_START,
+                error.reason(),
+                &trace,
+                error.response(),
+            );
+        }
     };
-    match runtime.start_authentication(&state, &body.email, unix_now()) {
-        Ok((ceremony_id, public_key)) => Json(StartCeremonyResponse {
-            ceremony_id,
-            public_key,
-        })
-        .into_response(),
-        Err(error) => error.response(),
+    match runtime.start_authentication(&state, &body.email, native, unix_now()) {
+        Ok((ceremony_id, public_key)) => {
+            completed(PASSKEY_LOGIN_START, "ceremony_started", &trace);
+            Json(StartCeremonyResponse {
+                ceremony_id,
+                public_key,
+            })
+            .into_response()
+        }
+        Err(error) => refused(
+            PASSKEY_LOGIN_START,
+            error.reason(),
+            &trace,
+            error.response(),
+        ),
     }
 }
 
+/// `POST /auth/account/passkey/login/finish` — verify the assertion. A browser
+/// sign-in gets its session cookie; a native one gets `native_return`, the
+/// handoff URL carrying the one-time code, and no cookie.
 async fn post_authentication_finish(
     State(wb): State<SharedWorkbench>,
     Extension(auth): Extension<AuthShellState>,
     headers: HeaderMap,
     Json(body): Json<FinishAuthenticationRequest>,
 ) -> Response {
+    use crate::signin_log::{completed, refused, Trace, PASSKEY_LOGIN_FINISH};
     let runtime = match runtime(&auth) {
         Ok(runtime) => runtime,
-        Err(error) => return error.response(),
+        Err(error) => {
+            return refused(
+                PASSKEY_LOGIN_FINISH,
+                error.reason(),
+                &Trace::new(),
+                error.response(),
+            )
+        }
     };
     let result = runtime.finish_authentication(
         &mut wb.lock_unpoisoned(),
@@ -1827,7 +2023,39 @@ async fn post_authentication_finish(
         &body.credential,
         unix_now(),
     );
-    session_response_with_wallet(result, &wb, &headers)
+    match result {
+        Ok(PasskeyLogin::Session {
+            account_id,
+            session,
+        }) => {
+            completed(PASSKEY_LOGIN_FINISH, "session_minted", &Trace::new());
+            session_response_with_wallet(Ok((account_id, session)), &wb, &headers)
+        }
+        Ok(PasskeyLogin::Native { account_id, native }) => {
+            // `issue_account_native_handoff` logs the issue with its attempt
+            // and the code's digest.
+            let code = auth.issue_account_native_handoff(
+                PASSKEY_LOGIN_FINISH,
+                &account_id,
+                "passkey",
+                &native.label,
+                runtime.native_session_expires_at_ms(),
+                None,
+                native.challenge,
+            );
+            Json(json!({
+                "account_id": account_id,
+                "native_return": format!("{}#code={code}", native.return_to),
+            }))
+            .into_response()
+        }
+        Err(error) => refused(
+            PASSKEY_LOGIN_FINISH,
+            error.reason(),
+            &Trace::new(),
+            error.response(),
+        ),
+    }
 }
 
 async fn post_recovery_start(
@@ -2019,10 +2247,11 @@ fn registration_response_with_wallet(
     headers: &HeaderMap,
 ) -> Response {
     let wallet_entry = result.as_ref().ok().and_then(|outcome| {
-        let native = outcome
-            .consumer_signup
-            .as_ref()
-            .is_some_and(|signup| signup.native_return.is_some());
+        let native = outcome.native.is_some()
+            || outcome
+                .consumer_signup
+                .as_ref()
+                .is_some_and(|signup| signup.native_return.is_some());
         (!native).then(|| {
             (
                 outcome.account_id.clone(),
@@ -2093,10 +2322,11 @@ fn registration_response(
             // desktop window over the one tab that will ever hold these codes,
             // and the person closes it without having read them. The page shows
             // them and navigates only when they say they have saved them.
-            let handoff = outcome.consumer_signup.as_ref().and_then(|signup| {
+            let provider_handoff = outcome.consumer_signup.as_ref().and_then(|signup| {
                 let native_return = signup.native_return.as_deref()?;
                 let challenge = signup.native_handoff_challenge.clone()?;
                 let code = auth.issue_account_native_handoff(
+                    crate::signin_log::PASSKEY_REGISTER_FINISH,
                     &outcome.account_id,
                     "passkey",
                     &signup.label,
@@ -2109,7 +2339,33 @@ fn registration_response(
                 );
                 Some(format!("{native_return}#code={code}"))
             });
-            let native = handoff.is_some();
+            // The email entrance, begun for a desktop (DR-0457). A passkey
+            // carries no provider grant, so the session it hands back lasts
+            // as long as a browser passkey session would.
+            let handoff = provider_handoff.or_else(|| {
+                let native = outcome.native.as_ref()?;
+                let expires_at_ms = auth
+                    .account_auth()
+                    .map(|runtime| runtime.native_session_expires_at_ms())?;
+                let code = auth.issue_account_native_handoff(
+                    crate::signin_log::PASSKEY_REGISTER_FINISH,
+                    &outcome.account_id,
+                    "passkey",
+                    &native.label,
+                    expires_at_ms,
+                    None,
+                    native.challenge.clone(),
+                );
+                Some(format!("{}#code={code}", native.return_to))
+            });
+            // Whether the ceremony was begun for a native client, not whether
+            // a code came of it: a native ceremony leaves no browser session
+            // either way.
+            let native = outcome.native.is_some()
+                || outcome
+                    .consumer_signup
+                    .as_ref()
+                    .is_some_and(|signup| signup.native_return.is_some());
             if let (Some(handoff), Some(map)) = (handoff, body.as_object_mut()) {
                 map.insert("native_return".into(), json!(handoff));
             }
@@ -2761,7 +3017,7 @@ mod tests {
             .complete_email(&email_challenge, &email_code, 2)
             .unwrap();
         let (registration_id, registration_options) = runtime
-            .start_registration(&email_ticket, "Alice", 3)
+            .start_registration(&email_ticket, "Alice", None, 3)
             .unwrap();
         let authenticator = FakeAuthenticator::new();
         let registration = authenticator
@@ -2852,11 +3108,13 @@ mod tests {
         let challenge = runtime.begin_email("alice@example.com", 10).unwrap();
         let code = sender.0.lock().unwrap()[0].1.clone();
         let ticket = runtime.complete_email(&challenge, &code, 11).unwrap();
-        let (ceremony, public_key) = runtime.start_registration(&ticket, "Alice", 12).unwrap();
+        let (ceremony, public_key) = runtime
+            .start_registration(&ticket, "Alice", None, 12)
+            .unwrap();
         assert!(public_key.get("challenge").is_some());
         assert!(runtime.lock().registrations.contains_key(&ceremony));
         assert_eq!(
-            runtime.start_registration(&ticket, "Alice", 13),
+            runtime.start_registration(&ticket, "Alice", None, 13),
             Err(CeremonyError::UnknownOrExpired)
         );
     }
@@ -2975,6 +3233,7 @@ mod tests {
                 session: "web-session-token".into(),
                 recovery_codes: vec!["AAAA-BBBB-CCCC".into()],
                 consumer_signup: None,
+                native: None,
             }),
             &auth,
         );
@@ -3005,6 +3264,7 @@ mod tests {
                     native_handoff_challenge: Some("challenge-1".into()),
                     picture: None,
                 }),
+                native: None,
             }),
             &auth,
         );
@@ -3274,6 +3534,7 @@ mod tests {
                 "New.Person@Example.com",
                 "New Person",
                 Some(signup.clone()),
+                None,
                 10,
             )
             .unwrap();
@@ -3372,6 +3633,7 @@ mod tests {
                 "new.person@example.com",
                 "New Person",
                 Some(signup.clone()),
+                None,
                 10,
             )
             .unwrap();
@@ -3410,7 +3672,9 @@ mod tests {
         let challenge = runtime.begin_email("alice@example.com", 10).unwrap();
         let code = sender.0.lock().unwrap()[0].1.clone();
         let ticket = runtime.complete_email(&challenge, &code, 11).unwrap();
-        let (ceremony_id, options) = runtime.start_registration(&ticket, "Alice", 12).unwrap();
+        let (ceremony_id, options) = runtime
+            .start_registration(&ticket, "Alice", None, 12)
+            .unwrap();
         let authenticator = FakeAuthenticator::new();
         let response = authenticator.registration_response(options["challenge"].as_str().unwrap());
         let outcome = runtime
@@ -3431,7 +3695,7 @@ mod tests {
             .complete_email(&email_challenge, &email_code, 11)
             .unwrap();
         let (registration_id, registration_options) = runtime
-            .start_registration(&email_ticket, "Alice", 12)
+            .start_registration(&email_ticket, "Alice", None, 12)
             .unwrap();
         let challenge = registration_options["challenge"].as_str().unwrap();
         let mut authenticator = FakeAuthenticator::new();
@@ -3470,13 +3734,19 @@ mod tests {
         assert_eq!(account.methods_for(&account_id).webauthn.len(), 1);
 
         let (authentication_id, authentication_options) = runtime
-            .start_authentication(&account, "alice@example.com", 15)
+            .start_authentication(&account, "alice@example.com", None, 15)
             .unwrap();
         let challenge = authentication_options["challenge"].as_str().unwrap();
         let assertion = authenticator.authentication_response(challenge);
-        let (authenticated_account, second_session) = runtime
+        let PasskeyLogin::Session {
+            account_id: authenticated_account,
+            session: second_session,
+        } = runtime
             .finish_authentication(&mut wb, &authentication_id, &assertion, 16)
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("a browser sign-in mints a session");
+        };
         assert_eq!(authenticated_account, account_id);
         assert_eq!(
             wb.account_sessions()
@@ -3738,7 +4008,7 @@ mod tests {
             .complete_email(&email_challenge, &email_code, 11)
             .unwrap();
         let (registration_id, registration_options) = runtime
-            .start_registration(&email_ticket, "Alice", 12)
+            .start_registration(&email_ticket, "Alice", None, 12)
             .unwrap();
         let challenge = registration_options["challenge"].as_str().unwrap();
         let authenticator = FakeAuthenticator::new();
@@ -3757,5 +4027,330 @@ mod tests {
             runtime.finish_registration(&mut wb, &registration_id, &response, "Laptop", 14),
             Err(CeremonyError::UnknownOrExpired)
         );
+    }
+
+    /// The verifier a desktop mints and keeps; only its S256 challenge leaves.
+    const DESKTOP_VERIFIER: &str = "the-desktop-verifier-that-never-left-it-000";
+
+    fn shared_workbench_with_vault() -> (tempfile::TempDir, SharedWorkbench) {
+        let (vault_dir, wb) = signup_workbench();
+        (vault_dir, Arc::new(Mutex::new(wb)))
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn set_cookies(response: &Response) -> Vec<String> {
+        response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn signin_refusal(response: &Response) -> Option<&'static str> {
+        response
+            .extensions()
+            .get::<crate::signin_log::SigninRefusal>()
+            .map(|refusal| refusal.reason)
+    }
+
+    /// An account with one passkey, made through the email entrance.
+    fn passkey_account(
+        runtime: &AccountAuthRuntime,
+        sender: &CapturingSender,
+        wb: &SharedWorkbench,
+    ) -> (String, FakeAuthenticator) {
+        let now = unix_now();
+        let email_challenge = runtime.begin_email("alice@example.com", now).unwrap();
+        let email_code = sender.0.lock().unwrap().last().unwrap().1.clone();
+        let email_ticket = runtime
+            .complete_email(&email_challenge, &email_code, now)
+            .unwrap();
+        let (registration_id, options) = runtime
+            .start_registration(&email_ticket, "Alice", None, now)
+            .unwrap();
+        let authenticator = FakeAuthenticator::new();
+        let registration =
+            authenticator.registration_response(options["challenge"].as_str().unwrap());
+        let outcome = runtime
+            .finish_registration(
+                &mut wb.lock_unpoisoned(),
+                &registration_id,
+                &registration,
+                "Laptop",
+                now,
+            )
+            .unwrap();
+        (outcome.account_id, authenticator)
+    }
+
+    /// Sign in by passkey through the two routes, as the browser page does,
+    /// bound to the desktop attempt whose challenge is `challenge`.
+    async fn native_passkey_sign_in(
+        wb: &SharedWorkbench,
+        auth: &AuthShellState,
+        authenticator: &mut FakeAuthenticator,
+        challenge: &str,
+    ) -> Response {
+        let started = post_authentication_start(
+            State(wb.clone()),
+            Extension(auth.clone()),
+            Json(StartAuthenticationRequest {
+                email: "Alice@Example.com".into(),
+                return_to: Some("gaugewright://auth/callback".into()),
+                handoff_challenge: Some(challenge.to_owned()),
+            }),
+        )
+        .await;
+        assert_eq!(started.status(), StatusCode::OK);
+        let started = body_json(started).await;
+        let assertion = authenticator
+            .authentication_response(started["public_key"]["challenge"].as_str().unwrap());
+        post_authentication_finish(
+            State(wb.clone()),
+            Extension(auth.clone()),
+            HeaderMap::new(),
+            Json(FinishAuthenticationRequest {
+                ceremony_id: started["ceremony_id"].as_str().unwrap().to_owned(),
+                credential: assertion,
+            }),
+        )
+        .await
+    }
+
+    fn exchange(
+        wb: &SharedWorkbench,
+        auth: &AuthShellState,
+        code: &str,
+        verifier: &str,
+    ) -> Response {
+        crate::auth_oidc::native_exchange(
+            wb,
+            auth,
+            Ok(Json(crate::auth_oidc::NativeHandoffExchange::for_test(
+                code, verifier,
+            ))),
+            true,
+        )
+    }
+
+    fn handoff_code(native_return: &str) -> String {
+        native_return
+            .strip_prefix("gaugewright://auth/callback#code=")
+            .unwrap_or_else(|| panic!("not a native handoff: {native_return}"))
+            .to_owned()
+    }
+
+    /// DR-0457: a passkey signs a desktop in exactly as Google does. The
+    /// ceremony bound to the desktop's challenge ends in a one-time code and
+    /// no browser session; the Hub's exchange redeems that code for the
+    /// account only with the desktop's own verifier, and a code presented
+    /// with another attempt's verifier is refused and spent.
+    #[tokio::test]
+    async fn a_native_passkey_sign_in_hands_back_a_code_only_its_verifier_redeems() {
+        let (runtime, sender) = runtime();
+        let (_vault_dir, wb) = shared_workbench_with_vault();
+        let (account_id, mut authenticator) = passkey_account(&runtime, &sender, &wb);
+        let auth = AuthShellState::default().with_account_auth(Arc::new(runtime));
+        let challenge = crate::identity_oidc::s256_challenge(DESKTOP_VERIFIER);
+
+        let finished = native_passkey_sign_in(&wb, &auth, &mut authenticator, &challenge).await;
+        assert_eq!(finished.status(), StatusCode::OK);
+        assert!(
+            set_cookies(&finished).is_empty(),
+            "a native sign-in leaves no session or wallet in the system browser: {:?}",
+            set_cookies(&finished),
+        );
+        let finished = body_json(finished).await;
+        assert_eq!(finished["account_id"], account_id.as_str());
+        let code = handoff_code(finished["native_return"].as_str().unwrap());
+
+        let redeemed = exchange(&wb, &auth, &code, DESKTOP_VERIFIER);
+        assert_eq!(redeemed.status(), StatusCode::OK);
+        let redeemed = body_json(redeemed).await;
+        assert_eq!(redeemed["account_id"], account_id.as_str());
+        assert_eq!(redeemed["label"], "alice@example.com");
+        let session = redeemed["account_session"].as_str().unwrap();
+        assert_eq!(
+            wb.lock_unpoisoned().resolve_account_session(session),
+            Some((account_id.clone(), "passkey".to_owned())),
+            "the redeemed session is the account's, by passkey",
+        );
+        let lifetime_ms =
+            redeemed["expires_at_ms"].as_u64().unwrap() - crate::account::session_now_ms();
+        assert!(
+            lifetime_ms <= SESSION_TTL_SECS * 1000
+                && lifetime_ms > SESSION_TTL_SECS * 1000 - 60_000,
+            "a passkey session lasts as long as a browser passkey session: {lifetime_ms} ms",
+        );
+        assert_eq!(
+            exchange(&wb, &auth, &code, DESKTOP_VERIFIER).status(),
+            StatusCode::UNAUTHORIZED,
+            "the code is single-use",
+        );
+
+        // A second sign-in, and a code presented with another attempt's
+        // verifier: refused, and spent, so the right one cannot follow it.
+        let finished = native_passkey_sign_in(&wb, &auth, &mut authenticator, &challenge).await;
+        let code = handoff_code(body_json(finished).await["native_return"].as_str().unwrap());
+        let wrong = exchange(
+            &wb,
+            &auth,
+            &code,
+            "another-attempts-verifier-0000000000000000",
+        );
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(signin_refusal(&wrong), Some("pkce_mismatch"));
+        assert_eq!(
+            exchange(&wb, &auth, &code, DESKTOP_VERIFIER).status(),
+            StatusCode::UNAUTHORIZED,
+            "a refused verifier spends the code",
+        );
+    }
+
+    /// The browser sign-in is unchanged: no return asked for, a session cookie
+    /// set, and no code issued.
+    #[tokio::test]
+    async fn a_browser_passkey_sign_in_still_sets_its_session() {
+        let (runtime, sender) = runtime();
+        let (_vault_dir, wb) = shared_workbench_with_vault();
+        let (account_id, mut authenticator) = passkey_account(&runtime, &sender, &wb);
+        let auth = AuthShellState::default().with_account_auth(Arc::new(runtime));
+        let started = post_authentication_start(
+            State(wb.clone()),
+            Extension(auth.clone()),
+            Json(StartAuthenticationRequest {
+                email: "alice@example.com".into(),
+                return_to: None,
+                handoff_challenge: None,
+            }),
+        )
+        .await;
+        let started = body_json(started).await;
+        let assertion = authenticator
+            .authentication_response(started["public_key"]["challenge"].as_str().unwrap());
+        let finished = post_authentication_finish(
+            State(wb.clone()),
+            Extension(auth.clone()),
+            HeaderMap::new(),
+            Json(FinishAuthenticationRequest {
+                ceremony_id: started["ceremony_id"].as_str().unwrap().to_owned(),
+                credential: assertion,
+            }),
+        )
+        .await;
+        assert_eq!(finished.status(), StatusCode::OK);
+        assert!(set_cookies(&finished)
+            .iter()
+            .any(|cookie| cookie.starts_with(crate::net_http::SESSION_COOKIE)));
+        let body = body_json(finished).await;
+        assert_eq!(body["account_id"], account_id.as_str());
+        assert!(body.get("native_return").is_none());
+    }
+
+    /// A native sign-in may only be bound to a return `/auth/login` would
+    /// admit, with a well-formed challenge, and each refusal names its reason.
+    #[tokio::test]
+    async fn a_native_passkey_sign_in_refuses_a_return_the_login_would_refuse() {
+        let (runtime, sender) = runtime();
+        let (_vault_dir, wb) = shared_workbench_with_vault();
+        let _ = passkey_account(&runtime, &sender, &wb);
+        let auth = AuthShellState::default().with_account_auth(Arc::new(runtime));
+        let start = |return_to: Option<&str>, challenge: Option<&str>| {
+            post_authentication_start(
+                State(wb.clone()),
+                Extension(auth.clone()),
+                Json(StartAuthenticationRequest {
+                    email: "alice@example.com".into(),
+                    return_to: return_to.map(str::to_owned),
+                    handoff_challenge: challenge.map(str::to_owned),
+                }),
+            )
+        };
+        let challenge = crate::identity_oidc::s256_challenge(DESKTOP_VERIFIER);
+
+        let response = start(Some("gaugewright://auth/callback"), Some("short")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(signin_refusal(&response), Some("invalid_handoff_challenge"));
+
+        let response = start(Some("gaugewright://auth/callback"), None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(signin_refusal(&response), Some("invalid_handoff_challenge"));
+
+        let response = start(Some("https://evil.example/steal"), Some(&challenge)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(signin_refusal(&response), Some("unsupported_return_uri"));
+
+        let response = start(Some("gaugewright://auth/callback"), Some(&challenge)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// DR-0457: the email entrance, begun for a desktop, creates the account
+    /// and hands the desktop the same one-time code, with no browser session.
+    #[tokio::test]
+    async fn a_native_email_signup_hands_back_a_code_and_no_browser_session() {
+        let (runtime, sender) = runtime();
+        let now = unix_now();
+        let email_challenge = runtime.begin_email("new.person@example.com", now).unwrap();
+        let email_code = sender.0.lock().unwrap().last().unwrap().1.clone();
+        let email_ticket = runtime
+            .complete_email(&email_challenge, &email_code, now)
+            .unwrap();
+        let (_vault_dir, wb) = shared_workbench_with_vault();
+        let auth = AuthShellState::default().with_account_auth(Arc::new(runtime));
+        let challenge = crate::identity_oidc::s256_challenge(DESKTOP_VERIFIER);
+
+        let started = post_registration_start(
+            Extension(auth.clone()),
+            Json(StartRegistrationRequest {
+                email_verification: email_ticket,
+                display_name: "New Person".into(),
+                return_to: Some("gaugewright://auth/callback".into()),
+                handoff_challenge: Some(challenge),
+            }),
+        )
+        .await;
+        assert_eq!(started.status(), StatusCode::OK);
+        let started = body_json(started).await;
+        let authenticator = FakeAuthenticator::new();
+        let registration = authenticator
+            .registration_response(started["public_key"]["challenge"].as_str().unwrap());
+        let finished = post_registration_finish(
+            State(wb.clone()),
+            Extension(auth.clone()),
+            HeaderMap::new(),
+            Json(FinishRegistrationRequest {
+                ceremony_id: started["ceremony_id"].as_str().unwrap().to_owned(),
+                label: "Laptop".into(),
+                credential: registration,
+            }),
+        )
+        .await;
+        assert_eq!(finished.status(), StatusCode::OK);
+        assert!(
+            set_cookies(&finished).is_empty(),
+            "a desktop signup leaves no session in the system browser: {:?}",
+            set_cookies(&finished),
+        );
+        let finished = body_json(finished).await;
+        assert!(
+            !finished["recovery_codes"].as_array().unwrap().is_empty(),
+            "the codes still come back to the page that has to show them",
+        );
+        let account_id = finished["account_id"].as_str().unwrap().to_owned();
+        let code = handoff_code(finished["native_return"].as_str().unwrap());
+
+        let redeemed = exchange(&wb, &auth, &code, DESKTOP_VERIFIER);
+        assert_eq!(redeemed.status(), StatusCode::OK);
+        let redeemed = body_json(redeemed).await;
+        assert_eq!(redeemed["account_id"], account_id.as_str());
+        assert_eq!(redeemed["label"], "new.person@example.com");
     }
 }

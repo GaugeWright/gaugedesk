@@ -162,6 +162,7 @@ pub(crate) mod target_change_set;
 pub(crate) mod target_names;
 pub(crate) mod target_settlement;
 pub mod tenancy;
+pub mod test_signin;
 pub mod throttle;
 pub mod tokenwright;
 pub mod tokenwright_anchors;

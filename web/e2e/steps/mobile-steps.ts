@@ -104,11 +104,14 @@ Then("the device shows the Personal project settings", async ({ page }) => {
 
 Then("Personal project settings do not offer sharing", async ({ page }) => {
     const picker = page.getByLabel("Settings page for Personal");
+    // Every Project Settings page but People & sharing (admin-console.md,
+    // "Project Settings"; Background work since DR-0312/DR-0331).
     await expect(picker.locator("option")).toHaveText([
         "Overview",
         "Work & data",
         "Agents & placements",
         "Model access",
+        "Background work",
     ]);
     await expect(picker.locator('option[value="people"]')).toHaveCount(0);
 });

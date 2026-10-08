@@ -23,10 +23,13 @@ Feature: File editor
     And the "view" tab is absent
     And the file editor shows "agent-note"
 
+  # The Agent's authored directory is `agent/`, and `SYSTEM.md` there holds its
+  # editable system-level instructions (archetype.md, DR-0247). GaugeDesk
+  # derives the package under `.whipple/` from it; that is not a file to edit.
   Scenario: an edit chat can save authored behavior in the package draft
     Given the workbench is open
     When I create an edit chat under the archetype "Default"
-    And I select the file ".whipple/draft/persona.md" in the workspace
+    And I select the file "agent/SYSTEM.md" in the workspace
     Then the content viewer offers the "view" tab
     And the content viewer offers the "edit" tab
     When I open the "edit" tab

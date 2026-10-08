@@ -11,7 +11,12 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="$REPO/target/debug/gaugedesk-enterprise-server"
 STATE="${GAUGEDESK_E2E_STATE:-/tmp/gaugewright-e2e-state-${PORT}}"
 
-(fuser -k "${PORT}/tcp" 2>/dev/null || lsof -ti "tcp:${PORT}" 2>/dev/null | xargs -r kill 2>/dev/null) || true
+# Free an orphaned LISTENER on this port, and nothing else. `fuser -k PORT/tcp`
+# and `lsof -i tcp:PORT` also match any process whose outgoing connection
+# happens to use PORT as its ephemeral local port, so on a host running two
+# suites (or a gate host running other bars) they killed unrelated processes,
+# another run's control plane among them (WS-871).
+(lsof -nP -t -iTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null | xargs -r kill 2>/dev/null) || true
 sleep 0.4
 
 rm -rf "$STATE"

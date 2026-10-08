@@ -22,6 +22,9 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use gaugedesk_app::account_link_seal::{
+    open_link_copy, LinkContext, LinkRecipientPrivateKey, SealedLinkCopy,
+};
 use serde_json::{json, Value};
 
 const PERSON: &str = "e2e-person@example.test";
@@ -29,6 +32,18 @@ const ACCOUNT: &str = "e2e-account-root";
 const SESSION: &str = "e2e-opaque-account-session";
 const CODE: &str = "e2e-handoff-code";
 const DEVICE: &str = "native-e2e-device";
+/// The provider key the journey links (`hub-session-steps.ts`).
+const PROVIDER_SECRET: &str = "native-e2e-provider-secret";
+/// The signed-in device's provider-link recipient key (DR-0334), as a fixed
+/// fixture seed. A real Hub stores only the device's public key and the copies
+/// sealed to it; the stand-in also plays the device, opening the one copy it
+/// is sent to prove the page sealed exactly the key the person typed, for this
+/// account, provider and version, and sent nothing else.
+const DEVICE_LINK_SEED: [u8; 32] = [0x5e; 32];
+
+fn device_link_key() -> LinkRecipientPrivateKey {
+    LinkRecipientPrivateKey::from_seed(DEVICE_LINK_SEED).expect("fixture recipient seed")
+}
 /// Short enough that every status read on the desktop control plane falls
 /// inside its proactive-refresh window (10 minutes).
 const TOKEN_LIFE_SECS: i64 = 360;
@@ -161,6 +176,23 @@ async fn revoke(State(hub): State<Arc<Hub>>) -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
 
+/// Forget everything a scenario did here. The suite starts one stand-in Hub
+/// per run and resets the control plane before every scenario; without this
+/// the Hub kept the last scenario's revocation, provider link, device link and
+/// conversation, so a journey that runs twice in one run (once per browser)
+/// met its own leftovers the second time (WS-871).
+async fn reset(State(hub): State<Arc<Hub>>) -> impl IntoResponse {
+    hub.revoked.store(false, Ordering::SeqCst);
+    hub.refreshes.store(0, Ordering::SeqCst);
+    hub.provider_linked.store(false, Ordering::SeqCst);
+    hub.device_link_started.store(false, Ordering::SeqCst);
+    hub.account_messages
+        .lock()
+        .expect("account messages")
+        .clear();
+    StatusCode::NO_CONTENT
+}
+
 fn account_authorized(headers: &HeaderMap) -> bool {
     headers
         .get("authorization")
@@ -239,6 +271,43 @@ async fn open_account_gaugeapp(State(hub): State<Arc<Hub>>, headers: HeaderMap) 
     .into_response()
 }
 
+/// The cheap read the workbench makes on every page load instead of admitting
+/// Account Settings (WS-916): the same identity and memberships the Account
+/// page shows, and the default appearance this fixture never changes.
+async fn account_summary(headers: HeaderMap) -> Response {
+    if !account_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, "sealed account session required").into_response();
+    }
+    Json(json!({
+        "summary": {
+            "actor": ACCOUNT,
+            "profile": { "display_name": "E2E Person", "email": PERSON, "avatar": null },
+            // The same memberships the Account page lists below, which the
+            // workbench's organization selector reads at page load (WS-916).
+            "memberships": [{
+                "id": "personal-e2e",
+                "display_name": "Personal",
+                "role": "owner",
+                "personal": true,
+                "provider_commercial": false
+            }, {
+                "id": "org",
+                "display_name": "E2E Organization",
+                "role": "owner",
+                "personal": false,
+                "provider_commercial": false
+            }],
+            "appearance": {
+                "version": 1,
+                "interface_scale": "standard",
+                "contrast": "standard",
+                "motion": "system"
+            }
+        }
+    }))
+    .into_response()
+}
+
 async fn account_page(
     State(hub): State<Arc<Hub>>,
     headers: HeaderMap,
@@ -268,9 +337,28 @@ async fn account_page(
                     "display_name": "Personal",
                     "role": "owner",
                     "personal": true,
-                    "provider_commercial": false
+                    "provider_commercial": false,
+                    // Personal is never left (AccountSettingsPageV1).
+                    "can_leave": false,
+                    "leave_blocked_reason": null
+                }, {
+                    // The enterprise composition's organization, which its
+                    // test reset makes this account the owner of
+                    // (`administration_account`, `org::ORG_ID`).
+                    "id": "org",
+                    "display_name": "E2E Organization",
+                    "role": "owner",
+                    "personal": false,
+                    "provider_commercial": false,
+                    "can_leave": false,
+                    "leave_blocked_reason": "Make someone else an owner before you leave."
                 }],
-                "invitations": []
+                "invitations": [],
+                "erasure": {
+                    "available": false,
+                    "confirmation": "ERASE MY ACCOUNT",
+                    "blocking_organizations": ["org"]
+                }
             }
         }),
         "provider-connections" => {
@@ -290,7 +378,8 @@ async fn account_page(
                     "models": [],
                     "linked_at_ms": 1,
                     "last_verified_at_ms": null,
-                    "verification": "unverified"
+                    "verification": "unverified",
+                    "waiting": []
                 })]
             } else {
                 Vec::new()
@@ -305,6 +394,13 @@ async fn account_page(
                 "freshness": "live",
                 "model": {
                     "connections": connections,
+                    "account_links": {
+                        "account": ACCOUNT,
+                        "recipients": [{
+                            "device_id": DEVICE,
+                            "public_key": device_link_key().public_key().as_str(),
+                        }]
+                    },
                     "default_model": null,
                     "subscription_sign_ins": {
                         "codex": { "provider": "openai-codex", "linked": false, "expires": null, "expired": false, "login": null },
@@ -443,7 +539,10 @@ async fn account_provider_secret(
             .and_then(|payload| payload.get("provider"))
             .and_then(Value::as_str)
             == Some("openai")
-        && body.get("secret").and_then(Value::as_str) == Some("native-e2e-provider-secret");
+        // The account authority never receives the key (DR-0334): only the
+        // copies sealed to each trusted device, the next version of the link.
+        && body.get("secret").is_none()
+        && sealed_for_this_device(body.get("sealed"));
     if !valid || hub.provider_linked.swap(true, Ordering::SeqCst) {
         return (StatusCode::CONFLICT, "credential intake was not current").into_response();
     }
@@ -462,6 +561,29 @@ async fn account_provider_secret(
         "result": { "connection_id": "native-e2e-openai", "verification": "unverified" }
     }))
     .into_response()
+}
+
+/// Whether `sealed` is the first version of the OpenAI link, as exactly one
+/// copy for this device that opens to the journey's key.
+fn sealed_for_this_device(sealed: Option<&Value>) -> bool {
+    let Some(sealed) = sealed else { return false };
+    if sealed.get("expected_version").and_then(Value::as_u64) != Some(0) {
+        return false;
+    }
+    let copies: Vec<SealedLinkCopy> =
+        match sealed.get("copies").cloned().map(serde_json::from_value) {
+            Some(Ok(copies)) => copies,
+            _ => return false,
+        };
+    let [copy] = copies.as_slice() else {
+        return false;
+    };
+    let Ok(context) = LinkContext::new(ACCOUNT, "openai", 1) else {
+        return false;
+    };
+    copy.device_id == DEVICE
+        && open_link_copy(&context, &device_link_key(), copy).as_deref()
+            == Ok(PROVIDER_SECRET.as_bytes())
 }
 
 async fn account_updates(headers: HeaderMap) -> Response {
@@ -584,6 +706,7 @@ async fn main() {
             post(open_account_gaugeapp),
         )
         .route("/gaugeapps/account-settings/pages/{id}", get(account_page))
+        .route("/gaugeapps/account-settings/summary", get(account_summary))
         .route(
             "/gaugeapps/account-settings/commands",
             post(account_command),
@@ -606,6 +729,7 @@ async fn main() {
             get(account_agent_events),
         )
         .route("/test/revoke", post(revoke))
+        .route("/test/reset", post(reset))
         .with_state(hub);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

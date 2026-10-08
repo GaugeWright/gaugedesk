@@ -95,15 +95,16 @@ describe("unpublished directory discovery (WS-675)", () => {
         api.setCurrentProject("project:a" as ProjectId);
         for (let i = 0; i < 6; i++) await expect(api.getWorkspace()).resolves.toMatchObject({ projects: [] });
         const discoveryCount = () => paths.filter((path) => path.endsWith("/account/directory")).length;
-        // Initial pool discovery, then one repair read for the ungranted project.
-        expect(discoveryCount()).toBe(2);
+        // The pool's own discovery began after the project was asked about,
+        // so it answers for the ungranted project too: no repair read (WS-891).
+        expect(discoveryCount()).toBe(1);
         expect(paths.filter((path) => path.endsWith("/home/admissions"))).toHaveLength(1);
         api.setCurrentProject("project:b" as ProjectId);
         await api.getWorkspace();
-        expect(discoveryCount()).toBe(3);
+        expect(discoveryCount()).toBe(2);
         api.setBearer("next-account-token");
         await api.getWorkspace();
-        expect(discoveryCount()).toBe(5);
+        expect(discoveryCount()).toBe(3);
         expect(paths.filter((path) => path.endsWith("/home/admissions"))).toHaveLength(2);
     });
 });
@@ -142,9 +143,10 @@ describe("organization shared project creation", () => {
         await expect(api.organizationSharedProject("organization:abc")).resolves.toMatchObject({
             projectId: "proj-org-abc", homeId: null,
         });
+        // One reach: the routes it read to build the pool are already newer
+        // than the question about the Personal project (WS-891).
         expect(paths).toEqual([
             "http://127.0.0.1:4919/account/tenants",
-            "http://127.0.0.1:4919/account/hub-session/reach",
             "http://127.0.0.1:4919/account/hub-session/reach",
             "http://127.0.0.1:4919/account/tenants/organization%3Aabc/shared-project",
             "http://127.0.0.1:4919/account/tenants/organization%3Aabc/shared-project",
@@ -1195,6 +1197,150 @@ describe("project-first Home resolution (DESK-3)", () => {
         await api.getWorkspace();
         expect(worked.at(-1)).toBe("c");
         expect(routeReads()).toBe(built + 2);
+    });
+});
+
+describe("projects no route names, asked about all at once (WS-891)", () => {
+    /** Six projects served by the selected Home with no route between them,
+     * the shape of the chat-turn canary's account. The task bar lists every
+     * project's trackers at once, several times while a page settles, and a
+     * route read is slow: each is three account and directory requests the
+     * Hub answers one after another. Until every read was shared, a new chat
+     * waited about a minute for its own route behind ninety of them. */
+    function unroutedAccount() {
+        const projects = ["proj-1", "proj-2", "proj-3", "proj-4", "proj-5", "proj-6"] as ProjectId[];
+        const counts = { routeReads: 0, homeReads: 0, admissions: 0, trackers: 0 };
+        const servedBy: string[] = [];
+        const streamed: string[] = [];
+        let published: { project: string; home_id: string; endpoint: string }[] = [];
+        let release: () => void = () => undefined;
+        let held: Promise<void> | null = null;
+        const hold = () => { held = new Promise((resolve) => { release = resolve; }); };
+        vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            if (url === "https://hub.example/account/home-routes") {
+                counts.routeReads += 1;
+                const routes = published;
+                if (held) await held;
+                return Response.json({ routes });
+            }
+            if (url === "https://hub.example/account/directory") return new Response(null, { status: 404 });
+            if (url === "https://hub.example/account/homes") {
+                counts.homeReads += 1;
+                return Response.json({
+                    homes: [{ id: "home:z", kind: "cloud", endpoint: "https://z.example" }],
+                    selected_home: "home:z",
+                });
+            }
+            const admission = url.match(/^https:\/\/([zn])\.example\/home\/admissions$/);
+            if (admission && init?.method === "POST") {
+                counts.admissions += 1;
+                return Response.json({ home: `home:${admission[1]}`, admission: `token-${admission[1]}` }, { status: 201 });
+            }
+            const tracker = url.match(/^https:\/\/z\.example\/projects\/([^/]+)\/trackers$/);
+            if (tracker) {
+                counts.trackers += 1;
+                return Response.json({ trackers: [{
+                    project_id: tracker[1], workspace_id: "workspace-z", queue: "tasks",
+                    resource_id: `tracker-${tracker[1]}`, can_complete: true,
+                }] });
+            }
+            const events = url.match(/^https:\/\/([zn])\.example\/workspace\/events$/);
+            if (events) {
+                streamed.push(events[1]!);
+                return new Response(new ReadableStream({ start(controller) {
+                    init?.signal?.addEventListener("abort", () => { try { controller.close(); } catch { /* closed */ } });
+                } }), { headers: { "content-type": "text/event-stream" } });
+            }
+            const workspace = url.match(/^https:\/\/([zn])\.example\/workspace$/);
+            if (workspace) {
+                servedBy.push(workspace[1]!);
+                return Response.json({
+                    archetypes: [], projects: [], recent: [], workstreams: [],
+                    work_targets: [], personal_placement: null,
+                });
+            }
+            throw new Error(`unexpected fetch ${url}`);
+        }));
+        const api = new WorkbenchControlPlane("https://hub.example", { splitHomes: true });
+        api.setBearer("person-token");
+        return {
+            api, projects, counts, servedBy, streamed, hold,
+            release: () => { const open = release; held = null; open(); },
+            publish: (project: string) => {
+                published = [...published, { project, home_id: "home:n", endpoint: "https://n.example" }];
+            },
+        };
+    }
+
+    it("shares one route read and one selected Home among every project asked about meanwhile", async () => {
+        const { api, projects, counts, servedBy, hold, release } = unroutedAccount();
+        hold();
+        const taskBar = () => Promise.all(projects.map((project) => api.listProjectTrackers(project)));
+        // Three passes of the task bar, and the new chat's route moving to its
+        // project, all before the first route read has answered.
+        const pending = [taskBar(), taskBar(), taskBar()];
+        api.setCurrentProject(projects[0]!);
+        const chat = api.getWorkspace();
+        await vi.waitFor(() => expect(counts.routeReads).toBe(1));
+        release();
+        await Promise.all([...pending, chat]);
+
+        expect(counts.routeReads).toBe(1);
+        expect(counts.homeReads).toBe(1);
+        expect(counts.admissions).toBe(1);
+        expect(counts.trackers).toBe(18);
+        expect(servedBy).toEqual(["z"]);
+
+        // Once known, an unrouted project is not read about again.
+        await taskBar();
+        api.setCurrentProject(projects[1]!);
+        await api.getWorkspace();
+        expect(counts.routeReads).toBe(1);
+        expect(counts.homeReads).toBe(1);
+    });
+
+    it("leaves the workbench's streams open when the open project keeps the same Home", async () => {
+        const { api, projects, streamed, publish } = unroutedAccount();
+        const stop = api.subscribeWorkspace(() => undefined);
+        try {
+            await vi.waitFor(() => expect(streamed).toEqual(["z"]));
+            // Opening a chat in a project no route names: still the selected Home.
+            api.setCurrentProject(projects[0]!);
+            await api.getWorkspace();
+            api.setCurrentProject(projects[1]!);
+            await api.getWorkspace();
+            api.setCurrentProject(null);
+            await api.getWorkspace();
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            expect(streamed).toEqual(["z"]);
+            // A project another Home serves still moves them.
+            publish("proj-new");
+            api.setCurrentProject("proj-new" as ProjectId);
+            await vi.waitFor(() => expect(streamed).toEqual(["z", "n"]));
+        } finally { stop(); }
+    });
+
+    it("still finds a project routed after a read that was already in flight", async () => {
+        const { api, projects, counts, servedBy, hold, release, publish } = unroutedAccount();
+        await api.listProjectTrackers(projects[0]!);
+        expect(counts.routeReads).toBe(1);
+        // A read the pool did not answer begins for an older project...
+        hold();
+        const older = api.listProjectTrackers("proj-older" as ProjectId);
+        await vi.waitFor(() => expect(counts.routeReads).toBe(2));
+        // ...and a project created on another Home is opened while it runs.
+        // That read may predate the project, so it is not the one trusted:
+        // the read after it is.
+        publish("proj-new");
+        api.setCurrentProject("proj-new" as ProjectId);
+        const opened = api.getWorkspace();
+        release();
+        await older;
+        await expect(opened).resolves.toBeDefined();
+        expect(counts.routeReads).toBe(3);
+        // Served by its own Home, not by the selected one.
+        expect(servedBy).toEqual(["n"]);
     });
 });
 

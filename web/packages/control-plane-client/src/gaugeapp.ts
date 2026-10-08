@@ -206,6 +206,7 @@ export const gaugeAppRoutes = {
         agentStop: controlPlaneOperation("POST", "/gaugeapps/account-settings/agent/stop"),
         agentErase: controlPlaneOperation("POST", "/gaugeapps/account-settings/agent/erase"),
         updates: controlPlaneOperation("GET", "/gaugeapps/account-settings/updates"),
+        summary: controlPlaneOperation("GET", "/gaugeapps/account-settings/summary"),
     },
     administration: {
         ssoCredential: controlPlaneOperation("POST", "/gaugeapps/administration/enterprise-identity/credential"),
@@ -328,6 +329,80 @@ export async function readGaugeAppPage(
     const value = await json(route.method, `${bind(route.path, pageId)}?${sessionQuery(session)}`);
     const response = value as { readonly page?: unknown } | null;
     return parseGaugeAppPage(response?.page, session.app, pageId, session.scope);
+}
+
+/** One organization the person belongs to, as the workbench's selector lists it. */
+export interface AccountSettingsMembership {
+    readonly id: string;
+    readonly display_name: string;
+    readonly role: string;
+    readonly personal: boolean;
+    readonly provider_commercial: boolean;
+}
+
+/**
+ * What the workbench needs about the signed-in person on every page load —
+ * who they are, which organizations they belong to, and how they asked the
+ * interface to look — without admitting Account Settings (WS-916). Admission
+ * builds every Account Settings page on the Hub; this read builds none.
+ */
+export interface AccountSettingsSummary {
+    readonly actor: string;
+    readonly profile: {
+        readonly display_name: string | null;
+        readonly email: string | null;
+        readonly avatar: string | null;
+    };
+    readonly memberships: readonly AccountSettingsMembership[];
+    /** The person's stored appearance preference, unvalidated here: the shell
+     *  parses it with `parseAppearancePreference` and falls back to the default
+     *  on anything it cannot read, as it does for the admitted page. */
+    readonly appearance: unknown;
+}
+
+const summaryRecord = (value: unknown): Record<string, unknown> | null =>
+    typeof value === "object" && value !== null && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null;
+const summaryText = (value: unknown): string | null =>
+    typeof value === "string" && value.length > 0 ? value : null;
+
+/** Read the summary, tolerating any field but the actor being absent or
+ *  malformed: a Hub that adds or omits a field must not cost the person their
+ *  organization selector. Memberships are coerced exactly as the Account
+ *  page's were, so the two sources list the same organizations. */
+export function parseAccountSettingsSummary(value: unknown): AccountSettingsSummary {
+    const summary = summaryRecord(summaryRecord(value)?.summary);
+    const actor = summaryText(summary?.actor);
+    if (!summary || !actor) throw new Error("Account summary response is malformed");
+    const profile = summaryRecord(summary.profile);
+    const memberships = (Array.isArray(summary.memberships) ? summary.memberships : []).flatMap((entry) => {
+        const membership = summaryRecord(entry);
+        return membership && typeof membership.id === "string"
+            ? [{
+                id: membership.id,
+                display_name: typeof membership.display_name === "string" ? membership.display_name : membership.id,
+                role: typeof membership.role === "string" ? membership.role : "member",
+                personal: membership.personal === true,
+                provider_commercial: membership.provider_commercial === true,
+            }]
+            : [];
+    });
+    return {
+        actor,
+        profile: {
+            display_name: summaryText(profile?.display_name),
+            email: summaryText(profile?.email),
+            avatar: summaryText(profile?.avatar),
+        },
+        memberships,
+        appearance: summary.appearance,
+    };
+}
+
+export async function readAccountSettingsSummary(json: RouteJson): Promise<AccountSettingsSummary> {
+    const route = gaugeAppRoutes["account-settings"].summary;
+    return parseAccountSettingsSummary(await json(route.method, route.path));
 }
 
 export async function submitGaugeAppCommand(

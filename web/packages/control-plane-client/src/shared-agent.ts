@@ -40,3 +40,18 @@ export interface WorkRouteInputs {
 export function workRouteProject(inputs: WorkRouteInputs): ProjectId | null {
     return inputs.requested ?? inputs.agentSettings ?? inputs.chatProject ?? inputs.authoring ?? null;
 }
+
+/** The project an open chat's work is routed by, from the project the
+ *  workspace read lists it under and the route that read went out under.
+ *  A chat in any other project routes by that project. A Personal project is
+ *  each Home's own, and every headless Home's is `proj-default`, so its id
+ *  names no one Home: a route another Home published for it sent a Personal
+ *  chat's turns there while the chat was on the Home that listed it (WS-893).
+ *  A Personal chat keeps the route its read went out under instead, which
+ *  reached the Home that holds it — the Home it was created on. */
+export function chatRouteProject(
+    project: { readonly id: ProjectId; readonly isPersonal: boolean },
+    readUnder: ProjectId | null,
+): ProjectId | null {
+    return project.isPersonal ? readUnder : project.id;
+}

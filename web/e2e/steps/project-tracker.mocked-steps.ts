@@ -117,7 +117,6 @@ Then("the backlog shows its instructions and separate claim", async ({ page }) =
     await expect(panel(page).getByLabel("Assigned to")).toHaveValue("learner");
     await expect(panel(page).locator("[data-task-claim]")).toHaveText("No current claim");
     await expect(panel(page).getByRole("button", { name: "Mark complete" })).toBeDisabled();
-    await page.screenshot({ path: "/var/tmp/desk-whip-backlog-ui.png", fullPage: true });
 });
 When("I include completed backlog tasks", async ({ page }) => {
     await panel(page).getByLabel("Show all tasks").check();
@@ -221,8 +220,12 @@ Then("the task is released as its expected holder", async ({ page }) => {
 When("I assign the task to myself", async ({ page }) => {
     await panel(page).getByLabel("Assigned to").selectOption("learner");
 });
+// The act reports its outcome as the dialog's status, naming the new assignee
+// as the reader knows them. The task rows also read "Assigned to …", so the
+// whole dialog is no place to look for it: once the re-read lands the rows
+// match too, and which a check meets depended on how fast the re-read was.
 Then("the task is reassigned only if it was still unassigned", async ({ page }) => {
-    await expect(panel(page).getByText(/^Assigned to /)).toBeVisible();
+    await expect(panel(page).getByRole("status").filter({ hasText: /^Assigned to / })).toHaveText("Assigned to you.");
     await expect(panel(page).getByLabel("Assigned to")).toHaveValue("learner");
     const assign = fixtures.get(page)!.controls.at(-1)!;
     expect(assign.body).toEqual({ subject_id: "unassigned-subject", control: { kind: "assign", expected_assignee: null, assigned_to: "learner" } });

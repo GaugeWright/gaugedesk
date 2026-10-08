@@ -56,6 +56,12 @@ export const edgeURL = `http://127.0.0.1:${ports.edge}`;
 export const enterpriseAppURL = `http://127.0.0.1:${ports.enterpriseApp}/apps/enterprise-workbench/`;
 
 /** Per-run control-plane state dirs (keyed by port so concurrent runs don't share state). */
-export const aliceState = `${os.tmpdir()}/gw-e2e-state-${ports.alice}`;
-export const bobState = `${os.tmpdir()}/gw-e2e-state-${ports.bob}`;
-export const enterpriseState = `${os.tmpdir()}/gw-e2e-state-${ports.enterprise}`;
+// `GW_E2E_STATE_ROOT` moves them elsewhere: the fleet's job puts them on tmpfs,
+// because every scenario's reset rewrites the state root with fsyncs, and on a
+// gate host whose disk the other bars saturate one fsync can take seconds —
+// enough to hold a control plane's startup past its webServer timeout and a
+// reset past the scenario's (WS-871).
+const stateRoot = process.env.GW_E2E_STATE_ROOT || os.tmpdir();
+export const aliceState = `${stateRoot}/gw-e2e-state-${ports.alice}`;
+export const bobState = `${stateRoot}/gw-e2e-state-${ports.bob}`;
+export const enterpriseState = `${stateRoot}/gw-e2e-state-${ports.enterprise}`;

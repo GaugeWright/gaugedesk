@@ -1,7 +1,9 @@
 use std::sync::{Mutex, MutexGuard};
 
+mod keep_alive_server;
 mod remote_harness;
 pub(crate) mod remote_wire;
+pub(crate) use keep_alive_server::keep_alive_server;
 pub(crate) use remote_harness::RemoteLoopbackHarness;
 
 static FAKE_AGENT_ENV_GUARD: Mutex<()> = Mutex::new(());

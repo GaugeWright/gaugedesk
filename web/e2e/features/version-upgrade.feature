@@ -6,8 +6,9 @@ Feature: Placement version upgrade (UX-9, ADR 0063)
   its version until taken.
 
   # A deliberately-placed archetype shows as its own node; publishing a new version of
-  # it offers that placement an upgrade. (The project's built-in general placement is
-  # hidden plumbing, so upgrade notices surface on the placements you explicitly added.)
+  # it offers that placement an upgrade. Agent view also shows the project's built-in
+  # general placement, which runs Default too, so it is offered the same upgrade and
+  # keeps its version until it takes it.
   Scenario: publishing a new version offers a placement upgrade
     Given the workbench is open
     When I create a project named "site"
@@ -16,3 +17,4 @@ Feature: Placement version upgrade (UX-9, ADR 0063)
     Then the placement on "site" shows an upgrade is available
     When I upgrade the placement on "site"
     Then the placement on "site" is up to date
+    And the built-in placement on "site" still offers its upgrade

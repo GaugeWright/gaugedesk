@@ -1,10 +1,12 @@
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 import { App, openExternal, type WorkbenchGaugeApps } from "@gaugewright/workbench-web";
-import { createGaugeAppResource, gaugeAppMenuIdentity } from "@gaugewright/workbench-ui";
+import { createGaugeAppResource, gaugeAppMenuIdentity, summaryMenuIdentity } from "@gaugewright/workbench-ui";
 import { availablePopoverHeight } from "./popover-fit";
 import {
+    type AccountSettingsMembership,
     type GaugeAppKind,
+    type GaugeAppPageModel,
     type GaugeAppScope,
     parseAccountGaugeAppPage,
     parseAppearancePreference,
@@ -18,7 +20,7 @@ import {
 import { createGaugeAppWorkspace, type GaugeAppWorkspaceController, type OrganizationInvitationAccess } from "./AdministrationGaugeApp";
 import { parseDeviceLinkInvitation, type DeviceLinkInvitation } from "./account-device-link";
 import { ProposalChat, ProposalContent, ProposalMenu } from "./CommercialProposal";
-import { applyAppearancePreference, resetAppearancePreference } from "./appearance-preference";
+import { applyAppearancePreference, DEFAULT_APPEARANCE, resetAppearancePreference } from "./appearance-preference";
 
 const APP_LABELS: Readonly<Record<GaugeAppKind, string>> = {
     "account-settings": "Account Settings",
@@ -49,18 +51,41 @@ const PAGE_LABELS: Readonly<Record<string, string>> = {
     payments: "Payments",
 };
 
-interface Membership {
-    readonly id: string;
-    readonly display_name: string;
-    readonly role: string;
-    readonly personal: boolean;
-    readonly provider_commercial: boolean;
-}
+/** Account Settings' pages in the order its page-action contract lists them
+ * (`contracts/gaugeapps-page-actions.json`). The account menu offers them
+ * before admission, from the summary, and each opens through admission. */
+const ACCOUNT_SETTINGS_PAGES = ["account", "provider-connections", "trusted-devices", "application-settings"] as const;
+
+type Membership = AccountSettingsMembership;
 
 function record(value: unknown): Record<string, unknown> | null {
     return typeof value === "object" && value !== null && !Array.isArray(value)
         ? value as Record<string, unknown>
         : null;
+}
+
+/** Memberships as the admitted Account page lists them, for a Hub that
+ * predates the summary read. */
+function accountPageMemberships(page: GaugeAppPageModel | undefined, actor: string): Membership[] {
+    if (page?.scope.kind !== "person" || page.scope.id !== actor) return [];
+    const model = record(page.model);
+    const values = Array.isArray(model?.memberships) ? model.memberships : [];
+    return values.flatMap((value) => {
+        const membership = record(value);
+        return membership && typeof membership.id === "string"
+            ? [{
+                id: membership.id,
+                display_name: typeof membership.display_name === "string" ? membership.display_name : membership.id,
+                role: typeof membership.role === "string" ? membership.role : "member",
+                personal: membership.personal === true,
+                provider_commercial: membership.provider_commercial === true,
+            }]
+            : [];
+    });
+}
+
+function notFound(error: unknown): boolean {
+    return typeof error === "object" && error !== null && (error as { readonly status?: unknown }).status === 404;
 }
 
 function initialGaugeApp(): GaugeAppKind | null {
@@ -294,6 +319,32 @@ export function EnterpriseWorkbench(): JSX.Element {
     };
 
     const [accountEnabled, setAccountEnabled] = createSignal(true);
+    // Account Settings is admitted when the person reaches for it — its menu
+    // entries, a link to one of its pages, a device link or an organization
+    // invitation — and not on every page load (WS-916). Admission builds all
+    // four Account Settings pages on the Hub under the lock every other
+    // request waits on; on production on 2026-10-08 the open alone took
+    // 370 ms before the page reads that followed it. What every page load
+    // needs — who the person is, their organizations, their appearance — comes
+    // from the summary read below, which builds no page.
+    const [accountWanted, setAccountWanted] = createSignal(
+        initialGaugeApp() === "account-settings" || Boolean(deviceLinkInvitation() || organizationInvitation()),
+    );
+    createEffect(() => {
+        if (activeApp() === "account-settings" || deviceLinkInvitation() || organizationInvitation()) {
+            setAccountWanted(true);
+        }
+    });
+    const [summary, { refetch: refetchSummary }] = createGaugeAppResource(
+        () => accountEnabled() || null,
+        () => "account-summary",
+        () => api.accountSettingsSummary(),
+    );
+    createEffect(() => {
+        // A Hub that predates the summary read answers 404: admit as before,
+        // so that person still gets their identity, organizations and theme.
+        if (notFound(summary.error)) setAccountWanted(true);
+    });
     // Inside GaugeDesk, Provider Connections signs in to a provider through
     // this computer's own Model access (DR-0360); on the web there is none.
     const [modelAccessRequest, setModelAccessRequest] = createSignal(0);
@@ -301,7 +352,7 @@ export function EnterpriseWorkbench(): JSX.Element {
     const account = createGaugeAppWorkspace({
         api,
         app: "account-settings",
-        enabled: accountEnabled,
+        enabled: () => accountEnabled() && accountWanted(),
         active: () => activeApp() === "account-settings",
         scope: () => undefined,
         openExternal,
@@ -313,6 +364,7 @@ export function EnterpriseWorkbench(): JSX.Element {
         },
         onAccountErased: () => {
             setBearer(null);
+            void refetchSummary().catch(() => undefined);
             setCreatedMembership(null);
             setTenant(null);
             setActiveApp(null);
@@ -327,6 +379,11 @@ export function EnterpriseWorkbench(): JSX.Element {
         organizationInvitation,
         onOrganizationInvitationResponded: () => setOrganizationInvitation(null),
     });
+    // The person account every management App is admitted for, known from
+    // the summary at page load so it does not change when Account Settings is
+    // admitted later: Administration and Commercial Operations key their
+    // sessions on it, and a change would admit them a second time.
+    const accountActor = () => account.session()?.actor ?? summary()?.actor;
     const appearanceGrant = createMemo(() => {
         const session = account.session();
         return session?.pages.some((page) => page.id === "application-settings") ? session : undefined;
@@ -334,46 +391,60 @@ export function EnterpriseWorkbench(): JSX.Element {
     const [accountAppearancePage] = createGaugeAppResource(appearanceGrant,
         (session) => JSON.stringify([session.actor, session.id, session.generation, session.update_cursor]),
         (session) => api.readGaugeAppPage(session, "application-settings"));
-    let appearanceSession = "";
+    // Keyed on the person rather than on an admission, so admitting Account
+    // Settings does not reset the theme the summary already applied.
+    let appearanceActor: string | undefined;
     createEffect(() => {
-        const admitted = account.session();
-        const key = admitted ? JSON.stringify([admitted.actor, admitted.id, admitted.generation]) : "";
-        if (key !== appearanceSession) {
-            appearanceSession = key;
+        const actor = accountActor();
+        if (actor !== appearanceActor) {
+            appearanceActor = actor;
             resetAppearancePreference();
         }
-        if (!admitted) return;
-        const current = account.page()?.id === "application-settings"
-            ? account.page()
-            : accountAppearancePage();
-        if (!current) return;
-        const parsed = parseAccountGaugeAppPage(current);
-        if (parsed.id === "application-settings") {
-            applyAppearancePreference(parseAppearancePreference(parsed.model.preferences.appearance, "application-settings.appearance"));
+        if (account.session()) {
+            const current = account.page()?.id === "application-settings"
+                ? account.page()
+                : accountAppearancePage();
+            const parsed = current ? parseAccountGaugeAppPage(current) : undefined;
+            if (parsed?.id === "application-settings") {
+                applyAppearancePreference(parseAppearancePreference(parsed.model.preferences.appearance, "application-settings.appearance"));
+                return;
+            }
         }
+        const loaded = summary();
+        if (!loaded || loaded.actor !== actor) return;
+        let preference = DEFAULT_APPEARANCE;
+        try {
+            preference = parseAppearancePreference(loaded.appearance, "summary.appearance");
+        } catch {
+            // An unreadable preference is the default, as an unset one is.
+        }
+        applyAppearancePreference(preference);
     });
+    // The Account page is what Account Settings itself shows; it is read only
+    // once Account Settings is admitted, never to fill the menus at page load.
     const [accountIndex, { refetch: refetchAccountIndex }] = createGaugeAppResource(account.session,
         (session) => JSON.stringify([session.actor, session.id, session.generation]),
         (session) => api.readGaugeAppPage(session, "account"));
+    /** Every read that lists the person's organizations, after one changes. */
+    const refetchAccount = async (): Promise<void> => {
+        const summaryRead = refetchSummary().catch(() => undefined);
+        try {
+            await refetchAccountIndex();
+        } finally {
+            await summaryRead;
+        }
+    };
     const [createdMembership, setCreatedMembership] = createSignal<Membership | null>(null);
-    const memberships = createMemo<readonly Membership[]>(() => {
+    const listedMemberships = (): readonly Membership[] | undefined => {
+        const actor = accountActor();
+        if (!actor) return undefined;
+        const loaded = summary();
+        if (loaded?.actor === actor) return loaded.memberships;
         const admitted = account.session();
-        const page = accountIndex();
-        if (!admitted || page?.scope.kind !== "person" || page.scope.id !== admitted.actor) return [];
-        const model = record(page.model);
-        const values = Array.isArray(model?.memberships) ? model.memberships : [];
-        const listed = values.flatMap((value) => {
-            const membership = record(value);
-            return membership && typeof membership.id === "string"
-                ? [{
-                    id: membership.id,
-                    display_name: typeof membership.display_name === "string" ? membership.display_name : membership.id,
-                    role: typeof membership.role === "string" ? membership.role : "member",
-                    personal: membership.personal === true,
-                    provider_commercial: membership.provider_commercial === true,
-                }]
-                : [];
-        });
+        return admitted ? accountPageMemberships(accountIndex(), admitted.actor) : undefined;
+    };
+    const memberships = createMemo<readonly Membership[]>(() => {
+        const listed = listedMemberships() ?? [];
         const created = createdMembership();
         return created && !listed.some((membership) => membership.id === created.id)
             ? [...listed, created]
@@ -381,13 +452,11 @@ export function EnterpriseWorkbench(): JSX.Element {
     });
     createEffect(() => {
         const created = createdMembership();
-        if (!account.session()) {
+        if (!accountActor()) {
             if (created) setCreatedMembership(null);
             return;
         }
-        const model = record(accountIndex()?.model);
-        if (created && Array.isArray(model?.memberships)
-            && model.memberships.some((value) => record(value)?.id === created.id)) {
+        if (created && listedMemberships()?.some((membership) => membership.id === created.id)) {
             setCreatedMembership(null);
         }
     });
@@ -416,6 +485,7 @@ export function EnterpriseWorkbench(): JSX.Element {
         if (activeApp() === "commercial-operations") setCommercialWanted(true);
     });
     const wantManagement = (app: GaugeAppKind): void => {
+        if (app === "account-settings") setAccountWanted(true);
         if (app === "administration") setAdministrationWanted(true);
         if (app === "commercial-operations") setCommercialWanted(true);
     };
@@ -423,8 +493,8 @@ export function EnterpriseWorkbench(): JSX.Element {
     const administration = createGaugeAppWorkspace({
         api,
         app: "administration",
-        enabled: () => Boolean(account.session() && tenant() && administrationWanted()),
-        actor: () => account.session()?.actor,
+        enabled: () => Boolean(accountActor() && tenant() && administrationWanted()),
+        actor: accountActor,
         active: () => activeApp() === "administration",
         scope: tenantScope,
         onPageChange: (page) => {
@@ -438,13 +508,13 @@ export function EnterpriseWorkbench(): JSX.Element {
             setActiveApp(null);
             setProposalAccess(null);
             writeManagementLocation(null, undefined, nextTenant);
-            void refetchAccountIndex();
+            void refetchAccount();
             setProjectRequest(null);
         },
         onOpenProject: setProjectRequest,
         onOpenGaugeApp: (app, page) => openGaugeApp(app, page),
         onTenantServicesChanged: async () => {
-            await refetchAccountIndex();
+            await refetchAccount();
             await commercial.refresh().catch(() => undefined);
         },
     });
@@ -454,8 +524,8 @@ export function EnterpriseWorkbench(): JSX.Element {
         // Attempt exact-scope admission, once it is wanted, and let the server
         // decide. A cached membership label or organization kind is never a
         // capability gate.
-        enabled: () => Boolean(account.session() && tenant() && commercialWanted()),
-        actor: () => account.session()?.actor,
+        enabled: () => Boolean(accountActor() && tenant() && commercialWanted()),
+        actor: accountActor,
         active: () => activeApp() === "commercial-operations",
         scope: providerScope,
         onPageChange: (page) => {
@@ -481,8 +551,7 @@ export function EnterpriseWorkbench(): JSX.Element {
     };
     const openGaugeApp = (app: GaugeAppKind, page: string): void => {
         const target = controller(app);
-        if ((app === "administration" || app === "commercial-operations")
-            && target && !target.session() && !target.session.error) {
+        if (target && !target.session() && !target.session.error) {
             // Not admitted yet: admit, and open the page once its grants say
             // it exists (the activation effect below reads it from the URL).
             wantManagement(app);
@@ -556,18 +625,30 @@ export function EnterpriseWorkbench(): JSX.Element {
         active: surfaceOpen,
         modelAccessRequest,
         selectedTenant: () => memberships().find((membership) => membership.id === tenant()) ?? null,
-        accountIdentity: () => gaugeAppMenuIdentity(
-            account.session.error ? undefined : account.session(), accountIndex(),
-        ),
-        accountActions: () => (account.session()?.pages ?? []).map((page) => ({
-            id: page.id,
-            label: PAGE_LABELS[page.id] ?? page.id,
-            open: () => openGaugeApp("account-settings", page.id),
-        })),
-        organizationSelector: () => <Show when={account.session()}><OrganizationSelector
+        accountIdentity: () => {
+            const admitted = account.session.error ? undefined : account.session();
+            // Until the admitted Account page arrives, keep the summary's
+            // identity rather than falling back to the bare actor id.
+            const loaded = summary();
+            return admitted && (accountIndex() || loaded?.actor !== admitted.actor)
+                ? gaugeAppMenuIdentity(admitted, accountIndex())
+                : summaryMenuIdentity(loaded) ?? gaugeAppMenuIdentity(admitted, accountIndex());
+        },
+        accountActions: () => {
+            const admitted = account.session();
+            const pages = admitted
+                ? admitted.pages.map((page) => page.id)
+                : summary() ? ACCOUNT_SETTINGS_PAGES : [];
+            return pages.map((page) => ({
+                id: page,
+                label: PAGE_LABELS[page] ?? page,
+                open: () => openGaugeApp("account-settings", page),
+            }));
+        },
+        organizationSelector: () => <Show when={account.session() || summary()}><OrganizationSelector
             memberships={memberships()}
             selected={tenant()}
-            canCreate={Boolean(account.session())}
+            canCreate={Boolean(account.session() || summary())}
             administration={administration.admitted() ? administration : undefined}
             commercial={commercial.admitted() ? commercial : undefined}
             onSelect={(id) => {
@@ -587,7 +668,7 @@ export function EnterpriseWorkbench(): JSX.Element {
                 setTenant(created.id);
                 closeGaugeApp();
                 writeManagementLocation(null, undefined, created.id);
-                void refetchAccountIndex().catch(() => undefined);
+                void refetchAccount().catch(() => undefined);
             }}
             onOpen={openGaugeApp}
             onMenuOpen={() => {
@@ -644,7 +725,7 @@ export function EnterpriseWorkbench(): JSX.Element {
             // identity, memberships, and chat all come back through the local
             // control plane's sealed account-authority proxy.
             await account.refresh().catch(() => undefined);
-            await refetchAccountIndex().catch(() => undefined);
+            await refetchAccount().catch(() => undefined);
         },
         onMobileAccountToken: async (token) => {
             setBearer(token);
@@ -657,7 +738,7 @@ export function EnterpriseWorkbench(): JSX.Element {
             // treating the OS-vault token or an earlier failed resource as
             // management state.
             await account.refresh();
-            await refetchAccountIndex();
+            await refetchAccount();
             if (tenant()) {
                 await Promise.all([
                     administration.refresh().catch(() => undefined),

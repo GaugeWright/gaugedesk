@@ -1,4 +1,4 @@
-@transport @enterprise-composition
+@transport @enterprise-composition @core
 Feature: GaugeWright account sign-in in Desk (ADR 0123, LOGIN-3/4/5)
 
   The desktop links the person's GaugeWright account through the native device

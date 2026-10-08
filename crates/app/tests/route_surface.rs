@@ -210,6 +210,7 @@ async fn test_only_harness_routes_refuse_without_activation_guard() {
     for (path, body) in [
         ("/test/reset", json!({})),
         ("/test/force-conflict", json!({ "on": true })),
+        ("/test/desktop-home-session", json!({})),
         (
             "/account/devices",
             json!({

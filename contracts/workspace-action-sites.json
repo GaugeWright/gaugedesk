@@ -6491,6 +6491,16 @@
         "count": 1
       },
       "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for TestSignin::load_journey",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "std :: fs :: remove_file (path)",
+        "file": "crates/app/src/test_signin.rs"
+      },
+      "profile": "custody-and-erasure"
     }
   ]
 }

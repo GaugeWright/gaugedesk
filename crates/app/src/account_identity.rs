@@ -139,12 +139,13 @@ pub enum EmailStanding {
 /// Ask the Hub at `hub` whether the account `bearer` belongs to holds `email`
 /// as a verified email (DR-0332). `Err` is not reaching a Hub that answers.
 pub fn hub_email_standing(hub: &str, bearer: &str, email: &str) -> Result<EmailStanding, String> {
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::net_http::shared_agent(crate::net_http::AgentSettings {
+        timeout: None,
+        connect: Some(std::time::Duration::from_secs(10)),
+        read: Some(std::time::Duration::from_secs(15)),
         // Never follow a redirect with someone's bearer in hand.
-        .redirects(0)
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(15))
-        .build();
+        redirects: false,
+    });
     let response = match agent
         .get(&format!("{}/account/identity", hub.trim_end_matches('/')))
         .set("authorization", &format!("Bearer {bearer}"))

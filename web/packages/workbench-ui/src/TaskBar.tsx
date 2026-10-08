@@ -27,6 +27,29 @@ import { isProjectTask, type EngagementId, type HumanTask } from "@gaugewright/c
 import type { AssignedTrackerTask, AssignedTrackerTasks } from "./assigned-tracker-tasks";
 import { displayChatTitle } from "./chat-title";
 
+/** A read that keeps at most one request in flight and one waiting. A call
+ * while one runs is answered by a single read begun after it finishes, shared
+ * by every call made meanwhile, so the answer is never older than the call. */
+export function coalescedRead<T>(read: () => Promise<T>): () => Promise<T> {
+    let running: Promise<T> | null = null;
+    let waiting: Promise<T> | null = null;
+    const start = (): Promise<T> => {
+        const current = read();
+        running = current;
+        const settle = () => { if (running === current) running = null; };
+        current.then(settle, settle);
+        return current;
+    };
+    return () => {
+        if (!running) return start();
+        waiting ??= running.then(() => undefined, () => undefined).then(() => {
+            waiting = null;
+            return start();
+        });
+        return waiting;
+    };
+}
+
 /** Per-ask presentation: the pill's verb chip and its hover explanation. */
 const ASK_COPY: Record<string, { verb: string; hint: (title: string) => string }> = {
     answer: {
@@ -92,6 +115,16 @@ export function TaskBar(props: {
         onOpen: (task: AssignedTrackerTask) => void;
     };
 }) {
+    // The refresh key moves on every workspace and tracker change, several
+    // times a second while a chat opens. Each move used to start a full read
+    // beside the ones still running; now a move during a read waits for it and
+    // is answered by the one read after it (WS-891).
+    const readTasks = coalescedRead(() => props.api.getTasks());
+    const readAssigned = coalescedRead(async () => {
+        const assigned = props.assigned;
+        if (!assigned) throw new Error("signed out");
+        return assigned.read();
+    });
     // A person's own queue: signed out there is none to show, and signed in a
     // read that fails says so rather than drawing an empty queue.
     const [taskRead] = createResource(
@@ -99,7 +132,7 @@ export function TaskBar(props: {
         async ([, signedIn]) => {
             if (!signedIn) return [] as HumanTask[];
             try {
-                return await props.api.getTasks();
+                return await readTasks();
             } catch {
                 return null;
             }
@@ -108,9 +141,9 @@ export function TaskBar(props: {
     const tasks = () => taskRead() ?? [];
     const [assignedRead] = createResource(
         () => (props.assigned ? [props.refreshKey, props.assigned] as const : false),
-        async ([, assigned]) => {
+        async () => {
             try {
-                return await assigned.read();
+                return await readAssigned();
             } catch {
                 return null;
             }

@@ -5,12 +5,20 @@ Feature: Your account (ACCT-1)
   models agents may run and whose credentials pay for them, what can reach your work,
   and who you are. The linked token is sealed server-side (SEC-4) and never shown again.
 
+  # The local Settings rooms are the open composition's account surface. In
+  # the enterprise composition, the one that ships, the account menu carries
+  # the Account Settings GaugeApp's pages in their place (account.md, the
+  # account menu) and hides the local Model access room, which Provider
+  # Connections opens inside GaugeDesk (DR-0360). Linking a provider there is
+  # account-signin.feature's Provider Connections journey.
+  @open-only
   Scenario: link an AI provider account
     Given the workbench is open
     When I open my model access
     And I link the "openai" account with token "sk-test-secret"
     Then "openai" shows as a linked account
 
+  @open-only
   Scenario: configure the local managed-inference plan through the shipped Account client
     Given the workbench is open
     When I open my model access

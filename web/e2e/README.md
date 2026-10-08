@@ -53,8 +53,32 @@ panel-edge.mjs       a loopback publisher-protocol edge Panel deployments publis
 Both manage their own servers via Playwright `webServer`. `run.mjs` resolves a free
 port set per run (control plane, federation peer, broker, `vite preview`) and exports
 them, so a parallel run or a second worktree picks a disjoint set and the two never
-collide. They use system Google Chrome (`channel: 'chrome'`), so no browser download
-is needed.
+collide. By default they use system Google Chrome (`channel: 'chrome'`), so no
+browser download is needed; `GW_E2E_BROWSERS=chromium,webkit` runs Playwright's own
+builds instead, one Playwright project each.
+
+## What CI runs
+
+The fleet runs this suite as two jobs (WS-871), through `scripts/e2e-job.mjs`:
+
+- **`gaugewright/bar/e2e`** — every pull request and every head of `main`: the
+  `@core` journeys (start a chat, send, keep talking, sign in, a signed-in desktop
+  window, a refused action explained) in both compositions, in Chromium and in
+  WebKit, the desktop webview's engine.
+- **`gaugewright/bar/e2e-full`** — the newest `main` every two hours: every lane (open,
+  enterprise, account-entry) in Chromium.
+
+Which scenarios a lane runs is stated once, in `lanes.mjs`; `run.mjs` hands it to
+bddgen as a tag expression. To run the per-change job's selection locally:
+`GW_E2E_CORE=1 npm run e2e` (and again with `GW_E2E_COMPOSITION=enterprise`).
+
+`scripts/check-product-contracts.mjs` accepts a scenario as a contract's evidence
+only when one of those lanes runs it, so a scenario nothing runs proves nothing.
+
+**`@quarantine`** takes a scenario out of every lane, and so out of contract
+evidence. It is the last resort for a red that cannot be repaired at once: each
+use carries a comment naming the tracker item that will lift it, and the item
+says what is wrong. `GW_E2E_QUARANTINED=1` runs quarantined scenarios too.
 
 ## Adding a story
 
@@ -106,7 +130,12 @@ Neither substitutes for the other. The reset that seeds a withheld context
 source writes it only for an authenticated current owner of a live project,
 under that project's session hold.
 
-The desktop-updater story is not yet qualified by this fixture: its browser
-IPC stand-in answers `null` for every call, so the client has neither a scoped
-Home session nor an admitted selected remote Home, and never requests the
+The hermetic Hub lists that organization among `e2e-account-root`'s
+memberships, so the workbench selects it as the account's organization. The
+desktop-updater story stands in for the shell the way the signed-in desktop
+story does: its IPC stand-in answers `home_session` with the session
+`POST /test/desktop-home-session` mints for the owner (debug builds only),
+and `null` to everything else. A window handed no Home session while signed
+in reaches its Home remotely through the account plane, which in this fixture
+is the Hub's unreachable registered Home, so it never read this Home's
 software policy.

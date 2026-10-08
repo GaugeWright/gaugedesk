@@ -1,4 +1,4 @@
-@transport
+@transport @core
 Feature: The composer's delivery controls
 
   ⏎ sends the draft wherever the mode points, and the primary button is the same

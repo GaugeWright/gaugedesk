@@ -1,4 +1,4 @@
-@ui-mocked
+@ui-mocked @core
 Feature: A workbench action that fails says why (error path)
 
   The workbench records each action's outcome in a status that is not on

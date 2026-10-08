@@ -74,6 +74,10 @@ pub fn gaugeapp_proxy_routes() -> Router<SharedWorkbench> {
             get(proxy_account_gaugeapp),
         )
         .route(
+            "/gaugeapps/account-settings/summary",
+            get(proxy_account_gaugeapp),
+        )
+        .route(
             "/gaugeapps/account-settings/updates",
             get(proxy_account_gaugeapp),
         )
@@ -217,11 +221,12 @@ fn open_account_authority_request(
     // Credential-bearing proxy calls never follow redirects. A redirect could
     // otherwise carry the sealed account bearer outside the configured account
     // origin. The account authority returns explicit JSON launch URLs instead.
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(45))
-        .build();
+    let agent = crate::net_http::shared_agent(crate::net_http::AgentSettings {
+        timeout: None,
+        connect: Some(Duration::from_secs(10)),
+        read: Some(Duration::from_secs(45)),
+        redirects: false,
+    });
     let mut request = agent
         .request(method, url)
         .set("authorization", &format!("Bearer {bearer}"));
@@ -1296,6 +1301,15 @@ fn take_pending(wb: &SharedWorkbench) -> PendingOutcome {
     }
 }
 
+/// The verifier [`take_pending`] would hand a callback now, taking it.
+#[cfg(test)]
+pub(crate) fn take_pending_verifier_for_test(wb: &SharedWorkbench) -> Option<String> {
+    match take_pending(wb) {
+        PendingOutcome::Ready(verifier, _, _) => Some(verifier),
+        PendingOutcome::Refused { .. } => None,
+    }
+}
+
 /// A fresh 32-byte verifier, base64url without padding (43 chars — the shape
 /// the Hub's `native_return_uri` guard requires of its S256 challenge).
 fn new_verifier() -> String {
@@ -2043,10 +2057,14 @@ pub async fn post_signin_start(
         .detail(if body.work_email.is_some() {
             "work_email"
         } else {
-            body.provider
-                .as_deref()
-                .and_then(crate::auth_oidc::consumer_provider_by_slug)
-                .map_or("default", |provider| provider.slug)
+            match body.provider.as_deref() {
+                // The account's own passkey (DR-0457), which no consumer
+                // connection names.
+                Some("passkey") => "passkey",
+                provider => provider
+                    .and_then(crate::auth_oidc::consumer_provider_by_slug)
+                    .map_or("default", |provider| provider.slug),
+            }
         });
     // A second press of Sign in replaces the attempt the first one began, so
     // the first browser tab's code can no longer be redeemed. Say so here,
@@ -2126,6 +2144,40 @@ pub async fn post_signin_start(
         "return": web_return.as_deref().unwrap_or(NATIVE_RETURN),
     }))
     .into_response()
+}
+
+/// Store `verifier` as the attempt a callback completes, exactly as
+/// [`post_signin_start`] stores the one it mints, and return its challenge.
+///
+/// Reached only through [`crate::test_signin::TestSignin`], which exists only
+/// when the release canary's test entrances are admitted against a fresh data
+/// directory (DR-0457): the canary performs the passkey sign-in itself, bound
+/// to this challenge, and the app then redeems the code it was handed through
+/// its own callback.
+pub(crate) fn seed_pending_attempt(wb: &SharedWorkbench, verifier: &str) -> Result<String, String> {
+    use crate::signin_log::{completed, Trace, DESKTOP_START};
+    let challenge = challenge_for(verifier);
+    let sealed = wb
+        .lock_unpoisoned()
+        .seal_account_secret(verifier)
+        .ok_or("could not seal the sign-in attempt")?;
+    write_pending(
+        wb,
+        &PendingRecord {
+            id: PENDING_RECORD_ID.to_string(),
+            sealed,
+            started_ms: now_ms(),
+            provider: "passkey".to_string(),
+            selection_revision: selected_revision(wb),
+            challenge: challenge.clone(),
+        },
+    )?;
+    completed(
+        DESKTOP_START,
+        "test_attempt_seeded",
+        &Trace::new().attempt(&challenge).detail("passkey"),
+    );
+    Ok(challenge)
 }
 
 /// The same corporate ceremony as web, bound to this device's pending verifier.

@@ -2,16 +2,22 @@
 //! integration, and operator-facing calls that need plain HTTPS without introducing
 //! a larger async client stack.
 //!
-//! Blocking (`ureq`), matching the sync seam signatures — every caller is
-//! setup/login/operator frequency, never the request hot path, so a blocking call (run from
-//! async handlers via [`tokio::task::spawn_blocking`]) is appropriate. TLS is `rustls` on
-//! **`ring`** (no native-tls), keeping the build OpenSSL- and cmake-free like the rest of
-//! the stack.
+//! Blocking (`ureq`), matching the sync seam signatures, so a call from an async
+//! handler runs under [`tokio::task::spawn_blocking`]. Some callers are on a
+//! person's request path — the account proxy, a relay caller's identity, Home
+//! reach — so every client with the same settings shares one agent, and with it
+//! one connection pool ([`shared_agent`]). TLS is `rustls` on **`ring`** (no
+//! native-tls), keeping the build OpenSSL- and cmake-free like the rest of the
+//! stack.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::{http::StatusCode, response::IntoResponse, Json};
 use gaugedesk_store::AdmitError;
+
+use crate::LockUnpoisoned;
 
 /// The name of the shared web-account session cookie (ADR 0077): the hosted hub sets it
 /// `Domain=.gaugewright.com` on login, so one sign-in authenticates the whole site.
@@ -252,6 +258,56 @@ pub struct HttpClient {
     agent: ureq::Agent,
 }
 
+/// How a [`shared_agent`] is configured. Callers asking for the same settings
+/// get the same agent.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AgentSettings {
+    /// A bound on the whole request, when there is one.
+    pub timeout: Option<Duration>,
+    pub connect: Option<Duration>,
+    pub read: Option<Duration>,
+    /// Credential-bearing calls never follow a redirect with a bearer in hand.
+    pub redirects: bool,
+}
+
+/// Idle connections kept per host. A window opening fires several account and
+/// Home calls at once; one kept connection would leave the rest to handshake
+/// again on the next burst.
+const IDLE_PER_HOST: usize = 8;
+
+/// The process's agent for `settings`. An agent is its connection pool, so an
+/// agent built per call opens a new TCP connection and TLS handshake every time.
+/// On 2026-10-08 a handshake to the Hub cost ~0.8 s from the founder's network
+/// and a relay caller's identity lookup took 1.9 s where the Hub's work was
+/// ~90 ms (WS-919). A pooled connection is checked for a server-side close
+/// before reuse. Requests carry their own authorization, and ureq is built
+/// without its cookie store, so nothing one caller sends rides on another's.
+pub(crate) fn shared_agent(settings: AgentSettings) -> ureq::Agent {
+    static AGENTS: OnceLock<Mutex<HashMap<AgentSettings, ureq::Agent>>> = OnceLock::new();
+    AGENTS
+        .get_or_init(Default::default)
+        .lock_unpoisoned()
+        .entry(settings)
+        .or_insert_with(|| {
+            let mut builder =
+                ureq::AgentBuilder::new().max_idle_connections_per_host(IDLE_PER_HOST);
+            if let Some(timeout) = settings.timeout {
+                builder = builder.timeout(timeout);
+            }
+            if let Some(connect) = settings.connect {
+                builder = builder.timeout_connect(connect);
+            }
+            if let Some(read) = settings.read {
+                builder = builder.timeout_read(read);
+            }
+            if !settings.redirects {
+                builder = builder.redirects(0);
+            }
+            builder.build()
+        })
+        .clone()
+}
+
 impl HttpClient {
     pub fn new() -> Self {
         Self::with_timeout(Duration::from_secs(20))
@@ -263,7 +319,12 @@ impl HttpClient {
     /// quickly. That refresh never runs under the workbench lock (WS-855).
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+            agent: shared_agent(AgentSettings {
+                timeout: Some(timeout),
+                connect: None,
+                read: None,
+                redirects: true,
+            }),
         }
     }
 
@@ -271,10 +332,12 @@ impl HttpClient {
     /// a redirect. The caller also validates the exact configured origin.
     pub fn with_timeout_no_redirects(timeout: Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new()
-                .redirects(0)
-                .timeout(timeout)
-                .build(),
+            agent: shared_agent(AgentSettings {
+                timeout: Some(timeout),
+                connect: None,
+                read: None,
+                redirects: false,
+            }),
         }
     }
 }
@@ -492,7 +555,7 @@ impl HttpClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{bearer, cors_layer, default_allowed_origins, session_cookie};
+    use super::{bearer, cors_layer, default_allowed_origins, session_cookie, HttpClient};
     use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
     use axum::{routing::get, Router};
     use tower::ServiceExt;
@@ -624,5 +687,23 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         assert!(exposed.contains("x-workspace-cut"));
+    }
+
+    /// Two clients with the same settings share one agent, so the second call
+    /// rides the connection the first left open (WS-919).
+    #[test]
+    fn clients_with_the_same_settings_share_a_connection() {
+        let server = crate::test_support::keep_alive_server(r#"{"ok":true}"#);
+        let url = format!("{}/x", server.url);
+        assert_eq!(
+            HttpClient::new().get_string(&url).unwrap(),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(
+            HttpClient::new().get_string(&url).unwrap(),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(server.requests(), 2);
+        assert_eq!(server.connections(), 1);
     }
 }

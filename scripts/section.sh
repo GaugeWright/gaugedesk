@@ -90,7 +90,7 @@ case "${1:-}" in
   architecture-boundaries) python3 scripts/architecture-check.py ;;
   license-boundary)        python3 scripts/check-license-boundary.py ;;
   product-contracts)
-    node --test scripts/control-plane-proxy.test.mjs
+    node --test scripts/control-plane-proxy.test.mjs scripts/feature-evidence.test.mjs
     node scripts/check-product-contracts.mjs --enforce-local-evidence ;;
   gaugeapp-contract)
     node scripts/check-gaugeapps-contract.mjs

@@ -4,7 +4,10 @@
 //! A desktop sign-in crosses five steps in two processes: the desktop's
 //! `/account/hub-session/start`, the Hub's `/auth/login`, the provider, the
 //! Hub's `/auth/callback`, then the desktop's `/account/hub-session/callback`,
-//! which redeems the one-time code at the Hub's `/auth/mobile/exchange`. On
+//! which redeems the one-time code at the Hub's `/auth/mobile/exchange`. A
+//! passkey sign-in replaces the provider and the callback with the Hub's
+//! `/auth/account/passkey/login/start` and `/finish`, which issues the code
+//! (DR-0457). On
 //! 2026-10-07 a person's exchange answered 401 and a desktop callback answered
 //! 400, and neither process had written down why: the Hub's handoff store
 //! answered "no" alike for a code it never issued, one that had expired, one
@@ -51,13 +54,23 @@ pub(crate) const SAML_ACS: &str = "/auth/saml/acs";
 pub(crate) const EXCHANGE: &str = "/auth/mobile/exchange";
 pub(crate) const CONSUMER_LINK_START: &str = "/auth/account/consumer-oidc/link/start";
 pub(crate) const CONSUMER_AVATAR_START: &str = "/auth/account/consumer-oidc/avatar/start";
+pub(crate) const PASSKEY_REGISTER_START: &str = "/auth/account/passkey/register/start";
 pub(crate) const PASSKEY_REGISTER_FINISH: &str = "/auth/account/passkey/register/finish";
+pub(crate) const PASSKEY_LOGIN_START: &str = "/auth/account/passkey/login/start";
+pub(crate) const PASSKEY_LOGIN_FINISH: &str = "/auth/account/passkey/login/finish";
 pub(crate) const DESKTOP_START: &str = "/account/hub-session/start";
 pub(crate) const DESKTOP_CALLBACK: &str = "/account/hub-session/callback";
 
 /// The Hub's sign-in steps. A refusal on one of these that no handler named is
 /// still logged, as `unclassified`, by [`log_unclassified_refusals`].
-const HUB_STEPS: [&str; 4] = [LOGIN, WORK_EMAIL, CALLBACK, EXCHANGE];
+const HUB_STEPS: [&str; 6] = [
+    LOGIN,
+    WORK_EMAIL,
+    CALLBACK,
+    EXCHANGE,
+    PASSKEY_LOGIN_START,
+    PASSKEY_LOGIN_FINISH,
+];
 
 /// The first eight hex digits of `value`'s SHA-256: enough to join lines across
 /// steps and processes, and useless to anyone who reads it.

@@ -15,6 +15,7 @@ import {
     listGaugeAppProposals,
     listGaugeAppAgentMessages,
     openGaugeApp,
+    readAccountSettingsSummary,
     readGaugeAppPage,
     readGaugeAppUpdates,
     readPlacementGovernance,
@@ -166,6 +167,12 @@ export class EnterpriseControlPlane implements EnterpriseAdminApi {
     readGaugeAppPage(session: GaugeAppSession, pageId: string): Promise<GaugeAppPageModel>;
     readGaugeAppPage(session: GaugeAppSession, pageId: string): Promise<GaugeAppPageModel> {
         return readGaugeAppPage(this.json, session, pageId);
+    }
+
+    /** Identity, memberships and appearance for every page load, read without
+     *  admitting Account Settings (WS-916). */
+    accountSettingsSummary() {
+        return readAccountSettingsSummary(this.json);
     }
 
     readGaugeAppUpdates(session: GaugeAppSession, after?: string) {

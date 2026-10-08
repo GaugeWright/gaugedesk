@@ -1,4 +1,4 @@
-@transport
+@transport @core
 Feature: Personal-project "just start typing" quick-start
 
   Personal is the explicit zero-setup project (ADR 0097). Its "+ new chat"

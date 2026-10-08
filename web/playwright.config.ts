@@ -1,5 +1,6 @@
 import { defineConfig } from "@playwright/test";
 import { defineBddConfig } from "playwright-bdd";
+import { laneFromEnv, laneTags, tagExpression } from "./e2e/lanes.mjs";
 // Single source of truth for the harness ports (concurrency-safety). `e2e/run.mjs`
 // resolves a free set per run and exports them; here we just read the resolved values.
 import {
@@ -26,6 +27,11 @@ import {
 // exist only in the open bundle are tagged @open-only and skipped by the lane.
 const enterpriseLane = process.env.GW_E2E_COMPOSITION === "enterprise";
 
+// Which scenarios are generated is the lane's choice, stated once in
+// e2e/lanes.mjs: run.mjs exports it here as a tag expression. A bare
+// `playwright test` (no run.mjs) generates the open lane.
+const tags = process.env.GW_E2E_TAGS ?? tagExpression(laneTags(laneFromEnv()));
+
 const testDir = defineBddConfig({
     features: [
         "e2e/features/**/*.feature",
@@ -33,7 +39,28 @@ const testDir = defineBddConfig({
     ],
     featuresRoot: "..",
     steps: "e2e/steps/**/*.ts",
+    tags,
 });
+
+// The browsers a run drives, as Playwright projects. `chrome` is the system
+// Google Chrome a workstation already has (no download). The fleet names
+// `chromium`, Playwright's own build at the version the lockfile pins, so every
+// host runs the same browser, and `webkit` for the core journeys: the desktop
+// shell's webview is WebKit, whose "Load failed" is not Chrome's error text.
+// How long each harness server may take to answer. A fresh control plane
+// fsyncs its new state root as it starts, and on a host whose disk is busy
+// that alone took over 30 s (WS-871); a server that is up answers at once.
+const serverStartTimeout = 120_000;
+
+const browsers = (process.env.GW_E2E_BROWSERS ?? "chrome").split(",").map((name) => name.trim()).filter(Boolean);
+const browserUse = {
+    chrome: { browserName: "chromium", channel: "chrome" },
+    chromium: { browserName: "chromium" },
+    webkit: { browserName: "webkit" },
+} as const;
+for (const name of browsers) {
+    if (!(name in browserUse)) throw new Error(`GW_E2E_BROWSERS names an unknown browser: ${name} (chrome, chromium, webkit)`);
+}
 
 export default defineConfig({
     testDir,
@@ -44,17 +71,17 @@ export default defineConfig({
     reporter: [["list"]],
     use: {
         baseURL: previewURL,
-        channel: "chrome", // system Google Chrome — no browser download
         headless: true,
         trace: "retain-on-failure",
     },
+    projects: browsers.map((name) => ({ name, use: browserUse[name as keyof typeof browserUse] })),
     webServer: [
         // The hermetic WSS relay both authorities dial out to (M8 federation).
         {
             command: "bash e2e/broker.sh",
             port: ports.broker,
             reuseExistingServer: false,
-            timeout: 30_000,
+            timeout: serverStartTimeout,
             env: { BROKER_PORT: String(ports.broker) },
         },
         // The stand-in Hub the desktop account handoff redeems against
@@ -63,7 +90,7 @@ export default defineConfig({
             command: "bash e2e/account-hub.sh",
             url: `http://127.0.0.1:${ports.hub}/health`,
             reuseExistingServer: false,
-            timeout: 30_000,
+            timeout: serverStartTimeout,
             env: { HUB_PORT: String(ports.hub) },
         },
         // The publisher-protocol fixture a Panel deployment publishes to and
@@ -72,7 +99,7 @@ export default defineConfig({
             command: "node e2e/panel-edge.mjs",
             url: `http://127.0.0.1:${ports.edge}/health`,
             reuseExistingServer: false,
-            timeout: 30_000,
+            timeout: serverStartTimeout,
             env: { EDGE_PORT: String(ports.edge) },
         },
         // The primary control plane (alice / `local-user`) — the one the existing
@@ -83,7 +110,7 @@ export default defineConfig({
             command: "bash e2e/fed-control-plane.sh",
             url: `http://127.0.0.1:${ports.alice}/chats`,
             reuseExistingServer: false,
-            timeout: 30_000,
+            timeout: serverStartTimeout,
             env: {
                 FED_PORT: String(ports.alice),
                 GAUGEDESK_RELAY_ENDPOINT: brokerAddr,
@@ -100,7 +127,7 @@ export default defineConfig({
             command: "bash e2e/fed-control-plane.sh",
             url: `http://127.0.0.1:${ports.bob}/chats`,
             reuseExistingServer: false,
-            timeout: 30_000,
+            timeout: serverStartTimeout,
             env: {
                 FED_PORT: String(ports.bob),
                 GAUGEDESK_AUTHORITY: "bob",
@@ -119,13 +146,13 @@ export default defineConfig({
                 cwd: "../ee/web",
                 url: previewURL,
                 reuseExistingServer: false,
-                timeout: 30_000,
+                timeout: serverStartTimeout,
             }
             : {
                 command: `npm run preview -- --port ${ports.preview} --strictPort --host 127.0.0.1`,
                 url: previewURL,
                 reuseExistingServer: false,
-                timeout: 30_000,
+                timeout: serverStartTimeout,
             },
         // The SELF-HOSTED enterprise composition (`gaugedesk-enterprise-server`,
         // ee/): the /admin/* + SSO surface without the managed planes. The
@@ -135,7 +162,7 @@ export default defineConfig({
             command: "bash e2e/enterprise-control-plane.sh",
             url: `${enterpriseCP}/chats`,
             reuseExistingServer: false,
-            timeout: 30_000,
+            timeout: serverStartTimeout,
             env: {
                 ENTERPRISE_PORT: String(ports.enterprise),
                 // Native account admission uses this run's hermetic Hub.
@@ -160,7 +187,7 @@ export default defineConfig({
             cwd: "../ee/web",
             url: enterpriseAppURL,
             reuseExistingServer: false,
-            timeout: 30_000,
+            timeout: serverStartTimeout,
         },
     ],
 });

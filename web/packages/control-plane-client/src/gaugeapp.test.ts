@@ -10,7 +10,9 @@ import {
     listGaugeAppAgentMessages,
     listGaugeAppProposals,
     openGaugeApp,
+    parseAccountSettingsSummary,
     parseGaugeAppAgentLiveFrame,
+    readAccountSettingsSummary,
     parseGaugeAppUpdateSnapshot,
     prepareGaugeAppProposal,
     readGaugeAppPage,
@@ -80,13 +82,52 @@ describe("typed GaugeApp client", () => {
         for (const app of gaugeAppKinds) {
             const routes = Object.keys(gaugeAppRoutes[app]).sort();
             expect(routes).toEqual(app === "account-settings" ? [
-                "agentErase", "agentEvents", "agentRead", "agentSend", "agentStop", "command", "consumerOidcAvatar", "consumerOidcLink", "deviceLinkClaim", "deviceLinkComplete", "deviceLinkRead", "page", "proposals", "providerSecret", "review", "session", "updates",
+                "agentErase", "agentEvents", "agentRead", "agentSend", "agentStop", "command", "consumerOidcAvatar", "consumerOidcLink", "deviceLinkClaim", "deviceLinkComplete", "deviceLinkRead", "page", "proposals", "providerSecret", "review", "session", "summary", "updates",
             ] : app === "administration" ? [
                 "agentErase", "agentEvents", "agentRead", "agentSend", "agentStop", "command", "page", "proposals", "providerCredential", "providerIntake", "providerVerify", "review", "session", "ssoCredential", "updates",
             ] : [
                 "agentErase", "agentEvents", "agentRead", "agentSend", "agentStop", "command", "page", "proposals", "review", "session", "updates",
             ]);
         }
+    });
+
+    it("reads the account summary without admitting Account Settings (WS-916)", async () => {
+        const { json, calls } = fakeJson({ summary: {
+            actor: "person:alice",
+            profile: { display_name: "Alice", email: "alice@example.test", avatar: null },
+            memberships: [
+                { id: "personal:alice", display_name: "Personal", role: "owner", personal: true, provider_commercial: false },
+                { id: "org:acme", role: "admin", provider_commercial: true },
+                { display_name: "no id" },
+            ],
+            appearance: { version: 1, interface_scale: "large", contrast: "standard", motion: "system" },
+        } });
+        const summary = await readAccountSettingsSummary(json);
+        expect(calls).toEqual([["GET", "/gaugeapps/account-settings/summary", undefined, undefined]]);
+        expect(summary).toEqual({
+            actor: "person:alice",
+            profile: { display_name: "Alice", email: "alice@example.test", avatar: null },
+            memberships: [
+                { id: "personal:alice", display_name: "Personal", role: "owner", personal: true, provider_commercial: false },
+                { id: "org:acme", display_name: "org:acme", role: "admin", personal: false, provider_commercial: true },
+            ],
+            appearance: { version: 1, interface_scale: "large", contrast: "standard", motion: "system" },
+        });
+    });
+
+    it("tolerates an account summary missing everything but its actor", () => {
+        expect(parseAccountSettingsSummary({ summary: { actor: "person:bob" } })).toEqual({
+            actor: "person:bob",
+            profile: { display_name: null, email: null, avatar: null },
+            memberships: [],
+            appearance: undefined,
+        });
+        expect(parseAccountSettingsSummary({ summary: {
+            actor: "person:bob", profile: { display_name: 7, email: "" }, memberships: "none",
+        } }).profile).toEqual({ display_name: null, email: null, avatar: null });
+        expect(() => parseAccountSettingsSummary({ summary: { profile: {} } })).toThrow(/malformed/);
+        expect(() => parseAccountSettingsSummary({ actor: "person:bob" })).toThrow(/malformed/);
+        expect(() => parseAccountSettingsSummary(null)).toThrow(/malformed/);
     });
 
     it("submits organization OIDC credentials only through the write-only route", async () => {

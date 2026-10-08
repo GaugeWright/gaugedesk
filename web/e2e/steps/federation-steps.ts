@@ -9,7 +9,7 @@
  */
 
 import { generateKeyPairSync, sign as signBytes } from "node:crypto";
-import { expect, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 import { createBdd } from "playwright-bdd";
 import { aliceCP, bobCP } from "../ports.mjs";
 import { mutationHeaders } from "./idempotency";
@@ -84,6 +84,21 @@ async function openEngagement(page: Page, projectName: string): Promise<void> {
     await expect(page.locator("[data-engagement-pane]")).toBeVisible();
 }
 
+/** Make sure a navigator row is open, through the control a person uses.
+ *
+ *  Opening a chat reveals it: its project and its placement are expanded once
+ *  (`revealedChat` in FacetBrowser; the placement since #1252), and that lands
+ *  whenever the tree next reads the chat. The row's control toggles, so a click
+ *  made on a row that has just been revealed folds it again. Click only a row
+ *  that reads as folded, and look again until it reads as open. */
+async function unfold(row: Locator, toggle: Locator): Promise<void> {
+    await expect(row).toBeVisible();
+    await expect(async () => {
+        if (await row.getAttribute("aria-expanded") === "false") await toggle.click();
+        await expect(row).toHaveAttribute("aria-expanded", "true", { timeout: 1_000 });
+    }).toPass();
+}
+
 Given("the two federated workbenches are open", async ({ page, request }) => {
     // The global Before resets 7878; reset the peer (7879) too for a clean pair.
     const reset = await request.post(`${BOB_CP}/test/reset`, { headers: mutationHeaders() });
@@ -154,12 +169,9 @@ Given("the two federated workbenches are open", async ({ page, request }) => {
     const invitedProject = page.locator("[data-project]", { hasText: "Invite Engagement" });
     await invitedProject.locator("[data-create='new-project-chat']").click();
     await page.locator(".facet", { hasText: "Projects" }).click();
-    // Projects open folded in the tree; unfold this one to reach its chat.
-    const unfold = invitedProject.getByRole("button", {
-        name: "Expand Invite Engagement",
-        exact: true,
-    });
-    if (await unfold.count()) await unfold.first().click();
+    // Projects open folded in the tree, and opening the new chat reveals it.
+    const invitedRow = invitedProject.locator(".tree-node.project");
+    await unfold(invitedRow, invitedRow.locator(".project-caret"));
     const invitedChat = invitedProject.locator("[data-project-home] .chat-item").first();
     await expect(invitedChat).toBeVisible();
     await invitedChat.click({ button: "right" });
@@ -172,11 +184,11 @@ Given("the two federated workbenches are open", async ({ page, request }) => {
     await page.getByRole("menuitem", { name: /Group by/ }).click();
     await page.getByRole("menuitemradio", { name: "Agent view" }).click();
     await page.keyboard.press("Escape");
-    // The Default placement that holds the chat opens folded in Agent view.
+    // The Default placement holds the chat; the reveal above opened it.
     const defaultPlacement = page.getByRole("treeitem", {
         name: /^Agent Default on Invite Engagement — open its chats$/,
     });
-    if (await defaultPlacement.count()) await defaultPlacement.first().click();
+    await unfold(defaultPlacement, defaultPlacement);
     await expect(
         invitedProject.locator(".ws-group", {
             has: page.locator(".ws-label-name", { hasText: "Federated line" }),

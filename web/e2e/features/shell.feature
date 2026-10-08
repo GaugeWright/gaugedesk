@@ -41,7 +41,7 @@ Feature: The workbench shell
     And the content pane is labelled "Content"
     And the workspace pane is labelled "Files"
     When I start a new chat in Personal
-    Then the run pane has no caption row
+    Then the run pane's caption gives way to the chat's branch and kind
     And the content header says only CONTENT
     And the workspace pane is labelled "Files"
 
@@ -107,13 +107,20 @@ Feature: The workbench shell
     And I search the facets for "mail"
     Then the matched text "Mail" is highlighted in the results
 
-  Scenario: searching hides the "+ archetype" create affordance so it can't read as a hit
+  # navigation.md (Workshop): the toolbar keeps New Agent and Search on one line,
+  # and New Agent is the facet's standing create action (ADR 0112 §3). It stands
+  # above the search row rather than among the rows a search filters, so it
+  # cannot read as a hit and is not withdrawn while a search is active.
+  Scenario: the Workshop's New Agent stands beside Search, outside the results
     Given the workbench is open
-    Then I can create a new method
+    When I switch to the "Workshop" facet
+    Then New Agent and Search share the Workshop toolbar line
     When I search the facets for "Default"
-    Then I cannot create a new method
+    Then I see the archetype "Default"
+    And New Agent and Search share the Workshop toolbar line
+    And New Agent stands above the search results
     When I clear the facet search
-    Then I can create a new method
+    Then New Agent and Search share the Workshop toolbar line
 
   Scenario: the chat lane keeps only one options button
     Given a new engagement

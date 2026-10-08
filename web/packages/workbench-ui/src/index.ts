@@ -20,7 +20,7 @@ export { AccountEntry } from "./AccountEntry";
 export { SignInCard } from "./SignInCard";
 export type { SignInCardProps, SignInRoute, SignInPasskeyActions, SignInRecoveryActions } from "./SignInCard";
 export type { AccountEntryProps, AccountRecoveryActions, PasskeyAccountActions } from "./AccountEntry";
-export { gaugeAppMenuIdentity } from "./gaugeapp-identity";
+export { gaugeAppMenuIdentity, summaryMenuIdentity } from "./gaugeapp-identity";
 export { createGaugeAppResource, refreshGaugeAppResources } from "./gaugeapp-resource";
 export { createGaugeAppOperations, gaugeAppContextChanged, type GaugeAppOperation } from "./gaugeapp-operations";
 export { createGaugeAppUpdateChannel, GAUGEAPP_UPDATE_INTERVAL_MS, GAUGEAPP_UPDATE_RETRY_MS } from "./gaugeapp-update-channel";

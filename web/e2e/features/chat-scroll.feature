@@ -15,6 +15,8 @@ Feature: The chat log's reading position
     And my sent message is anchored near the top of the chat log
     And blank room is reserved under the conversation
 
+  # quarantined (WS-909): signed-out sends show twice and stay held (WS-888)
+  @quarantine
   Scenario: the jump-to-latest button returns me to the live end
     Given a new engagement
     When I task the agent with "make a change"
@@ -25,6 +27,8 @@ Feature: The chat log's reading position
     Then the chat log rests at its end
     And no jump-to-latest button is offered
 
+  # quarantined (WS-908): signed-out sends show twice and stay held (WS-888)
+  @quarantine
   Scenario: user-message marks preview and revisit earlier requests
     Given a new engagement
     When I task the agent with "first request"

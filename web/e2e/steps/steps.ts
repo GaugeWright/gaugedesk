@@ -17,14 +17,17 @@ import { createBdd } from "playwright-bdd";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { aliceCP } from "../ports.mjs";
+import { aliceCP, hubURL } from "../ports.mjs";
 import { mutationHeaders } from "./idempotency";
 
 const { Given, When, Then, Before, After } = createBdd();
 
 async function openChatOption(page: Page, option: "Filters" | "History" | "Context sources") {
     await page.locator("[data-chat-options-trigger]").click();
-    await page.getByRole("menuitem", { name: option, exact: true }).click();
+    // An item that switches something on states it beside its name: Filters
+    // reads "Filters On" while any category is hidden. Match the name, and that
+    // state when present, rather than the name alone.
+    await page.getByRole("menuitem", { name: new RegExp(`^${option}( On)?$`) }).click();
 }
 
 async function dropTextFile(page: Page, target: string, name: string, content: string) {
@@ -49,6 +52,10 @@ async function dropTextFile(page: Page, target: string, name: string, content: s
 // fed-control-plane.sh) stops live agents, wipes the state, and re-seeds — so every
 // scenario starts from the same fresh workbench, pollution-proof by construction.
 Before(async ({ request }) => {
+    // The stand-in Hub (account-hub.sh) is one process per run too; forget what
+    // the last scenario signed in, linked or revoked there.
+    const hub = await request.post(`${hubURL}/test/reset`);
+    if (!hub.ok()) throw new Error(`stand-in Hub reset failed: ${hub.status()} ${await hub.text()}`);
     // The desktop operator plane requires an explicit local selection before
     // Home routes can be used. Reset removes that selection with the state root.
     await selectLocalHome(request);
@@ -116,6 +123,8 @@ let multiTargetProject = "";
 let multiTargetProjectId = "";
 let multiTargetChatId = "";
 let multiTargetTargetRoots = new Map<string, string>();
+// Each selected target's workspace root and the name Files shows it by.
+let multiTargetTargetNames = new Map<string, string>();
 let multiTargetDirectory = "";
 let multiTargetWorkstreamId = "";
 let multiTargetWorkstreamChatId = "";
@@ -132,6 +141,7 @@ After(async () => {
     multiTargetProjectId = "";
     multiTargetChatId = "";
     multiTargetTargetRoots = new Map();
+    multiTargetTargetNames = new Map();
     multiTargetWorkstreamId = "";
     multiTargetWorkstreamChatId = "";
     historicalForkChatId = "";
@@ -168,10 +178,26 @@ async function pickFirstMethod(page: import("@playwright/test").Page) {
 // ADR 0112: projects open in the flat `chats` lens. Placement structure is
 // shown by the Projects filter's global grouping control.
 async function ensureArchetypeLens(page: Page, name: string) {
+    await groupProjectsBy(page, "Agent view");
+    await expandProject(page, name);
+}
+
+async function groupProjectsBy(page: Page, choice: "Agent view" | "Recent activity") {
     await page.getByRole("button", { name: "Filter projects" }).click();
     await page.getByRole("menuitem", { name: /Group by/ }).click();
-    await page.getByRole("menuitemradio", { name: "Agent view" }).click();
-    await expandProject(page, name);
+    await page.getByRole("menuitemradio", { name: choice }).click();
+}
+
+// Placements start collapsed (experience/navigation.md). Unfold each folded one
+// with its caret, as a person would; a placement without chats has none.
+async function expandPlacements(project: Locator) {
+    const rows = project.locator(".tree-subgroup[data-placement] > .tree-node.placement");
+    await expect(rows.first()).toBeVisible();
+    for (const row of await rows.all()) {
+        if (await row.getAttribute("aria-expanded") !== "false") continue;
+        await row.locator(".node-icon").click();
+        await expect(row).toHaveAttribute("aria-expanded", "true");
+    }
 }
 
 // Project groups start collapsed (experience/navigation.md). Choosing a lens
@@ -246,21 +272,31 @@ When("I select every target and start the chat", async ({ page, request }) => {
     multiTargetChatId = (await row.getAttribute("data-chat")) ?? "";
     const workspace = await request.get(`${aliceCP}/workspace`);
     const projection = await workspace.json() as {
-        projects: { id: string; placements: { chats: { id: string; targets: { target_id: string; root: string }[] }[] }[] }[];
+        projects: { id: string; placements: { chats: { id: string; targets: { target_id: string; root: string; name: string }[] }[] }[] }[];
     };
     const chat = projection.projects
         .find((project) => project.id === multiTargetProjectId)?.placements
         .flatMap((placement) => placement.chats)
         .find((candidate) => candidate.id === multiTargetChatId);
     multiTargetTargetRoots = new Map((chat?.targets ?? []).map((target) => [target.target_id, target.root]));
+    multiTargetTargetNames = new Map((chat?.targets ?? []).map((target) => [target.root, target.name]));
 });
 
 Then("the chat shows both selected targets", async ({ page }) => {
     await expect(page.locator("[data-chat].active [data-chat-target-count='2']")).toBeVisible();
 });
 
+// Files presents each selected target as a root folder named after it
+// (work-target.md "Workspace view", DR-0248) — the empty Reference target
+// included, since it holds no file yet. The separate partition strip this once
+// read was folded into the Files tree (#803).
 Then("Files shows two target partitions", async ({ page }) => {
-    await expect(page.locator("[data-target-partitions] [data-target-id]")).toHaveCount(2);
+    expect(multiTargetTargetNames.size).toBe(2);
+    const tree = page.locator("[data-worktree]");
+    for (const [root, name] of multiTargetTargetNames) {
+        await expect(tree.locator(`.file-row[data-file-path="${root}"] > .file`)).toHaveAccessibleName(name);
+    }
+    expect([...multiTargetTargetNames.values()]).toContain("Reference target");
 });
 
 When("I change the Reference target to read-only", async ({ page }) => {
@@ -398,7 +434,8 @@ Given("two placements have chats in one project workstream", async ({ page, requ
 });
 
 Then("the project workstream groups both chats", async ({ page }) => {
-    const project = page.locator("[data-project]", { hasText: multiTargetProject });
+    // Project groups start collapsed (navigation.md); unfold it as a person does.
+    const project = await expandProject(page, multiTargetProject);
     const group = project.locator(".ws-group", {
         has: page.locator(".ws-label-name", { hasText: /^Project-wide line$/ }),
     });
@@ -407,9 +444,12 @@ Then("the project workstream groups both chats", async ({ page }) => {
 });
 
 Then("Agent view shows each chat under its own Agent", async ({ page }) => {
-    const project = page.locator("[data-project]", { hasText: multiTargetProject });
-    await project.locator(".lens-sort").click();
-    await page.getByRole("menuitemradio", { name: "Agent view" }).click();
+    const project = await expandProject(page, multiTargetProject);
+    // Grouping is the Projects filter's one global control (navigation.md:
+    // "Group by offers Recent activity and Agent view").
+    await groupProjectsBy(page, "Agent view");
+    // Placements start collapsed like every Agent group (navigation.md).
+    await expandPlacements(project);
     const first = project.locator(".tree-subgroup[data-placement]", { hasText: "First placement chat" });
     const second = project.locator(".tree-subgroup[data-placement]", { hasText: "Second placement chat" });
     await expect(first).toHaveCount(1);
@@ -417,8 +457,7 @@ Then("Agent view shows each chat under its own Agent", async ({ page }) => {
     await expect(first.locator("[data-chat]")).toHaveCount(1);
     await expect(second.locator("[data-chat]")).toHaveCount(1);
     await expect(project.locator("[data-project-home] [data-chat]")).toHaveCount(0);
-    await project.locator(".lens-sort").click();
-    await page.getByRole("menuitemradio", { name: "Recent activity" }).click();
+    await groupProjectsBy(page, "Recent activity");
 });
 
 When("I promote collaboration and start a later target settlement", async ({ page, request }) => {
@@ -724,16 +763,33 @@ Then("Recent uses the same menu as the chat's rooted row", async ({ page }) => {
     const recentItems = await page.locator(".context-menu .menu-item-label").allTextContents();
     expect(recentItems).toEqual(rootedItems);
     expect(recentItems).toContain("rename");
-    expect(recentItems).toContain("delete");
     expect(recentItems).toContain("fork");
+    // navigation.md "Pinned and archived chats": a chat row offers Pin/Unpin and
+    // Archive in its menu, and only an archived chat offers Delete. Recent never
+    // lists an archived chat, so its menu never offers Delete.
+    expect(recentItems).toContain("pin");
+    expect(recentItems).toContain("archive");
+    expect(recentItems.filter((label) => /delete/i.test(label))).toEqual([]);
 });
 
+/** The facet search input. navigation.md: the toolbar's Search control "expands
+ *  an input", so press it when the input is not already open. Idempotent: an
+ *  open input (its control then reads "Close search") is used as it stands. */
+async function facetSearch(page: Page): Promise<Locator> {
+    const input = page.getByTestId("facet-search");
+    if (!(await input.isVisible())) {
+        await page.locator(".panel.nav .facet-toolbar").getByRole("button", { name: "Search", exact: true }).click();
+    }
+    await expect(input).toBeVisible();
+    return input;
+}
+
 When("I search the facets for {string}", async ({ page }, q: string) => {
-    await page.locator('[data-testid="facet-search"]').fill(q);
+    await (await facetSearch(page)).fill(q);
 });
 
 When("I clear the facet search", async ({ page }) => {
-    await page.locator('[data-testid="facet-search"]').fill("");
+    await (await facetSearch(page)).fill("");
 });
 
 // Content search (SEARCH-1): a chat whose transcript matches surfaces in the tree
@@ -1330,8 +1386,37 @@ When("I reload the workbench", async ({ page }) => {
 
 // ---- content viewer (view / edit / diff) ----
 
+// The Files pane is a folder tree, not a list of paths: folders are navigable
+// entries (DR-0216), `agent/` starts collapsed (archetype.md, "The Files pane
+// shows `artifacts/` prominently and starts `agent/` collapsed"), a work
+// target's files sit under the folder named after it (DR-0248), and dot-paths
+// wait behind "show N internal files". So a file is reached the way a person
+// reaches it: reveal internal files when the path has a dot segment, then open
+// each folder on the way down, then the file. The path is the one the chat
+// shows, relative to its target folder when it lives in one.
 When("I select the file {string} in the workspace", async ({ page }, file: string) => {
-    await page.locator("[data-worktree] .file", { hasText: file }).click();
+    const tree = page.locator("[data-worktree]");
+    await expect(tree).toBeVisible();
+    const segments = file.split("/");
+    if (segments.some((segment) => segment.startsWith("."))) {
+        const toggle = page.locator("[data-show-internal]");
+        await expect(toggle).toBeVisible();
+        if (/^show /.test((await toggle.textContent()) ?? "")) await toggle.click();
+    }
+    for (let depth = 1; depth <= segments.length; depth++) {
+        const path = segments.slice(0, depth).join("/");
+        const entry = tree
+            .locator(`.file-row[data-file-path="${path}"], .file-row[data-file-path$="/${path}"]`)
+            .locator("button.file");
+        await expect(entry).toBeVisible();
+        if (depth === segments.length) {
+            await entry.click();
+            await expect(entry).toHaveClass(/\bactive\b/);
+        } else if ((await entry.getAttribute("aria-expanded")) === "false") {
+            await entry.click();
+            await expect(entry).toHaveAttribute("aria-expanded", "true");
+        }
+    }
 });
 
 Then("the target workspace contains {string}", async ({ page }, file: string) => {
@@ -1854,23 +1939,35 @@ Then("the composer is ready to send again", async ({ page }) => {
 });
 // Panel captions are empty-state placeholders: with no chat open the chat and
 // content panes carry their captions; opening a chat replaces them with the
-// working rows (the chat's own header, the viewer's tab strip). The nav never
-// captions — the facet tabs are always its top row. Files always captions.
+// working rows (the chat's branch and kind, the viewer's tab strip). The nav
+// never captions — the facet tabs are always its top row. Files always captions.
+// The chat caption sits in the chat lane's quiet top strip, beside its collapse
+// control, rather than in a heading row of its own (run-chat.md: the strip holds
+// the Chat menu, the branch and kind, and collapse).
 Then("the browse pane opens with the facet tabs and no caption", async ({ page }) => {
     await expect(page.locator(".panel.nav .panel-heading")).toHaveCount(0);
     await expect(page.locator(".panel.nav .facets")).toBeVisible();
 });
 Then("the run pane is labelled {string}", async ({ page }, label) => {
-    await expect(page.locator(".panel.run > .panel-heading")).toContainText(label);
+    await expect(page.locator(".panel.run .panel-heading")).toHaveCount(0);
+    await expect(page.locator(".panel.run .chat-toolbar .chat-empty-title")).toHaveText(label);
 });
 Then("the content pane is labelled {string}", async ({ page }, label) => {
     await expect(page.locator(".panel.content [data-content-title]")).toContainText(label);
 });
-Then("the run pane has no caption row", async ({ page }) => {
-    await expect(page.locator(".panel.run > .panel-heading")).toHaveCount(0);
+Then("the run pane's caption gives way to the chat's branch and kind", async ({ page }) => {
+    const strip = page.locator(".panel.run .chat-toolbar");
+    await expect(strip.locator(".chat-empty-title")).toHaveCount(0);
+    await expect(page.locator(".panel.run .panel-heading")).toHaveCount(0);
+    // A new chat in Personal is a work chat on the project's Main line.
+    const identity = strip.locator(".chat-identity");
+    await expect(identity).toHaveAttribute("data-chat-branch", "Main");
+    await expect(identity).toHaveAttribute("data-chat-kind", "work");
+    await expect(identity).toHaveAttribute("title", "Main · Work chat");
 });
 Then("the workspace pane is labelled {string}", async ({ page }, label) => {
-    await expect(page.locator(".panel.workspace .panel-body > h2")).toContainText(label);
+    // The Files caption heads the pane's compact header, beside its Files menu.
+    await expect(page.locator(".panel.workspace .files-header").getByRole("heading", { level: 2 })).toHaveText(label);
 });
 
 // Panel collapse (legacy 13-chrome-ui.md §6). Steps refer to a panel by its
@@ -2054,7 +2151,16 @@ When("I test the archetype {string} from its menu", async ({ page }, name: strin
 Then("a test chat of its draft opens under it", async ({ page }) => {
     await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
     await expect(page.locator('[data-panel-previews] [data-chat].active .status-gem[data-kind="work"]')).toBeVisible();
-    await expect(page.locator("[data-agent-test-note]")).toBeVisible();
+    // "The test chat's composer says it is a test of the draft with its own
+    // empty files" (DR-0324). A narrow composer folds its model row, the note
+    // with it, behind "More" — as the Panel preview's note is read.
+    const more = page.locator("[data-composer-more]");
+    if (await more.isVisible()) await more.click();
+    const note = page.locator("[data-agent-test-note]");
+    await expect(note).toBeVisible();
+    await expect(note).toContainText("the draft as it stands");
+    await expect(note).toContainText("its own empty files");
+    if (await more.isVisible()) await page.keyboard.press("Escape");
 });
 
 // ---- auto-titling a new chat (#4, round 2) ----
@@ -2186,7 +2292,7 @@ Then("no edit chat was opened for it", async ({ page }) => {
 
 // Search has a clear control that resets the filter (#6).
 When("I type {string} in the search box", async ({ page }, q: string) => {
-    await page.getByTestId("facet-search").fill(q);
+    await (await facetSearch(page)).fill(q);
 });
 
 When("I clear the search", async ({ page }) => {
@@ -2331,14 +2437,34 @@ Then("the matched text {string} is highlighted in the results", async ({ page },
     await expect(page.locator("mark.search-hit", { hasText: text }).first()).toBeVisible();
 });
 
-// The create affordance is hidden while a search is active so it can't read as a
-// stray hit (#6 round-9).
-Then("I can create a new method", async ({ page }) => {
-    await page.locator(".facet", { hasText: "Workshop" }).click();
-    await expect(page.getByText("+ archetype", { exact: true })).toBeVisible();
+// Round 9 (#6) hid an in-list "+ archetype" row during a search so it could not
+// read as a stray hit. The create action has since become the Workshop's standing
+// toolbar control: navigation.md "The toolbar keeps New Agent and Search on one
+// line" (ADR 0112 §3, standing facet on-ramps). It stays put while searching and
+// sits above the search row, outside the rows a search filters.
+const workshopToolbar = (page: Page) => page.locator('.panel.nav .facet-toolbar[data-facet-toolbar="library"]');
+const newAgent = (page: Page) => workshopToolbar(page).getByRole("button", { name: "+ agent", exact: true });
+
+Then("New Agent and Search share the Workshop toolbar line", async ({ page }) => {
+    const create = newAgent(page);
+    const search = workshopToolbar(page).getByRole("button", { name: /^(Search|Close search)$/ });
+    await expect(create).toBeVisible();
+    await expect(search).toBeVisible();
+    const [a, b] = [await create.boundingBox(), await search.boundingBox()];
+    expect(a && b).toBeTruthy();
+    // One line: their vertical extents overlap.
+    expect(a!.y < b!.y + b!.height && b!.y < a!.y + a!.height).toBe(true);
 });
-Then("I cannot create a new method", async ({ page }) => {
-    await expect(page.getByText("+ archetype", { exact: true })).toHaveCount(0);
+
+Then("New Agent stands above the search results", async ({ page }) => {
+    // Exactly one New Agent in the browse pane, and it is the toolbar's.
+    await expect(page.locator(".panel.nav").getByRole("button", { name: "+ agent", exact: true })).toHaveCount(1);
+    const create = await newAgent(page).boundingBox();
+    const input = await page.getByTestId("facet-search").boundingBox();
+    const firstHit = await page.locator("[data-archetype]").first().boundingBox();
+    expect(create && input && firstHit).toBeTruthy();
+    expect(create!.y + create!.height).toBeLessThanOrEqual(input!.y);
+    expect(input!.y + input!.height).toBeLessThanOrEqual(firstHit!.y);
 });
 
 // Open the context menu on a named archetype (Workshop facet).
@@ -2351,10 +2477,15 @@ When("I open the context menu on the archetype {string}", async ({ page }, name:
     await expect(page.locator(".context-menu")).toBeVisible();
 });
 
-// One honest edit entry, not two identically-behaving modes (#5 round-9). The
-// action is now called "edit" (was "improve this method").
-Then("the menu offers exactly one improve entry", async ({ page }) => {
-    await expect(page.locator(".menu-item-label", { hasText: /^edit$/i })).toHaveCount(1);
+// One honest authoring entry, not two identically-behaving modes (#5 round-9).
+// The action was "improve this method", then "edit"; it is now "new authoring
+// chat", the page-edit entry beside the eye (try) entry (navigation.md: "a plain
+// plus menu with distinct eye (try) and page-edit (new authoring chat)
+// entries", DR-0222).
+Then("the menu offers exactly one authoring entry", async ({ page }) => {
+    const labels = page.locator(".context-menu .menu-item-label");
+    await expect(labels.filter({ hasText: /^new authoring chat$/ })).toHaveCount(1);
+    await expect(labels.filter({ hasText: /improve|^edit$/i })).toHaveCount(0);
 });
 Then("the menu does not promise working alongside it live", async ({ page }) => {
     await expect(page.locator(".context-menu", { hasText: "alongside it live" })).toHaveCount(0);
@@ -2391,12 +2522,19 @@ Then("the rename field has the existing name selected", async ({ page }) => {
 
 // ---- round 10: honest improve vocabulary, legible status, clearer review chrome ----
 
-// The top strip now exposes secondary actions through one menu control.
+// The top strip exposes secondary actions through one menu control (DR-0210).
+// run-chat.md: the menu opens Filters, History, Context sources, and the Raw
+// context view ("Raw model context").
 Then("the chat lane has one options button", async ({ page }) => {
     await expect(page.locator("[data-chat-options-trigger]")).toBeVisible();
     await expect(page.locator(".chat-toolbar button")).toHaveCount(2);
     await page.locator("[data-chat-options-trigger]").click();
-    await expect(page.locator("[data-chat-options-menu] [role=menuitem]")).toHaveCount(3);
+    await expect(page.locator("[data-chat-options-menu] [role=menuitem]")).toHaveText([
+        "Filters",
+        "History",
+        "Context sources",
+        "Raw context",
+    ]);
 });
 
 // #6 — the hidden-config disclosure must not read like the changed-file count that
@@ -2528,6 +2666,17 @@ Given("a desktop chat with a source-approved output", async ({ page, request }) 
         });
     }, { selectedPath: exportDestination });
     await page.goto("/?chat=export-contract");
+    // The reset seeds the Home's owner, and this desktop holds no session for
+    // that account, so it asks which account to use. Saving here without
+    // signing in is local mode, which that card always offers (DR-0264 §3;
+    // account.md: a signed-out desktop keeps local work available). Choosing
+    // reopens the workbench at its root, so the chat is opened again after.
+    const choice = page.locator("[data-account-choice]");
+    await choice.getByRole("button", { name: "Use this computer locally" }).click();
+    await page.waitForURL((url) => url.pathname === "/" && url.search === "");
+    await page.goto("/?chat=export-contract");
+    await expect(page.getByRole("button", { name: "Local account" })).toBeVisible();
+    await expect(choice).toHaveCount(0);
     await openChatOption(page, "History");
     await page.locator('.shelf-drawer .tab[data-tab="outputs"]').click();
     await expect(page.locator('[data-output="out-export-contract"]')).toBeVisible();
@@ -2545,8 +2694,12 @@ When("I save the source-approved output to a folder", async ({ page }) => {
     await expect(page.locator("[data-save-output-status]")).toContainText(/saved [1-9]\d* file/);
 });
 
+// The seed writes the deliverable into the chat's Personal target, and a target
+// leaves under the folder the chat shows it as (run-chat.md: "A work chat shows
+// each target as a folder named after it, the same folder the agent sees";
+// DR-0248), never under its stable-ID partition.
 Then("the production export-to-disk route writes the deliverable", async () => {
-    await expect(readFile(join(exportDestination, "deliverable.txt"), "utf8"))
+    await expect(readFile(join(exportDestination, "Personal files", "deliverable.txt"), "utf8"))
         .resolves.toBe("desktop export proof\n");
 });
 
@@ -2561,9 +2714,20 @@ Given("a placement I can open more chats under", async ({ page }) => {
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
+// The new chat is selected only once the control plane has created it. Until
+// then the chat on screen, its composer and its `stream-ready` marker are still
+// the previous chat's, so waiting on the marker alone let the next draft go to
+// the busy first chat, where ⏎ means Steer and stopped it. Wait for the
+// selection to move, then for the new chat's own stream.
 When("I open another chat under that placement", async ({ page }) => {
     const group = page.locator(`.tree-group[data-project]`, { hasText: concProject });
+    const active = group.locator("[data-chat].active");
+    const previous = await active.getAttribute("data-chat");
+    expect(previous).toBeTruthy();
     await group.locator(".tree-subgroup[data-placement] [data-create='new-placement-chat']").first().click();
+    await expect(active).toHaveCount(1);
+    await expect(active).not.toHaveAttribute("data-chat", previous!);
+    await expect(page.getByTestId("run-phase")).toHaveAttribute("data-run-phase", "Init");
     await expect(page.getByTestId("stream-ready")).toBeAttached();
 });
 
@@ -2606,9 +2770,13 @@ When("I open model access for project {string}", async ({ page }, name: string) 
         .click();
 });
 
+// Project Settings put the project's bounded management conversation in Chat in
+// place of the work chat (navigation.md: "Selecting a project row opens that
+// exact project's Project Settings GaugeApp in Content, its page Menu on the
+// right and its bounded project management conversation in Chat").
 Then("project settings do not expose the work chat composer", async ({ page }) => {
     await expect(page.locator("[data-work-chat-slot]")).toBeHidden();
-    await expect(page.locator(".project-settings-chat-unavailable")).toBeVisible();
+    await expect(page.locator('[data-management-chat="project-settings"]')).toBeVisible();
 });
 
 Then("the model-access panel is open", async ({ page }) => {
@@ -2646,31 +2814,46 @@ Then("the project has no project-owned keys", async ({ page }) => {
     await expect(page.getByText("using the account default", { exact: false })).toHaveCount(0);
 });
 
-// ---- project home rollup (UX-2) ----
+// ---- a project's at-a-glance summary (UX-2, Project Settings overview) ----
 
-// Open a project's home panel from its right-click context menu (id from the node).
-When("I open project home for project {string}", async ({ page }, name: string) => {
+// The "project home…" menu entry and its rollup dialog were replaced by Project
+// Settings: selecting the project row opens its Overview, which "names the
+// project and links to the settings pages available to this project"
+// (admin-console.md, "Project Settings"; navigation.md, "The facet browser").
+When("I open project settings for project {string}", async ({ page }, name: string) => {
     await page.locator(".facet", { hasText: "Projects" }).click();
     await page
         .locator("[data-project]", { hasText: name })
         .locator(".tree-node.project")
-        .click({ button: "right" });
-    await page.locator(".menu-item", { hasText: "project home" }).click();
+        .click();
 });
 
-Then("the project-home panel is open", async ({ page }) => {
-    await expect(page.locator("[data-project-home-panel]")).toBeVisible();
+Then("the project settings overview names the project {string}", async ({ page }, name: string) => {
+    const content = page.locator(".project-settings-content");
+    await expect(content.getByRole("heading", { level: 1, name, exact: true })).toBeVisible();
+    await expect(content.getByRole("heading", { level: 2, name: "Overview", exact: true })).toBeVisible();
 });
 
-// A project created here gets a default placement, so the audit rollup counts >= 1.
-Then("the project-home panel shows at least {int} placement", async ({ page }, n: number) => {
-    const badge = page.locator("[data-project-home-panel] [data-audit-placements]");
-    await expect(badge).toBeVisible();
-    // The dialog mounts before its projection resource resolves. Assert the
-    // eventual rollup instead of sampling the transient zero placeholder.
-    await expect
-        .poll(async () => Number.parseInt((await badge.textContent()) ?? "0", 10))
-        .toBeGreaterThanOrEqual(n);
+// The Agents & placements link counts deliberate placements; the project's
+// built-in general placement is plumbing and is not counted.
+Then("the project settings overview counts {int} placed Agent(s)", async ({ page }, n: number) => {
+    const link = page.locator(".project-settings-overview button", { hasText: "Agents & placements" });
+    await expect(link).toContainText(`${n} placed`);
+});
+
+When("I follow the project settings overview to {string}", async ({ page }, label: string) => {
+    await page.locator(".project-settings-overview button", { hasText: label }).click();
+    await expect(
+        page.locator(".project-settings-content").getByRole("heading", { level: 2, name: label, exact: true }),
+    ).toBeVisible();
+});
+
+// Agents & placements shows each placement's "pinned version"
+// (admin-console.md, "Project Settings").
+Then("project settings list {int} placed Agent(s) with its pinned version", async ({ page }, n: number) => {
+    const rows = page.locator(".project-settings-content .project-settings-agent-row");
+    await expect(rows).toHaveCount(n);
+    for (const row of await rows.all()) await expect(row).toContainText(/· v\d+/);
 });
 
 // ---- fork tree (UX-8) ----

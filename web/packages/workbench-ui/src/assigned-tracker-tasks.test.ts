@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readAssignedTrackerTasks, type AssignedTrackerTaskApi } from "./assigned-tracker-tasks";
+import { readAssignedTrackerTasks, TRACKER_READS_AT_ONCE, type AssignedTrackerTaskApi } from "./assigned-tracker-tasks";
 import type { ProjectId } from "@gaugewright/control-plane-client";
 
 const personal = { id: "personal" as ProjectId, name: "Personal" };
@@ -43,6 +43,31 @@ describe("assigned tracker tasks", () => {
             { project: "personal", projectName: "Personal", queue: "notes" },
             { project: "work", projectName: "Work", queue: null },
         ]);
+    });
+    it("keeps no more than a few tracker reads outstanding at once (WS-891)", async () => {
+        // A Home answers each tracker read under its workbench lock. A pass
+        // that asked about every project at once held a new chat's own
+        // requests behind all of them.
+        const projects = Array.from({ length: 6 }, (_, index) => ({ id: `p${index}` as ProjectId, name: `P${index}` }));
+        let outstanding = 0;
+        let most = 0;
+        const answer = async <T>(value: T): Promise<T> => {
+            outstanding += 1;
+            most = Math.max(most, outstanding);
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            outstanding -= 1;
+            return value;
+        };
+        const api: AssignedTrackerTaskApi = {
+            listProjectTrackers: (project) => answer([tracker(project, "tasks")]),
+            readProjectTrackerTasks: (project, queue) => answer({
+                actor: "learner", tracker: tracker(project, queue), issues: [issue(`WS-${project.slice(1)}`, project)],
+            }),
+        };
+        const { tasks, unavailable } = await readAssignedTrackerTasks(api, projects);
+        expect(unavailable).toEqual([]);
+        expect(tasks.map((task) => task.project)).toEqual(projects.map((project) => project.id));
+        expect(most).toBe(TRACKER_READS_AT_ONCE);
     });
     it("asks nothing when there are no projects", async () => {
         const api: AssignedTrackerTaskApi = {

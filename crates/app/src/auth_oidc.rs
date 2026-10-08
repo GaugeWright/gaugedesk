@@ -869,12 +869,15 @@ impl AuthShellState {
     }
 
     /// Issue the same one-time native handoff an ordinary provider login issues,
-    /// for a desktop signup that finished its passkey ceremony in the system
-    /// browser. The account is already resolved — this mints no identity, and
-    /// the code is still redeemable only with the verifier whose challenge the
-    /// desktop pinned at `/auth/login`.
+    /// for a desktop sign-in or signup that finished its passkey ceremony in the
+    /// system browser (DR-0457). The account is already resolved — this mints
+    /// no identity, and the code is still redeemable only with the verifier
+    /// whose challenge the desktop pinned when it began. `route` is the step
+    /// that issued it, for the log.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn issue_account_native_handoff(
         &self,
+        route: &'static str,
         account_id: &str,
         session_method: &str,
         label: &str,
@@ -883,7 +886,7 @@ impl AuthShellState {
         challenge: String,
     ) -> String {
         self.issue_native_handoff(
-            crate::signin_log::PASSKEY_REGISTER_FINISH,
+            route,
             NativeHandoffIssue {
                 account_id: account_id.to_owned(),
                 session_method: session_method.to_owned(),
@@ -4282,7 +4285,7 @@ const INVALID_HANDOFF_CHALLENGE: &str = "native login requires a valid handoff c
 const UNSUPPORTED_RETURN: &str = "unsupported login return URI";
 
 /// The logged reason for a [`native_return_uri`] refusal.
-fn return_refusal_reason(message: &str) -> &'static str {
+pub(crate) fn return_refusal_reason(message: &str) -> &'static str {
     if message == INVALID_HANDOFF_CHALLENGE {
         "invalid_handoff_challenge"
     } else {
@@ -4290,7 +4293,7 @@ fn return_refusal_reason(message: &str) -> &'static str {
     }
 }
 
-fn native_return_uri(
+pub(crate) fn native_return_uri(
     raw: Option<&str>,
     challenge: Option<&str>,
     dev_web_return: bool,
@@ -4325,7 +4328,7 @@ fn native_return_uri(
 /// (ADR 0140): `GAUGEDESK_DEV_WEB_RETURN=1`. Off is the production posture — the
 /// hosted Hub never sets it, so the `gaugewright://` scheme stays the only
 /// admitted return there.
-fn dev_web_return_enabled() -> bool {
+pub(crate) fn dev_web_return_enabled() -> bool {
     gaugedesk_env::enabled("DEV_WEB_RETURN")
 }
 
@@ -5460,6 +5463,18 @@ pub struct NativeHandoffExchange {
     device_label: Option<String>,
 }
 
+#[cfg(test)]
+impl NativeHandoffExchange {
+    /// The exchange a desktop sends, for a test in another module.
+    pub(crate) fn for_test(code: &str, verifier: &str) -> Self {
+        Self {
+            code: code.to_owned(),
+            verifier: verifier.to_owned(),
+            device_label: Some("Test Mac".to_owned()),
+        }
+    }
+}
+
 /// Record the redeeming native client in the person's trusted-devices registry
 /// (ADR 0123 §4 / ADR 0053): the handoff session is device-bound, so the
 /// account surface can see and revoke it. Returns the minted device id.
@@ -5549,7 +5564,7 @@ pub async fn post_native_exchange(
 /// [`post_native_exchange`] with the deployment mode passed in, so a test need
 /// not set the process environment. Every refusal names its reason in the log
 /// (WS-869); the client is told the same thing it always was.
-fn native_exchange(
+pub(crate) fn native_exchange(
     wb: &SharedWorkbench,
     auth: &AuthShellState,
     request: Result<Json<NativeHandoffExchange>, axum::extract::rejection::JsonRejection>,

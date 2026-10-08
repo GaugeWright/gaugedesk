@@ -44,24 +44,49 @@ export interface AssignedTrackerTasks {
     unavailable: UnavailableTrackerRead[];
 }
 
+/** How many tracker reads one pass keeps outstanding. A Home answers a
+ * tracker read under its workbench lock, close to a second each on the
+ * production canary Home, so a pass that asked about every project at once
+ * held every other request behind all of them: a new chat's event stream
+ * waited tens of seconds (WS-891). One at a time costs nothing there, since
+ * the Home answers them one at a time anyway, and lets a person's own
+ * request in between each. */
+export const TRACKER_READS_AT_ONCE = 1;
+
+function limited(limit: number): <T>(read: () => Promise<T>) => Promise<T> {
+    let active = 0;
+    const waiting: (() => void)[] = [];
+    return async (read) => {
+        if (active >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+        active += 1;
+        try {
+            return await read();
+        } finally {
+            active -= 1;
+            waiting.shift()?.();
+        }
+    };
+}
+
 export async function readAssignedTrackerTasks(
     api: AssignedTrackerTaskApi,
     projects: readonly { id: ProjectId; name: string }[],
 ): Promise<AssignedTrackerTasks> {
     const tasks: AssignedTrackerTask[] = [];
     const unavailable: UnavailableTrackerRead[] = [];
+    const read = limited(TRACKER_READS_AT_ONCE);
     await Promise.all(projects.map(async (project) => {
         let trackers: ReadableProjectTracker[];
         try {
-            trackers = await api.listProjectTrackers(project.id);
+            trackers = await read(() => api.listProjectTrackers(project.id));
         } catch {
             unavailable.push({ project: project.id, projectName: project.name, queue: null });
             return;
         }
         await Promise.all(trackers.map(async (tracker) => {
             try {
-                const read = await api.readProjectTrackerTasks(project.id, tracker.queue);
-                for (const issue of read.issues) {
+                const assigned = await read(() => api.readProjectTrackerTasks(project.id, tracker.queue));
+                for (const issue of assigned.issues) {
                     tasks.push({
                         project: project.id,
                         projectName: project.name,

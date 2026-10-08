@@ -11,6 +11,9 @@ Feature: Cross-machine federation
   # One scenario, one pairing: the rendezvous broker is shared and long-lived, so
   # a single pairing keeps its parked receiver legs unambiguous (re-pairing across
   # scenarios would leave stale legs on the reused session tokens).
+  # Open composition only until WS-912 lands: the enterprise composition has
+  # no Devices list in which to see or revoke the enrolled device.
+  @open-only
   Scenario: pair two machines and collaborate both ways
     Given the two federated workbenches are open
     When the two authorities pair with each other

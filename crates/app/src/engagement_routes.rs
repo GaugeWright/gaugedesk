@@ -4661,14 +4661,12 @@ pub(crate) async fn post_test_reset(
                 .into_response()
         }
     }
-    if let Err(error) = std::fs::remove_dir_all(&root) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("reset wipe: {error}"),
-            )
-                .into_response();
-        }
+    if let Err(error) = wipe_state_root(&root) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("reset wipe: {error}"),
+        )
+            .into_response();
     }
     // Clear any armed test-only conflict injection (UX-7) so it can't leak across scenarios.
     engine::set_force_merge_conflict(false);
@@ -4915,67 +4913,8 @@ pub(crate) async fn post_test_reset(
                 }
             }
             if query.exportable_output {
-                let chat = "export-contract";
-                if fresh
-                    .create_default_engagement(chat.to_owned(), "Export contract".to_owned())
-                    .is_err()
-                {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "test export chat could not be created",
-                    )
-                        .into_response();
-                }
-                match fresh.write_engagement_file(chat, "deliverable.txt", "desktop export proof\n")
-                {
-                    Some(Ok(())) => {}
-                    Some(Err(error)) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("test export file: {error}"),
-                        )
-                            .into_response()
-                    }
-                    None => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "test export engagement disappeared",
-                        )
-                            .into_response()
-                    }
-                }
-                let authority = fresh.authority().as_str().to_owned();
-                let output = match crate::resource_store::mint_output(
-                    fresh.store_mut(),
-                    chat,
-                    &authority,
-                    "test-fixture",
-                ) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("test output resource: {error:?}"),
-                        )
-                            .into_response()
-                    }
-                };
-                match fresh.admit_resource_export(chat, &output.resource.id) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "test output resource disappeared",
-                        )
-                            .into_response()
-                    }
-                    Err(error) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("test output export proposal: {error:?}"),
-                        )
-                            .into_response()
-                    }
+                if let Err(error) = seed_exportable_output(fresh, &headers) {
+                    return *error;
                 }
             }
             (StatusCode::OK, Json(serde_json::json!({ "reset": true }))).into_response()
@@ -5043,6 +4982,46 @@ fn reset_fixture_session(
         StatusCode::INTERNAL_SERVER_ERROR,
         "fixture project custody unavailable",
     ))
+}
+
+/// Seed `export-contract`: a local chat whose `deliverable.txt` is minted as an
+/// output resource with its export proposed, so the desktop picker can supply
+/// target admission and perform the real crossing. The deliverable's edit
+/// record, the output resource and its export proposal are protected chat
+/// content (SECAUD-9), so they are written only under
+/// [`reset_fixture_session`]'s hold, as a request that produced them would be.
+#[cfg(debug_assertions)]
+fn seed_exportable_output(
+    fresh: &mut Workbench,
+    headers: &HeaderMap,
+) -> Result<(), Box<axum::response::Response>> {
+    fn refuse(message: impl Into<String>) -> Box<axum::response::Response> {
+        Box::new((StatusCode::INTERNAL_SERVER_ERROR, message.into()).into_response())
+    }
+    let chat = "export-contract";
+    fresh
+        .create_default_engagement(chat.to_owned(), "Export contract".to_owned())
+        .map_err(|_| refuse("test export chat could not be created"))?;
+    let project = fresh
+        .library
+        .project_of_chat(chat)
+        .map(str::to_owned)
+        .ok_or_else(|| refuse("test export project missing"))?;
+    let _session = reset_fixture_session(fresh, headers, &project)
+        .map_err(|refusal| Box::new(refusal.into_response()))?;
+    fresh
+        .write_engagement_file(chat, "deliverable.txt", "desktop export proof\n")
+        .ok_or_else(|| refuse("test export engagement disappeared"))?
+        .map_err(|error| refuse(format!("test export file: {error}")))?;
+    let authority = fresh.authority().as_str().to_owned();
+    let output =
+        crate::resource_store::mint_output(fresh.store_mut(), chat, &authority, "test-fixture")
+            .map_err(|error| refuse(format!("test output resource: {error:?}")))?;
+    fresh
+        .admit_resource_export(chat, &output.resource.id)
+        .map_err(|error| refuse(format!("test output export proposal: {error:?}")))?
+        .ok_or_else(|| refuse("test output resource disappeared"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5157,6 +5136,47 @@ mod reset_fixture_session_tests {
             .expect("local operator project session");
         drop(session);
     }
+
+    #[test]
+    fn exportable_output_seed_writes_its_protected_content_under_the_owner_session() {
+        use gaugedesk_core::resource::ResourceId;
+        use gaugedesk_core::resource_export::ExportPhase;
+
+        let root = tempfile::tempdir().expect("fixture root");
+        let shared = crate::open_workbench(root.path()).expect("open fixture workbench");
+        let mut wb = shared.lock_unpoisoned();
+        let refused = seed_exportable_output(&mut wb, &bearer("unknown"))
+            .expect_err("a presented credential that names no owner writes nothing");
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            crate::resource_store::get(
+                wb.store_ref(),
+                "export-contract",
+                &ResourceId::new("out-export-contract"),
+            )
+            .expect("read refused seed")
+            .is_none(),
+            "a refused seed mints no output"
+        );
+
+        let root = tempfile::tempdir().expect("fixture root");
+        let shared = crate::open_workbench(root.path()).expect("open fixture workbench");
+        let mut wb = shared.lock_unpoisoned();
+        seed_exportable_output(&mut wb, &HeaderMap::new())
+            .expect("the local operator seeds the export contract under its session");
+        let output = ResourceId::new("out-export-contract");
+        assert!(
+            crate::resource_store::get(wb.store_ref(), "export-contract", &output)
+                .expect("read seeded output")
+                .is_some()
+        );
+        assert_eq!(
+            wb.resource_export_state("export-contract", &output)
+                .expect("fold seeded export")
+                .phase,
+            ExportPhase::Requested
+        );
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -5171,6 +5191,27 @@ pub(crate) struct ForceConflictBody {
 /// [`post_test_reset`]; `POST /test/reset` also clears it. Debug builds only
 /// (DR-0054 Phase A), like the reset route it accompanies.
 #[cfg(debug_assertions)]
+/// Remove the debug harness's state root for a reset.
+///
+/// A thread the previous scenario started can still be finishing a write
+/// into the root while it is removed — on Linux the browser suite met
+/// `Directory not empty` here about once a run (WS-871) — so a removal that
+/// loses that race is retried briefly before the reset is refused.
+fn wipe_state_root(root: &std::path::Path) -> std::io::Result<()> {
+    let mut attempt = 0;
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < 20 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(crate) async fn post_test_force_conflict(
     Json(body): Json<ForceConflictBody>,
 ) -> impl IntoResponse {
@@ -5183,6 +5224,31 @@ pub(crate) async fn post_test_force_conflict(
         Json(serde_json::json!({ "force_conflict": body.on })),
     )
         .into_response()
+}
+
+/// `POST /test/desktop-home-session`: the Home session the desktop shell hands
+/// its own window over IPC once someone is signed in (DR-0188), for the browser
+/// BDD that stands in for the shell. The real handover never crosses HTTP; this
+/// exists only in debug builds, behind `GAUGEDESK_TEST_RESET`, so the suite can
+/// drive the window a signed-in desktop actually has — one presenting an
+/// account session to its control plane from another origin. That window's
+/// preflights were refused in 0.8.7 and its first chat never started, while the
+/// suite drove only the signed-out window, whose preflights pass (WS-871).
+pub(crate) async fn post_test_desktop_home_session(
+    State(wb): State<SharedWorkbench>,
+) -> impl IntoResponse {
+    if gaugedesk_env::var("TEST_RESET").is_none() {
+        return (
+            StatusCode::FORBIDDEN,
+            "desktop home session fixture is disabled",
+        )
+            .into_response();
+    }
+    let token = tokio::task::spawn_blocking(move || crate::desktop_session::home_session(&wb))
+        .await
+        .ok()
+        .flatten();
+    (StatusCode::OK, Json(serde_json::json!({ "token": token }))).into_response()
 }
 
 #[cfg(test)]

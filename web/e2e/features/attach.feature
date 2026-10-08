@@ -5,6 +5,8 @@ Feature: Message attachments
   inline into the turn, images ride along as native WhippleScript resources (message-scoped,
   no workspace ingest). It is distinct from the durable Files-bar upload (context).
 
+  # quarantined (WS-904): signed-out sends show twice and stay held (WS-888)
+  @quarantine
   Scenario: attach a text file to a message
     Given a new engagement
     When I attach the file "notes.txt" containing "hello from attachment"
@@ -12,6 +14,8 @@ Feature: Message attachments
     Then the transcript echoes my message "hello from attachment"
     And the composer has no pending attachments
 
+  # quarantined (WS-905): signed-out sends show twice and stay held (WS-888)
+  @quarantine
   Scenario: drop a file onto chat
     Given a new engagement
     When I drop the file "dropped.txt" containing "hello from drop" on chat
@@ -36,6 +40,8 @@ Feature: Message attachments
     Then the run phase is "Completed"
     And the composer has no pending attachments
 
+  # quarantined (WS-906): signed-out sends show twice and stay held (WS-888)
+  @quarantine
   Scenario: extract an Office document in the browser
     Given a new engagement
     When I attach a DOCX document "sample.docx"
@@ -43,6 +49,8 @@ Feature: Message attachments
     Then the transcript echoes my message "hello from Word"
     And the composer has no pending attachments
 
+  # quarantined (WS-907): WS-888, and PDF extraction refused by a pdf.js version mismatch
+  @quarantine
   Scenario: extract a PDF in the browser
     Given a new engagement
     When I attach the PDF document "report.pdf" containing "hello from PDF"

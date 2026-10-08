@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseWorkspace, type ProjectId } from "./control-plane-domain";
-import { ownsAgent, sharedAgentProject, workRouteProject } from "./shared-agent";
+import { chatRouteProject, ownsAgent, sharedAgentProject, workRouteProject } from "./shared-agent";
 
 const project = (id: string) => id as ProjectId;
 
@@ -73,5 +73,20 @@ describe("the Home that serves the work in hand", () => {
 
     it("returns to the selected Home for the person's own Agent", () => {
         expect(workRouteProject(none)).toBeNull();
+    });
+});
+
+describe("the route an open chat's work takes (WS-893)", () => {
+    it("routes a chat in a project by that project", () => {
+        expect(chatRouteProject({ id: project("proj-launch"), isPersonal: false }, null)).toBe("proj-launch");
+        expect(chatRouteProject({ id: project("proj-launch"), isPersonal: false }, project("proj-other"))).toBe("proj-launch");
+    });
+
+    it("keeps a Personal chat on the Home that listed it, never on a route for its id", () => {
+        // Every headless Home's Personal is proj-default. Read from the
+        // selected Home, the chat stays there, though another Home routes the id.
+        expect(chatRouteProject({ id: project("proj-default"), isPersonal: true }, null)).toBeNull();
+        // Read through another project's Home, it stays on that Home.
+        expect(chatRouteProject({ id: project("proj-default"), isPersonal: true }, project("proj-launch"))).toBe("proj-launch");
     });
 });

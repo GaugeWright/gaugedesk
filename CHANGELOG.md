@@ -19,6 +19,28 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- GaugeDesk keeps its connections to the GaugeWright account service open
+  between calls instead of starting a new secure connection for each one.
+  Every account call after the first skips the handshake, which on a slow
+  network was most of the wait: a lookup that took nearly two seconds now
+  takes one round trip.
+- Right after you sign in, the account menu no longer shows a long account id
+  until your name arrives. It shows the address you signed in with, or
+  "Signed in", and then your name.
+- A new chat in desk is ready for its first message in seconds rather than
+  a minute or two. Opening one read the account's Home routes again for every
+  project the task bar asked about, about ninety times over, reopened every
+  live stream on a Home that had not changed, and the task bar read every
+  project's trackers at once on each refresh while the Home answers those one
+  at a time. Route reads are now shared, streams move only when the Home does,
+  and the task bar reads one tracker at a time and never overlaps itself.
+- A message sent straight after starting a chat runs in that chat's project
+  instead of failing with "Task project selection changed": a turn now waits
+  until desk knows which project the chat is in.
+- A Personal chat's turns go to the Home the chat was created on. A route
+  another of the account's Homes published for its Personal project sent them
+  there instead, where they timed out.
+
 ## [0.8.9] — 2026-10-08
 
 - A collecting Panel agent can be placed on a project when the project's and

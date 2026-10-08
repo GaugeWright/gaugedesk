@@ -247,9 +247,26 @@ export class WorkbenchControlPlane implements ControlPlane {
      * selected Home here: whichever project is open decides which Home serves,
      * and a Home that fails degrades only the projects routed to it. */
     private pool: HomePool<workbenchClient.WorkbenchTransport> | null = null;
+    /** The pool while its routes are read, shared by every caller meanwhile.
+     * The task bar asks about every project at once, and each of those callers
+     * used to read the routes for itself (WS-891). */
+    private poolPending: Promise<HomePool<workbenchClient.WorkbenchTransport>> | null = null;
+    /** Route reads begun under this credential, the one in flight, and the
+     * newest whose answer the pool holds. A project missing from the pool is
+     * judged by any read begun after it was asked about, so misses that
+     * arrive together share one read rather than each starting their own. */
+    private routeReadsBegun = 0;
+    private routeRead: { readonly seq: number; readonly routes: Promise<OpaqueHomeRoute[]> } | null = null;
+    private nextRouteRead: Promise<{ readonly seq: number; readonly routes: Promise<OpaqueHomeRoute[]> }> | null = null;
+    private poolRoutesSeq = 0;
     /** Projects a fresh route read found unrouted, with when it did. Cleared
      * with the pool, since routes read under one credential never serve another. */
     private readonly unroutedProjects = new Map<ProjectId, number>();
+    /** The account's selected Home, which serves every project no route names.
+     * Kept until the selection, credential or admission changes, like the
+     * per-project transport, because reading the account's Homes again for
+     * each such call put one more Hub request in front of all the others. */
+    private selectedHome: Promise<workbenchClient.WorkbenchTransport> | null = null;
     private currentProject: ProjectId | null = null;
     /** Who shared-project pins are kept for, resolved once per credential. */
     private sharedSubject: { generation: number; subject: Promise<string> } | null = null;
@@ -363,7 +380,21 @@ export class WorkbenchControlPlane implements ControlPlane {
     private async invalidateHomeTransport(project: ProjectId | null): Promise<void> {
         if (project) await this.pool?.invalidateProject(project);
         this.homeTransport = null;
+        this.selectedHome = null;
         this.selectedDirectHome = null;
+    }
+
+    /** Forget every route read under the current credential, including a read
+     * or a pool still being built, and return the pool that was live. */
+    private forgetRoutes(): HomePool<workbenchClient.WorkbenchTransport> | null {
+        const pool = this.pool;
+        this.pool = null;
+        this.poolPending = null;
+        this.routeRead = null;
+        this.nextRouteRead = null;
+        this.poolRoutesSeq = 0;
+        this.unroutedProjects.clear();
+        return pool;
     }
 
     /** The shell proves local Home standing separately from Hub sign-in. A
@@ -374,11 +405,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.credentialGeneration++;
         this.homeAdmission = null;
         this.homeTransport = null;
+        this.selectedHome = null;
         this.selectedDirectJson = null;
         this.selectedDirectHome = null;
-        void this.pool?.closeAll().catch(() => undefined);
-        this.pool = null;
-        this.unroutedProjects.clear();
+        void this.forgetRoutes()?.closeAll().catch(() => undefined);
         for (const reconnect of this.restartWorkStreams) reconnect();
         return true;
     }
@@ -404,12 +434,11 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.streamGate.suspend();
         this.credentialGeneration++;
         this.homeTransport = null;
+        this.selectedHome = null;
         this.selectedDirectHome = null;
         const selected = this.selectedDirectJson;
         this.selectedDirectJson = null;
-        const pool = this.pool;
-        this.pool = null;
-        this.unroutedProjects.clear();
+        const pool = this.forgetRoutes();
         await Promise.allSettled([
             selected?.("DELETE", "/home/admissions"),
             pool?.closeAll(),
@@ -425,10 +454,9 @@ export class WorkbenchControlPlane implements ControlPlane {
             this.credentialGeneration++;
             this.homeAdmission = null;
             this.homeTransport = null;
+            this.selectedHome = null;
             this.selectedDirectHome = null;
-            void this.pool?.closeAll().catch(() => undefined);
-            this.pool = null;
-            this.unroutedProjects.clear();
+            void this.forgetRoutes()?.closeAll().catch(() => undefined);
         }
         this.bearer = token;
     }
@@ -655,15 +683,33 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.nativeShell || !this.splitHomes;
     }
 
+    /** The project the work in hand is routed by, or null for the selected
+     * Home: whichever Home answers a read made now. */
+    get workProject(): ProjectId | null {
+        return this.currentProject;
+    }
+
     /** Open a project, so subsequent work resolves to *its* Home. Passing null
      * returns to whatever the account last selected. */
     setCurrentProject(project: ProjectId | null): void {
         if (this.currentProject === project) return;
+        const previous = this.homeTransport;
         this.currentProject = project;
         // Only the per-project path is invalidated; other Homes in the pool keep
         // their connections, which is the point of holding several.
         this.homeTransport = null;
-        for (const reconnect of this.restartWorkStreams) reconnect();
+        if (this.restartWorkStreams.size === 0) return;
+        // Streams move only when the project is served by another Home. Opening
+        // a chat in a project no route names keeps the selected Home, and
+        // reopening every stream there made each reopen refresh the whole
+        // workbench while the chat's own stream waited behind it (WS-891).
+        void Promise.allSettled([previous ?? Promise.reject(), this.requireHomeTransport()])
+            .then(([before, after]) => {
+                if (this.currentProject !== project) return;
+                if (before.status === "fulfilled" && after.status === "fulfilled"
+                    && before.value === after.value) return;
+                for (const reconnect of this.restartWorkStreams) reconnect();
+            });
     }
 
     /** Resolve the transport for the work in hand.
@@ -684,14 +730,27 @@ export class WorkbenchControlPlane implements ControlPlane {
                     // Cache this fallback just like a routed connection. Clearing
                     // it here re-reads directory discovery on every project call.
                     // Project/account/admission changes already invalidate it.
-                    return this.connectSelectedHome();
+                    return this.selectedHomeTransport();
                 }
                 throw error;
             });
             return this.homeTransport;
         }
-        this.homeTransport ??= this.connectSelectedHome();
+        this.homeTransport ??= this.selectedHomeTransport();
         return this.homeTransport;
+    }
+
+    /** The selected Home's transport, connected once and shared by every
+     * project no route names until something it depends on changes. A
+     * rejected attempt is not kept, so the next call dials again. */
+    private selectedHomeTransport(): Promise<workbenchClient.WorkbenchTransport> {
+        if (this.selectedHome) return this.selectedHome;
+        const pending = this.connectSelectedHome();
+        this.selectedHome = pending;
+        pending.catch(() => {
+            if (this.selectedHome === pending) this.selectedHome = null;
+        });
+        return pending;
     }
 
     /** Connect the exact Home a project is routed to, reusing a live connection
@@ -699,6 +758,10 @@ export class WorkbenchControlPlane implements ControlPlane {
     private async connectRoutedProject(
         project: ProjectId,
     ): Promise<workbenchClient.WorkbenchTransport> {
+        // Taken before the pool is awaited: a pool built meanwhile was built
+        // from a read begun after this project was asked about, and answers
+        // for it as well as a second read would.
+        const asked = this.routeReadsBegun;
         const pool = await this.homePool();
         let route: OpaqueHomeRoute;
         try {
@@ -716,7 +779,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             // every settings and tracker call (WS-849).
             const confirmed = this.unroutedProjects.get(project);
             if (confirmed !== undefined && Date.now() - confirmed < UNROUTED_RECHECK_MS) throw error;
-            pool.replaceRoutes(await this.homeRoutes());
+            await this.routesReadSince(pool, asked);
             try {
                 route = pool.routeFor(project);
                 this.unroutedProjects.delete(project);
@@ -737,10 +800,72 @@ export class WorkbenchControlPlane implements ControlPlane {
         return connection.api;
     }
 
+    /** Begin a route read that every concurrent miss may share. */
+    private readRoutes(): { readonly seq: number; readonly routes: Promise<OpaqueHomeRoute[]> } {
+        const read = { seq: ++this.routeReadsBegun, routes: this.homeRoutes() };
+        this.routeRead = read;
+        read.routes.then(
+            () => { if (this.routeRead === read) this.routeRead = null; },
+            () => { if (this.routeRead === read) this.routeRead = null; },
+        );
+        return read;
+    }
+
+    /** A read begun after `asked`: the one in flight if it did, else one
+     * shared by everyone who asks before it begins. A read in flight that
+     * began earlier may predate a project created since, so it is waited
+     * out rather than trusted, and the read after it is the one shared. */
+    private routesBegunAfter(
+        asked: number,
+    ): Promise<{ readonly seq: number; readonly routes: Promise<OpaqueHomeRoute[]> }> {
+        const current = this.routeRead;
+        if (!current) return Promise.resolve(this.readRoutes());
+        if (current.seq > asked) return Promise.resolve(current);
+        if (!this.nextRouteRead) {
+            const next = current.routes.then(() => undefined, () => undefined).then(() => {
+                if (this.nextRouteRead === next) this.nextRouteRead = null;
+                return this.readRoutes();
+            });
+            this.nextRouteRead = next;
+        }
+        return this.nextRouteRead;
+    }
+
+    /** Bring the pool's routes up to a read begun after `asked`: the one the
+     * pool already holds, or one from `routesBegunAfter`. Every project the
+     * task bar asks about at once used to start a read of its own, each three
+     * Hub and directory requests answered one after another, and a new chat's
+     * own route waited behind about ninety of them (WS-891). */
+    private async routesReadSince(
+        pool: HomePool<workbenchClient.WorkbenchTransport>,
+        asked: number,
+    ): Promise<void> {
+        if (this.pool === pool && this.poolRoutesSeq > asked) return;
+        const read = await this.routesBegunAfter(asked);
+        const routes = await read.routes;
+        // Routes read under a credential since replaced, or older than the
+        // ones the pool already holds, never overwrite what it has.
+        if (this.pool !== pool || read.seq <= this.poolRoutesSeq) return;
+        pool.replaceRoutes(routes);
+        this.poolRoutesSeq = read.seq;
+    }
+
     /** The account's project→Home routes, as a live pool. Built once and
-     * refreshed whenever the account directory is re-read. */
-    private async homePool(): Promise<HomePool<workbenchClient.WorkbenchTransport>> {
-        if (this.pool) return this.pool;
+     * refreshed whenever the account directory is re-read. Callers that need
+     * it while it is being built wait for that one build. */
+    private homePool(): Promise<HomePool<workbenchClient.WorkbenchTransport>> {
+        if (this.pool) return Promise.resolve(this.pool);
+        if (this.poolPending) return this.poolPending;
+        const pending = this.buildHomePool();
+        this.poolPending = pending;
+        pending.then(
+            () => { if (this.poolPending === pending) this.poolPending = null; },
+            () => { if (this.poolPending === pending) this.poolPending = null; },
+        );
+        return pending;
+    }
+
+    private async buildHomePool(): Promise<HomePool<workbenchClient.WorkbenchTransport>> {
         // Routes resolved under one credential are never used under another.
         // One change is not a change of person, though: a page that started
         // with no bearer at all receiving its first one. After a reload that
@@ -751,17 +876,25 @@ export class WorkbenchControlPlane implements ControlPlane {
         // by another still refuses, because work begun for one account must
         // never be admitted under the next.
         let routes: OpaqueHomeRoute[] | undefined;
+        let routesSeq = 0;
+        // Begin the read after every caller of this turn has asked, so the
+        // task bar's question about each of its projects is answered by it.
+        await Promise.resolve();
         for (let attempt = 0; attempt < 2 && routes === undefined; attempt += 1) {
             const generation = this.credentialGeneration;
             const rehydrating = this.bearer === null;
-            const resolved = await this.homeRoutes();
-            if (generation === this.credentialGeneration) routes = resolved;
-            else if (!rehydrating || this.credentialGeneration !== generation + 1) break;
+            const read = this.readRoutes();
+            const resolved = await read.routes;
+            if (generation === this.credentialGeneration) {
+                routes = resolved;
+                routesSeq = read.seq;
+            } else if (!rehydrating || this.credentialGeneration !== generation + 1) break;
         }
         if (routes === undefined) {
             throw new Error("Account session changed while resolving Home routes");
         }
         if (this.pool) return this.pool;
+        this.poolRoutesSeq = routesSeq;
         // The live carrier per relay-only Home. A tunnel is not reclaimed by
         // being forgotten: the Home stays spliced to a client that has gone and
         // never re-parks, so the *next* attempt to reach it waits for a splice
@@ -994,6 +1127,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             // not. A failed one must not outlive this call, or every Retry would
             // read back the same rejection without dialing anything.
             this.homeTransport = null;
+            this.selectedHome = null;
             // A selected Home that has published no route belongs with the other
             // "no Home is serving you yet" states, not with connection failures
             // (ADR 0134 §5): the surface below lists the account's Homes and
@@ -1050,6 +1184,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             true,
         );
         this.homeTransport = null;
+        this.selectedHome = null;
         return this.bootstrapHome();
     }
 
@@ -1060,6 +1195,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             await accountClient.accountSelectHome(this.route, id);
         }
         this.homeTransport = null;
+        this.selectedHome = null;
         return this.bootstrapHome();
     }
 
@@ -1079,6 +1215,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         }, true);
         this.homeAdmission = null;
         this.homeTransport = null;
+        this.selectedHome = null;
     }
 
     tenantHosts(tenant: string): Promise<accountClient.TenantHost[]> {
@@ -1196,6 +1333,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         }, true);
         this.homeAdmission = null;
         this.homeTransport = null;
+        this.selectedHome = null;
     }
 
     getCloudHome(tenant: string): Promise<accountClient.CloudHomeProjection> {
@@ -1240,8 +1378,11 @@ export class WorkbenchControlPlane implements ControlPlane {
             homeId: accepted.homeId,
             endpoint: accepted.endpoint,
         });
+        // Registering the Home selected it.
+        this.selectedHome = null;
         if (accepted.shared) {
-            this.pool?.replaceRoutes(await this.homeRoutes());
+            const pool = this.pool;
+            if (pool) await this.routesReadSince(pool, this.routeReadsBegun);
             this.homeTransport = null;
         } else {
             this.homeAdmission = accepted.admission;
@@ -1276,7 +1417,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             // account's selected Home (DESK-5a), so that Home is the one that
             // holds it, as for every other call about the project.
             if (!String(error).includes("no granted Home route")) throw error;
-            const transport = await this.connectSelectedHome();
+            const transport = await this.selectedHomeTransport();
             const reach = this.nativeRemote
                 ? await accountClient.hubSessionReach(this.route)
                 : await accountClient.accountHomes(this.route);
@@ -1354,7 +1495,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         } catch (error) {
             // Older projects may predate route authorship; their selected Home
             // still admits the exact requested project at the product boundary.
-            if (String(error).includes("no granted Home route")) return this.connectSelectedHome();
+            if (String(error).includes("no granted Home route")) return this.selectedHomeTransport();
             throw error;
         }
     }
@@ -2594,7 +2735,7 @@ export class WorkbenchControlPlane implements ControlPlane {
 
     async materializeOrganizationSharedProject(tenantId: string): Promise<string> {
         const home = this.usesRemoteHome()
-            ? await this.connectSelectedHome()
+            ? await this.selectedHomeTransport()
             : this.localWorkTransport;
         return accountClient.materializeOrganizationSharedProject(home.json, tenantId, false);
     }

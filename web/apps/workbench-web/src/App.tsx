@@ -25,7 +25,7 @@ import { accountSelectionSync } from "./account-selection-sync";
 import { accountMenuIdentity } from "./account-menu-identity";
 import { followDesktopHomeSession } from "./desktop-home-session";
 import { claimWithoutAsking } from "./desktop-home-default";
-import { createEffect, createMemo, createResource, createRoot, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack, type Accessor, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Match, on, onCleanup, onMount, Show, Switch, untrack, type Accessor, type JSX } from "solid-js";
 import {
     authority,
     bearer,
@@ -77,6 +77,7 @@ import {
     beginWorkEmailLogin,
     sharedAgentProject,
     workRouteProject,
+    chatRouteProject,
 } from "@gaugewright/control-plane-client";
 import { WorkbenchControlPlane, controlPlaneBase } from "./workbench-control-plane";
 import { ManagementChat } from "./ManagementChat";
@@ -84,6 +85,7 @@ import { captureHomeDiscovery, type HomeDiscoveryFailure } from "./home-bootstra
 import { desktopUpdateOffer, desktopUpdateScopeReady, desktopUpdateShouldRecheck, selectedDesktopUpdatePolicy, withDesktopUpdateTimeout, DESKTOP_UPDATE_CHECK_TIMEOUT_MS, DESKTOP_UPDATE_RECHECK_MS } from "./desktop-update";
 import { openExternal } from "./open-external";
 import { chatAcceptanceEvidence } from "./chat-acceptance-observation";
+import { chatRouted } from "./chat-route-wait";
 import { CHAT_NOTIFICATION_EVENT, deliverChatNotice, personIsLooking } from "./chat-notification-delivery";
 import "@gaugewright/gw-embed";
 import {
@@ -1404,9 +1406,15 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     // Chat context comes from the workspace projection, so it tracks renames and
     // other changes to the selected chat. Keying on `navTick` re-resolves it after
     // navigation updates. Guarded so no selection means no fetch.
+    //
+    // Each answer names the chat it describes and the project its work is
+    // routed by (`chatRouteProject`): a Personal chat's stays on the route this
+    // read went out under, because a Personal project's id names no one Home
+    // (WS-893).
     const [chatInfo, { refetch: refetchChatInfo }] = createResource(
         () => (selected() ? ([selected()!, navTick()] as const) : false),
         async ([id]) => {
+        const readUnder = api.workProject;
         const ws = await api.getWorkspace();
         // Work chats live under a project's placement → lineage is archetype · project.
         for (const p of ws.projects) {
@@ -1444,6 +1452,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                         acts: c.availableActs,
                         // Only a project-rooted work chat has a project here.
                         project: { id: p.id, name: p.name, networkIsolated: p.networkIsolated },
+                        chat: id,
+                        route: chatRouteProject(p, readUnder),
                     };
                 }
             }
@@ -1475,6 +1485,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     basis: targets.map((target) => target.basis).join(" · "),
                     candidate: c.candidateRevision,
                     acts: c.availableActs,
+                    chat: id,
+                    route: null,
                 };
             }
         }
@@ -1501,6 +1513,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     acts: c.availableActs,
                     preview: a.kind,
                     authoringProject: sharedAgentProject(a),
+                    chat: id,
+                    route: null,
                 };
             }
         }
@@ -1526,6 +1540,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             basis: targets.map((target) => target.basis).join(" · "),
             candidate: r?.candidateRevision,
             acts: r?.availableActs,
+            chat: id,
+            route: null,
         };
         },
     );
@@ -1573,6 +1589,11 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         };
     });
     const [taskRouteProject, setTaskRouteProject] = createSignal<ProjectId | null>(null);
+    // The chat whose own project the route was last decided from. A chat is
+    // selected before the workspace projection says which project it is in,
+    // and a turn started in between was refused as "Task project selection
+    // changed" when the route then moved under it (WS-892).
+    const [routedChat, setRoutedChat] = createSignal<EngagementId | null>(null);
     // Tell the control plane which project is open, so work resolves to *that*
     // project's Home rather than one selected Home (DESK-3). Several Homes stay
     // connected at once; this only decides which one serves the work in hand.
@@ -1583,14 +1604,16 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         const requested = projectSettings()?.id
             ?? panelSettings()?.projectId
             ?? (projectHome()?.id === routedProject() ? routedProject() : null);
+        const info = chatInfo();
         const project = workRouteProject({
             requested: (requested ?? null) as ProjectId | null,
             agentSettings: agentSettings()?.project ?? null,
-            chatProject: (currentProject()?.id ?? null) as ProjectId | null,
-            authoring: chatInfo()?.authoringProject ?? null,
+            chatProject: (info?.route ?? null) as ProjectId | null,
+            authoring: info?.authoringProject ?? null,
         });
         api.setCurrentProject(project);
         setTaskRouteProject(project);
+        setRoutedChat(info?.chat ?? null);
     });
     // The transcript is a projection of durable truth: a **snapshot** of admitted
     // records (refetched per engagement, survives reloads) concatenated with the
@@ -2039,27 +2062,17 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     }
 
     // A task captures the open project when it starts and refuses to run if the
-    // selection moves under it (WS-459). A chat created from the empty composer
-    // is selected before the workspace projection names its project, so its
-    // first turn waits for the task route to reach that project rather than
-    // starting on the route it replaces and being refused as "Task project
-    // selection changed". Bounded: past the limit the turn runs and reports
-    // whatever it meets, as it did before.
-    function whenTaskRoute(project: ProjectId, limitMs = 10_000): Promise<void> {
-        return new Promise((resolve) => {
-            createRoot((dispose) => {
-                const timer = setTimeout(() => { dispose(); resolve(); }, limitMs);
-                createEffect(() => {
-                    if (taskRouteProject() !== project) return;
-                    clearTimeout(timer);
-                    dispose();
-                    resolve();
-                });
-            });
-        });
-    }
+    // selection moves under it (WS-459). A chat is selected before the workspace
+    // projection names its project, so a turn in the selected chat waits until
+    // the route has been decided from that chat rather than starting on the
+    // route it replaces and being refused as "Task project selection changed"
+    // (WS-892). That covers every way a chat opens — the navigator's new chat,
+    // the empty composer, a link — where only a chat created with a project
+    // used to wait. A chat no longer selected does not wait, and the wait is
+    // bounded: past the limit the turn runs and reports whatever it meets.
+    const whenChatRouted = (id: EngagementId) => chatRouted(id, { routedChat, selected });
 
-    async function finishNewChat(id: EngagementId, prompt?: string, images: ImageRef[] = [], project?: ProjectId) {
+    async function finishNewChat(id: EngagementId, prompt?: string, images: ImageRef[] = []) {
         // The quick-start composer's model/effort choices were held as pending
         // pins (no chat existed to own them); write them into the new chat's
         // config before its first turn so the first message runs with them.
@@ -2083,9 +2096,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         recordFeature("chat.create", "completed");
         if (prompt) {
             // Let the selected-chat effect subscribe before the first turn starts;
-            // otherwise an eager turn can race the fresh transcript reset.
-            const route = project ? whenTaskRoute(project) : Promise.resolve();
-            queueMicrotask(() => void route.then(() => runPrompt(id, prompt, images)).catch((e) => {
+            // otherwise an eager turn can race the fresh transcript reset. The
+            // turn itself waits for the chat's route (`whenChatRouted`).
+            queueMicrotask(() => void runPrompt(id, prompt, images).catch((e) => {
                 // No composer row owns this first turn, so nothing else reports it.
                 if (!turnStopped(e) && selected() === id) {
                     reportFailure("chat", e instanceof Rejected
@@ -2130,7 +2143,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             }
             if (project && placementId && targets.length === 1) {
                 const id = await api.createChatUnderPlacement(project.id, placementId, "new chat", [targets[0].id]);
-                await finishNewChat(id, prompt, images, project.id);
+                await finishNewChat(id, prompt, images);
                 return;
             }
             if (scope) {
@@ -2194,7 +2207,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             return;
         }
         // The chat exists now, so the message is its first turn and does not go back.
-        await finishNewChat(id, choice.prompt, choice.images, choice.projectId)
+        await finishNewChat(id, choice.prompt, choice.images)
             .catch((error) => reportFailure("chat", `couldn't open the new chat — ${failureReason(error)}`));
     }
 
@@ -2258,6 +2271,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         // chat's dot in Browse reflects its own state.
         const isCurrent = () => selected() === id;
         const rid = composedId ?? crypto.randomUUID();
+        await whenChatRouted(id);
         const context = await api.taskContext(id);
         const attempt = taskCommands.begin(context.scope, rid, prompt, snapshot().lines.length);
         const unsubscribeCorrelation = context.subscribe((event) => taskCommands.observe(context.scope, event));
@@ -3713,7 +3727,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     };
     const signedInNote = (showLocal = true): JSX.Element => (<>
         <p class="homegate-auth-note homegate-signed-in" data-home-signed-in>
-            {menuIdentity()
+            {menuIdentity() && !menuIdentity()?.pending
                 ? <>Signed in as {menuIdentity()?.email ?? menuIdentity()?.name}.</>
                 : "Signed in."}
             {" "}

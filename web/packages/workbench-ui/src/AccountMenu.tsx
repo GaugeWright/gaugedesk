@@ -35,6 +35,9 @@ export interface MenuIdentity {
     /** The account's avatar as a re-encoded image `data:` URI (DR-0195). Absent
      *  for most accounts; initials are the steady state, not a loading state. */
     readonly avatar?: string;
+    /** Signed in, but nothing has named the account yet. Its `name` is a
+     *  placeholder, never an id, and a name the client already holds wins. */
+    readonly pending?: boolean;
 }
 
 export interface AccountMenuItem {
@@ -92,7 +95,8 @@ export function AccountMenu(props: AccountMenuProps): JSX.Element {
     });
     const initials = () => {
         const name = props.identity?.name;
-        if (!showsAccount() || !name) return null;
+        // A placeholder name has no initials of the person's.
+        if (!showsAccount() || !name || props.identity?.pending) return null;
         return name.split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("");
     };
 

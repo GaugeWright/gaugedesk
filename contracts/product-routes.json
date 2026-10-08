@@ -11434,6 +11434,20 @@
       ]
     },
     {
+      "id": "test.desktop-home-session",
+      "method": "POST",
+      "path": "/test/desktop-home-session",
+      "owner": "gaugedesk",
+      "status": "test-only",
+      "guard": "GAUGEDESK_TEST_RESET",
+      "reason": "Browser-BDD stand-in for the desktop shell's IPC handover of the signed-in window's Home session (DR-0188); refuses with 403 unless the explicit test harness guard is enabled.",
+      "evidence": [
+        "specs/implementation/local-api-contract.md#Test-only harness routes",
+        "web/e2e/features/signed-in-desktop.feature#signed-in-desktop-window",
+        "crates/app/tests/route_surface.rs#test_only_harness_routes_refuse_without_activation_guard"
+      ]
+    },
+    {
       "id": "test.account-device-fixture",
       "method": "POST",
       "path": "/account/devices",

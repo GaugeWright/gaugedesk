@@ -17,6 +17,7 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 mod chat_notification;
 mod logging;
+mod test_journey;
 
 const BACKGROUND_ARG: &str = "--background";
 
@@ -137,6 +138,47 @@ fn launch_operator_secret() -> gaugedesk_app::open_api::LocalOperatorSecret {
     gaugedesk_app::open_api::LocalOperatorSecret::generate()
 }
 
+/// The release canary's journey, when the test entrances were admitted and a
+/// plan was named (DR-0457). Unset in every ordinary launch.
+static TEST_JOURNEY: std::sync::OnceLock<gaugedesk_app::test_signin::Journey> =
+    std::sync::OnceLock::new();
+
+/// One report from the canary's journey in the window. Refused unless a
+/// journey was loaded, which a launch without `GAUGEDESK_TEST_SIGNIN=1` and a
+/// fresh `GAUGEDESK_ROOT` never does.
+#[tauri::command]
+fn test_journey_report(event: serde_json::Value) -> Result<(), String> {
+    gaugedesk_app::test_signin::report(TEST_JOURNEY.get(), &event)
+}
+
+/// Whether the release canary's test entrances are open for this launch
+/// (DR-0457), decided before anything is written to the data directory. A
+/// switch that cannot be honoured stops the app here, rather than letting it
+/// fall back to the person's own data.
+fn admit_test_entrances() -> Option<gaugedesk_app::test_signin::TestSignin> {
+    use gaugedesk_app::test_signin::Admission;
+    match gaugedesk_app::test_signin::admit_from_env() {
+        Admission::Off { ignored } => {
+            if !ignored.is_empty() {
+                eprintln!(
+                    "[gaugedesk] ignoring {} without GAUGEDESK_TEST_SIGNIN=1",
+                    ignored
+                        .iter()
+                        .map(|name| format!("GAUGEDESK_{name}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            None
+        }
+        Admission::On(admitted) => Some(admitted),
+        Admission::Refused(reason) => {
+            eprintln!("[gaugedesk] refusing to start: {reason}");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tauri::command]
 fn hash_chat_acceptance_text(text: String) -> Result<String, String> {
     gaugedesk_app::open_api::chat_acceptance_digest(&text)
@@ -182,6 +224,19 @@ fn main() {
     ) {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", value);
     }
+    let test_entrances = admit_test_entrances();
+    if let Some(admitted) = &test_entrances {
+        match admitted.load_journey() {
+            Ok(Some(journey)) => {
+                let _ = TEST_JOURNEY.set(journey);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("[gaugedesk] refusing to start: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             restart_app,
@@ -191,7 +246,8 @@ fn main() {
             notify_chat,
             home_session,
             operator_secret,
-            control_plane_failure
+            control_plane_failure,
+            test_journey_report
         ])
         .menu(|app| {
             let menu = Menu::default(app)?;
@@ -259,11 +315,18 @@ fn main() {
                 }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             // First, so the control plane's start below is recorded either way.
             match app.path().app_log_dir() {
                 Ok(dir) => logging::init(&dir),
                 Err(e) => eprintln!("[gaugewright] no log directory: {e}"),
+            }
+            if let Some(admitted) = &test_entrances {
+                tracing::warn!(
+                    root = %admitted.root().display(),
+                    journey = TEST_JOURNEY.get().is_some(),
+                    "the release canary's test entrances are open for this launch (DR-0457)"
+                );
             }
             let open_item = MenuItem::with_id(app, "open", "Open GaugeDesk", true, None::<&str>)?;
             let startup = CheckMenuItem::with_id(
@@ -327,6 +390,7 @@ fn main() {
                     // The secret exists before the window does, so the window's
                     // first request can carry it and nothing is ever served open.
                     let secret = OPERATOR.get_or_init(launch_operator_secret).clone();
+                    let test_entrances = test_entrances.clone();
                     // Start the control plane in the background before the window is
                     // interactive. Both stores live under the OS app-data dir
                     // (cwd `.gaugewright` in dev), resolved by the workspace crate.
@@ -340,6 +404,13 @@ fn main() {
                             let served = match gaugedesk_app::open_api::open_prepare(&root) {
                                 Ok(wb) => {
                                     let _ = HOME.set(wb.clone());
+                                    // Before serving, so the window cannot reach
+                                    // the callback ahead of the attempt it completes.
+                                    if let Some(admitted) = &test_entrances {
+                                        if let Err(error) = admitted.seed_pending_attempt(&wb) {
+                                            tracing::error!("the canary's sign-in attempt was not seeded: {error}");
+                                        }
+                                    }
                                     gaugedesk_app::open_api::open_serve_workbench_with(
                                         wb,
                                         bind,
@@ -406,6 +477,15 @@ fn main() {
             // can make room for the traffic lights and carry the window drag.
             if cfg!(target_os = "macos") {
                 window = window.initialization_script(OVERLAY_TITLE_BAR);
+            }
+            // The canary's journey (DR-0457), present only when it was admitted.
+            // Its host's console is locked, so the window is never on screen,
+            // and WebKit throttles a hidden page's timers until a minute-long
+            // wait takes many; the journey runs the window as if it were seen.
+            if let Some(journey) = TEST_JOURNEY.get() {
+                window = window
+                    .initialization_script(test_journey::script(journey))
+                    .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
             }
             if std::env::args().any(|arg| arg == BACKGROUND_ARG) {
                 window = window.visible(false);

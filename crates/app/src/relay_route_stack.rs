@@ -181,12 +181,13 @@ impl HubBearerAccounts {
             .hub
             .as_deref()
             .ok_or_else(|| "no account service is configured".to_owned())?;
-        let agent = ureq::AgentBuilder::new()
+        let agent = net_http::shared_agent(net_http::AgentSettings {
+            timeout: None,
+            connect: Some(Duration::from_secs(10)),
+            read: Some(Duration::from_secs(15)),
             // Never follow a redirect with someone's bearer in hand.
-            .redirects(0)
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(15))
-            .build();
+            redirects: false,
+        });
         let response = match agent
             .get(&format!("{hub}/account/identity"))
             .set("authorization", &format!("Bearer {bearer}"))

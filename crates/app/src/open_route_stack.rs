@@ -193,6 +193,24 @@ mod tests {
         assert!(!body.is_empty(), "{status}");
     }
 
+    /// The workbench reads the account summary — identity, memberships,
+    /// appearance — on every page load instead of admitting Account Settings
+    /// (WS-916), so a desktop that did not forward it would show no
+    /// organization selector. With no account signed in the alias answers its
+    /// own refusal, which has a body; axum's unmatched-route `404` is empty.
+    #[tokio::test]
+    async fn the_desktop_forwards_the_account_settings_summary() {
+        let (status, body) = send(
+            &desktop(),
+            "GET",
+            "/gaugeapps/account-settings/summary",
+            None,
+        )
+        .await;
+        assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.is_empty(), "{status}");
+    }
+
     /// Detaching a facility is asserted as a success, not as "not 404".
     ///
     /// `delete_facility` answers its own `404` for an unknown id, so a probe
