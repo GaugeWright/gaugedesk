@@ -154,6 +154,38 @@ pub fn default_allowed_origins() -> Vec<String> {
     v
 }
 
+/// Let an allowed origin read a refusal answered outside [`cors_layer`].
+///
+/// A gate layered around the CORS layer answers before it, so its refusal
+/// carries no `Access-Control-Allow-Origin`, and the browser rejects the
+/// `fetch` with a bare network error — WebKit's "Load failed" — instead of
+/// the status and reason. The desktop window then reports "couldn't start a
+/// chat — Load failed" for what was a precise, logged refusal (2026-10-07).
+/// Inserts rather than appends, so it never doubles a header the CORS layer
+/// already set.
+pub fn allow_origin_on_refusal(
+    request: &axum::http::HeaderMap,
+    response: &mut axum::response::Response,
+) {
+    use axum::http::{header, HeaderValue};
+    let Some(origin) = request.get(header::ORIGIN) else {
+        return;
+    };
+    let allowed = origin
+        .to_str()
+        .is_ok_and(|origin| default_allowed_origins().iter().any(|o| o == origin));
+    if !allowed {
+        return;
+    }
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        HeaderValue::from_static("true"),
+    );
+    headers.append(header::VARY, HeaderValue::from_static("origin"));
+}
+
 /// The CORS layer for the control-plane API (FED-2): a pinned origin allowlist.
 pub fn cors_layer() -> tower_http::cors::CorsLayer {
     use axum::http::{header, HeaderValue, Method};

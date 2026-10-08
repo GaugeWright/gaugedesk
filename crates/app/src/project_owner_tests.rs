@@ -2283,3 +2283,82 @@ async fn a_members_authoring_and_settings_assistant_spend_the_projects_credentia
     assert!(token(VIEWER, "project", "p-shared").is_err());
     assert!(token(OTHER, "project", "p-shared").is_err());
 }
+
+/// The desktop window calls its control plane from another origin, so every
+/// request with a session is preceded by a CORS preflight that carries none.
+/// Driven through the composition the shell serves — the window's secret,
+/// this gate, then the routes — because each layer alone was correct while
+/// the stack refused every preflight to a signed-in account's project, and
+/// the window could not start a chat (2026-10-07).
+#[tokio::test]
+async fn the_desktop_window_reaches_a_signed_in_accounts_project_across_origins() {
+    use axum::http::header;
+    const ORIGIN: &str = "tauri://localhost";
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    let (_root, wb) = open();
+    claim(&wb, CLAIMANT);
+    project(&wb, "own-project", serde_json::json!({ "owner": CLAIMANT }));
+    let claimant = session(&wb, CLAIMANT);
+    let other = session(&wb, OTHER);
+    let app = crate::local_operator::guard(
+        crate::open_runtime::desktop_operator_plane(wb.clone()),
+        Some(crate::local_operator::LocalOperatorSecret::parse(SECRET).unwrap()),
+    );
+    let call = |method: &str, uri: &str, bearer: Option<&str>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::ORIGIN, ORIGIN);
+        if method == "OPTIONS" {
+            request = request
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,content-type,idempotency-key,x-gaugedesk-operator",
+                );
+        } else {
+            request = request.header(crate::local_operator::HEADER, SECRET);
+        }
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let request = request.body(Body::empty()).unwrap();
+        let app = app.clone();
+        async move { app.oneshot(request).await.unwrap() }
+    };
+    let allowed_origin = |response: &axum::response::Response| {
+        response
+            .headers()
+            .get_all(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    // The preflight for starting a chat in the account's own project.
+    let preflight = call(
+        "OPTIONS",
+        "/projects/own-project/placements/inst-placement-default/chats",
+        None,
+    )
+    .await;
+    assert!(
+        preflight.status().is_success(),
+        "a preflight is answered by CORS, not judged as the signed-out local account: {}",
+        preflight.status()
+    );
+    assert_eq!(allowed_origin(&preflight), vec![ORIGIN.to_owned()]);
+
+    // The request it was asking for reaches the route, readable by the window.
+    let read = call("GET", "/projects/own-project/home", Some(&claimant)).await;
+    assert_eq!(read.status(), StatusCode::OK);
+    assert_eq!(allowed_origin(&read), vec![ORIGIN.to_owned()]);
+
+    // A refusal is still a refusal, and the window can read it as one rather
+    // than as a network error.
+    let refused = call("GET", "/projects/own-project/home", Some(&other)).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(allowed_origin(&refused), vec![ORIGIN.to_owned()]);
+    let body = refused.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("not in scope for this project"));
+}

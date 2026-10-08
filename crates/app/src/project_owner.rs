@@ -737,6 +737,13 @@ pub(crate) fn administered_organizations(account: &str, org: &Org) -> BTreeSet<S
 /// request is the local channel and keeps its view until the local account
 /// has a Personal of its own (WS-588); a route naming no project is the
 /// next step's (WS-655).
+///
+/// A CORS preflight passes untouched. The browser sends it without the
+/// session it is asking permission to send, so judging it here judges the
+/// signed-out local account, which reaches none of a signed-in account's
+/// projects. Refusing it cancelled the real request before this gate could
+/// judge it with its session: every project route the desktop window called
+/// failed as "Load failed", starting a chat among them (2026-10-07).
 pub(crate) async fn account_project_gate(
     axum::extract::State(wb): axum::extract::State<crate::SharedWorkbench>,
     request: axum::extract::Request,
@@ -744,6 +751,9 @@ pub(crate) async fn account_project_gate(
 ) -> axum::response::Response {
     use crate::LockUnpoisoned;
     use axum::response::IntoResponse;
+    if request.method() == axum::http::Method::OPTIONS {
+        return next.run(request).await;
+    }
     // A phone's controller session has its own admission and is no account.
     let controller = crate::mobile_machine_session::session_token(request.headers()).is_some();
     let refused = !controller && {
@@ -769,11 +779,19 @@ pub(crate) async fn account_project_gate(
             }))
     };
     if refused {
-        return (
+        tracing::warn!(
+            method = %request.method(),
+            path = request.uri().path(),
+            signed_in = crate::net_http::bearer(request.headers()).is_some(),
+            "project gate refused a request: not in scope for this project"
+        );
+        let mut response = (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({ "error": "not in scope for this project" })),
         )
             .into_response();
+        crate::net_http::allow_origin_on_refusal(request.headers(), &mut response);
+        return response;
     }
     next.run(request).await
 }

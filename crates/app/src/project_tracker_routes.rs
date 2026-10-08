@@ -83,7 +83,12 @@ pub async fn read_backlog(
     }
     match wb.read_project_tracker_backlog(&context, &project, &queue) {
         Ok(backlog) => Json(backlog).into_response(),
-        Err(_) => problem(StatusCode::SERVICE_UNAVAILABLE, "Tracker is unavailable"),
+        Err(error) => {
+            // Said here because the person sees only "some tasks could not
+            // be read", and the reason is otherwise nowhere (2026-10-07).
+            tracing::warn!(project, queue, %error, "project tracker backlog could not be read");
+            problem(StatusCode::SERVICE_UNAVAILABLE, "Tracker is unavailable")
+        }
     }
 }
 
@@ -112,7 +117,12 @@ pub async fn read_tasks(
     }
     match wb.read_project_tracker_tasks(&context, &project, &queue) {
         Ok(tasks) => Json(tasks).into_response(),
-        Err(_) => problem(StatusCode::SERVICE_UNAVAILABLE, "Tracker is unavailable"),
+        Err(error) => {
+            // Said here because the person sees only "some tasks could not
+            // be read", and the reason is otherwise nowhere (2026-10-07).
+            tracing::warn!(project, queue, %error, "project tracker tasks could not be read");
+            problem(StatusCode::SERVICE_UNAVAILABLE, "Tracker is unavailable")
+        }
     }
 }
 

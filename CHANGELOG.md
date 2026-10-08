@@ -19,6 +19,17 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-10-08
+
+- Starting a chat works again in GaugeDesk when you are signed in. The
+  desktop's project check refused the browser's permission request that comes
+  before every signed-in call, so starting a chat, reading project tasks and
+  other project actions failed with "Load failed". Signed-out use was not
+  affected.
+- When GaugeDesk's own service refuses a request, the app now shows the
+  refusal instead of "Load failed", and the reason is written to the log, as
+  is the reason a project's tasks could not be read.
+
 ## [0.8.7] — 2026-10-07
 
 - Someone you share a project with as a member can now build and ship the

@@ -61,7 +61,7 @@ impl LocalOperatorSecret {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         let value = value.trim();
         if value.len() < MIN_LEN {
             return Err(format!(
@@ -128,13 +128,23 @@ async fn require(
     if presented.is_some_and(|value| secret.admits(value)) {
         return next.run(request).await;
     }
-    (
+    tracing::warn!(
+        method = %request.method(),
+        path,
+        presented = presented.is_some(),
+        "local control plane refused a request without the window's secret"
+    );
+    let mut response = (
         StatusCode::UNAUTHORIZED,
         Json(serde_json::json!({
             "error": "only the GaugeDesk window may use this computer's local control plane"
         })),
     )
-        .into_response()
+        .into_response();
+    // The window itself must be able to read this, or a lost secret reads as
+    // "Load failed" (crate::net_http::allow_origin_on_refusal).
+    crate::net_http::allow_origin_on_refusal(request.headers(), &mut response);
+    response
 }
 
 #[cfg(test)]
@@ -228,6 +238,33 @@ mod tests {
             status(router(None), get_workspace(None)).await,
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn the_window_can_read_its_own_refusal_and_a_foreign_page_cannot() {
+        let refused = |origin: &'static str| {
+            let request = axum::http::Request::get("/workspace")
+                .header(axum::http::header::ORIGIN, origin)
+                .body(Body::empty())
+                .unwrap();
+            async move { router(Some(secret())).oneshot(request).await.unwrap() }
+        };
+        let window = refused("tauri://localhost").await;
+        assert_eq!(window.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            window
+                .headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "tauri://localhost",
+            "without it the window sees \"Load failed\", not the refusal"
+        );
+        let page = refused("https://example.com").await;
+        assert_eq!(page.status(), StatusCode::UNAUTHORIZED);
+        assert!(page
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
     }
 
     #[test]
