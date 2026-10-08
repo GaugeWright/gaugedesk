@@ -2053,7 +2053,7 @@
       "path": "/auth/refresh",
       "producer": "gaugedesk-ee auth_oidc production router",
       "consumer": "refreshHostedAccountSession via @gaugewright/control-plane-client",
-      "authentication": "valid-account-session-and-sealed-person-refresh-token",
+      "authentication": "valid-account-session-and-sealed-person-refresh-token; passkey-or-recovery-session-cookie",
       "scope": "authenticated-person",
       "capability": "refresh-own-account-session",
       "requestSchema": "http/empty",

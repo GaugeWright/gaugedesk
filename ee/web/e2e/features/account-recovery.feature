@@ -20,3 +20,4 @@ Feature: Provider-neutral account recovery
     Then Desk enters the new account through a persistent passkey session
     When I sign out and use the same passkey again
     Then Desk re-enters the same passkey account
+    And Desk's refresh hands it a Home credential the account service names as that account

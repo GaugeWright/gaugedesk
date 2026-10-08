@@ -111,6 +111,19 @@ export function opaqueHomeRouteKey(route: OpaqueHomeRoute): string {
     return `${route.homeId}\n${route.endpoint}\n${relay}`;
 }
 
+/**
+ * Which Home a route reaches, as the route itself shows it: the Home's address,
+ * or for a Home reached only through its relay, the certificate its locator
+ * pins. A Home's id alone does not say which Home it is — every desktop's is
+ * `home:local-user` today (WS-1024) — so a project someone else shared, on
+ * their desktop, would otherwise share a connection with the person's own
+ * desktop and tear it down on every switch. A locator that rotates keeps its
+ * Home's certificate, and so its key.
+ */
+export function homeConnectionKey(route: OpaqueHomeRoute): string {
+    return `${route.homeId}\n${route.endpoint || `relay\n${route.relay?.homeFingerprint ?? ""}`}`;
+}
+
 export function parseOpaqueHomeRoutes(
     raw: unknown,
     provenance: RouteProvenance = "unsigned",

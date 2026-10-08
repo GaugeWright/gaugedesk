@@ -5,6 +5,7 @@ import {
     pinSharedProject,
     sharedProjectPins,
     sharedProjectRoutes,
+    withSharedProjects,
     withSharedRoutes,
     type SharedProjectPin,
     type SharedRouteWire,
@@ -148,5 +149,72 @@ describe("a browser holding no shared project", () => {
         expect(holdsSharedProjects({ storage })).toBe(false);
         await pinSharedProject({ subject: "invitee", storage, placementVerified }, pin());
         expect(holdsSharedProjects({ storage })).toBe(true);
+    });
+});
+
+describe("a member's workspace lists the projects shared with them (DR-0451, DR-0455)", () => {
+    const empty = {
+        archetypes: [], projects: [], recent: [], workstreams: [], workTargets: [],
+        personalPlacement: null, homeOrganization: null,
+    };
+    const project = (id: string, placement: string, target: string, isPersonal = false) => ({
+        id, homeId: "home:local-user", name: id, isPersonal, organization: null, networkIsolated: false,
+        targets: [{ id: target }], placements: [{ placementId: placement, targetIds: [target], chats: [] }],
+    });
+    const own = {
+        ...empty,
+        projects: [project("proj-mine", "pl-mine", "t-mine")],
+        workTargets: [{ id: "t-mine" }],
+        personalPlacement: "pl-personal",
+    } as never;
+    const ownersHome = {
+        ...empty,
+        projects: [project("proj-shared", "pl-shared", "t-shared"), project("proj-owners", "pl-owners", "t-owners")],
+        archetypes: [
+            { id: "agent-shared", sharedThrough: ["proj-shared"] },
+            { id: "agent-owners", sharedThrough: [] },
+        ],
+        recent: [
+            { id: "chat-shared", placement: "pl-shared" },
+            { id: "chat-owners", placement: "pl-owners" },
+        ],
+        workstreams: [
+            { id: "ws-shared", projectId: "proj-shared", placementId: "pl-shared" },
+            { id: "ws-owners", projectId: "proj-owners", placementId: "pl-owners" },
+        ],
+        workTargets: [{ id: "t-shared" }, { id: "t-owners" }],
+        personalPlacement: "pl-owners-personal",
+    } as never;
+
+    it("adds the pinned project from its Home, and nothing else that Home shows", () => {
+        const listed = withSharedProjects(own, [{ project: "proj-shared" as ProjectId, workspace: ownersHome }]);
+        expect(listed.projects.map((p) => p.id)).toEqual(["proj-mine", "proj-shared"]);
+        expect(listed.archetypes.map((a) => a.id)).toEqual(["agent-shared"]);
+        expect(listed.recent.map((c) => c.id)).toEqual(["chat-shared"]);
+        expect(listed.workstreams.map((w) => w.id)).toEqual(["ws-shared"]);
+        expect(listed.workTargets.map((t) => t.id)).toEqual(["t-mine", "t-shared"]);
+        // The person's own quick-start stays their own Home's.
+        expect(listed.personalPlacement).toBe("pl-personal");
+    });
+
+    it("lists it for a person with no Home of their own", () => {
+        const listed = withSharedProjects(empty as never, [{ project: "proj-shared" as ProjectId, workspace: ownersHome }]);
+        expect(listed.projects.map((p) => p.id)).toEqual(["proj-shared"]);
+    });
+
+    it("keeps a project the person's own Home already lists as that Home lists it", () => {
+        const mine = { ...empty, projects: [{ ...project("proj-shared", "pl-shared", "t-shared"), name: "as listed here" }] } as never;
+        const listed = withSharedProjects(mine, [{ project: "proj-shared" as ProjectId, workspace: ownersHome }]);
+        expect(listed.projects).toHaveLength(1);
+        expect(listed.projects[0]?.name).toBe("as listed here");
+    });
+
+    it("never takes a Personal project, or one the Home did not list, from another Home", () => {
+        const personal = { ...empty, projects: [project("proj-default", "pl-default", "t-default", true)] } as never;
+        const listed = withSharedProjects(own, [
+            { project: "proj-default" as ProjectId, workspace: personal },
+            { project: "proj-gone" as ProjectId, workspace: ownersHome },
+        ]);
+        expect(listed.projects.map((p) => p.id)).toEqual(["proj-mine"]);
     });
 });

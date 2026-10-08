@@ -3,8 +3,9 @@
  * (DESK-3, [ADR 0130](../../../../specs/decisions/0130-browser-thin-client-tunnels-the-relay-fabric-in-wasm.md)).
  *
  * Work is organized by project, never by Home: a client resolves a project to
- * its opaque route, opens or reuses a connection keyed by the exact Home, admits
- * the person there, and verifies the responding Home is the one the route named.
+ * its opaque route, opens or reuses a connection keyed by the exact Home the
+ * route reaches (`homeConnectionKey`, never its id alone), admits the person
+ * there, and verifies the responding Home is the one the route named.
  * Several Homes are live at once and **there is no selected Home** — one Home
  * failing degrades only its own projects.
  *
@@ -22,7 +23,7 @@
 import { browserRouteJson } from "./browser-route-json";
 import type { RouteJson } from "./control-plane-transport";
 import type { HomeId, ProjectId } from "./control-plane-domain";
-import { opaqueHomeRouteKey, type OpaqueHomeRoute } from "./home-routing";
+import { homeConnectionKey, opaqueHomeRouteKey, type OpaqueHomeRoute } from "./home-routing";
 
 /** Why a Home is not currently serving. Each is distinct and said plainly; none
  * is collapsed into a generic failure, and none implies a retry that cannot
@@ -49,6 +50,8 @@ export interface HomeConnection<Api> {
 
 interface MutableHomeConnection<Api> {
     readonly homeId: HomeId;
+    /** The Home this reaches, as its route shows it (`homeConnectionKey`). */
+    readonly key: string;
     readonly endpoint: string;
     readonly route: OpaqueHomeRoute;
     readonly routeKey: string;
@@ -98,7 +101,9 @@ export interface HomePoolOptions<Api> {
      * pinned tunnel and returns device loopback; the default takes the route's
      * own endpoint. */
     readonly resolveEndpoint?: (route: OpaqueHomeRoute) => Promise<string>;
-    readonly closeRoute?: (homeId: HomeId) => Promise<void>;
+    /** A Home's connection is done with. `key` is its `homeConnectionKey`,
+     * which tells apart two Homes that carry one id (WS-1024). */
+    readonly closeRoute?: (homeId: HomeId, key: string) => Promise<void>;
     /** Re-read the account's routes. A rotation invalidates outstanding locators
      * the moment it lands at the relay, so a client refused for a stale epoch
      * re-reads once and retries rather than reporting the Home unreachable
@@ -153,8 +158,9 @@ export function refusalState(status: number, detail: string): HomeConnectionStat
 
 export class HomePool<Api> {
     private routes = new Map<ProjectId, OpaqueHomeRoute>();
-    private readonly connections = new Map<HomeId, MutableHomeConnection<Api>>();
-    private readonly pending = new Map<HomeId, Promise<MutableHomeConnection<Api>>>();
+    /** By `homeConnectionKey`: the Home a route reaches, not the id it claims. */
+    private readonly connections = new Map<string, MutableHomeConnection<Api>>();
+    private readonly pending = new Map<string, Promise<MutableHomeConnection<Api>>>();
     private epoch = 0;
     private readonly maxConnections: number;
     private readonly idleMs: number;
@@ -214,13 +220,11 @@ export class HomePool<Api> {
         }
         this.routes = next;
 
-        for (const [homeId, connection] of this.connections) {
+        for (const [key, connection] of this.connections) {
             const stillRouted = routes.some(
-                (route) =>
-                    route.homeId === homeId
-                    && opaqueHomeRouteKey(route) === connection.routeKey,
+                (route) => opaqueHomeRouteKey(route) === connection.routeKey,
             );
-            if (!stillRouted) void this.disconnect(homeId);
+            if (!stillRouted) void this.disconnect(key);
         }
     }
 
@@ -251,9 +255,15 @@ export class HomePool<Api> {
      * account-scoped work on a Home with no endpoint — and because it lands in
      * the same pool entry, that work and the project work on that Home share one
      * tunnel and one admission (§4).
+     *
+     * An id can name more than one Home (WS-1024), so a caller that holds
+     * routes to someone else's Home says which routes may answer for it.
      */
-    async connectHome(homeId: HomeId): Promise<HomeConnection<Api>> {
-        const route = [...this.routes.values()].find((entry) => entry.homeId === homeId);
+    async connectHome(
+        homeId: HomeId,
+        eligible: (route: OpaqueHomeRoute) => boolean = () => true,
+    ): Promise<HomeConnection<Api>> {
+        const route = [...this.routes.values()].find((entry) => entry.homeId === homeId && eligible(entry));
         // Distinct from a Home that refused, and it resolves differently: the
         // Home has to publish before anything can reach it (§5).
         if (!route) throw new UnroutedHomeError(`no granted route reaches Home ${homeId}`);
@@ -282,33 +292,34 @@ export class HomePool<Api> {
 
     private async attemptProject(project: ProjectId): Promise<HomeConnection<Api>> {
         const route = this.routeFor(project);
-        const existing = this.connections.get(route.homeId);
+        const key = homeConnectionKey(route);
+        const existing = this.connections.get(key);
         if (existing) {
             if (existing.routeKey !== opaqueHomeRouteKey(route)) {
-                await this.disconnect(route.homeId);
+                await this.disconnect(key);
             } else if (existing.state === "live") {
                 existing.lastUsedAt = this.now();
                 return this.publicConnection(existing);
             } else {
-                await this.disconnect(route.homeId);
+                await this.disconnect(key);
             }
         }
 
-        let pending = this.pending.get(route.homeId);
+        let pending = this.pending.get(key);
         if (!pending) {
             pending = this.admit(route);
-            this.pending.set(route.homeId, pending);
+            this.pending.set(key, pending);
         }
         try {
             return this.publicConnection(await pending);
         } finally {
-            this.pending.delete(route.homeId);
+            this.pending.delete(key);
         }
     }
 
     mark(project: ProjectId, state: HomeConnectionState): void {
         const route = this.routeFor(project);
-        const connection = this.connections.get(route.homeId);
+        const connection = this.connections.get(homeConnectionKey(route));
         if (!connection) return;
         connection.state = state;
         connection.lastUsedAt = this.now();
@@ -321,16 +332,17 @@ export class HomePool<Api> {
     async invalidateProject(project: ProjectId): Promise<boolean> {
         const route = this.routes.get(project);
         if (!route) return false;
-        await this.disconnect(route.homeId);
-        this.pending.delete(route.homeId);
+        const key = homeConnectionKey(route);
+        await this.disconnect(key);
+        this.pending.delete(key);
         return true;
     }
 
     async evictIdle(now = this.now()): Promise<void> {
         const stale = [...this.connections.values()]
             .filter((connection) => now - connection.lastUsedAt >= this.idleMs)
-            .map((connection) => connection.homeId);
-        await Promise.all(stale.map((homeId) => this.disconnect(homeId)));
+            .map((connection) => connection.key);
+        await Promise.all(stale.map((key) => this.disconnect(key)));
     }
 
     async closeAll(): Promise<void> {
@@ -338,7 +350,7 @@ export class HomePool<Api> {
         // discarded for another selected account.
         this.epoch++;
         await Promise.all(
-            [...this.connections.keys()].map((homeId) => this.disconnect(homeId)),
+            [...this.connections.keys()].map((key) => this.disconnect(key)),
         );
         this.pending.clear();
     }
@@ -406,6 +418,7 @@ export class HomePool<Api> {
         });
         connection = {
             homeId: route.homeId,
+            key: homeConnectionKey(route),
             endpoint,
             route,
             routeKey,
@@ -415,7 +428,7 @@ export class HomePool<Api> {
             state: "live",
             lastUsedAt: this.now(),
         };
-        this.connections.set(route.homeId, connection);
+        this.connections.set(connection.key, connection);
         this.onStateChange(connection.homeId, "live");
         await this.enforceBound();
         return connection;
@@ -427,20 +440,20 @@ export class HomePool<Api> {
                 (left, right) => left.lastUsedAt - right.lastUsedAt,
             )[0];
             if (!oldest) return;
-            await this.disconnect(oldest.homeId);
+            await this.disconnect(oldest.key);
         }
     }
 
-    private async disconnect(homeId: HomeId): Promise<void> {
-        const connection = this.connections.get(homeId);
+    private async disconnect(key: string): Promise<void> {
+        const connection = this.connections.get(key);
         if (!connection) return;
-        this.connections.delete(homeId);
+        this.connections.delete(key);
         // Over the connection that holds the admission, not a fresh one. Asking
         // `routeJson` again would build a second transport — for a tunnel, a
         // whole second carrier and a second Home leg — to revoke a credential
         // the first one is already holding, and then leak it.
         await connection.json("DELETE", "/home/admissions").catch(() => undefined);
-        await this.closeRoute(homeId).catch(() => undefined);
+        await this.closeRoute(connection.homeId, key).catch(() => undefined);
     }
 
     private publicConnection(

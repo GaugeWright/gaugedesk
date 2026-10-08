@@ -5366,6 +5366,143 @@ pub async fn get_callback(
         .into_response()
 }
 
+/// What `GET /auth/refresh` does next for the session a request presents.
+enum BrowserRefresh {
+    /// Renew this session's provider grant at its provider (ADR 0147 §1).
+    ProviderGrant {
+        person: String,
+        session_id: String,
+        refresh_token: String,
+        session_method: Option<String>,
+        verifier: Option<Arc<dyn IdentityProvider + Send + Sync>>,
+    },
+    /// Answered without the provider: a refusal, a session ended at its bounds,
+    /// or a passkey session's own bearer (DR-0470).
+    Answered(axum::response::Response),
+}
+
+/// Judge `GET /auth/refresh` for the session `headers` present at `now_ms`:
+/// everything but the provider round trip and the deployment-mode check, so it
+/// is decided without the network or the environment.
+fn admit_refresh(wb: &SharedWorkbench, headers: &HeaderMap, now_ms: u64) -> BrowserRefresh {
+    let refused = |message: &'static str| {
+        BrowserRefresh::Answered((StatusCode::UNAUTHORIZED, message).into_response())
+    };
+    let bearer = crate::net_http::bearer(headers);
+    let g = wb.lock_unpoisoned();
+    let person = g.actor(bearer);
+    if person == "anonymous" {
+        return refused("authenticate to refresh");
+    }
+    // The opaque session token resolves to the session id that keys this session's
+    // own refresh grant (ADR 0147 §2). A non-anonymous person always carries a
+    // resolvable bearer here.
+    let Some(token) = bearer else {
+        return refused("authenticate to refresh");
+    };
+    let session_id = crate::account_session::session_id(token);
+    let grant = match admit_browser_refresh(&g, &person, &session_id, now_ms) {
+        Ok(grant) => grant,
+        Err(reason) if refresh_refusal_ends_session(reason) => {
+            // The session is over, so end it here, as this handler's contract
+            // says. Refusing the refresh alone left the cookie resolving: the
+            // person still counted as signed in, got no Home credential, and
+            // "Sign in" bounced them straight back (`login_ceremony_skippable`)
+            // — a loop whose only exit was finding Sign out.
+            drop(g);
+            return BrowserRefresh::Answered(end_browser_session(
+                wb,
+                token,
+                &person,
+                &session_id,
+                reason,
+            ));
+        }
+        Err(reason) => {
+            return BrowserRefresh::Answered(session_bearer_without_grant(
+                &g, headers, token, &person, reason,
+            ))
+        }
+    };
+    // Which provider minted this session, so the grant is refreshed at that
+    // provider's token endpoint (DR-0189).
+    let session_method = g.resolve_account_session(token).map(|(_, method)| method);
+    match g.unseal_account_secret(&grant.sealed) {
+        Some(refresh_token) => BrowserRefresh::ProviderGrant {
+            person,
+            session_id,
+            refresh_token,
+            session_method,
+            verifier: g.identity_provider(),
+        },
+        None => refused("no refresh token on file; sign in again"),
+    }
+}
+
+/// The answer for a live session that holds no provider grant (DR-0470,
+/// WS-1019).
+///
+/// A browser session the account's own door minted — by a passkey, or by a
+/// recovery code when the passkey is lost — has no provider to refresh at, so
+/// desk got no Home access credential and nothing it could present over a
+/// relay. Its own opaque session is that credential instead: the same
+/// in-memory bearer an OIDC session's refresh yields as a provider id-token,
+/// re-verified by the Hub on every request and ended by sign-out or
+/// revocation. Only for the session the request's `gw_session` cookie carries:
+/// a caller already holding a bearer gains nothing here, and any other session
+/// without a grant is refused as before. Interim until every credential handed
+/// to a browser is bound to its device (WS-1033). The token is never logged.
+fn session_bearer_without_grant(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    token: &str,
+    person: &str,
+    reason: &'static str,
+) -> axum::response::Response {
+    use crate::signin_log::{completed, refuse, Trace, REFRESH};
+    let method = wb.resolve_account_session(token).map(|(_, method)| method);
+    let trace = Trace::new().detail(refresh_method_detail(method.as_deref()));
+    if !method.as_deref().is_some_and(independent_account_method) {
+        return refuse(
+            REFRESH,
+            "no_refresh_grant",
+            &trace,
+            StatusCode::UNAUTHORIZED,
+            reason,
+        );
+    }
+    if crate::net_http::session_cookie(headers) != Some(token) {
+        return refuse(
+            REFRESH,
+            "not_the_browser_session",
+            &trace,
+            StatusCode::UNAUTHORIZED,
+            reason,
+        );
+    }
+    completed(REFRESH, "session_bearer_delivered", &trace);
+    (
+        StatusCode::OK,
+        Json(json!({ "refreshed": true, "person": person, "id_token": token })),
+    )
+        .into_response()
+}
+
+/// The sign-in method of a session without a provider grant, as a bounded
+/// label for its log line: never the method's own text, which names a
+/// connection or an organization.
+fn refresh_method_detail(method: Option<&str>) -> &'static str {
+    match method {
+        None => "unresolved",
+        Some("passkey") => "passkey",
+        Some("recovery") => "recovery",
+        Some(method) if method.starts_with("consumer-oidc:") => "consumer-oidc",
+        Some(method) if method.starts_with("enterprise-oidc:") => "enterprise-oidc",
+        Some(method) if method.starts_with("enterprise-saml:") => "enterprise-saml",
+        Some(_) => "other",
+    }
+}
+
 /// `GET /auth/refresh` (`ADR 0147` §1/§4): mint a fresh short-lived id-token from this
 /// session's stored refresh grant and return it in the **body** — the browser holds it
 /// in memory as its Home access credential. The opaque session **cookie is unchanged**;
@@ -5374,8 +5511,10 @@ pub async fn get_callback(
 /// authenticates to nobody once revoked/expired, so it cannot refresh itself). An
 /// elapsed absolute lifetime or idle timeout refuses refresh and ends the session on
 /// this surface (ADR 0147 §4, closes SOC 2 F-1.4 for the personal path). Web-account
-/// only. Authenticated by the opaque cookie alone — never an `Authorization` bearer —
-/// so the session id resolves from the session token, not an in-memory id-token.
+/// only. The session resolves from the presented session token — an `Authorization`
+/// bearer when one is sent, otherwise the cookie; desk sends only the cookie. A
+/// passkey or recovery session has no grant and is answered with its own session
+/// as the in-memory credential instead ([`session_bearer_without_grant`], DR-0470).
 pub async fn get_refresh(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
@@ -5383,48 +5522,18 @@ pub async fn get_refresh(
     if !web_account_mode() {
         return (StatusCode::NOT_FOUND, "not a web-account deployment").into_response();
     }
-    let bearer = crate::net_http::bearer(&headers).map(str::to_string);
     let now_ms = crate::account::session_now_ms();
-    let (person, session_id, refresh_token, session_method, verifier) = {
-        let g = wb.lock_unpoisoned();
-        let person = g.actor(bearer.as_deref());
-        if person == "anonymous" {
-            return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
-        }
-        // The opaque session token resolves to the session id that keys this session's
-        // own refresh grant (ADR 0147 §2). A non-anonymous person always carries a
-        // resolvable bearer here.
-        let Some(token) = bearer.as_deref() else {
-            return (StatusCode::UNAUTHORIZED, "authenticate to refresh").into_response();
+    let (person, session_id, refresh_token, session_method, verifier) =
+        match admit_refresh(&wb, &headers, now_ms) {
+            BrowserRefresh::ProviderGrant {
+                person,
+                session_id,
+                refresh_token,
+                session_method,
+                verifier,
+            } => (person, session_id, refresh_token, session_method, verifier),
+            BrowserRefresh::Answered(response) => return response,
         };
-        let session_id = crate::account_session::session_id(token);
-        let grant = match admit_browser_refresh(&g, &person, &session_id, now_ms) {
-            Ok(grant) => grant,
-            Err(reason) if refresh_refusal_ends_session(reason) => {
-                // The session is over, so end it here, as this handler's contract
-                // says. Refusing the refresh alone left the cookie resolving: the
-                // person still counted as signed in, got no Home credential, and
-                // "Sign in" bounced them straight back (`login_ceremony_skippable`)
-                // — a loop whose only exit was finding Sign out.
-                drop(g);
-                return end_browser_session(&wb, token, &person, &session_id, reason);
-            }
-            Err(reason) => return (StatusCode::UNAUTHORIZED, reason).into_response(),
-        };
-        // Which provider minted this session, so the grant is refreshed at that
-        // provider's token endpoint (DR-0189).
-        let method = g.resolve_account_session(token).map(|(_, method)| method);
-        match g.unseal_account_secret(&grant.sealed) {
-            Some(rt) => (person, session_id, rt, method, g.identity_provider()),
-            None => {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    "no refresh token on file; sign in again",
-                )
-                    .into_response()
-            }
-        }
-    };
     let Some((provider, sso)) = session_method
         .as_deref()
         .and_then(session_consumer_connection)
@@ -7718,6 +7827,223 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(g.account_sessions().resolve_now(&token).is_none());
         assert_ne!(g.actor(Some(&token)), person);
         assert!(resolve_refresh_grant(&g, person, &session_id).is_none());
+    }
+
+    /// A request carrying `token` as the browser's `gw_session` cookie, the
+    /// only credential desk sends to `/auth/refresh`.
+    fn session_cookie(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("gw_session={token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    fn refresh_answer(refresh: BrowserRefresh) -> axum::response::Response {
+        match refresh {
+            BrowserRefresh::Answered(response) => response,
+            BrowserRefresh::ProviderGrant { .. } => {
+                panic!("answered by a provider refresh, not here")
+            }
+        }
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn refusal_reason_of(response: &axum::response::Response) -> Option<&'static str> {
+        response
+            .extensions()
+            .get::<crate::signin_log::SigninRefusal>()
+            .map(|refusal| refusal.reason)
+    }
+
+    // WS-1019, DR-0470: a passkey sign-in in a browser sets only the session
+    // cookie and holds no provider grant, so desk had no Home credential and a
+    // relay-only Home answered "sign in to reach this Home".
+    #[tokio::test]
+    async fn a_passkey_browser_session_refreshes_to_itself_as_the_home_bearer() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        for (person, method) in [("passkey-person", "passkey"), ("recovered", "recovery")] {
+            let token = wb
+                .lock_unpoisoned()
+                .mint_account_session(person, method, 12 * 60 * 60)
+                .unwrap();
+            let now_ms = crate::account::session_now_ms();
+            let mut refresh = None;
+            let logged = crate::signin_log::capture::lines(|| {
+                refresh = Some(admit_refresh(&wb, &session_cookie(&token), now_ms));
+            });
+            let response = refresh_answer(refresh.unwrap());
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            let body = response_json(response).await;
+            assert_eq!(body["refreshed"], true);
+            assert_eq!(body["person"], person);
+            // The same field an OIDC refresh's id-token rides in, so desk holds
+            // it in memory as its bearer with no change of its own.
+            let bearer = body["id_token"].as_str().unwrap().to_owned();
+            assert_eq!(bearer, token);
+
+            // What a relay-only Home asks before it admits the caller.
+            let identity = crate::account_identity::identity_response(
+                &wb.lock_unpoisoned(),
+                Some(&bearer),
+                true,
+                None,
+            );
+            assert_eq!(identity.status(), StatusCode::OK);
+            let identity: crate::account_identity::AccountIdentity =
+                serde_json::from_value(response_json(identity).await).unwrap();
+            assert_eq!(identity.account, person);
+            assert_eq!(identity.session.unwrap().method, method);
+
+            assert!(
+                logged.contains("outcome=\"session_bearer_delivered\"")
+                    && logged.contains(&format!("detail=\"{method}\"")),
+                "{logged}"
+            );
+            assert!(!logged.contains(&token), "the bearer is never logged");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revoked_passkey_session_refreshes_to_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let token = wb
+            .lock_unpoisoned()
+            .mint_account_session("passkey-person", "passkey", 12 * 60 * 60)
+            .unwrap();
+        // Sign-out and device-page revocation both end here.
+        wb.lock_unpoisoned().revoke_account_session(&token);
+        let response = refresh_answer(admit_refresh(
+            &wb,
+            &session_cookie(&token),
+            crate::account::session_now_ms(),
+        ));
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(&token));
+        // And the Hub no longer names anyone for the bearer desk already held.
+        let identity = crate::account_identity::identity_response(
+            &wb.lock_unpoisoned(),
+            Some(&token),
+            true,
+            None,
+        );
+        assert_eq!(identity.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn a_refresh_without_a_session_cookie_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let response = refresh_answer(admit_refresh(
+            &wb,
+            &HeaderMap::new(),
+            crate::account::session_now_ms(),
+        ));
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn a_passkey_session_is_handed_back_only_to_its_own_cookie() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let token = wb
+            .lock_unpoisoned()
+            .mint_account_session("passkey-person", "passkey", 12 * 60 * 60)
+            .unwrap();
+        let mut presented = HeaderMap::new();
+        presented.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let response = refresh_answer(admit_refresh(
+            &wb,
+            &presented,
+            crate::account::session_now_ms(),
+        ));
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            refusal_reason_of(&response),
+            Some("not_the_browser_session")
+        );
+    }
+
+    #[test]
+    fn a_session_from_any_other_door_without_a_grant_is_still_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        for method in [
+            "consumer-oidc:consumer-google",
+            "enterprise-oidc:org",
+            "enterprise-saml:org",
+            "oidc",
+        ] {
+            let token = wb
+                .lock_unpoisoned()
+                .mint_account_session("someone", method, 12 * 60 * 60)
+                .unwrap();
+            let response = refresh_answer(admit_refresh(
+                &wb,
+                &session_cookie(&token),
+                crate::account::session_now_ms(),
+            ));
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+            assert_eq!(refusal_reason_of(&response), Some("no_refresh_grant"));
+        }
+    }
+
+    #[test]
+    fn an_oidc_session_still_refreshes_through_its_grant() {
+        use crate::account::{RefreshBinding, SESSION_ABSOLUTE_LIFETIME_MS};
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let person = "google-person";
+        let method = "consumer-oidc:consumer-google";
+        let token = wb
+            .lock_unpoisoned()
+            .mint_account_session(person, method, SESSION_ABSOLUTE_LIFETIME_MS / 1000)
+            .unwrap();
+        let session = crate::account_session::session_id(&token);
+        store_refresh_token(
+            &mut wb.lock_unpoisoned(),
+            person,
+            "rt-google",
+            RefreshBinding::Web,
+            &session,
+            "",
+        );
+        match admit_refresh(
+            &wb,
+            &session_cookie(&token),
+            crate::account::session_now_ms(),
+        ) {
+            BrowserRefresh::ProviderGrant {
+                person: refreshed,
+                session_id,
+                refresh_token,
+                session_method,
+                ..
+            } => {
+                assert_eq!(refreshed, person);
+                assert_eq!(session_id, session);
+                assert_eq!(refresh_token, "rt-google");
+                assert_eq!(session_method.as_deref(), Some(method));
+            }
+            BrowserRefresh::Answered(response) => {
+                panic!("answered {} instead of refreshing", response.status())
+            }
+        }
     }
 
     #[test]

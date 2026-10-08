@@ -287,3 +287,61 @@ describe("admit waits for the in-memory bearer to rehydrate after a reload", () 
         );
     });
 });
+
+describe("two Homes that carry one id (WS-1024)", () => {
+    /** The person's own desktop and someone else's, both `home:local-user`,
+     * each reached through its own relay locator. */
+    function twoDesktops() {
+        const locator = (fingerprint: string) => ({
+            endpoint: "wss://relay.example",
+            handle: fingerprint.slice(0, 1).toUpperCase().repeat(43),
+            proof: "A".repeat(43),
+            route_epoch: 1,
+            home_fingerprint: fingerprint,
+        });
+        const routes = parseOpaqueHomeRoutes({
+            routes: [
+                { project: "proj-mine", home_id: "home:local-user", endpoint: "", relay: locator("aa".repeat(32)) },
+                { project: "proj-shared", home_id: "home:local-user", endpoint: "", relay: locator("bb".repeat(32)) },
+            ],
+        }, "signed");
+        const admitted: string[] = [];
+        const closed: string[] = [];
+        const instance = new HomePool<{ fingerprint: string }>(routes, () => "token", {
+            client: (context) => ({ fingerprint: context.route.relay?.homeFingerprint ?? "" }),
+            routeJson: ((_endpoint: string, _auth: unknown, route: { relay?: { homeFingerprint: string } }) =>
+                async (method: string) => {
+                    if (method === "POST") admitted.push(route.relay?.homeFingerprint ?? "");
+                    return method === "POST" ? { home: "home:local-user", admission: "token" } : {};
+                }) as never,
+            closeRoute: async (_homeId, key) => { closed.push(key); },
+        });
+        return { instance, admitted, closed };
+    }
+
+    it("keeps a connection to each, so neither switch tears the other down", async () => {
+        const { instance, admitted, closed } = twoDesktops();
+        const mine = await instance.connectProject("proj-mine" as ProjectId);
+        const shared = await instance.connectProject("proj-shared" as ProjectId);
+        expect(mine.api.fingerprint).toBe("aa".repeat(32));
+        expect(shared.api.fingerprint).toBe("bb".repeat(32));
+        await instance.connectProject("proj-mine" as ProjectId);
+        await instance.connectProject("proj-shared" as ProjectId);
+        // One admission each, and nothing closed between switches. Keyed by
+        // id, every switch hung up the other desktop and admitted again.
+        expect(admitted).toEqual(["aa".repeat(32), "bb".repeat(32)]);
+        expect(closed).toEqual([]);
+        expect(instance.snapshot()).toHaveLength(2);
+    });
+
+    it("reaches a Home by id only through the routes the caller says may answer for it", async () => {
+        const { instance } = twoDesktops();
+        const own = await instance.connectHome(
+            "home:local-user" as never,
+            (route) => route.project !== "proj-shared",
+        );
+        expect(own.api.fingerprint).toBe("aa".repeat(32));
+        await expect(instance.connectHome("home:local-user" as never, () => false))
+            .rejects.toBeInstanceOf(UnroutedHomeError);
+    });
+});

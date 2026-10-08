@@ -768,7 +768,7 @@ function MobileAccountShell(props: {
         const next = current
             ? new MobileHomePool(current, () => props.token, {
                 resolveEndpoint: resolveMobileRouteEndpoint,
-                closeRoute: closeMobileRelayRoute,
+                closeRoute: (homeId) => closeMobileRelayRoute(homeId),
                 onStateChange: (homeId, state) => {
                     setHomeStates((current) => ({
                         ...current,

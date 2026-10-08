@@ -258,3 +258,34 @@ Then("Desk re-enters the same passkey account", async ({ page }) => {
     });
     expect(credentials.credentials).toHaveLength(1);
 });
+
+// WS-1019, DR-0470: a passkey sign-in sets only the session cookie and holds
+// no provider grant, so `/auth/refresh` gave Desk no Home credential and a
+// relay-only Home refused it with "sign in to reach this Home". Desk's refresh
+// now yields the session as that credential, and a Home admits a relayed
+// caller once the account service names the bearer's account. Both calls are
+// the ones Desk and a Home make; the bearer never leaves the page.
+Then("Desk's refresh hands it a Home credential the account service names as that account", async ({ page }) => {
+    const answered = await page.evaluate(async (base) => {
+        const refreshed = await fetch(`${base}/auth/refresh`, { credentials: "include" });
+        const body = await refreshed.json().catch(() => null) as { id_token?: unknown } | null;
+        const bearer = typeof body?.id_token === "string" ? body.id_token : "";
+        if (!bearer) return { refreshed: refreshed.status, held: false };
+        const identity = await fetch(`${base}/account/identity`, {
+            headers: { authorization: `Bearer ${bearer}` },
+        });
+        const named = await identity.json().catch(() => null) as { account?: unknown } | null;
+        return {
+            refreshed: refreshed.status,
+            held: true,
+            identity: identity.status,
+            account: named?.account ?? null,
+        };
+    }, passkeyCP);
+    expect(answered).toEqual({
+        refreshed: 200,
+        held: true,
+        identity: 200,
+        account: passkeyAccount,
+    });
+});

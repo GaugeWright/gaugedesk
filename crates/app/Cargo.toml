@@ -5,6 +5,15 @@ version.workspace = true
 license.workspace = true
 description = "gaugewright local control plane: the co-resident axum HTTP/WS server over the admission shell (Phase 0)."
 
+[package.metadata.native-tests]
+# The library's own tests, 2,255 of them and about 320 test-seconds, are the
+# one long run the native bar waits on: a change to this crate, or to code it
+# links, ends its critical path there. That run took 174 s of a 473 s change
+# to crates/core on the EliteMini at a load of 40 to 50 (WS-1015). Four stable
+# shares of it run as four actions (GaugeWright tools/buck/native_test.bzl),
+# and a failed test reruns only its share. No other binary here takes long.
+shards = { gaugedesk_app = 4 }
+
 [dependencies]
 gaugedesk-env = { path = "../env" }
 gaugedesk-core = { path = "../core" }

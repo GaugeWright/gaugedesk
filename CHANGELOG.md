@@ -19,6 +19,23 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Signed in to desk.gaugewright.com with a passkey, you can accept a project
+  invitation and reach a Home that answers only through the relay. Accepting
+  used to fail with "sign in to reach this Home", and every reload with such a
+  Home selected said "We couldn't load your Homes", because a passkey sign-in
+  left desk without the credential it presents to a Home. desk now holds your
+  session in memory as that credential, as it already held one for a Google or
+  Microsoft sign-in.
+
+- On desk.gaugewright.com, a project someone shared with you from their
+  desktop appears in your navigator beside your own projects, and opens there:
+  its chats, starting a chat and reading a transcript all reach their computer.
+  This works with no Home of your own, and accepting the invitation no longer
+  touches your account's Homes. Accepting used to stop at "POST /account/homes:
+  422 valid Home id and secure endpoint or relay required". Registering the
+  owner's computer instead replaced your own desktop in your account, because
+  every desktop carries the same Home id, and the project still never appeared.
+
 ## [0.8.10] — 2026-10-08
 
 - On desk.gaugewright.com, Account Settings and Trusted Devices open while desk

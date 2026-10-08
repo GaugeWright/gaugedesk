@@ -55,7 +55,9 @@ pub async fn get_account_identity(
     )
 }
 
-fn identity_response(
+/// The Hub's answer to `GET /account/identity` for `bearer`: what a Home asks
+/// before it admits a caller over the relay.
+pub(crate) fn identity_response(
     wb: &Workbench,
     bearer: Option<&str>,
     on_hub: bool,

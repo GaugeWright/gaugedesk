@@ -1442,7 +1442,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [chatInfo, { refetch: refetchChatInfo }] = createResource(
         () => (selected() ? ([selected()!, navTick()] as const) : false),
         async ([id]) => {
-        const readUnder = api.workProject;
+        const readUnder = api.workspaceProject;
         const ws = await api.getWorkspace();
         // Work chats live under a project's placement → lineage is archetype · project.
         for (const p of ws.projects) {

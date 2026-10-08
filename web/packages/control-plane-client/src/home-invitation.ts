@@ -40,6 +40,27 @@ export interface AcceptedHomeInvitation extends HomeInvitationPreview {
     readonly shared?: SharedProjectPin;
 }
 
+/** What a member's account records once an invitation is accepted: the Home
+ * it was accepted on, registered and selected, and the project's route — or
+ * nothing at all, for a project shared from someone else's Home.
+ *
+ * Such a project is reached through its pin, held to the project's key
+ * (DR-0451), and sharing it is not a choice of Home (DR-0455). Registering the
+ * owner's Home was refused with a 422 when it had no endpoint (WS-1022), and
+ * with its relay locator it replaced the member's own desktop, which carries
+ * the same id — every desktop's is `home:local-user` today (WS-1024) — and
+ * selected the owner's in its place. */
+export function acceptedHomeRecords(accepted: AcceptedHomeInvitation): {
+    readonly home: { readonly id: HomeId; readonly kind: "registered"; readonly endpoint: string };
+    readonly route: OpaqueHomeRoute;
+} | null {
+    if (accepted.shared) return null;
+    return {
+        home: { id: accepted.homeId, kind: "registered", endpoint: accepted.endpoint },
+        route: { project: accepted.project, homeId: accepted.homeId, endpoint: accepted.endpoint },
+    };
+}
+
 export interface CreatedHomeInvitation {
     readonly invite: string;
     readonly url: string;

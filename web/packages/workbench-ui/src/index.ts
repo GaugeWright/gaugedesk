@@ -23,7 +23,7 @@ export type { AccountEntryProps, AccountRecoveryActions, PasskeyAccountActions }
 export { gaugeAppMenuIdentity, summaryMenuIdentity } from "./gaugeapp-identity";
 export { createGaugeAppResource, refreshGaugeAppResources } from "./gaugeapp-resource";
 export { createGaugeAppOperations, gaugeAppContextChanged, type GaugeAppOperation } from "./gaugeapp-operations";
-export { createGaugeAppUpdateChannel, GAUGEAPP_UPDATE_INTERVAL_MS, GAUGEAPP_UPDATE_RETRY_MS } from "./gaugeapp-update-channel";
+export { createGaugeAppUpdateChannel, GAUGEAPP_UPDATE_INTERVAL_MS, GAUGEAPP_UPDATE_RETRY_MS, pagesMovedByUpdate } from "./gaugeapp-update-channel";
 export type { GaugeAppUpdateScheduler } from "./gaugeapp-update-channel";
 export type { AccountMenuItem, AccountMenuProps, MenuComposition, MenuIdentity } from "./AccountMenu";
 export { FirstRunOverlay } from "./FirstRunOverlay";

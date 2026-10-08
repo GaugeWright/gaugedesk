@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { GaugeAppSession, GaugeAppUpdateSnapshot } from "@gaugewright/control-plane-client";
-import { createGaugeAppUpdateChannel, type GaugeAppUpdateScheduler } from "./gaugeapp-update-channel";
+import { createGaugeAppUpdateChannel, pagesMovedByUpdate, type GaugeAppUpdateScheduler } from "./gaugeapp-update-channel";
 
 const session = (scope: string, cursor: string): GaugeAppSession => ({
     id: `session:${scope}`,
@@ -135,5 +135,29 @@ describe("GaugeApp update channel", () => {
 
         channel.stop();
         expect(onDelayedChange).toHaveBeenLastCalledWith(false);
+    });
+});
+
+describe("pagesMovedByUpdate (WS-1017)", () => {
+    const known = new Map([["account", "a1"], ["application-settings", "s1"]]);
+    const snapshot = (pages: Record<string, string>) => ({
+        cursor: "next",
+        invalidations: Object.entries(pages).map(([page_id, resource_basis]) => ({ page_id, resource_basis })),
+    });
+    it("names the pages whose basis moved", () => {
+        expect(pagesMovedByUpdate(known, snapshot({ account: "a2", "application-settings": "s1" })))
+            .toEqual(["account"]);
+    });
+    it("asks for admission when a page was added or removed", () => {
+        expect(pagesMovedByUpdate(known, snapshot({ account: "a1" }))).toBeNull();
+        expect(pagesMovedByUpdate(known, snapshot({ account: "a1", "application-settings": "s1", extra: "x" })))
+            .toBeNull();
+        expect(pagesMovedByUpdate(known, snapshot({ account: "a1", other: "s1" }))).toBeNull();
+    });
+    it("reads nothing when the cursor advanced with no page listed", () => {
+        expect(pagesMovedByUpdate(known, snapshot({}))).toEqual([]);
+    });
+    it("asks for admission when the grants moved but every basis held", () => {
+        expect(pagesMovedByUpdate(known, snapshot({ account: "a1", "application-settings": "s1" }))).toBeNull();
     });
 });

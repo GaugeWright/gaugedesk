@@ -6,6 +6,7 @@ import {
     setTunnelModuleLoader,
     type RawTunnelFacade,
 } from "@gaugewright/control-plane-client";
+import { MINE, OWNERS, releaseSharedMember, sharedMember } from "./shared-member.fixture";
 import { WorkbenchControlPlane } from "./workbench-control-plane";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -2173,5 +2174,69 @@ describe("a project is shared by the Home that holds it (DR-0455)", () => {
         await expect(api.createHomeInvitation({ email: "alex@example.test" }, "proj-direct" as never))
             .resolves.toMatchObject({ homeId: "home:d", endpoint: "https://d.example" });
         expect(asked).not.toContain("https://hub.example/account/homes");
+    });
+});
+
+describe("projects shared with a member, beside their own (DR-0451, DR-0455, WS-1034)", () => {
+    afterEach(releaseSharedMember);
+    const member = sharedMember;
+
+    it("lists the shared project beside the member's own, each read from its own desktop", async () => {
+        const { api, dialed, carried, hubWrites, projects } = member("selected");
+        // The member's own desktop serves them, as their account selected it.
+        await expect(api.bootstrapHome()).resolves.toMatchObject({
+            kind: "connected", home: { id: "home:local-user", kind: "registered" },
+        });
+        expect(carried[0]).toEqual({ home: MINE, call: "POST /home/admissions" });
+        expect(await projects()).toEqual(["proj-mine", "proj-shared"]);
+        // Each desktop dialed once, through its own locator.
+        expect([...dialed].sort()).toEqual([MINE, OWNERS]);
+        expect(carried).toContainEqual({ home: OWNERS, call: "GET /workspace" });
+        // Nothing about the owner's Home was written to the member's account,
+        // so their own desktop stays the Home it is.
+        expect(hubWrites).toEqual([]);
+    });
+
+    it("opens the shared project at the owner's desktop and keeps both projects listed", async () => {
+        const { api, dialed, carried, hubWrites, projects } = member("selected");
+        await projects();
+        // Starting a chat from its row reaches its Home whichever project is open.
+        await expect(api.createChatUnderPlacement("proj-shared" as ProjectId, "pl-shared" as never, "new chat", ["t" as never]))
+            .resolves.toBe("chat-shared");
+        api.setCurrentProject("proj-shared" as ProjectId);
+        await expect(api.getTranscript("chat-shared" as never)).resolves.toEqual([]);
+        expect(carried.filter((entry) => entry.call.includes("chat-shared") || entry.call.startsWith("POST /projects/")))
+            .toEqual([
+                { home: OWNERS, call: "POST /projects/proj-shared/placements/pl-shared/chats" },
+                { home: OWNERS, call: "GET /chats/chat-shared/transcript" },
+            ]);
+        // With it open, the workspace is still the member's own beside it, and
+        // a Personal chat that read lists stays on the member's own Home.
+        expect(api.workspaceProject).toBeNull();
+        expect(await projects()).toEqual(["proj-mine", "proj-shared"]);
+        api.setCurrentProject("proj-mine" as ProjectId);
+        expect(await projects()).toEqual(["proj-mine", "proj-shared"]);
+        // One admission at each desktop: neither switch hung the other up,
+        // which one key per Home id did.
+        expect([...dialed].sort()).toEqual([MINE, OWNERS]);
+        expect(carried.filter((entry) => entry.call === "POST /home/admissions").map((entry) => entry.home).sort())
+            .toEqual([MINE, OWNERS]);
+        expect(hubWrites).toEqual([]);
+    });
+
+    it("opens on the shared project for a member with no Home, never reaching their old desktop", async () => {
+        const { api, dialed, carried, hubWrites, projects } = member("signed out");
+        // Not "no reachable Home is selected": the workbench opens.
+        await expect(api.bootstrapHome()).resolves.toMatchObject({
+            kind: "connected", home: { id: "home:local-user", endpoint: "" },
+        });
+        expect(await projects()).toEqual(["proj-shared"]);
+        api.setCurrentProject("proj-shared" as ProjectId);
+        await expect(api.getTranscript("chat-shared" as never)).resolves.toEqual([]);
+        // Their own desktop's entry still names `home:local-user`, and it is
+        // never what answers for the owner's project.
+        expect(dialed).toEqual([OWNERS]);
+        expect(carried.every((entry) => entry.home === OWNERS)).toBe(true);
+        expect(hubWrites).toEqual([]);
     });
 });

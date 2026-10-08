@@ -50,6 +50,7 @@ import {
     type GaugeAppProposal,
     type GaugeAppScope,
     type GaugeAppSession,
+    type GaugeAppUpdateSnapshot,
 } from "@gaugewright/control-plane-client";
 import { ManagementChat } from "@gaugewright/workbench-web/ManagementChat";
 import { EnterpriseControlPlane } from "@gaugewright/enterprise-client";
@@ -62,6 +63,7 @@ import {
     createGaugeAppResource,
     createGaugeAppOperations,
     createGaugeAppUpdateChannel,
+    pagesMovedByUpdate,
     gaugeAppContextChanged,
     type GaugeAppOperation,
     createWorkbenchShellState,
@@ -3794,10 +3796,42 @@ export function createGaugeAppWorkspace(options: {
         } finally { request.finish(); }
     };
     const retry = () => { void refresh().catch(() => undefined); };
+    // The basis each page last had, from the admitted session's grants and then
+    // from every update applied without re-admitting.
+    let knownBases = new Map<string, string>();
+    createEffect(() => {
+        const admitted = visibleSession();
+        knownBases = new Map((admitted?.pages ?? []).map((page) => [page.id, page.resource_basis]));
+    });
+    // An update that moved only page contents re-reads the page in view, its
+    // proposals and its conversation, and keeps the session. Re-admitting on
+    // every update rebuilt every page on the Hub under its lock and refetched
+    // all of it again: on production on 2026-10-08 the first update after
+    // opening Account Settings held the page back to 12.5 s (WS-1017).
+    // Commands present the basis of the page they read, never the session's
+    // grant, so the grants' older bases are not presented anywhere.
+    const applyUpdate = async (snapshot: GaugeAppUpdateSnapshot) => {
+        const moved = options.active() ? pagesMovedByUpdate(knownBases, snapshot) : null;
+        if (!moved) {
+            await refresh();
+            return;
+        }
+        if (moved.length === 0) return;
+        const request = navigation.begin();
+        try {
+            await Promise.all([
+                moved.includes(selectedPage()) ? refetchPage() : undefined,
+                refetchProposals(),
+                refetchMessages(),
+            ]);
+            request.assertCurrent();
+            knownBases = new Map(snapshot.invalidations.map((page) => [page.page_id, page.resource_basis]));
+        } finally { request.finish(); }
+    };
     const updateChannel = createGaugeAppUpdateChannel({
         session: visibleSession,
         read: (admitted, after) => options.api.readGaugeAppUpdates(admitted, after),
-        apply: async () => { await refresh(); },
+        apply: async (_admitted, snapshot) => { await applyUpdate(snapshot); },
         recover: async (_admitted, error) => {
             if (!(error instanceof RouteHttpError) || (error.status !== 401 && error.status !== 403)) return;
             // Authorization epochs are server-owned. A refused update cursor is

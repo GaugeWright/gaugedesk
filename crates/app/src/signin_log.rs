@@ -58,6 +58,10 @@ pub(crate) const PASSKEY_REGISTER_START: &str = "/auth/account/passkey/register/
 pub(crate) const PASSKEY_REGISTER_FINISH: &str = "/auth/account/passkey/register/finish";
 pub(crate) const PASSKEY_LOGIN_START: &str = "/auth/account/passkey/login/start";
 pub(crate) const PASSKEY_LOGIN_FINISH: &str = "/auth/account/passkey/login/finish";
+/// Logged only where a browser session holds no provider grant to refresh
+/// (DR-0470): every signed-out page load asks here, so the step's ordinary
+/// refusals are not, and it is not one of [`HUB_STEPS`].
+pub(crate) const REFRESH: &str = "/auth/refresh";
 pub(crate) const DESKTOP_START: &str = "/account/hub-session/start";
 pub(crate) const DESKTOP_CALLBACK: &str = "/account/hub-session/callback";
 

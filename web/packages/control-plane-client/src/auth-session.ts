@@ -19,10 +19,11 @@
  * a display label, never trusted.
  *
  * Residual (not closed here): a live XSS *in the running page* can still read the
- * in-memory signal — inherent to a header-bearer SPA. The further hardening is a
- * server-set `HttpOnly` cookie session so the token never lives in JS at all (tracked as
- * the `ENTSEC-6` follow-on; it needs credentialed CORS + CSRF for the cross-origin thin
- * client).
+ * in-memory signal and present it from anywhere until it lapses or its session ends or
+ * is revoked — inherent to a header-bearer SPA. The decided hardening is to bind every
+ * credential to this device: a non-extractable WebCrypto key, a credential bound to its
+ * thumbprint, and a fresh signed proof on every request (gaugedesk-src DR-0470 §1,
+ * WS-1033), which closes the `ENTSEC-6` residual.
  *
  * The pure helpers ({@link parseCallbackFragment}, {@link decodeSubject}) take explicit
  * inputs so they unit-test without a real `window`.
@@ -797,13 +798,15 @@ export async function refreshMobileAccountToken(
 
 /** Proactively refresh one hosted account session (ADR 0147 §1). The opaque session
  * **cookie** is the durable, revocable session and stays unreadable to JavaScript;
- * `GET /auth/refresh` authenticates by that cookie and returns a fresh, short-lived
- * **id-token in its body**. That id-token — never the session cookie — is the access
- * credential the browser presents to project Homes (`Authorization: Bearer`), so we
- * hold it in the in-memory {@link bearer} signal (never at rest, `ENTSEC-6`). This is
- * also the reload-rehydration path: after a reload the in-memory id-token is gone but
- * the opaque cookie survives, so one refresh re-obtains the Home credential. Callers
- * receive only whether the server admitted the refresh; the token stays in memory. */
+ * `GET /auth/refresh` authenticates by that cookie and returns the access credential
+ * the browser presents to project Homes (`Authorization: Bearer`) in its body's
+ * `id_token`: a fresh, short-lived provider id-token for a provider session, or, for a
+ * passkey or recovery session, which holds no provider grant, that session itself
+ * (DR-0470 §2). Either way we hold it in the in-memory {@link bearer} signal (never at
+ * rest, `ENTSEC-6`). This is also the reload-rehydration path: after a reload the
+ * in-memory credential is gone but the opaque cookie survives, so one refresh
+ * re-obtains it. Callers receive only whether the server admitted the refresh; the
+ * token stays in memory. */
 export async function refreshHostedAccountSession(
     controlPlaneBase: string,
 ): Promise<boolean> {

@@ -54,6 +54,7 @@ import type {
 } from "@gaugewright/control-plane-client";
 import {
     browserTunnelSocket,
+    homeConnectionKey,
     HomePool,
     openEventTunnel,
     openTunnel,
@@ -145,6 +146,31 @@ export interface SoftwareUpdatePolicy {
 }
 
 class NoSelectedHomeError extends Error {}
+
+interface SharedWorkspaces {
+    readonly read: readonly accountClient.SharedProjectWorkspace[];
+    readonly failures: readonly unknown[];
+}
+
+/** The shared projects to list, or — when the person has no Home of their own
+ * and no shared project's Home answered — that Home's failure, so the
+ * navigator says it could not load rather than that there is nothing. */
+function sharedOrFailure(own: unknown, shared: SharedWorkspaces): readonly accountClient.SharedProjectWorkspace[] {
+    if (own === null && shared.read.length === 0 && shared.failures.length > 0) throw shared.failures[0];
+    return shared.read;
+}
+
+/** What a person with no Home of their own lists before the projects others
+ * shared with them are added (DR-0451). */
+const NO_WORKSPACE: Workspace = {
+    archetypes: [],
+    projects: [],
+    recent: [],
+    workstreams: [],
+    workTargets: [],
+    personalPlacement: null,
+    homeOrganization: null,
+};
 
 /** Whether this client reaches its control plane on this computer's loopback. */
 function isLoopbackBase(base: string): boolean {
@@ -270,6 +296,11 @@ export class WorkbenchControlPlane implements ControlPlane {
     private currentProject: ProjectId | null = null;
     /** Who shared-project pins are kept for, resolved once per credential. */
     private sharedSubject: { generation: number; subject: Promise<string> } | null = null;
+    /** The projects someone else shared with this person, as the newest route
+     * read found them pinned (DR-0451). Each is reached through its pin and
+     * never stands for the person's own Home, which may carry the same Home id
+     * (WS-1024). */
+    private sharedProjects: ReadonlySet<ProjectId> = new Set();
     private readonly restartWorkStreams = new Set<() => void>();
     /** Every event stream this control plane opens, Home or local (WS-581). */
     private readonly streamGate = new EventStreamGate();
@@ -393,6 +424,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.nextRouteRead = null;
         this.poolRoutesSeq = 0;
         this.unroutedProjects.clear();
+        this.sharedProjects = new Set();
         return pool;
     }
 
@@ -559,7 +591,11 @@ export class WorkbenchControlPlane implements ControlPlane {
      */
     private async homeRoutes(): Promise<OpaqueHomeRoute[]> {
         if (this.nativeRemote) return (await accountClient.hubSessionReach(this.route)).routes;
+        const generation = this.credentialGeneration;
         const [own, shared] = await Promise.all([this.ownHomeRoutes(), this.sharedRoutes()]);
+        if (generation === this.credentialGeneration) {
+            this.sharedProjects = new Set(shared.map((route) => route.project));
+        }
         return accountClient.withSharedRoutes(own, shared);
     }
 
@@ -702,10 +738,14 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.nativeShell || !this.splitHomes;
     }
 
-    /** The project the work in hand is routed by, or null for the selected
-     * Home: whichever Home answers a read made now. */
-    get workProject(): ProjectId | null {
-        return this.currentProject;
+    /** The project a workspace read made now is routed by, or null for the
+     * selected Home. A project someone shared is served by its own Home, but the
+     * workspace a person sees is never that Home's: it is their own, with every
+     * shared project beside it (DR-0455). So while one is open, a workspace read
+     * goes to the selected Home, and a Personal chat it lists is that Home's. */
+    get workspaceProject(): ProjectId | null {
+        const project = this.currentProject;
+        return project && this.sharedProjects.has(project) ? null : project;
     }
 
     /** Open a project, so subsequent work resolves to *its* Home. Passing null
@@ -918,14 +958,19 @@ export class WorkbenchControlPlane implements ControlPlane {
         // being forgotten: the Home stays spliced to a client that has gone and
         // never re-parks, so the *next* attempt to reach it waits for a splice
         // that cannot happen. The pool tells us when a Home is done with.
-        const tunnels = new Map<HomeId, TunnelRoute>();
+        //
+        // Keyed as the pool keys its connections (`homeConnectionKey`), never
+        // by Home id: a project shared from someone else's desktop carries the
+        // same id as the person's own desktop (WS-1024), and one id would hang
+        // up the other Home's carrier.
+        const tunnels = new Map<string, TunnelRoute>();
         // Each relay-only Home's event streams, each holding a crossing of its
         // own. Closing the route ends them as closed rather than as abandoned,
         // so a subscriber resolves its Home again instead of going quiet.
-        const streams = new Map<HomeId, TunnelEventStream>();
+        const streams = new Map<string, TunnelEventStream>();
         // And its raw requests — files, config — on a carrier of their own, so a
         // large file never holds the calls behind it (WS-678).
-        const raws = new Map<HomeId, TunnelRouteRequest>();
+        const raws = new Map<string, TunnelRouteRequest>();
         this.pool = new HomePool<workbenchClient.WorkbenchTransport>(
             routes,
             () => this.nativeRemote ? "selected desktop session" : this.bearer,
@@ -958,17 +1003,18 @@ export class WorkbenchControlPlane implements ControlPlane {
                     // Home that already has one. Hang the old one up here rather
                     // than waiting for a `closeRoute` that will name only the
                     // survivor.
-                    tunnels.get(route.homeId)?.close();
-                    tunnels.set(route.homeId, carried);
+                    const key = homeConnectionKey(route);
+                    tunnels.get(key)?.close();
+                    tunnels.set(key, carried);
                     return carried;
                 },
-                closeRoute: async (homeId) => {
-                    tunnels.get(homeId)?.close();
-                    tunnels.delete(homeId);
-                    streams.get(homeId)?.closeAll();
-                    streams.delete(homeId);
-                    raws.get(homeId)?.close();
-                    raws.delete(homeId);
+                closeRoute: async (_homeId, key) => {
+                    tunnels.get(key)?.close();
+                    tunnels.delete(key);
+                    streams.get(key)?.closeAll();
+                    streams.delete(key);
+                    raws.get(key)?.close();
+                    raws.delete(key);
                 },
                 client: (context) => {
                     if (this.nativeRemote) {
@@ -1008,8 +1054,9 @@ export class WorkbenchControlPlane implements ControlPlane {
                             bearer: context.bearer,
                             homeAdmission: context.homeAdmission,
                         });
-                        raws.get(context.route.homeId)?.close();
-                        raws.set(context.route.homeId, request);
+                        const key = homeConnectionKey(context.route);
+                        raws.get(key)?.close();
+                        raws.set(key, request);
                         const events = tunnelRouteEventStream({
                             open: async (path, headers) => {
                                 const { tunnel, handshake } = await openEventTunnel(relay, path, headers);
@@ -1018,8 +1065,8 @@ export class WorkbenchControlPlane implements ControlPlane {
                             bearer: context.bearer,
                             homeAdmission: context.homeAdmission,
                         });
-                        streams.get(context.route.homeId)?.closeAll();
-                        streams.set(context.route.homeId, events);
+                        streams.get(key)?.closeAll();
+                        streams.set(key, events);
                         return { base: "", json: context.routeJson, request, events: this.streamGate.wrap(events) };
                     }
                     return {
@@ -1093,7 +1140,10 @@ export class WorkbenchControlPlane implements ControlPlane {
         // proves nothing (ADR 0131 §3).
         if (!selected.endpoint) {
             const pool = await this.homePool();
-            return (await pool.connectHome(selected.id)).api;
+            // A project someone shared from their desktop names a Home with the
+            // same id as the person's own desktop (WS-1024). Its route reaches
+            // their Home, never this one.
+            return (await pool.connectHome(selected.id, (route) => !this.sharedProjects.has(route.project))).api;
         }
         // A project switch must reuse this admission. The task bar reads
         // several projects, and opening a second admission revokes the first.
@@ -1168,8 +1218,24 @@ export class WorkbenchControlPlane implements ControlPlane {
                 }
                 throw error;
             }
+            // Someone with no Home serving them may still work in the projects
+            // others shared with them. Each is reached through its pin, never
+            // through a Home of theirs (DR-0451, DR-0455), so the workbench
+            // opens on those rather than on "no reachable Home is selected".
+            const shared = await this.sharedProjectHome().catch(() => null);
+            if (shared) return shared;
             return this.noHomeServing();
         }
+    }
+
+    /** The Home of the first project shared with this person, as its pin
+     * routes to it, or null when nothing is shared with them. Never written to
+     * the account: it is what this browser reaches, not a Home they have. */
+    private async sharedProjectHome(): Promise<HomeBootstrapState | null> {
+        const [project] = await this.sharedWorkspaceProjects();
+        if (!project) return null;
+        const route = (await this.homePool()).routeFor(project);
+        return { kind: "connected", home: { id: route.homeId, kind: "registered", endpoint: route.endpoint } };
     }
 
     private async noHomeServing(): Promise<HomeBootstrapState & { kind: "none" }> {
@@ -1385,6 +1451,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             kind: "registered",
             endpoint: accepted.endpoint,
         };
+        const records = accountClient.acceptedHomeRecords(accepted);
         // A project on a Home reached only through its relay: pin its key and
         // route here before anything resolves routes, so the pool reaches it
         // over the relay like the person's own relay-only Homes (DR-0370).
@@ -1399,14 +1466,12 @@ export class WorkbenchControlPlane implements ControlPlane {
                     console.warn("this computer could not vouch for the shared project's key", error));
             }
         }
-        await accountClient.accountRegisterHome(this.route, home, true);
-        await accountClient.accountPublishHomeRoute(this.route, {
-            project: accepted.project,
-            homeId: accepted.homeId,
-            endpoint: accepted.endpoint,
-        });
-        // Registering the Home selected it.
-        this.selectedHome = null;
+        if (records) {
+            await accountClient.accountRegisterHome(this.route, records.home, true);
+            await accountClient.accountPublishHomeRoute(this.route, records.route);
+            // Registering the Home selected it.
+            this.selectedHome = null;
+        }
         if (accepted.shared) {
             const pool = this.pool;
             if (pool) await this.routesReadSince(pool, this.routeReadsBegun);
@@ -1498,12 +1563,121 @@ export class WorkbenchControlPlane implements ControlPlane {
         return workbenchClient.listEngagements(this.workbenchTransport());
     }
 
+    /** The person's workspace, with every project shared with them beside
+     * their own (DR-0451, DR-0455). A browser that keeps no shared project
+     * reads exactly as it did, and begins its read at once: a project's route
+     * is judged by the reads begun after it was asked about (WS-891). */
     getWorkspace(): Promise<Workspace> {
-        return workbenchClient.getWorkspace(this.workbenchTransport());
+        if (!this.mayHoldSharedProjects()) return workbenchClient.getWorkspace(this.workbenchTransport());
+        return this.workspaceWithShared();
     }
 
     getWorkspaceCarriage(): Promise<ProjectionCarriage<Workspace>> {
-        return workbenchClient.getWorkspaceCarriage(this.workbenchTransport());
+        if (!this.mayHoldSharedProjects()) return workbenchClient.getWorkspaceCarriage(this.workbenchTransport());
+        return this.workspaceCarriageWithShared();
+    }
+
+    private async workspaceWithShared(): Promise<Workspace> {
+        const shared = await this.sharedWorkspaceProjects();
+        if (shared.length === 0) return workbenchClient.getWorkspace(this.workbenchTransport());
+        const [own, others] = await Promise.all([
+            this.ownWorkspace((transport) => workbenchClient.getWorkspace(transport)),
+            this.sharedWorkspaces(shared),
+        ]);
+        return accountClient.withSharedProjects(own ?? NO_WORKSPACE, sharedOrFailure(own, others));
+    }
+
+    private async workspaceCarriageWithShared(): Promise<ProjectionCarriage<Workspace>> {
+        const shared = await this.sharedWorkspaceProjects();
+        if (shared.length === 0) return workbenchClient.getWorkspaceCarriage(this.workbenchTransport());
+        const [own, others] = await Promise.all([
+            this.ownWorkspace((transport) => workbenchClient.getWorkspaceCarriage(transport)),
+            this.sharedWorkspaces(shared),
+        ]);
+        const value = accountClient.withSharedProjects(own?.value ?? NO_WORKSPACE, sharedOrFailure(own, others));
+        if (own) return { ...own, value };
+        // No Home of the person's own: what is listed is what the shared
+        // projects' Homes answered just now.
+        return { value, freshness: { marker: "live", generatedAt: Date.now(), repairHint: null }, clientRequestId: null };
+    }
+
+    /** Whether this browser keeps a shared project for anyone, which only a
+     * hosted client reaching Homes itself can (DR-0370). */
+    private mayHoldSharedProjects(): boolean {
+        return this.splitHomes && !this.nativeRemote && accountClient.holdsSharedProjects();
+    }
+
+    /** The projects shared with this person, once the routes have been read. */
+    private async sharedWorkspaceProjects(): Promise<ProjectId[]> {
+        if (!this.mayHoldSharedProjects()) return [];
+        await this.homePool().catch(() => undefined);
+        return [...this.sharedProjects];
+    }
+
+    /** The person's own workspace — the open project's Home's, or the selected
+     * Home's while a shared project is open — or null when no Home of theirs
+     * serves them, which leaves the projects shared with them. */
+    private async ownWorkspace<T>(
+        read: (transport: workbenchClient.WorkbenchTransport) => Promise<T>,
+    ): Promise<T | null> {
+        try {
+            if (this.workspaceProject === this.currentProject) return await read(this.workbenchTransport());
+            try {
+                return await read(await this.selectedHomeTransport());
+            } catch (error) {
+                if (!isExpiredHomeAdmission(error)) throw error;
+                this.selectedHome = null;
+                this.selectedDirectHome = null;
+                return await read(await this.selectedHomeTransport());
+            }
+        } catch (error) {
+            if (
+                error instanceof NoSelectedHomeError
+                || error instanceof UnroutedHomeError
+                || isUnprovisionedHomeError(error)
+            ) {
+                return null;
+            }
+            throw error;
+        }
+    }
+
+    /** Each shared project as its own Home lists it, read through the project's
+     * pinned route — never by its Home id, which another Home may also carry
+     * (WS-1024). A Home that does not answer leaves its project out of this
+     * read and the rest in. */
+    private async sharedWorkspaces(projects: readonly ProjectId[]): Promise<SharedWorkspaces> {
+        const settled = await Promise.allSettled(projects.map(async (project) => ({
+            project,
+            workspace: await this.onSharedProject(project, (transport) => workbenchClient.getWorkspace(transport)),
+        })));
+        const read: accountClient.SharedProjectWorkspace[] = [];
+        const failures: unknown[] = [];
+        for (const [index, outcome] of settled.entries()) {
+            if (outcome.status === "fulfilled") {
+                read.push(outcome.value);
+            } else {
+                failures.push(outcome.reason);
+                console.warn("[account] shared project %s unavailable: %s", projects[index], String(outcome.reason));
+            }
+        }
+        return { read, failures };
+    }
+
+    /** Work on a project someone shared, at its own Home, whichever project is
+     * open, with the expired-admission retry the rest of the work has. */
+    private async onSharedProject<T>(
+        project: ProjectId,
+        operation: (transport: workbenchClient.WorkbenchTransport) => Promise<T>,
+    ): Promise<T> {
+        try {
+            return await operation(await this.connectRoutedProject(project));
+        } catch (error) {
+            if (!isExpiredHomeAdmission(error)) throw error;
+            await this.pool?.invalidateProject(project);
+            if (this.currentProject === project) this.homeTransport = null;
+            return operation(await this.connectRoutedProject(project));
+        }
     }
 
     getWorkspaceDeltaCarriage(
@@ -2016,6 +2190,12 @@ export class WorkbenchControlPlane implements ControlPlane {
 
 
     createChatUnderPlacement(pid: ProjectId, placementId: PlacementId, title: string, targetIds: readonly WorkTargetId[]): Promise<EngagementId> {
+        // A chat started in a project someone shared is made at that project's
+        // Home, whichever project is open (DR-0455).
+        if (this.sharedProjects.has(pid)) {
+            return this.onSharedProject(pid, (transport) =>
+                workbenchClient.createChatUnderPlacement(transport, pid, placementId, title, targetIds));
+        }
         return workbenchClient.createChatUnderPlacement(this.workbenchTransport(), pid, placementId, title, targetIds);
     }
 

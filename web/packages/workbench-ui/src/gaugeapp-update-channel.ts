@@ -121,3 +121,26 @@ export function createGaugeAppUpdateChannel(options: {
         cursor: () => cursor,
     };
 }
+
+/** The pages an update moved, judged against the bases last seen for each
+ * page (the session's grants at admission, then each applied snapshot's).
+ *
+ * An update that moved only page contents lists the same pages, at least one
+ * at a new basis: re-reading those pages shows it, and the admitted session
+ * still stands (WS-1017). `null` means the update changed something only a
+ * fresh admission shows — a page added or removed, or the grants moved while
+ * every basis held (availability, commands) — so the caller re-admits. An
+ * empty list means the cursor advanced and nothing needs reading. */
+export function pagesMovedByUpdate(
+    known: ReadonlyMap<string, string>,
+    snapshot: GaugeAppUpdateSnapshot,
+): string[] | null {
+    // A cursor that advanced with nothing listed moved no page: the Hub's
+    // Account Settings re-checks its pages on a cheap fingerprint and says so
+    // when they held (WS-1018).
+    if (snapshot.invalidations.length === 0) return [];
+    const listed = new Map(snapshot.invalidations.map((page) => [page.page_id, page.resource_basis]));
+    if (listed.size !== known.size || [...known.keys()].some((id) => !listed.has(id))) return null;
+    const moved = [...listed].filter(([id, basis]) => known.get(id) !== basis).map(([id]) => id);
+    return moved.length > 0 ? moved : null;
+}

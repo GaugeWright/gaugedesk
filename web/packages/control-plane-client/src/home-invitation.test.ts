@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+    acceptedHomeRecords,
     acceptHomeInvitation,
     cancelHomeInvitation,
     createHomeInvitation,
@@ -208,6 +209,51 @@ describe("ordinary Home invitations", () => {
                 route: { relay: expect.objectContaining({ route_epoch: 4 }) },
             },
         });
+    });
+
+    // A shared project is reached through its pin (DR-0451) and sharing it is
+    // not a choice of Home (DR-0455). Registering the owner's Home was refused
+    // with a 422 when it had no endpoint (WS-1022), and with a relay locator it
+    // replaced the member's own desktop, which carries the same id (WS-1024).
+    it("records nothing in the member's account for a project shared from someone's desktop", () => {
+        const shared = {
+            project: "proj-1" as never,
+            homeId: "home:local-user" as never,
+            projectKey: "project-key",
+            route: { project: "proj-1", home_id: "home:local-user", endpoint: "", relay: LOCATOR, placement: PLACEMENT },
+        };
+        expect(acceptedHomeRecords({
+            authority: "",
+            project: "proj-1" as never,
+            homeId: "home:local-user" as never,
+            endpoint: "",
+            admission: "memory-only-admission",
+            shared,
+        })).toBeNull();
+        // Nor for a shared Home that also has an address.
+        expect(acceptedHomeRecords({
+            authority: "",
+            project: "proj-1" as never,
+            homeId: "home:owner" as never,
+            endpoint: "https://home.example",
+            admission: "memory-only-admission",
+            shared: { ...shared, homeId: "home:owner" as never },
+        })).toBeNull();
+    });
+
+    it("registers a Home answered directly, and its project's route, as before", () => {
+        const records = acceptedHomeRecords({
+            authority: "account:invitee",
+            project: "proj-1" as never,
+            homeId: "home:owner" as never,
+            endpoint: "https://home.example",
+            admission: "memory-only-admission",
+        });
+        expect(records).toEqual({
+            home: { id: "home:owner", kind: "registered", endpoint: "https://home.example" },
+            route: { project: "proj-1", homeId: "home:owner", endpoint: "https://home.example" },
+        });
+        expect(JSON.stringify(records)).not.toContain("memory-only-admission");
     });
 
     it("dials nothing for a relay-only invitation its project key did not sign", async () => {

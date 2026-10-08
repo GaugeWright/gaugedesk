@@ -102,7 +102,13 @@ When("I connect the native OpenAI credential", async ({ page }) => {
     const secret = page.getByLabel("API key", { exact: true });
     await secret.fill("native-e2e-provider-secret");
     await page.getByRole("button", { name: "Connect", exact: true }).click();
-    await expect(secret).toHaveValue("");
+    // Connect empties the key field at once and, once the account authority
+    // has taken the link, closes the form (AdministrationGaugeApp's
+    // submitConnection). An empty field is only the state between those two,
+    // and a check that reached it after the round trip found no field at all.
+    // The settled state is the form gone, with the key in it; the next step
+    // finds the linked row and no key anywhere on the page.
+    await expect(secret).toHaveCount(0);
 });
 
 Then("the native provider connection is loaded from account authority", async ({ page }) => {
