@@ -1,6 +1,6 @@
 //! Current-recipient discovery and reads of project-owned native trackers.
 use super::*;
-use gaugedesk_workspace::WorkflowProtection;
+use gaugedesk_workspace::{NativeWorkflowStorage, WorkflowProtection};
 use whipplescript_store::tracker_filing::{TrackerFiling, TrackerFilings};
 fn query_error(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
@@ -95,6 +95,18 @@ pub struct ProjectTrackerTasks {
     pub actor: String,
     #[serde(flatten)]
     pub backlog: ProjectTrackerBacklog,
+}
+
+impl ProjectTrackerTasks {
+    /// The caller's own open work in a backlog it may read.
+    pub fn of(context: &AuthenticatedActionContext, mut backlog: ProjectTrackerBacklog) -> Self {
+        let actor = context.actor().as_str().to_owned();
+        backlog.issues.retain(|issue| {
+            issue.assigned_to.as_deref() == Some(actor.as_str())
+                && matches!(issue.status.as_str(), "open" | "in_progress")
+        });
+        Self { actor, backlog }
+    }
 }
 
 fn visible(snapshot: &Snapshot, actor: &str) -> Result<Option<ReadableProjectTracker>, AdmitError> {
@@ -227,13 +239,10 @@ impl Workbench {
         project: &str,
         queue: &str,
     ) -> Result<ProjectTrackerTasks, String> {
-        let actor = context.actor().as_str().to_owned();
-        let mut backlog = self.read_project_tracker_backlog(context, project, queue)?;
-        backlog.issues.retain(|issue| {
-            issue.assigned_to.as_deref() == Some(actor.as_str())
-                && matches!(issue.status.as_str(), "open" | "in_progress")
-        });
-        Ok(ProjectTrackerTasks { actor, backlog })
+        Ok(ProjectTrackerTasks::of(
+            context,
+            self.read_project_tracker_backlog(context, project, queue)?,
+        ))
     }
 
     /// List only the project's readable tracker resources; no issue body is read.
@@ -289,10 +298,10 @@ impl Workbench {
         let prefix = format!("project::{project}::tracker::");
         let scopes = self
             .store_ref()
-            .scope_high_water_marks()
+            .scopes_with_prefix(&prefix)
             .map_err(query_error)?;
         let mut result = Vec::new();
-        for scope in scopes.keys() {
+        for scope in &scopes {
             let Some(encoded) = scope
                 .strip_prefix(&prefix)
                 .filter(|suffix| !suffix.contains("::"))
@@ -340,6 +349,21 @@ impl Workbench {
         project: &str,
         queue: &str,
     ) -> Result<ProjectTrackerBacklog, String> {
+        self.prepare_project_tracker_backlog(context, project, queue)?
+            .read()
+    }
+
+    /// Everything a backlog read needs from the Workbench: the caller's
+    /// current standing on the queue and the native store's custody. The
+    /// native read itself, which grows with the tracker's history, needs none
+    /// of it and runs from [`PreparedTrackerBacklog::read`] with the Workbench
+    /// lock released (WS-926).
+    pub fn prepare_project_tracker_backlog(
+        &self,
+        context: &AuthenticatedActionContext,
+        project: &str,
+        queue: &str,
+    ) -> Result<PreparedTrackerBacklog, String> {
         let (snapshot, basis) = capture(
             self.store_ref(),
             self.home_id(),
@@ -356,6 +380,7 @@ impl Workbench {
         tracker.can_complete &=
             crate::federation::require_project_writes_available(self.store_ref(), project).is_ok();
         let storage = self.workflow_storage(&tracker.workspace_id)?;
+        let confirm = self.store_ref().read_only_sibling().map_err(query_error)?;
         // Every project's automatic Home-owned `tasks` tracker is declared on
         // open, before any issue exists. Its uninitialized native store reads
         // empty without creating one. Other declared trackers still report
@@ -367,21 +392,79 @@ impl Workbench {
                 .map_err(query_error)?
                 .is_none()
         {
-            let mut writer = self.store_ref().sibling().map_err(query_error)?;
-            return writer
-                .with_dispatch_basis(&basis, || ProjectTrackerBacklog {
-                    tracker,
-                    issues: Vec::new(),
-                })
-                .map_err(query_error);
+            return Ok(PreparedTrackerBacklog {
+                tracker,
+                queue: queue.to_owned(),
+                basis,
+                confirm,
+                native: None,
+            });
         }
         let key = self.workflow_key(project, &tracker.workspace_id, false)?;
         let protection =
             WorkflowProtection::new(&tracker.workspace_id, key.clone()).map_err(query_error)?;
-        let mut writer = self.store_ref().sibling().map_err(query_error)?;
-        let issues = writer
-            .with_dispatch_basis(&basis, || {
-                key.retain(|| {
+        Ok(PreparedTrackerBacklog {
+            tracker,
+            queue: queue.to_owned(),
+            basis,
+            confirm,
+            native: Some((storage, key, protection)),
+        })
+    }
+}
+
+/// A test pauses a backlog read of one product store at its native read.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(crate) static NATIVE_READ_GATES: std::sync::Mutex<
+    BTreeMap<String, std::sync::Arc<dyn Fn() + Send + Sync>>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+/// A backlog read prepared under the Workbench lock, to be finished without
+/// it (see [`Workbench::prepare_project_tracker_backlog`]).
+pub struct PreparedTrackerBacklog {
+    tracker: ReadableProjectTracker,
+    queue: String,
+    basis: DispatchReadBasis,
+    /// A read-only connection to the product store, on which the standing
+    /// the read was prepared under is confirmed once it is done.
+    confirm: gaugedesk_store::Store,
+    native: Option<(
+        NativeWorkflowStorage,
+        std::sync::Arc<crate::content_vault::PreparedScopeKey>,
+        WorkflowProtection,
+    )>,
+}
+
+impl PreparedTrackerBacklog {
+    /// Read the queue's issues from its native store, then confirm the
+    /// caller's standing is unchanged since preparation; a change refuses
+    /// the read rather than answering it. The project key is retained for
+    /// the whole read, so the read cannot overlap the key's erasure.
+    pub fn read(self) -> Result<ProjectTrackerBacklog, String> {
+        let Self {
+            tracker,
+            queue,
+            basis,
+            confirm,
+            native,
+        } = self;
+        let queue = queue.as_str();
+        #[cfg(test)]
+        {
+            let gate = NATIVE_READ_GATES
+                .lock()
+                .unwrap()
+                .get(confirm.path())
+                .cloned();
+            if let Some(gate) = gate {
+                gate();
+            }
+        }
+        let issues = match native {
+            None => Vec::new(),
+            Some((storage, key, protection)) => key
+                .retain(|| {
                     let stores = storage
                         .open_existing_protected(&protection)
                         .map_err(|error| std::io::Error::other(query_error(error)))?;
@@ -436,8 +519,10 @@ impl Workbench {
                         })
                         .map_err(|error| std::io::Error::other(query_error(error)))
                 })
-            })
-            .map_err(query_error)?
+                .map_err(query_error)?,
+        };
+        confirm
+            .confirm_dispatch_basis(&basis)
             .map_err(query_error)?;
         Ok(ProjectTrackerBacklog { tracker, issues })
     }

@@ -563,8 +563,15 @@ pub struct ManagedUsageSummary {
 }
 
 pub fn fold_plan(store: &Store, scope: &str) -> Result<Option<ManagedInferencePlan>, AdmitError> {
+    fold_plan_rows(store.records(scope, MANAGED_PLAN_KIND)?)
+}
+
+/// [`fold_plan`] over records already read.
+pub(crate) fn fold_plan_rows(
+    rows: Vec<String>,
+) -> Result<Option<ManagedInferencePlan>, AdmitError> {
     let mut plan = None;
-    for row in store.records(scope, MANAGED_PLAN_KIND)? {
+    for row in rows {
         let record: ManagedPlanRecord = serde_json::from_str(&row)?;
         match record.op {
             RecordOp::Upsert => plan = Some(record.subscription),

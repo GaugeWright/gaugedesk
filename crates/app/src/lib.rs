@@ -151,6 +151,7 @@ pub mod relay_route_stack;
 pub mod remote_runtime;
 pub mod resolution_recording_policy;
 pub mod resource_store;
+pub(crate) mod retained_scope;
 mod retained_signin_log;
 pub mod root_publication;
 pub mod roster;
@@ -182,11 +183,11 @@ pub(crate) mod workstream_promotion;
 pub mod workstream_routes;
 pub mod xai_oauth;
 pub(crate) use app_support::io;
-pub use app_support::LockUnpoisoned;
 pub use app_support::{
     AttestationMode, RuntimePackageDescriptor, DEFAULT_AGENT, DEFAULT_INSTANCE, DEFAULT_PLACEMENT,
     DEFAULT_PROJECT, LOCAL_AUTHORITY,
 };
+pub use app_support::{LockGuard, LockUnpoisoned};
 // The desktop shell reads its prefixed environment through this. The
 // architecture boundary allows `gaugedesk-desktop -> gaugedesk-app` and nothing
 // else local, so the shell reaches the env accessor the same way it reaches

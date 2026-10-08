@@ -469,16 +469,51 @@ impl AccountAuth {
         Ok(state)
     }
 
+    /// [`rebuild_for_account`](Self::rebuild_for_account) with the account's
+    /// authority scope read strictly, once: a record that cannot be opened
+    /// refuses, and the fold sees exactly the records that read returned.
+    /// Returns the projection and the scope it read, which is the legacy
+    /// scope for an account not yet migrated and `None` for a fenced one.
+    pub(crate) fn rebuild_for_account_retained(
+        store: &Store,
+        account_id: &str,
+    ) -> Result<(Self, Option<String>), AdmitError> {
+        let catalog =
+            crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild_retained(store)?;
+        let custody = catalog.account(account_id);
+        let mut state = Self::default();
+        let scope = if custody.reads_account_scope() {
+            if !custody.may_authenticate() {
+                return Ok((state, None));
+            }
+            crate::account_auth_custody::account_auth_scope(account_id)
+                .map_err(|_| AdmitError::Codec("invalid account-auth scope identity".into()))?
+        } else {
+            ACCOUNT_AUTH_SCOPE.to_owned()
+        };
+        let rows = crate::retained_scope::RetainedScope::read(store, &scope)?;
+        state.fold_records(|kind| Ok(rows.records(kind)))?;
+        state.retain_account(account_id);
+        Ok((state, Some(scope)))
+    }
+
     fn fold_scope(&mut self, store: &Store, scope: &str) -> Result<(), AdmitError> {
-        for row in store.records(scope, ROOT_CUSTODY_KIND)? {
+        self.fold_records(|kind| store.records(scope, kind))
+    }
+
+    fn fold_records(
+        &mut self,
+        mut records: impl FnMut(&str) -> Result<Vec<String>, AdmitError>,
+    ) -> Result<(), AdmitError> {
+        for row in records(ROOT_CUSTODY_KIND)? {
             let record: CustodiedAccountRootRecord = serde_json::from_str(&row)?;
             fold(&mut self.roots, record.id.clone(), record.op, record);
         }
-        for row in store.records(scope, EMAIL_KIND)? {
+        for row in records(EMAIL_KIND)? {
             let record: VerifiedEmailRecord = serde_json::from_str(&row)?;
             fold(&mut self.emails, record.id.clone(), record.op, record);
         }
-        for row in store.records(scope, WEBAUTHN_KIND)? {
+        for row in records(WEBAUTHN_KIND)? {
             let record: WebAuthnMethodRecord = serde_json::from_str(&row)?;
             fold(
                 &mut self.webauthn_methods,
@@ -487,7 +522,7 @@ impl AccountAuth {
                 record,
             );
         }
-        for row in store.records(scope, SUBJECT_KIND)? {
+        for row in records(SUBJECT_KIND)? {
             let record: ExternalSubjectRecord = serde_json::from_str(&row)?;
             fold(
                 &mut self.external_subjects,
@@ -496,7 +531,7 @@ impl AccountAuth {
                 record,
             );
         }
-        for row in store.records(scope, RECOVERY_BATCH_KIND)? {
+        for row in records(RECOVERY_BATCH_KIND)? {
             let record: RecoveryBatchRecord = serde_json::from_str(&row)?;
             fold(
                 &mut self.recovery_batches,
@@ -505,7 +540,7 @@ impl AccountAuth {
                 record,
             );
         }
-        for row in store.records(scope, RECOVERY_CODE_KIND)? {
+        for row in records(RECOVERY_CODE_KIND)? {
             let record: RecoveryCodeRecord = serde_json::from_str(&row)?;
             fold(
                 &mut self.recovery_codes,
@@ -514,7 +549,7 @@ impl AccountAuth {
                 record,
             );
         }
-        for row in store.records(scope, RECOVERY_ATTEMPT_KIND)? {
+        for row in records(RECOVERY_ATTEMPT_KIND)? {
             let record: RecoveryAttemptRecord = serde_json::from_str(&row)?;
             fold(
                 &mut self.recovery_attempts,
@@ -523,7 +558,7 @@ impl AccountAuth {
                 record,
             );
         }
-        for row in store.records(scope, SESSION_KIND)? {
+        for row in records(SESSION_KIND)? {
             let record: AccountSessionRecord = serde_json::from_str(&row)?;
             fold(&mut self.sessions, record.id.clone(), record.op, record);
         }

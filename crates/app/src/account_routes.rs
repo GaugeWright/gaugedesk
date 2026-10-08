@@ -286,10 +286,41 @@ pub(crate) fn secure_home_endpoint(endpoint: &str) -> bool {
         || (scheme == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"))
 }
 
+/// Fold the caller's account with the Workbench lock released (WS-1010).
+///
+/// `resolve` runs under the lock and names the account scope to fold (and
+/// anything else the handler needs from the Workbench); a remembered session
+/// standing makes that cheap. The account is then folded on a read-only
+/// connection of its own, so a burst of account reads — desk sent about two
+/// hundred per load on 2026-10-08, each holding the lock 50-250 ms on the Hub —
+/// no longer takes turns holding the lock every other request needs. The
+/// connection opens after the caller's earlier writes committed, so it reads
+/// them. Where one cannot be opened the fold runs under the lock, as before.
+fn fold_account_unlocked<T>(
+    wb: &SharedWorkbench,
+    resolve: impl FnOnce(&crate::Workbench) -> (String, T),
+) -> (
+    T,
+    Result<crate::account::Account, gaugedesk_store::AdmitError>,
+) {
+    let (scope, resolved, reader) = {
+        let guard = wb.lock_unpoisoned();
+        let (scope, resolved) = resolve(&guard);
+        let reader = guard.store_ref().read_only_sibling().ok();
+        (scope, resolved, reader)
+    };
+    let account = match reader {
+        Some(reader) => crate::account::Account::rebuild_in(&reader, &scope),
+        None => crate::account::Account::rebuild_in(wb.lock_unpoisoned().store_ref(), &scope),
+    };
+    (resolved, account)
+}
+
 pub async fn get_homes(State(wb): State<SharedWorkbench>, headers: HeaderMap) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
-    let scope = wb.account_scope_for(net_http::bearer(&headers));
-    match crate::account::Account::rebuild_in(wb.store_ref(), &scope) {
+    let ((), account) = fold_account_unlocked(&wb, |wb| {
+        (wb.account_scope_for(net_http::bearer(&headers)), ())
+    });
+    match account {
         Ok(account) => {
             let selected_home = account
                 .settings
@@ -463,16 +494,15 @@ pub async fn get_account_directory(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
     let bearer = net_http::bearer(&headers);
-    let scope = wb.account_scope_for(bearer);
     // Who is asking, so a browser can namespace its root-key pin by person
     // (ADR 0132 §5). A browser session here authenticates by cookie and holds
     // no bearer to read claims from, so without this the pin has no namespace
     // and the signed-directory path is skipped entirely — which is the state
     // every desk session has actually been in.
-    let subject = wb.actor(bearer);
-    match crate::account::Account::rebuild_in(wb.store_ref(), &scope) {
+    let (subject, account) =
+        fold_account_unlocked(&wb, |wb| (wb.account_scope_for(bearer), wb.actor(bearer)));
+    match account {
         Ok(account) => match account.directory {
             Some(record) => (
                 StatusCode::OK,
@@ -676,9 +706,10 @@ pub async fn get_home_routes(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
-    let scope = wb.account_scope_for(net_http::bearer(&headers));
-    match crate::account::Account::rebuild_in(wb.store_ref(), &scope) {
+    let ((), account) = fold_account_unlocked(&wb, |wb| {
+        (wb.account_scope_for(net_http::bearer(&headers)), ())
+    });
+    match account {
         Ok(account) => {
             let routes: Vec<crate::home::OpaqueHomeRoute> =
                 account.home_routes.into_values().map(Into::into).collect();
@@ -1643,6 +1674,71 @@ mod home_directory_tests {
         let (status, _) = call(&app, "POST", "/account/sessions/native/revoke", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// WS-1010: an account read folds the account with the Workbench lock
+    /// released, so a slow fold — the Hub's took 50-250 ms each, and desk sent
+    /// about two hundred per load — no longer holds every other request.
+    /// Here the fold is made to take most of a second; a request that needs
+    /// the lock meanwhile takes it at once, and the read still answers what
+    /// was written before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_account_read_folds_with_the_workbench_lock_released() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct SlowAccount(AtomicBool);
+        impl gaugedesk_store::ContentCodec for SlowAccount {
+            fn encode(&self, _scope: &str, _kind: &str, payload: &str) -> Result<String, String> {
+                Ok(payload.to_owned())
+            }
+            fn decode(&self, _scope: &str, _kind: &str, payload: &str) -> Option<String> {
+                Some(payload.to_owned())
+            }
+            fn decode_scope(&self, scope: &str, rows: &[(&str, &str)]) -> Vec<Option<String>> {
+                if scope == crate::account::ACCOUNT_SCOPE && self.0.swap(false, Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                }
+                rows.iter()
+                    .map(|(_, payload)| Some((*payload).to_owned()))
+                    .collect()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        let codec = std::sync::Arc::new(SlowAccount(AtomicBool::new(false)));
+        let store = gaugedesk_store::Store::open(path.to_str().unwrap())
+            .unwrap()
+            .with_codec(codec.clone());
+        let wb: SharedWorkbench =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::Workbench::new(store)));
+        let app = routes().with_state(wb.clone());
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/account/home-routes",
+            Some(r#"{"project":"opaque-project-1","home_id":"home:desk","endpoint":"https://home.example"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        codec.0.store(true, Ordering::SeqCst);
+        let reader = app.clone();
+        let read =
+            tokio::spawn(async move { call(&reader, "GET", "/account/home-routes", None).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !codec.0.load(Ordering::SeqCst),
+            "the read is folding the account now"
+        );
+        let asked = std::time::Instant::now();
+        drop(wb.lock_unpoisoned());
+        let waited = asked.elapsed();
+        let (status, routes) = read.await.unwrap();
+        assert!(
+            waited < std::time::Duration::from_millis(300),
+            "another request waited {waited:?} for the lock behind an account read"
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert!(routes.contains("opaque-project-1"), "{routes}");
+    }
 }
 
 // ---- devices (the trusted-devices registry) ------------------------------
@@ -1897,9 +1993,10 @@ pub async fn get_settings(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
-    let scope = wb.credential_scope_for(net_http::bearer(&headers));
-    match wb.account_settings_in(&scope) {
+    let ((), account) = fold_account_unlocked(&wb, |wb| {
+        (wb.credential_scope_for(net_http::bearer(&headers)), ())
+    });
+    match account.map(|account| account.setting_values()) {
         Ok(settings) => (StatusCode::OK, Json(json!({ "settings": settings }))).into_response(),
         Err(e) => err_response(e),
     }

@@ -404,6 +404,11 @@ pub struct ContentVault {
     project_keys: scope_key::ProjectKeyCache,
     /// Which projects a session holds now (WS-740).
     holds: Arc<holds::Holds>,
+    /// Moves whenever a row this vault opened might no longer open: a scope
+    /// erased or fenced, or a scope key that could not be resolved. A
+    /// projection remembered against it is discarded when it moves (see
+    /// [`ContentCodec::epoch`]).
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -439,7 +444,13 @@ impl ContentVault {
             scope_projects: Arc::default(),
             project_keys: scope_key::ProjectKeyCache::default(),
             holds: Arc::default(),
+            epoch: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Something a remembered projection may have depended on changed.
+    pub(crate) fn advance_epoch(&self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Write context-authenticated records while retaining legacy reads for migration.
@@ -611,6 +622,7 @@ impl ContentVault {
             state
                 .cache
                 .retain(|scope, _| !recorded.contains(&crate::org::sha256_hex(scope)));
+            self.advance_epoch();
         }
         let mut count = 0;
         for key_id in &recorded {
@@ -718,30 +730,104 @@ impl ContentCodec for ContentVault {
     }
 
     fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String> {
+        match self.opening(scope, kind, payload) {
+            Opening::Answered(answer) => answer,
+            Opening::Sealed { ciphertext, aad } => {
+                let mut resolved = false;
+                let answer = self.with_legacy_key(scope, false, |dek| {
+                    resolved = true;
+                    open_sealed(&LocalAeadEncryptor::new(dek), &ciphertext, &aad)
+                });
+                if !resolved {
+                    self.advance_epoch();
+                }
+                answer
+            }
+        }
+    }
+
+    /// One resolution of the scope key for every sealed row, instead of one
+    /// per row: resolving it reads the wrapped key file and takes its lock, and
+    /// on the Hub that was most of the cost of folding an encrypted scope
+    /// under the Workbench lock. Each row's answer is the one `decode` gives.
+    fn decode_scope(&self, scope: &str, rows: &[(&str, &str)]) -> Vec<Option<String>> {
+        let mut answers = vec![None; rows.len()];
+        let mut sealed = Vec::new();
+        for (index, (kind, payload)) in rows.iter().enumerate() {
+            match self.opening(scope, kind, payload) {
+                Opening::Answered(answer) => answers[index] = answer,
+                Opening::Sealed { ciphertext, aad } => sealed.push((index, ciphertext, aad)),
+            }
+        }
+        if !sealed.is_empty()
+            && self
+                .with_legacy_key(scope, false, |dek| {
+                    let cipher = LocalAeadEncryptor::new(dek);
+                    for (index, ciphertext, aad) in &sealed {
+                        answers[*index] = open_sealed(&cipher, ciphertext, aad);
+                    }
+                    Some(())
+                })
+                .is_none()
+        {
+            self.advance_epoch();
+        }
+        answers
+    }
+
+    /// A scope outside every project opens by its own key alone, so its
+    /// answers change only when that key is erased or cannot be resolved,
+    /// both of which move the epoch. A project scope's answers also follow
+    /// which sessions hold the project and for how long (WS-740), which no
+    /// epoch tracks, so nothing decoded from one is remembered.
+    fn epoch(&self, scope: &str) -> Option<u64> {
+        if self.scope_projects.project_of(scope).is_some() {
+            return None;
+        }
+        Some(self.epoch.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// What a stored payload needs before it can be read.
+enum Opening {
+    /// Readable, or refused, without the scope key.
+    Answered(Option<String>),
+    /// Sealed under the scope key, bound to `aad`.
+    Sealed { ciphertext: Vec<u8>, aad: Vec<u8> },
+}
+
+impl ContentVault {
+    fn opening(&self, scope: &str, kind: &str, payload: &str) -> Opening {
         if !self.protects_record(scope, kind) {
-            return (!payload.starts_with(ENCRYPTED_PREFIX)).then(|| payload.to_string());
+            return Opening::Answered(
+                (!payload.starts_with(ENCRYPTED_PREFIX)).then(|| payload.to_string()),
+            );
         }
         let (hexct, aad) = if let Some(ct) = payload.strip_prefix(BOUND_MARKER) {
             (ct, record_binding(scope, kind))
         } else if let Some(ct) = payload.strip_prefix(MARKER) {
             if matches!(self.record_mode(scope), RecordProtection::Required) {
-                return None;
+                return Opening::Answered(None);
             }
             (ct, Vec::new())
         } else {
             // Unknown encrypted formats never fall through as plaintext.
-            return (!payload.starts_with(ENCRYPTED_PREFIX)
-                && !matches!(self.record_mode(scope), RecordProtection::Required))
-            .then(|| payload.to_string());
+            return Opening::Answered(
+                (!payload.starts_with(ENCRYPTED_PREFIX)
+                    && !matches!(self.record_mode(scope), RecordProtection::Required))
+                .then(|| payload.to_string()),
+            );
         };
-        let ct = hex::decode(hexct).ok()?;
-        self.with_legacy_key(scope, false, |dek| {
-            let plain = LocalAeadEncryptor::new(dek)
-                .decrypt_with_aad(&ct, &aad)
-                .ok()?;
-            String::from_utf8(plain).ok()
-        })
+        match hex::decode(hexct) {
+            Ok(ciphertext) => Opening::Sealed { ciphertext, aad },
+            Err(_) => Opening::Answered(None),
+        }
     }
+}
+
+fn open_sealed(cipher: &LocalAeadEncryptor, ciphertext: &[u8], aad: &[u8]) -> Option<String> {
+    let plain = cipher.decrypt_with_aad(ciphertext, aad).ok()?;
+    String::from_utf8(plain).ok()
 }
 
 /// The durable record of crypto-erasures (SOC 2 finding 4.7 / DR-0086).
@@ -1668,6 +1754,57 @@ mod tests {
         );
         // Idempotent.
         assert!(!v.crypto_erase("eng-a"));
+    }
+
+    /// A read of many rows resolves the scope key once (Hub lock work), and
+    /// must answer every row exactly as decoding it alone would: sealed,
+    /// legacy-sealed, plaintext, unprotected, malformed and foreign rows alike,
+    /// before and after the scope is erased.
+    #[test]
+    fn a_scope_read_answers_each_row_as_decoding_it_alone_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = vault(dir.path()).with_authenticated_record_writes();
+        let legacy = vault(dir.path());
+        let bound = v.encode("eng-a", "transcript", "bound line").unwrap();
+        let sealed_legacy = legacy.encode("eng-a", "transcript", "legacy line").unwrap();
+        let other_kind = v.encode("eng-a", "setting", "bound to setting").unwrap();
+        let foreign = v.encode("eng-b", "transcript", "another scope").unwrap();
+        let rows: Vec<(&str, String)> = vec![
+            ("transcript", bound),
+            ("transcript", sealed_legacy),
+            ("transcript", "old plaintext line".into()),
+            ("not-content", "plain metadata".into()),
+            ("not-content", "gwenc:2:00".into()),
+            ("transcript", "gwenc:2:not-hex".into()),
+            ("transcript", "gwenc:9:unknown".into()),
+            // Sealed for one kind, read as another: the binding refuses it.
+            ("transcript", other_kind),
+            ("transcript", foreign),
+        ];
+        let pairs: Vec<(&str, &str)> = rows.iter().map(|(k, p)| (*k, p.as_str())).collect();
+        let alone = |v: &ContentVault| -> Vec<Option<String>> {
+            pairs
+                .iter()
+                .map(|(kind, payload)| v.decode("eng-a", kind, payload))
+                .collect()
+        };
+        let expected = alone(&v);
+        assert_eq!(
+            expected.iter().filter(|answer| answer.is_some()).count(),
+            4,
+            "the fixture mixes readable and refused rows: {expected:?}"
+        );
+        assert_eq!(v.decode_scope("eng-a", &pairs), expected);
+        assert!(v.decode_scope("eng-a", &[]).is_empty());
+
+        assert!(v.crypto_erase("eng-a"));
+        let erased = alone(&v);
+        assert_eq!(
+            erased.iter().filter(|answer| answer.is_some()).count(),
+            2,
+            "only the rows that need no key still read: {erased:?}"
+        );
+        assert_eq!(v.decode_scope("eng-a", &pairs), erased);
     }
 
     #[test]

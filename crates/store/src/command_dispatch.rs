@@ -813,6 +813,25 @@ impl Store {
         Ok(result)
     }
 
+    /// Confirm, once a bounded native *read* is done, that the product
+    /// standing it was prepared under still holds: the check
+    /// [`with_dispatch_basis`](Self::with_dispatch_basis) makes before its
+    /// callback, made after the read instead. The standing's heads only
+    /// advance, so heads unchanged since preparation mean no authority event
+    /// was appended at any point during the read, which is the same inference
+    /// that lets preparation stand in for the moment its fence is taken.
+    ///
+    /// Nothing is serialized against writers, so the read holds no write
+    /// transaction while it runs: a Home's tracker read held one for its whole
+    /// native read, under the Workbench lock, so every other request waited on
+    /// it (WS-926). A native effect must still use `with_dispatch_basis`.
+    pub fn confirm_dispatch_basis(&self, basis: &DispatchReadBasis) -> Result<(), AdmitError> {
+        let tx = self.conn.unchecked_transaction()?;
+        check_dispatch_basis(&tx, &self.path, basis)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Run bounded native work with the original authority check available at
     /// its actual effect/commit boundaries. No product writes or network work
     /// belong in this callback. Native effects that committed before refusal

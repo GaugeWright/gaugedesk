@@ -550,45 +550,63 @@ impl Account {
     /// Rebuild **one person's** account by folding `scope`'s records in position order. Pass
     /// [`ACCOUNT_SCOPE`] for the default tenant-of-one / desktop, or [`account_scope`]`(person)`
     /// for a hosted person. Scope-isolated (`INV-1`).
+    ///
+    /// Remembered on the store until the scope changes (WS-1010).
     pub fn rebuild_in(store: &Store, scope: &str) -> Result<Account, AdmitError> {
+        store.remember("account", scope, |store| {
+            Self::fold_records(|kind| store.records(scope, kind))
+        })
+    }
+
+    /// [`rebuild_in`](Self::rebuild_in) from one strict read of `scope`:
+    /// every record must open, and the fold sees exactly the records that
+    /// read returned. Session authentication folds the account this way.
+    pub(crate) fn rebuild_retained_in(store: &Store, scope: &str) -> Result<Account, AdmitError> {
+        let rows = crate::retained_scope::RetainedScope::read(store, scope)?;
+        Self::fold_records(|kind| Ok(rows.records(kind)))
+    }
+
+    fn fold_records(
+        mut records: impl FnMut(&str) -> Result<Vec<String>, AdmitError>,
+    ) -> Result<Account, AdmitError> {
         let mut acct = Account::default();
         let mut profiles = BTreeMap::new();
-        for row in store.records(scope, ACCOUNT_PROFILE_KIND)? {
+        for row in records(ACCOUNT_PROFILE_KIND)? {
             let record: AccountProfileRecord = serde_json::from_str(&row)?;
             fold(&mut profiles, record.id.clone(), record.op, record);
         }
         acct.profile = profiles.remove(ACCOUNT_PROFILE_ID);
         let mut avatars = BTreeMap::new();
-        for row in store.records(scope, ACCOUNT_AVATAR_KIND)? {
+        for row in records(ACCOUNT_AVATAR_KIND)? {
             let record: AccountAvatarRecord = serde_json::from_str(&row)?;
             fold(&mut avatars, record.id.clone(), record.op, record);
         }
         acct.avatar = avatars.remove(ACCOUNT_AVATAR_ID);
-        for row in store.records(scope, "device")? {
+        for row in records("device")? {
             let r: DeviceRecord = serde_json::from_str(&row)?;
             fold(&mut acct.devices, r.id.clone(), r.op, r);
         }
-        for row in store.records(scope, "refresh")? {
+        for row in records("refresh")? {
             let r: RefreshRecord = serde_json::from_str(&row)?;
             fold(&mut acct.refresh_sessions, r.id.clone(), r.op, r);
         }
-        for row in store.records(scope, "setting")? {
+        for row in records("setting")? {
             let r: SettingRecord = serde_json::from_str(&row)?;
             fold(&mut acct.settings, r.id.clone(), r.op, r);
         }
-        for row in store.records(scope, "credential")? {
+        for row in records("credential")? {
             let r: CredentialRecord = serde_json::from_str(&row)?;
             fold(&mut acct.credentials, r.id.clone(), r.op, r);
         }
-        for row in store.records(scope, BOX_RECORD_KIND)? {
+        for row in records(BOX_RECORD_KIND)? {
             let r: BoxRecord = serde_json::from_str(&row)?;
             fold(&mut acct.boxes, r.id.clone(), r.op, r);
         }
-        for row in store.records(scope, "home")? {
+        for row in records("home")? {
             let r: RegisteredHomeRecord = serde_json::from_str(&row)?;
             fold(&mut acct.homes, r.id.as_str().to_owned(), r.op, r);
         }
-        for row in store.records(scope, "home_route")? {
+        for row in records("home_route")? {
             let r: HomeRouteRecord = serde_json::from_str(&row)?;
             // Departure is retained rather than discarded (ADR 0155 §1). The
             // live fold below is unchanged, so every existing reader sees
@@ -606,13 +624,23 @@ impl Account {
             fold(&mut acct.home_routes, r.id.clone(), r.op, r);
         }
         let mut directory = BTreeMap::new();
-        for row in store.records(scope, DIRECTORY_RECORD_KIND)? {
+        for row in records(DIRECTORY_RECORD_KIND)? {
             let r: AccountDirectoryRecord = serde_json::from_str(&row)?;
             fold(&mut directory, r.id.clone(), r.op, r);
         }
         acct.directory = directory.remove(DIRECTORY_RECORD_ID);
-        acct.managed_inference_plan = crate::managed_inference::fold_plan(store, scope)?;
+        acct.managed_inference_plan = crate::managed_inference::fold_plan_rows(records(
+            crate::managed_inference::MANAGED_PLAN_KIND,
+        )?)?;
         Ok(acct)
+    }
+
+    /// Every setting's value, by key.
+    pub fn setting_values(self) -> BTreeMap<String, String> {
+        self.settings
+            .into_values()
+            .map(|setting| (setting.id, setting.value))
+            .collect()
     }
 
     /// The active (non-revoked) devices, stable order.
@@ -1340,11 +1368,7 @@ impl Workbench {
 
     /// Folded settings for the account in `scope` (the caller's account, `ADR 0077`).
     pub fn account_settings_in(&self, scope: &str) -> Result<BTreeMap<String, String>, AdmitError> {
-        Ok(Account::rebuild_in(self.store_ref(), scope)?
-            .settings
-            .into_values()
-            .map(|setting| (setting.id, setting.value))
-            .collect())
+        Ok(Account::rebuild_in(self.store_ref(), scope)?.setting_values())
     }
 
     /// Every provider with a credential admitted for `class` in `scope` — keyed

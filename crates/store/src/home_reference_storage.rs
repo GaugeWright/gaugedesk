@@ -168,6 +168,7 @@ impl HomeReferenceJournal {
                 path,
                 scratch: None,
                 home_product: None,
+                remembered: Default::default(),
             },
             binding,
         }

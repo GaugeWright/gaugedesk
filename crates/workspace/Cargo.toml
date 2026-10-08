@@ -14,6 +14,12 @@ license.workspace = true
 # entry fails the test instead of caching a pass it never earned.
 data = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "contracts/workspace-action-sites.json", "contracts/action-evidence-writers.json", "crates", "ee/app"]
 
+[lib]
+# It has no doctests. Natively a doctest run links the library as a staticlib of
+# everything it depends on; scripts/check-doctest-opt-outs.py holds this to the
+# sources, in both directions.
+doctest = false
+
 [dependencies]
 # The versioned-workspace substrate AND the merge engine (SUB-6
 # convergence port, 2026-07-11): whip's WorkspaceVcs over its native

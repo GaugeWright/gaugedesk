@@ -25,15 +25,86 @@ pub enum AttestationMode {
 /// Lock a mutex, recovering from poisoning (RF-A4). Durable product truth is
 /// the store's atomic transactions and the in-memory `Workbench` is rebuildable
 /// projection state, so the data behind a poisoned lock is safe to reuse.
+///
+/// The guard reports a long hold when it is released (see [`LockGuard`]).
 pub trait LockUnpoisoned<T> {
-    fn lock_unpoisoned(&self) -> std::sync::MutexGuard<'_, T>;
+    #[track_caller]
+    fn lock_unpoisoned(&self) -> LockGuard<'_, T>;
 }
 
 impl<T> LockUnpoisoned<T> for Mutex<T> {
-    fn lock_unpoisoned(&self) -> std::sync::MutexGuard<'_, T> {
-        self.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    #[track_caller]
+    fn lock_unpoisoned(&self) -> LockGuard<'_, T> {
+        let site = std::panic::Location::caller();
+        let asked = std::time::Instant::now();
+        let guard = self
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let acquired = std::time::Instant::now();
+        LockGuard {
+            guard,
+            acquired,
+            waited: acquired - asked,
+            site,
+        }
     }
+}
+
+/// A held [`LockUnpoisoned`] lock that says so at `warn` when it was held
+/// longer than [`lock_hold_warning`], naming where it was taken.
+///
+/// A Hub or Home serves almost every request under one Workbench lock, so a
+/// request that holds it for a second stalls every other request for that
+/// second. Until this, the only evidence was a slow-request log that could not
+/// say which request had held the lock and which had merely waited for it.
+pub struct LockGuard<'a, T> {
+    guard: std::sync::MutexGuard<'a, T>,
+    acquired: std::time::Instant,
+    waited: std::time::Duration,
+    site: &'static std::panic::Location<'static>,
+}
+
+impl<T> std::ops::Deref for LockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for LockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for LockGuard<'_, T> {
+    fn drop(&mut self) {
+        let held = self.acquired.elapsed();
+        if held >= lock_hold_warning() {
+            let lock = std::any::type_name::<T>();
+            tracing::warn!(
+                target: "lock_hold",
+                lock = lock.rsplit("::").next().unwrap_or(lock),
+                site = %self.site,
+                held_ms = held.as_millis() as u64,
+                waited_ms = self.waited.as_millis() as u64,
+                "long lock hold"
+            );
+        }
+    }
+}
+
+/// A [`LockGuard`] held at least this long is logged. 200 ms by default;
+/// `GAUGEDESK_LOCK_HOLD_WARN_MS` sets another, read once.
+pub fn lock_hold_warning() -> std::time::Duration {
+    static WARNING: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WARNING.get_or_init(|| {
+        std::time::Duration::from_millis(
+            gaugedesk_env::var("LOCK_HOLD_WARN_MS")
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(200),
+        )
+    })
 }
 
 /// The stable id of the seeded default archetype's repo.
@@ -371,4 +442,41 @@ impl Workbench {
 pub struct RuntimePackageDescriptor {
     pub package_ref: String,
     pub capabilities: Vec<String>,
+}
+
+#[cfg(test)]
+mod lock_hold_tests {
+    use super::*;
+
+    /// A lock held past the warning names where it was taken and how long it
+    /// was held, so a Hub log can say which request held the Workbench lock
+    /// rather than only which requests were slow while it was held.
+    #[test]
+    fn a_long_hold_names_its_site_and_a_short_one_says_nothing() {
+        let lock = Mutex::new(0_u32);
+        let taken_at = line!() + 2;
+        let logged = crate::signin_log::capture::lines(|| {
+            let mut guard = lock.lock_unpoisoned();
+            *guard += 1;
+            std::thread::sleep(lock_hold_warning() + std::time::Duration::from_millis(20));
+        });
+        let line = logged
+            .lines()
+            .find(|line| line.contains("long lock hold"))
+            .unwrap_or_else(|| panic!("no hold logged: {logged}"));
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("lock=\"u32\""), "{line}");
+        assert!(
+            line.contains(&format!("site={}:{taken_at}:", file!())),
+            "the site is the caller's: {line}"
+        );
+        assert!(line.contains("held_ms="), "{line}");
+        assert!(line.contains("waited_ms="), "{line}");
+
+        let quiet = crate::signin_log::capture::lines(|| {
+            *lock.lock_unpoisoned() += 1;
+        });
+        assert!(!quiet.contains("long lock hold"), "{quiet}");
+        assert_eq!(*lock.lock_unpoisoned(), 2);
+    }
 }

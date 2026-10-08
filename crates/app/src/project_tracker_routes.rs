@@ -65,31 +65,73 @@ pub async fn read_backlog(
     authenticated: Option<Extension<AuthenticatedActionContext>>,
     operator: Option<Extension<crate::account_signin::DesktopOperatorPlane>>,
 ) -> Response {
+    let (_, read) = match prepare_backlog(&wb, &project, &queue, &headers, authenticated, operator)
+    {
+        Ok(prepared) => prepared,
+        Err(refused) => return *refused,
+    };
+    match read.read() {
+        Ok(backlog) => Json(backlog).into_response(),
+        Err(error) => unavailable(&project, &queue, "backlog", error.as_str()),
+    }
+}
+
+/// Admit a tracker read and prepare it under the Workbench lock, which is
+/// released before the native read: on a Home with a long task history that
+/// read took most of a second, and every other request — a new chat's actor
+/// proof and event stream among them — waited behind it (WS-926).
+fn prepare_backlog(
+    wb: &SharedWorkbench,
+    project: &str,
+    queue: &str,
+    headers: &HeaderMap,
+    authenticated: Option<Extension<AuthenticatedActionContext>>,
+    operator: Option<Extension<crate::account_signin::DesktopOperatorPlane>>,
+) -> Result<
+    (
+        AuthenticatedActionContext,
+        crate::project_tracker::PreparedTrackerBacklog,
+    ),
+    Box<Response>,
+> {
     let mut wb = wb.lock_unpoisoned();
-    let Some(context) = context(&mut wb, &headers, authenticated).or_else(|| {
+    let Some(context) = context(&mut wb, headers, authenticated).or_else(|| {
         (operator.is_some()
-            && crate::net_http::bearer(&headers).is_none()
-            && crate::mobile_machine_session::session_token(&headers).is_none())
-        .then(|| wb.local_personal_tracker_context(&project))
+            && crate::net_http::bearer(headers).is_none()
+            && crate::mobile_machine_session::session_token(headers).is_none())
+        .then(|| wb.local_personal_tracker_context(project))
         .flatten()
     }) else {
-        return problem(StatusCode::UNAUTHORIZED, "Sign in to read project tasks");
+        return Err(Box::new(problem(
+            StatusCode::UNAUTHORIZED,
+            "Sign in to read project tasks",
+        )));
     };
     if wb
-        .read_project_tracker(&context, &project, &queue, TrackerPermission::Read)
+        .read_project_tracker(&context, project, queue, TrackerPermission::Read)
         .is_err()
     {
-        return problem(StatusCode::FORBIDDEN, "Tracker is not readable");
+        return Err(Box::new(problem(
+            StatusCode::FORBIDDEN,
+            "Tracker is not readable",
+        )));
     }
-    match wb.read_project_tracker_backlog(&context, &project, &queue) {
-        Ok(backlog) => Json(backlog).into_response(),
-        Err(error) => {
-            // Said here because the person sees only "some tasks could not
-            // be read", and the reason is otherwise nowhere (2026-10-07).
-            tracing::warn!(project, queue, %error, "project tracker backlog could not be read");
-            problem(StatusCode::SERVICE_UNAVAILABLE, "Tracker is unavailable")
-        }
+    match wb.prepare_project_tracker_backlog(&context, project, queue) {
+        Ok(prepared) => Ok((context, prepared)),
+        Err(error) => Err(Box::new(unavailable(
+            project,
+            queue,
+            "backlog",
+            error.as_str(),
+        ))),
     }
+}
+
+/// Said here because the person sees only "some tasks could not be read",
+/// and the reason is otherwise nowhere (2026-10-07).
+fn unavailable(project: &str, queue: &str, read: &str, error: &str) -> Response {
+    tracing::warn!(project, queue, read, %error, "project tracker could not be read");
+    problem(StatusCode::SERVICE_UNAVAILABLE, "Tracker is unavailable")
 }
 
 pub async fn read_tasks(
@@ -99,30 +141,17 @@ pub async fn read_tasks(
     authenticated: Option<Extension<AuthenticatedActionContext>>,
     operator: Option<Extension<crate::account_signin::DesktopOperatorPlane>>,
 ) -> Response {
-    let mut wb = wb.lock_unpoisoned();
-    let Some(context) = context(&mut wb, &headers, authenticated).or_else(|| {
-        (operator.is_some()
-            && crate::net_http::bearer(&headers).is_none()
-            && crate::mobile_machine_session::session_token(&headers).is_none())
-        .then(|| wb.local_personal_tracker_context(&project))
-        .flatten()
-    }) else {
-        return problem(StatusCode::UNAUTHORIZED, "Sign in to read project tasks");
-    };
-    if wb
-        .read_project_tracker(&context, &project, &queue, TrackerPermission::Read)
-        .is_err()
-    {
-        return problem(StatusCode::FORBIDDEN, "Tracker is not readable");
-    }
-    match wb.read_project_tracker_tasks(&context, &project, &queue) {
-        Ok(tasks) => Json(tasks).into_response(),
-        Err(error) => {
-            // Said here because the person sees only "some tasks could not
-            // be read", and the reason is otherwise nowhere (2026-10-07).
-            tracing::warn!(project, queue, %error, "project tracker tasks could not be read");
-            problem(StatusCode::SERVICE_UNAVAILABLE, "Tracker is unavailable")
-        }
+    let (context, read) =
+        match prepare_backlog(&wb, &project, &queue, &headers, authenticated, operator) {
+            Ok(prepared) => prepared,
+            Err(refused) => return *refused,
+        };
+    match read.read() {
+        Ok(backlog) => Json(crate::project_tracker::ProjectTrackerTasks::of(
+            &context, backlog,
+        ))
+        .into_response(),
+        Err(error) => unavailable(&project, &queue, "tasks", error.as_str()),
     }
 }
 

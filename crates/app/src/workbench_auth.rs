@@ -357,13 +357,10 @@ impl Workbench {
         let (account_id, method, cache_expires_secs) =
             self.account_sessions.resolve_bounds(token)?;
         let session_ref = crate::account_session::session_id(token);
-        let (durable_account, mut evidence) = crate::account_session::durable_evidence(
-            self.store_ref(),
-            &session_ref,
-            &account_id,
-            now_ms,
-        )
-        .ok()??;
+        let (durable_account, mut evidence) = self
+            .session_standings
+            .standing(self.store_ref(), &session_ref, &account_id)
+            .ok()??;
         if durable_account != account_id || evidence.method != method {
             return None;
         }
@@ -2170,6 +2167,120 @@ mod provider_neutral_identity_tests {
         assert!(
             !wb.account_sessions().revoke_id(&attempted[0]),
             "failed issuance left no hot credential"
+        );
+    }
+
+    /// WS-1010: a burst of requests on one session folds its durable standing
+    /// once, not once per request under the Workbench lock. What it remembers
+    /// is never answered past a change that could alter it: revoking the
+    /// session's device (a commit) and erasing the account's key (no commit at
+    /// all) both end the session on the very next request.
+    #[test]
+    fn a_session_standing_is_remembered_until_anything_it_read_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting {
+            vault: Arc<crate::content_vault::ContentVault>,
+            reads: AtomicUsize,
+        }
+        impl gaugedesk_store::ContentCodec for Counting {
+            fn encode(&self, scope: &str, kind: &str, payload: &str) -> Result<String, String> {
+                self.vault.encode(scope, kind, payload)
+            }
+            fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.vault.decode(scope, kind, payload)
+            }
+            fn decode_scope(&self, scope: &str, rows: &[(&str, &str)]) -> Vec<Option<String>> {
+                self.reads.fetch_add(rows.len(), Ordering::SeqCst);
+                self.vault.decode_scope(scope, rows)
+            }
+            fn epoch(&self, scope: &str) -> Option<u64> {
+                self.vault.epoch(scope)
+            }
+        }
+        let keys = tempfile::tempdir().unwrap();
+        let vault = Arc::new(
+            crate::content_vault::ContentVault::new(
+                keys.path(),
+                Box::new(crate::at_rest::LoopbackKeyWrap::new([7u8; 32])),
+            )
+            .with_ledger(Box::new(crate::content_vault::LocalFileErasureLedger::new(
+                keys.path().join("ledger"),
+            ))),
+        );
+        let codec = Arc::new(Counting {
+            vault: vault.clone(),
+            reads: AtomicUsize::new(0),
+        });
+        let mut wb = Workbench::new(
+            gaugedesk_store::Store::open_in_memory()
+                .unwrap()
+                .with_codec(codec.clone()),
+        );
+        let token = wb
+            .mint_account_session("person-root", "passkey", 3600)
+            .unwrap();
+        let session_id = crate::account_session::session_id(&token);
+        let scope = crate::account::account_scope("person-root");
+        let device = crate::account::DeviceRecord {
+            id: "phone-1".into(),
+            op: crate::account::RecordOp::Upsert,
+            label: "Alice's phone".into(),
+            kind: crate::account::DeviceKind::Phone,
+            subkey_pubkey: "device-subkey".into(),
+            status: crate::account::DeviceStatus::Active,
+            enrolled_at: 1,
+        };
+        wb.upsert_account_device_in(&scope, &device).unwrap();
+        assert!(wb.bind_account_session_device(&session_id, "person-root", &device.id));
+
+        let reads = || codec.reads.load(Ordering::SeqCst);
+        let before = reads();
+        assert_eq!(wb.actor(Some(&token)), "person-root");
+        let folded = reads() - before;
+        assert!(
+            folded > 0,
+            "the first request folds the session's authority"
+        );
+        for _ in 0..20 {
+            assert_eq!(wb.actor(Some(&token)), "person-root");
+        }
+        assert_eq!(
+            reads() - before,
+            folded,
+            "twenty more requests on the session read nothing more"
+        );
+
+        // A write to another scope changes nothing the standing read.
+        wb.store_mut()
+            .append_record("elsewhere", "note", "unrelated")
+            .unwrap();
+        assert_eq!(wb.actor(Some(&token)), "person-root");
+        assert_eq!(reads() - before, folded, "an unrelated write folds nothing");
+        // An event in the account's own scope is a change it cannot see past.
+        wb.store_mut().append_record(&scope, "note", "{}").unwrap();
+        assert_eq!(wb.actor(Some(&token)), "person-root");
+        assert!(reads() - before > folded, "it is folded again");
+
+        let mut inactive = device.clone();
+        inactive.status = crate::account::DeviceStatus::Revoked;
+        wb.upsert_account_device_in(&scope, &inactive).unwrap();
+        assert_eq!(
+            wb.actor(Some(&token)),
+            "anonymous",
+            "a revoked device ends it at once"
+        );
+        wb.upsert_account_device_in(&scope, &device).unwrap();
+        assert_eq!(wb.actor(Some(&token)), "person-root");
+        assert_eq!(wb.actor(Some(&token)), "person-root");
+
+        // Erasing the account's key commits nothing to the store, and still
+        // ends the session on the next request.
+        assert!(vault.crypto_erase(&scope));
+        assert_eq!(
+            wb.actor(Some(&token)),
+            "anonymous",
+            "an erased account ends it at once"
         );
     }
 

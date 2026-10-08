@@ -154,6 +154,25 @@ pub trait GaugeAppDefinition: 'static {
         default_context::<Self>(wb, headers, id)
     }
 
+    /// The admitted session alone, for a request that reads no page: the
+    /// conversation's transcript and its live events, which key on the
+    /// session's actor, app and scope and check its id and generation. A
+    /// definition whose [`Self::context`] projects every page under the lock
+    /// can answer this without them; the session it returns may then carry no
+    /// page grants and no update cursor, and nothing that reads either may be
+    /// given it (WS-916). The default is the context's session, as before.
+    fn session(
+        wb: &Workbench,
+        headers: &HeaderMap,
+        id: &str,
+        services: &Self::Services,
+    ) -> Result<GaugeAppSession, Box<Response>>
+    where
+        Self: Sized,
+    {
+        Self::context(wb, headers, id, services).map(|context| context.session)
+    }
+
     /// Whether [`Self::prepare`] has anything to do for these services. When
     /// it has not, the request does not leave its task for a blocking thread,
     /// and so is scheduled exactly as before prepare existed.
@@ -973,28 +992,28 @@ async fn messages<D: GaugeAppDefinition>(
     let id = path.map(|Path(id)| id).unwrap_or_default();
     let services = prepared::<D>(&wb, &headers, services).await;
     let mut guard = wb.lock_unpoisoned();
-    let context = match D::context(&guard, &headers, &id, &services) {
+    let session = match D::session(&guard, &headers, &id, &services) {
         Ok(value) => value,
         Err(response) => return *response,
     };
-    if context.session.id != query.session
-        || context.session.generation != query.generation
-        || context.session.scope.id != query.scope
+    if session.id != query.session
+        || session.generation != query.generation
+        || session.scope.id != query.scope
     {
         return D::agent_stale();
     }
-    if let Err(reason) = D::prepare_transcript(&mut guard, &context.session) {
+    if let Err(reason) = D::prepare_transcript(&mut guard, &session) {
         return D::agent_error(reason);
     }
-    match gaugeapp_agent_transcript(guard.store_ref(), &context.session) {
+    match gaugeapp_agent_transcript(guard.store_ref(), &session) {
         Ok(messages) => {
             let thread = if D::RESUMABLE_CONVERSATION {
-                match agent_transcript_payload(&context.session, messages, query.after.as_deref()) {
+                match agent_transcript_payload(&session, messages, query.after.as_deref()) {
                     Ok(thread) => thread,
                     Err(response) => return *response,
                 }
             } else {
-                json!({ "id": gaugeapp_thread_id(&context.session), "messages": messages })
+                json!({ "id": gaugeapp_thread_id(&session), "messages": messages })
             };
             (StatusCode::OK, Json(json!({ "thread": thread }))).into_response()
         }
@@ -1109,17 +1128,17 @@ async fn events<D: GaugeAppDefinition>(
     let services = prepared::<D>(&wb, &headers, services).await;
     let thread_id = {
         let guard = wb.lock_unpoisoned();
-        let context = match D::context(&guard, &headers, &id, &services) {
-            Ok(context) => context,
+        let session = match D::session(&guard, &headers, &id, &services) {
+            Ok(session) => session,
             Err(response) => return *response,
         };
-        if context.session.id != query.session
-            || context.session.generation != query.generation
-            || context.session.scope.id != query.scope
+        if session.id != query.session
+            || session.generation != query.generation
+            || session.scope.id != query.scope
         {
             return D::agent_stale();
         }
-        gaugeapp_thread_id(&context.session)
+        gaugeapp_thread_id(&session)
     };
     let live_event =
         |frame: GaugeAppAgentLiveFrame| -> Result<Event, std::convert::Infallible> {

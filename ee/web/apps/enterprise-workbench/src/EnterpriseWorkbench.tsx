@@ -420,9 +420,13 @@ export function EnterpriseWorkbench(): JSX.Element {
         }
         applyAppearancePreference(preference);
     });
-    // The Account page is what Account Settings itself shows; it is read only
-    // once Account Settings is admitted, never to fill the menus at page load.
-    const [accountIndex, { refetch: refetchAccountIndex }] = createGaugeAppResource(account.session,
+    // The Account page is what Account Settings itself shows, and the workspace
+    // reads it there. The menus and the organization selector read the summary,
+    // so the shell reads the page itself only from a Hub that predates the
+    // summary; reading it beside the workspace read it twice on every open
+    // (WS-934).
+    const accountIndexGrant = createMemo(() => notFound(summary.error) ? account.session() : undefined);
+    const [accountIndex, { refetch: refetchAccountIndex }] = createGaugeAppResource(accountIndexGrant,
         (session) => JSON.stringify([session.actor, session.id, session.generation]),
         (session) => api.readGaugeAppPage(session, "account"));
     /** Every read that lists the person's organizations, after one changes. */

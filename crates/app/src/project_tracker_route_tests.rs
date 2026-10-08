@@ -493,3 +493,112 @@ async fn interrupted_tracker_http_command_recovers_native_closure_on_same_key() 
     );
     assert_eq!(native.runtime.list_instances().unwrap().len(), 2);
 }
+
+/// WS-926: a tracker read prepares under the Workbench lock and reads the
+/// native store without it. On the production canary Home one read took
+/// ~830 ms, six concurrent ones 4.5 s, and an actor read sent beside them
+/// waited 3.1 s. Here the read is paused at its native read: the lock is
+/// free meanwhile, and the read then answers in full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backlog_read_holds_no_workbench_lock_while_it_reads_the_native_store() {
+    let (_root, shared, _context, _invocation, intent) = completion::setup();
+    let (token, admission) = auth(&mut shared.lock_unpoisoned());
+    let app = app(&shared, true);
+    let store = shared.lock_unpoisoned().store_ref().path().to_owned();
+    let (reached, reached_rx) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let reached = std::sync::Mutex::new(reached);
+    let released = std::sync::Mutex::new(released);
+    crate::project_tracker::NATIVE_READ_GATES
+        .lock()
+        .unwrap()
+        .insert(
+            store.clone(),
+            std::sync::Arc::new(move || {
+                reached.lock().unwrap().send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+            }),
+        );
+    let path = format!("/projects/{DEFAULT_PROJECT}/trackers/tasks/issues");
+    let read = tokio::spawn(async move {
+        send(
+            &app,
+            "GET",
+            &path,
+            Some(&token),
+            Some(&admission),
+            None,
+            None,
+        )
+        .await
+    });
+    tokio::task::spawn_blocking(move || {
+        reached_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let free = shared.try_lock().is_ok();
+    release.send(()).unwrap();
+    let (status, body) = read.await.unwrap();
+    crate::project_tracker::NATIVE_READ_GATES
+        .lock()
+        .unwrap()
+        .remove(&store);
+    assert!(free, "the Workbench lock was held through the native read");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["id"] == intent.item_id.as_str()),
+        "{body}"
+    );
+}
+
+/// WS-926: the read is answered only if the caller's standing it was
+/// prepared under still holds when it is done. Authority that moves while
+/// the native store is read refuses the read rather than answering it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backlog_read_refuses_when_its_standing_moves_while_it_reads() {
+    let (_root, shared, _context, _invocation, _intent) = completion::setup();
+    let (token, admission) = auth(&mut shared.lock_unpoisoned());
+    let app = app(&shared, true);
+    let store = shared.lock_unpoisoned().store_ref().path().to_owned();
+    let moved = shared.clone();
+    crate::project_tracker::NATIVE_READ_GATES
+        .lock()
+        .unwrap()
+        .insert(
+            store.clone(),
+            std::sync::Arc::new(move || {
+                moved
+                    .lock_unpoisoned()
+                    .store_mut()
+                    .append_record(crate::org::ORG_SCOPE, "standing-moved", "{}")
+                    .unwrap();
+            }),
+        );
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/projects/{DEFAULT_PROJECT}/trackers/tasks/issues"),
+        Some(&token),
+        Some(&admission),
+        None,
+        None,
+    )
+    .await;
+    crate::project_tracker::NATIVE_READ_GATES
+        .lock()
+        .unwrap()
+        .remove(&store);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.get("issues").is_none(), "{body}");
+}

@@ -353,6 +353,7 @@ impl ContentVault {
         let rewrapped = self.wrap_dek_for_project(&project, &dek)?;
         replace_durably(&root, &path, &rewrapped)?;
         self.key_state.lock().unwrap().cache.remove(scope);
+        self.advance_epoch();
         Ok(true)
     }
 }

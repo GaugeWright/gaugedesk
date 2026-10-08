@@ -51,12 +51,26 @@ pub(crate) fn durable_evidence(
     account_id: &str,
     now_ms: u64,
 ) -> Result<Option<(String, AccountSessionEvidence)>, gaugedesk_store::AdmitError> {
-    let custody = crate::account_auth_custody::AccountAuthCustodyCatalog::rebuild_retained(store)?
-        .account(account_id);
-    if !custody.reads_account_scope() {
-        store.retained_events(crate::account_auth::ACCOUNT_AUTH_SCOPE)?;
-    }
-    let auth = crate::account_auth::AccountAuth::rebuild_for_account(store, account_id)?;
+    Ok(durable_standing(store, session_ref, account_id)?
+        .filter(|(_, evidence)| evidence.expires_at_ms > now_ms))
+}
+
+/// [`durable_evidence`] before the clock is consulted: the session's account
+/// and evidence, with `expires_at_ms` the earliest of every bound the store
+/// holds. It is a function of the store's contents alone, which is what lets
+/// the Workbench remember it until the store changes (WS-1010).
+///
+/// Each authority scope is read strictly once and folded from that read. The
+/// fold used to read the account and account-auth scopes a second time, kind
+/// by kind, after (or before) proving them readable, so a request decrypted
+/// each twice under the Workbench lock and the two reads could disagree.
+pub(crate) fn durable_standing(
+    store: &gaugedesk_store::Store,
+    session_ref: &str,
+    account_id: &str,
+) -> Result<Option<(String, AccountSessionEvidence)>, gaugedesk_store::AdmitError> {
+    let (auth, folded) =
+        crate::account_auth::AccountAuth::rebuild_for_account_retained(store, account_id)?;
     let Some(record) = auth.sessions.get(session_ref) else {
         return Ok(None);
     };
@@ -67,10 +81,13 @@ pub(crate) fn durable_evidence(
         crate::account_auth_custody::account_auth_scope(&record.account_id).map_err(|_| {
             gaugedesk_store::AdmitError::Codec("invalid account-auth scope identity".into())
         })?;
-    store.retained_events(&auth_scope)?;
+    // An account not yet migrated folds the legacy scope; its own scope must
+    // still be readable, as it always had to be.
+    if folded.as_deref() != Some(auth_scope.as_str()) {
+        store.retained_events(&auth_scope)?;
+    }
     let scope = crate::account::account_scope(&record.account_id);
-    store.retained_events(&scope)?;
-    let account = crate::account::Account::rebuild_in(store, &scope)?;
+    let account = crate::account::Account::rebuild_retained_in(store, &scope)?;
     if !record.device_id.is_empty()
         && !account
             .devices
@@ -104,7 +121,7 @@ pub(crate) fn durable_evidence(
         );
     }
     expires_at_ms = expires_at_ms.min(last_seen_ms.saturating_add(crate::account::SESSION_IDLE_MS));
-    if last_seen_ms == 0 || expires_at_ms <= now_ms {
+    if last_seen_ms == 0 {
         return Ok(None);
     }
     Ok(Some((
@@ -116,6 +133,103 @@ pub(crate) fn durable_evidence(
             expires_at_ms,
         },
     )))
+}
+
+/// How long a remembered standing may be answered at all, however still the
+/// store has been. The read stamp already moves with every event appended to
+/// the scopes the standing was folded from and every change in how the
+/// content vault opens them; this bounds anything a stamp cannot see, such as
+/// another process erasing a key file.
+const STANDING_MEMORY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// At most this many sessions are remembered; past it the memory starts over.
+const STANDINGS_REMEMBERED: usize = 4096;
+
+/// Durable session standings remembered against the store (WS-1010).
+///
+/// Every authenticated Hub request resolves its session's durable standing,
+/// and it did so twice per request — in the admission middleware and in the
+/// handler — by strictly reading and decrypting the account's authority and
+/// account scopes, all under the Workbench lock. A page load of a few dozen
+/// requests therefore folded the same account a few dozen times, one request
+/// after another. Only a standing that admits is remembered, only against an
+/// unchanged [`ReadStamp`](gaugedesk_store::ReadStamp) of exactly the scopes it
+/// was folded from, and only for [`STANDING_MEMORY`]; the clock is consulted
+/// on every use, as it always was.
+#[derive(Default)]
+pub(crate) struct RememberedStandings {
+    standings: Mutex<std::collections::HashMap<String, RememberedStanding>>,
+}
+
+struct RememberedStanding {
+    account_id: String,
+    stamp: gaugedesk_store::ReadStamp,
+    at: std::time::Instant,
+    standing: (String, AccountSessionEvidence),
+}
+
+impl RememberedStandings {
+    /// [`durable_standing`], answered from memory when the store has not
+    /// changed since it was last folded for this session and account.
+    pub(crate) fn standing(
+        &self,
+        store: &gaugedesk_store::Store,
+        session_ref: &str,
+        account_id: &str,
+    ) -> Result<Option<(String, AccountSessionEvidence)>, gaugedesk_store::AdmitError> {
+        let stamp = standing_scopes(account_id).and_then(|scopes| {
+            let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
+            store.read_stamp(&scopes)
+        });
+        if let Some(stamp) = &stamp {
+            let remembered = self.lock();
+            if let Some(found) = remembered.get(session_ref).filter(|found| {
+                found.account_id == account_id
+                    && found.stamp == *stamp
+                    && found.at.elapsed() < STANDING_MEMORY
+            }) {
+                return Ok(Some(found.standing.clone()));
+            }
+        }
+        let standing = durable_standing(store, session_ref, account_id)?;
+        // The stamp was taken before the fold, so a change during it leaves
+        // this remembered under a stamp that no later read will match.
+        if let (Some(stamp), Some(standing)) = (stamp, standing.as_ref()) {
+            let mut remembered = self.lock();
+            if remembered.len() >= STANDINGS_REMEMBERED {
+                remembered.clear();
+            }
+            remembered.insert(
+                session_ref.to_owned(),
+                RememberedStanding {
+                    account_id: account_id.to_owned(),
+                    stamp,
+                    at: std::time::Instant::now(),
+                    standing: standing.clone(),
+                },
+            );
+        }
+        Ok(standing)
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, RememberedStanding>> {
+        self.standings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Every scope [`durable_standing`] reads for `account_id`: the legacy
+/// account-auth scope (read for the custody catalog, and for an account not
+/// yet migrated), the account's own account-auth scope and its account scope.
+fn standing_scopes(account_id: &str) -> Option<[String; 3]> {
+    Some([
+        crate::account_auth::ACCOUNT_AUTH_SCOPE.to_owned(),
+        crate::account_auth_custody::account_auth_scope(account_id).ok()?,
+        crate::account::account_scope(account_id),
+    ])
 }
 
 /// The in-memory hot cache of live opaque sessions. It is the request-path resolver

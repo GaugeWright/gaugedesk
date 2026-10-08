@@ -369,6 +369,7 @@ fn existing(
         path: path_string,
         scratch: None,
         home_product: Some(expected.clone()),
+        remembered: Default::default(),
     })
 }
 
@@ -490,6 +491,7 @@ impl Store {
             path: path_string,
             scratch: None,
             home_product: Some(binding),
+            remembered: Default::default(),
         })
     }
 

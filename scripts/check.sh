@@ -128,6 +128,18 @@ export GREEN_BAR_RUN="${GREEN_BAR_RUN:-$(date +%s)-$$}"
 # has always said what a run did not assert. Output is still streamed as it
 # arrives; the tee is what makes it readable twice.
 section_unasserted=""
+# A section is built through the rules cell's scripts/buck2-section.sh: it is
+# `buck2 build` on the gate, and on a workstation joined to the fleet's cache it
+# asks the cache for the gate's own verdict before answering the section here
+# (GaugeWright DR-0252). Plain `buck2 build` where the rules cell predates it.
+buck2_section() {
+  if [ -x ../GaugeWright/scripts/buck2-section.sh ]; then
+    ../GaugeWright/scripts/buck2-section.sh "$@"
+  else
+    buck2 build "$@"
+  fi
+}
+
 gate_section() {
   local transcript status=0
   transcript="$(mktemp)"
@@ -137,7 +149,7 @@ gate_section() {
     if [ -n "${GREEN_BAR_COLD_CARGO_TARGET_DIR:-}" ]; then
       cold_args=(--no-remote-cache -c "green_bar.cold_cargo_target_dir=$GREEN_BAR_COLD_CARGO_TARGET_DIR")
     fi
-    log="$(buck2 build "//:$1" ${cold_args[@]+"${cold_args[@]}"} -c "green_bar.run=$GREEN_BAR_RUN" \
+    log="$(buck2_section "//:$1" ${cold_args[@]+"${cold_args[@]}"} -c "green_bar.run=$GREEN_BAR_RUN" \
       -c "green_bar.prerequisites=${prerequisites:-required}" --show-full-simple-output)" || status=$?
     [ "$status" -eq 0 ] && { cat "$log" | tee "$transcript"; status=$?; }
   else
@@ -474,7 +486,7 @@ native_targets() {
 # A native suite: one target over many actions, so there is no one transcript
 # to print and nothing in it announces what it could not establish.
 native_section() {
-  buck2 build "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" -c "green_bar.prerequisites=${prerequisites:-required}"
+  buck2_section "//:$1" -c "green_bar.run=$GREEN_BAR_RUN" -c "green_bar.prerequisites=${prerequisites:-required}"
 }
 
 
@@ -712,6 +724,10 @@ run_all() {
             -c "green_bar.run=$GREEN_BAR_RUN" -c "green_bar.prerequisites=$prerequisites" \
             > "$transcripts/together" 2>&1 || true
         grep -E "Commands: [0-9]+" "$transcripts/together" | tail -n 1 || true
+        # That tally is every action of every section above. Which test runs
+        # this change actually ran, and for which crates, is the line that
+        # shows the suites are per test binary (scripts/native-runs.py).
+        buck2 log what-ran --format json 2>/dev/null | python3 scripts/native-runs.py || true
     fi
     set -m
     for lane in ${alongside[@]+"${alongside[@]}"}; do
@@ -791,7 +807,11 @@ dispatch() {
         required) run_all required ;;
         contracts) run_contracts "$(prerequisite_policy "${2:-best-effort}")" ;;
         dependencies) run_dependencies "$(prerequisite_policy "${2:-best-effort}")" ;;
-        desktop) run_desktop "$(prerequisite_policy "${2:-}")" ;;
+        # On a Mac this is the macOS compile job's command, so a workstation
+        # asks the fleet for macworker's verdict rather than the Linux bar's
+        # (GaugeWright DR-0252, scripts/buck2-section.sh).
+        desktop) if [ "$(uname -s)" = Darwin ]; then export GREEN_BAR_PROBE="${GREEN_BAR_PROBE:-macos}"; fi
+                 run_desktop "$(prerequisite_policy "${2:-}")" ;;
         mobile) run_mobile "$(prerequisite_policy "${2:-}")" ;;
         rust) run_rust ;;
         web) run_web ;;

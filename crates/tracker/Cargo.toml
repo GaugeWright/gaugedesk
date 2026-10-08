@@ -5,6 +5,12 @@ version.workspace = true
 license.workspace = true
 description = "Per-boundary WhippleScript tracker runtime (ADR 0075): a RuntimeKernel + WorkItemStore embedded per trust boundary for the onboarding/issue surface."
 
+[lib]
+# It has no doctests. Natively a doctest run links the library as a staticlib of
+# everything it depends on; scripts/check-doctest-opt-outs.py holds this to the
+# sources, in both directions.
+doctest = false
+
 [dependencies]
 # WhippleScript is embedded, not shelled out (ADR 0075 §1). Pinned to a commit
 # on the public whipplescript mirror (GaugeWright ADR 0010: whipplescript-src

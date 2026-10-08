@@ -60,6 +60,71 @@ pub trait ContentCodec: Send + Sync {
     /// folds must refuse. Pass-through and legacy plaintext depend on the codec's
     /// policy; a strict deployment need not accept legacy plaintext.
     fn decode(&self, scope: &str, kind: &str, payload: &str) -> Option<String>;
+    /// [`decode`](Self::decode) every `(kind, payload)` row of one scope, in
+    /// order, answered as of one instant. The answers must be exactly those
+    /// `decode` would give each row at that instant; a codec that resolves a
+    /// key per scope overrides this to resolve it once per read rather than
+    /// once per row, which on the Hub was most of the cost of every fold of an
+    /// encrypted scope.
+    fn decode_scope(&self, scope: &str, rows: &[(&str, &str)]) -> Vec<Option<String>> {
+        rows.iter()
+            .map(|(kind, payload)| self.decode(scope, kind, payload))
+            .collect()
+    }
+    /// A value that moves whenever [`decode`](Self::decode) may answer a row
+    /// of `scope` differently than it has: a key erased or fenced, a key that
+    /// could not be resolved. `None`, the default, says the codec cannot tell,
+    /// and nothing decoded from `scope` may be remembered (see
+    /// [`Store::read_stamp`]).
+    fn epoch(&self, scope: &str) -> Option<u64> {
+        let _ = scope;
+        None
+    }
+}
+
+/// What a read of some scopes answered from (see [`Store::read_stamp`]). Two
+/// equal stamps of the same scopes mean every read of those scopes between
+/// them would have answered the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadStamp {
+    heads: Vec<Option<i64>>,
+    codec_epoch: u64,
+}
+
+/// The least string greater than every string that starts with `prefix`, in
+/// code-point order (which is SQLite's binary order for UTF-8 text): the
+/// prefix with its last character advanced, past any that cannot advance.
+/// `None` when no string bounds it, as for the empty prefix.
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = match last as u32 {
+            0xD7FF => Some('\u{E000}'),
+            0x10FFFF => None,
+            point => char::from_u32(point + 1),
+        };
+        if let Some(next) = next {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// [`ContentCodec::decode_scope`], held to one answer per row: a codec that
+/// answers a different number of rows has answered none of them, so every row
+/// reads as unavailable rather than the read silently losing some.
+fn decode_scope(
+    codec: &dyn ContentCodec,
+    scope: &str,
+    rows: &[(&str, &str)],
+) -> Vec<Option<String>> {
+    let decoded = codec.decode_scope(scope, rows);
+    if decoded.len() == rows.len() {
+        decoded
+    } else {
+        vec![None; rows.len()]
+    }
 }
 
 pub struct Store {
@@ -73,6 +138,29 @@ pub struct Store {
     scratch: Option<Arc<ScratchHome>>,
     /// Independently retained coordinates for a dedicated Home product store.
     home_product: Option<home_product::HomeProductBinding>,
+    /// Folds remembered on this connection (see [`Store::remember`]).
+    remembered: std::sync::Mutex<Remembered>,
+}
+
+/// How long [`Store::remember`] answers a fold at all, however still the store
+/// has been. The read stamp already moves with every event appended to the
+/// scope and every change in how the codec opens it; this bounds what a stamp
+/// cannot see, such as another process erasing a key file.
+pub const REMEMBERED_FOR: Duration = Duration::from_secs(5);
+
+/// At most this many folds are remembered per connection; past it the memory
+/// starts over.
+const FOLDS_REMEMBERED: usize = 512;
+
+#[derive(Default)]
+struct Remembered {
+    folds: std::collections::HashMap<(&'static str, String), RememberedFold>,
+}
+
+struct RememberedFold {
+    stamp: ReadStamp,
+    at: std::time::Instant,
+    value: Box<dyn std::any::Any + Send>,
 }
 
 /// An additional exact-input identity claimed atomically with record facts.
@@ -909,6 +997,7 @@ impl Store {
             // outlives whichever connection drops first.
             scratch: self.scratch.clone(),
             home_product: None,
+            remembered: Default::default(),
         })
     }
 
@@ -930,6 +1019,7 @@ impl Store {
             path: self.path.clone(),
             scratch: self.scratch.clone(),
             home_product: None,
+            remembered: Default::default(),
         })
     }
 
@@ -2134,6 +2224,7 @@ impl Store {
             path,
             scratch: None,
             home_product: None,
+            remembered: Default::default(),
         })
     }
 
@@ -2358,53 +2449,156 @@ impl Store {
         Ok((position, true))
     }
 
+    /// A stamp that changes whenever a read of `scopes` may answer
+    /// differently: an event appended to one of them, through any connection,
+    /// or the codec changing how it opens one of them. A projection folded
+    /// from those scopes alone may be remembered while the stamp is unchanged.
+    ///
+    /// A scope's head is its greatest position. Events are only ever appended,
+    /// so the head moves with every change to the scope and with nothing
+    /// else: a write to another scope leaves the stamp, and whatever was
+    /// remembered against it, alone. Dispatch authorization rests on the same
+    /// heads.
+    ///
+    /// `None` when nothing may be remembered: a transaction is open on this
+    /// connection, whose reads see writes that may yet roll back, or the codec
+    /// cannot say when its answers for one of the scopes change.
+    pub fn read_stamp(&self, scopes: &[&str]) -> Option<ReadStamp> {
+        if !self.conn.is_autocommit() {
+            return None;
+        }
+        let mut codec_epoch = 0_u64;
+        if let Some(codec) = &self.codec {
+            for scope in scopes {
+                codec_epoch = codec_epoch.wrapping_add(codec.epoch(scope)?);
+            }
+        }
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT MAX(position) FROM events WHERE scope_id = ?1")
+            .ok()?;
+        let heads = scopes
+            .iter()
+            .map(|scope| statement.query_row(params![scope], |row| row.get::<_, Option<i64>>(0)))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        Some(ReadStamp { heads, codec_epoch })
+    }
+
+    /// `fold` of `scope`, answered from this connection's memory while
+    /// nothing a read of `scope` could answer differently has changed (see
+    /// [`read_stamp`](Self::read_stamp)), and for at most [`REMEMBERED_FOR`].
+    /// `name` names the fold, so two folds of one scope are remembered apart.
+    ///
+    /// `fold` must read nothing but `scope`: a change to any other scope does
+    /// not move the stamp it is remembered against. An error is never
+    /// remembered, and nothing is remembered inside a transaction or through
+    /// a codec that cannot say when its answers change.
+    ///
+    /// The Hub folds the same organization and account scopes on almost every
+    /// request, under the Workbench lock, and between two writes the answer is
+    /// the same each time (WS-1010).
+    pub fn remember<T: Clone + Send + 'static>(
+        &self,
+        name: &'static str,
+        scope: &str,
+        fold: impl FnOnce(&Store) -> Result<T, AdmitError>,
+    ) -> Result<T, AdmitError> {
+        let Some(stamp) = self.read_stamp(&[scope]) else {
+            return fold(self);
+        };
+        let key = (name, scope.to_owned());
+        {
+            let remembered = self
+                .remembered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(value) = remembered
+                .folds
+                .get(&key)
+                .filter(|found| found.stamp == stamp && found.at.elapsed() < REMEMBERED_FOR)
+                .and_then(|found| found.value.downcast_ref::<T>())
+            {
+                return Ok(value.clone());
+            }
+        }
+        // The stamp was taken before the fold, so a change during it leaves
+        // the answer remembered under a stamp no later read will match.
+        let value = fold(self)?;
+        let mut remembered = self
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remembered
+            .folds
+            .retain(|_, found| found.at.elapsed() < REMEMBERED_FOR);
+        if remembered.folds.len() >= FOLDS_REMEMBERED {
+            remembered.folds.clear();
+        }
+        remembered.folds.insert(
+            key,
+            RememberedFold {
+                stamp,
+                at: std::time::Instant::now(),
+                value: Box::new(value.clone()),
+            },
+        );
+        Ok(value)
+    }
+
     /// All records of one `kind` in a scope, in order — a durable projection
     /// source (e.g. the transcript snapshot). A content codec (`SECAUD-9/6`) decodes
     /// each row; a crypto-erased row (`decode` ⇒ `None`) is dropped (content gone).
     pub fn records(&self, scope_id: &str, kind: &str) -> Result<Vec<String>, AdmitError> {
+        let payloads = self.kind_payloads(scope_id, kind)?;
+        Ok(self
+            .decode_kind(scope_id, kind, payloads)
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    fn kind_payloads(&self, scope_id: &str, kind: &str) -> Result<Vec<String>, AdmitError> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![scope_id, kind], |r| r.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let payload = row?;
-            match &self.codec {
-                Some(codec) => {
-                    if let Some(plain) = codec.decode(scope_id, kind, &payload) {
-                        out.push(plain);
-                    }
-                }
-                None => out.push(payload),
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Decode payloads of one kind in one scope with one codec read, so a
+    /// codec that resolves its scope key does so once rather than per row.
+    fn decode_kind(
+        &self,
+        scope_id: &str,
+        kind: &str,
+        payloads: Vec<String>,
+    ) -> Vec<Option<String>> {
+        match &self.codec {
+            Some(codec) => {
+                let rows: Vec<(&str, &str)> = payloads
+                    .iter()
+                    .map(|payload| (kind, payload.as_str()))
+                    .collect();
+                decode_scope(codec.as_ref(), scope_id, &rows)
             }
+            None => payloads.into_iter().map(Some).collect(),
         }
-        Ok(out)
     }
 
     /// The decoded records of one `kind` for an authority fold. Like
     /// [`Self::retained_events`], an unavailable record refuses the read instead
     /// of disappearing, but only the named kind is read and decoded.
     pub fn retained_records(&self, scope_id: &str, kind: &str) -> Result<Vec<String>, AdmitError> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT payload FROM events WHERE scope_id = ?1 AND kind = ?2 ORDER BY position",
-        )?;
-        let rows = stmt.query_map(params![scope_id, kind], |r| r.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let payload = row?;
-            match &self.codec {
-                Some(codec) => match codec.decode(scope_id, kind, &payload) {
-                    Some(plain) => out.push(plain),
-                    None => {
-                        return Err(AdmitError::Codec(
-                            "authority history contains an unavailable record".into(),
-                        ))
-                    }
-                },
-                None => out.push(payload),
-            }
-        }
-        Ok(out)
+        let payloads = self.kind_payloads(scope_id, kind)?;
+        self.decode_kind(scope_id, kind, payloads)
+            .into_iter()
+            .map(|plain| {
+                plain.ok_or_else(|| {
+                    AdmitError::Codec("authority history contains an unavailable record".into())
+                })
+            })
+            .collect()
     }
 
     /// All decoded records of one `kind`, paired with the exact scope that owns
@@ -2422,17 +2616,28 @@ impl Store {
         let rows = stmt.query_map(params![kind], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
+        let rows = rows.collect::<Result<Vec<_>, _>>()?;
         let mut out = Vec::new();
-        for row in rows {
-            let (scope, payload) = row?;
-            match &self.codec {
-                Some(codec) => {
-                    if let Some(plain) = codec.decode(&scope, kind, &payload) {
-                        out.push((scope, plain));
-                    }
-                }
-                None => out.push((scope, payload)),
+        // Rows arrive grouped by scope; each scope's run is decoded together.
+        let mut start = 0;
+        while start < rows.len() {
+            let scope = rows[start].0.clone();
+            let end = rows[start..]
+                .iter()
+                .position(|(other, _)| *other != scope)
+                .map_or(rows.len(), |offset| start + offset);
+            let payloads = rows[start..end]
+                .iter()
+                .map(|(_, payload)| payload.clone())
+                .collect();
+            for plain in self
+                .decode_kind(&scope, kind, payloads)
+                .into_iter()
+                .flatten()
+            {
+                out.push((scope.clone(), plain));
             }
+            start = end;
         }
         Ok(out)
     }
@@ -2469,23 +2674,59 @@ impl Store {
                 r.get::<_, String>(2)?,
             ))
         })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (pos, kind, payload) = row?;
-            match &self.codec {
-                Some(codec) => match codec.decode(scope_id, &kind, &payload) {
-                    Some(plain) => out.push((pos, kind, plain)),
-                    None if require_retained => {
-                        return Err(AdmitError::Codec(
-                            "authority history contains an unavailable record".into(),
-                        ))
-                    }
-                    None => {}
-                },
-                None => out.push((pos, kind, payload)),
+        let rows = rows.collect::<Result<Vec<_>, _>>()?;
+        let Some(codec) = &self.codec else {
+            return Ok(rows);
+        };
+        let pairs: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(_, kind, payload)| (kind.as_str(), payload.as_str()))
+            .collect();
+        let decoded = decode_scope(codec.as_ref(), scope_id, &pairs);
+        let mut out = Vec::with_capacity(rows.len());
+        for ((pos, kind, _), plain) in rows.into_iter().zip(decoded) {
+            match plain {
+                Some(plain) => out.push((pos, kind, plain)),
+                None if require_retained => {
+                    return Err(AdmitError::Codec(
+                        "authority history contains an unavailable record".into(),
+                    ))
+                }
+                None => {}
             }
         }
         Ok(out)
+    }
+
+    /// Every scope whose id starts with `prefix`, in order. It reads only the
+    /// scope index's range for the prefix, where
+    /// [`scope_high_water_marks`](Self::scope_high_water_marks) aggregates
+    /// every event the store holds: a project's tracker discovery ran that
+    /// over a Home's whole history on every task-bar read (WS-926).
+    pub fn scopes_with_prefix(&self, prefix: &str) -> Result<Vec<String>, AdmitError> {
+        // Every id with the prefix sorts at or after it and before its
+        // successor; the equality filter keeps the answer exact regardless.
+        let rows = match prefix_successor(prefix) {
+            Some(successor) => self
+                .conn
+                .prepare_cached(
+                    "SELECT DISTINCT scope_id FROM events \
+                     WHERE scope_id >= ?1 AND scope_id < ?2 \
+                     AND substr(scope_id, 1, length(?1)) = ?1 ORDER BY scope_id",
+                )?
+                .query_map(params![prefix, successor], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => self
+                .conn
+                .prepare_cached(
+                    "SELECT DISTINCT scope_id FROM events \
+                     WHERE scope_id >= ?1 \
+                     AND substr(scope_id, 1, length(?1)) = ?1 ORDER BY scope_id",
+                )?
+                .query_map(params![prefix], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
     }
 
     /// Monotonic high-water cursor for every admitted scope. Migration and
@@ -2512,6 +2753,7 @@ impl Store {
     /// content kinds under per-scope keys. Builder; without one the store is plaintext.
     pub fn with_codec(mut self, codec: Arc<dyn ContentCodec>) -> Self {
         self.codec = Some(codec);
+        self.remembered = Default::default();
         self
     }
 
@@ -4232,6 +4474,271 @@ mod tests {
         fn decode(&self, _scope: &str, _kind: &str, payload: &str) -> Option<String> {
             Some(payload.to_owned())
         }
+    }
+
+    /// Reads hand a codec every row of a scope at once (Hub lock work). One
+    /// that answers a different number of rows than it was given has answered
+    /// none of them: a retained read refuses and an ordinary one reads nothing,
+    /// rather than pairing answers with the wrong rows or losing some quietly.
+    #[test]
+    fn a_codec_answering_the_wrong_number_of_rows_answers_none() {
+        struct ShortCodec;
+        impl ContentCodec for ShortCodec {
+            fn encode(&self, _scope: &str, _kind: &str, payload: &str) -> Result<String, String> {
+                Ok(payload.to_owned())
+            }
+            fn decode(&self, _scope: &str, _kind: &str, payload: &str) -> Option<String> {
+                Some(payload.to_owned())
+            }
+            fn decode_scope(&self, _scope: &str, rows: &[(&str, &str)]) -> Vec<Option<String>> {
+                rows.iter()
+                    .skip(1)
+                    .map(|(_, payload)| Some((*payload).to_owned()))
+                    .collect()
+            }
+        }
+        let mut store = Store::open_in_memory()
+            .unwrap()
+            .with_codec(std::sync::Arc::new(ShortCodec));
+        store.append_record("eng-1", "secret", "first").unwrap();
+        store.append_record("eng-1", "secret", "second").unwrap();
+        store.append_record("eng-2", "secret", "third").unwrap();
+        assert!(store.records("eng-1", "secret").unwrap().is_empty());
+        assert!(store.retained_records("eng-1", "secret").is_err());
+        assert!(store.events("eng-1").unwrap().is_empty());
+        assert!(store.retained_events("eng-1").is_err());
+        assert!(store.records_across_scopes("secret").unwrap().is_empty());
+    }
+
+    /// The default `decode_scope` is `decode` row by row, and every read that
+    /// now batches still answers per scope: rows of two scopes read across
+    /// scopes are each decoded under their own scope.
+    #[test]
+    fn a_batched_read_decodes_each_row_under_its_own_scope() {
+        let codec = std::sync::Arc::new(RevCodec {
+            erased: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        });
+        let mut store = Store::open_in_memory().unwrap().with_codec(codec.clone());
+        for (scope, payload) in [
+            ("eng-1", "a1"),
+            ("eng-2", "b1"),
+            ("eng-1", "a2"),
+            ("eng-3", "c1"),
+        ] {
+            store.append_record(scope, "secret", payload).unwrap();
+        }
+        codec.erased.lock().unwrap().insert("eng-2".into());
+        assert_eq!(
+            store.records_across_scopes("secret").unwrap(),
+            vec![
+                ("eng-1".to_owned(), "a1".to_owned()),
+                ("eng-1".to_owned(), "a2".to_owned()),
+                ("eng-3".to_owned(), "c1".to_owned()),
+            ]
+        );
+        assert_eq!(store.records("eng-1", "secret").unwrap(), vec!["a1", "a2"]);
+        assert!(store.records("eng-2", "secret").unwrap().is_empty());
+        assert!(store.retained_records("eng-2", "secret").is_err());
+        assert_eq!(
+            store.retained_records("eng-3", "secret").unwrap(),
+            vec!["c1"]
+        );
+    }
+
+    /// A projection may be remembered against a read stamp only if every way
+    /// the scopes' reads could change moves it, and should survive anything
+    /// that cannot change them (WS-1010).
+    #[test]
+    fn a_read_stamp_moves_with_its_scopes_and_codec_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stamp.db");
+        let mut store = Store::open(path.to_str().unwrap()).unwrap();
+        let first = store.read_stamp(&["eng-1"]).unwrap();
+        assert_eq!(
+            store.read_stamp(&["eng-1"]),
+            Some(first.clone()),
+            "a read changes nothing"
+        );
+        store.records("eng-1", "secret").unwrap();
+        assert_eq!(store.read_stamp(&["eng-1"]), Some(first.clone()));
+
+        store.append_record("eng-2", "secret", "elsewhere").unwrap();
+        assert_eq!(
+            store.read_stamp(&["eng-1"]),
+            Some(first.clone()),
+            "another scope's write changes nothing this scope reads"
+        );
+        store.append_record("eng-1", "secret", "mine").unwrap();
+        let after_own = store.read_stamp(&["eng-1"]).unwrap();
+        assert_ne!(
+            after_own, first,
+            "a write to the scope through this connection moves it"
+        );
+
+        let mut other = store.sibling().unwrap();
+        other.append_record("eng-1", "secret", "theirs").unwrap();
+        let after_other = store.read_stamp(&["eng-1"]).unwrap();
+        assert_ne!(
+            after_other, after_own,
+            "so does one through another connection"
+        );
+        assert_ne!(
+            store.read_stamp(&["eng-1", "eng-2"]).unwrap(),
+            after_other,
+            "a stamp is of exactly the scopes named"
+        );
+
+        store.conn.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            store.read_stamp(&["eng-1"]),
+            None,
+            "inside a transaction its reads may yet roll back"
+        );
+        store.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(store.read_stamp(&["eng-1"]).is_some());
+
+        // A codec that cannot say when it changes makes nothing rememberable.
+        let silent = Store::open(path.to_str().unwrap())
+            .unwrap()
+            .with_codec(std::sync::Arc::new(FailingCodec));
+        assert_eq!(silent.read_stamp(&["eng-1"]), None);
+        assert!(
+            silent.read_stamp(&[]).is_some(),
+            "no scope, no codec answer needed"
+        );
+
+        struct Epochs(std::sync::atomic::AtomicU64);
+        impl ContentCodec for Epochs {
+            fn encode(&self, _scope: &str, _kind: &str, payload: &str) -> Result<String, String> {
+                Ok(payload.to_owned())
+            }
+            fn decode(&self, _scope: &str, _kind: &str, payload: &str) -> Option<String> {
+                Some(payload.to_owned())
+            }
+            fn epoch(&self, scope: &str) -> Option<u64> {
+                (scope != "held-project").then(|| self.0.load(std::sync::atomic::Ordering::SeqCst))
+            }
+        }
+        let epochs = std::sync::Arc::new(Epochs(std::sync::atomic::AtomicU64::new(0)));
+        let watched = Store::open(path.to_str().unwrap())
+            .unwrap()
+            .with_codec(epochs.clone());
+        let before = watched.read_stamp(&["eng-1", "eng-2"]).unwrap();
+        epochs.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(watched.read_stamp(&["eng-1", "eng-2"]).unwrap(), before);
+        assert_eq!(watched.read_stamp(&["eng-1", "held-project"]), None);
+    }
+
+    /// WS-1010: a remembered fold is answered without folding again until
+    /// anything that could change its answer happens, and never inside a
+    /// transaction, after an error, or through a codec that cannot tell.
+    #[test]
+    fn a_remembered_fold_is_answered_until_its_scope_could_have_changed() {
+        let folds = std::cell::Cell::new(0);
+        let count = |store: &Store| {
+            folds.set(folds.get() + 1);
+            Ok(store.records("eng-1", "secret")?.len())
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store.append_record("eng-1", "secret", "one").unwrap();
+        assert_eq!(store.remember("count", "eng-1", count).unwrap(), 1);
+        assert_eq!(store.remember("count", "eng-1", count).unwrap(), 1);
+        assert_eq!(folds.get(), 1, "the second answer came from memory");
+        assert_eq!(store.remember("other", "eng-1", count).unwrap(), 1);
+        assert_eq!(folds.get(), 2, "another fold of the scope is its own");
+
+        store.append_record("eng-2", "secret", "elsewhere").unwrap();
+        assert_eq!(store.remember("count", "eng-1", count).unwrap(), 1);
+        assert_eq!(folds.get(), 2, "another scope's write leaves it remembered");
+
+        store.append_record("eng-1", "secret", "two").unwrap();
+        assert_eq!(store.remember("count", "eng-1", count).unwrap(), 2);
+        assert_eq!(folds.get(), 3, "a write to the scope is folded again");
+
+        let mut other = store.sibling().unwrap();
+        other.append_record("eng-1", "secret", "three").unwrap();
+        assert_eq!(store.remember("count", "eng-1", count).unwrap(), 3);
+        assert_eq!(folds.get(), 4, "so is another connection's");
+
+        store.conn.execute_batch("BEGIN").unwrap();
+        assert_eq!(store.remember("count", "eng-1", count).unwrap(), 3);
+        assert_eq!(store.remember("count", "eng-1", count).unwrap(), 3);
+        assert_eq!(folds.get(), 6, "nothing is remembered inside a transaction");
+        store.conn.execute_batch("ROLLBACK").unwrap();
+
+        let refusals = std::cell::Cell::new(0);
+        let refuse = |_: &Store| -> Result<usize, AdmitError> {
+            refusals.set(refusals.get() + 1);
+            Err(AdmitError::Codec("unavailable".into()))
+        };
+        assert!(store.remember("refuse", "eng-1", refuse).is_err());
+        assert!(store.remember("refuse", "eng-1", refuse).is_err());
+        assert_eq!(refusals.get(), 2, "an error is never remembered");
+
+        let silent = Store::open_in_memory()
+            .unwrap()
+            .with_codec(std::sync::Arc::new(FailingCodec));
+        let before = folds.get();
+        silent.remember("count", "eng-1", count).unwrap();
+        silent.remember("count", "eng-1", count).unwrap();
+        assert_eq!(
+            folds.get(),
+            before + 2,
+            "a codec that cannot tell disables it"
+        );
+    }
+
+    /// WS-926: tracker discovery names a project's tracker scopes by prefix,
+    /// and must find exactly the ones `scope_high_water_marks` would have.
+    #[test]
+    fn scopes_with_a_prefix_are_exactly_those_the_high_water_marks_name() {
+        let mut store = Store::open_in_memory().unwrap();
+        for scope in [
+            "project::a::tracker::74",
+            "project::a::tracker::7461736b73",
+            "project::a::tracker::74::grant",
+            "project::a::tracker:",
+            "project::a::trackers",
+            "project::a::tracker",
+            "project::ab::tracker::74",
+            "project::a::tracker::%_",
+            "project::a::tracker::\u{10FFFF}",
+            "project::a::tracker::\u{10FFFF}\u{10FFFF}x",
+            "project::a::tracker;",
+            "project::b::tracker::74",
+            "zzz",
+        ] {
+            store.append_record(scope, "note", "{}").unwrap();
+            store.append_record(scope, "note", "{}").unwrap();
+        }
+        for prefix in [
+            "project::a::tracker::",
+            "project::a::tracker",
+            "project::",
+            "project::a::tracker::\u{10FFFF}",
+            "\u{10FFFF}",
+            "",
+            "nothing",
+        ] {
+            let expected: Vec<String> = store
+                .scope_high_water_marks()
+                .unwrap()
+                .into_keys()
+                .filter(|scope| scope.starts_with(prefix))
+                .collect();
+            assert_eq!(
+                store.scopes_with_prefix(prefix).unwrap(),
+                expected,
+                "{prefix}"
+            );
+        }
+        assert_eq!(
+            store
+                .scopes_with_prefix("project::a::tracker::")
+                .unwrap()
+                .len(),
+            6
+        );
     }
 
     #[test]

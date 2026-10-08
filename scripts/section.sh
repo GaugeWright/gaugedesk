@@ -250,12 +250,15 @@ case "${1:-}" in
         cargo test --workspace
     fi ;;
   # The native targets are rendered from Cargo.toml (GaugeWright BUILD.md
-  # stages 5 and 6); this fails when the rendering has drifted from it.
+  # stages 5 and 6); this fails when the rendering has drifted from it. And
+  # which libraries run doctests, on either path, is held to which have any.
   native-crates)
     if projected; then
         echo "#unasserted: Buck2 target rendering is private and is not checked in the public mirror"
     else
         python3 scripts/buckify-crates.py --check
+        python3 scripts/check-doctest-opt-outs.py --self-test
+        python3 scripts/check-doctest-opt-outs.py
     fi ;;
   no-default-features)
     # The open build must stay buildable without the enterprise features. Keep

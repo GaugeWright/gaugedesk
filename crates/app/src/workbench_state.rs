@@ -153,6 +153,11 @@ pub struct Workbench {
     /// link against that one account's current authority and falls back to the
     /// full projection, so a request reads one account instead of all (WS-849).
     pub(crate) linked_subject_hints: Mutex<BTreeMap<(String, String), String>>,
+    /// Each recently authenticated session's durable standing, remembered
+    /// against the store's read stamp for the scopes it was folded from, so a
+    /// burst of requests on one session folds its authority once instead of
+    /// once per request under this lock (WS-1010).
+    pub(crate) session_standings: crate::account_session::RememberedStandings,
     /// Optional streaming audit sink (`AUD-4`).
     pub(crate) audit_sink: Option<Arc<dyn audit::AuditSink>>,
     /// Governance key store used to sign audit checkpoints (`SECAUD-2`).
@@ -508,6 +513,7 @@ impl Workbench {
             relay_crossings: None,
             account_sessions: Arc::new(crate::account_session::AccountSessionStore::new()),
             linked_subject_hints: Mutex::default(),
+            session_standings: Default::default(),
             audit_sink: None,
             audit_signer: None,
             content_vault: None,

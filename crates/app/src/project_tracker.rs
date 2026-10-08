@@ -1061,6 +1061,9 @@ pub struct ControlTrackerIssue {
 
 #[path = "project_tracker_query.rs"]
 mod query;
+#[cfg(test)]
+pub(crate) use query::NATIVE_READ_GATES;
 pub use query::{
-    ProjectTrackerBacklog, ProjectTrackerIssue, ProjectTrackerTasks, ReadableProjectTracker,
+    PreparedTrackerBacklog, ProjectTrackerBacklog, ProjectTrackerIssue, ProjectTrackerTasks,
+    ReadableProjectTracker,
 };

@@ -404,6 +404,7 @@ impl ContentVault {
             state
                 .cache
                 .retain(|scope, _| crate::org::sha256_hex(scope) != key_id);
+            self.advance_epoch();
         }
         let existed = match std::fs::remove_file(key_path(&root, key_id)) {
             Ok(()) => true,

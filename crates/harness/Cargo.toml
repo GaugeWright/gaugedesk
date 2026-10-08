@@ -5,6 +5,12 @@ version.workspace = true
 license.workspace = true
 description = "gaugewright runtime seam: the adapter-free Harness contract, egress gate, neutral turn/content types, and the OS sandbox."
 
+[lib]
+# It has no doctests. Natively a doctest run links the library as a staticlib of
+# everything it depends on; scripts/check-doctest-opt-outs.py holds this to the
+# sources, in both directions.
+doctest = false
+
 [dependencies]
 gaugedesk-env = { path = "../env" }
 serde = { version = "1", features = ["derive"] }

@@ -158,6 +158,7 @@ impl ContentVault {
             .sync_all()?;
         sync_directory(&root)?;
         self.key_state.lock().unwrap().cache.remove(expected_scope);
+        self.advance_epoch();
         Ok(PreparedScopeKey {
             root,
             scope: expected_scope.into(),

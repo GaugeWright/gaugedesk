@@ -771,7 +771,14 @@ impl Org {
     /// Rebuild a tenant's directory by folding **its** scope's records in position order
     /// (latest-wins). For the default tenant pass [`ORG_SCOPE`]; for a named tenant pass
     /// [`tenant_scope`]`(id)`. Tenancy-as-scope (`DEPLOY-6`): the fold is scope-isolated.
+    ///
+    /// Remembered on the store until the scope changes (WS-1010): every Hub
+    /// admission folds its tenant's directory, under the Workbench lock.
     pub fn rebuild_in(store: &Store, scope: &str) -> Result<Org, AdmitError> {
+        store.remember("org", scope, |store| Self::fold_in(store, scope))
+    }
+
+    fn fold_in(store: &Store, scope: &str) -> Result<Org, AdmitError> {
         let mut org = Org {
             scope: scope.to_owned(),
             ..Org::default()
