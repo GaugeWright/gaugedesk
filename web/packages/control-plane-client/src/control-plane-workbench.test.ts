@@ -229,13 +229,13 @@ describe("project fork and pull", () => {
 
     it("pulls against the previewed cut with a choice for every conflict", async () => {
         const json = vi.fn()
-            .mockResolvedValueOnce({ upstream: { available: true, project_id: "proj-1", name: "Peach", source_cut: "cut-9", take: ["a.md"], remove: [], conflicts: ["b.md"] } })
+            .mockResolvedValueOnce({ upstream: { available: true, project_id: "proj-1", name: "Peach", source_cut: "cut-9", fork_cut: "fork-3", take: ["a.md"], remove: [], conflicts: ["b.md"] } })
             .mockResolvedValueOnce({ pulled: 2 });
         const transport = { base: "", json } as WorkbenchTransport;
         const upstream = await projectUpstream(transport, "proj-2" as ProjectId);
-        expect(upstream).toMatchObject({ available: true, sourceCut: "cut-9", take: ["a.md"], conflicts: ["b.md"] });
-        const result = await pullProjectUpstream(transport, "proj-2" as ProjectId, "cut-9", { "b.md": "theirs" });
-        expect(json).toHaveBeenLastCalledWith("POST", "/projects/proj-2/upstream/pull", { source_cut: "cut-9", resolutions: { "b.md": "theirs" } });
+        expect(upstream).toMatchObject({ available: true, sourceCut: "cut-9", forkCut: "fork-3", take: ["a.md"], conflicts: ["b.md"] });
+        const result = await pullProjectUpstream(transport, "proj-2" as ProjectId, "cut-9", "fork-3", { "b.md": "theirs" });
+        expect(json).toHaveBeenLastCalledWith("POST", "/projects/proj-2/upstream/pull", { source_cut: "cut-9", fork_cut: "fork-3", resolutions: { "b.md": "theirs" } });
         expect(result.pulled).toBe(2);
     });
 });
@@ -283,5 +283,23 @@ describe("publisher authority", () => {
     it("fails closed on a malformed key", async () => {
         const transport = { base: "", json: vi.fn().mockResolvedValue({ public_key: "nope" }) } as WorkbenchTransport;
         await expect(publicPublisherKey(transport)).rejects.toThrow(/malformed/);
+    });
+});
+
+
+describe("required fork preview revisions", () => {
+    it("refuses absent or malformed revisions rather than treating them as empty Main", async () => {
+        for (const cuts of [{}, {source_cut: null}, {fork_cut: null}, {source_cut: "", fork_cut: null}]) {
+            const transport = { json: vi.fn(async () => ({upstream: {available: true, project_id: "p", ...cuts}})) } as unknown as WorkbenchTransport;
+            await expect(projectUpstream(transport, "p" as ProjectId)).rejects.toThrow("both original and fork revisions");
+        }
+    });
+    it("retains explicit empty original and fork revisions in the actual pull payload", async () => {
+        const json = vi.fn().mockResolvedValueOnce({upstream: {available: true, project_id: "p", source_cut: null, fork_cut: null}}).mockResolvedValueOnce({pulled:0});
+        const transport = {json} as unknown as WorkbenchTransport;
+        const preview = await projectUpstream(transport, "p" as ProjectId);
+        expect(preview).toMatchObject({sourceCut:null, forkCut:null});
+        await pullProjectUpstream(transport, "p" as ProjectId, null, null, {});
+        expect(json).toHaveBeenLastCalledWith("POST", "/projects/p/upstream/pull", {source_cut:null, fork_cut:null, resolutions:{}});
     });
 });

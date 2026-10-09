@@ -571,6 +571,7 @@ export type ProjectUpstream =
         readonly projectId: ProjectId;
         readonly name: string | null;
         readonly sourceCut: string | null;
+        readonly forkCut: string | null;
         readonly take: readonly string[];
         readonly remove: readonly string[];
         readonly conflicts: readonly string[];
@@ -592,6 +593,7 @@ export async function projectUpstream(
             project_id?: string;
             name?: string | null;
             source_cut?: string | null;
+            fork_cut?: string | null;
             take?: string[];
             remove?: string[];
             conflicts?: string[];
@@ -608,11 +610,16 @@ export async function projectUpstream(
             reason: u.reason ?? "Pulling is unavailable.",
         };
     }
+    if (!(u.source_cut === null || typeof u.source_cut === "string" && u.source_cut.length > 0)
+        || !(u.fork_cut === null || typeof u.fork_cut === "string" && u.fork_cut.length > 0)) {
+        throw new Error("Pull preview must name both original and fork revisions");
+    }
     return {
         available: true,
         projectId: (u.project_id ?? "") as ProjectId,
         name: u.name ?? null,
-        sourceCut: u.source_cut ?? null,
+        sourceCut: u.source_cut,
+        forkCut: u.fork_cut,
         take: u.take ?? [],
         remove: u.remove ?? [],
         conflicts: u.conflicts ?? [],
@@ -625,10 +632,12 @@ export async function pullProjectUpstream(
     transport: WorkbenchTransport,
     id: ProjectId,
     sourceCut: string | null,
+    forkCut: string | null,
     resolutions: Readonly<Record<string, "mine" | "theirs">>,
 ): Promise<{ readonly pulled: number }> {
     const o = (await transport.json("POST", `/projects/${id}/upstream/pull`, {
         source_cut: sourceCut,
+        fork_cut: forkCut,
         resolutions,
     })) as { pulled?: number };
     return { pulled: o.pulled ?? 0 };

@@ -52,7 +52,10 @@ pub async fn get_project_models(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    let scope = wb.credential_scope_for(crate::net_http::bearer(&headers));
+    let scope = match wb.credential_scope_for(crate::net_http::bearer(&headers)) {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     let access = wb.project_model_access_in(&scope, &project);
     (StatusCode::OK, Json(access)).into_response()
 }

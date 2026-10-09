@@ -790,6 +790,30 @@
         "signature": "fn witnessed_turn_start_guarded (& self , _actor : & str , _command : & str , _check : & mut dyn FnMut () -> Result < () > ,) -> Result < NativeWitnessedTurnTarget >"
       },
       "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "merge_into_main_at",
+        "owner": "ChatWorkspace",
+        "signature": "fn merge_into_main_at (& self , _expected : Option < & str >) -> Result < MergeOutcome >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "main_snapshot",
+        "owner": "Workspace",
+        "signature": "fn main_snapshot (& self) -> Result < MainSnapshot >"
+      },
+      "classification": "requires-provenance-review"
+    },
+    {
+      "declaration": {
+        "name": "read_snapshot_file",
+        "owner": "Workspace",
+        "signature": "fn read_snapshot_file (& self , _snapshot : & MainSnapshot , _path : & str) -> Result < Option < Vec < u8 > > >"
+      },
+      "classification": "requires-provenance-review"
     }
   ],
   "profiles": {
@@ -1217,7 +1241,7 @@
         "callable": "impl inherent for Workbench::revert_engagement",
         "capability": "publish",
         "count": 1,
-        "expression": "self . publish (id , ServerEvent :: Admitted { kind : \"revert\" . into () , text : \"reverted to main — engagement work discarded\" . into () , } ,)",
+        "expression": "self . publish (id , ServerEvent :: Admitted { kind : \"revert\" . into () , text : \"reverted to main \u2014 engagement work discarded\" . into () , } ,)",
         "file": "crates/app/src/engagement_routes.rs"
       },
       "profile": "editor-and-import"
@@ -1387,7 +1411,7 @@
         "callable": "admit_crossing",
         "capability": "publish",
         "count": 1,
-        "expression": "guard . publish (FED_INBOX_SCOPE , ServerEvent :: Admitted { kind : \"federated\" . into () , text : format ! (\"{} ← {} : {}\" , wire . target , wire . source , wire . payload_handle) , } ,)",
+        "expression": "guard . publish (FED_INBOX_SCOPE , ServerEvent :: Admitted { kind : \"federated\" . into () , text : format ! (\"{} \u2190 {} : {}\" , wire . target , wire . source , wire . payload_handle) , } ,)",
         "file": "crates/app/src/federation.rs"
       },
       "profile": "topology-and-settlement"
@@ -1407,7 +1431,7 @@
         "callable": "admit_remote_consent",
         "capability": "publish",
         "count": 1,
-        "expression": "guard . publish (& req . review_scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"remote consent from {} → {:?}\" , req . consenting_authority , state . phase) , } ,)",
+        "expression": "guard . publish (& req . review_scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"remote consent from {} \u2192 {:?}\" , req . consenting_authority , state . phase) , } ,)",
         "file": "crates/app/src/federation.rs"
       },
       "profile": "topology-and-settlement"
@@ -2837,7 +2861,7 @@
         "callable": "impl inherent for Workbench::admit_export_command",
         "capability": "publish",
         "count": 1,
-        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"export\" . into () , text : format ! (\"export → {:?}\" , admission . state . phase) , } ,)",
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"export\" . into () , text : format ! (\"export \u2192 {:?}\" , admission . state . phase) , } ,)",
         "file": "crates/app/src/lifecycle_routes.rs"
       },
       "profile": "publication-review"
@@ -2847,7 +2871,7 @@
         "callable": "impl inherent for Workbench::admit_review_command",
         "capability": "publish",
         "count": 1,
-        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"review → {:?}\" , admission . state . phase) , } ,)",
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"review\" . into () , text : format ! (\"review \u2192 {:?}\" , admission . state . phase) , } ,)",
         "file": "crates/app/src/lifecycle_routes.rs"
       },
       "profile": "publication-review"
@@ -2857,7 +2881,7 @@
         "callable": "impl inherent for Workbench::admit_run_command",
         "capability": "publish",
         "count": 1,
-        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"run\" . into () , text : format ! (\"run → {:?}\" , admission . state . phase) , } ,)",
+        "expression": "self . publish (scope , ServerEvent :: Admitted { kind : \"run\" . into () , text : format ! (\"run \u2192 {:?}\" , admission . state . phase) , } ,)",
         "file": "crates/app/src/lifecycle_routes.rs"
       },
       "profile": "publication-review"
@@ -5784,7 +5808,7 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::chat_target_name",
+        "callable": "impl inherent for Workbench::chat_target_name_in",
         "capability": "read_file",
         "count": 1,
         "expression": "engagement . read_file (& target_name_path (target_id) . ok () ?)",
@@ -5894,86 +5918,6 @@
     },
     {
       "site": {
-        "callable": "impl inherent for Workbench::land_on_managed_main",
-        "capability": "commit_turn",
-        "count": 1,
-        "expression": "engagement . commit_turn (message)",
-        "file": "crates/app/src/project_fork.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::land_on_managed_main",
-        "capability": "create_engagement",
-        "count": 1,
-        "expression": "workspace . create_engagement (& line)",
-        "file": "crates/app/src/project_fork.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::land_on_managed_main",
-        "capability": "merge_into_main",
-        "count": 1,
-        "expression": "engagement . merge_into_main ()",
-        "file": "crates/app/src/project_fork.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::land_on_managed_main",
-        "capability": "remove_engagement",
-        "count": 1,
-        "expression": "workspace . remove_engagement (& line)",
-        "file": "crates/app/src/project_fork.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::land_on_managed_main",
-        "capability": "remove_file",
-        "count": 1,
-        "expression": "engagement . remove_file (& format ! (\"{root}/{path}\"))",
-        "file": "crates/app/src/project_fork.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::land_on_managed_main",
-        "capability": "write_file_bytes",
-        "count": 1,
-        "expression": "engagement . write_file_bytes (& format ! (\"{root}/{path}\") , bytes)",
-        "file": "crates/app/src/project_fork.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::managed_manifest",
-        "capability": "current_main_cut",
-        "count": 1,
-        "expression": "workspace . current_main_cut ()",
-        "file": "crates/app/src/project_fork.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
-        "callable": "impl inherent for Workbench::managed_manifest",
-        "capability": "main_manifest",
-        "count": 1,
-        "expression": "workspace . main_manifest ()",
-        "file": "crates/app/src/project_fork.rs"
-      },
-      "profile": "editor-and-import"
-    },
-    {
-      "site": {
         "callable": "impl inherent for Workbench::read_managed_bytes",
         "capability": "read_main_file_bytes",
         "count": 1,
@@ -6067,7 +6011,7 @@
         "file": "crates/app/src/office_turn_result.rs",
         "callable": "admit_result",
         "capability": "publish",
-        "expression": "reviewed . publish (| native , settlement | { let cut = native . cut () . to_owned () ; let (merge_commands , merge_phase) = if settlement . is_some () { (vec ! [MergeCommand :: StartMerge , MergeCommand :: WorkspaceClean , MergeCommand :: PolicyAdmit , MergeCommand :: AdvanceStandingRef] , MergePhase :: Advanced) } else { (vec ! [MergeCommand :: StartMerge , MergeCommand :: WorkspaceConflict] , MergePhase :: Rejected) } ; let mut records = output . facts_at (& cut) . map_err (native_error) ? ; let creation = OfficeCreationRecord { revision : \"office-result-creation/v1\" . into () , command : original . command_id () . into () , actor : office . authority . actor () . into () , chat : scope . into () , input_position : startup . user_entry_id , base_cut : before_cut . clone () , lineage : original_lineage , runtime_start : outcome . runtime_start_position . clone () . expect (\"qualified start\") , runtime_terminal : outcome . runtime_terminal_position . clone () . expect (\"qualified terminal\") , runtime_cut : receipt . workspace_cut_ref . clone () . expect (\"qualified runtime cut\") , result_cut : cut . clone () , ordered_writes : descriptors . clone () , evidence : native . result_evidence () . cloned () . ok_or_else (| | whipplescript_store :: StoreError :: Conflict (\"office original creation evidence unavailable\" . into ())) ? , } ; records . push (fact (scope , CREATION_KIND , serde_json :: to_string (& creation) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; records . push (fact (scope , \"office_runtime_receipt\" , witness . receipt_json . clone ())) ; records . push (fact (scope , \"workspace_result\" , cut . clone ())) ; if let Some (settlement) = settlement { records . push (settlement_fact (scope , original . command_id () , & cut , settlement) ?) ; } records . push (fact (scope , \"office_turn_settlement_gap\" , serde_json :: to_string (& serde_json :: json ! ({ \"revision\" : \"office-turn-settlement-gap/v1\" , \"command_id\" : original . command_id () , \"result_cut\" : cut , \"reason\" : if settlement . is_some () { \"original_office_projection_and_sibling_reconciliation_not_qualified\" } else { \"original_office_conflicted_candidate_isolated\" } , })) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; records . push (fact (scope , \"workspace_local_result\" , serde_json :: to_string (& serde_json :: json ! ({ \"revision\" : \"office-workspace-local-result/v1\" , \"runtime_reads\" : witness . reads , \"runtime_workspace_cut\" : receipt . workspace_cut_ref , \"pending_questions\" : outcome . asked_questions , \"evidence\" : native . result_evidence () , \"files\" : native . local_files () , \"removed\" : native . local_removed () , })) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; let mut pointers = std :: collections :: BTreeSet :: new () ; for pointer in & outcome . runtime_evidence_pointers { if pointers . insert (pointer) { let payload = serde_json :: to_string (& super :: RuntimeEvidenceCrossing { runtime : \"whipplescript\" , pointer , workspace_cut_ref : Some (super :: WorkspaceCutRef { substrate : \"whipplescript\" , revision : & cut }) , }) . map_err (| error | native_error (AdmitError :: Json (error))) ? ; records . push (fact (scope , super :: RUNTIME_EVIDENCE_POINTER_KIND , payload)) ; } } if let Some (reading) = & outcome . context_reading { records . push (fact (scope , super :: CONTEXT_READING_KIND , serde_json :: to_string (reading) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; } if let Some (usage) = & outcome . managed_usage { records . push (fact (scope , \"office_model_usage\" , serde_json :: to_string (usage) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; } let changed_paths = crate :: advancement :: TurnFacts :: changed_paths_of (& diff) ; let summary = crate :: turn_summary :: TurnSummary { user_entry_id : startup . user_entry_id , receipt_status : if run_phase == RunPhase :: Completed { crate :: turn_summary :: ReceiptStatus :: Completed } else { crate :: turn_summary :: ReceiptStatus :: Failed } , error : outcome . error . clone () , changed_count : changed_paths . len () , changed_paths , policy_diff_direction : crate :: turn_summary :: policy_diff_direction (& diff) , certified_reads , } ; let mut commands = vec ! [RunCommand :: RecordObservation ; outcome . observations . len ()] ; commands . push (if run_phase == RunPhase :: Completed { RunCommand :: CompleteRun } else { RunCommand :: FailRun }) ; let settled_at_unix_ms = std :: time :: SystemTime :: now () . duration_since (std :: time :: UNIX_EPOCH) . ok () . and_then (| elapsed | u64 :: try_from (elapsed . as_millis ()) . ok ()) ; let result = writer . commit_recorded_claimed_lifecycle_pair (original . command_id () , original . scope () , original . key () , original . snapshot () , LifecycleBatch :: < RunState > { scope : scope . into () , commands } , LifecycleBatch :: < MergeState > { scope : scope . into () , commands : merge_commands } , | next | { let mut assistant = None ; for observation in & outcome . observations { let event = match observation . kind { \"assistant\" => { assistant = Some (next + records . len () as i64) ; Some (ServerEvent :: Assistant { text : observation . detail . clone () , settled_at_unix_ms }) } , \"egress\" | \"egress_staged\" | \"tool_result\" | \"egress_blocked\" => Some (ServerEvent :: from_observation (observation)) , _ => None , } ; if let Some (event) = event { records . push (fact (scope , \"transcript\" , event . to_json ())) ; } } let assistant_entry_id = assistant . unwrap_or_else (| | { let position = next + records . len () as i64 ; records . push (fact (scope , \"transcript\" , ServerEvent :: Assistant { text : outcome . assistant_text . clone () , settled_at_unix_ms } . to_json ())) ; position }) ; let fork_snapshot = fork_snapshot . map (| mut snapshot | { snapshot . before_collaboration_cut = before_cut . clone () ; snapshot . after_collaboration_cut = cut . clone () ; snapshot . after_taint_evidence_digest = super :: taint_evidence_digest (& output . reads_after) ; snapshot }) ; let boundary = TurnBoundaryRecord { user_entry_id : startup . user_entry_id , assistant_entry_id , before_workspace_cut : before_cut , after_workspace_cut : cut . clone () , runtime_before : outcome . runtime_start_position . clone () . expect (\"qualified start\") , runtime_after : outcome . runtime_terminal_position . clone () . expect (\"qualified terminal\") , reads_before : startup . reads_before , reads_after : output . reads_after , fork_snapshot , } ; records . push (fact (scope , super :: TURN_BOUNDARY_KIND , serde_json :: to_string (& boundary) ?)) ; if let Some (reason) = & outcome . error { records . push (fact (scope , \"transcript\" , ServerEvent :: Error { reason : reason . clone () , code : None } . to_json ())) ; } records . push (fact (scope , \"transcript\" , ServerEvent :: Admitted { kind : \"run\" . into () , text : format ! (\"run → {run_phase:?}\") } . to_json ())) ; records . push (fact (scope , crate :: turn_summary :: TURN_SUMMARY_KIND , serde_json :: to_string (& summary) ?)) ; Ok (records) } ,) . map_err (native_error) ? ; Ok (((cut , diff , merge_phase) , result)) })",
+        "expression": "reviewed . publish (| native , settlement | { let cut = native . cut () . to_owned () ; let (merge_commands , merge_phase) = if settlement . is_some () { (vec ! [MergeCommand :: StartMerge , MergeCommand :: WorkspaceClean , MergeCommand :: PolicyAdmit , MergeCommand :: AdvanceStandingRef] , MergePhase :: Advanced) } else { (vec ! [MergeCommand :: StartMerge , MergeCommand :: WorkspaceConflict] , MergePhase :: Rejected) } ; let mut records = output . facts_at (& cut) . map_err (native_error) ? ; let creation = OfficeCreationRecord { revision : \"office-result-creation/v1\" . into () , command : original . command_id () . into () , actor : office . authority . actor () . into () , chat : scope . into () , input_position : startup . user_entry_id , base_cut : before_cut . clone () , lineage : original_lineage , runtime_start : outcome . runtime_start_position . clone () . expect (\"qualified start\") , runtime_terminal : outcome . runtime_terminal_position . clone () . expect (\"qualified terminal\") , runtime_cut : receipt . workspace_cut_ref . clone () . expect (\"qualified runtime cut\") , result_cut : cut . clone () , ordered_writes : descriptors . clone () , evidence : native . result_evidence () . cloned () . ok_or_else (| | whipplescript_store :: StoreError :: Conflict (\"office original creation evidence unavailable\" . into ())) ? , } ; records . push (fact (scope , CREATION_KIND , serde_json :: to_string (& creation) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; records . push (fact (scope , \"office_runtime_receipt\" , witness . receipt_json . clone ())) ; records . push (fact (scope , \"workspace_result\" , cut . clone ())) ; if let Some (settlement) = settlement { records . push (settlement_fact (scope , original . command_id () , & cut , settlement) ?) ; } records . push (fact (scope , \"office_turn_settlement_gap\" , serde_json :: to_string (& serde_json :: json ! ({ \"revision\" : \"office-turn-settlement-gap/v1\" , \"command_id\" : original . command_id () , \"result_cut\" : cut , \"reason\" : if settlement . is_some () { \"original_office_projection_and_sibling_reconciliation_not_qualified\" } else { \"original_office_conflicted_candidate_isolated\" } , })) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; records . push (fact (scope , \"workspace_local_result\" , serde_json :: to_string (& serde_json :: json ! ({ \"revision\" : \"office-workspace-local-result/v1\" , \"runtime_reads\" : witness . reads , \"runtime_workspace_cut\" : receipt . workspace_cut_ref , \"pending_questions\" : outcome . asked_questions , \"evidence\" : native . result_evidence () , \"files\" : native . local_files () , \"removed\" : native . local_removed () , })) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; let mut pointers = std :: collections :: BTreeSet :: new () ; for pointer in & outcome . runtime_evidence_pointers { if pointers . insert (pointer) { let payload = serde_json :: to_string (& super :: RuntimeEvidenceCrossing { runtime : \"whipplescript\" , pointer , workspace_cut_ref : Some (super :: WorkspaceCutRef { substrate : \"whipplescript\" , revision : & cut }) , }) . map_err (| error | native_error (AdmitError :: Json (error))) ? ; records . push (fact (scope , super :: RUNTIME_EVIDENCE_POINTER_KIND , payload)) ; } } if let Some (reading) = & outcome . context_reading { records . push (fact (scope , super :: CONTEXT_READING_KIND , serde_json :: to_string (reading) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; } if let Some (usage) = & outcome . managed_usage { records . push (fact (scope , \"office_model_usage\" , serde_json :: to_string (usage) . map_err (| error | native_error (AdmitError :: Json (error))) ?)) ; } let changed_paths = crate :: advancement :: TurnFacts :: changed_paths_of (& diff) ; let summary = crate :: turn_summary :: TurnSummary { user_entry_id : startup . user_entry_id , receipt_status : if run_phase == RunPhase :: Completed { crate :: turn_summary :: ReceiptStatus :: Completed } else { crate :: turn_summary :: ReceiptStatus :: Failed } , error : outcome . error . clone () , changed_count : changed_paths . len () , changed_paths , policy_diff_direction : crate :: turn_summary :: policy_diff_direction (& diff) , certified_reads , } ; let mut commands = vec ! [RunCommand :: RecordObservation ; outcome . observations . len ()] ; commands . push (if run_phase == RunPhase :: Completed { RunCommand :: CompleteRun } else { RunCommand :: FailRun }) ; let settled_at_unix_ms = std :: time :: SystemTime :: now () . duration_since (std :: time :: UNIX_EPOCH) . ok () . and_then (| elapsed | u64 :: try_from (elapsed . as_millis ()) . ok ()) ; let result = writer . commit_recorded_claimed_lifecycle_pair (original . command_id () , original . scope () , original . key () , original . snapshot () , LifecycleBatch :: < RunState > { scope : scope . into () , commands } , LifecycleBatch :: < MergeState > { scope : scope . into () , commands : merge_commands } , | next | { let mut assistant = None ; for observation in & outcome . observations { let event = match observation . kind { \"assistant\" => { assistant = Some (next + records . len () as i64) ; Some (ServerEvent :: Assistant { text : observation . detail . clone () , settled_at_unix_ms }) } , \"egress\" | \"egress_staged\" | \"tool_result\" | \"egress_blocked\" => Some (ServerEvent :: from_observation (observation)) , _ => None , } ; if let Some (event) = event { records . push (fact (scope , \"transcript\" , event . to_json ())) ; } } let assistant_entry_id = assistant . unwrap_or_else (| | { let position = next + records . len () as i64 ; records . push (fact (scope , \"transcript\" , ServerEvent :: Assistant { text : outcome . assistant_text . clone () , settled_at_unix_ms } . to_json ())) ; position }) ; let fork_snapshot = fork_snapshot . map (| mut snapshot | { snapshot . before_collaboration_cut = before_cut . clone () ; snapshot . after_collaboration_cut = cut . clone () ; snapshot . after_taint_evidence_digest = super :: taint_evidence_digest (& output . reads_after) ; snapshot }) ; let boundary = TurnBoundaryRecord { user_entry_id : startup . user_entry_id , assistant_entry_id , before_workspace_cut : before_cut , after_workspace_cut : cut . clone () , runtime_before : outcome . runtime_start_position . clone () . expect (\"qualified start\") , runtime_after : outcome . runtime_terminal_position . clone () . expect (\"qualified terminal\") , reads_before : startup . reads_before , reads_after : output . reads_after , fork_snapshot , } ; records . push (fact (scope , super :: TURN_BOUNDARY_KIND , serde_json :: to_string (& boundary) ?)) ; if let Some (reason) = & outcome . error { records . push (fact (scope , \"transcript\" , ServerEvent :: Error { reason : reason . clone () , code : None } . to_json ())) ; } records . push (fact (scope , \"transcript\" , ServerEvent :: Admitted { kind : \"run\" . into () , text : format ! (\"run \u2192 {run_phase:?}\") } . to_json ())) ; records . push (fact (scope , crate :: turn_summary :: TURN_SUMMARY_KIND , serde_json :: to_string (& summary) ?)) ; Ok (records) } ,) . map_err (native_error) ? ; Ok (((cut , diff , merge_phase) , result)) })",
         "count": 1
       },
       "profile": "agent-turn"
@@ -6501,6 +6445,156 @@
         "file": "crates/app/src/test_signin.rs"
       },
       "profile": "custody-and-erasure"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::failed_chat_creation",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "storage . remove_engagement (chat_id)",
+        "file": "crates/app/src/library_state.rs"
+      },
+      "profile": "topology-and-settlement"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main_at",
+        "capability": "commit_turn",
+        "count": 1,
+        "expression": "engagement . commit_turn (message)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main_at",
+        "capability": "create_engagement",
+        "count": 1,
+        "expression": "workspace . create_engagement (& line)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main_at",
+        "capability": "fork_engagement_at",
+        "count": 1,
+        "expression": "workspace . fork_engagement_at (& line , \"main\" , \"main\" , cut)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main_at",
+        "capability": "merge_into_main",
+        "count": 1,
+        "expression": "engagement . merge_into_main ()",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main_at",
+        "capability": "merge_into_main_at",
+        "count": 1,
+        "expression": "engagement . merge_into_main_at (cut)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main_at",
+        "capability": "remove_engagement",
+        "count": 1,
+        "expression": "workspace . remove_engagement (& line)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main_at",
+        "capability": "remove_file",
+        "count": 1,
+        "expression": "engagement . remove_file (& format ! (\"{root}/{path}\"))",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::land_on_managed_main_at",
+        "capability": "write_file_bytes",
+        "count": 1,
+        "expression": "engagement . write_file_bytes (& format ! (\"{root}/{path}\") , bytes)",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::managed_manifest",
+        "capability": "main_snapshot",
+        "count": 1,
+        "expression": "workspace . main_snapshot ()",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::managed_snapshot",
+        "capability": "main_snapshot",
+        "count": 1,
+        "expression": "self . collaboration_workspaces . get (& workspace_id) . ok_or_else (| | \"project collaboration workspace is not open\" . to_owned ()) ? . main_snapshot ()",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl inherent for Workbench::pull_upstream",
+        "capability": "read_snapshot_file",
+        "count": 1,
+        "expression": "self . collaboration_workspaces . get (& workspace_id) . ok_or_else (| | ForkError :: Failed (\"original workspace is unavailable\" . into ())) ? . read_snapshot_file (& source . whole , & format ! (\"{root}/{path}\"))",
+        "file": "crates/app/src/project_fork.rs"
+      },
+      "profile": "editor-and-import"
+    },
+    {
+      "site": {
+        "callable": "impl ChatWorkspace for Engagement::merge_into_main_at",
+        "capability": "merge_into_main_at",
+        "count": 1,
+        "expression": "Self :: merge_into_main_at (self , expected)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::main_snapshot",
+        "capability": "main_snapshot",
+        "count": 1,
+        "expression": "Self :: main_snapshot (self)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
+    },
+    {
+      "site": {
+        "callable": "impl Workspace for Instance::read_snapshot_file",
+        "capability": "read_snapshot_file",
+        "count": 1,
+        "expression": "Self :: read_snapshot_file (self , snapshot , path)",
+        "file": "crates/workspace/src/lib.rs"
+      },
+      "profile": "native-workspace-adapter"
     }
   ]
 }

@@ -169,8 +169,13 @@ pub fn record_hosted_home_recipient(
     let public_key = LinkRecipientPublicKey::parse(public_key)
         .map_err(|_| "the Home's recipient key is not a P-256 public key".to_owned())?;
     let scope = crate::org::tenant_scope(tenant);
-    let current = hosted_home_recipients_in(wb.store_ref(), &scope)
-        .map_err(|error| format!("could not read the tenant's Homes: {error:?}"))?;
+    let current = fold_retained(
+        wb.store_ref(),
+        &scope,
+        HOSTED_HOME_RECIPIENT_KIND,
+        |record: &HostedHomeRecipientRecord| (&record.id, record.op),
+    )
+    .map_err(|error| format!("could not read the tenant's Homes: {error:?}"))?;
     if current
         .get(home_id)
         .is_some_and(|existing| existing.public_key == public_key)
@@ -183,8 +188,70 @@ pub fn record_hosted_home_recipient(
         public_key,
         recorded_at_ms: now_ms,
     };
-    wb.write_account_record_in(&scope, HOSTED_HOME_RECIPIENT_KIND, home_id, &record)
-        .map_err(|error| format!("could not record the Home's recipient key: {error:?}"))?;
+    // A copy names its recipient, not a key revision. A changed key and every
+    // old ciphertext tombstone must therefore become visible in one commit.
+    // Discover actual copy-owning scopes, including accounts no longer active
+    // in this tenant; a current-members roster would miss retained copies.
+    let mut records = Vec::new();
+    let mut cursor = None;
+    let page_size = std::num::NonZeroUsize::new(128).expect("positive discovery page");
+    loop {
+        let scopes = wb
+            .store_ref()
+            .scope_ids_with_kind(LINK_COPY_KIND, cursor.as_deref(), page_size)
+            .map_err(|error| format!("could not discover Home copies: {error:?}"))?;
+        if scopes.is_empty() {
+            break;
+        }
+        cursor = scopes.last().cloned();
+        for account_scope in scopes {
+            let is_account = account_scope == crate::account::ACCOUNT_SCOPE
+                || account_scope
+                    .strip_prefix("account::")
+                    .is_some_and(|person| !person.is_empty());
+            if !is_account {
+                continue;
+            }
+            let copies = fold_retained(
+                wb.store_ref(),
+                &account_scope,
+                LINK_COPY_KIND,
+                |copy: &LinkCopyRecord| (&copy.id, copy.op),
+            )
+            .map_err(|error| format!("could not read retained Home copies: {error:?}"))?;
+            for copy in copies
+                .into_values()
+                .filter(|copy| copy.copy.device_id == home_id)
+            {
+                let tombstone = LinkCopyRecord {
+                    op: RecordOp::Tombstone,
+                    ..copy
+                };
+                records.push((
+                    account_scope.clone(),
+                    LINK_COPY_KIND,
+                    serde_json::to_string(&tombstone)
+                        .map_err(|_| "could not encode a Home copy tombstone".to_owned())?,
+                ));
+            }
+        }
+    }
+    records.push((
+        scope,
+        HOSTED_HOME_RECIPIENT_KIND,
+        serde_json::to_string(&record)
+            .map_err(|_| "could not encode the Home's recipient key".to_owned())?,
+    ));
+    let borrowed: Vec<_> = records
+        .iter()
+        .map(|(scope, kind, body)| (scope.as_str(), *kind, body.as_str()))
+        .collect();
+    wb.store_mut()
+        .append_records_atomically(&borrowed)
+        .map_err(|error| {
+            format!("could not record the Home's key and invalidate its copies: {error:?}")
+        })?;
+    wb.notify_library_changed("account", home_id, "upsert");
     Ok(true)
 }
 
@@ -278,6 +345,35 @@ pub struct LinkSet {
     /// The hosted Homes serving the person now, with their recipient keys.
     /// A copy for any other Home is never counted or served.
     pub homes: BTreeMap<String, LinkRecipientPublicKey>,
+}
+
+/// Rotation is an authority transition: missing or malformed retained history
+/// must refuse before any key or copy write, never masquerade as an empty set.
+fn fold_retained<T, F>(
+    store: &Store,
+    scope: &str,
+    kind: &str,
+    id: F,
+) -> Result<BTreeMap<String, T>, AdmitError>
+where
+    T: serde::de::DeserializeOwned,
+    F: Fn(&T) -> (&str, RecordOp),
+{
+    let mut folded = BTreeMap::new();
+    for payload in store.retained_records(scope, kind)? {
+        let record: T = serde_json::from_str(&payload)?;
+        let (key, op) = id(&record);
+        let key = key.to_owned();
+        match op {
+            RecordOp::Upsert => {
+                folded.insert(key, record);
+            }
+            RecordOp::Tombstone => {
+                folded.remove(&key);
+            }
+        }
+    }
+    Ok(folded)
 }
 
 fn fold<T, F>(

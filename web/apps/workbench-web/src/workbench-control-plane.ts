@@ -55,6 +55,7 @@ import type {
 import {
     browserTunnelSocket,
     homeConnectionKey,
+    opaqueHomeRouteKey,
     HomePool,
     HomeTunnelError,
     openEventTunnel,
@@ -76,6 +77,7 @@ import {
     RemoteControlPlane,
     RouteHttpError,
     type RouteEventStream,
+    type ReconnectingEventStream,
     type RouteJson,
     type RouteRequest,
 } from "@gaugewright/control-plane-client";
@@ -291,7 +293,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     private readonly homeDialTimeoutMs: number;
     private readonly workTransport: workbenchClient.WorkbenchTransport;
     private readonly localWorkTransport: workbenchClient.WorkbenchTransport;
-    private homeTransport: Promise<workbenchClient.WorkbenchTransport> | null = null;
+    private homeTransport: Promise<{ transport: workbenchClient.WorkbenchTransport; origin: ProjectId | "selected" | null }> | null = null;
     private selectedDirectJson: RouteJson | null = null;
     private selectedDirectHome: { key: string; transport: Promise<workbenchClient.WorkbenchTransport> } | null = null;
     /** Several Homes at once, resolved per project (DESK-3). There is no
@@ -332,6 +334,25 @@ export class WorkbenchControlPlane implements ControlPlane {
      * whichever project is open (WS-1048). Only added to while the routes
      * stand: a chat made a moment ago is held before the next read lists it. */
     private readonly sharedHoldings = new Map<string, ProjectId>();
+    /** Observations from the own workspace, never from its composed shared rows. */
+    private readonly ownHoldings = new Map<string, ProjectId | "selected">();
+    private workspaceOwnOrigin: ProjectId | "selected" = "selected";
+    private workspaceOwnAbsent = false;
+    private workspaceRoutingGeneration = 0;
+    private readonly workspaceSubscriptions = new Set<() => void>();
+    private readonly workspaceSubscriptionStops = new Set<() => void>();
+
+    private refreshWorkspaceSubscriptions(): void {
+        for (const refresh of this.workspaceSubscriptions) refresh();
+    }
+
+    private forgetOwnWorkspace(): void {
+        this.workspaceRoutingGeneration++;
+        this.ownHoldings.clear();
+        this.workspaceOwnOrigin = "selected";
+        this.workspaceOwnAbsent = false;
+        this.refreshWorkspaceSubscriptions();
+    }
     /** The selected Home, while it is not answering and desk serves the person
      * the projects shared with them instead (WS-1036). */
     private silentSelectedHome: HomeId | null = null;
@@ -383,8 +404,9 @@ export class WorkbenchControlPlane implements ControlPlane {
                   events: (path, onMessage, onOpen, onClose) => {
                       const subscription = openReconnectingEventStream(
                           async () => {
-                              const shared = this.sharedStreamProject(path);
-                              return (shared ? await this.connectRoutedProject(shared) : await this.requireHomeTransport()).events;
+                              const origin = this.sharedRouteOf("GET", path);
+                              return (origin === "selected" ? await this.selectedHomeTransport()
+                                  : origin ? await this.connectRoutedProject(origin) : await this.requireHomeTransport()).events;
                           },
                           path,
                           onMessage,
@@ -396,8 +418,9 @@ export class WorkbenchControlPlane implements ControlPlane {
                                       reason?.status === 401
                                       && reason.detail === "target Home admission required"
                                   ) {
-                                      const shared = this.sharedStreamProject(path);
-                                      if (shared) await this.pool?.invalidateProject(shared);
+                                      const origin = this.sharedRouteOf("GET", path);
+                                      if (origin === "selected") { this.selectedHome = null; this.selectedDirectHome = null; }
+                                      else if (origin) await this.pool?.invalidateProject(origin);
                                       else await this.invalidateHomeTransport(this.currentProject);
                                   }
                               },
@@ -465,6 +488,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         this.unroutedProjects.clear();
         this.sharedProjects = new Set();
         this.sharedHoldings.clear();
+        this.forgetOwnWorkspace();
         this.silentSelectedHome = null;
         return pool;
     }
@@ -504,6 +528,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         // The admission revocation below is itself a request on the streams'
         // origin, so it must not queue behind them either.
         this.streamGate.suspend();
+        for (const stop of [...this.workspaceSubscriptionStops]) stop();
         this.credentialGeneration++;
         this.homeTransport = null;
         this.selectedHome = null;
@@ -635,7 +660,11 @@ export class WorkbenchControlPlane implements ControlPlane {
         const generation = this.credentialGeneration;
         const [own, shared] = await Promise.all([this.ownHomeRoutes(), this.sharedRoutes()]);
         if (generation === this.credentialGeneration) {
-            this.sharedProjects = new Set(shared.map((route) => route.project));
+            const next = new Set(shared.map((route) => route.project));
+            const changed = next.size !== this.sharedProjects.size
+                || [...next].some((project) => !this.sharedProjects.has(project));
+            this.sharedProjects = next;
+            if (changed) this.refreshWorkspaceSubscriptions();
         }
         return accountClient.withSharedRoutes(own, shared);
     }
@@ -701,6 +730,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     setHomeAdmission(token: string | null): void {
+        if (this.homeAdmission !== token) this.forgetOwnWorkspace();
         this.homeAdmission = token;
     }
 
@@ -803,7 +833,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         // a chat in a project no route names keeps the selected Home, and
         // reopening every stream there made each reopen refresh the whole
         // workbench while the chat's own stream waited behind it (WS-891).
-        void Promise.allSettled([previous ?? Promise.reject(), this.requireHomeTransport()])
+        void Promise.allSettled([previous?.then((resolved) => resolved.transport) ?? Promise.reject(), this.requireHomeTransport()])
             .then(([before, after]) => {
                 if (this.currentProject !== project) return;
                 if (before.status === "fulfilled" && after.status === "fulfilled"
@@ -820,23 +850,26 @@ export class WorkbenchControlPlane implements ControlPlane {
      * falls back to the account's selected Home, which is what accounts whose
      * Homes have not yet authored routes still rely on (DESK-5a). */
     private requireHomeTransport(): Promise<workbenchClient.WorkbenchTransport> {
-        if (!this.usesRemoteHome()) return Promise.resolve(this.localWorkTransport);
+        return this.resolveHomeTransport().then((resolved) => resolved.transport);
+    }
+
+    /** Keep the actual resolution with its transport, including selected
+     * fallback. A returned item must not acquire the open project's origin. */
+    private resolveHomeTransport(): Promise<{ transport: workbenchClient.WorkbenchTransport; origin: ProjectId | "selected" | null }> {
+        if (!this.usesRemoteHome()) return Promise.resolve({ transport: this.localWorkTransport, origin: null });
         const project = this.currentProject;
         if (project) {
-            this.homeTransport ??= this.connectRoutedProject(project).catch((error) => {
-                // A project with no granted route is not an error: it predates
-                // authorship, so the selected Home still serves it.
-                if (String(error).includes("no granted Home route")) {
-                    // Cache this fallback just like a routed connection. Clearing
-                    // it here re-reads directory discovery on every project call.
-                    // Project/account/admission changes already invalidate it.
-                    return this.selectedHomeTransport();
-                }
-                throw error;
-            });
-            return this.homeTransport;
+            this.homeTransport ??= this.connectRoutedProject(project)
+                .then((transport) => ({ transport, origin: project as ProjectId | "selected" | null }))
+                .catch((error) => {
+                    if (String(error).includes("no granted Home route")) {
+                        return this.selectedHomeTransport().then((transport) => ({ transport, origin: "selected" as const }));
+                    }
+                    throw error;
+                });
+        } else {
+            this.homeTransport ??= this.selectedHomeTransport().then((transport) => ({ transport, origin: "selected" as const }));
         }
-        this.homeTransport ??= this.selectedHomeTransport();
         return this.homeTransport;
     }
 
@@ -951,6 +984,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         if (this.pool !== pool || read.seq <= this.poolRoutesSeq) return;
         pool.replaceRoutes(routes);
         this.poolRoutesSeq = read.seq;
+        this.refreshWorkspaceSubscriptions();
     }
 
     /** The account's project→Home routes, as a live pool. Built once and
@@ -1139,6 +1173,13 @@ export class WorkbenchControlPlane implements ControlPlane {
     /** The Home that answers work not scoped to a project — the chat list, the
      * workspace, the account's own view of itself. */
     private async connectSelectedHome(): Promise<workbenchClient.WorkbenchTransport> {
+        const originalGeneration = this.workspaceRoutingGeneration;
+        const originalCredentials = this.credentialGeneration;
+        const assertCurrent = () => {
+            if (originalGeneration !== this.workspaceRoutingGeneration || originalCredentials !== this.credentialGeneration) {
+                throw new Error("Selected Home context changed");
+            }
+        };
         if (this.nativeRemote) {
             const generation = this.credentialGeneration;
             const reach = await accountClient.hubSessionReach(this.route);
@@ -1172,6 +1213,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             };
         }
         const state = await accountClient.accountHomes(this.route);
+        assertCurrent();
         const selected = state.homes.find((home) => home.id === state.selectedHome);
         if (!selected) throw new NoSelectedHomeError("No reachable Home is selected");
         // No address to dial (ADR 0134 §3). Its reachability lives in the
@@ -1208,6 +1250,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             if (result.home !== selected.id || typeof result.admission !== "string") {
                 throw new Error(`Selected Home identity mismatch: expected ${selected.id}`);
             }
+            assertCurrent();
             admission = result.admission;
             this.homeAdmission = admission;
             this.selectedDirectJson = json;
@@ -1315,6 +1358,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async connectHome(endpoint: string): Promise<HomeBootstrapState> {
+        this.forgetOwnWorkspace();
         const normalized = endpoint.trim().replace(/\/+$/, "");
         if (!isSecureControlPlaneEndpoint(normalized)) {
             throw new Error("Use an HTTPS Home endpoint (HTTP is allowed only on this computer)");
@@ -1332,6 +1376,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async selectHome(id: HomeId): Promise<HomeBootstrapState> {
+        this.forgetOwnWorkspace();
         if (this.nativeRemote) {
             await this.route("PUT", "/account/hub-session/homes/selected", { home_id: id });
         } else {
@@ -1346,6 +1391,7 @@ export class WorkbenchControlPlane implements ControlPlane {
      * work mounts. The membership-gated Hub route is authoritative; a local
      * resume hint can never select another tenant's Home. */
     async selectTenantWorkspace(tenant: string): Promise<void> {
+        this.forgetOwnWorkspace();
         if (!this.splitHomes) return;
         const home = await this.getCloudHome(tenant);
         if (home.status !== "active") {
@@ -1458,6 +1504,7 @@ export class WorkbenchControlPlane implements ControlPlane {
     /** Select one tenant-owned registered Home after freshly verifying the
      * directory pointer. Work is then mounted through the normal adapter. */
     async selectTenantHost(tenant: string, hostId: string): Promise<void> {
+        this.forgetOwnWorkspace();
         const host = (await this.tenantHosts(tenant)).find((item) => item.id === hostId);
         if (!host) throw new Error("This computer is no longer registered for the workspace.");
         const home = new RemoteControlPlane(host.endpoint, { bearer: () => this.bearer });
@@ -1528,6 +1575,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             await accountClient.accountRegisterHome(this.route, records.home, true);
             await accountClient.accountPublishHomeRoute(this.route, records.route);
             // Registering the Home selected it.
+            this.forgetOwnWorkspace();
             this.selectedHome = null;
         }
         if (accepted.shared) {
@@ -1537,7 +1585,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         } else {
             this.homeAdmission = accepted.admission;
             this.homeTransport = Promise.resolve(
-                accountClient.acceptedHomeTransport(accepted, () => this.bearer),
+                { transport: accountClient.acceptedHomeTransport(accepted, () => this.bearer), origin: "selected" },
             );
         }
         console.info(
@@ -1636,27 +1684,66 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     private async workspaceWithShared(): Promise<Workspace> {
+        const generation = this.workspaceRoutingGeneration;
+        const credentials = this.credentialGeneration;
         const shared = await this.sharedWorkspaceProjects();
         if (shared.length === 0) return workbenchClient.getWorkspace(this.workbenchTransport());
         const [own, others] = await Promise.all([
-            this.ownWorkspace((transport) => workbenchClient.getWorkspace(transport)),
+            this.ownWorkspace((transport) => workbenchClient.getWorkspace(transport), (value, origin) => this.rememberOwnWorkspace(value, origin)),
             this.sharedWorkspaces(shared),
         ]);
+        if (generation !== this.workspaceRoutingGeneration || credentials !== this.credentialGeneration) {
+            throw new Error("Workspace context changed");
+        }
         return this.composeShared(own ?? NO_WORKSPACE, sharedOrFailure(own, others));
     }
 
     private async workspaceCarriageWithShared(): Promise<ProjectionCarriage<Workspace>> {
+        const generation = this.workspaceRoutingGeneration;
+        const credentials = this.credentialGeneration;
         const shared = await this.sharedWorkspaceProjects();
         if (shared.length === 0) return workbenchClient.getWorkspaceCarriage(this.workbenchTransport());
         const [own, others] = await Promise.all([
-            this.ownWorkspace((transport) => workbenchClient.getWorkspaceCarriage(transport)),
+            this.ownWorkspace((transport) => workbenchClient.getWorkspaceCarriage(transport), (value, origin) => this.rememberOwnWorkspace(value.value, origin)),
             this.sharedWorkspaces(shared),
         ]);
+        if (generation !== this.workspaceRoutingGeneration || credentials !== this.credentialGeneration) {
+            throw new Error("Workspace context changed");
+        }
         const value = this.composeShared(own?.value ?? NO_WORKSPACE, sharedOrFailure(own, others));
         if (own) return { ...own, value };
         // No Home of the person's own: what is listed is what the shared
         // projects' Homes answered just now.
         return { value, freshness: { marker: "live", generatedAt: Date.now(), repairHint: null }, clientRequestId: null };
+    }
+
+    private rememberOwnWorkspace(own: Workspace, origin: ProjectId | "selected"): void {
+        this.workspaceOwnAbsent = false;
+        this.workspaceOwnOrigin = origin;
+        this.ownHoldings.clear();
+        const hold = (kind: string, id: string) => this.ownHoldings.set(`${kind}/${id}`, origin);
+        for (const project of own.projects) {
+            hold("projects", project.id);
+            for (const target of project.targets) hold("targets", target.id);
+            for (const placement of project.placements) {
+                hold("placements", placement.placementId);
+                for (const target of placement.targetIds) hold("targets", target);
+                for (const line of placement.workstreams) hold("workstreams", line.id);
+                for (const chat of placement.chats) hold("chats", chat.id);
+            }
+        }
+        for (const agent of own.archetypes) {
+            hold("archetypes", agent.id);
+            hold("placements", agent.instanceId);
+            hold("targets", agent.authoringTargetId);
+            for (const line of agent.workstreams) hold("workstreams", line.id);
+            for (const chat of agent.chats) hold("chats", chat.id);
+            for (const preview of agent.previews) hold("chats", preview.chat.id);
+        }
+        for (const chat of own.recent) hold("chats", chat.id);
+        for (const line of own.workstreams) hold("workstreams", line.id);
+        for (const target of own.workTargets) hold("targets", target.id);
+        this.refreshWorkspaceSubscriptions();
     }
 
     /** The person's workspace with the shared projects beside it, holding
@@ -1681,7 +1768,7 @@ export class WorkbenchControlPlane implements ControlPlane {
      * project, Agent or Personal chat is the person's own, never the shared
      * project's Home's (DR-0455). */
     private sharedRouteOf(method: string, path: string): ProjectId | "selected" | undefined {
-        if (this.sharedHoldings.size === 0 && this.sharedProjects.size === 0) return undefined;
+        if (this.ownHoldings.size === 0 && this.sharedHoldings.size === 0 && this.sharedProjects.size === 0) return undefined;
         const bare = path.split(/[?#]/, 1)[0] ?? "";
         const [kind, raw] = bare.replace(/^\/+/, "").split("/");
         if (raw === undefined || raw === "") {
@@ -1696,27 +1783,53 @@ export class WorkbenchControlPlane implements ControlPlane {
         }
         // A run scope and its projections are a chat's.
         const key = kind === "scopes" || (kind === "projections" && id !== "library") ? `chats/${id}` : `${kind}/${id}`;
+        const own = this.ownHoldings.get(key);
+        if (own !== undefined) return own;
         if (kind === "projects" && this.sharedProjects.has(id as ProjectId)) return id as ProjectId;
         const held = this.sharedHoldings.get(key);
         return held && this.sharedProjects.has(held) ? held : undefined;
     }
 
-    /** The shared project whose Home serves an event stream when the open
-     * project's does not: a chat's stream reaches its own Home (WS-1048). */
-    private sharedStreamProject(path: string): ProjectId | null {
-        const route = this.sharedRouteOf("GET", path);
-        return route && route !== "selected" && route !== this.currentProject ? route : null;
-    }
-
     private async workJson(args: Parameters<RouteJson>): Promise<unknown> {
+        if (!this.usesRemoteHome()) return this.withHomeAdmissionRetry((transport) => transport.json(...args));
+        const generation = this.workspaceRoutingGeneration;
+        const credentials = this.credentialGeneration;
+        const current = () => generation === this.workspaceRoutingGeneration && credentials === this.credentialGeneration;
         const [method, path] = args;
         const route = this.sharedRouteOf(method, path);
-        if (route === "selected") return this.onSelectedHome((transport) => transport.json(...args));
-        if (route === undefined || route === this.currentProject) {
-            return this.withHomeAdmissionRetry((transport) => transport.json(...args));
+        const defaultResolution = route === undefined || route === this.currentProject
+            ? this.resolveHomeTransport() : null;
+        const resolved = route === "selected"
+            ? { transport: await this.selectedHomeTransport(), origin: "selected" as const }
+            : defaultResolution !== null
+                ? await defaultResolution
+                : { transport: await this.connectRoutedProject(route as ProjectId), origin: route as ProjectId };
+        if (!current()) throw new Error("Home routing context changed before dispatch");
+        let result: unknown;
+        try {
+            result = await resolved.transport.json(...args);
+        } catch (error) {
+            if (!isExpiredHomeAdmission(error) || !current() || resolved.origin === null) throw error;
+            // Retry the captured dispatch origin, even if another project opened
+            // meanwhile. Credential/own-origin invalidation refuses the retry.
+            if (this.homeTransport === defaultResolution) this.homeTransport = null;
+            let transport: workbenchClient.WorkbenchTransport;
+            if (resolved.origin === "selected") {
+                this.selectedHome = null;
+                this.selectedDirectHome = null;
+                transport = await this.selectedHomeTransport();
+            } else {
+                await this.pool?.invalidateProject(resolved.origin);
+                transport = await this.connectRoutedProject(resolved.origin);
+            }
+            if (!current()) throw new Error("Home routing context changed before retry");
+            result = await transport.json(...args);
         }
-        const result = await this.onSharedProject(route, (transport) => transport.json(...args));
-        this.holdCreated(route, method, path, result);
+        if (current() && resolved.origin !== null) {
+            if (resolved.origin !== "selected" && this.sharedProjects.has(resolved.origin)) {
+                this.holdCreated(resolved.origin, method, path, result);
+            } else this.holdOwnCreated(resolved.origin, method, path, result);
+        }
         return result;
     }
 
@@ -1746,6 +1859,18 @@ export class WorkbenchControlPlane implements ControlPlane {
         } else if (/^\/placements\/[^/]+\/workstreams$/.test(bare)) {
             this.sharedHoldings.set(`workstreams/${id}`, project);
         }
+    }
+
+    private holdOwnCreated(origin: ProjectId | "selected", method: string, path: string, result: unknown): void {
+        const id = (result as { id?: unknown } | null)?.id;
+        if (method !== "POST" || typeof id !== "string" || !id) return;
+        const bare = path.split(/[?#]/, 1)[0] ?? "";
+        const kind = /^\/(projects|archetypes|chats)$/.exec(bare)?.[1];
+        if (kind) this.ownHoldings.set(`${kind}/${id}`, origin);
+        else if (/^\/archetypes\/[^/]+\/(?:fork|copy-as-panel)$/.test(bare)) this.ownHoldings.set(`archetypes/${id}`, origin);
+        else if (/^\/projects\/[^/]+\/fork$/.test(bare)) this.ownHoldings.set(`projects/${id}`, origin);
+        else if (/^\/(?:archetypes\/[^/]+\/(?:chats|preview)|projects\/[^/]+\/placements\/[^/]+\/chats|chats\/[^/]+\/fork(?:\/[^/]+)?)$/.test(bare)) this.ownHoldings.set(`chats/${id}`, origin);
+        else if (/^\/placements\/[^/]+\/workstreams$/.test(bare)) this.ownHoldings.set(`workstreams/${id}`, origin);
     }
 
     /** Work for the selected Home whichever project is open, with the
@@ -1779,10 +1904,30 @@ export class WorkbenchControlPlane implements ControlPlane {
      * serves them, which leaves the projects shared with them. */
     private async ownWorkspace<T>(
         read: (transport: workbenchClient.WorkbenchTransport) => Promise<T>,
+        remember?: (value: T, origin: ProjectId | "selected") => void,
     ): Promise<T | null> {
+        const generation = this.workspaceRoutingGeneration;
+        const credentials = this.credentialGeneration;
+        let origin: ProjectId | "selected" = this.workspaceProject ?? "selected";
         try {
-            if (this.workspaceProject === this.currentProject) return await read(this.workbenchTransport());
-            return await this.onSelectedHome(read);
+            let value: T;
+            if (!this.usesRemoteHome()) value = await read(this.localWorkTransport);
+            else if (origin === "selected") value = await this.onSelectedHome(read);
+            else {
+                try { value = await this.onSharedProject(origin, read); }
+                catch (error) {
+                    // A legacy own project with no route still belongs to the
+                    // selected Home; remember the transport actually observed.
+                    if (!String(error).includes("no granted Home route")) throw error;
+                    origin = "selected";
+                    value = await this.onSelectedHome(read);
+                }
+            }
+            if (generation !== this.workspaceRoutingGeneration || credentials !== this.credentialGeneration) {
+                throw new Error("Workspace context changed");
+            }
+            remember?.(value, origin);
+            return value;
         } catch (error) {
             if (
                 error instanceof NoSelectedHomeError
@@ -1790,6 +1935,10 @@ export class WorkbenchControlPlane implements ControlPlane {
                 || error instanceof SilentSelectedHomeError
                 || isUnprovisionedHomeError(error)
             ) {
+                if (generation === this.workspaceRoutingGeneration && credentials === this.credentialGeneration) {
+                    this.workspaceOwnAbsent = true;
+                    this.refreshWorkspaceSubscriptions();
+                }
                 return null;
             }
             throw error;
@@ -2185,9 +2334,10 @@ export class WorkbenchControlPlane implements ControlPlane {
     pullProjectUpstream(
         id: ProjectId,
         sourceCut: string | null,
+        forkCut: string | null,
         resolutions: Readonly<Record<string, "mine" | "theirs">>,
     ): Promise<{ readonly pulled: number }> {
-        return workbenchClient.pullProjectUpstream(this.workbenchTransport(), id, sourceCut, resolutions);
+        return workbenchClient.pullProjectUpstream(this.workbenchTransport(), id, sourceCut, forkCut, resolutions);
     }
 
     projectHome(id: ProjectId): Promise<ProjectHome> {
@@ -2593,7 +2743,115 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     subscribeWorkspace(onChange: (change: WorkspaceChange) => void, onOpen?: () => void): () => void {
-        return workbenchClient.subscribeWorkspace(this.workbenchTransport(), onChange, onOpen);
+        if (!this.mayHoldSharedProjects()) {
+            return workbenchClient.subscribeWorkspace(this.workbenchTransport(), onChange, onOpen);
+        }
+        // An originless item reference cannot select a Home for a delta. The
+        // aggregate asks for the existing full-authorized-refresh form instead.
+        let active = true;
+        let requested = 0;
+        let generation = this.workspaceRoutingGeneration;
+        const children = new Map<string, ReconnectingEventStream>();
+        const closeChildren = () => {
+            for (const child of children.values()) child.close();
+            children.clear();
+        };
+        const refresh = () => { if (active) onChange({ record: "project", id: "", op: "upsert" }); };
+        const reconcile = () => {
+            const current = this.workspaceRoutingGeneration;
+            if (generation !== current) {
+                generation = current;
+                closeChildren();
+            }
+            const request = ++requested;
+            const credentials = this.credentialGeneration;
+            void this.sharedWorkspaceProjects().then((projects) => {
+                if (!active || request !== requested || generation !== this.workspaceRoutingGeneration
+                    || credentials !== this.credentialGeneration) return;
+                const origins: Array<ProjectId | "selected"> = [...projects];
+                if (!this.workspaceOwnAbsent) origins.push(this.workspaceOwnOrigin);
+                const wanted = new Map<string, ProjectId | "selected">();
+                for (const origin of origins) {
+                    if (origin === "selected") wanted.set("own:selected", origin);
+                    else {
+                        const route = this.pool?.routeFor(origin);
+                        if (route) wanted.set(`project:${origin}:${opaqueHomeRouteKey(route)}`, origin);
+                    }
+                }
+                let removed = false;
+                for (const [key, child] of children) {
+                    if (!wanted.has(key)) { child.close(); children.delete(key); removed = true; }
+                }
+                if (removed) refresh();
+                for (const [key, origin] of wanted) {
+                    if (children.has(key)) continue;
+                    const childGeneration = generation;
+                    let retained = true;
+                    const currentChild = () => active && retained && childGeneration === this.workspaceRoutingGeneration
+                        && credentials === this.credentialGeneration;
+                    let acceptFrame: (data: string) => void = () => {};
+                    workbenchClient.subscribeWorkspace({ base: "", json: async () => null,
+                        events: (_path, accept) => { acceptFrame = accept; return () => {}; } },
+                    (change) => { if (currentChild()) onChange({ ...change, id: "" }); });
+                    const child = openReconnectingEventStream(async () => {
+                        if (!currentChild()) throw new Error("Workspace origin changed");
+                        try {
+                            const transport = origin === "selected"
+                                ? await this.selectedHomeTransport()
+                                : await this.connectRoutedProject(origin);
+                            if (!currentChild()) throw new Error("Workspace origin changed");
+                            return transport.events;
+                        } catch (error) {
+                            if (origin === "selected" && currentChild()
+                                && (error instanceof NoSelectedHomeError || error instanceof SilentSelectedHomeError
+                                    || error instanceof UnroutedHomeError || isUnprovisionedHomeError(error))) {
+                                this.workspaceOwnAbsent = true;
+                                reconcile();
+                            }
+                            throw error;
+                        }
+                    }, "/workspace/events", (data) => {
+                        if (!currentChild()) return;
+                        // Use the shipped parser, including malformed-frame refusal.
+                        acceptFrame(data);
+                    }, () => { if (currentChild()) { onOpen?.(); refresh(); } }, () => {
+                        if (currentChild()) refresh();
+                    }, { beforeReconnect: async (reason) => {
+                        if (!currentChild()) return;
+                        if (reason?.status === 401 && reason.detail === "target Home admission required") {
+                            if (origin === "selected") { this.selectedHome = null; this.selectedDirectHome = null; }
+                            else await this.pool?.invalidateProject(origin);
+                        }
+                        if (origin !== "selected" && (reason?.status === 401 || reason?.status === 403)) {
+                            const pool = await this.homePool();
+                            await this.routesReadSince(pool, this.routeReadsBegun);
+                            if (currentChild()) reconcile();
+                        }
+                    } });
+                    children.set(key, {
+                        close: () => { retained = false; child.close(); },
+                        reconnect: child.reconnect,
+                    });
+                }
+            }).catch(() => { if (active && request === requested) refresh(); });
+        };
+        const schedule = () => {
+            // Retire connections synchronously, but begin no new request until
+            // the caller has finished replacing its credential/selection.
+            if (generation !== this.workspaceRoutingGeneration) closeChildren();
+            queueMicrotask(() => { if (active) reconcile(); });
+        };
+        const stop = () => {
+            active = false;
+            requested++;
+            this.workspaceSubscriptions.delete(schedule);
+            this.workspaceSubscriptionStops.delete(stop);
+            closeChildren();
+        };
+        this.workspaceSubscriptions.add(schedule);
+        this.workspaceSubscriptionStops.add(stop);
+        reconcile();
+        return stop;
     }
 
     getResourceReview(id: EngagementId, resource: string): Promise<ReviewState> {

@@ -31,6 +31,19 @@ pub async fn publish_deployment(
             .project_of_instance(&request.placement_id)
             .and_then(|project| workbench.project_member_requester(&headers, project))
     };
+    // Resolve before minting an entitlement or publishing anything. Member
+    // publication uses its already admitted owner's scope, not this helper.
+    let caller_scope = if requested_by.is_none() {
+        match workbench
+            .lock_unpoisoned()
+            .credential_scope_for(crate::net_http::bearer(&headers))
+        {
+            Ok(scope) => Some(scope),
+            Err((status, error)) => return (status, error).into_response(),
+        }
+    } else {
+        None
+    };
     let structured = request.funding.clone();
     if structured.is_some()
         && (!request.funding_ref.trim().is_empty()
@@ -122,7 +135,7 @@ pub async fn publish_deployment(
         let mut workbench = workbench.lock_unpoisoned();
         request.work_chat_default_model = work_chat_default_model(
             &workbench,
-            &headers,
+            caller_scope.as_deref(),
             &request.placement_id,
             requested_by.is_some(),
         );
@@ -164,7 +177,7 @@ pub async fn publish_deployment(
 /// asks, its owner's, whose key publishes it (DR-0453).
 fn work_chat_default_model(
     workbench: &crate::Workbench,
-    headers: &axum::http::HeaderMap,
+    caller_scope: Option<&str>,
     placement: &str,
     member: bool,
 ) -> Option<String> {
@@ -180,7 +193,7 @@ fn work_chat_default_model(
             _ => crate::account::ACCOUNT_SCOPE.to_owned(),
         }
     } else {
-        workbench.credential_scope_for(crate::net_http::bearer(headers))
+        caller_scope?.to_owned()
     };
     workbench.work_chat_default_model_in(&scope).1
 }

@@ -1,6 +1,6 @@
 //! Fork a project, and pull a fork's original into it
 //! ([DR-0327](../../../specs/decisions/0327-a-project-can-be-forked-and-pull-its-original.md);
-//! GaugeWright DR-0208).
+//! GaugeWright DR-0208; [DR-0475](../../../specs/decisions/0475-a-fork-pull-retains-both-preview-versions.md)).
 //!
 //! A fork is the export-and-import that transfers no standing. It is a new
 //! project made by the ordinary project lifecycle, owned by the forking
@@ -24,7 +24,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use gaugedesk_workspace::MergeOutcome;
+use gaugedesk_workspace::{MainSnapshot, MergeOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -149,6 +149,29 @@ impl IntoResponse for ForkError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewBases {
+    #[serde(deserialize_with = "required_cut")]
+    pub source_cut: Option<String>,
+    #[serde(deserialize_with = "required_cut")]
+    pub fork_cut: Option<String>,
+}
+
+fn required_cut<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let cut = Option::<String>::deserialize(d)?;
+    if cut.as_deref() == Some("") {
+        return Err(serde::de::Error::custom(
+            "empty cut identifier is not an empty Main",
+        ));
+    }
+    Ok(cut)
+}
+
+struct ManagedSnapshot {
+    whole: MainSnapshot,
+    files: BTreeMap<String, String>,
+}
+
 impl Workbench {
     /// The collaboration workspace id and partition root of `project`'s
     /// managed target: the project's own files.
@@ -179,18 +202,34 @@ impl Workbench {
             .collaboration_workspaces
             .get(&workspace_id)
             .ok_or_else(|| "project collaboration workspace is not open".to_owned())?;
-        let cut = workspace.current_main_cut().map_err(|e| e.to_string())?;
+        let snapshot = workspace.main_snapshot().map_err(|e| e.to_string())?;
+        let files = Self::partition_snapshot(&snapshot, &root);
+        Ok((files, snapshot.cut().map(str::to_owned)))
+    }
+
+    fn partition_snapshot(snapshot: &MainSnapshot, root: &str) -> BTreeMap<String, String> {
         let prefix = format!("{root}/");
-        let files = workspace
-            .main_manifest()
-            .map_err(|e| e.to_string())?
-            .into_iter()
+        snapshot
+            .files()
+            .iter()
             .filter_map(|(path, hash)| {
                 let inner = path.strip_prefix(&prefix)?.to_owned();
-                (!inner.starts_with(".gaugedesk-runtime/")).then_some((inner, hash))
+                (!inner.starts_with(".gaugedesk-runtime/")).then_some((inner, hash.clone()))
             })
-            .collect();
-        Ok((files, cut))
+            .collect()
+    }
+
+    fn managed_snapshot(&mut self, project_id: &str) -> Result<ManagedSnapshot, String> {
+        self.ensure_project_collaboration_workspace(project_id)?;
+        let (workspace_id, root) = self.managed_partition(project_id)?;
+        let whole = self
+            .collaboration_workspaces
+            .get(&workspace_id)
+            .ok_or_else(|| "project collaboration workspace is not open".to_owned())?
+            .main_snapshot()
+            .map_err(|e| e.to_string())?;
+        let files = Self::partition_snapshot(&whole, &root);
+        Ok(ManagedSnapshot { whole, files })
     }
 
     fn read_managed_bytes(&self, project_id: &str, path: &str) -> Result<Vec<u8>, String> {
@@ -214,15 +253,28 @@ impl Workbench {
         removes: &[String],
         message: &str,
     ) -> Result<MergeOutcome, String> {
+        self.land_on_managed_main_at(project_id, writes, removes, message, None)
+    }
+
+    fn land_on_managed_main_at(
+        &mut self,
+        project_id: &str,
+        writes: &[(String, Vec<u8>)],
+        removes: &[String],
+        message: &str,
+        expected: Option<Option<&str>>,
+    ) -> Result<MergeOutcome, String> {
         let (workspace_id, root) = self.managed_partition(project_id)?;
         let workspace = self
             .collaboration_workspaces
             .get(&workspace_id)
             .ok_or_else(|| "project collaboration workspace is not open".to_owned())?;
         let line = crate::library::gen_id("upstream");
-        let engagement = workspace
-            .create_engagement(&line)
-            .map_err(|e| e.to_string())?;
+        let engagement = match expected.flatten() {
+            Some(cut) => workspace.fork_engagement_at(&line, "main", "main", cut),
+            None => workspace.create_engagement(&line),
+        }
+        .map_err(|e| e.to_string())?;
         let outcome = (|| {
             for (path, bytes) in writes {
                 engagement
@@ -235,7 +287,11 @@ impl Workbench {
                     .map_err(|e| e.to_string())?;
             }
             engagement.commit_turn(message).map_err(|e| e.to_string())?;
-            engagement.merge_into_main().map_err(|e| e.to_string())
+            match expected {
+                Some(cut) => engagement.merge_into_main_at(cut),
+                None => engagement.merge_into_main(),
+            }
+            .map_err(|e| e.to_string())
         })();
         drop(engagement);
         let _ = workspace.remove_engagement(&line);
@@ -516,7 +572,22 @@ impl Workbench {
     fn pull_preview(
         &mut self,
         fork_id: &str,
-    ) -> Result<(Upstream, PullPlan, Option<String>), ForkError> {
+    ) -> Result<(Upstream, PullPlan, PreviewBases), ForkError> {
+        let (upstream, plan, source, fork) = self.pull_preview_snapshots(fork_id)?;
+        Ok((
+            upstream,
+            plan,
+            PreviewBases {
+                source_cut: source.whole.cut().map(str::to_owned),
+                fork_cut: fork.whole.cut().map(str::to_owned),
+            },
+        ))
+    }
+
+    fn pull_preview_snapshots(
+        &mut self,
+        fork_id: &str,
+    ) -> Result<(Upstream, PullPlan, ManagedSnapshot, ManagedSnapshot), ForkError> {
         let fork = self
             .library
             .projects
@@ -542,34 +613,30 @@ impl Workbench {
             ));
         }
         let basis = self.current_basis(fork_id).map_err(ForkError::Failed)?;
-        let (theirs, source_cut) = self
-            .managed_manifest(&upstream.project_id)
+        let source = self
+            .managed_snapshot(&upstream.project_id)
             .map_err(ForkError::Failed)?;
-        let (ours, _) = self.managed_manifest(fork_id).map_err(ForkError::Failed)?;
-        Ok((
-            upstream,
-            plan_pull(&basis.files, &theirs, &ours),
-            source_cut,
-        ))
+        let fork = self.managed_snapshot(fork_id).map_err(ForkError::Failed)?;
+        let plan = plan_pull(&basis.files, &source.files, &fork.files);
+        Ok((upstream, plan, source, fork))
     }
 
-    /// Pull `fork_id`'s upstream into its Main. `expected_cut` is the
-    /// original's cut the caller previewed; if the original moved since, the
-    /// caller previews again rather than settling conflicts it never saw.
+    /// Choices refer to both exact versions rendered in the required preview.
     pub fn pull_upstream(
         &mut self,
         fork_id: &str,
         actor: &str,
-        expected_cut: Option<&str>,
+        expected: &PreviewBases,
         resolutions: &BTreeMap<String, Resolution>,
     ) -> Result<serde_json::Value, ForkError> {
-        let (upstream, plan, source_cut) = self.pull_preview(fork_id)?;
-        if let Some(expected) = expected_cut {
-            if source_cut.as_deref() != Some(expected) {
-                return Err(ForkError::Conflict(
-                    "the original changed since this pull was previewed".into(),
-                ));
-            }
+        let (upstream, plan, source, fork) = self.pull_preview_snapshots(fork_id)?;
+        let source_cut = source.whole.cut().map(str::to_owned);
+        if source.whole.cut() != expected.source_cut.as_deref()
+            || fork.whole.cut() != expected.fork_cut.as_deref()
+        {
+            return Err(ForkError::Conflict(
+                "the original or fork changed since this pull was previewed".into(),
+            ));
         }
         let unresolved: Vec<&String> = plan
             .conflicts
@@ -586,9 +653,7 @@ impl Workbench {
                     .join(", ")
             )));
         }
-        let (theirs, _) = self
-            .managed_manifest(&upstream.project_id)
-            .map_err(ForkError::Failed)?;
+        let theirs = source.files;
         let mut take: Vec<String> = plan.take.clone();
         let mut remove: Vec<String> = plan.remove.clone();
         for path in &plan.conflicts {
@@ -602,11 +667,19 @@ impl Workbench {
         }
         let mut writes = Vec::with_capacity(take.len());
         for path in &take {
-            writes.push((
-                path.clone(),
-                self.read_managed_bytes(&upstream.project_id, path)
-                    .map_err(ForkError::Failed)?,
-            ));
+            writes.push((path.clone(), {
+                let (workspace_id, root) = self
+                    .managed_partition(&upstream.project_id)
+                    .map_err(ForkError::Failed)?;
+                self.collaboration_workspaces
+                    .get(&workspace_id)
+                    .ok_or_else(|| ForkError::Failed("original workspace is unavailable".into()))?
+                    .read_snapshot_file(&source.whole, &format!("{root}/{path}"))
+                    .map_err(|e| ForkError::Failed(e.to_string()))?
+                    .ok_or_else(|| {
+                        ForkError::Failed("previewed original bytes are unavailable".into())
+                    })?
+            }));
         }
         let source_name = self
             .library
@@ -614,13 +687,15 @@ impl Workbench {
             .get(&upstream.project_id)
             .map(|project| project.name.clone())
             .unwrap_or_default();
-        if !writes.is_empty() || !remove.is_empty() {
+        {
+            // Even Mine-only/no-op pulls publish against the expected parent.
             let outcome = self
-                .land_on_managed_main(
+                .land_on_managed_main_at(
                     fork_id,
                     &writes,
                     &remove,
                     &format!("Pull from {source_name}"),
+                    Some(expected.fork_cut.as_deref()),
                 )
                 .map_err(ForkError::Failed)?;
             if outcome != MergeOutcome::Clean {
@@ -750,14 +825,15 @@ pub async fn get_upstream(
         .get(&upstream.project_id)
         .map(|project| project.name.clone());
     match wb.pull_preview(&id) {
-        Ok((upstream, plan, source_cut)) => (
+        Ok((upstream, plan, bases)) => (
             StatusCode::OK,
             Json(json!({
                 "upstream": {
                     "available": true,
                     "project_id": upstream.project_id,
                     "name": name,
-                    "source_cut": source_cut,
+                    "source_cut": bases.source_cut,
+                    "fork_cut": bases.fork_cut,
                     "take": plan.take,
                     "remove": plan.remove,
                     "conflicts": plan.conflicts,
@@ -781,11 +857,11 @@ pub async fn get_upstream(
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 pub struct PullUpstream {
-    /// The original's cut the caller previewed.
-    #[serde(default)]
-    pub source_cut: Option<String>,
+    /// Both fields are required even when their genuine revision is null.
+    #[serde(flatten)]
+    pub bases: PreviewBases,
     /// A version for every conflicting path.
     #[serde(default)]
     pub resolutions: BTreeMap<String, Resolution>,
@@ -815,7 +891,7 @@ pub async fn pull_upstream(
         return ForkError::Refused("only the fork's owner can pull its original".into())
             .into_response();
     }
-    match wb.pull_upstream(&id, &actor, body.source_cut.as_deref(), &body.resolutions) {
+    match wb.pull_upstream(&id, &actor, &body.bases, &body.resolutions) {
         Ok(receipt) => (StatusCode::OK, Json(receipt)).into_response(),
         Err(error) => error.into_response(),
     }
@@ -1132,7 +1208,7 @@ mod tests {
         assert_eq!(plan.remove, vec!["image.bin".to_owned()]);
         assert!(plan.conflicts.is_empty());
         let actor = wb.authority().as_str().to_owned();
-        wb.pull_upstream(&fork, &actor, cut.as_deref(), &BTreeMap::new())
+        wb.pull_upstream(&fork, &actor, &cut, &BTreeMap::new())
             .unwrap();
         let files = bytes(&mut wb, &fork);
         assert_eq!(files["notes.md"], b"newer notes");
@@ -1154,13 +1230,12 @@ mod tests {
         assert_eq!(plan.conflicts, vec!["notes.md".to_owned()]);
         let actor = wb.authority().as_str().to_owned();
         assert!(matches!(
-            wb.pull_upstream(&fork, &actor, cut.as_deref(), &BTreeMap::new()),
+            wb.pull_upstream(&fork, &actor, &cut, &BTreeMap::new()),
             Err(ForkError::Conflict(_))
         ));
         assert_eq!(bytes(&mut wb, &fork)["notes.md"], b"mine");
         let keep = BTreeMap::from([("notes.md".to_owned(), Resolution::Mine)]);
-        wb.pull_upstream(&fork, &actor, cut.as_deref(), &keep)
-            .unwrap();
+        wb.pull_upstream(&fork, &actor, &cut, &keep).unwrap();
         assert_eq!(bytes(&mut wb, &fork)["notes.md"], b"mine");
         // Kept once, it is not asked about again until the original moves.
         assert!(wb.pull_preview(&fork).unwrap().1.is_empty());
@@ -1168,8 +1243,7 @@ mod tests {
         let (_, plan, cut) = wb.pull_preview(&fork).unwrap();
         assert_eq!(plan.conflicts, vec!["notes.md".to_owned()]);
         let take = BTreeMap::from([("notes.md".to_owned(), Resolution::Theirs)]);
-        wb.pull_upstream(&fork, &actor, cut.as_deref(), &take)
-            .unwrap();
+        wb.pull_upstream(&fork, &actor, &cut, &take).unwrap();
         assert_eq!(bytes(&mut wb, &fork)["notes.md"], b"theirs again");
     }
 
@@ -1181,7 +1255,7 @@ mod tests {
         land(&mut wb, &source, &[("notes.md", b"moved")], &[]);
         let actor = wb.authority().as_str().to_owned();
         assert!(matches!(
-            wb.pull_upstream(&fork, &actor, cut.as_deref(), &BTreeMap::new()),
+            wb.pull_upstream(&fork, &actor, &cut, &BTreeMap::new()),
             Err(ForkError::Conflict(_))
         ));
         assert_eq!(bytes(&mut wb, &fork)["notes.md"], b"base notes");
@@ -1235,5 +1309,317 @@ mod tests {
     fn a_fork_name_stays_within_the_project_name_limit() {
         assert_eq!(fork_name("Peach"), "Peach (fork)");
         assert_eq!(fork_name(&"x".repeat(200)).chars().count(), 120);
+    }
+    #[test]
+    fn a_choice_cannot_replace_a_fork_edit_made_after_preview() {
+        let (root, shared, source, fork) = forked();
+        let mut wb = shared.lock_unpoisoned();
+        land(&mut wb, &source, &[("notes.md", b"original")], &[]);
+        land(&mut wb, &fork, &[("notes.md", b"f1")], &[]);
+        let (_, _, preview) = wb.pull_preview(&fork).expect("preview f1");
+        land(&mut wb, &fork, &[("notes.md", b"f2")], &[]);
+        let fork_before = bytes(&mut wb, &fork);
+        let original_before = bytes(&mut wb, &source);
+        let basis = wb.current_basis(&fork).expect("basis");
+        let actor = wb.authority().as_str().to_owned();
+        let choices = BTreeMap::from([("notes.md".to_owned(), Resolution::Theirs)]);
+        assert!(
+            matches!(
+                wb.pull_upstream(&fork, &actor, &preview, &choices),
+                Err(ForkError::Conflict(_))
+            ),
+            "unseen f2 must refuse"
+        );
+        assert_eq!(bytes(&mut wb, &fork), fork_before);
+        assert_eq!(bytes(&mut wb, &source), original_before);
+        assert_eq!(
+            serde_json::to_value(wb.current_basis(&fork).expect("retained basis")).expect("encode"),
+            serde_json::to_value(basis).expect("encode")
+        );
+        drop(wb);
+        drop(shared);
+        let shared = crate::workbench_state::open_lean_workbench(root.path()).expect("reopen");
+        let mut wb = shared.lock_unpoisoned();
+        let (_, _, fresh) = wb.pull_preview(&fork).expect("fresh f2 preview");
+        wb.pull_upstream(&fork, &actor, &fresh, &choices)
+            .expect("deliberate new choice");
+        assert_eq!(bytes(&mut wb, &fork)["notes.md"], b"original");
+    }
+
+    #[test]
+    fn a_stale_mine_only_choice_is_refused_at_preview_admission() {
+        let (_root, shared, source, fork) = forked();
+        let mut wb = shared.lock_unpoisoned();
+        land(&mut wb, &source, &[("notes.md", b"original")], &[]);
+        land(&mut wb, &fork, &[("notes.md", b"f1")], &[]);
+        let (_, _, preview) = wb.pull_preview(&fork).expect("preview f1");
+        land(&mut wb, &fork, &[("notes.md", b"f2")], &[]);
+        let before = wb.managed_snapshot(&fork).expect("current Main").whole;
+        let basis =
+            serde_json::to_value(wb.current_basis(&fork).expect("basis")).expect("encode basis");
+        let actor = wb.authority().as_str().to_owned();
+        let choices = BTreeMap::from([("notes.md".to_owned(), Resolution::Mine)]);
+        let result = wb.pull_upstream(&fork, &actor, &preview, &choices);
+        assert!(matches!(result, Err(ForkError::Conflict(_))),
+            "a stale Mine-only preview must refuse at admission, not attempt late publication: {result:?}");
+        assert_eq!(
+            wb.managed_snapshot(&fork).expect("unchanged Main").whole,
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(wb.current_basis(&fork).expect("retained basis"))
+                .expect("encode basis"),
+            basis
+        );
+    }
+
+    #[test]
+    fn a_binary_pull_uses_the_previewed_whole_bytes() {
+        let (_root, shared, source, fork) = forked();
+        let mut wb = shared.lock_unpoisoned();
+        let binary: &[u8] = &[0, 255, 128, 1, 0];
+        land(&mut wb, &source, &[("image.bin", binary)], &[]);
+        let (_, _, preview) = wb.pull_preview(&fork).expect("binary preview");
+        let actor = wb.authority().as_str().to_owned();
+        wb.pull_upstream(&fork, &actor, &preview, &BTreeMap::new())
+            .expect("binary pull");
+        assert_eq!(bytes(&mut wb, &fork)["image.bin"], binary);
+        assert_eq!(bytes(&mut wb, &source)["image.bin"], binary);
+    }
+
+    #[test]
+    fn late_no_op_publication_refuses_without_advancing_upstream_basis() {
+        let (_root, shared, _source, fork) = forked();
+        let mut wb = shared.lock_unpoisoned();
+        let (_, _, preview) = wb.pull_preview(&fork).expect("no-op preview");
+        let basis =
+            serde_json::to_value(wb.current_basis(&fork).expect("basis")).expect("encode basis");
+        land(&mut wb, &fork, &[("late.md", b"unseen")], &[]);
+        let before = wb.managed_snapshot(&fork).expect("late snapshot").whole;
+        assert!(
+            wb.land_on_managed_main_at(
+                &fork,
+                &[],
+                &[],
+                "late no-op",
+                Some(preview.fork_cut.as_deref())
+            )
+            .is_err(),
+            "even an empty incoming pull must fence the previewed parent"
+        );
+        assert_eq!(
+            wb.managed_snapshot(&fork).expect("unchanged Main").whole,
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(wb.current_basis(&fork).expect("basis retained"))
+                .expect("encode basis"),
+            basis
+        );
+    }
+
+    #[test]
+    fn required_preview_coordinates_preserve_explicit_empty_versions() {
+        for invalid in [
+            json!({}),
+            json!({"source_cut": null}),
+            json!({"fork_cut": null}),
+            json!({"source_cut":"", "fork_cut":null}),
+        ] {
+            assert!(
+                serde_json::from_value::<PullUpstream>(invalid).is_err(),
+                "omitted or malformed preview must refuse"
+            );
+        }
+        let empty =
+            serde_json::from_value::<PullUpstream>(json!({"source_cut":null,"fork_cut":null}))
+                .expect("explicit empty versions");
+        assert_eq!(empty.bases.source_cut, None);
+        assert_eq!(empty.bases.fork_cut, None);
+    }
+
+    #[test]
+    fn mine_only_pull_certifies_same_content_and_fresh_basis() {
+        let (_root, shared, source, fork) = forked();
+        let mut wb = shared.lock_unpoisoned();
+        land(&mut wb, &source, &[("notes.md", b"original")], &[]);
+        land(&mut wb, &fork, &[("notes.md", b"mine")], &[]);
+        let before = bytes(&mut wb, &fork);
+        let (_, _, preview) = wb.pull_preview(&fork).expect("preview");
+        let actor = wb.authority().as_str().to_owned();
+        let choices = BTreeMap::from([("notes.md".to_owned(), Resolution::Mine)]);
+        wb.pull_upstream(&fork, &actor, &preview, &choices)
+            .expect("mine choice");
+        assert_eq!(bytes(&mut wb, &fork), before);
+        let (_, plan, current) = wb.pull_preview(&fork).expect("current preview");
+        assert!(plan.is_empty());
+        assert_ne!(current.fork_cut, preview.fork_cut);
+        assert_eq!(current.source_cut, preview.source_cut);
+    }
+
+    #[tokio::test]
+    async fn router_requires_both_preview_fields_before_a_pull_can_run() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let (_root, shared, _source, fork) = forked();
+        let app = crate::open_control_plane(shared.clone());
+        let before = shared
+            .lock_unpoisoned()
+            .current_basis(&fork)
+            .expect("basis");
+        for body in [json!({}), json!({"source_cut":null})] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/projects/{fork}/upstream/pull"))
+                        .header("content-type", "application/json")
+                        .header(
+                            "idempotency-key",
+                            whipplescript_store::stable_hash_hex(&body.to_string()),
+                        )
+                        .body(Body::from(body.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        assert_eq!(
+            serde_json::to_value(
+                shared
+                    .lock_unpoisoned()
+                    .current_basis(&fork)
+                    .expect("basis unchanged")
+            )
+            .expect("encode"),
+            serde_json::to_value(before).expect("encode")
+        );
+    }
+    #[tokio::test]
+    async fn authenticated_router_preview_and_pull_keep_exact_pair_and_refuse_revoked_session() {
+        use axum::{body::Body, http::Request, Router};
+        use tower::ServiceExt;
+        async fn request(
+            app: &Router,
+            token: &str,
+            method: &str,
+            uri: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .header(
+                            "idempotency-key",
+                            crate::library::gen_id("fork-preview-test"),
+                        )
+                        .body(if method == "GET" {
+                            Body::empty()
+                        } else {
+                            Body::from(body.to_string())
+                        })
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .expect("body");
+            (
+                status,
+                serde_json::from_slice(&bytes).expect("JSON response"),
+            )
+        }
+        let root = tempfile::tempdir().expect("owned state");
+        let shared = crate::workbench_state::open_lean_workbench(root.path()).expect("open");
+        crate::account_signin::store_session_for_test(&shared);
+        crate::home_owner::claim_if_never_claimed(&shared).expect("claim native Home");
+        let token = crate::desktop_session::home_session(&shared)
+            .expect("current native account Home session");
+        let app = crate::open_control_plane(shared.clone());
+        let (status, created) = request(
+            &app,
+            &token,
+            "POST",
+            "/projects",
+            json!({"name":"Original"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let source = created["id"].as_str().expect("source ID").to_owned();
+        {
+            let mut wb = shared.lock_unpoisoned();
+            land(&mut wb, &source, &[("notes.md", b"base")], &[]);
+        }
+        let (status, created) = request(
+            &app,
+            &token,
+            "POST",
+            &format!("/projects/{source}/fork"),
+            json!({"operation_id":"router-fork"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let fork = created["id"].as_str().expect("fork ID").to_owned();
+        {
+            let mut wb = shared.lock_unpoisoned();
+            land(&mut wb, &source, &[("notes.md", b"original")], &[]);
+            land(&mut wb, &fork, &[("notes.md", b"f1")], &[]);
+        }
+        let (status, preview) = request(
+            &app,
+            &token,
+            "GET",
+            &format!("/projects/{fork}/upstream"),
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let preview = &preview["upstream"];
+        assert!(preview["source_cut"].is_string() && preview["fork_cut"].is_string());
+        {
+            let mut wb = shared.lock_unpoisoned();
+            land(&mut wb, &fork, &[("notes.md", b"f2")], &[]);
+        }
+        let payload = json!({"source_cut":preview["source_cut"], "fork_cut":preview["fork_cut"], "resolutions":{"notes.md":"theirs"}});
+        let uri = format!("/projects/{fork}/upstream/pull");
+        assert_eq!(
+            request(&app, &token, "POST", &uri, payload).await.0,
+            StatusCode::CONFLICT
+        );
+        {
+            let mut wb = shared.lock_unpoisoned();
+            assert_eq!(bytes(&mut wb, &fork)["notes.md"], b"f2");
+        }
+        let (_, preview) = request(
+            &app,
+            &token,
+            "GET",
+            &format!("/projects/{fork}/upstream"),
+            json!(null),
+        )
+        .await;
+        let payload = json!({"source_cut":preview["upstream"]["source_cut"], "fork_cut":preview["upstream"]["fork_cut"], "resolutions":{"notes.md":"theirs"}});
+        assert_eq!(
+            request(&app, &token, "POST", &uri, payload.clone()).await.0,
+            StatusCode::OK
+        );
+        {
+            let mut wb = shared.lock_unpoisoned();
+            assert_eq!(bytes(&mut wb, &fork)["notes.md"], b"original");
+            wb.revoke_account_session(&token);
+        }
+        assert_eq!(
+            request(&app, &token, "POST", &uri, payload).await.0,
+            StatusCode::FORBIDDEN
+        );
     }
 }

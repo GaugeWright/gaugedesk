@@ -73,6 +73,7 @@ struct Fixture {
     wb: SharedWorkbench,
     chat: String,
     origin: String,
+    provider_origin: String,
     owned_listeners: Vec<String>,
     headers: Vec<(String, String)>,
     calls: Mutex<mpsc::Receiver<ProviderCall>>,
@@ -219,6 +220,7 @@ impl Fixture {
             wb,
             chat,
             origin: String::new(),
+            provider_origin: String::new(),
             owned_listeners: Vec::new(),
             headers: Vec::new(),
             calls: Mutex::new(calls),
@@ -282,6 +284,7 @@ impl Fixture {
                 .headers
                 .push((actor.into(), body["admission"].as_str().unwrap().into()));
         }
+        fixture.provider_origin = provider_origin.clone();
         let linked = fixture
             .request(
                 READER,
@@ -1335,3 +1338,7 @@ async fn raw_context_browser_fixture() {
         true
     );
 }
+
+// Shares the actual admitted runtime fixture without making a production bypass.
+#[path = "choice_route_contract_tests.rs"]
+mod choice_routes;

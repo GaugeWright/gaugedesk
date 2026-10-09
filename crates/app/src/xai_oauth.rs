@@ -327,10 +327,18 @@ fn start_login(
     Ok(projection)
 }
 
-fn status(wb: &SharedWorkbench, headers: &HeaderMap, class: ModelExecutionClass) -> Json<Value> {
-    let scope = wb
+fn status(
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+    class: ModelExecutionClass,
+) -> axum::response::Response {
+    let scope = match wb
         .lock_unpoisoned()
-        .credential_scope_for(net_http::bearer(headers));
+        .credential_scope_for(net_http::bearer(headers))
+    {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     let credential = load_credential_in(wb, &scope, class).map(|(credential, _)| credential);
     Json(json!({
         "provider": PROVIDER,
@@ -339,6 +347,7 @@ fn status(wb: &SharedWorkbench, headers: &HeaderMap, class: ModelExecutionClass)
         "expired": credential.as_ref().is_some_and(|credential| credential.expires <= now_ms()),
         "login": login_for_scope(&scope).map(|login| login.projection()),
     }))
+    .into_response()
 }
 
 pub fn home_status_for_scope(wb: &crate::Workbench, scope: &str) -> Value {
@@ -393,9 +402,13 @@ async fn start(
     headers: HeaderMap,
     class: ModelExecutionClass,
 ) -> axum::response::Response {
-    let scope = wb
+    let scope = match wb
         .lock_unpoisoned()
-        .credential_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers))
+    {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     match tokio::task::spawn_blocking(move || start_login(wb, scope, class)).await {
         Ok(Ok(login)) => Json(json!({ "mode": "device", "login": login })).into_response(),
         Ok(Err(error)) => {
@@ -416,9 +429,13 @@ pub async fn post_home_start(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let scope = wb
+    let scope = match wb
         .lock_unpoisoned()
-        .credential_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers))
+    {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     match start_home_login_for_scope(wb, scope).await {
         Ok(login) => Json(json!({ "mode": "device", "login": login })).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response(),
@@ -429,11 +446,15 @@ pub async fn post_cancel(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let scope = wb
+    let scope = match wb
         .lock_unpoisoned()
-        .credential_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers))
+    {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     cancel_home_login_for_scope(&scope);
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn refresh_credential(credential: &XaiOAuthCredential) -> Result<XaiOAuthCredential, String> {

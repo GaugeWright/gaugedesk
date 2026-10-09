@@ -145,7 +145,21 @@ impl Workbench {
     /// The name a chat sees for one of its targets: its branch's, and the
     /// project's until the branch has one.
     pub(crate) fn chat_target_name(&self, chat_id: &str, target_id: &str) -> String {
-        let branch = self.engagements.get(chat_id).and_then(|engagement| {
+        self.chat_target_name_in(
+            self.engagements
+                .get(chat_id)
+                .map(|engagement| engagement.as_ref()),
+            target_id,
+        )
+    }
+
+    /// The same name projection for an owned candidate that is not published yet.
+    pub(crate) fn chat_target_name_in(
+        &self,
+        engagement: Option<&dyn gaugedesk_workspace::ChatWorkspace>,
+        target_id: &str,
+    ) -> String {
+        let branch = engagement.and_then(|engagement| {
             engagement
                 .read_file(&target_name_path(target_id).ok()?)
                 .ok()

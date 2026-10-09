@@ -79,6 +79,7 @@ export interface ProjectSettingsApi extends ProjectModelAccessApi, WhipCostsApi 
     pullProjectUpstream?(
         project: ProjectId,
         sourceCut: string | null,
+        forkCut: string | null,
         resolutions: Readonly<Record<string, "mine" | "theirs">>,
     ): Promise<{ readonly pulled: number }>;
     /** What background work holds which of the project's keys (DR-0312). */
@@ -487,6 +488,15 @@ function ForkedFrom(props: ProjectSettingsProps): JSX.Element {
         const u = upstream();
         return u && u.available ? u : null;
     };
+    let choiceBasis = "";
+    createEffect(() => {
+        const u = ready();
+        const basis = JSON.stringify([props.project.id, u?.sourceCut, u?.forkCut]);
+        if (basis !== choiceBasis) {
+            choiceBasis = basis;
+            setChoices({});
+        }
+    });
     const unresolved = () => ready()?.conflicts.filter((path) => !choices()[path]) ?? [];
     const pull = async () => {
         const u = ready();
@@ -494,12 +504,13 @@ function ForkedFrom(props: ProjectSettingsProps): JSX.Element {
         setBusy(true);
         setStatus("");
         try {
-            const result = await props.api.pullProjectUpstream(props.project.id, u.sourceCut, choices());
+            const result = await props.api.pullProjectUpstream(props.project.id, u.sourceCut, u.forkCut, choices());
             setStatus(result.pulled ? `Pulled ${plural(result.pulled, "file")} from ${u.name ?? "the original"}.` : "Your choices were recorded; nothing else changed.");
             setChoices({});
             setRefresh((n) => n + 1);
             await props.onChanged();
         } catch (error) {
+            setChoices({});
             setStatus(describeError(error));
             setRefresh((n) => n + 1);
         } finally {

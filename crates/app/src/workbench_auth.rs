@@ -1403,18 +1403,28 @@ impl Workbench {
     /// except that a desktop keys them by the account session's own account
     /// (DR-0313). The other account records — Homes, routes, devices,
     /// sessions, tenants — stay where `account_scope_for` puts them.
-    pub fn credential_scope_for(&self, bearer: Option<&str>) -> String {
+    /// A presented desktop bearer must resolve its own current account session;
+    /// an unavailable session refuses, rather than borrowing the install scope.
+    pub fn credential_scope_for(
+        &self,
+        bearer: Option<&str>,
+    ) -> Result<String, (StatusCode, &'static str)> {
         if self.desktop_account_mode() {
             let account = match bearer {
                 Some(token) => match self.resolve_account_session(token) {
                     Some((account, _)) => account,
-                    None => return crate::account::ACCOUNT_SCOPE.to_string(),
+                    None => {
+                        return Err((
+                            StatusCode::UNAUTHORIZED,
+                            "credential account session is unavailable",
+                        ))
+                    }
                 },
                 None => self.authority().as_str().to_owned(),
             };
-            return self.desktop_account_store_scope(&account);
+            return Ok(self.desktop_account_store_scope(&account));
         }
-        self.account_scope_for(bearer)
+        Ok(self.account_scope_for(bearer))
     }
 
     /// Gate an export by the org's resource-floor policy (`RBAC-6`; the export half

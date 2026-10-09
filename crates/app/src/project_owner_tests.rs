@@ -892,14 +892,23 @@ fn the_claimant_keeps_the_installs_credentials_and_another_account_has_its_own()
     let other = session(&wb, OTHER);
     let guard = wb.lock_unpoisoned();
     let install = crate::account::ACCOUNT_SCOPE.to_owned();
-    assert_eq!(guard.credential_scope_for(Some(&claimant)), install);
     assert_eq!(
-        guard.credential_scope_for(None),
+        guard
+            .credential_scope_for(Some(&claimant))
+            .expect("valid credential scope"),
+        install
+    );
+    assert_eq!(
+        guard
+            .credential_scope_for(None)
+            .expect("valid credential scope"),
         crate::account::account_scope(guard.authority().as_str()),
         "signed out, the local account has its own (DR-0328 §2)"
     );
     assert_eq!(
-        guard.credential_scope_for(Some(&other)),
+        guard
+            .credential_scope_for(Some(&other))
+            .expect("valid credential scope"),
         crate::account::account_scope(OTHER)
     );
     // A turn resolves its actor's credentials the same way.
@@ -1157,7 +1166,9 @@ fn an_unclaimed_computers_local_account_keeps_the_installs_personal_and_credenti
         "the install's Personal is the local account's"
     );
     assert_eq!(
-        guard.credential_scope_for(None),
+        guard
+            .credential_scope_for(None)
+            .expect("valid credential scope"),
         crate::account::ACCOUNT_SCOPE
     );
     assert!(guard.project_visibility(None).allows(DEFAULT_PROJECT));
@@ -2486,3 +2497,6 @@ async fn the_desktop_window_reaches_a_signed_in_accounts_project_across_origins(
     let body = refused.into_body().collect().await.unwrap().to_bytes();
     assert!(String::from_utf8_lossy(&body).contains("not in scope for this project"));
 }
+
+#[path = "credential_scope_tests.rs"]
+mod credential_scope_tests;

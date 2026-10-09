@@ -1207,7 +1207,10 @@ pub async fn get_default_model(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    let scope = wb.credential_scope_for(net_http::bearer(&headers));
+    let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     let (provider, model) = wb.work_chat_default_model_in(&scope);
     (
         StatusCode::OK,
@@ -1993,9 +1996,14 @@ pub async fn get_settings(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let ((), account) = fold_account_unlocked(&wb, |wb| {
-        (wb.credential_scope_for(net_http::bearer(&headers)), ())
-    });
+    let scope = match wb
+        .lock_unpoisoned()
+        .credential_scope_for(net_http::bearer(&headers))
+    {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
+    let ((), account) = fold_account_unlocked(&wb, |_| (scope, ()));
     match account.map(|account| account.setting_values()) {
         Ok(settings) => (StatusCode::OK, Json(json!({ "settings": settings }))).into_response(),
         Err(e) => err_response(e),
@@ -2019,7 +2027,10 @@ pub async fn put_setting(
         value: body.value,
     };
     let mut wb = wb.lock_unpoisoned();
-    let scope = wb.credential_scope_for(net_http::bearer(&headers));
+    let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     if let Err(e) = wb.upsert_account_setting_in(&scope, &record) {
         return err_response(e);
     }
@@ -2033,7 +2044,10 @@ pub async fn get_credentials(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    let scope = wb.credential_scope_for(net_http::bearer(&headers));
+    let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     match wb.account_credential_providers_in(&scope) {
         Ok(provider_ids) => {
             // Providers + linked-flag only — never the token (sealed or otherwise).
@@ -2076,7 +2090,10 @@ pub async fn post_credential(
             .into_response();
     }
     let mut wb = shared.lock_unpoisoned();
-    let scope = wb.credential_scope_for(net_http::bearer(&headers));
+    let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     // The seal is at-rest encryption under this account's seed-derived key (ADR 0053 §4);
     // the per-person access boundary is the scope (INV-1), so a person only ever reads their
     // own credentials.
@@ -2150,7 +2167,10 @@ fn box_fingerprint(value: &str) -> Option<String> {
 /// bytes must not be copied, which is what sealing them was for.
 pub async fn get_boxes(State(wb): State<SharedWorkbench>, headers: HeaderMap) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    let scope = wb.credential_scope_for(net_http::bearer(&headers));
+    let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     match wb.account_boxes_in(&scope) {
         Ok(records) => {
             let boxes: Vec<serde_json::Value> = records
@@ -2190,7 +2210,10 @@ pub async fn delete_box(
             .into_response();
     };
     let mut wb = wb.lock_unpoisoned();
-    let scope = wb.credential_scope_for(net_http::bearer(&headers));
+    let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     match wb.tombstone_account_box_in(&scope, fingerprint) {
         Ok(()) => (StatusCode::OK, Json(json!({ "forgotten": true }))).into_response(),
         Err(e) => err_response(e),
@@ -2230,7 +2253,10 @@ pub async fn post_box_claim(
     // holding the workbench across it would stall every other request.
     let (scope, home_id, home_key) = {
         let wb = wb.lock_unpoisoned();
-        let scope = wb.credential_scope_for(net_http::bearer(&headers));
+        let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+            Ok(scope) => scope,
+            Err((status, error)) => return (status, error).into_response(),
+        };
         (scope, wb.authority().as_str().to_owned(), wb.account_key())
     };
     // A stable per-account value the box pins as "the Home that claimed me".
@@ -2339,7 +2365,10 @@ async fn carry_to_box(
     // every other request against this Home.
     let (endpoint, material) = {
         let wb = wb.lock_unpoisoned();
-        let scope = wb.credential_scope_for(net_http::bearer(&headers));
+        let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+            Ok(scope) => scope,
+            Err((status, error)) => return (status, error).into_response(),
+        };
         let Ok(records) = wb.account_boxes_in(&scope) else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "reading boxes").into_response();
         };
@@ -2421,7 +2450,10 @@ pub async fn delete_credential(
     Path(provider): Path<String>,
 ) -> impl IntoResponse {
     let mut wb = shared.lock_unpoisoned();
-    let scope = wb.credential_scope_for(net_http::bearer(&headers));
+    let scope = match wb.credential_scope_for(net_http::bearer(&headers)) {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     if let Err(e) = wb.tombstone_account_credential_in(&scope, provider.clone()) {
         return err_response(e);
     }

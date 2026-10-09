@@ -54,6 +54,8 @@ pub use resolution_recording_target::{
     NativeResolutionRecordingEvidenceTarget, NativeResolutionRecordingTarget,
 };
 
+mod fork_pull;
+pub use fork_pull::MainSnapshot;
 mod guarded_upload;
 mod streamed_upload;
 pub use streamed_upload::{NativeStreamedUpload, NativeStreamedUploadTarget};
@@ -2000,6 +2002,19 @@ impl Engagement {
     /// because it adopted the content, ours because the line rebased onto
     /// the merge cut (folding anything the target had that we lacked).
     pub fn merge_into_main(&self) -> Result<MergeOutcome> {
+        self.merge_into_main_with_expected(None)
+    }
+
+    /// Publish only against the exact Main revision observed by a fork preview.
+    /// The outer option distinguishes ordinary merges from a guarded empty Main.
+    pub fn merge_into_main_at(&self, expected: Option<&str>) -> Result<MergeOutcome> {
+        self.merge_into_main_with_expected(Some(expected))
+    }
+
+    fn merge_into_main_with_expected(
+        &self,
+        expected: Option<Option<&str>>,
+    ) -> Result<MergeOutcome> {
         // A fold is a read-modify-write across TWO heads — it advances the
         // target and then rebases this line onto the merge cut — so it holds
         // both writers for the whole verb, import through projection. Held
@@ -2016,12 +2031,8 @@ impl Engagement {
         // landing after this import is work no import has considered yet, not
         // content the merge decided against.
         let sides = self.import_sides_under_writer(&mut vcs)?;
-        match vcs.merge_keeping(
-            &self.branch,
-            &fresh_cut_id("keep"),
-            &now_at(),
-            &mut GaugeDeskMainlineGate,
-        )? {
+        let mut gate = fork_pull::PreviewMainlineGate { expected };
+        match vcs.merge_keeping(&self.branch, &fresh_cut_id("keep"), &now_at(), &mut gate)? {
             VcsMergeOutcome::Landed { .. } | VcsMergeOutcome::Adopted { .. } => {
                 if let Some(repo) = &sides.repo {
                     sync_out_observing(
@@ -3341,6 +3352,16 @@ pub trait Workspace: Send {
             "this workspace has no durable cut-lineage authority",
         ))
     }
+    fn main_snapshot(&self) -> Result<MainSnapshot> {
+        Err(WorkspaceError::msg(
+            "this workspace cannot bind a fork preview",
+        ))
+    }
+    fn read_snapshot_file(&self, _snapshot: &MainSnapshot, _path: &str) -> Result<Option<Vec<u8>>> {
+        Err(WorkspaceError::msg(
+            "this workspace cannot read an immutable fork preview",
+        ))
+    }
     fn current_main_cut(&self) -> Result<Option<String>> {
         Err(WorkspaceError::msg(
             "this workspace has no durable Main ref authority",
@@ -3595,6 +3616,12 @@ pub trait ChatWorkspace: Send {
     }
     fn merge_probe(&self) -> Result<MergeOutcome>;
     fn merge_into_main(&self) -> Result<MergeOutcome>;
+    fn merge_into_main_at(&self, _expected: Option<&str>) -> Result<MergeOutcome> {
+        Err(WorkspaceError::msg(
+            "this workspace cannot fence fork preview publication",
+        ))
+    }
+
     fn ingest(&self, source: &Path) -> Result<usize>;
     fn ingest_into(&self, prefix: &str, source: &Path) -> Result<usize> {
         if prefix.is_empty() {
@@ -3735,6 +3762,12 @@ impl Workspace for Instance {
         Ok(Self::native_workflow_storage(self))
     }
 
+    fn main_snapshot(&self) -> Result<MainSnapshot> {
+        Self::main_snapshot(self)
+    }
+    fn read_snapshot_file(&self, snapshot: &MainSnapshot, path: &str) -> Result<Option<Vec<u8>>> {
+        Self::read_snapshot_file(self, snapshot, path)
+    }
     fn mainline(&self) -> &str {
         MAINLINE_BRANCH_ID
     }
@@ -4012,6 +4045,9 @@ impl ChatWorkspace for Engagement {
     }
     fn merge_into_main(&self) -> Result<MergeOutcome> {
         self.merge_into_main()
+    }
+    fn merge_into_main_at(&self, expected: Option<&str>) -> Result<MergeOutcome> {
+        Self::merge_into_main_at(self, expected)
     }
     fn ingest(&self, source: &Path) -> Result<usize> {
         self.ingest(source)

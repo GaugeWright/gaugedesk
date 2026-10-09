@@ -19,6 +19,36 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Fork pull previews pin both original and fork Main versions. Pulls require
+  both preview fields (explicit `null` for an uncut Main), refuse stale choices,
+  and certify Mine-only/no-op pulls before advancing their upstream basis.
+  Older clients must be updated with the Home; this wire change requires a
+  middle-number release when shipped (WS-981, DR-0475).
+
+
+- Prepare chat discipline and target mounts before publishing a new chat, and
+  atomically retain its target records and initial acts. Failed preparation or
+  publication removes the owned candidate branch instead of leaving a ghost.
+
+- Desktop credential and model-setting routes refuse an unavailable presented
+  account session instead of borrowing install-owner scope. Independently admitted
+  Office task recovery remains available without borrowing an account scope.
+
+- Make the hermetic relay close old pairs and waiters on route rotation and select waiting Homes by acknowledged keepalive freshness.
+
+- Route observed and newly created own workspace items to their actual origin
+  while a shared project is open, and subscribe the composed workspace to its
+  currently admitted own/shared origins even without an own Home (WS-1049).
+
+- Choice cards admit current chat participants to answer the default owner’s card,
+  retain that owner for attention, and preserve attributed answers through retry
+  and reload. Their private Home routes now use current scoped participation and
+  return structured refusal responses to the production client.
+
+- When a hosted Home changes its recipient key, the Hub removes every account's
+  copies sealed to its old key in the same transaction. The next device exchange
+  can seal fresh copies; the old ciphertext no longer counts as coverage.
+
 - Default browser fixtures block Stripe script, frame and fetch requests even
   when payment components mount. The payment SDK loads lazily after an admitted
   account session; isolated session and cleanup checks keep their local adapter.

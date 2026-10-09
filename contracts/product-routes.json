@@ -11075,6 +11075,88 @@
           "crates/app/src/mobile_machine_session.rs#enrollment_restart_session_and_revocation_are_device_bound"
         ]
       }
+    },
+    {
+      "id": "home.chat.choice-card.read",
+      "method": "GET",
+      "path": "/chats/:id/choice-cards",
+      "producer": "gaugedesk-app engagement_routes::get_choice_cards",
+      "consumer": "RemoteControlPlane via control-plane-workbench and browser-route-json",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "authentication": "account session and exact current Home admission; current chat participant standing",
+      "scope": "person-home-project-chat",
+      "capability": "read-durable-choice-cards",
+      "requestSchema": "http/path-chat-id",
+      "responseSchema": "rust:gaugedesk-app/choice_prompt/ChoiceCard",
+      "sideEffect": "read",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/choice_route_contract_tests.rs#current_participant_can_answer_default_owner_card_and_revocation_refuses",
+          "web/packages/control-plane-client/src/choice-card-transport.test.ts#choice-route-production-client admits participants and preserves attribution and retry through reload and durable reopen"
+        ],
+        "authority": [
+          "crates/app/src/choice_route_contract_tests.rs#current_participant_can_answer_default_owner_card_and_revocation_refuses",
+          "web/packages/control-plane-client/src/choice-card-transport.test.ts#choice-route-production-client admits participants and preserves attribution and retry through reload and durable reopen"
+        ],
+        "journey": [
+          "web/packages/control-plane-client/src/choice-card-transport.test.ts#choice-route-production-client admits participants and preserves attribution and retry through reload and durable reopen"
+        ],
+        "property": [
+          "crates/app/src/choice_route_contract_tests.rs#current_participant_can_answer_default_owner_card_and_revocation_refuses",
+          "crates/app/src/choice_route_contract_tests.rs#busy_continuation_keeps_answer_pending_and_replays_once_after_current_admission",
+          "crates/app/src/choice_route_contract_tests.rs#current_pending_handoff_blocks_execution_then_retry_runs_once_after_abort",
+          "web/packages/control-plane-client/src/choice-card-transport.test.ts#choice-route-production-client admits participants and preserves attribution and retry through reload and durable reopen"
+        ],
+        "deployed": []
+      }
+    },
+    {
+      "id": "home.chat.choice-card.answer",
+      "method": "POST",
+      "path": "/chats/:id/choice-cards/:card_id/answer",
+      "producer": "gaugedesk-app engagement_routes::post_choice_answer",
+      "consumer": "RemoteControlPlane via control-plane-workbench and browser-route-json",
+      "jurisdiction": "private-home",
+      "transport": "http-json",
+      "authentication": "account session and exact current Home admission; current chat participant standing",
+      "scope": "person-home-project-chat",
+      "capability": "answer-choice-card-and-request-separately-admitted-continuation",
+      "requestSchema": "rust:gaugedesk-app/choice_prompt/AnswerRequest",
+      "responseSchema": "http/json-attributed-choice-card-and-continuation",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/choice_route_contract_tests.rs#current_participant_can_answer_default_owner_card_and_revocation_refuses",
+          "web/packages/control-plane-client/src/choice-card-transport.test.ts#choice-route-production-client admits participants and preserves attribution and retry through reload and durable reopen"
+        ],
+        "authority": [
+          "crates/app/src/choice_route_contract_tests.rs#current_participant_can_answer_default_owner_card_and_revocation_refuses",
+          "web/packages/control-plane-client/src/choice-card-transport.test.ts#choice-route-production-client admits participants and preserves attribution and retry through reload and durable reopen"
+        ],
+        "journey": [
+          "web/packages/control-plane-client/src/choice-card-transport.test.ts#choice-route-production-client admits participants and preserves attribution and retry through reload and durable reopen"
+        ],
+        "property": [
+          "crates/app/src/choice_route_contract_tests.rs#current_participant_can_answer_default_owner_card_and_revocation_refuses",
+          "crates/app/src/choice_route_contract_tests.rs#busy_continuation_keeps_answer_pending_and_replays_once_after_current_admission",
+          "crates/app/src/choice_route_contract_tests.rs#current_pending_handoff_blocks_execution_then_retry_runs_once_after_abort",
+          "web/packages/control-plane-client/src/choice-card-transport.test.ts#choice-route-production-client admits participants and preserves attribution and retry through reload and durable reopen"
+        ],
+        "deployed": []
+      }
     }
   ],
   "exceptions": [
@@ -11291,20 +11373,6 @@
     {
       "method": "POST",
       "path": "/auth/work-email",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "GET",
-      "path": "/chats/{id}/choice-cards",
-      "owner": "gaugedesk",
-      "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
-      "expires": "2026-10-31"
-    },
-    {
-      "method": "POST",
-      "path": "/chats/{id}/choice-cards/{card_id}/answer",
       "owner": "gaugedesk",
       "reason": "Inventoried export; DR-0051 real-transport, authority, and production-client evidence is not yet classified.",
       "expires": "2026-10-31"

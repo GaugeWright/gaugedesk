@@ -864,7 +864,9 @@ pub fn validate_project_target_name<'a>(
     Ok(())
 }
 
-fn validate_target_set_revision(record: &ChatTargetSetRevisionRecord) -> Result<(), String> {
+pub(crate) fn validate_target_set_revision(
+    record: &ChatTargetSetRevisionRecord,
+) -> Result<(), String> {
     if record.chat_id.is_empty() {
         return Err("a target-set revision must name its chat".to_owned());
     }

@@ -3316,6 +3316,25 @@ async fn chat_creation_answers_a_missing_agent_package_as_the_homes_failure() {
     .await;
     assert!(status.is_server_error(), "{status}: {body}");
     assert!(body.contains("cannot open agent package"), "{body}");
+
+    let (status, body) = send(&app, "GET", "/workspace", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let workspace: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let placement = workspace["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["id"] == project_id)
+        .expect("the project remains")["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|placement| placement["placement_id"] == placement_id)
+        .expect("the placement remains");
+    assert!(
+        placement["chats"].as_array().unwrap().is_empty(),
+        "the failed chat remained in the navigator: {placement}"
+    );
 }
 
 /// The mutation response is the same redacted target projection consumed by

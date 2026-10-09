@@ -845,3 +845,401 @@ fn the_homes_serving_a_person_are_their_active_tenants_recorded_homes() {
         .homes
         .is_empty());
 }
+
+// DR-0380: Home recipient copies have no key revision. A rekey must remove
+// every retained account copy, including a former member's account scope.
+fn home_rekey_fixture(wb: &mut crate::Workbench) -> (String, Vec<String>) {
+    let people = [PERSON, "acct-former-member"];
+    let tenant = crate::tenancy::provision_organization(
+        wb.store_mut(),
+        PERSON,
+        &crate::account::account_scope(PERSON),
+        "Rekey fixture",
+        None,
+    )
+    .unwrap()
+    .id;
+    let tenant_scope = crate::org::tenant_scope(&tenant);
+    let member = crate::org::MembershipRecord {
+        id: people[1].into(),
+        op: RecordOp::Upsert,
+        org_id: tenant.clone(),
+        authority: people[1].into(),
+        email: String::new(),
+        role: "member".into(),
+        status: crate::org::MembershipStatus::Invited,
+        managed_by_scim: false,
+        team: None,
+    };
+    wb.write_account_record_in(&tenant_scope, "membership", &member.id, &member)
+        .unwrap();
+    crate::tenancy::accept_tenant_invitation_in(wb.store_mut(), people[1], &tenant)
+        .unwrap()
+        .unwrap();
+    record_hosted_home_recipient(wb, &tenant, HOME.0, key(HOME.1).public_key().as_str(), NOW)
+        .unwrap();
+    record_hosted_home_recipient(
+        wb,
+        &tenant,
+        "home:other",
+        key(12).public_key().as_str(),
+        NOW,
+    )
+    .unwrap();
+    let mut scopes = Vec::new();
+    for person in people {
+        let scope = crate::account::account_scope(person);
+        wb.write_account_record_in(&scope, "device", MAC.0, &device(MAC.0))
+            .unwrap();
+        let set = LinkSet::rebuild(wb.store_ref(), &scope).unwrap();
+        for fact in register_recipient(&set, MAC.0, key(MAC.1).public_key().as_str(), NOW).unwrap()
+        {
+            fact.append(wb, &scope).unwrap();
+        }
+        let context = LinkContext::new(person, "openai", 1).unwrap();
+        let copies = [MAC, HOME, ("home:other", 12)]
+            .into_iter()
+            .map(|(id, seed)| {
+                seal_link_copy(
+                    &context,
+                    b"synthetic-provider-key",
+                    &LinkRecipient::new(id, key(seed).public_key()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let set = LinkSet::rebuild(wb.store_ref(), &scope).unwrap();
+        for fact in put_link(&set, "openai", Some(MAC.0), &put_for_homes(0, copies), NOW).unwrap() {
+            fact.append(wb, &scope).unwrap();
+        }
+        assert!(set.homes.contains_key(HOME.0));
+        let set = LinkSet::rebuild(wb.store_ref(), &scope).unwrap();
+        assert!(set.waiting("openai").is_empty());
+        assert_eq!(
+            open_link_copy(
+                &context,
+                &key(HOME.1),
+                set.copy_for("openai", HOME.0).unwrap()
+            )
+            .unwrap(),
+            b"synthetic-provider-key"
+        );
+        scopes.push(scope);
+    }
+    let mut departed = member;
+    departed.status = crate::org::MembershipStatus::Deprovisioned;
+    wb.write_account_record_in(&tenant_scope, "membership", &departed.id, &departed)
+        .unwrap();
+    (tenant, scopes)
+}
+
+#[test]
+fn home_rekey_invalidates_all_accounts_and_preserves_other_recipients_and_grants() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    let mut guard = wb.lock_unpoisoned();
+    let (tenant, scopes) = home_rekey_fixture(&mut guard);
+    let tenant_scope = crate::org::tenant_scope(&tenant);
+    let before: Vec<_> = scopes
+        .iter()
+        .map(|scope| LinkSet::rebuild(guard.store_ref(), scope).unwrap())
+        .collect();
+    let histories: Vec<_> = scopes
+        .iter()
+        .map(|scope| guard.store_ref().records(scope, LINK_COPY_KIND).unwrap())
+        .collect();
+    let keys = guard
+        .store_ref()
+        .records(&tenant_scope, HOSTED_HOME_RECIPIENT_KIND)
+        .unwrap();
+    let members = guard
+        .store_ref()
+        .records(&tenant_scope, "membership")
+        .unwrap();
+    assert!(!record_hosted_home_recipient(
+        &mut guard,
+        &tenant,
+        HOME.0,
+        key(HOME.1).public_key().as_str(),
+        NOW + 1
+    )
+    .unwrap());
+    assert_eq!(
+        guard
+            .store_ref()
+            .records(&tenant_scope, HOSTED_HOME_RECIPIENT_KIND)
+            .unwrap(),
+        keys
+    );
+    for (scope, history) in scopes.iter().zip(&histories) {
+        assert_eq!(
+            &guard.store_ref().records(scope, LINK_COPY_KIND).unwrap(),
+            history
+        );
+    }
+    assert!(record_hosted_home_recipient(
+        &mut guard,
+        &tenant,
+        HOME.0,
+        key(22).public_key().as_str(),
+        NOW + 2
+    )
+    .unwrap());
+    for (index, scope) in scopes.iter().enumerate() {
+        let set = LinkSet::rebuild(guard.store_ref(), scope).unwrap();
+        assert!(
+            set.copy_for("openai", HOME.0).is_none(),
+            "old Home ciphertext still counted in an account"
+        );
+        assert_eq!(
+            set.copy_for("openai", MAC.0),
+            before[index].copy_for("openai", MAC.0)
+        );
+        assert_eq!(
+            set.copy_for("openai", "home:other"),
+            before[index].copy_for("openai", "home:other")
+        );
+        assert_eq!(set.links, before[index].links);
+        assert_eq!(set.recipients, before[index].recipients);
+        if index == 0 {
+            assert_eq!(set.waiting("openai"), vec![HOME.0.to_string()]);
+        }
+    }
+    assert_eq!(
+        guard
+            .store_ref()
+            .records(&tenant_scope, "membership")
+            .unwrap(),
+        members
+    );
+    // The active account can reseal through the ordinary add-copies admission.
+    let set = LinkSet::rebuild(guard.store_ref(), &scopes[0]).unwrap();
+    let context = LinkContext::new(PERSON, "openai", 1).unwrap();
+    let copy = seal_link_copy(
+        &context,
+        b"synthetic-provider-key",
+        &LinkRecipient::new(HOME.0, key(22).public_key()).unwrap(),
+    )
+    .unwrap();
+    for fact in add_copies(&set, "openai", 1, &[copy]).unwrap() {
+        fact.append(&mut guard, &scopes[0]).unwrap();
+    }
+    let set = LinkSet::rebuild(guard.store_ref(), &scopes[0]).unwrap();
+    assert!(set.waiting("openai").is_empty());
+    assert!(
+        open_link_copy(
+            &context,
+            &key(HOME.1),
+            set.copy_for("openai", HOME.0).unwrap()
+        )
+        .is_err(),
+        "old Home key opened the newly resealed copy"
+    );
+    assert_eq!(
+        open_link_copy(&context, &key(22), set.copy_for("openai", HOME.0).unwrap()).unwrap(),
+        b"synthetic-provider-key"
+    );
+}
+
+#[test]
+fn home_rekey_late_key_append_failure_rolls_back_every_account_tombstone() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    let mut guard = wb.lock_unpoisoned();
+    let (tenant, scopes) = home_rekey_fixture(&mut guard);
+    let before: Vec<_> = scopes
+        .iter()
+        .map(|scope| guard.store_ref().records(scope, LINK_COPY_KIND).unwrap())
+        .collect();
+    let tenant_scope = crate::org::tenant_scope(&tenant);
+    let keys = guard
+        .store_ref()
+        .records(&tenant_scope, HOSTED_HOME_RECIPIENT_KIND)
+        .unwrap();
+    let fault = rusqlite::Connection::open(guard.store_ref().path()).unwrap();
+    fault.execute_batch(&format!("CREATE TRIGGER refuse_rekey BEFORE INSERT ON events WHEN NEW.kind = '{HOSTED_HOME_RECIPIENT_KIND}' BEGIN SELECT RAISE(ABORT, 'synthetic late key write failure'); END;")).unwrap();
+    assert!(record_hosted_home_recipient(
+        &mut guard,
+        &tenant,
+        HOME.0,
+        key(22).public_key().as_str(),
+        NOW + 1
+    )
+    .is_err());
+    assert_eq!(
+        guard
+            .store_ref()
+            .records(&tenant_scope, HOSTED_HOME_RECIPIENT_KIND)
+            .unwrap(),
+        keys
+    );
+    for (scope, history) in scopes.iter().zip(&before) {
+        assert_eq!(
+            &guard.store_ref().records(scope, LINK_COPY_KIND).unwrap(),
+            history
+        );
+    }
+    fault.execute_batch("DROP TRIGGER refuse_rekey").unwrap();
+    assert!(record_hosted_home_recipient(
+        &mut guard,
+        &tenant,
+        HOME.0,
+        key(22).public_key().as_str(),
+        NOW + 2
+    )
+    .unwrap());
+}
+
+#[test]
+fn home_rekey_refuses_malformed_or_unavailable_history_before_key_write() {
+    struct UnavailableCopies;
+    impl gaugedesk_store::ContentCodec for UnavailableCopies {
+        fn encode(&self, _: &str, _: &str, payload: &str) -> Result<String, String> {
+            Ok(payload.to_owned())
+        }
+        fn decode(&self, _: &str, kind: &str, payload: &str) -> Option<String> {
+            (kind != LINK_COPY_KIND).then(|| payload.to_owned())
+        }
+    }
+    for unavailable in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let wb = crate::open_workbench(root.path()).unwrap();
+        let mut guard = wb.lock_unpoisoned();
+        let (tenant, _) = home_rekey_fixture(&mut guard);
+        let tenant_scope = crate::org::tenant_scope(&tenant);
+        let keys = guard
+            .store_ref()
+            .records(&tenant_scope, HOSTED_HOME_RECIPIENT_KIND)
+            .unwrap();
+        let path = guard.store_ref().path().to_owned();
+        let probe = rusqlite::Connection::open(&path).unwrap();
+        if unavailable {
+            // Declared Store codec fault: retained ciphertext cannot be opened.
+            guard.store = Store::open(&path)
+                .unwrap()
+                .with_codec(std::sync::Arc::new(UnavailableCopies));
+        } else {
+            guard
+                .store_mut()
+                .append_record("account::unknown-history", LINK_COPY_KIND, "not JSON")
+                .unwrap();
+        }
+        let count: i64 = probe
+            .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert!(record_hosted_home_recipient(
+            &mut guard,
+            &tenant,
+            HOME.0,
+            key(22).public_key().as_str(),
+            NOW + 1
+        )
+        .is_err());
+        assert_eq!(
+            probe
+                .query_row("SELECT count(*) FROM events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            count
+        );
+        assert_eq!(
+            guard
+                .store_ref()
+                .records(&tenant_scope, HOSTED_HOME_RECIPIENT_KIND)
+                .unwrap(),
+            keys
+        );
+    }
+}
+
+#[test]
+fn home_rekey_discovers_copy_accounts_past_the_first_metadata_page() {
+    let root = tempfile::tempdir().unwrap();
+    let wb = crate::open_workbench(root.path()).unwrap();
+    let mut guard = wb.lock_unpoisoned();
+    let (tenant, mut scopes) = home_rekey_fixture(&mut guard);
+    let tenant_scope = crate::org::tenant_scope(&tenant);
+    for index in 0..129 {
+        let person = format!("acct-bulk-{index:03}");
+        let scope = crate::account::account_scope(&person);
+        let member = crate::org::MembershipRecord {
+            id: person.clone(),
+            op: RecordOp::Upsert,
+            org_id: tenant.clone(),
+            authority: person.clone(),
+            email: String::new(),
+            role: "member".into(),
+            status: crate::org::MembershipStatus::Invited,
+            managed_by_scim: false,
+            team: None,
+        };
+        guard
+            .write_account_record_in(&tenant_scope, "membership", &person, &member)
+            .unwrap();
+        crate::tenancy::accept_tenant_invitation_in(guard.store_mut(), &person, &tenant)
+            .unwrap()
+            .unwrap();
+        guard
+            .write_account_record_in(&scope, "device", MAC.0, &device(MAC.0))
+            .unwrap();
+        let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+        for fact in register_recipient(&set, MAC.0, key(MAC.1).public_key().as_str(), NOW).unwrap()
+        {
+            fact.append(&mut guard, &scope).unwrap();
+        }
+        let context = LinkContext::new(&person, "openai", 1).unwrap();
+        let copies = [MAC, HOME, ("home:other", 12)]
+            .into_iter()
+            .map(|(id, seed)| {
+                seal_link_copy(
+                    &context,
+                    b"synthetic-provider-key",
+                    &LinkRecipient::new(id, key(seed).public_key()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+        for fact in put_link(&set, "openai", Some(MAC.0), &put_for_homes(0, copies), NOW).unwrap() {
+            fact.append(&mut guard, &scope).unwrap();
+        }
+        scopes.push(scope);
+    }
+    let first = guard
+        .store_ref()
+        .scope_ids_with_kind(
+            LINK_COPY_KIND,
+            None,
+            std::num::NonZeroUsize::new(128).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(first.len(), 128);
+    assert_eq!(
+        guard
+            .store_ref()
+            .scope_ids_with_kind(
+                LINK_COPY_KIND,
+                first.last().map(String::as_str),
+                std::num::NonZeroUsize::new(128).unwrap()
+            )
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(record_hosted_home_recipient(
+        &mut guard,
+        &tenant,
+        HOME.0,
+        key(22).public_key().as_str(),
+        NOW + 1
+    )
+    .unwrap());
+    for scope in scopes {
+        let set = LinkSet::rebuild(guard.store_ref(), &scope).unwrap();
+        assert!(
+            set.copy_for("openai", HOME.0).is_none(),
+            "second-page account retained old Home ciphertext"
+        );
+        assert!(set.copy_for("openai", MAC.0).is_some());
+    }
+}

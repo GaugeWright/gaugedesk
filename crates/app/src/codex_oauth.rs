@@ -172,11 +172,18 @@ pub async fn get_home_codex_status(
     codex_status(&wb, &headers, true)
 }
 
-fn codex_status(wb: &SharedWorkbench, headers: &HeaderMap, hosted: bool) -> Json<Value> {
+fn codex_status(
+    wb: &SharedWorkbench,
+    headers: &HeaderMap,
+    hosted: bool,
+) -> axum::response::Response {
     let (scope, class) = {
         let workbench = wb.lock_unpoisoned();
         (
-            workbench.credential_scope_for(net_http::bearer(headers)),
+            match workbench.credential_scope_for(net_http::bearer(headers)) {
+                Ok(scope) => scope,
+                Err((status, error)) => return (status, error).into_response(),
+            },
             if hosted {
                 ModelExecutionClass::PrivateHome
             } else {
@@ -198,6 +205,7 @@ fn codex_status(wb: &SharedWorkbench, headers: &HeaderMap, hosted: bool) -> Json
         "expired": expires.is_some_and(|value| value <= now_ms()),
         "login": login,
     }))
+    .into_response()
 }
 
 /// Secret-free hosted status for an already authenticated exact account scope.
@@ -604,9 +612,13 @@ pub async fn post_home_codex_login_start(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let scope = wb
+    let scope = match wb
         .lock_unpoisoned()
-        .credential_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers))
+    {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     match start_home_login_for_scope(wb, scope).await {
         Ok(login) => Json(json!({ "mode": "device", "login": login })).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response(),
@@ -617,11 +629,15 @@ pub async fn post_home_codex_login_cancel(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let scope = wb
+    let scope = match wb
         .lock_unpoisoned()
-        .credential_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers))
+    {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     cancel_home_login_for_scope(&scope);
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// The helper script rides inside the binary: spawning it must not depend on the
@@ -839,9 +855,13 @@ pub async fn post_codex_login_start(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let scope = wb
+    let scope = match wb
         .lock_unpoisoned()
-        .credential_scope_for(net_http::bearer(&headers));
+        .credential_scope_for(net_http::bearer(&headers))
+    {
+        Ok(scope) => scope,
+        Err((status, error)) => return (status, error).into_response(),
+    };
     match tokio::task::spawn_blocking(move || start_login_blocking(wb, scope)).await {
         Ok(Ok(url)) => Json(json!({ "mode": "browser", "url": url })).into_response(),
         Ok(Err(error)) => {

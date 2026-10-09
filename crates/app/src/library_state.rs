@@ -4923,6 +4923,22 @@ impl Workbench {
         if instance.kind == InstanceKind::Authoring {
             return Ok(());
         }
+        let engagement = self
+            .engagements
+            .get(chat_id)
+            .ok_or_else(|| "chat target candidate is unavailable".to_owned())?;
+        self.prepare_chat_discipline_mount(instance, engagement.as_ref())?;
+        self.refresh_chat_target_set_mount(chat_id)
+    }
+
+    fn prepare_chat_discipline_mount(
+        &self,
+        instance: &InstanceRecord,
+        engagement: &dyn ChatWorkspace,
+    ) -> Result<(), String> {
+        if instance.kind == InstanceKind::Authoring {
+            return Ok(());
+        }
         let archetype = self
             .library
             .agents
@@ -4940,10 +4956,6 @@ impl Workbench {
             &published_discipline_root(&self.targets_dir(), &authoring_target.id, instance.version),
             package.capabilities().iter().cloned(),
         )?;
-        let engagement = self
-            .engagements
-            .get(chat_id)
-            .ok_or_else(|| "chat target candidate is unavailable".to_owned())?;
         let mount = engagement
             .path()
             .join(gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT);
@@ -5001,7 +5013,7 @@ impl Workbench {
             }
             std::fs::write(destination, body).map_err(|error| error.to_string())?;
         }
-        self.refresh_chat_target_set_mount(chat_id)
+        Ok(())
     }
 
     /// Refresh the host-owned target-set declaration independently of an agent
@@ -5012,6 +5024,19 @@ impl Workbench {
             .engagements
             .get(chat_id)
             .ok_or_else(|| "chat target candidate is unavailable".to_owned())?;
+        let target_set = self
+            .library
+            .current_target_set(chat_id)
+            .ok_or_else(|| "chat target set is unavailable".to_owned())?;
+        self.prepare_chat_target_set_mount(chat_id, engagement.as_ref(), target_set)
+    }
+
+    fn prepare_chat_target_set_mount(
+        &self,
+        chat_id: &str,
+        engagement: &dyn ChatWorkspace,
+        target_set: &ChatTargetSetRevisionRecord,
+    ) -> Result<(), String> {
         for root in ["artifacts", "work"] {
             std::fs::create_dir_all(engagement.path().join(root))
                 .map_err(|error| error.to_string())?;
@@ -5020,10 +5045,6 @@ impl Workbench {
             .path()
             .join(gaugedesk_boundary::definition::RUNTIME_MOUNT_ROOT);
         std::fs::create_dir_all(&mount).map_err(|error| error.to_string())?;
-        let target_set = self
-            .library
-            .current_target_set(chat_id)
-            .ok_or_else(|| "chat target set is unavailable".to_owned())?;
         let members = target_set
             .members
             .iter()
@@ -5035,7 +5056,7 @@ impl Workbench {
                     .ok_or_else(|| format!("target {} is unavailable", member.target_id))?;
                 // DR-0248: the agent knows each target by the folder it sees,
                 // so the manifest names that folder and carries no stable id.
-                let name = self.chat_target_name(chat_id, &member.target_id);
+                let name = self.chat_target_name_in(Some(engagement), &member.target_id);
                 Ok(serde_json::json!({
                     "name": name,
                     "root": name,
@@ -5359,100 +5380,141 @@ impl Workbench {
             ));
         };
         let chat_id = library::gen_id("chat");
-        let eng = match &sparse_roots {
+        // A fresh identity cannot replace an existing or historical target selection.
+        if self.library.chats.contains_key(&chat_id)
+            || self.library.chat_target_sets.contains_key(&chat_id)
+        {
+            return Err(CreateChatError::Failed(
+                "chat identity already exists".to_owned(),
+            ));
+        }
+        let created = match &sparse_roots {
             Some(roots) => storage.create_engagement_subset(&chat_id, storage.mainline(), roots),
             None => storage.create_engagement(&chat_id),
-        }
-        .map_err(|e| CreateChatError::Failed(e.to_string()))?;
-        if inst_rec.kind == InstanceKind::Using {
-            for root in ["artifacts", "work"] {
-                std::fs::create_dir_all(eng.path().join(root))
-                    .map_err(|error| CreateChatError::Failed(error.to_string()))?;
+        };
+        let eng = match created {
+            Ok(eng) => eng,
+            Err(error) => {
+                return Err(self.failed_chat_creation(&storage_id, &chat_id, error.to_string()))
             }
-        }
-        // Pin the exact standing target basis. Runtime config and discipline
-        // are control/materialized state and never mint target cuts.
-        let _candidate = eng
-            .boundary_cut()
-            .map_err(|error| CreateChatError::Failed(error.to_string()))?
-            .0;
-        let basis = targets[0].current_basis.clone().ok_or_else(|| {
-            CreateChatError::Failed("work target has no exact standing basis".to_owned())
-        })?;
-        let rec = ChatRecord {
-            owner: None,
-            schema: crate::library::LIBRARY_RECORD_SCHEMA,
-            extra: Default::default(),
-            id: chat_id.clone(),
-            op: RecordOp::Upsert,
-            instance_id: inst_id.to_string(),
-            title: title.to_string(),
-            created_position: 0,
-            forked_from: None,
-            forked_from_entry: None,
-            forked_from_cut: None,
         };
-        let pos = self
-            .store_mut()
-            .append_record(LIBRARY_SCOPE, "chat", &serde_json::to_string(&rec).unwrap())
-            .ok();
-        let rec = ChatRecord {
-            created_position: pos.unwrap_or(0),
-            ..rec
-        };
-        self.library.apply_chat_at(rec, pos);
-        self.notify_library_changed("chat", &chat_id, "upsert");
-        let binding = (targets.len() == 1).then(|| ChatTargetBindingRecord {
-            schema: crate::library::LIBRARY_RECORD_SCHEMA,
-            extra: Default::default(),
-            chat_id: chat_id.clone(),
-            op: RecordOp::Upsert,
-            target_id: target_id.clone(),
-            basis: basis.clone(),
-            path_scope: targets[0].path_scope.clone(),
-            capabilities: targets[0].capabilities.clone(),
-        });
-        if let Some(binding) = binding.clone() {
-            self.write_chat_target_record(binding);
-        }
-        self.write_chat_target_set_record(ChatTargetSetRevisionRecord {
-            chat_id: chat_id.clone(),
-            revision: 0,
-            members: targets
+        let prepared = (|| -> Result<_, String> {
+            if inst_rec.kind == InstanceKind::Using {
+                for root in ["artifacts", "work"] {
+                    std::fs::create_dir_all(eng.path().join(root))
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            // This remains the existing candidate validation; mounts are excluded from cuts.
+            let _candidate = eng.boundary_cut().map_err(|error| error.to_string())?.0;
+            let basis = targets[0]
+                .current_basis
+                .clone()
+                .ok_or_else(|| "work target has no exact standing basis".to_owned())?;
+            let record = ChatRecord {
+                owner: None,
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                id: chat_id.clone(),
+                op: RecordOp::Upsert,
+                instance_id: inst_id.to_owned(),
+                title: title.to_owned(),
+                created_position: 0,
+                forked_from: None,
+                forked_from_entry: None,
+                forked_from_cut: None,
+            };
+            let binding = (targets.len() == 1).then(|| ChatTargetBindingRecord {
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+                chat_id: chat_id.clone(),
+                op: RecordOp::Upsert,
+                target_id: target_id.clone(),
+                basis: basis.clone(),
+                path_scope: targets[0].path_scope.clone(),
+                capabilities: targets[0].capabilities.clone(),
+            });
+            let target_set = ChatTargetSetRevisionRecord {
+                chat_id: chat_id.clone(),
+                revision: 0,
+                members: targets
+                    .iter()
+                    .map(|target| ChatTargetSetMemberRecord {
+                        target_id: target.id.clone(),
+                        adapter_family: target.adapter_family.clone(),
+                        path_scope: target.path_scope.clone(),
+                        capability_ceiling: target.capabilities.clone(),
+                        participation: if target.capabilities.propose {
+                            TargetParticipationMode::Writable
+                        } else {
+                            TargetParticipationMode::ReadOnly
+                        },
+                    })
+                    .collect(),
+                created_position: 0,
+                schema: LIBRARY_RECORD_SCHEMA,
+                extra: Default::default(),
+            };
+            crate::library::validate_target_set_revision(&target_set)?;
+            self.prepare_chat_discipline_mount(&inst_rec, eng.as_ref())?;
+            // Preserve Authoring's old early return: it never mounts this declaration here.
+            if inst_rec.kind != InstanceKind::Authoring {
+                self.prepare_chat_target_set_mount(&chat_id, eng.as_ref(), &target_set)?;
+            }
+            let mut rows = vec![(
+                LIBRARY_SCOPE.to_owned(),
+                "chat".to_owned(),
+                serde_json::to_string(&record).map_err(|error| error.to_string())?,
+            )];
+            if let Some(binding) = &binding {
+                rows.push((
+                    LIBRARY_SCOPE.to_owned(),
+                    "chat_target".to_owned(),
+                    serde_json::to_string(binding).map_err(|error| error.to_string())?,
+                ));
+            }
+            rows.push((
+                LIBRARY_SCOPE.to_owned(),
+                "chat_target_set".to_owned(),
+                serde_json::to_string(&target_set).map_err(|error| error.to_string())?,
+            ));
+            for target in &targets {
+                let act = self.prepare_initial_target_act(&chat_id, target)?;
+                rows.push((
+                    crate::target_adapter::target_act_scope(&target.id),
+                    crate::target_adapter::TARGET_ACT_KIND.to_owned(),
+                    serde_json::to_string(&act).map_err(|error| error.to_string())?,
+                ));
+            }
+            let refs = rows
                 .iter()
-                .map(|target| ChatTargetSetMemberRecord {
-                    target_id: target.id.clone(),
-                    adapter_family: target.adapter_family.clone(),
-                    path_scope: target.path_scope.clone(),
-                    capability_ceiling: target.capabilities.clone(),
-                    participation: if target.capabilities.propose {
-                        TargetParticipationMode::Writable
-                    } else {
-                        TargetParticipationMode::ReadOnly
-                    },
-                })
-                .collect(),
-            created_position: 0,
-            schema: LIBRARY_RECORD_SCHEMA,
-            extra: Default::default(),
-        })
-        .map_err(CreateChatError::Failed)?;
-        self.register_engagement(chat_id.clone(), storage_id, eng);
-        self.refresh_chat_discipline_mount(&chat_id)
-            .map_err(CreateChatError::Failed)?;
-        for target in &targets {
-            self.record_target_act(
-                Some(&chat_id),
-                &target.id,
-                crate::target_adapter::TargetActKind::Read,
-                None,
-                Vec::new(),
-                None,
-                crate::target_adapter::TargetActStatus::Completed,
-                None,
-            )
-            .map_err(CreateChatError::Failed)?;
+                .map(|(scope, kind, body)| (scope.as_str(), kind.as_str(), body.as_str()))
+                .collect::<Vec<_>>();
+            let positions = self
+                .store_mut()
+                .append_records_atomically(&refs)
+                .map_err(|error| format!("{error:?}"))?;
+            Ok((record, binding, target_set, positions, basis))
+        })();
+        let (mut record, binding, target_set, positions, basis) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(eng);
+                return Err(self.failed_chat_creation(&storage_id, &chat_id, error));
+            }
+        };
+        // All record validation and external writes have succeeded. Projection is infallible here.
+        record.created_position = positions[0];
+        self.library.apply_chat_at(record, Some(positions[0]));
+        if let Some(binding) = binding {
+            self.library
+                .apply_chat_target_at(binding, Some(positions[1]));
         }
+        self.library
+            .chat_target_sets
+            .insert(chat_id.clone(), BTreeMap::from([(0, target_set)]));
+        self.register_engagement(chat_id.clone(), storage_id, eng);
+        self.notify_library_changed("chat", &chat_id, "upsert");
         Ok(serde_json::json!({
             "id": chat_id,
             "title": title,
@@ -5463,6 +5525,27 @@ impl Workbench {
             "target_ids": targets.iter().map(|target| target.id.clone()).collect::<Vec<_>>(),
             "basis": basis,
         }))
+    }
+
+    /// Compensation concerns only this never-published candidate. Cleanup refusal stays explicit.
+    fn failed_chat_creation(
+        &self,
+        storage_id: &str,
+        chat_id: &str,
+        reason: String,
+    ) -> CreateChatError {
+        let cleanup = self
+            .workspace_by_storage_id(storage_id)
+            .ok_or_else(|| "owned chat storage became unavailable".to_owned())
+            .and_then(|storage| {
+                storage
+                    .remove_engagement(chat_id)
+                    .map_err(|error| error.to_string())
+            });
+        CreateChatError::Failed(match cleanup {
+            Ok(()) => reason,
+            Err(error) => format!("{reason}; owned chat candidate cleanup failed: {error}"),
+        })
     }
 
     /// Admit a new immutable target-set revision between settled turns.  This

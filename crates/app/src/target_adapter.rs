@@ -22,7 +22,7 @@ use crate::library::{
 };
 use crate::{LockUnpoisoned, SharedWorkbench, Workbench};
 
-const TARGET_ACT_KIND: &str = "target_act";
+pub(crate) const TARGET_ACT_KIND: &str = "target_act";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -56,7 +56,7 @@ pub struct TargetActRecord {
     pub reason: Option<String>,
 }
 
-fn target_act_scope(target_id: &str) -> String {
+pub(crate) fn target_act_scope(target_id: &str) -> String {
     format!("target::{target_id}::acts")
 }
 
@@ -171,6 +171,31 @@ pub(crate) fn remove_locator(targets_root: &Path, handle: &str) {
 }
 
 impl Workbench {
+    /// Preparation for a newly selected chat: there is no prior chat basis to override the admitted target basis.
+    pub(crate) fn prepare_initial_target_act(
+        &self,
+        chat_id: &str,
+        target: &WorkTargetRecord,
+    ) -> Result<TargetActRecord, String> {
+        let basis = target
+            .current_basis
+            .clone()
+            .ok_or_else(|| "work target has no exact basis".to_owned())?;
+        Ok(TargetActRecord {
+            id: gen_id("target-act"),
+            target_id: target.id.clone(),
+            chat_id: Some(chat_id.to_owned()),
+            act: TargetActKind::Read,
+            basis,
+            candidate: None,
+            checks: Vec::new(),
+            resulting_revision: None,
+            adapter: target.adapter.clone(),
+            status: TargetActStatus::Completed,
+            reason: None,
+        })
+    }
+
     // Each argument maps directly to a durable TargetActRecord field. Keeping
     // them explicit makes security-sensitive call sites auditable.
     #[allow(clippy::too_many_arguments)]

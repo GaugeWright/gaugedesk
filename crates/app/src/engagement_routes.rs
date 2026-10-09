@@ -3649,14 +3649,19 @@ mod raw_model_context_tests {
 pub(crate) async fn get_choice_cards(
     State(wb): State<SharedWorkbench>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let wb = wb.lock_unpoisoned();
-    if !wb.library.chats.contains_key(&id) {
-        return (StatusCode::NOT_FOUND, "no such chat").into_response();
+    if let Err((status, error)) = crate::method_access::chat_reader(&wb, &id, &headers) {
+        return (status, Json(serde_json::json!({"error": error}))).into_response();
     }
     match crate::choice_prompt::list(wb.store_ref(), &id) {
         Ok(cards) => (StatusCode::OK, Json(cards)).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":format!("{error:?}")})),
+        )
+            .into_response(),
     }
 }
 
@@ -3664,46 +3669,56 @@ pub(crate) async fn post_choice_answer(
     State(wb): State<SharedWorkbench>,
     Path((id, card_id)): Path<(String, String)>,
     headers: HeaderMap,
-    actor: Option<axum::extract::Extension<crate::identity::AuthenticatedActor>>,
     authenticated: Option<axum::extract::Extension<crate::identity::AuthenticatedActionContext>>,
     Json(body): Json<crate::choice_prompt::AnswerRequest>,
 ) -> impl IntoResponse {
-    let actor = actor.map(|axum::extract::Extension(actor)| actor.0);
     let authenticated = authenticated.map(|axum::extract::Extension(context)| context);
-    let (card, inserted, context, respondent) = {
+    let (card, inserted, context, respondent, account_scope) = {
         let mut g = wb.lock_unpoisoned();
         let Some(context) = g.engagement_task_context(&id) else {
-            return (StatusCode::NOT_FOUND, "no such chat").into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"no such chat"})),
+            )
+                .into_response();
         };
         if context.mode != ChatMode::Use {
-            return (StatusCode::FORBIDDEN, "choice answers require a work chat").into_response();
-        }
-        let respondent = actor
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| g.authority().clone());
-        if !g
-            .roster()
-            .iter()
-            .any(|person| person.authority == respondent.as_str())
-        {
-            return (StatusCode::FORBIDDEN, "respondent has no chat standing").into_response();
-        }
-        let Some(existing) = (match crate::choice_prompt::get(g.store_ref(), &id, &card_id) {
-            Ok(card) => card,
-            Err(error) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:?}")).into_response();
-            }
-        }) else {
-            return (StatusCode::NOT_FOUND, "choice card not found").into_response();
-        };
-        if existing.recipient != respondent.as_str() {
             return (
                 StatusCode::FORBIDDEN,
-                "choice card belongs to another recipient",
+                Json(serde_json::json!({"error":"choice answers require a work chat"})),
             )
                 .into_response();
         }
+        // The addressee drives attention, not the right to answer. Resolve
+        // current participation through the same admitted chat-reader boundary
+        // as the file/transcript surfaces (DR-0228); a global roster is not a
+        // tenant/project grant and an install-owner fallback is not proof.
+        let respondent = match crate::method_access::chat_reader(&g, &id, &headers) {
+            Ok(actor) => gaugedesk_core::ids::AuthorityId::new(actor),
+            Err((status, error)) => {
+                return (status, Json(serde_json::json!({"error": error}))).into_response()
+            }
+        };
+        let Some(_existing) = (match crate::choice_prompt::get(g.store_ref(), &id, &card_id) {
+            Ok(card) => card,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error":format!("{error:?}")})),
+                )
+                    .into_response();
+            }
+        }) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"choice card not found"})),
+            )
+                .into_response();
+        };
+        let account_scope = match g.credential_scope_for(crate::net_http::bearer(&headers)) {
+            Ok(scope) => scope,
+            Err((status, error)) => return (status, error).into_response(),
+        };
         let result =
             crate::choice_prompt::answer(g.store_mut(), &id, &card_id, respondent.as_str(), &body);
         let (card, inserted) = match result {
@@ -3714,11 +3729,11 @@ pub(crate) async fn post_choice_answer(
                 } else {
                     StatusCode::BAD_REQUEST
                 };
-                return (status, error).into_response();
+                return (status, Json(serde_json::json!({"error": error}))).into_response();
             }
         };
         g.notify_library_changed("question", &id, "upsert");
-        (card, inserted, context, respondent)
+        (card, inserted, context, respondent, account_scope)
     };
     if !inserted
         && card
@@ -3745,25 +3760,19 @@ pub(crate) async fn post_choice_answer(
             .into_response();
     }
     let account_bearer = crate::net_http::bearer(&headers).map(str::to_owned);
-    let (account_scope, tenant_scope) = {
-        let g = wb.lock_unpoisoned();
-        (
-            g.credential_scope_for(account_bearer.as_deref()),
-            crate::workbench_auth::req_scope(&headers),
-        )
-    };
+    let tenant_scope = crate::workbench_auth::req_scope(&headers);
     let client_build = crate::client_admission::ClientBuild::from_headers(&headers);
     let wb2 = wb.clone();
     let id2 = id.clone();
     let prompt = crate::choice_prompt::continuation_text(&card);
     let command_id = format!("choice-answer:{}", card.id);
     let outcome = tokio::task::spawn_blocking(move || {
-        engine::run_engagement_turn(
+        engine::run_engagement_turn_with_credential_scope(
             &wb2,
             &id2,
             &context.worktree,
             &context.sender,
-            engine::EngagementTurnInput {
+            engine::FallibleEngagementTurnInput {
                 task: &prompt,
                 images: &[],
                 mode: context.mode,
@@ -3772,7 +3781,7 @@ pub(crate) async fn post_choice_answer(
                 client_build: Some(&client_build),
                 local_operator: false,
                 contribution_by: None,
-                account_scope: &account_scope,
+                account_scope: Ok(&account_scope),
                 tenant_scope: &tenant_scope,
                 account_bearer: account_bearer.as_deref(),
                 client_request_id: None,
@@ -3811,7 +3820,11 @@ pub(crate) async fn post_choice_answer(
             continuation_status,
             error.as_deref(),
         ) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":error})),
+            )
+                .into_response();
         }
         g.notify_library_changed("question", &id, "upsert");
     }
@@ -4465,6 +4478,40 @@ pub(crate) async fn post_task(
                 outcome: crate::stream::TaskCorrelationOutcome::Refused,
             })
     };
+    let account_bearer = crate::net_http::bearer(&headers).map(str::to_owned);
+    let account_scope = wb
+        .lock_unpoisoned()
+        .credential_scope_for(account_bearer.as_deref());
+    let tenant_scope = crate::workbench_auth::req_scope(&headers);
+    let client_build = crate::client_admission::ClientBuild::from_headers(&headers);
+    if let Err((status, error)) = account_scope.as_ref() {
+        // Staff labels alone are insufficient. Only the full independent
+        // Office admission can defer an unavailable subscription scope.
+        match crate::engine::office_authority::OfficeTaskAuthority::for_turn(
+            &wb,
+            &id,
+            authenticated.as_deref(),
+            Some(&client_build),
+            actor.as_ref().map(|actor| &actor.0 .0),
+            account_bearer.as_deref(),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (
+                    *status,
+                    Json(serde_json::json!({"error":error,"correlation":refused()})),
+                )
+                    .into_response()
+            }
+            Err(error) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error":format!("{error:?}"),"correlation":refused()})),
+                )
+                    .into_response()
+            }
+        }
+    }
     // Brief lock: confirm the engagement and grab its worktree, live sender, mode.
     let (worktree, sender, mode) = {
         let mut g = wb.lock_unpoisoned();
@@ -4480,15 +4527,6 @@ pub(crate) async fn post_task(
         location
     };
 
-    let account_bearer = crate::net_http::bearer(&headers).map(str::to_owned);
-    let (account_scope, tenant_scope) = {
-        let g = wb.lock_unpoisoned();
-        (
-            g.credential_scope_for(account_bearer.as_deref()),
-            crate::workbench_auth::req_scope(&headers),
-        )
-    };
-    let client_build = crate::client_admission::ClientBuild::from_headers(&headers);
     let wb2 = wb.clone();
     let task = body.prompt;
     let images = body.images;
@@ -4500,12 +4538,12 @@ pub(crate) async fn post_task(
     let author2 = author.clone();
     let attempt2 = attempt.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        engine::run_engagement_turn(
+        engine::run_engagement_turn_with_credential_scope(
             &wb2,
             &id2,
             &worktree,
             &sender,
-            engine::EngagementTurnInput {
+            engine::FallibleEngagementTurnInput {
                 task: &task,
                 images: &images,
                 mode,
@@ -4514,7 +4552,9 @@ pub(crate) async fn post_task(
                 client_build: Some(&client_build),
                 local_operator,
                 contribution_by: None,
-                account_scope: &account_scope,
+                account_scope: account_scope
+                    .as_deref()
+                    .map_err(|_| engine::CredentialScopeError),
                 tenant_scope: &tenant_scope,
                 account_bearer: account_bearer.as_deref(),
                 client_request_id: Some(&client_request_id2),

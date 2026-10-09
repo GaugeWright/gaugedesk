@@ -219,6 +219,8 @@ pub(crate) use net_http::err_response;
 pub(crate) use stream::ServerEvent;
 
 #[cfg(test)]
+mod chat_creation_rollback_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

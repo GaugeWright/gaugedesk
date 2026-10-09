@@ -591,12 +591,12 @@ async fn engine_rejects_revoked_office_task_before_durable_turn_or_harness() {
             .revoke(&home, &AuthorityId::new("alice"));
         (task, before)
     };
-    let result = crate::engine::run_engagement_turn(
+    let result = crate::engine::run_engagement_turn_with_credential_scope(
         &wb,
         &chat,
         &task.worktree,
         &task.sender,
-        crate::engine::EngagementTurnInput {
+        crate::engine::FallibleEngagementTurnInput {
             task: "synthetic patient prompt must not run",
             images: &[],
             mode: task.mode,
@@ -605,7 +605,7 @@ async fn engine_rejects_revoked_office_task_before_durable_turn_or_harness() {
             client_build: Some(&Default::default()),
             local_operator: false,
             contribution_by: None,
-            account_scope: "account",
+            account_scope: Err(crate::engine::CredentialScopeError),
             tenant_scope: ORG_SCOPE,
             account_bearer: Some(ALICE),
             client_request_id: None,
@@ -881,12 +881,12 @@ async fn engine_refuses_office_work_without_original_http_claim_before_factory()
                 .len(),
         )
     };
-    let result = crate::engine::run_engagement_turn(
+    let result = crate::engine::run_engagement_turn_with_credential_scope(
         &wb,
         &chat,
         &task.worktree,
         &task.sender,
-        crate::engine::EngagementTurnInput {
+        crate::engine::FallibleEngagementTurnInput {
             task: "synthetic clinical prompt",
             images: &[],
             mode: task.mode,
@@ -895,7 +895,7 @@ async fn engine_refuses_office_work_without_original_http_claim_before_factory()
             client_build: Some(&Default::default()),
             local_operator: false,
             contribution_by: None,
-            account_scope: "account",
+            account_scope: Err(crate::engine::CredentialScopeError),
             tenant_scope: ORG_SCOPE,
             account_bearer: Some(ALICE),
             client_request_id: None,
@@ -1737,12 +1737,12 @@ async fn production_office_startup_uses_original_http_claim_and_recorded_native_
                             if matches!(case, "engine" | "engine-revoked") {
                                 let (worktree, sender, mode) = wb.lock_unpoisoned().engagement_turn_location(&chat).unwrap();
                                 let probe = StartupProbe { wb: wb.clone(), chat: chat.clone(), original: original.clone(), reached: reached.clone(), created: Arc::new(AtomicBool::new(false)), access: None, revoke: case == "engine-revoked" };
-                                let result = crate::engine::run_engagement_turn(&wb, &chat, &worktree, &sender,
-                                    crate::engine::EngagementTurnInput {
+                                let result = crate::engine::run_engagement_turn_with_credential_scope(&wb, &chat, &worktree, &sender,
+                                    crate::engine::FallibleEngagementTurnInput {
                                         task: "synthetic original task", images: &[], mode,
                                         authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                                         client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
-                                        account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
+                                        account_scope: Err(crate::engine::CredentialScopeError), tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
                                         client_request_id: None,
                                         client_author: None,
                                         client_attempt: None,
@@ -1953,12 +1953,12 @@ async fn production_office_startup_uses_original_http_claim_and_recorded_native_
                                 if case == "runtime-engine-read" {
                                     let observed = Arc::new(AtomicBool::new(false));
                                     let (worktree, sender, mode) = wb.lock_unpoisoned().engagement_turn_location(&chat).unwrap();
-                                    let engine_retry = crate::engine::run_engagement_turn(&wb, &chat, &worktree, &sender,
-                                        crate::engine::EngagementTurnInput {
+                                    let engine_retry = crate::engine::run_engagement_turn_with_credential_scope(&wb, &chat, &worktree, &sender,
+                                        crate::engine::FallibleEngagementTurnInput {
                                             task: "synthetic original task", images: &[], mode,
                                             authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                                             client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
-                                            account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
+                                            account_scope: Err(crate::engine::CredentialScopeError), tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
                                             client_request_id: None,
                                             client_author: None,
                                             client_attempt: None,
@@ -2107,12 +2107,12 @@ async fn production_office_startup_uses_original_http_claim_and_recorded_native_
                                     let (worktree, sender, mode) = wb.lock_unpoisoned().engagement_turn_location(&chat).unwrap();
                                     let created = Arc::new(AtomicBool::new(false));
                                     let probe = StartupProbe { wb: wb.clone(), chat: chat.clone(), original: original.clone(), reached: model_called.clone(), created: created.clone(), access: None, revoke: false };
-                                    let engine_retry = crate::engine::run_engagement_turn(&wb, &chat, &worktree, &sender,
-                                        crate::engine::EngagementTurnInput {
+                                    let engine_retry = crate::engine::run_engagement_turn_with_credential_scope(&wb, &chat, &worktree, &sender,
+                                        crate::engine::FallibleEngagementTurnInput {
                                             task: "synthetic original task", images: &[], mode,
                                             authenticated_actor: Some(captured.actor()), authenticated_context: Some(&captured),
                                             client_build: Some(&Default::default()), local_operator: false, contribution_by: None,
-                                            account_scope: "account", tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
+                                            account_scope: Err(crate::engine::CredentialScopeError), tenant_scope: ORG_SCOPE, account_bearer: Some(ALICE),
                                             client_request_id: None,
                                             client_author: None,
                                             client_attempt: None,

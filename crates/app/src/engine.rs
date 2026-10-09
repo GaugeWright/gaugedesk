@@ -2033,6 +2033,82 @@ pub struct EngagementTurnInput<'a> {
     pub harness_factory: Option<TurnHarnessFactory>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CredentialScopeError;
+impl CredentialScopeError {
+    fn required(self) -> EngineError {
+        EngineError::Harness(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "credential account session is unavailable",
+        ))
+    }
+}
+pub(crate) struct FallibleEngagementTurnInput<'a> {
+    pub task: &'a str,
+    pub images: &'a [ImageContent],
+    pub mode: ChatMode,
+    pub authenticated_actor: Option<&'a gaugedesk_core::ids::AuthorityId>,
+    /// Verified request authority, rechecked when a tracker tool executes.
+    pub authenticated_context: Option<&'a crate::identity::AuthenticatedActionContext>,
+    /// Original HTTP software declaration; office turns require it.
+    pub client_build: Option<&'a crate::client_admission::ClientBuild>,
+    /// Set only by the desktop operator listener, never a relay or federation run.
+    pub local_operator: bool,
+    /// Authority that drove this turn for workstream contribution attribution.
+    /// This is distinct from the runtime actor: a verified federated crossing may
+    /// drive a hub-resident chat while the hub still owns runtime execution.
+    pub contribution_by: Option<&'a str>,
+    /// Scope of the authenticated person's account subscription.
+    pub account_scope: Result<&'a str, CredentialScopeError>,
+    /// Scope of the current tenant's organization-funded subscription.
+    pub tenant_scope: &'a str,
+    /// Current account-Hub bearer when this turn entered over HTTP. Desktop
+    /// may instead use its memory-only signed-in Hub session. This credential
+    /// authenticates only the prompt-free invocation preparation call; it is
+    /// never a provider credential or durable runtime input.
+    pub account_bearer: Option<&'a str>,
+    /// Exact caller-composed identity for foreground task observations. This is
+    /// UI correlation, never the WhippleScript runtime command identity below.
+    pub client_request_id: Option<&'a str>,
+    pub client_author: Option<&'a crate::stream::TaskAuthor>,
+    pub client_attempt: Option<&'a crate::command_idempotency::TaskAttempt>,
+    /// Stable Home-admitted command identity for unattended execution. A retry
+    /// reuses this exact WhippleScript command/receipt. Foreground HTTP turns
+    /// instead derive it from their original middleware claim below.
+    pub runtime_command_id: Option<&'a str>,
+    /// Exact middleware-owned HTTP claim retained across background execution.
+    /// It is original intent, with no authentication or execution authority.
+    pub original_http_command: Option<&'a crate::command_idempotency::ClaimedHttpCommand>,
+    /// An admitted execution shell may supply the same WhippleScript factory
+    /// with a command-scoped transport (for example a Home-signed private
+    /// Durable workflow). Foreground turns use the workbench default.
+    pub harness_factory: Option<TurnHarnessFactory>,
+}
+
+impl<'a> From<EngagementTurnInput<'a>> for FallibleEngagementTurnInput<'a> {
+    fn from(input: EngagementTurnInput<'a>) -> Self {
+        Self {
+            task: input.task,
+            images: input.images,
+            mode: input.mode,
+            authenticated_actor: input.authenticated_actor,
+            authenticated_context: input.authenticated_context,
+            client_build: input.client_build,
+            local_operator: input.local_operator,
+            contribution_by: input.contribution_by,
+            account_scope: Ok(input.account_scope),
+            tenant_scope: input.tenant_scope,
+            account_bearer: input.account_bearer,
+            client_request_id: input.client_request_id,
+            client_author: input.client_author,
+            client_attempt: input.client_attempt,
+            runtime_command_id: input.runtime_command_id,
+            original_http_command: input.original_http_command,
+            harness_factory: input.harness_factory,
+        }
+    }
+}
+
 /// Non-secret, immutable inputs a managed Isolated-workspace scheduler must
 /// bind before acknowledging a background turn. The actual credential remains
 /// behind the Home's exact-reference capability and final-fetch boundary.
@@ -2151,6 +2227,16 @@ pub fn run_engagement_turn(
     sender: &broadcast::Sender<ServerEvent>,
     input: EngagementTurnInput<'_>,
 ) -> Result<TaskResult, EngineError> {
+    run_engagement_turn_with_credential_scope(wb, id, worktree, sender, input.into())
+}
+
+pub(crate) fn run_engagement_turn_with_credential_scope(
+    wb: &SharedWorkbench,
+    id: &str,
+    worktree: &Path,
+    sender: &broadcast::Sender<ServerEvent>,
+    input: FallibleEngagementTurnInput<'_>,
+) -> Result<TaskResult, EngineError> {
     let Some(claim) = claim_turn(id) else {
         return Err(EngineError::AlreadyRunning);
     };
@@ -2225,9 +2311,9 @@ fn run_claimed_engagement_turn(
     id: &str,
     worktree: &Path,
     sender: &broadcast::Sender<ServerEvent>,
-    input: EngagementTurnInput<'_>,
+    input: FallibleEngagementTurnInput<'_>,
 ) -> Result<TaskResult, EngineError> {
-    let EngagementTurnInput {
+    let FallibleEngagementTurnInput {
         task,
         images,
         mode,
@@ -2287,6 +2373,9 @@ fn run_claimed_engagement_turn(
         account_bearer,
     )?;
     task_checkpoint(wb, id, office_authority.as_ref())?;
+    if office_authority.is_none() {
+        account_scope.map_err(CredentialScopeError::required)?;
+    }
     let client_context =
         client_request_id
             .zip(client_author)
@@ -2908,7 +2997,7 @@ fn run_claimed_engagement_turn(
                     g.store_ref(),
                     authority,
                     now,
-                    account_scope,
+                    account_scope.map_err(CredentialScopeError::required)?,
                     tenant_scope,
                     model.as_deref().unwrap_or_default(),
                     &card,
@@ -2946,8 +3035,12 @@ fn run_claimed_engagement_turn(
         } else if is_host_managed_provider(&provider) {
             let resolved = {
                 let g = wb.lock_unpoisoned();
-                crate::managed_inference::resolve_plan(g.store_ref(), account_scope, tenant_scope)
-                    .map_err(|error| format!("{error:?}"))?
+                crate::managed_inference::resolve_plan(
+                    g.store_ref(),
+                    account_scope.map_err(CredentialScopeError::required)?,
+                    tenant_scope,
+                )
+                .map_err(|error| format!("{error:?}"))?
             };
             let Some((plan, scope)) = resolved else {
                 let reason = "Managed inference needs an active account or organization plan. Open Account settings or ask a billing admin to choose a plan.".to_owned();

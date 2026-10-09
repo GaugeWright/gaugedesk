@@ -179,3 +179,24 @@ it("drops the shown link when its own invitation is cancelled", async () => {
     await vi.waitFor(() => expect(host.textContent).not.toContain("Invitation link"));
     expect(button(/^Email it to/)).toBeUndefined();
 });
+
+
+it("submits both displayed fork versions and discards a choice when stale preview refreshes", async () => {
+    const host = document.createElement("div"); document.body.append(host);
+    const projectUpstream = vi.fn()
+        .mockResolvedValueOnce({available:true, projectId:"original", name:"Original", sourceCut:"o1", forkCut:"f1", take:[], remove:[], conflicts:["note.md"]})
+        .mockResolvedValue({available:true, projectId:"original", name:"Original", sourceCut:"o1", forkCut:"f2", take:[], remove:[], conflicts:["note.md"]});
+    const pullProjectUpstream = vi.fn().mockRejectedValueOnce(new Error("fork changed")).mockResolvedValue({pulled:1});
+    const api = {projectUpstream, pullProjectUpstream} as unknown as ProjectSettingsApi;
+    const project = {id:"fork", name:"Fork", isPersonal:false, targets:[], placements:[], upstream:"original"} as unknown as ProjectNode;
+    dispose = render(() => createComponent(ProjectSettingsContent, {api, project, library:[], page:"work-data", onSelectPage:vi.fn(), onClose:vi.fn(), onChanged:vi.fn()}), host);
+    const button = (text: string) => [...host.querySelectorAll("button")].find(b => b.textContent === text)!;
+    await vi.waitFor(() => expect(button("Take theirs")).toBeDefined());
+    button("Take theirs").click(); button("Pull changes").click();
+    await vi.waitFor(() => expect(pullProjectUpstream).toHaveBeenCalledWith("fork", "o1", "f1", {"note.md":"theirs"}));
+    await vi.waitFor(() => expect(projectUpstream).toHaveBeenCalledTimes(2));
+    expect(button("Pull changes").disabled).toBe(true);
+    expect(button("Take theirs").getAttribute("aria-pressed")).toBe("false");
+    button("Take theirs").click(); button("Pull changes").click();
+    await vi.waitFor(() => expect(pullProjectUpstream).toHaveBeenLastCalledWith("fork", "o1", "f2", {"note.md":"theirs"}));
+});
