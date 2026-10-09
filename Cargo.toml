@@ -31,7 +31,7 @@ wasm = [{ package = "gaugedesk-relay-transport" }, { package = "gaugedesk-direct
 
 [workspace.package]
 edition = "2021"
-version = "0.9.1"
+version = "0.9.2"
 # The platform default (ADR 0121 / company DR-0056).
 license = "AGPL-3.0-only"
 
@@ -87,8 +87,8 @@ debug = "line-tables-only"
 # source revision to the published contract revision and digest; no project
 # workstream feature may compile against the older crates.io release.
 [patch.crates-io]
-whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
-whipplescript-core = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
-whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
-whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
-whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
+whipplescript-core = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }

@@ -77,6 +77,7 @@ pub(super) fn command(delegated: bool) -> HostActionCommand {
                 label_ref: "project:one:private".into(),
             },
         )]),
+        anchor: None,
     }
 }
 

@@ -580,6 +580,7 @@ impl Workbench {
                     },
                 ),
             ]),
+            anchor: None,
         };
         let scope = command
             .instance_ref()

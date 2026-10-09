@@ -81,6 +81,8 @@ pub const DEFAULT_CONTENT_KINDS: &[&str] = &[
     "turn_boundary",
     "turn_summary",
     "context_window_reading",
+    "hosted_chat_checkpoint",
+    "hosted_chat_handoff",
     "workspace_result",
     "workspace_local_result",
     crate::engine::office_turn_result::CREATION_KIND,

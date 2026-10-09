@@ -268,6 +268,7 @@ impl Workbench {
             },
             inputs: BTreeMap::from([("corrections".into(), input.clone())]),
             resources: BTreeMap::from([("resolutions".into(), resolutions)]),
+            anchor: None,
         };
         let scope = command
             .instance_ref()

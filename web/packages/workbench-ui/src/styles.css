@@ -1944,12 +1944,10 @@ input {
 .approve-this-computer-step { display: flex; flex-direction: column; gap: 8px;
     margin-top: 14px; padding: 12px; border: 1px solid var(--edge); border-radius: 8px; }
 .approve-this-computer-step h4 { margin: 0; font-size: var(--fs-body); color: var(--ink); }
-.approve-this-computer-step p, .approve-this-computer-step ol { margin: 0; color: var(--muted); font-size: var(--fs-label); }
-.approve-this-computer-step ol { padding-left: 18px; display: flex; flex-direction: column; gap: 3px; }
-.approve-this-computer-step textarea, .approve-this-computer-step input { width: 100%; box-sizing: border-box;
+.approve-this-computer-step p { margin: 0; color: var(--muted); font-size: var(--fs-label); }
+.approve-this-computer-step input { width: 100%; box-sizing: border-box;
     font-family: var(--mono, ui-monospace, monospace); font-size: var(--fs-label); }
 .approve-this-computer-step .create-agent-actions { margin-top: 2px; }
-.approve-this-computer-sas strong { font-family: var(--mono, ui-monospace, monospace); letter-spacing: 0.08em; color: var(--ink); }
 .recovery-code-value { margin: 12px 0 0; padding: 12px; border: 1px solid var(--edge); border-radius: 8px;
     font-family: var(--mono, ui-monospace, monospace); font-size: var(--fs-body); line-height: 1.6;
     white-space: pre-wrap; word-break: break-word; user-select: all; color: var(--ink); }

@@ -3,7 +3,7 @@
 # cargo workspace (which stays self-contained and green).
 [package]
 name = "gaugedesk-desktop"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 autobins = false
 authors = ["GaugeWright <support@gaugewright.com>"]
@@ -22,11 +22,11 @@ path = "src/main.rs"
 # contract as the backend workspace. This nested Cargo workspace has its own
 # resolver and lockfile, so the root patch does not apply here.
 [patch.crates-io]
-whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
-whipplescript-core = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
-whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
-whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
-whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "7ffaea8f170c020a0fc628bfc7c30f7dc40c7f0c" }
+whipplescript = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
+whipplescript-core = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
+whipplescript-kernel = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
+whipplescript-parser = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
+whipplescript-store = { git = "https://github.com/GaugeWright/whipplescript.git", rev = "aa94947cc13fc29005a0843dab8d0bc4dfe6ec21" }
 
 [profile.release]
 strip = "symbols"

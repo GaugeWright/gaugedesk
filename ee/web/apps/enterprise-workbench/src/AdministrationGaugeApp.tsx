@@ -31,7 +31,7 @@ import {
     authenticationCredentialJSON,
     publicKeyCreationOptions,
     publicKeyRequestOptions,
-    registrationCredentialJSON,
+    registrationResponseJSON,
     RouteHttpError,
     type AccountLinkRecipients,
     type GaugeAppCommandResult,
@@ -4082,7 +4082,7 @@ export function createGaugeAppWorkspace(options: {
                 response = await submitOnce("account.authenticator.complete-add", {
                     ceremony_id: text(result.ceremony_id, ""),
                     label: "Passkey",
-                    attestation: registrationCredentialJSON(credential),
+                    attestation: registrationResponseJSON(credential),
                 });
             }
             if (response.receipt.status === "proposed") {

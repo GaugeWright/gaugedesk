@@ -27,7 +27,10 @@ use crate::library_state::{
     ForkChatError, ForkDestination, PublishArchetypeError, PullArchetypeError,
     UpgradePlacementError,
 };
-use crate::{net_http, LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT, DEFAULT_PROJECT};
+use crate::{
+    net_http, LockUnpoisoned, SharedWorkbench, Workbench, DEFAULT_AGENT, DEFAULT_PLACEMENT,
+    DEFAULT_PROJECT,
+};
 use gaugedesk_store::AdmitError;
 use gaugedesk_workspace::MergeOutcome;
 
@@ -1704,6 +1707,12 @@ pub fn general_placement_id(project_id: &str) -> String {
     format!("inst-general-{project_id}")
 }
 
+/// Personal's original built-in placement predates the per-project ID scheme.
+pub(crate) fn is_default_placement(project_id: &str, placement_id: &str) -> bool {
+    placement_id == general_placement_id(project_id)
+        || (project_id == DEFAULT_PROJECT && placement_id == DEFAULT_PLACEMENT)
+}
+
 /// Place `agent_id` on `project_id` under a caller-chosen instance id — used to give a
 /// project's built-in general placement its deterministic [`general_placement_id`].
 fn place_archetype_with_id(
@@ -1919,6 +1928,13 @@ pub async fn unbind_agent(
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "no such placement in project" })),
+        )
+            .into_response();
+    }
+    if is_default_placement(&pid, &iid) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "the project's default placement cannot be removed" })),
         )
             .into_response();
     }

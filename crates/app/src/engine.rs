@@ -549,6 +549,24 @@ pub(crate) fn task_correlation(
 
 /// Append a durable transcript record (admitted run evidence) to the engagement's
 /// log — the snapshot the client reduces on load (`app-stack.md`: repairable).
+/// A conversation carried past a turn whose outcome is unknown says so before
+/// it continues (DR-0412), once, as a durable line in the chat.
+fn record_continuity_notice(
+    store: &mut Store,
+    chat_id: &str,
+    harness: &mut dyn Harness,
+    sender: &broadcast::Sender<ServerEvent>,
+) {
+    if let Some(text) = harness.take_continuity_notice() {
+        let event = ServerEvent::Admitted {
+            kind: "continuity".into(),
+            text,
+        };
+        record_transcript(store, chat_id, &event);
+        let _ = sender.send(event);
+    }
+}
+
 fn record_transcript(store: &mut Store, scope: &str, event: &ServerEvent) {
     let _ = append_transcript(store, scope, event);
 }
@@ -2733,6 +2751,7 @@ fn run_claimed_engagement_turn(
             package_version_ref: package_version_ref.clone(),
             policy_epoch: None,
             signed_policy_envelope: None,
+            prior_policy_envelopes: Vec::new(),
             provider_binding_ref: None,
             credential_ref: None,
             placement_ceiling_ref: None,
@@ -3307,6 +3326,14 @@ fn run_claimed_engagement_turn(
         if let Some(process) = process_declaration.as_mut() {
             process.bind_governance(policy_epoch.epoch, &policy_epoch.signed_envelope);
         }
+        // The epochs this chat's conversation may have been recorded under,
+        // so a model switch or a gained tracker carries it forward (DR-0412).
+        let prior_policy_envelopes = crate::policy_compiler::earlier_policy_envelopes(
+            wb.lock_unpoisoned().store_ref(),
+            id,
+            policy_epoch.epoch,
+        )
+        .map_err(EngineError::Message)?;
         let spec = HarnessSpec {
             chat_id: id.to_string(),
             worktree: worktree.to_path_buf(),
@@ -3315,6 +3342,7 @@ fn run_claimed_engagement_turn(
             package_version_ref,
             policy_epoch: Some(policy_epoch.epoch),
             signed_policy_envelope: Some(policy_epoch.signed_envelope),
+            prior_policy_envelopes,
             provider_binding_ref: Some(policy_epoch.provider_binding_ref),
             credential_ref: Some(policy_epoch.credential_ref),
             placement_ceiling_ref: Some(policy_epoch.placement_ceiling_ref),
@@ -4115,6 +4143,9 @@ fn drive_persistent_turn(
             .create(spec)
             .map_err(|error| format!("spawn {}: {error}", factory.kind()))
     })?;
+    if let Some(started) = harness.lock_unpoisoned().as_deref_mut() {
+        record_continuity_notice(&mut wb.lock_unpoisoned().store, id, started, sender);
+    }
 
     // Do not consume answered questions until startup succeeds. A refused
     // transport must leave their delivery owed to the next successful turn.
@@ -4720,6 +4751,44 @@ mod tests {
         assert!(
             task_correlation(&store, "attempt-chat", "same-key", &author, Some(&rotated)).is_none()
         );
+    }
+
+    /// DR-0412 §3: what the runtime says about a carried conversation reaches
+    /// the chat once, as a durable line, and live.
+    #[test]
+    fn a_continuity_notice_is_recorded_once_in_the_chat() {
+        struct Carried(Option<String>);
+        impl Harness for Carried {
+            fn take_continuity_notice(&mut self) -> Option<String> {
+                self.0.take()
+            }
+            fn run_turn(
+                &mut self,
+                _gate: &dyn EgressGate,
+                _prompt: &str,
+                _images: &[ImageContent],
+                _sink: &mut dyn FnMut(&Observation),
+            ) -> io::Result<TurnOutcome> {
+                unreachable!("no turn runs here")
+            }
+        }
+        let mut store = Store::open_in_memory().unwrap();
+        let (sender, mut live) = broadcast::channel(8);
+        let mut harness = Carried(Some("The previous turn did not finish.".into()));
+        record_continuity_notice(&mut store, "carried-chat", &mut harness, &sender);
+        record_continuity_notice(&mut store, "carried-chat", &mut harness, &sender);
+
+        let lines = store.records("carried-chat", "transcript").unwrap();
+        assert_eq!(lines.len(), 1, "said once: {lines:?}");
+        let line: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(line["type"], "admitted");
+        assert_eq!(line["kind"], "continuity");
+        assert_eq!(line["text"], "The previous turn did not finish.");
+        assert!(matches!(
+            live.try_recv().unwrap(),
+            ServerEvent::Admitted { kind, .. } if kind == "continuity"
+        ));
+        assert!(live.try_recv().is_err());
     }
 
     #[test]

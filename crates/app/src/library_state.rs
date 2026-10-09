@@ -8337,7 +8337,7 @@ impl Workbench {
                             "kind": instance.placement_kind,
                             "archetype_id": instance.agent_id,
                             "archetype_name": archetype_name,
-                            "is_default": instance.id == library_routes::general_placement_id(&project.id),
+                            "is_default": library_routes::is_default_placement(&project.id, &instance.id),
                             "has_config": has_config,
                             "pinned_version": pinned_version,
                             "version": instance.version,

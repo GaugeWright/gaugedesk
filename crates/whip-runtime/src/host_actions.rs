@@ -31,13 +31,19 @@ where
 {
     let compiler_digest = whipplescript::host_runtime::native_compiler_artifact_digest()
         .map_err(facade::HostFacadeError::Resolver)?;
+    // The facade admits a program only against the vocabulary this host ships
+    // (WhippleScript WS-160): the standard packages the runtime crate embeds.
     facade::GovernedHostFacade::from_signed_store_with_verifier(
         store,
         epoch,
         signed_envelope,
         verifier,
     )
-    .map(|runtime| runtime.with_compiler_artifact_digest(compiler_digest))
+    .map(|runtime| {
+        runtime
+            .with_compiler_artifact_digest(compiler_digest)
+            .with_embedded_std_manifests(whipplescript::std_manifests::EMBEDDED_STD_MANIFESTS)
+    })
 }
 
 /// Product admission carries the runtime owner's complete command. The shell

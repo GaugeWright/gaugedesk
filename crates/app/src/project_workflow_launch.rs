@@ -390,6 +390,7 @@ impl Workbench {
                         },
                         inputs: command_inputs,
                         resources,
+                        anchor: None,
                     };
                     let dispatch = CommandDispatch {
                         runtime_ref: format!("workspace:{}", authority.workspace),

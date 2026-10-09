@@ -70,6 +70,18 @@ export function registrationCredentialJSON(credential: PublicKeyCredential): Rec
     };
 }
 
+/** Account-auth registration accepts the compact passkey-auth wire shape. */
+export function registrationResponseJSON(credential: PublicKeyCredential): Record<string, unknown> {
+    const encoded = registrationCredentialJSON(credential);
+    const response = encoded.response as Record<string, unknown>;
+    return {
+        id: encoded.rawId,
+        transports: response.transports,
+        attestationObject: response.attestationObject,
+        clientDataJSON: response.clientDataJSON,
+    };
+}
+
 export function publicKeyRequestOptions(value: unknown): PublicKeyCredentialRequestOptions {
     const envelope = record(value);
     const raw = envelope.publicKey == null ? envelope : record(envelope.publicKey);

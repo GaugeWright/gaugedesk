@@ -1,31 +1,28 @@
 @ui-mocked
-Feature: Approve this computer from one that holds the account's keys (DR-0359, DR-0361)
+Feature: Restore account keys to this computer after sign-in (DR-0478)
 
-  An account keeps one set of keys across its computers. A computer signed in
-  to an account whose keys another computer holds cannot make itself
-  reachable for that account until it is approved from there, or the
-  account's recovery code restores the keys here.
+  A fresh account sign-in normally restores the keys from private Hub custody.
+  If an older account has not deposited its keys yet, the computer offers
+  another sign-in after a key-holding computer updates. The recovery code is
+  the emergency path when neither Hub custody nor another computer is available.
 
-  Whether this computer needs approval, the enrollment it joins and the
-  recovery routes are answered by the window's own control plane, which this
-  browser lane does not reach; they are simulated here and proven against the
-  real plane by crates/app/src/account_publish_tests.rs,
-  crates/app/src/device_enroll_drive.rs and crates/app/src/account_recovery.rs.
+  The window's control plane answers reach and recovery, which this mocked
+  browser lane simulates. Rust tests cover key custody, root matching, and
+  encrypted delivery to the receiving device key.
 
-  Scenario: a computer that needs approval joins with a matching code
+  Scenario: an older computer awaiting a key copy offers account sign-in
     Given another computer holds the keys of "dana@example.com"
     And the workbench is open
-    Then the account bar offers "Approve this computer"
-    When I choose to approve this computer
-    Then the approval names "dana@example.com"
-    When I paste the other computer's ticket and join
-    Then this computer shows the matching code "482913"
-    And the approval finishes
+    Then the account bar offers "Connect this computer"
+    When I open the computer connection dialog
+    Then the connection names "dana@example.com"
+    When I choose to sign in again
+    Then account sign-in is shown
 
-  Scenario: a computer that needs approval restores the keys from the recovery code
+  Scenario: a computer with no available key copy uses emergency recovery
     Given another computer holds the keys of "dana@example.com"
     And the workbench is open
-    When I choose to approve this computer
+    When I open the computer connection dialog
     And I restore with the recovery code "AAAA-BBBB-CCCC"
     Then the recovery code "AAAA-BBBB-CCCC" was sent
     And the approval finishes

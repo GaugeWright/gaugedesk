@@ -19,9 +19,29 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-10-09
+
+- Remove the old Tutorials work target from Personal when no run or chat uses it.
+
+- Project settings no longer offer to remove a project's built-in Default
+  placement. Direct removal requests are refused, preserving the placement used
+  to start a chat without choosing an Agent.
+- Deleting an Agent in Workshop now closes its settings page and management
+  conversation, and clears an authoring or preview chat removed with it. A chat
+  belonging to another Agent stays open. The same cleanup follows a deletion
+  received from another client.
+
+- Signing in on another computer now restores an account's keys from encrypted
+  private Hub custody when a computer holding the keys has published its copy.
+  Older accounts seed that copy the next time their key-holding computer signs
+  in after updating GaugeDesk. The usual path no longer asks for a device
+  ticket or matching code; the recovery code remains for lost-key emergencies.
 - A hosted Home removes revoked provider links at its next account exchange even
   when another sealed copy cannot open. It reports that copy without exposing
   its secret and continues taking independent valid copies.
+- Adding a passkey in Account Settings now sends the registration response in
+  the format the account service accepts. This also unblocks account deletion
+  for accounts that still need a passkey for its fresh authorization check.
 
 ## [0.9.1] — 2026-10-09
 

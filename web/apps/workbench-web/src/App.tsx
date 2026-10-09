@@ -679,8 +679,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             () => void checkDesktopUpdate(false)));
     }
     const [claimPromptOpen, setClaimPromptOpen] = createSignal(false);
-    // Another computer holds the selected account's keys, so this one is not
-    // reachable for it until it is approved from there (DR-0359, DR-0361).
+    // A key copy may not yet be in Hub custody for an older account. A fresh
+    // sign-in restores it once a computer holding the keys deposits it (DR-0478).
     const [approvalOpen, setApprovalOpen] = createSignal(false);
     const needsApproval = () => hubSession()?.linked === true
         && hubSession()?.expired !== true
@@ -2053,6 +2053,27 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
         queueMicrotask(() => composerEl?.focus());
     }
 
+    function closeRemovedChat(id: EngagementId) {
+        if (forkTreeFor() === id) setForkTreeFor(null);
+        if (selected() !== id) return;
+        setSelected(null);
+        setSelectedFile(null);
+        setSnapshot(empty);
+        setLive(empty);
+        setShowShelf(false);
+        setShowSources(false);
+        if (typeof window !== "undefined") {
+            const withoutChat = searchWithChat(window.location.search, null);
+            const search = searchWithFile(withoutChat, null);
+            window.history.replaceState(null, "", `${window.location.pathname}${search}${window.location.hash}`);
+        }
+    }
+
+    function closeRemovedAgent(id: ArchetypeId) {
+        if (agentSettings()?.id === id) setAgentSettings(null);
+        if (openedPanelAgent()?.agent.id === id) setOpenedPanelAgent(null);
+    }
+
     // Selecting an Agent opens its settings and nothing else: the open work or
     // edit chat stays where it was, as it does under a GaugeApp
     // (navigation.md), and the Agent's row stays selected in the nav.
@@ -2753,7 +2774,8 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onOpenInbox={(id, name) => setProjectInbox({ id, name })}
             onAttachTarget={(id, name, kind) => void attachTarget(id, name, kind)}
             onOpenForkTree={(chat) => setForkTreeFor(chat)}
-            onChatRemoved={(id) => selected() === id && setSelected(null)}
+            onChatRemoved={closeRemovedChat}
+            onArchetypeRemoved={closeRemovedAgent}
             onStatus={setStatus}
             onFailure={(message) => reportFailure("nav", message)}
             runToneOf={runToneOf}
@@ -2816,10 +2838,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 <button
                     type="button"
                     data-open-device-approval
-                    title="Another computer holds this account's keys. Approve this one from there to reach your work on it from elsewhere."
+                    title="Sign in again to restore this account's keys to this computer."
                     onClick={() => setApprovalOpen(true)}
                 >
-                    Approve this computer
+                    Connect this computer
                 </button>
             </Show>
             <SettingsMenu
@@ -4852,6 +4874,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 <ApproveThisComputerDialog
                     account={hubSession()?.label ?? "this account"}
                     api={api}
+                    onSignIn={() => {
+                        setApprovalOpen(false);
+                        setSignInOpen(true);
+                    }}
                     onApproved={() => {
                         setApprovalOpen(false);
                         void refetchHubSession();

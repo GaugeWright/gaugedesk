@@ -40,10 +40,10 @@ pub use whipplescript::host_policy::{
     ResourcePolicy,
 };
 pub use whipplescript::host_protocol::{
-    CredentialRef, EventPosition, ForkInstanceCommand, ForkedInstance, LabeledRuntimeEvent,
-    OpenInstanceCommand, OpenedInstance, PolicyEpochRef, ProtocolError, ProviderBindingRef,
-    ResourceRef, RuntimeEvidencePointer, StartTurnCommand, TurnInput, TurnReceipt, TurnStatus,
-    HOST_PROTOCOL,
+    AdoptionCut, CredentialRef, EventPosition, ForkInstanceCommand, ForkedInstance,
+    LabeledRuntimeEvent, OpenInstanceCommand, OpenedInstance, PolicyEpochRef, ProtocolError,
+    ProviderBindingRef, ResourceRef, RuntimeEvidencePointer, StartTurnCommand, TurnInput,
+    TurnReceipt, TurnStatus, HOST_PROTOCOL,
 };
 pub use whipplescript::host_runtime::{
     native_workspace_tool_specs, native_workspace_tool_specs_with_capabilities,
@@ -1716,46 +1716,78 @@ impl WhipHarnessFactory {
         })
     }
 
-    /// Carry a chat's conversation into the package it runs now.
+    /// Carry a chat's conversation into the package and policy it runs under now.
     ///
     /// A chat's thread lives on the instance its turns ran on. That instance
-    /// is found by request ids that name the package, so when the package
-    /// changes — an edit chat's persona, a placement's Agent version — they
-    /// name a new instance, and the legacy-source fork below seeds it from a
-    /// source that never ran a turn. The model then answered with none of the
-    /// chat's history while the transcript still showed it (WS-631).
+    /// is found by request ids that name the package and the policy epoch, so
+    /// when either changes — an edit chat's persona, a placement's Agent
+    /// version, a model switch, a tracker gained — they name a new instance.
+    /// Seeding it from the legacy source, which never ran a turn, left the
+    /// model with none of the chat's history while the transcript still
+    /// showed it (WS-631, WS-660).
     ///
-    /// So the chat's most recently active instance decides. On this package it
-    /// is reused, when it is the instance this package and policy open to. On
-    /// an older package its thread is adopted into that instance, which does
-    /// not ask for the older package to be reproducible: it may not be.
+    /// So the chat's most recently active instance decides. On this package
+    /// and policy it is reused. Otherwise its thread is adopted into the
+    /// instance this package and policy open to, which does not ask for the
+    /// older package to be reproducible. A thread recorded under an earlier
+    /// epoch is read through a runtime opened under that epoch, so
+    /// WhippleScript can re-admit what it read under the current one
+    /// (WhippleScript DR-0293). A thread whose last turn never settled is
+    /// carried up to the turn before it, and the chat says so.
     ///
-    /// `None` leaves the chat to the legacy-source fork: a new chat, one whose
-    /// newest instance is that source, or one whose thread cannot be carried
-    /// because it was recorded under another policy epoch or has an effect
-    /// still running.
+    /// `Fresh` is a new chat, or one whose newest instance is the legacy
+    /// source. A thread that exists and cannot be carried is an error that
+    /// names why: the chat says so rather than starting again beneath a
+    /// transcript that shows earlier turns (DR-0412).
     fn continue_recorded_thread(
+        &self,
+        spec: &HarnessSpec,
         runtime: &mut GovernedHostRuntime,
         source_runtime: &GovernedHostRuntime,
         open: &OpenInstanceCommand,
         packages: &StaticPackages,
-    ) -> io::Result<Option<OpenedInstance>> {
+    ) -> io::Result<Continuation> {
         let Some(recorded) = source_runtime
             .newest_recorded_instance()
             .map_err(invalid_data)?
         else {
-            return Ok(None);
+            return Ok(Continuation::Fresh);
         };
-        if recorded.package_version_ref == open.package_version_ref {
+        if recorded.package_version_ref == open.package_version_ref
+            && recorded.policy == open.policy
+        {
             let opened = runtime
                 .open_instance(open, packages)
                 .map_err(invalid_data)?;
-            return Ok((opened.instance_ref == recorded.instance_ref).then_some(opened));
+            return Ok(if opened.instance_ref == recorded.instance_ref {
+                Continuation::Carried {
+                    instance: Box::new(opened),
+                    cut: None,
+                }
+            } else {
+                Continuation::Fresh
+            });
         }
         if recorded.package_version_ref == packages.previous.version_ref {
-            return Ok(None);
+            return Ok(Continuation::Fresh);
         }
-        let source = source_runtime
+        let earlier;
+        let source = if &recorded.policy == source_runtime.policy_ref() {
+            source_runtime
+        } else {
+            let (epoch, envelope) = spec
+                .prior_policy_envelopes
+                .iter()
+                .find(|(epoch, _)| *epoch == recorded.policy.epoch)
+                .ok_or_else(|| {
+                    not_carried("the settings it was recorded under are no longer on record")
+                })?;
+            earlier = self
+                .runtime_for_chat(&spec.chat_id, *epoch, envelope)
+                .map_err(|error| not_carried(&error.to_string()))?;
+            &earlier
+        };
+        let position = source
             .current_position(&recorded.instance_ref)
             .map_err(invalid_data)?;
         let adopt = ForkInstanceCommand {
@@ -1767,19 +1799,18 @@ impl WhipHarnessFactory {
                 open.policy.epoch,
                 open.policy.envelope_hash
             ),
-            source,
+            source: position,
             target_request_id: open.request_id.clone(),
             package_version_ref: open.package_version_ref.clone(),
             policy: open.policy.clone(),
         };
-        match runtime.adopt_instance_from(source_runtime, &adopt, packages) {
-            Ok(fork) => Ok(Some(fork.target)),
-            Err(
-                HostRuntimeError::Protocol(ProtocolError::Mismatch(_))
-                | HostRuntimeError::Incomplete(_),
-            ) => Ok(None),
-            Err(error) => Err(invalid_data(error)),
-        }
+        let adopted = runtime
+            .adopt_instance_from(source, &adopt, packages)
+            .map_err(|error| not_carried(&error.to_string()))?;
+        Ok(Continuation::Carried {
+            instance: Box::new(adopted.target),
+            cut: adopted.cut,
+        })
     }
 
     fn open_request(
@@ -1865,10 +1896,10 @@ impl WhipHarnessFactory {
             runtime.policy_ref().clone(),
         );
         let continued =
-            Self::continue_recorded_thread(&mut runtime, &source_runtime, &open, &packages)?;
-        let instance = match continued {
-            Some(instance) => instance,
-            None => {
+            self.continue_recorded_thread(spec, &mut runtime, &source_runtime, &open, &packages)?;
+        let (instance, cut) = match continued {
+            Continuation::Carried { instance, cut } => (*instance, cut),
+            Continuation::Fresh => {
                 let source_open = Self::open_request(
                     &spec.chat_id,
                     packages.previous.version_ref.as_str(),
@@ -1895,10 +1926,11 @@ impl WhipHarnessFactory {
                     package_version_ref: package.version_ref().to_owned(),
                     policy: open.policy.clone(),
                 };
-                runtime
+                let instance = runtime
                     .fork_instance_from(&source_runtime, &upgrade, &packages)
                     .map(|fork| fork.target)
-                    .map_err(invalid_data)?
+                    .map_err(invalid_data)?;
+                (instance, None)
             }
         };
 
@@ -1969,8 +2001,42 @@ impl WhipHarnessFactory {
             organization_model_broker: self.organization_model_broker.clone(),
             native_model_context: Arc::new(Mutex::new(NativeModelContext::default())),
             managed_call_meter: None,
+            continuity_notice: cut.as_ref().map(unresolved_turn_notice),
         })
     }
+}
+
+/// How a chat's recorded conversation continues into the run being opened.
+enum Continuation {
+    /// The thread runs on this instance. `cut` is set when it was carried
+    /// only up to the turn before one whose effect never settled.
+    Carried {
+        instance: Box<OpenedInstance>,
+        cut: Option<AdoptionCut>,
+    },
+    /// Nothing to carry: a new chat, or one whose newest instance is the
+    /// legacy source the package-upgrade fork seeds from.
+    Fresh,
+}
+
+/// A chat whose thread exists and cannot be carried says why (DR-0412).
+fn not_carried(reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "this chat's earlier conversation could not be carried into its current settings \
+             ({reason}); start a new chat to continue"
+        ),
+    )
+}
+
+/// What the chat shows when its conversation was cut before a turn whose
+/// outcome is unknown (DR-0412 §3). Turns are serial, so what never settled
+/// is the chat's previous turn.
+fn unresolved_turn_notice(_cut: &AdoptionCut) -> String {
+    "The previous turn did not finish, so what it did is unknown. The conversation \
+     continues from before it, and the assistant has not seen that turn."
+        .to_owned()
 }
 
 impl HarnessFactory for WhipHarnessFactory {
@@ -2345,6 +2411,9 @@ struct WhipHarness {
     organization_model_broker: Option<OrganizationModelBrokerConfig>,
     native_model_context: Arc<Mutex<NativeModelContext>>,
     managed_call_meter: Option<Arc<dyn gaugedesk_harness::ManagedCallMeter>>,
+    /// What the chat must show before this harness's first turn: that its
+    /// conversation was carried past a turn whose outcome is unknown.
+    continuity_notice: Option<String>,
 }
 
 const NATIVE_MODEL_CONTEXT_LIMIT: usize = 8 * 1024 * 1024;
@@ -2462,6 +2531,10 @@ mod native_model_context_tests {
 }
 
 impl Harness for WhipHarness {
+    fn take_continuity_notice(&mut self) -> Option<String> {
+        self.continuity_notice.take()
+    }
+
     fn bind_authenticated_actor(&mut self, actor_ref: &str) {
         if !actor_ref.trim().is_empty() {
             self.respondent_ref = actor_ref.to_owned();
@@ -7056,6 +7129,7 @@ workflow Method {
             package_version_ref: Some(package_ref.clone()),
             policy_epoch: Some(1),
             signed_policy_envelope: Some(signed_harness_policy_at(&origin)),
+            prior_policy_envelopes: Vec::new(),
             provider_binding_ref: Some("model".to_owned()),
             credential_ref: Some(
                 "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),
@@ -7357,6 +7431,7 @@ workflow Method {
             package_version_ref: package.map(|(_, reference)| reference.to_owned()),
             policy_epoch: Some(1),
             signed_policy_envelope: Some(signed_harness_policy_at(origin)),
+            prior_policy_envelopes: Vec::new(),
             provider_binding_ref: Some("model".to_owned()),
             credential_ref: Some(
                 "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),
@@ -7502,6 +7577,151 @@ workflow Method {
         );
     }
 
+    fn signed_harness_policy_for_model(base_url: &str, model: &str) -> String {
+        let authority = AuthorityId::new("authority:owner");
+        let key = SigningKey::from_seed(&[7u8; 32]).expect("key");
+        sign_policy_envelope(
+            &harness_policy_for("openai", model, base_url, "openai-responses"),
+            &authority,
+            &key,
+        )
+        .expect("signed harness policy")
+    }
+
+    /// `before`'s chat reopened under epoch 2, whose envelope names another
+    /// model: what switching an edit chat's model does.
+    fn after_a_model_switch(before: &HarnessSpec, origin: &str) -> HarnessSpec {
+        let mut after = before.clone();
+        after.policy_epoch = Some(2);
+        after.signed_policy_envelope =
+            Some(signed_harness_policy_for_model(origin, "gpt-test-next"));
+        after.model = Some("gpt-test-next".to_owned());
+        after.prior_policy_envelopes =
+            vec![(1, before.signed_policy_envelope.clone().expect("epoch 1"))];
+        after
+    }
+
+    /// WS-660, DR-0412: a chat whose policy epoch advances because its model
+    /// was switched keeps its conversation. On 2026-10-09 an edit chat moved
+    /// from one model to another between turns, and the editor then denied
+    /// having made the edits it had made, because it was started again.
+    #[test]
+    fn a_chat_keeps_its_conversation_when_its_model_is_switched() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (origin, calls, server) = recording_provider(3);
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            harness_policy_root(),
+            root.path(),
+        );
+        let edit = gaugedesk_harness::ChatMode::Edit;
+        let before = continuity_spec(worktree.path(), &origin, edit, None, Some("EDITOR"));
+        let after = after_a_model_switch(&before, &origin);
+
+        let first = continuity_turn(&factory, &before, &origin, "FIRST-REQUEST");
+        let carried = continuity_turn(&factory, &after, &origin, "SECOND-REQUEST");
+        let reopened = continuity_turn(&factory, &after, &origin, "THIRD-REQUEST");
+        server.join().unwrap();
+
+        assert_ne!(carried, first, "the new epoch runs on its own instance");
+        assert_eq!(reopened, carried, "a reopen continues the carried instance");
+        let calls = calls.lock().unwrap();
+        let second = calls[1].to_string();
+        assert!(second.contains("gpt-test-next"), "{second}");
+        assert!(
+            second.contains("FIRST-REQUEST"),
+            "the turn before the switch is still in the thread"
+        );
+        let third = calls[2].to_string();
+        assert!(third.contains("FIRST-REQUEST") && third.contains("SECOND-REQUEST"));
+    }
+
+    /// DR-0412 §4: a chat whose conversation cannot be carried says why and
+    /// does not start again beneath a transcript that shows earlier turns.
+    #[test]
+    fn a_chat_that_cannot_carry_its_conversation_says_so() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (origin, _calls, server) = recording_provider(1);
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            harness_policy_root(),
+            root.path(),
+        );
+        let edit = gaugedesk_harness::ChatMode::Edit;
+        let before = continuity_spec(worktree.path(), &origin, edit, None, Some("EDITOR"));
+        let mut after = after_a_model_switch(&before, &origin);
+        after.prior_policy_envelopes.clear();
+
+        continuity_turn(&factory, &before, &origin, "FIRST-REQUEST");
+        server.join().unwrap();
+        let Err(refused) = factory.create_harness(&after) else {
+            panic!("a conversation recorded under an epoch not on record started again");
+        };
+        let refused = refused.to_string();
+        assert!(refused.contains("could not be carried"), "{refused}");
+        assert!(refused.contains("no longer on record"), "{refused}");
+    }
+
+    /// DR-0412 §3: a turn that never settled is neither carried nor guessed.
+    /// The conversation continues from the turn before it, and the chat is
+    /// told so once.
+    #[test]
+    fn a_turn_that_never_settled_is_cut_and_the_chat_says_so() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (origin, calls, server) = recording_provider(3);
+        let factory = WhipHarnessFactory::new(
+            AuthorityId::new("authority:owner"),
+            harness_policy_root(),
+            root.path(),
+        );
+        let edit = gaugedesk_harness::ChatMode::Edit;
+        let before = continuity_spec(worktree.path(), &origin, edit, None, Some("EDITOR"));
+        let after = after_a_model_switch(&before, &origin);
+
+        continuity_turn(&factory, &before, &origin, "FIRST-REQUEST");
+        continuity_turn(&factory, &before, &origin, "LOST-REQUEST");
+        // The second turn's effect is left running, as a crash mid-turn leaves it.
+        let orphaned =
+            rusqlite::Connection::open(chat_runtime_database(root.path(), &before.chat_id))
+                .expect("chat runtime")
+                .execute(
+                    "UPDATE effects SET status = 'running' \
+             WHERE rowid = (SELECT MAX(rowid) FROM effects WHERE kind = 'agent.tell')",
+                    [],
+                )
+                .expect("orphan the second turn");
+        assert_eq!(orphaned, 1);
+
+        let mut harness = factory.create_harness(&after).expect("carried with a cut");
+        let notice = harness
+            .take_continuity_notice()
+            .expect("the chat is told about the unresolved turn");
+        assert!(notice.contains("did not finish"), "{notice}");
+        assert!(harness.take_continuity_notice().is_none(), "said once");
+        harness.provider.base_url = origin.clone();
+        let outcome = harness
+            .run_turn(
+                &gaugedesk_harness::AllowAllGate,
+                "AFTER-THE-CUT",
+                &[],
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        server.join().unwrap();
+
+        let calls = calls.lock().unwrap();
+        let third = calls[2].to_string();
+        assert!(third.contains("FIRST-REQUEST"), "{third}");
+        assert!(
+            !third.contains("LOST-REQUEST"),
+            "the unresolved turn is not carried: {third}"
+        );
+    }
+
     #[test]
     fn whip_harness_reopens_the_same_instance_and_owns_workspace_tools() {
         use std::sync::atomic::AtomicUsize;
@@ -7557,6 +7777,7 @@ workflow Method {
             package_version_ref: Some(package_ref.clone()),
             policy_epoch: Some(1),
             signed_policy_envelope: Some(signed_harness_policy()),
+            prior_policy_envelopes: Vec::new(),
             provider_binding_ref: Some("model".to_owned()),
             credential_ref: Some(
                 "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),
@@ -8338,6 +8559,10 @@ workflow Method {
         assert_eq!(reopened.instance_ref, instance);
         let mut changed_policy = spec.clone();
         changed_policy.policy_epoch = Some(2);
+        // The engine hands a reopened chat the epochs before its current one,
+        // so its conversation is carried into the new instance (DR-0412).
+        changed_policy.prior_policy_envelopes =
+            vec![(1, spec.signed_policy_envelope.clone().expect("epoch 1"))];
         let changed = factory
             .create_harness(&changed_policy)
             .expect("new policy epoch opens a new instance");
@@ -8355,7 +8580,10 @@ workflow Method {
             .expect("source position");
 
         let respondent = AuthorityId::new("authority:authenticated-member");
-        let mut attributed = factory.create_harness(&spec).expect("attributed harness");
+        // A chat's epoch only advances, so the newest one opens it now.
+        let mut attributed = factory
+            .create_harness(&changed_policy)
+            .expect("attributed harness");
         attributed.bind_authenticated_actor(respondent.as_str());
         assert_eq!(attributed.respondent_ref, respondent.as_str());
 
@@ -8612,6 +8840,7 @@ workflow Method {
                 signed_policy_envelope: Some(
                     sign_policy_envelope(&policy, &authority, &key).expect("signed policy"),
                 ),
+                prior_policy_envelopes: Vec::new(),
                 provider_binding_ref: Some("model".to_owned()),
                 credential_ref: Some(
                     "credential:gaugedesk/account/616c696365/6f70656e6169/v1".to_owned(),

@@ -93,6 +93,7 @@ fn full_turn_runs_over_workspace_and_harness_trait_objects() {
         package_version_ref: None,
         policy_epoch: None,
         signed_policy_envelope: None,
+        prior_policy_envelopes: Vec::new(),
         provider_binding_ref: None,
         credential_ref: None,
         placement_ceiling_ref: None,

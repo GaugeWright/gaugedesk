@@ -1,9 +1,8 @@
 /**
- * Approving this computer from one that holds the account's keys, or from
- * the account's recovery code (DR-0359, DR-0361). The window's control plane
+ * Restoring this computer's account keys after sign-in (DR-0478). The window's control plane
  * answers these only for its own window holding an account session; the
  * routes are simulated, and the shipped client, the account bar, the account
- * menu and both dialogs are real.
+ * menu and dialog are real.
  *
  * `@ui-mocked`, and isolated here, because the fidelity guard refuses route
  * interception from a `@transport` scenario.
@@ -16,8 +15,6 @@ import { openAccountMenu } from "./settings-nav";
 const { Given, When, Then } = createBdd();
 
 const HUB_SESSION = /\/account\/hub-session(\?|$)/;
-const JOIN = /\/account\/devices\/enroll\/join(\?|$)/;
-const JOIN_STATUS = /\/account\/devices\/enroll\/join\/[^/?]+(\?|$)/;
 const RECOVERY_CODE = /\/account\/recovery-code(\?|$)/;
 const RESTORE = /\/account\/recovery-code\/restore(\?|$)/;
 
@@ -43,19 +40,6 @@ Given("another computer holds the keys of {string}", async ({ page }, label: str
     await page.route(HUB_SESSION, (route) => route.request().method() === "GET"
         ? route.fulfill({ status: 200, json: session(label, reach) })
         : route.fallback());
-    await page.route(JOIN, (route) => route.request().method() === "POST"
-        ? route.fulfill({ status: 200, json: { session: "sess-1" } })
-        : route.fallback());
-    let polls = 0;
-    await page.route(JOIN_STATUS, (route) => {
-        polls += 1;
-        const done = polls > 2;
-        if (done) reach = "published";
-        return route.fulfill({
-            status: 200,
-            json: { phase: done ? "completed" : "sas_ready", sas: "482913", error: null },
-        });
-    });
     await page.route(RESTORE, async (route) => {
         if (route.request().method() !== "POST") return route.fallback();
         state.restored.push((route.request().postDataJSON() as { code: string }).code);
@@ -89,27 +73,25 @@ Then("the account bar offers {string}", async ({ page }, label: string) => {
     await shot(page, "approve-this-computer-bar");
 });
 
-When("I choose to approve this computer", async ({ page }) => {
+When("I open the computer connection dialog", async ({ page }) => {
     await page.locator("[data-open-device-approval]").click();
 });
 
 const dialog = (page: Page) => page.locator("[data-approve-this-computer] [role=dialog]");
 
-Then("the approval names {string}", async ({ page }, account: string) => {
+Then("the connection names {string}", async ({ page }, account: string) => {
     await expect(dialog(page)).toBeVisible();
     await expect(dialog(page).locator("h3")).toContainText(account);
     await shot(page, "approve-this-computer-dialog");
 });
 
-When("I paste the other computer's ticket and join", async ({ page }) => {
-    const ticket = { session: "sess-1", account_root: "04ab", broker: "wss://broker.example", account: "acct-dana" };
-    await dialog(page).locator("[data-approve-ticket]").fill(JSON.stringify(ticket));
-    await dialog(page).locator("[data-approve-join-start]").click();
+When("I choose to sign in again", async ({ page }) => {
+    await dialog(page).locator("[data-approve-signin]").click();
 });
 
-Then("this computer shows the matching code {string}", async ({ page }, sas: string) => {
-    await expect(dialog(page).locator("[data-approve-sas]")).toContainText(sas);
-    await shot(page, "approve-this-computer-sas");
+Then("account sign-in is shown", async ({ page }) => {
+    await expect(page.locator("[data-signin-overlay]")).toBeVisible();
+    await expect(page.locator("[data-approve-this-computer]")).toHaveCount(0);
 });
 
 Then("the approval finishes", async ({ page }) => {

@@ -17,9 +17,10 @@ export function chatIdFromSearch(search: string): string | null {
 }
 
 /** A search string that addresses `id`, preserving any other query params. */
-export function searchWithChat(search: string, id: string): string {
+export function searchWithChat(search: string, id: string | null): string {
     const p = new URLSearchParams(search);
-    p.set(CHAT_PARAM, id);
+    if (id) p.set(CHAT_PARAM, id);
+    else p.delete(CHAT_PARAM);
     const s = p.toString();
     return s ? `?${s}` : "";
 }

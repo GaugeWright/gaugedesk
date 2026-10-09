@@ -100,6 +100,7 @@ impl Workbench {
     /// works elsewhere. The computer keeps no Tutorials of theirs, so their
     /// grant stays the one project they were invited to (DR-0328 §6).
     pub fn ensure_shipped_tutorials(&mut self) -> Result<ShippedTutorials, String> {
+        self.retire_unused_personal_tutorials_target()?;
         let org = Org::rebuild(self.store_ref()).map_err(|e| format!("{e:?}"))?;
         let desktop = self.desktop_account_mode();
         let mut learners = org
@@ -127,6 +128,82 @@ impl Workbench {
             }
         }
         Ok(result)
+    }
+
+    /// DR-0225 kept this attachment only so a Personal run could use its
+    /// pinned source. Once nothing refers to it, remove the obsolete project
+    /// target; the shipped Tutorials project has its own source target.
+    fn retire_unused_personal_tutorials_target(&mut self) -> Result<(), String> {
+        let Some(target) = self.library.work_targets.get(TUTORIALS_TARGET).cloned() else {
+            return Ok(());
+        };
+        if target.owner
+            != (WorkTargetOwner::Project {
+                project_id: DEFAULT_PROJECT.into(),
+            })
+        {
+            return Ok(());
+        }
+        for scope in self.store_ref().scope_ids().map_err(|e| format!("{e:?}"))? {
+            if crate::project_workflow::launch_scope_parts(&scope)
+                .is_some_and(|(project, _, _)| project == DEFAULT_PROJECT)
+                && self
+                    .workflow_launch_declaration(&scope)
+                    .map_or(true, |launch| launch.target == TUTORIALS_TARGET)
+            {
+                return Ok(());
+            }
+        }
+        if self.library.chat_targets.values().any(|binding| {
+            self.library.chats.contains_key(&binding.chat_id)
+                && binding.target_id == TUTORIALS_TARGET
+        }) || self
+            .library
+            .chat_target_sets
+            .iter()
+            .any(|(chat, revisions)| {
+                self.library.chats.contains_key(chat)
+                    && revisions.values().any(|revision| {
+                        revision
+                            .members
+                            .iter()
+                            .any(|member| member.target_id == TUTORIALS_TARGET)
+                    })
+            })
+            || self.library.chat_target_bases.iter().any(|(chat, bases)| {
+                self.library.chats.contains_key(chat) && bases.contains_key(TUTORIALS_TARGET)
+            })
+            || self
+                .library
+                .workstream_roots
+                .values()
+                .any(|root| root.target_id == TUTORIALS_TARGET)
+        {
+            return Ok(());
+        }
+        let placements = self
+            .library
+            .placement_targets
+            .values()
+            .filter(|placement| placement.target_ids.iter().any(|id| id == TUTORIALS_TARGET))
+            .cloned()
+            .collect::<Vec<_>>();
+        if placements
+            .iter()
+            .any(|placement| placement.target_ids.len() == 1)
+        {
+            return Ok(());
+        }
+        for mut placement in placements {
+            placement.target_ids.retain(|id| id != TUTORIALS_TARGET);
+            self.write_placement_targets_record(placement);
+        }
+        self.write_work_target_record(crate::library::WorkTargetRecord {
+            op: RecordOp::Tombstone,
+            ..target
+        });
+        self.targets.remove(TUTORIALS_TARGET);
+        Ok(())
     }
 
     fn ensure_tutorial_project(

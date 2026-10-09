@@ -2850,8 +2850,8 @@ async fn relocate_preauthorized(
 /// seed, not project content, so the relocation carries the placement and the
 /// receiving Home binds it to its own seed — it never ships, nor admits,
 /// another Home's authoring instance, authoring target or bytes for it. A
-/// custom Agent placed in the project still travels whole, and a removed
-/// placement does not drag its Agent along.
+/// custom Agent placed in the project still travels whole, while the built-in
+/// general placement remains available throughout the move.
 #[tokio::test(flavor = "multi_thread")]
 async fn product_created_projects_relocate_between_two_seeded_homes() {
     let (broker, _relay) = start_broker().await;
@@ -2920,9 +2920,8 @@ async fn product_created_projects_relocate_between_two_seeded_homes() {
         alice_seed
     );
 
-    // A second product-created project whose general placement is removed and
-    // a custom Agent placed instead: the custom Agent and its authoring target
-    // travel, and the removed placement's seeded Agent does not.
+    // A second product-created project refuses removal of its general placement.
+    // A custom Agent can still be placed alongside it and travel with the project.
     let (_, created) = post(&alice, "/projects", json!({ "name": "Globex" })).await;
     let project = created["id"].as_str().unwrap().to_owned();
     let (status, body) = delete(
@@ -2930,9 +2929,10 @@ async fn product_created_projects_relocate_between_two_seeded_homes() {
         &format!("/projects/{project}/placements/inst-general-{project}"),
     )
     .await;
-    assert!(
-        status.is_success(),
-        "remove general placement: {status} {body}"
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "remove general placement: {body}"
     );
     let (status, agent) = post(&alice, "/archetypes", json!({ "name": "Analyst" })).await;
     assert!(status.is_success(), "create Agent: {status} {agent}");
@@ -2946,6 +2946,17 @@ async fn product_created_projects_relocate_between_two_seeded_homes() {
     assert!(status.is_success(), "place Agent: {status} {body}");
 
     relocate_preauthorized(&alice, &bob, "alice-root", "bob-root", &project).await;
+    assert_eq!(
+        library_record(
+            &bob_wb,
+            "instance",
+            "id",
+            &format!("inst-general-{project}")
+        )
+        .unwrap()["agent_id"],
+        "agent-default",
+        "the built-in general placement travelled with the project"
+    );
     assert_eq!(
         library_record(&bob_wb, "agent", "id", &agent_id).unwrap()["name"],
         "Analyst"

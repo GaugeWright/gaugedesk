@@ -365,6 +365,14 @@ pub trait ManagedCallMeter: Send + Sync {
 /// The seam between the admission shell and any agent runtime (DR-0031): drive one
 /// turn to a neutral [`TurnOutcome`]. WhippleScript implements this trait.
 pub trait Harness: Send {
+    /// A line the chat must show before this harness's first turn, taken once.
+    /// A runtime that carried the conversation past a turn whose outcome is
+    /// unknown says so here (DR-0412), because nothing the model now holds
+    /// may read as though it received that turn. The default has none.
+    fn take_continuity_notice(&mut self) -> Option<String> {
+        None
+    }
+
     /// Refresh the GaugeDesk-authenticated actor for the next turn. Persistent
     /// harnesses must not retain the actor from the turn that created them.
     /// Adapters may use this only for attribution; authentication stays in the
@@ -544,6 +552,12 @@ pub struct HarnessSpec {
     /// only for test/legacy adapters that do not consume the host protocol.
     pub policy_epoch: Option<u64>,
     pub signed_policy_envelope: Option<String>,
+    /// The chat's earlier signed epochs, oldest first, as `(epoch, envelope)`.
+    /// A chat reopened under a newer epoch opens the runtime its recorded
+    /// thread was written under from one of these, so the conversation is
+    /// carried forward rather than started again (DR-0412). Empty when the
+    /// chat has no earlier epoch.
+    pub prior_policy_envelopes: Vec<(u64, String)>,
     /// Typed, non-secret resolver references carried durably by the host command.
     pub provider_binding_ref: Option<String>,
     pub credential_ref: Option<String>,

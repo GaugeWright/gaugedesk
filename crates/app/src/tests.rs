@@ -7459,11 +7459,25 @@ async fn pulled_line_work_reads_as_one_operational_line() {
 async fn unbinding_a_placement_preserves_project_owned_workstreams() {
     let (_d, wb) = lean_workbench();
     let app = open_control_plane(wb.clone());
-    let target_id = library_state::managed_project_target_id(DEFAULT_PROJECT);
+    let (status, body) = send(&app, "POST", "/projects", Some(r#"{"name":"Client"}"#)).await;
+    assert_eq!(status, StatusCode::CREATED, "create project: {body}");
+    let project: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let project_id = project["id"].as_str().unwrap();
+    let target_id = project["target_id"].as_str().unwrap();
     let (status, body) = send(
         &app,
         "POST",
-        &format!("/placements/{DEFAULT_PLACEMENT}/workstreams"),
+        &format!("/projects/{project_id}/placements"),
+        Some(r#"{"agent_id":"agent-default"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "place agent: {body}");
+    let placement: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let placement_id = placement["instance_id"].as_str().unwrap();
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("/placements/{placement_id}/workstreams"),
         Some(
             &serde_json::json!({
                 "name": "survives creator placement",
@@ -7482,7 +7496,7 @@ async fn unbinding_a_placement_preserves_project_owned_workstreams() {
     let (status, body) = send(
         &app,
         "DELETE",
-        &format!("/projects/{DEFAULT_PROJECT}/placements/{DEFAULT_PLACEMENT}"),
+        &format!("/projects/{project_id}/placements/{placement_id}"),
         None,
     )
     .await;
@@ -7492,13 +7506,13 @@ async fn unbinding_a_placement_preserves_project_owned_workstreams() {
     assert!(guard.library.workstreams.contains_key(&workstream_id));
     assert_eq!(
         guard.library.workstream_roots[&workstream_id].project_id,
-        DEFAULT_PROJECT
+        project_id
     );
     let rebuilt = crate::library::Library::rebuild(guard.store_ref()).expect("rebuild library");
     assert!(rebuilt.workstreams.contains_key(&workstream_id));
     assert_eq!(
         rebuilt.workstream_roots[&workstream_id].project_id,
-        DEFAULT_PROJECT
+        project_id
     );
 }
 

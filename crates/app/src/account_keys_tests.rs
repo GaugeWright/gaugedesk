@@ -122,3 +122,27 @@ fn the_recovery_code_restores_the_root_and_the_account_key() {
         "never over held keys"
     );
 }
+
+#[test]
+fn sign_in_restores_to_the_device_key_that_opened_the_hub_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AccountKeyStore::new(dir.path());
+    let root = SigningKey::from_seed(&[9; 32]).unwrap();
+    let device = SigningKey::from_seed(&[10; 32]).unwrap();
+    let sealed =
+        crate::device_enroll::seal_to_subkey(&device.public_key(), &root.to_seed_bytes()).unwrap();
+    let opened = crate::device_enroll::open_sealed(&device, &sealed).unwrap();
+    let opened: [u8; 32] = opened.try_into().unwrap();
+    let restored = store
+        .restore_with_device(
+            "acct-a",
+            SigningKey::from_seed(&opened).unwrap(),
+            device,
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(restored.root.public_key(), root.public_key());
+    assert_eq!(restored.delegation.subkey, restored.device.public_key());
+    assert_eq!(restored.account_key, account_key_from_root(&root));
+    assert!(store.restore("acct-a", root, NOW).is_err());
+}

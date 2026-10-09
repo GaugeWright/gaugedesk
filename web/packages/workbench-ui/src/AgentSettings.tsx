@@ -206,10 +206,20 @@ export function AgentSettings(props: AgentSettingsProps) {
 
             <Show
                 when={
+                    !loaded.error && !loadedAbilities.error && !loadedPanel.error &&
                     (loaded.state === "ready" || raw() !== null) &&
                     loadedAbilities.state === "ready"
                 }
-                fallback={<div class="status">loading…</div>}
+                fallback={<Show when={loaded.error ?? loadedAbilities.error ?? loadedPanel.error}
+                    fallback={<div class="status">loading…</div>}>
+                    {(reason) => <div class="status" role="alert">
+                        Agent settings unavailable: {String(reason())}
+                        <button type="button" onClick={() => {
+                            void Promise.all([refetchConfig(), refetchAbilities(),
+                                ...(props.kind === "panel" ? [refetchPanel()] : [])]).catch(() => undefined);
+                        }}>Retry</button>
+                    </div>}
+                </Show>}
             >
                 <div data-settings-form>
                     <Show when={props.kind === "panel" && panel()}>

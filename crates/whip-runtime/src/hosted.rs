@@ -89,6 +89,44 @@ pub struct DoHostResponse {
 pub trait DoHostTransport: Send + Sync + std::fmt::Debug {
     fn send(&self, request: DoHostRequest) -> io::Result<DoHostResponse>;
 
+    fn requires_chat_checkpoint(&self) -> bool {
+        false
+    }
+
+    /// Home-owned, chat-scoped source evidence for a private command. Public
+    /// bearer placements do not have this custody and use their own session
+    /// continuity instead.
+    fn load_chat_checkpoint(&self, _chat_id: &str) -> io::Result<Option<Value>> {
+        Ok(None)
+    }
+
+    /// Persist the runtime's verified export before the host reports a turn
+    /// complete. The private Home seals it under the chat's erasure key.
+    fn retain_chat_checkpoint(&self, _chat_id: &str, _export: Value) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn register_chat_handoff(
+        &self,
+        _chat_id: &str,
+        _source_pin: &str,
+        _target_request_id: &str,
+        _target_package: &str,
+        _target_policy: &PolicyEpochRef,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn complete_chat_handoff(
+        &self,
+        _chat_id: &str,
+        _source_pin: &str,
+        _target_request_id: &str,
+        _receipt: Value,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     fn supports_streaming(&self) -> bool {
         false
     }
@@ -262,29 +300,85 @@ pub(crate) fn create_harness(
         "signed policy envelope",
     )?;
     let placement = required_ref(spec.runtime_placement_id.as_deref(), "runtime placement id")?;
-    let policy_started = Instant::now();
-    let (verified_config, policy) = bind_hosted_policy(factory, config, placement, epoch, signed)?;
-    let config = &verified_config;
-    let policy_ms = policy_started.elapsed().as_secs_f64() * 1000.0;
+    let admitted_policy = factory.verify_policy(epoch, signed).map_err(invalid_data)?;
     let open = super::OpenInstanceCommand {
         protocol: HOST_PROTOCOL.to_owned(),
         request_id: format!(
             "gaugedesk:{}:{}:{}:{}",
             spec.chat_id,
             package.version_ref(),
-            policy.epoch,
-            policy.envelope_hash,
+            admitted_policy.protocol_ref().epoch,
+            admitted_policy.protocol_ref().envelope_hash,
         ),
         package_version_ref: package.version_ref().to_owned(),
-        policy: policy.clone(),
+        policy: admitted_policy.protocol_ref().clone(),
     };
+    let checkpoint = config.transport.load_chat_checkpoint(&spec.chat_id)?;
+    if let Some(checkpoint) = &checkpoint {
+        let pin = required_json_string(checkpoint, "export_sha256", "hosted checkpoint")?;
+        config.transport.register_chat_handoff(
+            &spec.chat_id,
+            &pin,
+            &open.request_id,
+            package.version_ref(),
+            &open.policy,
+        )?;
+    }
+    let policy_started = Instant::now();
+    let (verified_config, policy) = bind_hosted_policy(factory, config, placement, epoch, signed)?;
+    let config = &verified_config;
+    let policy_ms = policy_started.elapsed().as_secs_f64() * 1000.0;
+    if policy != open.policy {
+        return Err(invalid_data(
+            "hosted policy changed during handoff registration",
+        ));
+    }
     let open_started = Instant::now();
-    let opened = post_json(
-        config,
-        placement,
-        "/host/instances/open",
-        &host_request(&open, &package)?,
-    )?;
+    let opened = if let Some(checkpoint) = checkpoint {
+        let pin =
+            required_json_string(&checkpoint, "export_sha256", "hosted checkpoint")?.to_owned();
+        let export = checkpoint
+            .get("export")
+            .cloned()
+            .ok_or_else(|| invalid_data("hosted checkpoint omitted its source export"))?;
+        let source: EventPosition =
+            serde_json::from_value(export["source"].clone()).map_err(invalid_data)?;
+        let command = ForkInstanceCommand {
+            protocol: HOST_PROTOCOL.to_owned(),
+            request_id: format!(
+                "gaugedesk:adopt:{}:{}",
+                spec.chat_id,
+                checkpoint["source_command_id"].as_str().unwrap_or_default()
+            ),
+            source,
+            target_request_id: open.request_id.clone(),
+            package_version_ref: package.version_ref().to_owned(),
+            policy: policy.clone(),
+        };
+        command.validate().map_err(invalid_data)?;
+        let mut request = host_fork_request(&command, &package, export)?;
+        request["source_pin"] = json!(pin);
+        let adopted = post_json(config, placement, "/host/forks/adopt", &request)?;
+        let instance = adopted
+            .get("target")
+            .and_then(|target| target.get("instance_ref"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_data("hosted adoption omitted target instance"))?;
+        config.transport.complete_chat_handoff(
+            &spec.chat_id,
+            &pin,
+            &open.request_id,
+            adopted.clone(),
+        )?;
+        json!({ "instance_ref": instance })
+    } else {
+        post_json(
+            config,
+            placement,
+            "/host/instances/open",
+            &host_request(&open, &package)?,
+        )?
+    };
     let open_ms = open_started.elapsed().as_secs_f64() * 1000.0;
     let instance_ref = opened
         .get("instance_ref")
@@ -774,6 +868,28 @@ impl Harness for DoHarness {
         // A harness serves more than one turn; this turn's Stop must not cancel
         // the next.
         self.cancel_requested.store(false, Ordering::SeqCst);
+        // A successful runtime turn must be recoverable even if the subsequent
+        // workspace pull or response projection fails on this Home.
+        if self.config.transport.requires_chat_checkpoint() {
+            let position = get_json(
+                &self.config,
+                &self.placement,
+                &format!("/host/instances/{}/position", encode(&self.instance_ref)),
+            )?;
+            let position = parse_position(&position, "DO completed turn position")?;
+            let export = get_json(
+                &self.config,
+                &self.placement,
+                &format!(
+                    "/host/instances/{}/fork-export?sequence={}",
+                    encode(&self.instance_ref),
+                    position.sequence
+                ),
+            )?;
+            self.config
+                .transport
+                .retain_chat_checkpoint(&self.chat_id, export)?;
+        }
         let pull_started = Instant::now();
         let renames = self.pull_workspace()?;
         // After the pull, which rewrites the checkout from the placement's
@@ -1953,6 +2069,93 @@ mod tests {
                 body: br#"{"ok":true}"#.to_vec(),
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct CheckpointTransport {
+        policy: PolicyEpochRef,
+        checkpoint: Value,
+        steps: Mutex<Vec<String>>,
+    }
+
+    impl DoHostTransport for CheckpointTransport {
+        fn requires_chat_checkpoint(&self) -> bool {
+            true
+        }
+        fn load_chat_checkpoint(&self, _: &str) -> io::Result<Option<Value>> {
+            self.steps.lock().unwrap().push("load".into());
+            Ok(Some(self.checkpoint.clone()))
+        }
+        fn register_chat_handoff(
+            &self,
+            _: &str,
+            pin: &str,
+            _: &str,
+            _: &str,
+            _: &PolicyEpochRef,
+        ) -> io::Result<()> {
+            assert_eq!(pin, "source-pin");
+            self.steps.lock().unwrap().push("register".into());
+            Ok(())
+        }
+        fn complete_chat_handoff(&self, _: &str, pin: &str, _: &str, _: Value) -> io::Result<()> {
+            assert_eq!(pin, "source-pin");
+            self.steps.lock().unwrap().push("complete".into());
+            Ok(())
+        }
+        fn send(&self, request: DoHostRequest) -> io::Result<DoHostResponse> {
+            self.steps.lock().unwrap().push(request.path.clone());
+            let body = match request.path.as_str() {
+                "/host/policy" => serde_json::to_vec(&self.policy).unwrap(),
+                "/host/forks/adopt" => {
+                    let value: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(value["source_pin"], "source-pin");
+                    assert_eq!(value["export"], self.checkpoint["export"]);
+                    br#"{"target":{"instance_ref":"adopted-instance"}}"#.to_vec()
+                }
+                path if path.ends_with("/files/sync") => br#"{"ok":true}"#.to_vec(),
+                path => return Err(io::Error::other(format!("unexpected request {path}"))),
+            };
+            Ok(DoHostResponse { status: 200, body })
+        }
+    }
+
+    #[test]
+    fn hosted_command_adopts_home_checkpoint_before_using_target() {
+        let root = tempfile::tempdir().unwrap();
+        let (factory, signed, policy) = hosted_policy_fixture(root.path());
+        let transport = Arc::new(CheckpointTransport {
+            policy,
+            checkpoint: json!({
+                "export_sha256": "source-pin", "source_command_id": "prior-command",
+                "export": {"source": {"instance_ref": "source-instance", "sequence": 4},
+                    "messages": [{"role":"user","content":"earlier"}]},
+            }),
+            steps: Mutex::new(Vec::new()),
+        });
+        let config = DoHostConfig::with_transport("tenant", transport.clone(), false).unwrap();
+        let mut spec = super::super::tests::continuity_spec(
+            root.path(),
+            "https://api.openai.com",
+            gaugedesk_harness::ChatMode::Edit,
+            None,
+            Some("edit safely"),
+        );
+        spec.policy_epoch = Some(3);
+        spec.signed_policy_envelope = Some(signed);
+        create_harness(&factory, &config, &spec).unwrap();
+        let steps = transport.steps.lock().unwrap();
+        assert_eq!(
+            &steps[..5],
+            [
+                "load",
+                "register",
+                "/host/policy",
+                "/host/forks/adopt",
+                "complete"
+            ]
+        );
+        assert!(!steps.iter().any(|step| step == "/host/instances/open"));
     }
 
     #[test]

@@ -36,7 +36,7 @@ import {
     authenticationCredentialJSON,
     publicKeyCreationOptions,
     publicKeyRequestOptions,
-    registrationCredentialJSON,
+    registrationResponseJSON,
 } from "./webauthn-browser";
 
 /**
@@ -247,20 +247,7 @@ export interface AccountEmailChallenge {
 
 type CredentialContainer = Pick<CredentialsContainer, "create" | "get">;
 
-/** The account-auth authority uses passkey-auth's deliberately smaller finish
- * payload, while Account Settings commands retain the browser-standard nested
- * credential JSON. Both share the same binary codec but not a wire envelope. */
-function accountRegistrationResponse(credential: PublicKeyCredential): Record<string, unknown> {
-    const encoded = registrationCredentialJSON(credential);
-    const response = encoded.response as Record<string, unknown>;
-    return {
-        id: encoded.rawId,
-        transports: response.transports,
-        attestationObject: response.attestationObject,
-        clientDataJSON: response.clientDataJSON,
-    };
-}
-
+/** Account authentication uses passkey-auth's compact assertion wire shape. */
 function accountAuthenticationResponse(credential: PublicKeyCredential): Record<string, unknown> {
     const encoded = authenticationCredentialJSON(credential);
     const response = encoded.response as Record<string, unknown>;
@@ -369,7 +356,7 @@ export async function finishPasskeyAccountCreation(
         {
             ceremony_id: started.ceremony_id,
             label: "Passkey",
-            credential: accountRegistrationResponse(credential as PublicKeyCredential),
+            credential: registrationResponseJSON(credential as PublicKeyCredential),
         },
         "The passkey could not be verified. Start account creation again.",
     );
@@ -560,7 +547,7 @@ export async function finishConsumerSignupAccount(
         {
             ceremony_id: started.ceremony_id,
             label: "Passkey",
-            credential: accountRegistrationResponse(credential as PublicKeyCredential),
+            credential: registrationResponseJSON(credential as PublicKeyCredential),
         },
         "The passkey could not be verified. Start account creation again.",
     );

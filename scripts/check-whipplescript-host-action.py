@@ -59,6 +59,18 @@ def publication_target(consumer_root, commit):
     return parent / commit
 
 
+def snapshot_names_source(publication, source_commit):
+    """Whether a public snapshot's footer names `source_commit`.
+
+    publish-mirror.sh writes `git rev-parse --short` of the source there, and
+    git lengthens that as the repository grows: 24d02822 was written with nine
+    characters. So any prefix of seven or more that the full SHA starts with
+    names it, which is also how publish-mirror.sh reads its own footer.
+    """
+    footer = re.search(r"^Curated snapshot of ([0-9a-f]{7,40})\. See ", publication, re.M)
+    return footer is not None and source_commit.startswith(footer.group(1))
+
+
 def check_resolved(pin, expected_source, consumer_root=ROOT):
     # Cargo tells us which package the product actually resolves. No peer
     # checkout or caller-supplied alternate runtime may stand in for that pin.
@@ -71,9 +83,8 @@ def check_resolved(pin, expected_source, consumer_root=ROOT):
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=runtime, text=True).strip()
     require(commit == pin["public_commit"], "resolved checkout is not the pinned public commit")
     publication = subprocess.check_output(["git", "show", "-s", "--format=%B", "HEAD"], cwd=runtime, text=True)
-    # publish-mirror.sh writes the source's short SHA in this fixed footer.
     # The public commit itself is pinned by its full SHA above.
-    require(re.search(rf"^Curated snapshot of {pin['source_commit'][:8]}\. See ", publication, re.M),
+    require(snapshot_names_source(publication, pin["source_commit"]),
             "public snapshot does not name the pinned source commit")
     require(subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=runtime).returncode == 0,
             "resolved runtime has modified tracked files")

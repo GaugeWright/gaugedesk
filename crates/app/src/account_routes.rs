@@ -94,6 +94,10 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
             "/account/directory/challenge",
             post(post_account_directory_challenge),
         )
+        .route(
+            "/account/directory/key-custody",
+            post(crate::account_key_custody::post_deposit_root),
+        )
         // A root hand-over waiting to take effect, for the account's own
         // sessions to show and answer (DR-0464 §2).
         .route(
@@ -632,7 +636,7 @@ pub async fn post_account_directory_challenge(
 }
 
 /// The device record the bearer's session is bound to, if any.
-fn session_device(
+pub(crate) fn session_device(
     wb: &crate::Workbench,
     bearer: Option<&str>,
     scope: &str,

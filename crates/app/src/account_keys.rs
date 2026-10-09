@@ -124,7 +124,19 @@ impl AccountKeyStore {
     /// computer gets a device key of its own with the root's delegation.
     /// Refuses when this computer already holds the account's keys.
     pub fn restore(&self, account: &str, root: SigningKey, now: u64) -> io::Result<AccountKeys> {
-        let device = random_signing_key()?;
+        self.restore_with_device(account, root, random_signing_key()?, now)
+    }
+
+    /// Restore from the Hub's device-bound sign-in exchange (DR-0478). The
+    /// receiving key is this computer's own new device key, so the key that
+    /// opened the ciphertext is the one the root delegates and persists.
+    pub fn restore_with_device(
+        &self,
+        account: &str,
+        root: SigningKey,
+        device: SigningKey,
+        now: u64,
+    ) -> io::Result<AccountKeys> {
         let delegation =
             DeviceDelegation::issue(&root, device.public_key(), now + DEVICE_DELEGATION_TTL_SECS);
         let keys = AccountKeys {

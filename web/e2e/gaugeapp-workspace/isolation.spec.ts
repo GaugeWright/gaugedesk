@@ -1385,17 +1385,15 @@ test("Chromium WebAuthn completes the add-passkey ceremony", async ({ page, brow
             payload: {
                 ceremony_id: "ceremony-A",
                 label: "Passkey",
-                attestation: {
-                    type: "public-key",
-                },
+                attestation: {},
             },
         });
         const attestation = (complete?.payload as { attestation?: Record<string, unknown> })?.attestation;
-        const response = attestation?.response as Record<string, unknown> | undefined;
         expect(attestation?.id).toMatch(/^[A-Za-z0-9_-]+$/);
-        expect(attestation?.rawId).toMatch(/^[A-Za-z0-9_-]+$/);
-        expect(response?.clientDataJSON).toMatch(/^[A-Za-z0-9_-]+$/);
-        expect(response?.attestationObject).toMatch(/^[A-Za-z0-9_-]+$/);
+        expect(attestation?.clientDataJSON).toMatch(/^[A-Za-z0-9_-]+$/);
+        expect(attestation?.attestationObject).toMatch(/^[A-Za-z0-9_-]+$/);
+        expect(attestation?.transports).toContain("internal");
+        expect(attestation).not.toHaveProperty("response");
         expect(JSON.stringify(complete)).not.toContain("privateKey");
 
         const credentials = await cdp.send("WebAuthn.getCredentials", { authenticatorId });

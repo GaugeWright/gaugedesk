@@ -299,6 +299,31 @@ fn root_entries(
     }
 }
 
+/// Let the private Hub recover the projected root on a later fresh sign-in.
+/// The request goes over the native account session; the Hub accepts only a
+/// seed that yields the root it already projects for this exact account.
+fn deposit_projected_root(
+    http: &HttpClient,
+    hub: &str,
+    headers: &[(String, String)],
+    keys: &AccountKeys,
+) -> Result<(), String> {
+    let body = json!({ "seed": hex::encode(keys.root.to_seed_bytes()) });
+    match http.post_json_headers(
+        &format!("{hub}/account/directory/key-custody"),
+        headers,
+        &body.to_string(),
+    ) {
+        Ok((204, _)) => Ok(()),
+        Ok((status, _)) => Err(format!(
+            "the Hub refused account key custody: HTTP {status}"
+        )),
+        Err(error) => Err(format!(
+            "the Hub could not keep account key custody: {error}"
+        )),
+    }
+}
+
 /// Publish `account`'s entry from this computer, minting the account's keys on
 /// its first computer. Blocking; run off the async runtime. `hub` and `bearer`
 /// are the account's Hub session, `directory` the blind directory's origin.
@@ -355,6 +380,11 @@ pub fn publish_from_here(
         None => return Err("the account's keys are missing".to_owned()),
     };
     let root = keys.root.public_key().as_str().to_owned();
+    if projection.root.as_deref() == Some(root.as_str()) {
+        if let Err(error) = deposit_projected_root(&http, hub, &headers, &keys) {
+            tracing::warn!("{error}");
+        }
+    }
     let device = device_name(&keys);
     let generation = next_generation(&root_entries(&http, directory, &root)?, &device)
         .ok_or_else(|| "this computer's directory generation is exhausted".to_owned())?;
@@ -426,6 +456,11 @@ pub fn publish_from_here(
         Ok((200..=299, _)) => true,
         _ => false,
     };
+    if announced {
+        if let Err(error) = deposit_projected_root(&http, hub, &headers, &keys) {
+            tracing::warn!("{error}");
+        }
+    }
     Ok(Published::Entry {
         root,
         generation,

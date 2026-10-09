@@ -3810,6 +3810,42 @@
       }
     },
     {
+      "id": "account.directory.key-custody.deposit",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "POST",
+      "path": "/account/directory/key-custody",
+      "producer": "gaugedesk-app account_key_custody",
+      "consumer": "deposit_projected_root in gaugedesk-app account_publish",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "deposit-own-projected-directory-root-in-private-custody",
+      "requestSchema": "rust:gaugedesk-app/account_key_custody/DepositRoot",
+      "responseSchema": "http/204",
+      "sideEffect": "mutation",
+      "risk": "critical",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/account_key_custody.rs#only_the_projected_root_is_custodied_and_it_opens_under_that_account"
+        ],
+        "authority": [
+          "crates/app/src/account_key_custody.rs#only_the_projected_root_is_custodied_and_it_opens_under_that_account"
+        ],
+        "journey": [
+          "crates/app/src/account_key_custody.rs#only_the_projected_root_is_custodied_and_it_opens_under_that_account"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/account_key_custody.rs#only_the_projected_root_is_custodied_and_it_opens_under_that_account"
+        ]
+      }
+    },
+    {
       "id": "account.directory.pending.read",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",
@@ -4119,7 +4155,7 @@
       },
       "evidence": {
         "contract": [
-          "web/e2e/features/approve-this-computer.feature#a computer that needs approval restores the keys from the recovery code"
+          "web/e2e/features/approve-this-computer.feature#a computer with no available key copy uses emergency recovery"
         ],
         "authority": [
           "crates/app/src/account_recovery.rs#only_the_window_with_a_signed_in_account_sees_its_recovery_code"

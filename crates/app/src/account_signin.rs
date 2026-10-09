@@ -1721,6 +1721,8 @@ fn store_session(
         expires,
         refresh_after,
         device: device.to_string(),
+        restored_root: None,
+        receiving_device: gaugedesk_core::signature::SigningKey::from_seed(&[7; 32]).unwrap(),
     };
     store_session_with_selection(wb, &session, None).map(|(record, _)| record)
 }
@@ -1774,6 +1776,10 @@ struct RedeemedHubSession {
     expires: i64,
     refresh_after: i64,
     device: String,
+    /// Root received only through this fresh PKCE-bound sign-in, after the Hub
+    /// sealed it to this attempt's device key and we checked its projection.
+    restored_root: Option<gaugedesk_core::signature::SigningKey>,
+    receiving_device: gaugedesk_core::signature::SigningKey,
 }
 
 /// Why the Hub's exchange did not yield a session. Its text is what the
@@ -1809,12 +1815,14 @@ fn redeem_at_hub(
     hub: &str,
     code: &str,
     verifier: &str,
+    receiving_device: gaugedesk_core::signature::SigningKey,
 ) -> Result<RedeemedHubSession, HubRedeemError> {
     let http = HttpClient::new();
     let body = json!({
         "code": code,
         "verifier": verifier,
         "device_label": device_label(),
+        "recipient_pubkey": receiving_device.public_key().as_str(),
     })
     .to_string();
     // The exchange is a POST, and a hub composition may require the
@@ -1864,6 +1872,40 @@ fn redeem_at_hub(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let restored_root = match parsed.get("sealed_directory_root") {
+        Some(Value::Null) | None => None,
+        Some(value) => {
+            let sealed: crate::device_enroll::SealedKey =
+                serde_json::from_value(value.clone()).map_err(|_| HubRedeemError::Malformed)?;
+            let seed = crate::device_enroll::open_sealed(&receiving_device, &sealed)
+                .ok_or(HubRedeemError::Malformed)?;
+            let seed: [u8; 32] = seed.try_into().map_err(|_| HubRedeemError::Malformed)?;
+            let root = gaugedesk_core::signature::SigningKey::from_seed(&seed)
+                .map_err(|_| HubRedeemError::Malformed)?;
+            let headers = [(
+                "authorization".to_owned(),
+                format!("Bearer {account_session}"),
+            )];
+            let (status, answer) = http
+                .get_string_headers(&format!("{hub}/account/directory"), &headers)
+                .map_err(HubRedeemError::Unreachable)?;
+            if status != 200
+                || serde_json::from_str::<Value>(&answer)
+                    .ok()
+                    .and_then(|projection| {
+                        projection
+                            .get("root_pubkey")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    != Some(root.public_key().as_str())
+            {
+                return Err(HubRedeemError::Malformed);
+            }
+            Some(root)
+        }
+    };
     Ok(RedeemedHubSession {
         account_session,
         person,
@@ -1871,6 +1913,8 @@ fn redeem_at_hub(
         expires,
         refresh_after,
         device,
+        restored_root,
+        receiving_device,
     })
 }
 
@@ -2303,9 +2347,27 @@ pub async fn post_signin_callback(
     let trace = trace
         .attempt(&challenge_for(&verifier))
         .outstanding_ms(u64::try_from(now_ms().saturating_sub(started_ms)).unwrap_or(0));
+    // The recipient key is minted inside the local control plane for this
+    // one exchange. Its private half never reaches the browser or Hub.
+    let receiving_device = loop {
+        let mut seed = [0u8; 32];
+        if getrandom::getrandom(&mut seed).is_err() {
+            return refuse(
+                DESKTOP_CALLBACK,
+                "recipient_key_unavailable",
+                &trace,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not make this computer's device key",
+            );
+        }
+        if let Ok(key) = gaugedesk_core::signature::SigningKey::from_seed(&seed) {
+            break key;
+        }
+    };
     let redeemed = {
         let code = code.clone();
-        tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &verifier)).await
+        tokio::task::spawn_blocking(move || redeem_at_hub(&hub, &code, &verifier, receiving_device))
+            .await
     };
     let session = match redeemed {
         Ok(Ok(session)) => session,
@@ -2333,6 +2395,47 @@ pub async fn post_signin_callback(
         }
     };
     let superseded = superseded_device(&wb, &session);
+    if let Some(root) = session.restored_root.as_ref() {
+        let guard = wb.lock_unpoisoned();
+        let keys = guard.account_key_store();
+        match keys.held(&session.person, crate::account::device_enrolled_at_now()) {
+            Ok(None) => {
+                if let Err(error) = keys.restore_with_device(
+                    &session.person,
+                    root.clone(),
+                    session.receiving_device.clone(),
+                    crate::account::device_enrolled_at_now(),
+                ) {
+                    return refuse(
+                        DESKTOP_CALLBACK,
+                        "account_key_restore_failed",
+                        &trace,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("this computer could not keep the account keys: {error}"),
+                    );
+                }
+            }
+            Ok(Some(keys)) if keys.root.public_key() == root.public_key() => {}
+            Ok(Some(_)) => {
+                return refuse(
+                    DESKTOP_CALLBACK,
+                    "account_root_mismatch",
+                    &trace,
+                    StatusCode::CONFLICT,
+                    "this computer holds a different account root",
+                );
+            }
+            Err(error) => {
+                return refuse(
+                    DESKTOP_CALLBACK,
+                    "account_keys_unreadable",
+                    &trace,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("this computer could not read the account keys: {error}"),
+                );
+            }
+        }
+    }
     match store_session_with_selection(&wb, &session, Some(selection_revision)) {
         Ok((record, selected)) => {
             completed(DESKTOP_CALLBACK, "session_sealed", &trace);
@@ -4251,6 +4354,9 @@ mod tests {
                 expires: 4_102_444_800_000,
                 refresh_after: 0,
                 device: "c".to_string(),
+                restored_root: None,
+                receiving_device: gaugedesk_core::signature::SigningKey::from_seed(&[7; 32])
+                    .unwrap(),
             },
             Some(started_revision),
         )
@@ -4268,6 +4374,9 @@ mod tests {
                 expires: 4_102_444_800_000,
                 refresh_after: 0,
                 device: "d".to_string(),
+                restored_root: None,
+                receiving_device: gaugedesk_core::signature::SigningKey::from_seed(&[7; 32])
+                    .unwrap(),
             },
             Some(current_revision),
         )
@@ -4287,6 +4396,8 @@ mod tests {
             expires: 4_102_444_800_000,
             refresh_after: 0,
             device: device.to_string(),
+            restored_root: None,
+            receiving_device: gaugedesk_core::signature::SigningKey::from_seed(&[7; 32]).unwrap(),
         };
         assert_eq!(superseded_device(&wb, &redeemed("alice", "native-1")), None);
         store_session_with_selection(&wb, &redeemed("alice", "native-1"), None).unwrap();
@@ -4347,6 +4458,62 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap()[0],
             ("native-1".to_string(), "Bearer new-token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_sign_in_opens_only_the_root_matching_the_hub_projection() {
+        let root = gaugedesk_core::signature::SigningKey::from_seed(&[41; 32]).unwrap();
+        let recipient = gaugedesk_core::signature::SigningKey::from_seed(&[42; 32]).unwrap();
+        let recipient_public = recipient.public_key();
+        let projected = root.public_key().as_str().to_owned();
+        let exchange_root = root.clone();
+        let app = axum::Router::new()
+            .route(
+                "/auth/mobile/exchange",
+                post(move |Json(request): Json<Value>| {
+                    let root = exchange_root.clone();
+                    async move {
+                        let recipient = gaugedesk_core::ids::PublicKey::new(
+                            request["recipient_pubkey"].as_str().unwrap().to_owned(),
+                        );
+                        let sealed =
+                            crate::device_enroll::seal_to_subkey(&recipient, &root.to_seed_bytes())
+                                .unwrap();
+                        Json(json!({
+                            "account_id": "account-7",
+                            "account_session": "new-session",
+                            "device_id": "new-device",
+                            "expires_at_ms": 4_102_444_800_000i64,
+                            "sealed_directory_root": sealed,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/account/directory",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let projected = projected.clone();
+                    async move {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer new-session");
+                        Json(json!({ "root_pubkey": projected }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let redeemed = tokio::task::spawn_blocking(move || {
+            redeem_at_hub(&hub, "one-time-code", "pkce-verifier", recipient)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(redeemed.person, "account-7");
+        assert_eq!(redeemed.receiving_device.public_key(), recipient_public);
+        assert_eq!(
+            redeemed.restored_root.unwrap().public_key(),
+            root.public_key()
         );
     }
 

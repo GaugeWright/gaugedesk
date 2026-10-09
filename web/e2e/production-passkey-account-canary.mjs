@@ -165,7 +165,7 @@ async function eraseAccount(page, deskOrigin) {
 export async function runPasskeyAccountJourney(
     environment = process.env,
     browserType,
-    { fetchImpl = fetch, wait = delay } = {},
+    { fetchImpl = fetch, wait = delay, afterAccountLogout } = {},
 ) {
     const settings = passkeyCanarySettings(environment);
     const chromium = browserType ?? await defaultBrowserType();
@@ -229,6 +229,12 @@ export async function runPasskeyAccountJourney(
 
         await logout(context, settings.apiOrigin, key("logout-before-login"));
         authenticated = false;
+        // A second canary can use this newly created identity while the same
+        // virtual authenticator is available. Its browser remains signed out;
+        // the ordinary passkey, recovery, and terminal erasure legs follow.
+        if (afterAccountLogout) {
+            await afterAccountLogout({ page, settings });
+        }
         await signInWithPasskey(page, settings.deskOrigin, settings.email, settings.apiOrigin);
         authenticated = true;
 

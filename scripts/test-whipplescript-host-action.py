@@ -30,6 +30,15 @@ class PinTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)
 
+    def test_a_snapshot_names_its_source_by_any_short_sha_git_wrote(self):
+        source = "24d028220f5bfd9f2cb73e188c0baf461cce976d"
+        footer = "Sync curated source {0}\n\nCurated snapshot of {1}. See scripts/publish-mirror.sh"
+        for short in (source[:7], source[:8], source[:9]):
+            self.assertTrue(checker.snapshot_names_source(footer.format(source, short), source), short)
+        self.assertFalse(checker.snapshot_names_source(footer.format(source, "24d028221"), source))
+        self.assertFalse(checker.snapshot_names_source(footer.format(source, "24d0282"[:6]), source))
+        self.assertFalse(checker.snapshot_names_source("Sync curated source " + source, source))
+
     def test_current_native_and_desktop_pins_are_one_resolved_identity(self):
         checker.check_pin(self.root)
 

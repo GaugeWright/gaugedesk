@@ -441,6 +441,7 @@ impl Workbench {
                             &policy.policy_ref().envelope_hash,
                         )
                         .map_err(io_error)?,
+                        anchor: None,
                     };
                     if original
                         .as_ref()

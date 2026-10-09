@@ -65,6 +65,20 @@ import {
 
 type Facet = "recent" | "projects" | "library";
 
+function agentChatIds(workspace: Workspace, agentId: ArchetypeId): Set<EngagementId> {
+    const ids = new Set<EngagementId>();
+    const agent = workspace.archetypes.find((candidate) => candidate.id === agentId);
+    for (const chat of agent?.chats ?? []) ids.add(chat.id);
+    for (const preview of agent?.previews ?? []) ids.add(preview.chat.id);
+    for (const project of workspace.projects) {
+        for (const placement of project.placements) {
+            if (placement.archetypeId !== agentId) continue;
+            for (const chat of placement.chats) ids.add(chat.id);
+        }
+    }
+    return ids;
+}
+
 /** Project child grouping: `chats` is flat/current-first; `archetype` shows
  *  Agent placements. The Projects filter applies one lens across its tree. */
 type ProjectLens = "chats" | "archetype";
@@ -227,6 +241,8 @@ export function FacetBrowser(props: {
     onAttachTarget?: (id: ProjectId, name: string, kind: "external-vcs" | "external-folder") => void;
     onOpenForkTree: (chat: EngagementId) => void;
     onChatRemoved: (id: EngagementId) => void;
+    /** Close Agent-scoped views after deletion or an authoritative workspace update. */
+    onArchetypeRemoved?: (id: ArchetypeId) => void;
     onStatus: (msg: string) => void;
     /** Where an action's failure is shown; without one it goes to `onStatus`. */
     onFailure?: (msg: string) => void;
@@ -291,6 +307,15 @@ export function FacetBrowser(props: {
     // chat twice" bug. Reconciling preserves node identity for unchanged rows, so
     // the row under the pointer stays put.
     const [store, setStore] = createStore<{ tree: Workspace | null }>({ tree: null });
+    const notifyRemoved = (before: Workspace | null, after: Workspace) => {
+        if (!before) return;
+        const currentAgents = new Set(after.archetypes.map((agent) => agent.id));
+        for (const agent of before.archetypes) {
+            if (currentAgents.has(agent.id)) continue;
+            for (const id of agentChatIds(before, agent.id)) props.onChatRemoved(id);
+            props.onArchetypeRemoved?.(agent.id);
+        }
+    };
     createEffect(() => {
         // Reading an errored resource RETHROWS the fetcher's failure. Letting that
         // escape the effect abandons the store on `null`, so `tree()` stays
@@ -301,6 +326,8 @@ export function FacetBrowser(props: {
         if (carriage.error) return;
         const v = carriage()?.value;
         if (v) setDeltaFreshness(null);
+        const before = untrack(() => store.tree);
+        if (v) untrack(() => notifyRemoved(before, v));
         setStore("tree", v ? reconcile(v, { key: "id" }) : null);
     });
     // Deltas patch the whole tree; the navigator renders it scoped to the
@@ -364,7 +391,10 @@ export function FacetBrowser(props: {
                     } else {
                         const delta = await props.api.getWorkspaceDeltaCarriage!(change);
                         if (!active) return;
-                        setStore("tree", reconcile(applyWorkspaceDelta(fullTree()!, delta.value), { key: "id" }));
+                        const before = fullTree()!;
+                        const after = applyWorkspaceDelta(before, delta.value);
+                        notifyRemoved(before, after);
+                        setStore("tree", reconcile(after, { key: "id" }));
                         setDeltaFreshness(delta.freshness);
                     }
                     props.onWorkspaceChange?.(change);
@@ -718,6 +748,15 @@ export function FacetBrowser(props: {
             // patches the tree. Other consumers retain the immediate full refresh.
             if (!props.deltaSync) await refetch();
         }
+    }
+
+    function deleteAgent(id: ArchetypeId) {
+        const chats = agentChatIds(fullTree()!, id);
+        void withRefresh(async () => {
+            await props.api.deleteArchetype(id);
+            for (const chat of chats) props.onChatRemoved(chat);
+            props.onArchetypeRemoved?.(id);
+        }, "Agent deleted");
     }
 
     function startEdit(kind: ReturnType<typeof editing>, initial = "") {
@@ -1401,7 +1440,7 @@ export function FacetBrowser(props: {
         { label: "rename", run: () => startEdit({ kind: "rename-archetype", id: a.id }, a.name) },
         ...(a.isDefault || !ownsAgent(a)
             ? []
-            : [{ label: "delete", danger: true, run: () => void withRefresh(() => props.api.deleteArchetype(a.id), "Agent deleted") }]),
+            : [{ label: "delete", danger: true, run: () => deleteAgent(a.id) }]),
     ];
 
     // The flat `chats` lens body (ADR 0112, NAVLENS-1): every work chat in the

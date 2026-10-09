@@ -490,6 +490,44 @@ pub(crate) fn recorded_policy_envelope(
     Ok(recorded_policy_record(store, chat_id, epoch)?.signed_envelope)
 }
 
+/// The chat's epochs before `current`, oldest first, each with its signed
+/// envelope. A chat reopened under a newer epoch opens the runtime its recorded
+/// thread was written under from one of these, so the conversation is carried
+/// forward (DR-0412). The native runtime owner verifies each envelope and its
+/// exact identity before using it; this lookup grants no access. An epoch
+/// recorded more than once is ambiguous and is left out, as
+/// [`recorded_policy_envelope`] refuses it.
+pub(crate) fn earlier_policy_envelopes(
+    store: &gaugedesk_store::Store,
+    chat_id: &str,
+    current: u64,
+) -> Result<Vec<(u64, String)>, String> {
+    let mut by_epoch: BTreeMap<u64, Vec<PolicyEpochRecord>> = BTreeMap::new();
+    for body in store
+        .records(chat_id, POLICY_RECORD_KIND)
+        .map_err(|error| format!("{error:?}"))?
+    {
+        let record =
+            serde_json::from_str::<PolicyEpochRecord>(&body).map_err(|error| error.to_string())?;
+        if record.epoch < current {
+            by_epoch.entry(record.epoch).or_default().push(record);
+        }
+    }
+    Ok(by_epoch
+        .into_iter()
+        .filter_map(|(epoch, records)| match records.as_slice() {
+            [record]
+                if record.id == POLICY_RECORD_ID
+                    && record.op == RecordOp::Upsert
+                    && !record.signed_envelope.is_empty() =>
+            {
+                Some((epoch, record.signed_envelope.clone()))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
 fn recorded_policy_record(
     store: &gaugedesk_store::Store,
     chat_id: &str,
@@ -1885,6 +1923,42 @@ mod tests {
             Some(next.epoch)
         );
     }
+
+    /// DR-0412: a chat reopened after its model changed is handed the epoch
+    /// its conversation was recorded under, and only the earlier ones.
+    #[test]
+    fn earlier_policy_envelopes_hand_a_reopened_chat_its_recorded_epochs() {
+        let mut wb = project_workbench();
+        let first = wb.compile_whipple_policy(input()).expect("first epoch");
+        let mut switched = input();
+        switched.model = "gpt-5.1".to_owned();
+        let next = wb.compile_whipple_policy(switched).expect("next epoch");
+        assert_eq!(
+            earlier_policy_envelopes(&wb.store, "chat-1", next.epoch).unwrap(),
+            [(first.epoch, first.signed_envelope.clone())]
+        );
+        assert!(earlier_policy_envelopes(&wb.store, "chat-1", first.epoch)
+            .unwrap()
+            .is_empty());
+        assert!(
+            earlier_policy_envelopes(&wb.store, "other-chat", next.epoch)
+                .unwrap()
+                .is_empty()
+        );
+
+        // An epoch recorded twice is ambiguous and is not offered.
+        let rows = wb.store.records("chat-1", POLICY_RECORD_KIND).unwrap();
+        let mut duplicated = Store::open_in_memory().unwrap();
+        for row in [&rows[0], &rows[0]] {
+            duplicated
+                .append_record("chat-1", POLICY_RECORD_KIND, row)
+                .unwrap();
+        }
+        assert!(earlier_policy_envelopes(&duplicated, "chat-1", next.epoch)
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn recorded_policy_refuses_duplicate_missing_or_ineligible_original_rows() {
         for case in [

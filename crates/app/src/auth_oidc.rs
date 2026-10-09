@@ -5713,6 +5713,11 @@ pub struct NativeHandoffExchange {
     /// pre-existing mobile clients — the wire contract is unchanged for them.
     #[serde(default)]
     device_label: Option<String>,
+    /// A fresh native device key. Only the single-use, PKCE-bound exchange can
+    /// ask for the account's custodied directory root (DR-0478), sealed to this
+    /// public key. Old mobile clients omit it and receive no root.
+    #[serde(default)]
+    recipient_pubkey: Option<String>,
 }
 
 #[cfg(test)]
@@ -5723,6 +5728,7 @@ impl NativeHandoffExchange {
             code: code.to_owned(),
             verifier: verifier.to_owned(),
             device_label: Some("Test Mac".to_owned()),
+            recipient_pubkey: None,
         }
     }
 }
@@ -5862,6 +5868,25 @@ pub(crate) fn native_exchange(
             "the native handoff verifier is missing",
         );
     }
+    let recipient = match request.recipient_pubkey.as_deref() {
+        Some(encoded) => {
+            let valid = hex::decode(encoded)
+                .ok()
+                .and_then(|bytes| p256::PublicKey::from_sec1_bytes(&bytes).ok())
+                .is_some();
+            if !valid {
+                return refuse(
+                    EXCHANGE,
+                    "invalid_recipient_key",
+                    &trace,
+                    StatusCode::BAD_REQUEST,
+                    "invalid native device key",
+                );
+            }
+            Some(gaugedesk_core::ids::PublicKey::new(encoded.to_owned()))
+        }
+        None => None,
+    };
     let redeemed =
         auth.native_handoffs_mut()
             .redeem(&request.code, &request.verifier, Instant::now());
@@ -5968,6 +5993,11 @@ pub(crate) fn native_exchange(
     } else {
         0
     };
+    let sealed_directory_root = recipient.as_ref().and_then(|recipient| {
+        let guard = wb.lock_unpoisoned();
+        let root = crate::account_key_custody::open_projected(&guard, &account_id)?;
+        crate::device_enroll::seal_to_subkey(recipient, &root.to_seed_bytes())
+    });
     completed(EXCHANGE, "handoff_redeemed", &trace);
     (
         StatusCode::OK,
@@ -5979,6 +6009,7 @@ pub(crate) fn native_exchange(
             "label": label,
             "expires_at_ms": expires_at_ms,
             "refresh_after_ms": refresh_after_ms,
+            "sealed_directory_root": sealed_directory_root,
         })),
     )
         .into_response()
@@ -7079,6 +7110,7 @@ iqlTEKVISscuchxZtKQJ4k8=
             code: code.to_string(),
             verifier: verifier.to_string(),
             device_label: Some("Test Mac".to_string()),
+            recipient_pubkey: None,
         }))
     }
 
@@ -7179,6 +7211,79 @@ iqlTEKVISscuchxZtKQJ4k8=
         assert!(!text.contains(&code), "{text}");
         assert!(!text.contains("rt-native"), "{text}");
         assert!(!text.contains("alice@example.test"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn fresh_native_sign_in_seals_the_projected_root_only_to_its_device_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(crate::content_vault::ContentVault::new(
+            dir.path(),
+            Box::new(crate::at_rest::LoopbackKeyWrap::new([12; 32])),
+        ));
+        let mut wb = Workbench::new(gaugedesk_store::Store::open_in_memory().unwrap())
+            .with_content_vault(vault);
+        let root = gaugedesk_core::signature::SigningKey::from_seed(&[4; 32]).unwrap();
+        let scope = crate::account::account_scope("account-7");
+        wb.write_account_record_in(
+            &scope,
+            crate::account::DIRECTORY_RECORD_KIND,
+            crate::account::DIRECTORY_RECORD_ID,
+            &crate::account::AccountDirectoryRecord {
+                id: crate::account::DIRECTORY_RECORD_ID.to_owned(),
+                op: RecordOp::Upsert,
+                root_pubkey: root.public_key().as_str().to_owned(),
+                origin: String::new(),
+                transitions: vec![],
+                proven: true,
+            },
+        )
+        .unwrap();
+        let sealed = wb
+            .seal_custodied_account_root("account-7", &hex::encode(root.to_seed_bytes()))
+            .unwrap();
+        wb.write_account_record_in(
+            &scope,
+            "account_directory_root_custody",
+            "directory-root",
+            &json!({
+                "id": "directory-root",
+                "root_pubkey": root.public_key().as_str(),
+                "sealed_seed": sealed,
+            }),
+        )
+        .unwrap();
+        let wb: SharedWorkbench = Arc::new(Mutex::new(wb));
+        let auth = AuthShellState::new();
+        let challenge = crate::identity_oidc::s256_challenge(HANDOFF_VERIFIER);
+        let code = auth
+            .native_handoffs_mut()
+            .issue(handoff_issue(None, challenge), Instant::now());
+        let recipient = gaugedesk_core::signature::SigningKey::from_seed(&[8; 32]).unwrap();
+        let response = native_exchange(
+            &wb,
+            &auth,
+            Ok(Json(NativeHandoffExchange {
+                code,
+                verifier: HANDOFF_VERIFIER.to_owned(),
+                device_label: Some("New computer".to_owned()),
+                recipient_pubkey: Some(recipient.public_key().as_str().to_owned()),
+            })),
+            true,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains(&hex::encode(root.to_seed_bytes())));
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sealed: crate::device_enroll::SealedKey =
+            serde_json::from_value(answer["sealed_directory_root"].clone()).unwrap();
+        assert_eq!(
+            crate::device_enroll::open_sealed(&recipient, &sealed).unwrap(),
+            root.to_seed_bytes()
+        );
+        let other = gaugedesk_core::signature::SigningKey::from_seed(&[9; 32]).unwrap();
+        assert!(crate::device_enroll::open_sealed(&other, &sealed).is_none());
     }
 
     async fn callback(

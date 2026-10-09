@@ -107,6 +107,54 @@ fn the_owner_gets_a_read_only_gaugewright_tutorials_project() {
     assert_eq!(records(&guard), before, "a current folder writes nothing");
 }
 
+#[test]
+fn an_unused_old_personal_tutorials_target_is_retired() {
+    let (_root, wb) = owned();
+    let mut guard = wb.lock_unpoisoned();
+    let workspace = guard
+        .workspace_provider(TUTORIALS_TARGET)
+        .init_at(&guard.targets_dir().join(TUTORIALS_TARGET))
+        .unwrap();
+    guard.targets.insert(TUTORIALS_TARGET.into(), workspace);
+    let record = crate::library_state::managed_target_record(
+        TUTORIALS_TARGET.into(),
+        "Tutorials".into(),
+        WorkTargetOwner::Project {
+            project_id: DEFAULT_PROJECT.into(),
+        },
+        guard.home_id(),
+        "old-cut".into(),
+    );
+    guard.write_work_target_record(record);
+    let personal_target = crate::library_state::managed_project_target_id(DEFAULT_PROJECT);
+    guard.write_placement_targets_record(crate::library::PlacementTargetsRecord {
+        placement_id: "old-placement".into(),
+        op: RecordOp::Upsert,
+        target_ids: vec![personal_target.clone(), TUTORIALS_TARGET.into()],
+        schema: LIBRARY_RECORD_SCHEMA,
+        extra: Default::default(),
+    });
+    assert!(guard.library.work_targets.contains_key(TUTORIALS_TARGET));
+
+    guard.ensure_shipped_tutorials().unwrap();
+    assert!(!guard.library.work_targets.contains_key(TUTORIALS_TARGET));
+    assert!(!guard.targets.contains_key(TUTORIALS_TARGET));
+    assert_eq!(
+        guard.library.placement_targets["old-placement"].target_ids,
+        vec![personal_target]
+    );
+    assert!(!crate::library::Library::rebuild(guard.store_ref())
+        .unwrap()
+        .work_targets
+        .contains_key(TUTORIALS_TARGET));
+    assert!(guard
+        .library
+        .projects
+        .contains_key(&tutorial_project_id("account-root")));
+    guard.ensure_shipped_tutorials().unwrap();
+    assert!(!guard.library.work_targets.contains_key(TUTORIALS_TARGET));
+}
+
 /// A release that ships a different set brings the folder to it, retiring what
 /// it no longer ships, and records which version did.
 #[test]
@@ -636,6 +684,7 @@ fn an_older_personal_run_resumes_without_starting_a_second_basics() {
         )
         .unwrap();
     guard.ensure_shipped_tutorials().unwrap();
+    assert!(guard.library.work_targets.contains_key(TUTORIALS_TARGET));
     let resumed = guard.start_shipped_tutorial(&context, "basics").unwrap();
     assert_eq!(resumed.project, DEFAULT_PROJECT);
     assert_eq!(resumed.product_scope, original.product_scope);
