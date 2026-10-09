@@ -19,6 +19,9 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- A project fork inherits its source isolation, deployment mode and run purpose
+  in its first durable project record, including when workspace creation fails.
+
 - On desk.gaugewright.com, a chat in a project shared with you offers the models
   that project's own provider key runs, and names the default, in the composer's
   model picker. It offered no model at all: the picker asked your own account,

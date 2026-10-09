@@ -361,19 +361,21 @@ impl Workbench {
             UPSTREAM_EXTRA.to_owned(),
             serde_json::to_value(&upstream).map_err(|e| ForkError::Failed(e.to_string()))?,
         );
-        crate::library_routes::create_project_lifecycle(self, &id, &name, extra, false)
-            .map_err(ForkError::Failed)?;
+        crate::library_routes::create_project_lifecycle_with_posture(
+            self,
+            &id,
+            &name,
+            extra,
+            false,
+            crate::library_routes::ProjectInitialPosture {
+                network_isolated: source.network_isolated,
+                deployment_mode: source.deployment_mode,
+                run_purpose: source.run_purpose.clone(),
+            },
+        )
+        .map_err(ForkError::Failed)?;
 
         let populated = (|| {
-            // A fork is never less protected than what it was made from.
-            self.update_project_record(
-                &id,
-                None,
-                Some(source.network_isolated),
-                source.deployment_mode,
-                Some(source.run_purpose.clone()),
-            )
-            .ok_or("fork vanished while it was being made")?;
             let (ours, _) = self.managed_manifest(&id)?;
             let changed: Vec<(String, Vec<u8>)> = writes
                 .into_iter()
@@ -822,6 +824,7 @@ pub async fn pull_upstream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::ProjectRecord;
 
     fn manifest(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries
@@ -952,6 +955,140 @@ mod tests {
             .fork_project(&source, Some("Another"), &actor, "op-2")
             .unwrap();
         assert_ne!(other["id"], fork.as_str());
+    }
+
+    #[test]
+    fn fork_initial_posture_survives_real_creation_failure_and_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+        let deployment = gaugedesk_core::boundary_lifecycle::Placement {
+            operator: gaugedesk_core::boundary_lifecycle::Operator::Counterparty,
+            attested: true,
+        };
+        let (actor, fork_id, obstruction) = {
+            let mut wb = shared.lock_unpoisoned();
+            crate::library_routes::create_named_project(&mut wb, "protected-source", "Protected")
+                .unwrap();
+            wb.update_project_record(
+                "protected-source",
+                None,
+                Some(true),
+                Some(deployment),
+                Some(Some("audit".into())),
+            )
+            .unwrap();
+            let actor = wb.authority().as_str().to_owned();
+            let fork_id = fork_project_id("protected-source", &actor, "initial-fault");
+            let obstruction = wb
+                .targets_dir()
+                .parent()
+                .unwrap()
+                .join("collaboration-workspaces")
+                .join(format!("project-workspace-{fork_id}"));
+            std::fs::create_dir_all(obstruction.parent().unwrap()).unwrap();
+            // Real workspace initialization fails after the first project write.
+            // Lifecycle compensation tombstones it; this is not a crash hook.
+            std::fs::write(&obstruction, b"owned filesystem fault").unwrap();
+            assert!(matches!(
+                wb.fork_project("protected-source", None, &actor, "initial-fault"),
+                Err(ForkError::Failed(_))
+            ));
+            assert!(!wb.library.projects.contains_key(&fork_id));
+            (actor, fork_id, obstruction)
+        };
+        drop(shared);
+        let reopened = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+        {
+            let mut wb = reopened.lock_unpoisoned();
+            let records: Vec<ProjectRecord> = wb
+                .store_ref()
+                .records(crate::library::LIBRARY_SCOPE, "project")
+                .unwrap()
+                .into_iter()
+                .map(|raw| serde_json::from_str(&raw).unwrap())
+                .filter(|record: &ProjectRecord| record.id == fork_id)
+                .collect();
+            let first = records.first().expect("actual durable initial fork record");
+            assert_eq!(first.op, RecordOp::Upsert);
+            assert!(
+                first.network_isolated,
+                "first durable fork record must be isolated"
+            );
+            assert_eq!(first.deployment_mode, Some(deployment));
+            assert_eq!(first.run_purpose.as_deref(), Some("audit"));
+            assert_eq!(upstream_of(first).unwrap().operation, "initial-fault");
+            assert_eq!(
+                crate::project_owner::recorded_owner(first),
+                Some(actor.as_str())
+            );
+            assert!(records
+                .iter()
+                .any(|record| record.op == RecordOp::Tombstone));
+            assert!(!wb.library.projects.contains_key(&fork_id));
+            std::fs::remove_file(&obstruction).unwrap();
+            let receipt = wb
+                .fork_project("protected-source", None, &actor, "initial-fault")
+                .unwrap();
+            assert_eq!(receipt["id"], fork_id);
+            let record = &wb.library.projects[&fork_id];
+            assert!(record.network_isolated);
+            assert_eq!(record.deployment_mode, Some(deployment));
+            assert_eq!(record.run_purpose.as_deref(), Some("audit"));
+            assert_eq!(bytes(&mut wb, &fork_id), bytes(&mut wb, "protected-source"));
+        }
+    }
+
+    #[test]
+    fn fork_initial_posture_does_not_reapply_current_source_on_exact_retry() {
+        let (_root, shared, source, fork) = forked();
+        let mut wb = shared.lock_unpoisoned();
+        let actor = wb.authority().as_str().to_owned();
+        wb.update_project_record(
+            &fork,
+            None,
+            Some(true),
+            None,
+            Some(Some("fork-owner-purpose".into())),
+        )
+        .unwrap();
+        wb.update_project_record(
+            &source,
+            None,
+            Some(false),
+            None,
+            Some(Some("changed-source-purpose".into())),
+        )
+        .unwrap();
+        let before = wb
+            .store_ref()
+            .records(crate::library::LIBRARY_SCOPE, "project")
+            .unwrap();
+        assert_eq!(
+            wb.fork_project(&source, None, &actor, "op-1").unwrap()["id"],
+            fork
+        );
+        assert_eq!(
+            wb.store_ref()
+                .records(crate::library::LIBRARY_SCOPE, "project")
+                .unwrap(),
+            before
+        );
+        let record = &wb.library.projects[&fork];
+        assert!(record.network_isolated);
+        assert_eq!(record.run_purpose.as_deref(), Some("fork-owner-purpose"));
+    }
+
+    #[test]
+    fn fork_initial_posture_keeps_ordinary_creation_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = crate::workbench_state::open_lean_workbench(root.path()).unwrap();
+        let mut wb = shared.lock_unpoisoned();
+        crate::library_routes::create_named_project(&mut wb, "ordinary-defaults", "Ordinary")
+            .unwrap();
+        let record = &wb.library.projects["ordinary-defaults"];
+        assert!(!record.network_isolated);
+        assert_eq!(record.deployment_mode, None);
+        assert_eq!(record.run_purpose, None);
     }
 
     #[test]

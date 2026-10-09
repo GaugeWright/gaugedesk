@@ -1430,6 +1430,33 @@ pub(crate) fn create_project_lifecycle(
     extra: std::collections::BTreeMap<String, serde_json::Value>,
     is_default: bool,
 ) -> Result<serde_json::Value, String> {
+    create_project_lifecycle_with_posture(
+        wb,
+        id,
+        requested_name,
+        extra,
+        is_default,
+        ProjectInitialPosture::default(),
+    )
+}
+
+/// The posture of the first durable project record. A fork supplies its
+/// captured source posture; ordinary project constructors retain their defaults.
+#[derive(Default)]
+pub(crate) struct ProjectInitialPosture {
+    pub network_isolated: bool,
+    pub deployment_mode: Option<gaugedesk_core::boundary_lifecycle::Placement>,
+    pub run_purpose: Option<String>,
+}
+
+pub(crate) fn create_project_lifecycle_with_posture(
+    wb: &mut Workbench,
+    id: &str,
+    requested_name: &str,
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
+    is_default: bool,
+    posture: ProjectInitialPosture,
+) -> Result<serde_json::Value, String> {
     let name = requested_name.trim();
     if wb
         .library
@@ -1478,9 +1505,9 @@ pub(crate) fn create_project_lifecycle(
                 name: name.to_owned(),
                 is_default,
                 home_id: home_id.clone(),
-                network_isolated: false,
-                run_purpose: None,
-                deployment_mode: None,
+                network_isolated: posture.network_isolated,
+                run_purpose: posture.run_purpose,
+                deployment_mode: posture.deployment_mode,
             },
         );
     }
