@@ -19,6 +19,10 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- A hosted Home removes revoked provider links at its next account exchange even
+  when another sealed copy cannot open. It reports that copy without exposing
+  its secret and continues taking independent valid copies.
+
 ## [0.9.1] — 2026-10-09
 
 GaugeDesk 0.9.0 was tagged but never published, because it carried the fault

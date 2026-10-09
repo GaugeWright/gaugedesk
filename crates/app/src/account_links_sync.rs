@@ -905,9 +905,27 @@ pub trait HomeLinkSource {
     fn home_links(&self, home_id: &str) -> Result<Option<HomeLinks>, String>;
 }
 
+/// Why one account-provided copy was not installed. These classifications
+/// contain neither secret bytes nor errors returned by a key-unwrapping host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HomeCopyFailureReason {
+    InvalidContext,
+    RecipientKeyUnavailable,
+    CopyDidNotOpen,
+    SecretIsNotText,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HomeCopyFailure {
+    pub provider: String,
+    pub reason: HomeCopyFailureReason,
+}
+
 /// What one [`reconcile_home`] changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HomeReconciled {
+    /// Copies not installed; unrelated copies and revocation cleanup still run.
+    pub failed: Vec<HomeCopyFailure>,
     /// Providers whose current version this Home now holds.
     pub taken: Vec<String>,
     /// Providers this Home no longer holds a copy of.
@@ -969,15 +987,27 @@ pub fn reconcile_home(
             }) {
                 continue;
             }
-            let context = LinkContext::new(&listed.account, &link.provider, link.version)
-                .map_err(|error| format!("the link's context is invalid: {error:?}"))?;
-            let private = key
-                .open()
-                .map_err(|error| format!("this Home holds no recipient key: {error}"))?;
-            let secret = open_link_copy(&context, &private, copy)
-                .map_err(|_| format!("this Home's copy of {} did not open", link.provider))?;
-            let text = String::from_utf8(secret)
-                .map_err(|_| "a provider link's secret is not text".to_owned())?;
+            let opened = (|| {
+                let context = LinkContext::new(&listed.account, &link.provider, link.version)
+                    .map_err(|_| HomeCopyFailureReason::InvalidContext)?;
+                let private = key
+                    .open()
+                    .map_err(|_| HomeCopyFailureReason::RecipientKeyUnavailable)?;
+                let secret = open_link_copy(&context, &private, copy)
+                    .map_err(|_| HomeCopyFailureReason::CopyDidNotOpen)?;
+                String::from_utf8(secret).map_err(|_| HomeCopyFailureReason::SecretIsNotText)
+            })();
+            let text = match opened {
+                Ok(text) => text,
+                Err(reason) => {
+                    done.failed.push(HomeCopyFailure {
+                        provider: link.provider.clone(),
+                        reason,
+                    });
+                    // A bad current copy must not postpone another link's revocation.
+                    continue;
+                }
+            };
             let mut guard = wb.lock_unpoisoned();
             let sealed = guard
                 .seal_account_secret(&text)
@@ -1164,10 +1194,16 @@ pub fn person_reached_home(wb: &SharedWorkbench, actor: &str, bearer: Option<&st
     let wb = wb.clone();
     std::thread::spawn(move || {
         match reconcile_home(&wb, &copies.home_id, &scope, &copies.key, &source) {
-            Ok(done) if !done.taken.is_empty() || !done.removed.is_empty() => eprintln!(
-                "[account-links] this Home took {:?}, removed {:?}",
-                done.taken, done.removed
-            ),
+            Ok(done)
+                if !done.taken.is_empty()
+                    || !done.removed.is_empty()
+                    || !done.failed.is_empty() =>
+            {
+                eprintln!(
+                    "[account-links] this Home took {:?}, removed {:?}, unopened copies {:?}",
+                    done.taken, done.removed, done.failed
+                )
+            }
             Ok(_) => {}
             Err(error) if error == NOT_SERVED => {}
             Err(error) => eprintln!("[account-links] could not take this Home's links: {error}"),

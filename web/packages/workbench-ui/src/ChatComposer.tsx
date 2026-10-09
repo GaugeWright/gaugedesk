@@ -8,16 +8,29 @@
  */
 import { createEffect, createSignal, For, on, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { IMAGE_MIMES, type Attachment } from "./attachments";
-import { ComposerMenuButton } from "./ComposerMenu";
+import { ComposerMenuButton, type ComposerFoldItem } from "./ComposerMenu";
 import { ContextMeter, type ContextUsage } from "./ContextMeter";
 import { Icon } from "./icons";
 import { MAX_DICTATION_SECONDS, recordedAudioAsWav } from "./dictation";
 
-/** Below this field width the rail cannot hold tools, both settings, the meter
- *  and delivery without crushing something, so everything non-essential folds
- *  behind one expander. Measured on the field, not the viewport: a chat panel
- *  can be narrow inside a wide window. */
-const COMPACT_RAIL_WIDTH = 430;
+/** What the rail folds behind its expander when it runs out of room, first to
+ *  last. It folds only what it must, one item at a time. Effort is the
+ *  least-used setting; the mode's label repeats what the send button's glyph
+ *  and its stack already say; attaching has paste and drop besides. The model
+ *  is what the next turn runs on, so it holds the rail longest, and gives up
+ *  the end of its name before it gives up its place. */
+const FOLD_ORDER: readonly ComposerFoldItem[] = ["effort", "mode", "attach", "model"];
+
+/** How many of `items` foldable controls the rail folds: the fewest, in order,
+ *  that let it fit. `fits(folded, tight)` measures the rail with the first
+ *  `folded` items put away; `tight` lets the last item that remains shorten,
+ *  which is asked only once every item before it has gone. */
+export function railFoldCount(items: number, fits: (folded: number, tight: boolean) => boolean): number {
+    let folded = 0;
+    while (folded < items - 1 && !fits(folded, false)) folded += 1;
+    if (folded === items - 1 && !fits(folded, false) && !fits(folded, true)) folded += 1;
+    return folded;
+}
 
 /**
  * Where a composed message goes. These are the *only* things that can happen to
@@ -144,7 +157,9 @@ export interface ChatComposerProps {
     /** The no-selection desktop on-ramp that mints a chat on first send. */
     readonly quickStart?: boolean;
     readonly modelToolbar?: JSX.Element;
-    /** Stacked-row rendering of {@link modelToolbar} for the compact expander. */
+    /** Stacked-row rendering of {@link modelToolbar} for the expander, which
+     *  shows only the settings the rail has folded. Without it the toolbar's
+     *  settings never fold. */
     readonly modelToolbarStacked?: JSX.Element;
     /** How full the pinned model's context window is. Absent on Environments that
      *  cannot measure it (the audience embed does not see transcript size). */
@@ -183,7 +198,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
     let attachInput: HTMLInputElement | undefined;
     let messageInput: HTMLTextAreaElement | undefined;
     let field: HTMLDivElement | undefined;
-    const [compact, setCompact] = createSignal(false);
+    let rail: HTMLDivElement | undefined;
     const [moreOpen, setMoreOpen] = createSignal(false);
     const [dictating, setDictating] = createSignal<"idle" | "recording" | "transcribing">("idle");
     const [dictationError, setDictationError] = createSignal<string>();
@@ -387,6 +402,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                 testAttr="mode"
                 rowLabel="Mode"
                 stacked={stacked}
+                foldItem="mode"
             >
                 {(close) => (
                     <>
@@ -458,21 +474,58 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
         const observer = panel ? new ResizeObserver(resizeMessage) : undefined;
         if (panel) observer?.observe(panel);
         resizeMessage();
-        // The rail folds on the field's own width. A media query would miss a
-        // narrow chat panel sitting in a wide window, which is the desktop's
-        // normal split. Measure once directly rather than waiting on the
-        // observer's first delivery: ResizeObserver is tied to the rendering
-        // lifecycle, so a composer that mounts in a hidden tab or an unpainted
-        // panel would otherwise render its wide rail into a narrow field.
+        // The rail folds on what its own controls need, not on a breakpoint: a
+        // width chosen in advance folds a rail that has room whenever the
+        // model's name is short, and a media query would miss a narrow chat
+        // panel in a wide window, which is the desktop's normal split. So the
+        // rail is laid out at its natural width with each prefix of FOLD_ORDER
+        // put away until it fits the field. Folding is an attribute the
+        // stylesheet reads rather than component state: every trial is then
+        // one synchronous layout, nothing re-renders, and a menu open on the
+        // rail stays open while the panel is dragged.
         const measureRail = () => {
-            if (field) setCompact(field.clientWidth < COMPACT_RAIL_WIDTH);
+            if (!field || !rail) return;
+            const room = rail.getBoundingClientRect().width;
+            const foldable = FOLD_ORDER.filter((item) => rail!.querySelector(`[data-fold-item="${item}"]`));
+            const fold = (count: number) => {
+                if (count > 0) field!.dataset.folded = foldable.slice(0, count).join(" ");
+                else delete field!.dataset.folded;
+            };
+            field.classList.add("measuring");
+            const folded = railFoldCount(foldable.length, (count, tight) => {
+                fold(count);
+                field!.classList.toggle("tight", tight);
+                return rail!.getBoundingClientRect().width <= room + 0.5;
+            });
+            field.classList.remove("measuring", "tight");
+            fold(folded);
+            if (folded === 0) setMoreOpen(false);
         };
+        // Measure once directly rather than waiting on the observer's first
+        // delivery: ResizeObserver is tied to the rendering lifecycle, so a
+        // composer that mounts in a hidden tab or an unpainted panel would
+        // otherwise render its wide rail into a narrow field. Only a change of
+        // width asks again; folding can move the field's height by a pixel,
+        // and answering that would be a resize loop.
         measureRail();
-        const railObserver = field ? new ResizeObserver(measureRail) : undefined;
+        let measuredWidth = field?.clientWidth;
+        const railObserver = field ? new ResizeObserver(() => {
+            if (field!.clientWidth === measuredWidth) return;
+            measuredWidth = field!.clientWidth;
+            measureRail();
+        }) : undefined;
         if (field) railObserver?.observe(field);
+        // What the rail needs also changes without the field moving: another
+        // model's name, an effort control that comes and goes with the model,
+        // the mode's label, a face that finishes loading.
+        const contentObserver = rail ? new MutationObserver(measureRail) : undefined;
+        if (rail) contentObserver?.observe(rail, { subtree: true, childList: true, characterData: true });
+        document.fonts?.addEventListener?.("loadingdone", measureRail);
         onCleanup(() => {
             observer?.disconnect();
             railObserver?.disconnect();
+            contentObserver?.disconnect();
+            document.fonts?.removeEventListener?.("loadingdone", measureRail);
         });
     });
     return (
@@ -558,7 +611,7 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
             {/* One field. The border belongs to the card; the textarea and every
                 control inside it are chrome-free, so the composer reads as a
                 place to type with things in it rather than a form of boxes. */}
-            <div class="composer-field" ref={field} classList={{ compact: compact() }}>
+            <div class="composer-field" ref={field}>
                 {/* Delivery rides with the text, not down in the rail: the gate
                     (queue vs. send) and the send/stop control sit at the end of
                     the entry line, so the choice about *this message* is beside
@@ -694,12 +747,11 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                     of the window it is carrying. No borders, no dividers — one
                     register of quiet text and glyphs.
 
-                    Everything that describes the *next turn* — model, effort, what
-                    Enter does, how full the window is — collects at the far end, so
-                    it reads as one statement about the run rather than settings
-                    scattered either side of an empty middle. Only the message tool
-                    stays at the reading start, next to the message. */}
-                <div class="composer-rail">
+                    Model and effort describe the *run*, so they sit at the reading
+                    start beside attach. What Enter does describes the *keystroke*,
+                    so it keeps company with the send button's end, beside the
+                    meter. */}
+                <div class="composer-rail" ref={rail}>
                     <div class="composer-tools">
                         <Show when={props.onTranscribe}>
                             <button class="composer-icon" type="button" data-dictation
@@ -710,84 +762,80 @@ export function ChatComposer(props: ChatComposerProps): JSX.Element {
                                 <Show when={dictating() !== "idle"}><span>{dictating() === "recording" ? "Recording" : "Transcribing"}</span></Show>
                             </button>
                         </Show>
-                        <Show
-                            when={compact()}
-                            fallback={
-                                <>
+                        <Show when={props.onAttachInput}>
+                            <button
+                                class="composer-icon attach-btn"
+                                type="button"
+                                data-attach
+                                data-fold-item="attach"
+                                aria-label="Attach files"
+                                disabled={props.attaching}
+                                title="Attach file(s) to this message — their text rides along with the agent (not saved to the workspace)"
+                                onClick={() => attachInput?.click()}
+                            >
+                                <Icon name="paperclip" />
+                            </button>
+                        </Show>
+                        <Show when={props.modelToolbar}>{props.modelToolbar}</Show>
+                        {/* One expander, not a wrapped second row: it holds what the
+                            rail has folded and nothing else, and is absent while
+                            everything fits. Delivery and the meter never fold. */}
+                        <span
+                            class="composer-more-anchor"
+                            /* Escape on the anchor, not the menu: opening the
+                               expander leaves focus on its button, and the
+                               dock behind reads Escape as "stop the turn". */
+                            onKeyDown={(event) => {
+                                if (event.key !== "Escape" || !moreOpen()) return;
+                                event.stopPropagation();
+                                setMoreOpen(false);
+                            }}
+                        >
+                            <button
+                                class="composer-icon more-btn"
+                                classList={{ on: moreOpen() }}
+                                type="button"
+                                data-composer-more
+                                aria-label="More composer options"
+                                aria-haspopup="menu"
+                                aria-expanded={moreOpen()}
+                                title="Settings there is no room for on this line"
+                                onClick={() => setMoreOpen((was) => !was)}
+                            >
+                                <Icon name="more" />
+                            </button>
+                            <Show when={moreOpen()}>
+                                <div class="popover-catcher" onClick={() => setMoreOpen(false)} />
+                                {/* Every foldable control is here; the stylesheet
+                                    shows only the ones the rail has folded. */}
+                                <div
+                                    class="composer-more"
+                                    role="menu"
+                                    data-composer-more-menu
+                                >
                                     <Show when={props.onAttachInput}>
                                         <button
-                                            class="composer-icon attach-btn"
+                                            class="composer-menu-item"
                                             type="button"
                                             data-attach
-                                            aria-label="Attach files"
+                                            data-fold-item="attach"
                                             disabled={props.attaching}
-                                            title="Attach file(s) to this message — their text rides along with the agent (not saved to the workspace)"
-                                            onClick={() => attachInput?.click()}
+                                            onClick={() => {
+                                                setMoreOpen(false);
+                                                attachInput?.click();
+                                            }}
                                         >
-                                            <Icon name="paperclip" />
+                                            <span>Attach files…</span>
                                         </button>
                                     </Show>
-                                    <Show when={props.modelToolbar}>{props.modelToolbar}</Show>
-                                </>
-                            }
-                        >
-                            {/* One expander, not a wrapped second row: a narrow rail
-                                keeps delivery and the meter, and folds the rest. */}
-                            <span
-                                class="composer-more-anchor"
-                                /* Escape on the anchor, not the menu: opening the
-                                   expander leaves focus on its button, and the
-                                   dock behind reads Escape as "stop the turn". */
-                                onKeyDown={(event) => {
-                                    if (event.key !== "Escape" || !moreOpen()) return;
-                                    event.stopPropagation();
-                                    setMoreOpen(false);
-                                }}
-                            >
-                                <button
-                                    class="composer-icon more-btn"
-                                    classList={{ on: moreOpen() }}
-                                    type="button"
-                                    data-composer-more
-                                    aria-label="More composer options"
-                                    aria-haspopup="menu"
-                                    aria-expanded={moreOpen()}
-                                    title="Attachments, model, effort"
-                                    onClick={() => setMoreOpen((was) => !was)}
-                                >
-                                    <Icon name="more" />
-                                </button>
-                                <Show when={moreOpen()}>
-                                    <div class="popover-catcher" onClick={() => setMoreOpen(false)} />
-                                    <div
-                                        class="composer-more"
-                                        role="menu"
-                                        data-composer-more-menu
-                                    >
-                                        <Show when={props.onAttachInput}>
-                                            <button
-                                                class="composer-menu-item"
-                                                type="button"
-                                                data-attach
-                                                disabled={props.attaching}
-                                                onClick={() => {
-                                                    setMoreOpen(false);
-                                                    attachInput?.click();
-                                                }}
-                                            >
-                                                <span>Attach files…</span>
-                                            </button>
-                                        </Show>
-                                        {/* Destinations no longer fold: they live in the
-                                            send button's own stack, which costs the
-                                            same width at every size. */}
-                                        <Show when={props.modelToolbarStacked ?? props.modelToolbar}>
-                                            {props.modelToolbarStacked ?? props.modelToolbar}
-                                        </Show>
-                                    </div>
-                                </Show>
-                            </span>
-                        </Show>
+                                    {/* Destinations no longer fold: they live in the
+                                        send button's own stack, which costs the
+                                        same width at every size. */}
+                                    <Show when={props.modelToolbarStacked}>{props.modelToolbarStacked}</Show>
+                                    {modeSetting(true)}
+                                </div>
+                            </Show>
+                        </span>
                     </div>
 
                     {/* What Enter does is about *delivery*, so it keeps company with

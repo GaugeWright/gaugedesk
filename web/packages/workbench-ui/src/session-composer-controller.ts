@@ -129,7 +129,7 @@ export interface SessionComposerControllerOptions {
     /** Preserve a host-owned draft across Session selection changes. Useful when
      * navigation and immediate typing can overlap; queued/attached state still retires. */
     readonly retainDraftOnScopeChange?: boolean;
-    /** `stacked` asks for the compact expander's labelled-row form. */
+    /** `stacked` asks for the rail expander's labelled-row form. */
     readonly modelToolbar?: (stacked?: boolean) => JSX.Element;
     /** `false` is authoritative; undefined remains runtime-permissive. */
     readonly acceptsImages?: Accessor<boolean | undefined>;
@@ -177,7 +177,7 @@ export interface SessionComposerController {
     readonly error: Accessor<string>;
     readonly attaching: Accessor<boolean>;
     readonly capabilities: Accessor<ComposerCapabilities>;
-    /** `stacked` asks for the compact expander's labelled-row form. */
+    /** `stacked` asks for the rail expander's labelled-row form. */
     readonly modelToolbar?: (stacked?: boolean) => JSX.Element;
     readonly submit: () => void;
     readonly steer: () => void;

@@ -10,14 +10,21 @@
 import { createSignal, Show, type JSX } from "solid-js";
 import { Icon, type IconName } from "./icons";
 
+/** What the composer's rail can fold behind its expander, one at a time, in
+ *  `ChatComposer`'s order. A control marks itself with one of these so the rail
+ *  can put it away without knowing who rendered it. */
+export type ComposerFoldItem = "effort" | "mode" | "attach" | "model";
+
 export function ComposerMenuButton(props: {
     readonly label: string;
     readonly title: string;
     /** Names the `data-*-picker` hook and the menu's `data-*-menu` sibling. */
     readonly testAttr: string;
-    /** Row caption used by the compact expander's stacked form. */
+    /** Row caption used by the rail expander's stacked form. */
     readonly rowLabel: string;
     readonly stacked?: boolean;
+    /** Which of the rail's foldable settings this is; see {@link ComposerFoldItem}. */
+    readonly foldItem?: ComposerFoldItem;
     /** Leading glyph, for settings whose value is itself iconic (the mode). */
     readonly icon?: IconName;
     readonly children: (close: () => void) => JSX.Element;
@@ -27,6 +34,7 @@ export function ComposerMenuButton(props: {
         <span
             class="composer-menu-anchor"
             classList={{ row: props.stacked }}
+            data-fold-item={props.foldItem}
             /* On the anchor, not the menu: opening this leaves focus on the
                button, so an Escape aimed at the menu is delivered to the button
                and a handler on the menu itself never sees it. The composer dock

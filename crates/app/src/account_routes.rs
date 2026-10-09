@@ -94,6 +94,12 @@ pub fn hub_routes() -> Router<SharedWorkbench> {
             "/account/directory/challenge",
             post(post_account_directory_challenge),
         )
+        // A root hand-over waiting to take effect, for the account's own
+        // sessions to show and answer (DR-0464 §2).
+        .route(
+            "/account/directory/pending",
+            get(get_account_directory_pending),
+        )
         .merge(managed_inference_routes())
 }
 
@@ -482,6 +488,38 @@ pub async fn delete_home(
     }
 }
 
+/// The caller's account folded off the Workbench lock, as
+/// [`fold_account_unlocked`] does, with a root hand-over that has come due
+/// taken first under it (DR-0464). Starts the hand-over sweeper if it is not
+/// running yet.
+fn fold_account_settled<T>(
+    shared: &SharedWorkbench,
+    now_ms: u64,
+    resolve: impl FnOnce(&crate::Workbench) -> (String, T),
+) -> (
+    T,
+    Result<crate::account::Account, gaugedesk_store::AdmitError>,
+) {
+    let ((scope, resolved), account) = fold_account_unlocked(shared, |wb| {
+        let (scope, resolved) = resolve(wb);
+        (scope.clone(), (scope, resolved))
+    });
+    crate::root_hand_over::watch(shared);
+    let due = account.as_ref().is_ok_and(|account| {
+        account
+            .root_hand_over
+            .as_ref()
+            .is_some_and(|hand_over| hand_over.is_due(now_ms))
+    });
+    if !due {
+        return (resolved, account);
+    }
+    let mut wb = shared.lock_unpoisoned();
+    let account = crate::root_hand_over::settle_due_in(&mut wb, &scope, now_ms)
+        .and_then(|_| crate::account::Account::rebuild_in(wb.store_ref(), &scope));
+    (resolved, account)
+}
+
 /// `GET /account/directory` — which root signs this account's directory record,
 /// and where that record lives (DESK-5f, ADR 0133 §1).
 ///
@@ -490,6 +528,10 @@ pub async fn delete_home(
 /// when nothing has published one, which is the ordinary state for an account
 /// that has never enabled library sync — a caller must degrade to endpoint-only
 /// reachability there, not treat it as an error.
+///
+/// Only roots and hand-overs that have taken effect are served. A pending root
+/// hand-over is not among the transitions, so a reader learns of one only once
+/// it has taken effect (DR-0464 §6); one that has come due is taken here first.
 pub async fn get_account_directory(
     State(wb): State<SharedWorkbench>,
     headers: HeaderMap,
@@ -500,8 +542,9 @@ pub async fn get_account_directory(
     // no bearer to read claims from, so without this the pin has no namespace
     // and the signed-directory path is skipped entirely — which is the state
     // every desk session has actually been in.
-    let (subject, account) =
-        fold_account_unlocked(&wb, |wb| (wb.account_scope_for(bearer), wb.actor(bearer)));
+    let (subject, account) = fold_account_settled(&wb, crate::account::session_now_ms(), |wb| {
+        (wb.account_scope_for(bearer), wb.actor(bearer))
+    });
     match account {
         Ok(account) => match account.directory {
             Some(record) => (
@@ -523,6 +566,32 @@ pub async fn get_account_directory(
                 "this account has published no directory record",
             )
                 .into_response(),
+        },
+        Err(error) => err_response(error),
+    }
+}
+
+/// `GET /account/directory/pending` — the root hand-over waiting to take
+/// effect on this account, for its own sessions to show and answer: which
+/// computer submitted it, when, when it takes effect, and what the account
+/// has been told (DR-0464 §2). `204` when none is pending.
+pub async fn get_account_directory_pending(
+    State(wb): State<SharedWorkbench>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let bearer = net_http::bearer(&headers);
+    let ((), account) = fold_account_settled(&wb, crate::account::session_now_ms(), |wb| {
+        (wb.account_scope_for(bearer), ())
+    });
+    match account {
+        Ok(account) => match account
+            .root_hand_over
+            .filter(crate::root_hand_over::RootHandOverRecord::is_pending)
+        {
+            Some(hand_over) => {
+                (StatusCode::OK, Json(json!({ "pending": hand_over.view() }))).into_response()
+            }
+            None => StatusCode::NO_CONTENT.into_response(),
         },
         Err(error) => err_response(error),
     }
@@ -582,17 +651,57 @@ fn session_device(
         .cloned()
 }
 
+const REVOKED_DEVICE: &str = "this computer has been revoked from the account";
+
+/// What a publication came to.
+enum Publication {
+    /// The projected root, written: a first publication, a republish of the
+    /// same root, or a hand-over taken at once.
+    Projected(crate::account::AccountDirectoryRecord),
+    /// A root hand-over held before it takes effect (DR-0464 §1); `fresh` when
+    /// this request submitted it, so its notice is owed now.
+    Pending {
+        hand_over: Box<crate::root_hand_over::RootHandOverRecord>,
+        fresh: bool,
+    },
+}
+
+/// Why a publication was not taken.
+enum Refused {
+    Status(StatusCode, &'static str),
+    Store(Box<gaugedesk_store::AdmitError>),
+}
+
+impl From<gaugedesk_store::AdmitError> for Refused {
+    fn from(error: gaugedesk_store::AdmitError) -> Self {
+        Refused::Store(Box::new(error))
+    }
+}
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Refused::Status(status, reason) => (status, reason).into_response(),
+            Refused::Store(error) => err_response(*error),
+        }
+    }
+}
+
 /// `POST /account/directory` — publish the account root's public half.
 ///
-/// The publisher is a client that holds the root; this endpoint cannot check
-/// that and does not pretend to. Anyone holding the person's bearer can write
-/// here, and demanding a self-signature would prove nothing, because an attacker
-/// signs their own key with their own root just as validly. The whole defence is
-/// on the reading side: a browser pins the first key it sees and refuses a later
-/// change (ADR 0132 §2). What this route *does* guarantee is scope isolation —
-/// the record lands in the caller's own account scope and nowhere else.
+/// An account's first root is trust-on-first-use, and so is republishing the
+/// root already projected: a publication may carry ADR 0133 §2's proof, is
+/// held to it when it does, and is still taken without one, because desktops
+/// before 0.8.0 send none. A root no device proved is recorded as such.
+///
+/// Replacing a projected root is narrower (DR-0464): it needs the session's
+/// own enrolled, still active computer, that computer's proof, and the
+/// outgoing root's signed hand-over. Away from a proven root the hand-over is
+/// held for 72 hours with notice and answered `202`; away from a root no
+/// device proved — a claimed computer's install-derived key — it is taken at
+/// once. Either way the record lands in the caller's own account scope.
 pub async fn post_account_directory(
-    State(wb): State<SharedWorkbench>,
+    State(shared): State<SharedWorkbench>,
     headers: HeaderMap,
     Json(body): Json<AccountDirectoryBody>,
 ) -> impl IntoResponse {
@@ -600,106 +709,230 @@ pub async fn post_account_directory(
     if root.is_empty() {
         return (StatusCode::BAD_REQUEST, "root_pubkey is required").into_response();
     }
-    let mut wb = wb.lock_unpoisoned();
-    let bearer = net_http::bearer(&headers);
+    let published = {
+        let mut wb = shared.lock_unpoisoned();
+        publish_account_root(
+            &mut wb,
+            net_http::bearer(&headers),
+            root,
+            body,
+            crate::account::session_now_ms(),
+        )
+    };
+    crate::root_hand_over::watch(&shared);
+    match published {
+        Ok(Publication::Projected(record)) => {
+            (StatusCode::CREATED, Json(json!({ "directory": record }))).into_response()
+        }
+        Ok(Publication::Pending { hand_over, fresh }) => {
+            if fresh {
+                crate::root_hand_over::submitted(&shared);
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "pending": hand_over.view() })),
+            )
+                .into_response()
+        }
+        Err(refused) => refused.into_response(),
+    }
+}
+
+fn publish_account_root(
+    wb: &mut crate::Workbench,
+    bearer: Option<&str>,
+    root: String,
+    body: AccountDirectoryBody,
+    now_ms: u64,
+) -> Result<Publication, Refused> {
+    let refuse = Refused::Status;
     let scope = wb.account_scope_for(bearer);
-    let projected = crate::account::Account::rebuild_in(wb.store_ref(), &scope)
-        .ok()
-        .and_then(|account| account.directory);
-    // A publication may carry ADR 0133 §2's proof. One that does is held to
-    // it; one that does not is still taken, as before, until every released
-    // desktop sends one.
-    let mut prove_device = None;
-    if let Some(proof) = &body.proof {
-        let continues = match projected.as_ref() {
-            None => true,
-            Some(record) if record.root_pubkey == root => true,
-            Some(record) => body.transition.as_ref().is_some_and(|transition| {
-                transition.from == record.root_pubkey
-                    && transition.to == root
-                    && gaugedesk_directory_protocol::root_transition_verifies(transition)
-            }),
-        };
-        let device = session_device(&wb, bearer, &scope);
-        let carried = device
-            .as_ref()
-            .map(|device| device.subkey_pubkey.clone())
-            .unwrap_or_default();
-        match crate::root_publication::verify(
-            proof,
-            &wb.actor(bearer),
-            &root,
-            &carried,
-            continues,
-            crate::account::device_enrolled_at_now(),
-        ) {
-            Ok(subkey) => {
-                prove_device =
-                    device
-                        .filter(|device| device.subkey_pubkey.is_empty())
-                        .map(|device| crate::account::DeviceRecord {
-                            subkey_pubkey: subkey.as_str().to_owned(),
-                            ..device
-                        });
-            }
-            Err(refusal) => return (StatusCode::FORBIDDEN, refusal.reason()).into_response(),
-        }
-    } else {
-        tracing::warn!("account root published without a device's proof");
-    }
-    // The chain of signed hand-overs is kept across every write. A replacement
-    // that carries the outgoing root's statement extends it; one that does not
-    // is still taken, as before, until an account can recover its root
-    // (DR-0361 §3) — clients then raise the changed-root alarm, as today.
-    let mut transitions = projected
+    // A hand-over that has come due is taken before this publication is
+    // judged against the projected root.
+    crate::root_hand_over::settle_due_in(wb, &scope, now_ms)?;
+    let account = crate::account::Account::rebuild_in(wb.store_ref(), &scope)?;
+    let actor = wb.actor(bearer);
+    let device = session_device(wb, bearer, &scope);
+    let carried = device
         .as_ref()
-        .map(|record| record.transitions.clone())
+        .map(|device| device.subkey_pubkey.clone())
         .unwrap_or_default();
-    if let Some(previous) = projected
-        .as_ref()
-        .filter(|record| record.root_pubkey != root)
-    {
-        match body.transition {
-            Some(transition)
-                if transition.from == previous.root_pubkey
-                    && transition.to == root
-                    && gaugedesk_directory_protocol::root_transition_verifies(&transition) =>
+    let origin = body.origin.trim().trim_end_matches('/').to_owned();
+    let replaced = account
+        .directory
+        .clone()
+        .filter(|record| record.root_pubkey != root);
+
+    let Some(previous) = replaced else {
+        // A first publication, or the projected root again.
+        let mut proven_here = false;
+        let mut prove_device = None;
+        if let Some(proof) = &body.proof {
+            if device
+                .as_ref()
+                .is_some_and(|device| device.status != crate::account::DeviceStatus::Active)
             {
-                transitions.push(transition);
+                return Err(refuse(StatusCode::FORBIDDEN, REVOKED_DEVICE));
             }
-            Some(_) => {
-                return (
-                    StatusCode::CONFLICT,
-                    "the root transition is not the projected root's signed hand-over to this one",
-                )
-                    .into_response();
-            }
-            None => tracing::warn!("account root replaced without a signed transition"),
+            let subkey = crate::root_publication::verify(
+                proof,
+                &actor,
+                &root,
+                &carried,
+                true,
+                crate::account::device_enrolled_at_now(),
+            )
+            .map_err(|refusal| refuse(StatusCode::FORBIDDEN, refusal.reason()))?;
+            // A proof proves a root only when it comes from an enrolled
+            // device of the account, over that device's own session.
+            proven_here = device.is_some();
+            prove_device = device
+                .filter(|device| device.subkey_pubkey.is_empty())
+                .map(|device| crate::account::DeviceRecord {
+                    subkey_pubkey: subkey.as_str().to_owned(),
+                    ..device
+                });
+        } else {
+            tracing::warn!("account root published without a device's proof");
         }
+        let projected = account.directory.as_ref();
+        let record = crate::account::AccountDirectoryRecord {
+            id: crate::account::DIRECTORY_RECORD_ID.to_owned(),
+            op: RecordOp::Upsert,
+            root_pubkey: root,
+            origin,
+            transitions: projected
+                .map(|record| record.transitions.clone())
+                .unwrap_or_default(),
+            proven: proven_here || projected.is_some_and(|record| record.proven),
+        };
+        return project(wb, &scope, record, prove_device);
+    };
+
+    // A replacement: an enrolled, active computer of the account, over its
+    // own session, with its proof and the outgoing root's signed hand-over
+    // (ADR 0133 §2, DR-0464 §6–§7).
+    let Some(device) = device else {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            "replacing the account's root needs a computer enrolled on it, over its own session",
+        ));
+    };
+    if device.status != crate::account::DeviceStatus::Active {
+        return Err(refuse(StatusCode::FORBIDDEN, REVOKED_DEVICE));
     }
+    let Some(proof) = &body.proof else {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            "replacing the account's root needs this computer's proof",
+        ));
+    };
+    let Some(transition) = body.transition else {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "replacing the account's root needs the projected root's signed hand-over",
+        ));
+    };
+    if transition.from != previous.root_pubkey
+        || transition.to != root
+        || !gaugedesk_directory_protocol::root_transition_verifies(&transition)
+    {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "the root transition is not the projected root's signed hand-over to this one",
+        ));
+    }
+    let subkey = crate::root_publication::verify(
+        proof,
+        &actor,
+        &root,
+        &carried,
+        true,
+        crate::account::device_enrolled_at_now(),
+    )
+    .map_err(|refusal| refuse(StatusCode::FORBIDDEN, refusal.reason()))?;
+
+    if let Some(pending) = account
+        .root_hand_over
+        .filter(crate::root_hand_over::RootHandOverRecord::is_pending)
+    {
+        if pending.transition.from == transition.from && pending.transition.to == transition.to {
+            return Ok(Publication::Pending {
+                hand_over: Box::new(pending),
+                fresh: false,
+            });
+        }
+        // An interim rule until the freeze lands: a second hand-over while
+        // one is pending is refused rather than freezing the root, which
+        // only the recovery code would resolve (DR-0464 §4, WS-984).
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            "a root hand-over is already pending",
+        ));
+    }
+
+    if previous.proven {
+        // DR-0464 §1: held, and the outgoing root stays projected meanwhile.
+        let hand_over = crate::root_hand_over::RootHandOverRecord::submitted(
+            &actor,
+            transition,
+            origin,
+            &device,
+            subkey.as_str(),
+            now_ms,
+        );
+        wb.write_account_record_in(
+            &scope,
+            crate::root_hand_over::ROOT_HAND_OVER_RECORD_KIND,
+            &hand_over.id,
+            &hand_over,
+        )?;
+        return Ok(Publication::Pending {
+            hand_over: Box::new(hand_over),
+            fresh: true,
+        });
+    }
+
+    // DR-0464 §1: away from a root no device proved, the account's first root
+    // of its own is taken at once.
+    let mut transitions = previous.transitions;
+    transitions.push(transition);
     let record = crate::account::AccountDirectoryRecord {
         id: crate::account::DIRECTORY_RECORD_ID.to_owned(),
         op: RecordOp::Upsert,
         root_pubkey: root,
-        origin: body.origin.trim().trim_end_matches('/').to_owned(),
+        origin,
         transitions,
+        proven: true,
     };
-    // The proving device's record takes its subkey on this first write; every
-    // later publication must come from that subkey.
+    let prove_device = device
+        .subkey_pubkey
+        .is_empty()
+        .then(|| crate::account::DeviceRecord {
+            subkey_pubkey: subkey.as_str().to_owned(),
+            ..device
+        });
+    project(wb, &scope, record, prove_device)
+}
+
+/// Write the projected root, and the proving device's subkey on its first
+/// write; every later publication must come from that subkey.
+fn project(
+    wb: &mut crate::Workbench,
+    scope: &str,
+    record: crate::account::AccountDirectoryRecord,
+    prove_device: Option<crate::account::DeviceRecord>,
+) -> Result<Publication, Refused> {
     if let Some(device) = prove_device {
-        if let Err(error) = wb.upsert_account_device_in(&scope, &device) {
-            return err_response(error);
-        }
+        wb.upsert_account_device_in(scope, &device)?;
     }
-    match wb.write_account_record_in(
-        &scope,
+    wb.write_account_record_in(
+        scope,
         crate::account::DIRECTORY_RECORD_KIND,
         &record.id,
         &record,
-    ) {
-        Ok(()) => (StatusCode::CREATED, Json(json!({ "directory": record }))).into_response(),
-        Err(error) => err_response(error),
-    }
+    )?;
+    Ok(Publication::Projected(record))
 }
 
 pub async fn get_home_routes(
@@ -1450,8 +1683,6 @@ mod home_directory_tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    /// DR-0361 §1: a replacement carrying the outgoing root's signed hand-over
-    /// extends the chain a client follows; a statement that is not that
     /// ADR 0133 §2: a publication carrying a device's proof is held to it.
     #[tokio::test]
     async fn a_root_published_with_a_proof_is_held_to_it() {
@@ -1502,97 +1733,21 @@ mod home_directory_tests {
         assert_eq!(status, StatusCode::FORBIDDEN, "a challenge answers once");
     }
 
-    /// hand-over is refused, and the chain survives every later write.
+    /// An account has one root, and a live session alone never replaces it
+    /// (DR-0464 §6): a different root published bare is refused and the
+    /// projected one stays, while republishing that same root is still taken,
+    /// as it is from desktops that send no proof. A hand-over that carries one
+    /// is `root_hand_over_tests`'s.
     #[tokio::test]
-    async fn a_signed_root_hand_over_is_kept_and_served() {
-        use gaugedesk_core::signature::SigningKey;
+    async fn a_bare_republish_cannot_replace_the_projected_root() {
         let dir = tempfile::tempdir().unwrap();
         let wb = crate::open_workbench(dir.path()).unwrap();
         let app = routes().with_state(wb);
-        let old = SigningKey::from_seed(&[1; 32]).unwrap();
-        let new = SigningKey::from_seed(&[2; 32]).unwrap();
-        let other = SigningKey::from_seed(&[3; 32]).unwrap();
-        let (old_key, new_key) = (
-            old.public_key().as_str().to_owned(),
-            new.public_key().as_str().to_owned(),
-        );
-        let post = |root: &str, transition: Option<serde_json::Value>| {
-            let mut body = serde_json::json!({ "root_pubkey": root });
-            if let Some(transition) = transition {
-                body["transition"] = transition;
-            }
-            body.to_string()
-        };
-        let (status, _) = call(
-            &app,
-            "POST",
-            "/account/directory",
-            Some(&post(&old_key, None)),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::CREATED,
-            "the first root is taken on first use"
-        );
-
-        let forged =
-            gaugedesk_directory_protocol::sign_root_transition(&new_key, 5, &other).unwrap();
-        let (status, _) = call(
-            &app,
-            "POST",
-            "/account/directory",
-            Some(&post(
-                &new_key,
-                Some(serde_json::to_value(&forged).unwrap()),
-            )),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::CONFLICT,
-            "not the projected root's statement"
-        );
-
-        let signed = gaugedesk_directory_protocol::sign_root_transition(&new_key, 5, &old).unwrap();
-        let (status, _) = call(
-            &app,
-            "POST",
-            "/account/directory",
-            Some(&post(
-                &new_key,
-                Some(serde_json::to_value(&signed).unwrap()),
-            )),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED);
-        // Republishing the same root keeps the chain.
-        let (status, _) = call(
-            &app,
-            "POST",
-            "/account/directory",
-            Some(&post(&new_key, None)),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED);
-        let (_, body) = call(&app, "GET", "/account/directory", None).await;
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["root_pubkey"], new_key);
-        let chain: Vec<gaugedesk_directory_protocol::RootTransition> =
-            serde_json::from_value(value["transitions"].clone()).unwrap();
-        assert!(gaugedesk_directory_protocol::root_chain_reaches(
-            &old_key, &new_key, &chain
-        ));
-    }
-
-    /// Latest wins, because an account has one root. A rotated key must replace
-    /// rather than accumulate, or a reader would have to choose between two.
-    #[tokio::test]
-    async fn republishing_replaces_the_projected_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let wb = crate::open_workbench(dir.path()).unwrap();
-        let app = routes().with_state(wb);
-        for key in ["ed25519:first", "ed25519:second"] {
+        for (key, expected) in [
+            ("ed25519:first", StatusCode::CREATED),
+            ("ed25519:second", StatusCode::FORBIDDEN),
+            ("ed25519:first", StatusCode::CREATED),
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -1606,12 +1761,12 @@ mod home_directory_tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(response.status(), expected, "{key}");
         }
         let (_, body) = call(&app, "GET", "/account/directory", None).await;
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap()["root_pubkey"],
-            "ed25519:second",
+            "ed25519:first",
         );
     }
 

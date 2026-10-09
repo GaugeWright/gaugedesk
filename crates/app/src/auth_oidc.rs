@@ -2993,10 +2993,13 @@ fn enterprise_sso_for_work_email(
         return Ok(None);
     };
     let mut matches = Vec::new();
-    for scope in store.scope_ids()? {
-        if scope != ORG_SCOPE && !scope.starts_with("org::") {
-            continue;
-        }
+    // The default organization and every tenant organization, read from the
+    // scope index's range rather than by listing every scope in the log.
+    let mut scopes = store.scopes_with_prefix("org::")?;
+    if store.record_scope_head(ORG_SCOPE)? >= 0 {
+        scopes.insert(0, ORG_SCOPE.to_owned());
+    }
+    for scope in scopes {
         let org = Org::rebuild_in(store, &scope)?;
         if org.org.is_none() || org.sso_admission.is_none() || !org.domain_is_verified(&email) {
             continue;

@@ -30,6 +30,75 @@ use serde::{Deserialize, Serialize};
 /// The record kind, in the person's [`ACCOUNT_SCOPE`], indexing the tenants they belong to.
 pub const TENANT_REF_KIND: &str = "tenant_ref";
 
+/// The record kind, in an invited person's account scope, pointing at a named
+/// tenant whose directory holds their `Invited` membership. The directory stays
+/// the truth: a pointer only says which tenant to read, so a stale one —
+/// cancelled, deprovisioned, already accepted — costs one directory read and
+/// shows nothing. It exists so the account shell reads the tenants that invited
+/// this person instead of every tenant on the Hub. Invitations written before
+/// it existed have no pointer and are not listed.
+pub const TENANT_INVITATION_KIND: &str = "tenant_invitation";
+
+/// One pointer from a person's account scope to a tenant that invited them.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TenantInvitationPointer {
+    /// The tenant id — the discriminator of its [`tenant_scope`].
+    pub id: String,
+    #[serde(default)]
+    pub op: RecordOp,
+}
+
+/// The pointer a membership write into `scope` must carry, as
+/// `(account scope, kind, payload)`: an upserted `Invited` membership naming a
+/// person in a named tenant. Anything else needs none.
+pub fn tenant_invitation_pointer_for(
+    scope: &str,
+    record: &MembershipRecord,
+) -> Option<(String, &'static str, String)> {
+    if record.op != RecordOp::Upsert || record.status != MembershipStatus::Invited {
+        return None;
+    }
+    let authority = record.authority.trim();
+    if authority.is_empty() || authority != record.authority {
+        return None;
+    }
+    let tenant_id = scope.strip_prefix("org::")?;
+    if tenant_id.is_empty() || tenant_scope(tenant_id) != scope {
+        return None;
+    }
+    let pointer = TenantInvitationPointer {
+        id: tenant_id.to_owned(),
+        op: RecordOp::Upsert,
+    };
+    Some((
+        crate::account::account_scope(authority),
+        TENANT_INVITATION_KIND,
+        serde_json::to_string(&pointer).expect("invitation pointer serializes"),
+    ))
+}
+
+/// Write `record` into the directory at `scope`, together with the invitee's
+/// pointer when it is an invitation, in one commit.
+pub fn append_membership_in(
+    store: &mut Store,
+    scope: &str,
+    record: &MembershipRecord,
+) -> Result<(), AdmitError> {
+    let membership = serde_json::to_string(record)?;
+    match tenant_invitation_pointer_for(scope, record) {
+        Some((account, kind, pointer)) => {
+            store.append_records_atomically(&[
+                (scope, "membership", membership.as_str()),
+                (account.as_str(), kind, pointer.as_str()),
+            ])?;
+        }
+        None => {
+            store.append_record(scope, "membership", &membership)?;
+        }
+    }
+    Ok(())
+}
+
 /// The **personal tenant** id for a person rooted at `root` — deterministic, so provisioning is
 /// idempotent and the id is stable across the person's devices. Namespaced `personal:` so it can
 /// never collide with a named org tenant.
@@ -121,21 +190,30 @@ impl Tenancy {
     }
 }
 
-/// Derive the signed-in person's outstanding tenant invitations. Only named
-/// tenant scopes are considered: the singleton local `org` scope is not a
-/// hosted workspace and must never appear in the account shell.
+/// Derive the signed-in person's outstanding tenant invitations from the
+/// pointers in their own account scope, confirming each against its tenant's
+/// directory. Only named tenant scopes are considered: the singleton local
+/// `org` scope is not a hosted workspace and must never appear in the account
+/// shell.
 pub fn pending_tenant_invitations_in(
     store: &Store,
     authority: &str,
 ) -> Result<Vec<PendingTenantInvitation>, AdmitError> {
+    let account = crate::account::account_scope(authority);
+    let mut pointed = BTreeMap::<String, RecordOp>::new();
+    for row in store.records(&account, TENANT_INVITATION_KIND)? {
+        let pointer: TenantInvitationPointer = serde_json::from_str(&row)?;
+        pointed.insert(pointer.id, pointer.op);
+    }
     let mut invitations = Vec::new();
-    for scope in store.scope_ids()? {
-        let Some(tenant_id) = scope.strip_prefix("org::") else {
+    for (tenant_id, op) in pointed {
+        if op != RecordOp::Upsert || tenant_id.is_empty() {
             continue;
-        };
-        // Keep the inverse mapping exact even if a malformed scope somehow
-        // reaches the store; no alternate string representation selects a tenant.
-        if tenant_scope(tenant_id) != scope {
+        }
+        let scope = tenant_scope(&tenant_id);
+        // Keep the inverse mapping exact; no alternate string representation
+        // selects a tenant.
+        if scope.strip_prefix("org::") != Some(tenant_id.as_str()) {
             continue;
         }
         let org = Org::rebuild_in(store, &scope)?;
@@ -148,7 +226,7 @@ pub fn pending_tenant_invitations_in(
         };
         if let Some(role) = invitation_role {
             invitations.push(PendingTenantInvitation {
-                tenant_id: tenant_id.to_owned(),
+                tenant_id,
                 display_name: org_record.display_name,
                 role,
             });
@@ -214,6 +292,24 @@ pub fn accept_tenant_invitation_in(
             &account_scope,
             TENANT_REF_KIND,
             serde_json::to_string(&tenant)?,
+        ));
+    }
+    let answered = TenantInvitationPointer {
+        id: tenant_id.to_owned(),
+        op: RecordOp::Tombstone,
+    };
+    let mut pointing = false;
+    for row in store.records(&account_scope, TENANT_INVITATION_KIND)? {
+        let pointer: TenantInvitationPointer = serde_json::from_str(&row)?;
+        if pointer.id == tenant_id {
+            pointing = pointer.op == RecordOp::Upsert;
+        }
+    }
+    if pointing {
+        payloads.push((
+            &account_scope,
+            TENANT_INVITATION_KIND,
+            serde_json::to_string(&answered)?,
         ));
     }
     if !payloads.is_empty() {
@@ -1150,6 +1246,89 @@ mod tests {
     }
 
     #[test]
+    fn invitations_are_read_from_the_invitees_pointers_not_every_tenant() {
+        let mut s = Store::open_in_memory().unwrap();
+        let owner_scope = crate::account::account_scope(ROOT);
+        let pointed = provision_organization(&mut s, ROOT, &owner_scope, "Pointed", None).unwrap();
+        let legacy = provision_organization(&mut s, ROOT, &owner_scope, "Legacy", None).unwrap();
+        let invited = |id: &str| MembershipRecord {
+            id: id.into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: "person:invitee".into(),
+            email: String::new(),
+            role: "member".into(),
+            status: MembershipStatus::Invited,
+            managed_by_scim: false,
+            team: None,
+        };
+        append_membership_in(&mut s, &tenant_scope(&pointed.id), &invited("a")).unwrap();
+        // Written before the index existed: no pointer, so not listed.
+        s.append_record(
+            &tenant_scope(&legacy.id),
+            "membership",
+            &serde_json::to_string(&invited("b")).unwrap(),
+        )
+        .unwrap();
+        let listed = |s: &Store| {
+            pending_tenant_invitations_in(s, "person:invitee")
+                .unwrap()
+                .into_iter()
+                .map(|invitation| invitation.display_name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(&s), vec!["Pointed".to_owned()]);
+
+        // A cancelled invitation leaves its pointer, which now shows nothing.
+        let mut cancelled = invited("a");
+        cancelled.status = MembershipStatus::Deprovisioned;
+        append_membership_in(&mut s, &tenant_scope(&pointed.id), &cancelled).unwrap();
+        assert!(listed(&s).is_empty());
+
+        // Only an invitation of a named person into a named tenant points.
+        let mut active = invited("c");
+        active.status = MembershipStatus::Active;
+        assert!(tenant_invitation_pointer_for(&tenant_scope(&pointed.id), &active).is_none());
+        let mut unnamed = invited("d");
+        unnamed.authority = String::new();
+        assert!(tenant_invitation_pointer_for(&tenant_scope(&pointed.id), &unnamed).is_none());
+        assert!(tenant_invitation_pointer_for(crate::org::ORG_SCOPE, &invited("e")).is_none());
+    }
+
+    #[test]
+    fn accepting_an_invitation_retires_its_pointer_once() {
+        let mut s = Store::open_in_memory().unwrap();
+        let owner_scope = crate::account::account_scope(ROOT);
+        let tenant = provision_organization(&mut s, ROOT, &owner_scope, "Acme", None).unwrap();
+        let invited = MembershipRecord {
+            id: "invitee".into(),
+            op: RecordOp::Upsert,
+            org_id: ORG_ID.into(),
+            authority: "person:invitee".into(),
+            email: String::new(),
+            role: "member".into(),
+            status: MembershipStatus::Invited,
+            managed_by_scim: false,
+            team: None,
+        };
+        append_membership_in(&mut s, &tenant_scope(&tenant.id), &invited).unwrap();
+        let account = crate::account::account_scope("person:invitee");
+        accept_tenant_invitation_in(&mut s, "person:invitee", &tenant.id)
+            .unwrap()
+            .unwrap();
+        let pointers = s.records(&account, TENANT_INVITATION_KIND).unwrap();
+        assert_eq!(pointers.len(), 2, "the pointer and its tombstone");
+        accept_tenant_invitation_in(&mut s, "person:invitee", &tenant.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.records(&account, TENANT_INVITATION_KIND).unwrap().len(),
+            2,
+            "a retry writes no second tombstone"
+        );
+    }
+
+    #[test]
     fn tenant_invitation_is_metadata_only_and_acceptance_is_atomic_and_idempotent() {
         let mut s = Store::open_in_memory().unwrap();
         let owner_scope = crate::account::account_scope(ROOT);
@@ -1167,12 +1346,7 @@ mod tests {
             team: None,
         };
         let tenant_scope = tenant_scope(&tenant.id);
-        s.append_record(
-            &tenant_scope,
-            "membership",
-            &serde_json::to_string(&invited).unwrap(),
-        )
-        .unwrap();
+        append_membership_in(&mut s, &tenant_scope, &invited).unwrap();
 
         // The shell sees only the tenant pointer and role; neither email nor
         // directory record id are duplicated into account state.

@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::*;
+use crate::account_link_seal::seal_link_copy;
 use crate::account_links::{self, LinkSet};
 
 const PERSON: &str = "acct-person";
@@ -634,4 +635,162 @@ fn a_home_drops_what_the_account_takes_away_and_only_that() {
     mac.authority.revoke("openai").unwrap();
     assert_eq!(home.reconcile().removed, vec!["openai".to_owned()]);
     assert_eq!(home.token("xai").as_deref(), Some("sk-home-own"));
+}
+
+/// A refused copy is independent of the account's authenticated current roster.
+#[test]
+fn home_copy_failure_does_not_postpone_revoked_link_cleanup() {
+    let set = Authority::shared();
+    let mac = Desktop::new(&set, "device:mac");
+    let home = HostedHome::new(&set);
+    mac.reconcile();
+    mac.link_for_homes("revoked", "secret-revoked");
+    mac.publish_link("revoked").unwrap();
+    mac.link_for_homes("edited", "secret-mirrored");
+    mac.publish_link("edited").unwrap();
+    home.reconcile();
+    // A taken link edited on this Home is now the person's own, even when
+    // the account subsequently stops serving its old mirrored version.
+    {
+        let mut guard = home.wb.lock_unpoisoned();
+        let sealed = guard.seal_account_secret("secret-home-edit").unwrap();
+        guard
+            .upsert_account_credential_in_with_policy(
+                &home.scope(),
+                "edited".into(),
+                sealed,
+                String::new(),
+                BTreeSet::from([ModelExecutionClass::PrivateHome]),
+            )
+            .unwrap();
+    }
+    mac.authority.revoke("revoked").unwrap();
+    mac.authority.revoke("edited").unwrap();
+    for (provider, secret) in [("bad", "secret-bad"), ("good", "secret-good")] {
+        mac.link_for_homes(provider, secret);
+        mac.publish_link(provider).unwrap();
+    }
+    set.borrow_mut()
+        .copies
+        .values_mut()
+        .find(|copy| copy.provider == "bad" && copy.copy.device_id == HOME)
+        .unwrap()
+        .copy
+        .ciphertext = "malformed ciphertext".into();
+    // An unreachable authority still gives no permission to remove anything.
+    home.reachable.set(false);
+    assert!(reconcile_home(&home.wb, HOME, &home.scope(), &home.key, &home).is_err());
+    assert_eq!(home.token("revoked").as_deref(), Some("secret-revoked"));
+    home.reachable.set(true);
+    let done = home.reconcile();
+    assert_eq!(done.removed, ["revoked"]);
+    assert_eq!(done.taken, ["good"]);
+    assert_eq!(
+        done.failed,
+        [HomeCopyFailure {
+            provider: "bad".into(),
+            reason: HomeCopyFailureReason::CopyDidNotOpen,
+        }]
+    );
+    assert_eq!(home.token("revoked"), None);
+    assert_eq!(home.token("bad"), None);
+    assert_eq!(home.token("edited").as_deref(), Some("secret-home-edit"));
+    assert_eq!(home.token("good").as_deref(), Some("secret-good"));
+    let report = format!("{done:?}");
+    for secret in [
+        "secret-revoked",
+        "secret-bad",
+        "secret-good",
+        "secret-home-edit",
+        "secret-mirrored",
+        "malformed ciphertext",
+    ] {
+        assert!(!report.contains(secret));
+    }
+}
+
+#[test]
+fn home_key_unwrap_failure_still_removes_revoked_links() {
+    let set = Authority::shared();
+    let mac = Desktop::new(&set, "device:mac");
+    let home = HostedHome::new(&set);
+    mac.reconcile();
+    mac.link_for_homes("revoked", "old-secret");
+    mac.publish_link("revoked").unwrap();
+    home.reconcile();
+    mac.authority.revoke("revoked").unwrap();
+    mac.link_for_homes("waiting", "new-secret");
+    mac.publish_link("waiting").unwrap();
+    // The real persisted seed is wrapped to another KEK, so AES-GCM unwrap fails.
+    let unavailable = crate::account_link_seal::HomeLinkRecipientKey::new(
+        home._root.path().join("keys/account-link/home.recipient"),
+        Box::new(crate::at_rest::LoopbackKeyWrap::generate().unwrap()),
+    );
+    assert!(unavailable.open().is_err());
+    let done = reconcile_home(&home.wb, HOME, &home.scope(), &unavailable, &home).unwrap();
+    assert_eq!(done.removed, ["revoked"]);
+    assert_eq!(
+        done.failed,
+        [HomeCopyFailure {
+            provider: "waiting".into(),
+            reason: HomeCopyFailureReason::RecipientKeyUnavailable,
+        }]
+    );
+    assert!(done.taken.is_empty());
+    assert_eq!(home.token("revoked"), None);
+    assert_eq!(home.token("waiting"), None);
+}
+
+#[test]
+fn invalid_context_and_nontext_copies_are_reported_without_blocking_cleanup() {
+    struct Listed(HomeLinks);
+    impl HomeLinkSource for Listed {
+        fn home_links(&self, _: &str) -> Result<Option<HomeLinks>, String> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+    for nontext in [false, true] {
+        let set = Authority::shared();
+        let mac = Desktop::new(&set, "device:mac");
+        let home = HostedHome::new(&set);
+        mac.reconcile();
+        mac.link_for_homes("revoked", "secret-old");
+        mac.publish_link("revoked").unwrap();
+        home.reconcile();
+        mac.authority.revoke("revoked").unwrap();
+        mac.link_for_homes("unopened", "secret-unopened");
+        mac.publish_link("unopened").unwrap();
+        let mut listed = home.home_links(HOME).unwrap().unwrap();
+        let link = listed
+            .links
+            .iter_mut()
+            .find(|link| link.provider == "unopened")
+            .unwrap();
+        if nontext {
+            let recipient = LinkRecipient::new(HOME, home.key.ensure().unwrap()).unwrap();
+            link.copy = Some(
+                seal_link_copy(
+                    &LinkContext::new(PERSON, "unopened", link.version).unwrap(),
+                    &[0xff, 0xfe],
+                    &recipient,
+                )
+                .unwrap(),
+            );
+        } else {
+            link.version = 0;
+        }
+        let done =
+            reconcile_home(&home.wb, HOME, &home.scope(), &home.key, &Listed(listed)).unwrap();
+        assert_eq!(done.removed, ["revoked"]);
+        assert_eq!(
+            done.failed[0].reason,
+            if nontext {
+                HomeCopyFailureReason::SecretIsNotText
+            } else {
+                HomeCopyFailureReason::InvalidContext
+            }
+        );
+        assert_eq!(home.token("revoked"), None);
+        assert_eq!(home.token("unopened"), None);
+    }
 }

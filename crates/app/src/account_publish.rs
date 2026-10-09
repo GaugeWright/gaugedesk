@@ -369,6 +369,13 @@ pub fn publish_from_here(
             .account_signed_entry(account, &keys, generation, vouched)
             .ok_or_else(|| "this computer's entry could not be signed".to_owned())?
     };
+    // This entry is signed under `root` and published before the Hub is told
+    // of `root`. That is safe only while the Hub takes the announcement at
+    // once: readers follow the root the Hub projects, and a hand-over away
+    // from a root an enrolled computer proved waits 72 hours with notice
+    // (DR-0464). A client that rotates such a root must keep signing under
+    // the settled root while its hand-over waits; none rotates one yet
+    // (WS-984).
     crate::directory_sync::publish(&http, directory, &put)?;
 
     let transition = match announce {
@@ -402,14 +409,23 @@ pub fn publish_from_here(
             crate::root_publication::prove(&challenge, &root, &keys.device, &keys.delegation);
         body["proof"] = serde_json::to_value(proof).map_err(|e| e.to_string())?;
     }
-    let announced = matches!(
-        http.post_json_headers(
-            &format!("{hub}/account/directory"),
-            &headers,
-            &body.to_string()
-        ),
-        Ok((200..=299, _))
-    );
+    let announced = match http.post_json_headers(
+        &format!("{hub}/account/directory"),
+        &headers,
+        &body.to_string(),
+    ) {
+        // The Hub holds the hand-over before taking it (DR-0464): the root is
+        // not announced, and the next publish tries again, as after a failed
+        // announcement.
+        Ok((202, _)) => {
+            tracing::info!(
+                "the Hub holds this account's root hand-over until it takes effect; the root is not announced yet"
+            );
+            false
+        }
+        Ok((200..=299, _)) => true,
+        _ => false,
+    };
     Ok(Published::Entry {
         root,
         generation,

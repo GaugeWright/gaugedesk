@@ -907,8 +907,7 @@ pub(crate) fn write_membership(
         ));
     }
     let op = op_str(r.op);
-    wb.store_mut()
-        .append_record(scope, "membership", &serde_json::to_string(r).unwrap())?;
+    gaugedesk_app::tenancy::append_membership_in(wb.store_mut(), scope, r)?;
     wb.notify_library_changed("membership", &r.id, op);
     Ok(())
 }

@@ -63,6 +63,16 @@ pub trait EmailChallengeSender: Send + Sync {
     ) -> Result<(), String> {
         Err("this deployment does not send invitations".to_owned())
     }
+    /// Tell one of an account's verified addresses that a root hand-over is
+    /// waiting to take effect, naming the computer that submitted it and when
+    /// (DR-0464 §2). It carries no key and grants nothing.
+    fn send_root_hand_over_notice(
+        &self,
+        _to: &str,
+        _notice: &crate::root_hand_over::RootHandOverNotice,
+    ) -> Result<(), String> {
+        Err("this deployment does not send root hand-over notices".to_owned())
+    }
 }
 
 /// Provider-neutral delivery relay. Deployments choose the mail provider
@@ -117,6 +127,22 @@ impl EmailChallengeSender for TestFileEmailChallengeSender {
         std::fs::write(&self.path, body)
             .map_err(|error| format!("test email delivery failed: {error}"))
     }
+    fn send_root_hand_over_notice(
+        &self,
+        to: &str,
+        notice: &crate::root_hand_over::RootHandOverNotice,
+    ) -> Result<(), String> {
+        let body = serde_json::to_vec(&json!({
+            "email": to,
+            "kind": notice.kind.as_str(),
+            "computer": notice.computer,
+            "effective_at_ms": notice.effective_at_ms,
+            "purpose": "root-hand-over",
+        }))
+        .map_err(|error| format!("test email serialization failed: {error}"))?;
+        std::fs::write(&self.path, body)
+            .map_err(|error| format!("test email delivery failed: {error}"))
+    }
 }
 
 impl EmailChallengeSender for WebhookEmailChallengeSender {
@@ -133,6 +159,19 @@ impl EmailChallengeSender for WebhookEmailChallengeSender {
             "template": "gaugedesk-project-invitation",
             "inviter": inviter,
             "link": link,
+        }))
+    }
+    fn send_root_hand_over_notice(
+        &self,
+        to: &str,
+        notice: &crate::root_hand_over::RootHandOverNotice,
+    ) -> Result<(), String> {
+        self.post(json!({
+            "to": to,
+            "template": crate::root_hand_over::NOTICE_TEMPLATE,
+            "kind": notice.kind.as_str(),
+            "computer": notice.computer,
+            "effective_at_ms": notice.effective_at_ms,
         }))
     }
 }
@@ -157,6 +196,26 @@ impl WebhookEmailChallengeSender {
             .map(|_| ())
             .map_err(|error| format!("email delivery failed: {error}"))
     }
+}
+
+/// The account-mail relay this deployment names: the HTTPS webhook, or in a
+/// debug build reset for browser acceptance, the test outbox file. `None`
+/// when neither is configured.
+pub(crate) fn email_sender_from_env() -> Option<Arc<dyn EmailChallengeSender>> {
+    #[cfg(debug_assertions)]
+    if gaugedesk_env::enabled("TEST_RESET") {
+        if let Some(path) = gaugedesk_env::var_os("TEST_AUTH_EMAIL_OUTBOX") {
+            return Some(Arc::new(TestFileEmailChallengeSender { path: path.into() }));
+        }
+    }
+    let endpoint = gaugedesk_env::var("AUTH_EMAIL_WEBHOOK_URL")?;
+    if !endpoint.starts_with("https://") {
+        return None;
+    }
+    Some(Arc::new(WebhookEmailChallengeSender {
+        endpoint,
+        bearer: gaugedesk_env::var("AUTH_EMAIL_WEBHOOK_TOKEN"),
+    }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,23 +497,8 @@ impl AccountAuthRuntime {
     pub fn from_env() -> Option<Arc<Self>> {
         let rp_id = gaugedesk_env::var("ACCOUNT_RP_ID")?;
         let origin = gaugedesk_env::var("ACCOUNT_ORIGIN")?;
-        #[cfg(debug_assertions)]
-        if gaugedesk_env::enabled("TEST_RESET") {
-            if let Some(path) = gaugedesk_env::var_os("TEST_AUTH_EMAIL_OUTBOX") {
-                let config = AccountAuthConfig::new(&rp_id, "GaugeDesk", &origin).ok()?;
-                let sender = Arc::new(TestFileEmailChallengeSender { path: path.into() });
-                return Self::new(config, sender).ok().map(Arc::new);
-            }
-        }
-        let endpoint = gaugedesk_env::var("AUTH_EMAIL_WEBHOOK_URL")?;
-        if !endpoint.starts_with("https://") {
-            return None;
-        }
+        let sender = email_sender_from_env()?;
         let config = AccountAuthConfig::new(&rp_id, "GaugeDesk", &origin).ok()?;
-        let sender = Arc::new(WebhookEmailChallengeSender {
-            endpoint,
-            bearer: gaugedesk_env::var("AUTH_EMAIL_WEBHOOK_TOKEN"),
-        });
         Self::new(config, sender).ok().map(Arc::new)
     }
 

@@ -417,13 +417,15 @@ pub struct RegisteredHomeRecord {
 /// it is only ever a **public** key: publishing it grants nothing, which is why
 /// it may live in an account projection a page can read.
 ///
-/// What this record cannot do is prove itself. Anyone holding the person's
-/// bearer can write one, and a proof of possession would not help, because an
-/// attacker signs their own key with their own root just as validly. The
-/// defence is entirely on the reading side — a browser pins on first sight and
-/// treats a later change as an alarm ([ADR 0132](../../../specs/decisions/0132-a-browser-pins-the-account-root-key.md)) —
-/// and stating that here is the point, because a reader who mistook this for an
-/// authenticated value would be trusting it for more than it can carry.
+/// What this record cannot do is prove itself to a reader. An account's first
+/// root is trust-on-first-use at the Hub: before any is projected there is
+/// nothing root-bound to check a publisher against (ADR 0133 §2). After that a
+/// replacement needs the outgoing root's signed hand-over and an enrolled
+/// computer's proof, and away from a proven root it waits 72 hours with notice
+/// (DR-0464). A reader still pins on first sight and treats a change no
+/// served transition explains as an alarm ([ADR 0132](../../../specs/decisions/0132-a-browser-pins-the-account-root-key.md)),
+/// because a reader who mistook this for an authenticated value would be
+/// trusting it for more than it can carry.
 pub const DIRECTORY_RECORD_KIND: &str = "account_directory";
 /// Record kind for a paired TokenWright box. Written into the person's own
 /// account scope, so `crypto_erase_content` covers it without naming it — an
@@ -450,6 +452,13 @@ pub struct AccountDirectoryRecord {
     /// the changed-root alarm (ADR 0133 §3, DR-0361).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transitions: Vec<gaugedesk_directory_protocol::RootTransition>,
+    /// Whether an enrolled device of the account proved this root when it was
+    /// accepted (ADR 0133 §2). A hand-over away from a proven root waits, and
+    /// one away from a root no device proved — a claimed computer's
+    /// install-derived key — is taken at once (DR-0464 §1). Records written
+    /// before this existed read as unproven.
+    #[serde(default)]
+    pub proven: bool,
 }
 
 /// The blind account-plane route for one granted project.
@@ -514,6 +523,9 @@ pub struct Account {
     /// Absent until a root-holding client publishes it, which is the ordinary
     /// state for an account that has never enabled library sync.
     pub directory: Option<AccountDirectoryRecord>,
+    /// The account's latest root hand-over, pending or not (DR-0464). Never
+    /// served as a transition until it has taken effect.
+    pub root_hand_over: Option<crate::root_hand_over::RootHandOverRecord>,
     pub managed_inference_plan: Option<crate::managed_inference::ManagedInferencePlan>,
 }
 
@@ -629,6 +641,12 @@ impl Account {
             fold(&mut directory, r.id.clone(), r.op, r);
         }
         acct.directory = directory.remove(DIRECTORY_RECORD_ID);
+        let mut hand_overs = BTreeMap::new();
+        for row in records(crate::root_hand_over::ROOT_HAND_OVER_RECORD_KIND)? {
+            let r: crate::root_hand_over::RootHandOverRecord = serde_json::from_str(&row)?;
+            fold(&mut hand_overs, r.id.clone(), r.op, r);
+        }
+        acct.root_hand_over = hand_overs.remove(crate::root_hand_over::ROOT_HAND_OVER_RECORD_ID);
         acct.managed_inference_plan = crate::managed_inference::fold_plan_rows(records(
             crate::managed_inference::MANAGED_PLAN_KIND,
         )?)?;
@@ -1675,7 +1693,25 @@ impl Workbench {
         record.op = RecordOp::Upsert;
         record.status = DeviceStatus::Revoked;
         let id = record.id.clone();
-        self.write_account_record_in(scope, "device", &id, &record)?;
+        // A root hand-over it submitted is withdrawn with it, in the same
+        // write (DR-0464 §7).
+        match crate::root_hand_over::withdrawn_by(&account, &id, "revoked", session_now_ms()) {
+            None => self.write_account_record_in(scope, "device", &id, &record)?,
+            Some(withdrawn) => {
+                let device = serde_json::to_string(&record).expect("device record serializes");
+                let hand_over =
+                    serde_json::to_string(&withdrawn).expect("hand-over record serializes");
+                self.store_mut().append_records_atomically(&[
+                    (scope, "device", device.as_str()),
+                    (
+                        scope,
+                        crate::root_hand_over::ROOT_HAND_OVER_RECORD_KIND,
+                        hand_over.as_str(),
+                    ),
+                ])?;
+                self.notify_library_changed("account", &id, "upsert");
+            }
+        }
         // Revoking a device revokes the sessions bound to it (ADR 0147 §3): tombstone
         // every refresh grant whose stored `device_id` names this device. Idempotent
         // when the device holds no grant.

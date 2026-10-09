@@ -83,6 +83,8 @@ struct Directory {
 struct Hub {
     root: Option<String>,
     transitions: Vec<RootTransition>,
+    /// Answer a publication as a Hub holding a hand-over does (DR-0464).
+    holds: bool,
 }
 
 #[derive(Clone, Default)]
@@ -154,6 +156,9 @@ async fn post_projection(State(world): State<World>, Json(body): Json<Value>) ->
     if crate::root_publication::verify(&proof, "acct", &root, "", true, now_secs()).is_err() {
         return StatusCode::FORBIDDEN;
     }
+    if hub.holds {
+        return StatusCode::ACCEPTED;
+    }
     if let Some(transition) = body.get("transition") {
         let transition: RootTransition = serde_json::from_value(transition.clone()).unwrap();
         if !gaugedesk_directory_protocol::root_transition_verifies(&transition)
@@ -182,6 +187,11 @@ fn serve(world: &World) -> String {
             axum::routing::post(post_challenge),
         )
         .with_state(world.clone());
+    listen(app)
+}
+
+/// Serve `app` on a thread of its own, since the publisher blocks.
+fn listen(app: Router) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -345,14 +355,7 @@ fn the_claimant_moves_off_the_install_key_under_a_hand_over_it_signs() {
         .as_str()
         .to_owned();
     world.hub.lock().unwrap().root = Some(install.clone());
-    wb.lock_unpoisoned()
-        .store_mut()
-        .append_record(
-            crate::account::ACCOUNT_SCOPE,
-            crate::project_owner::INSTALL_SCOPE_OWNER_KIND,
-            &json!({ "account": "acct-claimant" }).to_string(),
-        )
-        .unwrap();
+    claim(&wb, CLAIMANT);
 
     // Another account on the same computer cannot move the claimant's root.
     assert_eq!(
@@ -362,7 +365,7 @@ fn the_claimant_moves_off_the_install_key_under_a_hand_over_it_signs() {
 
     let Published::Entry {
         root, announced, ..
-    } = publish_from_here(&wb, "acct-claimant", &base, "bearer", &base).unwrap()
+    } = publish_from_here(&wb, CLAIMANT, &base, "bearer", &base).unwrap()
     else {
         panic!("the claimant publishes under fresh keys");
     };
@@ -374,6 +377,135 @@ fn the_claimant_moves_off_the_install_key_under_a_hand_over_it_signs() {
         &root,
         &hub.transitions
     ));
+}
+
+const CLAIMANT: &str = "acct-claimant";
+
+fn claim(wb: &SharedWorkbench, account: &str) {
+    wb.lock_unpoisoned()
+        .store_mut()
+        .append_record(
+            crate::account::ACCOUNT_SCOPE,
+            crate::project_owner::INSTALL_SCOPE_OWNER_KIND,
+            &json!({ "account": account }).to_string(),
+        )
+        .unwrap();
+}
+
+/// The Hub's own account plane, in Hub mode, with the claimant's computer
+/// enrolled and signed in over a session bound to it. Returns the Hub's
+/// address and that session's bearer.
+fn serve_hub(hub: &SharedWorkbench) -> (String, String) {
+    let bearer = {
+        let mut guard = hub.lock_unpoisoned();
+        guard.enable_hosted_home_mode();
+        guard
+            .upsert_account_device_in(
+                &crate::account::account_scope(CLAIMANT),
+                &crate::account::DeviceRecord {
+                    id: "device:claimed".into(),
+                    op: crate::account::RecordOp::Upsert,
+                    label: "Claimed computer".into(),
+                    kind: crate::account::DeviceKind::Computer,
+                    subkey_pubkey: String::new(),
+                    status: crate::account::DeviceStatus::Active,
+                    enrolled_at: 1,
+                },
+            )
+            .unwrap();
+        let token = guard
+            .mint_account_session(CLAIMANT, "passkey", 3600)
+            .unwrap();
+        let session = crate::account_session::session_id(&token);
+        assert!(guard.bind_account_session_device(&session, CLAIMANT, "device:claimed"));
+        token
+    };
+    (
+        listen(crate::account_routes::hub_routes().with_state(hub.clone())),
+        bearer,
+    )
+}
+
+/// DR-0464 §1, end to end against the Hub's own routes. A claimed computer's
+/// install key reaches the Hub without a proof — `announce_directory_root`
+/// and `first_home::publish_root` send none, and `publish_from_here` proves
+/// only the account's own root — so the Hub never counts it proven, and the
+/// claimant's move off it through this desktop's publish path is taken at
+/// once rather than held 72 hours.
+#[test]
+fn the_hub_takes_a_claimants_move_off_the_install_key_at_once() {
+    let world = World::default();
+    let directory = serve(&world);
+    let (_hub_root, hub_wb) = computer();
+    let (hub, bearer) = serve_hub(&hub_wb);
+    let (_root, wb) = computer();
+    claim(&wb, CLAIMANT);
+    let install = wb
+        .lock_unpoisoned()
+        .governance_public_key()
+        .as_str()
+        .to_owned();
+    let http = HttpClient::new();
+    let headers = [("authorization".to_owned(), format!("Bearer {bearer}"))];
+    let announced_install = http
+        .post_json_headers(
+            &format!("{hub}/account/directory"),
+            &headers,
+            &json!({ "root_pubkey": install, "origin": directory }).to_string(),
+        )
+        .unwrap();
+    assert_eq!(announced_install.0, 201, "{}", announced_install.1);
+
+    let Published::Entry {
+        root, announced, ..
+    } = publish_from_here(&wb, CLAIMANT, &hub, &bearer, &directory).unwrap()
+    else {
+        panic!("the claimant publishes under fresh keys");
+    };
+    assert!(announced, "the Hub took the move at once");
+    let (status, body) = http
+        .get_string_headers(&format!("{hub}/account/directory"), &headers)
+        .unwrap();
+    assert_eq!(status, 200);
+    let projection: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(projection["root_pubkey"], root);
+    let chain: Vec<RootTransition> =
+        serde_json::from_value(projection["transitions"].clone()).unwrap();
+    assert!(gaugedesk_directory_protocol::root_chain_reaches(
+        &install, &root, &chain
+    ));
+    let (status, _) = http
+        .get_string_headers(&format!("{hub}/account/directory/pending"), &headers)
+        .unwrap();
+    assert_eq!(status, 204);
+    let account = crate::account::Account::rebuild_in(
+        hub_wb.lock_unpoisoned().store_ref(),
+        &crate::account::account_scope(CLAIMANT),
+    )
+    .unwrap();
+    assert!(
+        account.directory.unwrap().proven,
+        "the account's own root is"
+    );
+    assert!(account.root_hand_over.is_none());
+}
+
+/// A Hub that holds the hand-over answers 202 (DR-0464). That is not an
+/// announcement: this computer records none, and its next publish tries
+/// again, as after a failed one.
+#[test]
+fn a_root_the_hub_holds_is_not_announced() {
+    let world = World::default();
+    world.hub.lock().unwrap().holds = true;
+    let base = serve(&world);
+    let (_root, wb) = computer();
+    let Published::Entry { announced, .. } =
+        publish_from_here(&wb, "acct-a", &base, "bearer", &base).unwrap()
+    else {
+        panic!("the first computer publishes its entry");
+    };
+    assert!(!announced);
+    assert_eq!(world.hub.lock().unwrap().root, None);
 }
 
 #[test]

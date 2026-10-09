@@ -95,6 +95,7 @@ export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
             testAttr="model"
             stacked={props.stacked}
             rowLabel="Model"
+            foldItem="model"
           >
             {(close) => (
               <>
@@ -152,7 +153,7 @@ export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
                        and its place in the row so the composer does not appear
                        to lose a setting, while saying the value is decided
                        elsewhere. */
-          <span class="composer-menu-anchor" classList={{ row: props.stacked }}>
+          <span class="composer-menu-anchor" classList={{ row: props.stacked }} data-fold-item="model">
             <Show when={props.stacked}>
               <span class="composer-menu-row-label">Model</span>
             </Show>
@@ -174,6 +175,7 @@ export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
           testAttr="effort"
           stacked={props.stacked}
           rowLabel="Effort"
+          foldItem="effort"
         >
           {(close) => (
             // `auto` leads because it is the unpinned state: getting back

@@ -199,6 +199,10 @@ pub struct Workbench {
     /// launch scope, or `project::<id>` for every launch in a project.
     pub(crate) project_workflow_changed: broadcast::Sender<String>,
     pub(crate) project_workflow_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this composition's root hand-over sweeper runs, and its wake
+    /// for a hand-over just submitted (DR-0464).
+    pub(crate) root_hand_over_sweeping: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) root_hand_over_submitted: Arc<tokio::sync::Notify>,
     /// Which projects members used lately, shared by every composition so a
     /// request is counted once however many layers see it (DR-0312).
     pub(crate) member_use: crate::key_delegation::MemberUse,
@@ -538,6 +542,8 @@ impl Workbench {
             native_editor_dispatch_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             project_workflow_changed: broadcast::channel(64).0,
             project_workflow_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            root_hand_over_sweeping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            root_hand_over_submitted: Arc::new(tokio::sync::Notify::new()),
             member_use: Default::default(),
             managed_funding_authority: None,
             #[cfg(test)]

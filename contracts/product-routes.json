@@ -3810,6 +3810,42 @@
       }
     },
     {
+      "id": "account.directory.pending.read",
+      "jurisdiction": "hosted-person-account",
+      "transport": "http-json",
+      "method": "GET",
+      "path": "/account/directory/pending",
+      "producer": "gaugedesk-app account_routes",
+      "consumer": "the desktop's root hand-over notice (DR-0464 §2, WS-984)",
+      "authentication": "valid-account-session-cookie-or-bearer",
+      "scope": "authenticated-person-account",
+      "capability": "read-own-pending-root-hand-over",
+      "requestSchema": "http/empty",
+      "responseSchema": "gw://schemas/account/root-hand-over-pending/v1",
+      "sideEffect": "none",
+      "risk": "important",
+      "compatibility": {
+        "contractVersion": 1,
+        "minimumConsumer": 1,
+        "maximumConsumer": null
+      },
+      "evidence": {
+        "contract": [
+          "crates/app/src/root_hand_over_tests.rs#a_hand_over_away_from_a_proven_root_waits_72_hours_from_its_notice"
+        ],
+        "authority": [
+          "crates/app/src/root_hand_over_tests.rs#revoking_the_submitting_computer_withdraws_its_hand_over"
+        ],
+        "journey": [
+          "crates/app/src/root_hand_over_tests.rs#a_hand_over_away_from_a_proven_root_waits_72_hours_from_its_notice"
+        ],
+        "deployed": [],
+        "property": [
+          "crates/app/src/root_hand_over_tests.rs#a_second_hand_over_is_refused_while_one_is_pending_and_the_same_one_is_idempotent"
+        ]
+      }
+    },
+    {
       "id": "account.home-routes.publish",
       "jurisdiction": "hosted-person-account",
       "transport": "http-json",

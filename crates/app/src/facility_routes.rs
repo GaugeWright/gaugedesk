@@ -778,13 +778,12 @@ mod tests {
             managed_by_scim: false,
             team: None,
         };
-        store
-            .append_record(
-                &crate::org::tenant_scope(&tenant.id),
-                "membership",
-                &serde_json::to_string(&membership).unwrap(),
-            )
-            .unwrap();
+        crate::tenancy::append_membership_in(
+            &mut store,
+            &crate::org::tenant_scope(&tenant.id),
+            &membership,
+        )
+        .unwrap();
         let wb: SharedWorkbench = Arc::new(Mutex::new(Workbench::new(store)));
         let app = router_with(wb);
 

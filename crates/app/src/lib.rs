@@ -153,6 +153,7 @@ pub mod resolution_recording_policy;
 pub mod resource_store;
 pub(crate) mod retained_scope;
 mod retained_signin_log;
+pub mod root_hand_over;
 pub mod root_publication;
 pub mod roster;
 pub mod secret;

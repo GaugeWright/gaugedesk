@@ -1374,14 +1374,33 @@ input {
 .composer-deliver .stop-btn { margin-left: 9px; }
 
 /* The rail carries what the turn runs *on*, and how much of the window it is
-   carrying. It never wraps: below COMPACT_RAIL_WIDTH the component folds tools
-   and settings behind one expander instead, so delivery is never crushed. */
+   carrying. It never wraps: when it runs out of room the component folds its
+   settings behind one expander, one at a time and the model last
+   (ChatComposer's FOLD_ORDER), so delivery is never crushed. */
 .composer-rail { display: flex; align-items: center; gap: 8px; min-width: 0;
     padding: 0 5px 4px 4px; }
-.composer-tools { display: flex; align-items: center; gap: 2px; min-width: 0; }
-/* Everything describing the next turn collects at the far end: model, effort,
-   what Enter does, and how full the window is. One statement about the run,
-   rather than settings scattered either side of an empty middle. */
+/* The field names what has folded in `data-folded`. A folded control leaves
+   the rail for the expander; an unfolded one is on the rail alone, so the
+   expander lists only what is missing, and is itself missing while nothing is.
+   The notes a preview chat carries in the model's toolbar go where it goes. */
+.composer-field[data-folded~="effort"] [data-fold-item="effort"]:not(.composer-more *),
+.composer-field[data-folded~="mode"] [data-fold-item="mode"]:not(.composer-more *),
+.composer-field[data-folded~="attach"] [data-fold-item="attach"]:not(.composer-more *),
+.composer-field[data-folded~="model"] :is([data-fold-item="model"], .composer-preview-note):not(.composer-more *),
+.composer-field:not([data-folded~="effort"]) .composer-more [data-fold-item="effort"],
+.composer-field:not([data-folded~="mode"]) .composer-more [data-fold-item="mode"],
+.composer-field:not([data-folded~="attach"]) .composer-more [data-fold-item="attach"],
+.composer-field:not([data-folded~="model"]) .composer-more :is([data-fold-item="model"], .composer-preview-note),
+.composer-field:not([data-folded]) .composer-more-anchor { display: none; }
+/* Measuring: the rail at its natural width, for the component to compare with
+   the room it has. A note wraps to whatever it is given, so it claims none.
+   `tight` asks whether the model fits once its name may end in an ellipsis. */
+.composer-field.measuring .composer-rail { width: max-content; }
+.composer-field.measuring .composer-preview-note { display: none; }
+.composer-field.measuring.tight [data-fold-item="model"] > .composer-menu-btn { max-width: 10ch; }
+.composer-tools { position: relative; display: flex; align-items: center; gap: 2px; min-width: 0; }
+/* The delivery end: what Enter does, and how full the window is. Model and
+   effort describe the run and sit at the reading start, beside attach. */
 .composer-settings { display: flex; align-items: center; gap: 4px; margin-left: auto;
     flex: 0 0 auto; }
 .composer-models { display: flex; align-items: center; gap: 2px; min-width: 0; }
@@ -1493,12 +1512,9 @@ input {
     border: 1px solid var(--edge); border-radius: 8px; background: var(--panel);
     box-shadow: 0 14px 36px rgba(0,0,0,0.42); }
 /* Right-anchored: the mode control sits at the delivery end of the field, so a
-   left-anchored menu hangs off the panel. The settings menus at the reading end
-   anchor left for the same reason, mirrored. */
-/* Settings live at the delivery end of the rail now, so their menus hang off the
-   right of the button. Left-anchored, effort and Enter opened past the panel
-   edge. The compact expander keeps its own left anchor — it sits at the reading
-   start, where there is room to the right. */
+   left-anchored menu hangs off the panel. Model, effort and the expander sit at
+   the reading start, where there is room to the right, and anchor left for the
+   same reason, mirrored. */
 .composer-settings .composer-menu { left: auto; right: 0; }
 .composer-menu-item { display: flex; width: 100%; align-items: center; justify-content: space-between;
     gap: 12px; padding: 5px 7px; border: 0; border-radius: 5px; background: transparent;
@@ -1518,16 +1534,19 @@ input {
 .composer-menu-item > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-menu-item small { flex: 0 0 auto; color: var(--muted); font-size: var(--fs-label);
     text-transform: uppercase; letter-spacing: 0.05em; }
-/* Inside the compact expander the two settings become labelled rows. */
+/* Inside the expander the settings become labelled rows. */
 .composer-menu-anchor.row { display: grid; grid-template-columns: auto minmax(0, 1fr);
     align-items: center; gap: 8px; padding: 2px 3px; }
 .composer-menu-row-label { color: var(--muted); font-size: var(--fs-label);
     text-transform: uppercase; letter-spacing: 0.05em; }
 .composer-menu-anchor.row .composer-menu-btn { justify-self: end; }
 
-/* The narrow-rail expander. Its menu lets the settings' own menus escape rather
-   than clipping them, so the nested popovers still open above the field. */
-.composer-more-anchor { position: relative; display: inline-flex; }
+/* The rail's expander. Its button sits after whatever is still on the rail, so
+   its menu hangs from the start of the tools rather than from the button: hung
+   from a button beside the model, it ran off the panel's far edge. It lets the
+   settings' own menus escape rather than clipping them, so the nested popovers
+   still open above the field. */
+.composer-more-anchor { display: inline-flex; }
 .composer-more { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 61;
     min-width: 232px; overflow: visible; padding: 4px;
     border: 1px solid var(--edge); border-radius: 8px; background: var(--panel);
