@@ -1,4 +1,4 @@
-import { loadConnectAndInitialize, type ConnectElementTagName } from "@stripe/connect-js";
+import { loadConnectAndInitialize, type ConnectElementTagName } from "@stripe/connect-js/pure";
 import { createSignal, onCleanup, onMount, type JSX } from "solid-js";
 
 export interface StripeAccountSession {

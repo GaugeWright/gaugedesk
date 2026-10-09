@@ -3,18 +3,17 @@ import {
     installTransportProof,
     type TransportProof,
 } from "../authenticated-transport-proof";
-import { installTransportFidelityGuards } from "../fidelity-guard";
+import { installStandardFixtureGuards } from "../fidelity-guard";
 
 const { Before, After } = createBdd();
 const transportProofs = new WeakMap<object, TransportProof>();
 
 Before(
     {
-        name: "prohibit application-route interception",
-        tags: "@transport or @authenticated or @staging or @production",
+        name: "isolate Stripe then prohibit application-route interception",
     },
     async ({ page, $tags }) => {
-        installTransportFidelityGuards(page, $tags);
+        await installStandardFixtureGuards(page, $tags);
     },
 );
 

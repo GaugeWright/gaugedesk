@@ -50,6 +50,22 @@ panel-edge.mjs       a loopback publisher-protocol edge Panel deployments publis
   ships. Features that exist only in the open bundle (the embed example page,
   the `?mobile=1` entry) carry the `@open-only` tag and are skipped here.
 
+The default browser context blocks HTTP(S) requests to `stripe.com` and its
+subdomains before navigation, including requests made by mounted payment
+components (WS-915). A blocked real SDK request is unavailable, not a payment
+success. The isolated GaugeApp workspace lane keeps its local Stripe test
+adapter for admitted session, mount, late-result and logout controls; neither
+lane needs Stripe egress. The model-live opt-in does not bypass Stripe isolation.
+The isolated Stripe guard fault-control spec is classified `@ui-mocked`: its
+`*.mocked-steps.ts` helper locally fulfills any escape before network access,
+so omission controls are safe. That backstop is not real-transport or payment
+evidence.
+The closed blocker is installed before real-transport contexts seal arbitrary
+route interception; application transport mocking remains refused. Production
+loads the same locked SDK lazily through its
+`/pure` entry after an admitted component session; this does not change payment
+or account-session authority.
+
 Both manage their own servers via Playwright `webServer`. `run.mjs` resolves a free
 port set per run (control plane, federation peer, broker, `vite preview`) and exports
 them, so a parallel run or a second worktree picks a disjoint set and the two never

@@ -335,6 +335,6 @@ const persistentAgent = {
 
 export default defineConfig({
     root: fileURLToPath(new URL(".", import.meta.url)), plugins: [persistentAgent, solid()],
-    resolve: { dedupe: ["solid-js"], alias: { "@stripe/connect-js": fileURLToPath(new URL("./stripe.ts", import.meta.url)) } },
+    resolve: { dedupe: ["solid-js"], alias: [{ find: /^@stripe\/connect-js(?:\/pure)?$/, replacement: fileURLToPath(new URL("./stripe.ts", import.meta.url)) }] },
     server: { host: "127.0.0.1", port: 7662, strictPort: true, fs: { allow: [fileURLToPath(new URL("../../../..", import.meta.url))] } },
 });

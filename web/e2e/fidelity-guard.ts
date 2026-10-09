@@ -1,4 +1,5 @@
 import type { Page } from "@playwright/test";
+import { installStripeOffline } from "./stripe-offline.mjs";
 
 const INTERCEPTION_METHODS = ["route", "routeFromHAR", "routeWebSocket"] as const;
 
@@ -29,5 +30,13 @@ export function installTransportFidelityGuards(page: Page, tags: readonly string
                 },
             });
         }
+    }
+}
+
+/** Install the closed third-party denial before sealing arbitrary interception. */
+export async function installStandardFixtureGuards(page: Page, tags: readonly string[]): Promise<void> {
+    await installStripeOffline(page.context());
+    if (tags.some((tag) => ["@transport", "@authenticated", "@staging", "@production"].includes(tag))) {
+        installTransportFidelityGuards(page, tags);
     }
 }

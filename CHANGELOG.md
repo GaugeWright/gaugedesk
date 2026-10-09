@@ -19,6 +19,10 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Default browser fixtures block Stripe script, frame and fetch requests even
+  when payment components mount. The payment SDK loads lazily after an admitted
+  account session; isolated session and cleanup checks keep their local adapter.
+
 - A project fork inherits its source isolation, deployment mode and run purpose
   in its first durable project record, including when workspace creation fails.
 

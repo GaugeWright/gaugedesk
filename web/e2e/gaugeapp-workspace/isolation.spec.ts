@@ -1,4 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
+import { installStripeOffline } from "../stripe-offline.mjs";
+
+test.beforeEach(async ({ context }) => { await installStripeOffline(context); });
 
 // QA inventory: actual submit/review/intake controls; one-time credential
 // visibility and dismissal; page/scope/authorization/disabled/read-denied
