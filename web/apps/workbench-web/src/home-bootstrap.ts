@@ -62,12 +62,29 @@ export function isRelayClosedRefusal(error: unknown): boolean {
         && /this computer is not signed in to GaugeDesk as you/.test(message);
 }
 
+/**
+ * Work begun under one account, or one selection of Home, whose context moved
+ * before it finished (WS-1049). It is dropped so nothing begun for one account
+ * lands under the next. It says nothing about whether the account service or
+ * any Home answered, so discovery tries again under the current context rather
+ * than reporting it, and the failure card never calls it an outage (WS-1061).
+ */
+export class HomeContextChangedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "HomeContextChangedError";
+    }
+}
+
 export type HomeDiscoveryFailure = {
     readonly kind: "failure";
     readonly authentication: boolean;
     readonly homeConnection: boolean;
     /** The Home refused remote connections outright; see [`isRelayClosedRefusal`]. */
     readonly relayClosed: boolean;
+    /** The account or Home selection moved under discovery twice running; see
+     * [`HomeContextChangedError`]. Not an outage. */
+    readonly contextChanged: boolean;
     readonly message: string;
 };
 
@@ -100,6 +117,7 @@ export async function captureHomeDiscovery<T>(
             authentication: isHomeAuthenticationFailure(error),
             homeConnection: error instanceof HomeTunnelError,
             relayClosed: isRelayClosedRefusal(error),
+            contextChanged: error instanceof HomeContextChangedError,
             message: error instanceof Error ? error.message : String(error ?? ""),
         };
     } finally {

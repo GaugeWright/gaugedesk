@@ -409,6 +409,9 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const homeConnectionFailure = createMemo(() => homeFailure()?.homeConnection ?? false);
     const homeRelayCapacity = createMemo(() => /relay .*capacity reached/.test(homeFailure()?.message ?? ""));
     const homeRelayClosed = createMemo(() => homeFailure()?.relayClosed ?? false);
+    // The account or Home selection moved under discovery twice running
+    // (WS-1061): nothing failed to answer, so it is not called an outage.
+    const homeContextChanged = createMemo(() => homeFailure()?.contextChanged ?? false);
     const [homeEndpoint, setHomeEndpoint] = createSignal("");
     const [homeError, setHomeError] = createSignal("");
     const [homeBusy, setHomeBusy] = createSignal(false);
@@ -4455,13 +4458,21 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                                     when={homeRelayClosed()}
                                     fallback={
                                         <>
-                                            <h1>{homeConnectionFailure() ? "We couldn’t connect to your Home" : "We couldn’t load your Homes"}</h1>
+                                            <h1>
+                                                {homeConnectionFailure()
+                                                    ? "We couldn’t connect to your Home"
+                                                    : homeContextChanged()
+                                                        ? "Your sign-in changed while we were finding your Home"
+                                                        : "We couldn’t load your Homes"}
+                                            </h1>
                                             <p class="homegate-lede">
                                                 {homeConnectionFailure()
                                                     ? homeRelayCapacity()
                                                         ? "Your Home’s relay is at its connection limit. Close unused sessions, then retry."
                                                         : "Your Home’s connection could not be opened. Check that GaugeDesk is running on that computer, then retry."
-                                                    : "The account service could not be reached. Retry when the connection is available."}
+                                                    : homeContextChanged()
+                                                        ? "Retry to find your Home as the account signed in now."
+                                                        : "The account service could not be reached. Retry when the connection is available."}
                                             </p>
                                         </>
                                     }

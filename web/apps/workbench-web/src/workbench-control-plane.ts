@@ -83,7 +83,7 @@ import {
 } from "@gaugewright/control-plane-client";
 import type { ControlPlane } from "@gaugewright/control-plane-client";
 import { EventStreamGate } from "./event-stream-gate";
-import { isRelayClosedRefusal } from "./home-bootstrap";
+import { HomeContextChangedError, isRelayClosedRefusal } from "./home-bootstrap";
 
 export { controlPlaneBase };
 
@@ -276,6 +276,45 @@ async function isExpiredHomeAdmissionResponse(response: Response): Promise<boole
     } catch {
         return false;
     }
+}
+
+/**
+ * The subject a bearer names in its own claims (DESK-5g), or null for an
+ * opaque one. Unverified: it decides whether two credentials name the same
+ * person, never what either may do, which each Home checks for itself.
+ */
+export function claimedSubject(token: string): string | null {
+    const claims = token.split(".")[1];
+    if (!claims) return null;
+    try {
+        const decoded = JSON.parse(atob(claims.replace(/-/g, "+").replace(/_/g, "/"))) as {
+            sub?: unknown;
+        };
+        return typeof decoded.sub === "string" && decoded.sub ? decoded.sub : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Whether `next` holds this page for the account `previous` did (WS-1061).
+ *
+ * - A sign-out (`next` null) is a change, unless nothing was held.
+ * - A first credential is not. What ran before it ran on the session cookie,
+ *   and `/auth/refresh` names that cookie's account. An account switch never
+ *   relies on this: it closes every connection and reloads the page.
+ * - The same credential is not. A passkey or recovery session's refresh
+ *   returns the session itself, so it renews as the same string.
+ * - A provider credential renewed for the same subject is not.
+ * - Anything else is, opaque credentials included: one opaque credential
+ *   replacing another cannot be told apart from a change of person, and work
+ *   begun for one account must never be admitted under the next.
+ */
+export function sameAccountCredential(previous: string | null, next: string | null): boolean {
+    if (next === null) return previous === null;
+    if (previous === null || previous === next) return true;
+    const subject = claimedSubject(previous);
+    return subject !== null && subject === claimedSubject(next);
 }
 
 /** App-owned control-plane edge for the open workbench shell. */
@@ -546,8 +585,18 @@ export class WorkbenchControlPlane implements ControlPlane {
         return this.splitHomes || this.nativeRemote;
     }
 
+    /**
+     * Hold the credential this page presents to Homes. Only a change of
+     * account changes the context work runs in: a sign-out, or a credential
+     * naming someone else. A page receiving its first credential and a
+     * credential renewed for the same person are not, and dropping routes,
+     * admissions and the own workspace for them failed every hosted load whose
+     * first `/auth/refresh` answered while Home discovery was reading the
+     * account's Homes, and work in flight at every renewal (WS-1061). See
+     * [`sameAccountCredential`].
+     */
     setBearer(token: string | null): void {
-        if (this.bearer !== token) {
+        if (!sameAccountCredential(this.bearer, token)) {
             this.credentialGeneration++;
             this.homeAdmission = null;
             this.homeTransport = null;
@@ -635,18 +684,7 @@ export class WorkbenchControlPlane implements ControlPlane {
      * key this page has no way to hold.
      */
     private subject(): string {
-        const token = this.bearer;
-        if (!token) return "";
-        const claims = token.split(".")[1];
-        if (!claims) return "";
-        try {
-            const decoded = JSON.parse(atob(claims.replace(/-/g, "+").replace(/_/g, "/"))) as {
-                sub?: unknown;
-            };
-            return typeof decoded.sub === "string" ? decoded.sub : "";
-        } catch {
-            return "";
-        }
+        return this.bearer ? claimedSubject(this.bearer) ?? "" : "";
     }
 
     /**
@@ -1177,7 +1215,7 @@ export class WorkbenchControlPlane implements ControlPlane {
         const originalCredentials = this.credentialGeneration;
         const assertCurrent = () => {
             if (originalGeneration !== this.workspaceRoutingGeneration || originalCredentials !== this.credentialGeneration) {
-                throw new Error("Selected Home context changed");
+                throw new HomeContextChangedError("Selected Home context changed");
             }
         };
         if (this.nativeRemote) {
@@ -1269,6 +1307,19 @@ export class WorkbenchControlPlane implements ControlPlane {
     }
 
     async bootstrapHome(): Promise<HomeBootstrapState> {
+        try {
+            return await this.discoverHome();
+        } catch (error) {
+            // A context that moved under discovery dropped the work begun in
+            // it (WS-1049); that is not a failure to find a Home. Discovery runs
+            // once more in the context now current, and a second move is
+            // reported as itself, never as an outage (WS-1061).
+            if (!(error instanceof HomeContextChangedError)) throw error;
+            return this.discoverHome();
+        }
+    }
+
+    private async discoverHome(): Promise<HomeBootstrapState> {
         if (!this.usesRemoteHome()) return { kind: "direct" };
         // Each bootstrap tries the selected Home again.
         this.silentSelectedHome = null;
@@ -1693,7 +1744,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             this.sharedWorkspaces(shared),
         ]);
         if (generation !== this.workspaceRoutingGeneration || credentials !== this.credentialGeneration) {
-            throw new Error("Workspace context changed");
+            throw new HomeContextChangedError("Workspace context changed");
         }
         return this.composeShared(own ?? NO_WORKSPACE, sharedOrFailure(own, others));
     }
@@ -1708,7 +1759,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             this.sharedWorkspaces(shared),
         ]);
         if (generation !== this.workspaceRoutingGeneration || credentials !== this.credentialGeneration) {
-            throw new Error("Workspace context changed");
+            throw new HomeContextChangedError("Workspace context changed");
         }
         const value = this.composeShared(own?.value ?? NO_WORKSPACE, sharedOrFailure(own, others));
         if (own) return { ...own, value };
@@ -1804,7 +1855,7 @@ export class WorkbenchControlPlane implements ControlPlane {
             : defaultResolution !== null
                 ? await defaultResolution
                 : { transport: await this.connectRoutedProject(route as ProjectId), origin: route as ProjectId };
-        if (!current()) throw new Error("Home routing context changed before dispatch");
+        if (!current()) throw new HomeContextChangedError("Home routing context changed before dispatch");
         let result: unknown;
         try {
             result = await resolved.transport.json(...args);
@@ -1822,7 +1873,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                 await this.pool?.invalidateProject(resolved.origin);
                 transport = await this.connectRoutedProject(resolved.origin);
             }
-            if (!current()) throw new Error("Home routing context changed before retry");
+            if (!current()) throw new HomeContextChangedError("Home routing context changed before retry");
             result = await transport.json(...args);
         }
         if (current() && resolved.origin !== null) {
@@ -1924,7 +1975,7 @@ export class WorkbenchControlPlane implements ControlPlane {
                 }
             }
             if (generation !== this.workspaceRoutingGeneration || credentials !== this.credentialGeneration) {
-                throw new Error("Workspace context changed");
+                throw new HomeContextChangedError("Workspace context changed");
             }
             remember?.(value, origin);
             return value;

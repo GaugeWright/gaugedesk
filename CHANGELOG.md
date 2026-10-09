@@ -19,6 +19,21 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-10-09
+
+GaugeDesk 0.9.0 was tagged but never published, because it carried the fault
+fixed below. This is the first 0.9 release you can install: updating from
+0.8.10 brings everything listed under 0.9.0 as well, including the change to
+pulling into a fork, which needs 0.9 on both ends, and what to do about it.
+
+- Opening or reloading desk.gaugewright.com no longer sometimes stops at "We
+  couldn't load your Homes — The account service could not be reached" until
+  you press Retry. desk was counting its routine session renewal, which arrives
+  while it is finding your Home and every 45 minutes after, as a change of
+  account. It dropped what it was doing at that moment and reported the drop as
+  an outage. Only signing out or switching to another account counts now, and
+  work in flight at a renewal finishes.
+
 ## [0.9.0] — 2026-10-09
 
 This release brings projects shared with you to desk.gaugewright.com: they

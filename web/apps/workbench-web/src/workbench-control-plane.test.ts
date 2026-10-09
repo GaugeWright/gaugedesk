@@ -1741,7 +1741,10 @@ describe("a selected Home with no address (DESK-8, ADR 0134)", () => {
         holder.api = api;
         api.setBearer(null); // a reload: the cookie survives, the bearer does not
         await expect(api.bootstrapHome()).resolves.toMatchObject({ kind: "connected" });
-        expect(refreshes).toBe(2);
+        // The first credential names the account the cookie already did, so
+        // the routes read under the cookie stand and are not read again
+        // (WS-1061).
+        expect(refreshes).toBe(1);
     });
 
     it("still refuses when one bearer is replaced by another mid-resolution", async () => {

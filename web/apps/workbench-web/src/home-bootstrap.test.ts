@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
     accountWorkReplacesHomeGate,
     captureHomeDiscovery,
+    HomeContextChangedError,
     isHomeAuthenticationFailure,
     isRelayClosedRefusal,
 } from "./home-bootstrap";
@@ -33,8 +34,18 @@ describe("hosted Home bootstrap failure", () => {
             authentication: true,
             relayClosed: false,
             homeConnection: false,
+            contextChanged: false,
             message: "GET /account/homes: 401 authenticate to access your account",
         });
+    });
+
+    it("tells a context that moved under discovery apart from an outage (WS-1061)", async () => {
+        // An account or Home selection that moved twice under discovery is not
+        // the account service failing to answer, and the card must not say so.
+        await expect(captureHomeDiscovery(async () => { throw new HomeContextChangedError("Selected Home context changed"); }))
+            .resolves.toMatchObject({ kind: "failure", authentication: false, homeConnection: false, contextChanged: true });
+        await expect(captureHomeDiscovery(async () => { throw new Error("GET /account/homes: 503 unavailable"); }))
+            .resolves.toMatchObject({ kind: "failure", contextChanged: false });
     });
 
     it("passes a successful Home result through unchanged", async () => {
