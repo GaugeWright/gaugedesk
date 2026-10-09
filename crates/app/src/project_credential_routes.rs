@@ -37,15 +37,16 @@ pub async fn get_project_credentials(
 
 /// `GET /projects/:id/models` — what the caller's turns in this project can run on:
 /// the providers the turn resolver chooses among (the caller's own credentials on
-/// this Home, then the project's), the model ids the caller declared for those that
-/// ship no catalog, and what an unpinned turn runs (WS-1026). Names only, never a
-/// token.
+/// this Home, then the project's), the model ids declared for those that ship no
+/// catalog — the project owner's for the project's own key (DR-0476 §1) — and what
+/// an unpinned turn runs (WS-1026). Names only, never a token.
 ///
 /// It is the composer's model picker for a project, read from the Home that holds
 /// the project. A member of a project shared from this computer reaches nothing
 /// host-wide here, `/account/default-model` included (DR-0451 §2), and keeps no
 /// credentials of its own, so this answers it the project's own credentials, which
-/// are what its turns spend (DR-0451, DR-0453 §5).
+/// are what its turns spend (DR-0451, DR-0453 §5), and nothing when the project
+/// holds none: it never falls back to the owner's own key (DR-0476 §2).
 pub async fn get_project_models(
     State(wb): State<SharedWorkbench>,
     Path(project): Path<String>,

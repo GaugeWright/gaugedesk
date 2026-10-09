@@ -260,6 +260,11 @@ case "${1:-}" in
         python3 scripts/check-doctest-opt-outs.py --self-test
         python3 scripts/check-doctest-opt-outs.py
     fi ;;
+  app-release)
+    # Release-only cfg paths must compile even when dev tests/lints pass.
+    # Keep this graph's fingerprints separate from the dev and test outputs.
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}/release-app" \
+        cargo check --release --locked -p gaugedesk-app ;;
   no-default-features)
     # The open build must stay buildable without the enterprise features. Keep
     # this feature graph out of the all-feature test graph's fingerprints:
@@ -412,7 +417,7 @@ case "${1:-}" in
     elif [ "${ADVISORY_DB_STALE:-0}" -gt 0 ]; then
         echo "#unasserted: cargo advisories from an unrefreshed database"
     fi ;;
-  desktop)
+  desktop|desktop-release)
     echo "-- lockfile is in sync with the manifest --"
     cargo metadata --manifest-path src-tauri/Cargo.toml --locked --format-version 1 >/dev/null
 
@@ -420,9 +425,16 @@ case "${1:-}" in
         # Cargo creates temporary siblings when creating a new target directory.
         # Keep those probes beneath the writable build-output mount, rather
         # than beside this shell's read-only manifest in the fleet sandbox.
-        recorded_desktop_check "${CARGO_TARGET_DIR:-$PWD/target/desktop}" \
-          cargo check --manifest-path src-tauri/Cargo.toml --locked \
-          --target-dir "${CARGO_TARGET_DIR:-$PWD/target/desktop}"
+        if [ "$1" = desktop-release ]; then
+            output="${CARGO_TARGET_DIR:-$PWD/target/desktop}/release-desktop"
+            recorded_desktop_check "$output" \
+              cargo check --manifest-path src-tauri/Cargo.toml --release --locked \
+              --target-dir "$output"
+        else
+            recorded_desktop_check "${CARGO_TARGET_DIR:-$PWD/target/desktop}" \
+              cargo check --manifest-path src-tauri/Cargo.toml --locked \
+              --target-dir "${CARGO_TARGET_DIR:-$PWD/target/desktop}"
+        fi
         exit 0
     fi
 

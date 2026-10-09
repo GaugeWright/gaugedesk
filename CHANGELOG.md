@@ -19,79 +19,25 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
-- Fork pull previews pin both original and fork Main versions. Pulls require
-  both preview fields (explicit `null` for an uncut Main), refuse stale choices,
-  and certify Mine-only/no-op pulls before advancing their upstream basis.
-  Older clients must be updated with the Home; this wire change requires a
-  middle-number release when shipped (WS-981, DR-0475).
+## [0.9.0] — 2026-10-09
 
+This release brings projects shared with you to desk.gaugewright.com: they
+appear beside your own projects, and their chats, Agents and models work even
+with no Home of your own. It raises the middle number because pulling into a
+fork now needs GaugeDesk 0.9.0 on both ends; the first entry says what to do.
 
-- Prepare chat discipline and target mounts before publishing a new chat, and
-  atomically retain its target records and initial acts. Failed preparation or
-  publication removes the owned candidate branch instead of leaving a ghost.
+- **Pulling into a fork needs 0.9.0 on both ends.** Pulling a fork's original
+  (Project settings ▸ Work & data ▸ **Pull changes**) no longer overwrites an
+  edit made to the fork after you looked at what the pull would bring. If the
+  original or the fork has changed since then, the pull is refused and your
+  choices for files changed in both are cleared, so you look again and choose
+  again. A pull that brings nothing new, or keeps only your own versions, is
+  checked the same way.
 
-- Desktop credential and model-setting routes refuse an unavailable presented
-  account session instead of borrowing install-owner scope. Independently admitted
-  Office task recovery remains available without borrowing an account scope.
-
-- Make the hermetic relay close old pairs and waiters on route rotation and select waiting Homes by acknowledged keepalive freshness.
-
-- Route observed and newly created own workspace items to their actual origin
-  while a shared project is open, and subscribe the composed workspace to its
-  currently admitted own/shared origins even without an own Home (WS-1049).
-
-- Choice cards admit current chat participants to answer the default owner’s card,
-  retain that owner for attention, and preserve attributed answers through retry
-  and reload. Their private Home routes now use current scoped participation and
-  return structured refusal responses to the production client.
-
-- When a hosted Home changes its recipient key, the Hub removes every account's
-  copies sealed to its old key in the same transaction. The next device exchange
-  can seal fresh copies; the old ciphertext no longer counts as coverage.
-
-- Default browser fixtures block Stripe script, frame and fetch requests even
-  when payment components mount. The payment SDK loads lazily after an admitted
-  account session; isolated session and cleanup checks keep their local adapter.
-
-- A project fork inherits its source isolation, deployment mode and run purpose
-  in its first durable project record, including when workspace creation fails.
-
-- On desk.gaugewright.com, a chat in a project shared with you offers the models
-  that project's own provider key runs, and names the default, in the composer's
-  model picker. It offered no model at all: the picker asked your own account,
-  which the owner's computer refuses you and which holds none of the project's
-  keys, and with your own desktop selected it offered your own keys, which a turn
-  on the owner's computer cannot spend. The Home answers this at
-  `GET /projects/:id/models`; against an owner's GaugeDesk from before it, desk
-  offers the project's linked providers without naming a default.
-
-- When a Home cannot start a chat because of its own fault — its storage will
-  not open, or the Agent's package is missing from disk — it now answers with
-  a server error (500, or 503 while the chat's storage is not open) and the
-  reason. It used to answer 400, as if the request had been wrong. A refusal,
-  such as a placement still awaiting approval or a target set that cannot be
-  used, is still a 400. The composer keeps your message either way.
-
-- Office task messages retain the verified requester's identity and request ID
-  with their original admission. A repeated request can recover its original
-  outcome without creating another message; older uncorrelated messages keep
-  their original records.
-
-- On desk.gaugewright.com, a new authoring chat with an Agent in a project shared
-  with you opens, and replies. Started from the Workshop it said "No reachable Home
-  is selected" when you had no Home of your own, and with your own desktop
-  selected it went to your desktop instead of the owner's and never opened. Every
-  act on a shared project's Agents, placements and chats now reaches the owner's
-  computer, whichever project is open, and a new project or Agent you make while
-  one is open is still made on your own Home.
-
-- Signed in to desk.gaugewright.com with a passkey, you can accept a project
-  invitation and reach a Home that answers only through the relay. Accepting
-  used to fail with "sign in to reach this Home", and every reload with such a
-  Home selected said "We couldn't load your Homes", because a passkey sign-in
-  left desk without the credential it presents to a Home. desk now holds your
-  session in memory as that credential, as it already held one for a Google or
-  Microsoft sign-in.
+  This breaks pulls between versions: a Home on 0.9.0 refuses a pull from a
+  GaugeDesk app older than 0.9.0. Update both — the GaugeDesk that holds the
+  project and every GaugeDesk app you pull from, on a computer or a phone. The
+  browser at desk.gaugewright.com is always current.
 
 - On desk.gaugewright.com, a project someone shared with you from their
   desktop appears in your navigator beside your own projects, and opens there:
@@ -110,11 +56,87 @@ Releases up to and including 0.4.30 are recorded on the
   **shared** tag, and **+ project** is disabled, saying why, while no Home of
   your own is serving you.
 
+- On desk.gaugewright.com, a new authoring chat with an Agent in a project
+  shared with you opens, and replies. Started from the Workshop it said "No
+  reachable Home is selected" when you had no Home of your own, and with your
+  own desktop selected it went to your desktop instead of the owner's and never
+  opened. Everything you do to a shared project's Agents and chats now reaches
+  the owner's computer, whichever project is open, and a new project or Agent
+  you make while one is open is still made on your own Home.
+
+- While a project shared with you is open, a chat, Agent or project you make
+  in your own work is still made on your own Home and opens from there, and
+  desk keeps both your own projects and the shared ones up to date, including
+  when you have no Home of your own.
+
+- On desk.gaugewright.com, a chat in a project shared with you offers, in the
+  composer's model picker, the models that project's own provider key runs,
+  and marks the default. It offered no model at all: the picker asked your own
+  account, which holds none of the project's keys, and with your own desktop
+  selected it offered your own keys, which a turn on the owner's computer
+  cannot spend.
+
+- Your GaugeDesk now tells the people you share a project with which models the
+  project runs and which one is the default, so their model picker can mark it
+  **(default)**. Until you update, desk.gaugewright.com offers them the
+  project's linked providers without naming a default.
+
+- If the key you link to a shared project is an OpenAI-compatible endpoint or
+  OpenRouter, the people you share it with are offered the models you declared
+  for that provider in your settings, and their chats run the first one unless
+  they pick another. They see those model names. Before, they were offered no
+  model, and a chat that picked none had nothing to run.
+
+- The people you share a project with never use your own account's model key:
+  their chats there run only on a key you link to the project itself. When you
+  have not linked one, their model picker and composer say "The owner hasn't
+  linked a model key to this project." rather than showing an empty list. Link
+  a key to each project you share (Project settings ▸ **Model access**).
+
+- In a shared chat, anyone taking part can answer a question card the Agent
+  addressed to the chat's owner, and the answer is credited to whoever gave it.
+  The owner is still the one notified, and the answer survives a retry or a
+  reload.
+
+- Signed in to desk.gaugewright.com with a passkey, you can accept a project
+  invitation and reach a Home that answers only through the relay. Accepting
+  used to fail with "sign in to reach this Home", and every reload with such a
+  Home selected said "We couldn't load your Homes", because a passkey sign-in
+  left desk without the credential it presents to a Home. desk now holds your
+  session in memory as that credential, as it already held one for a Google or
+  Microsoft sign-in.
+
 - Starting a chat in a project whose work targets are all unavailable or
   unreadable — an external folder that is offline, say — now says why, naming
   each target, where you asked. The navigator's new-chat button used to do
   nothing visible, and sending from the empty chat pane with an organization
   selected dropped the message.
+
+- A chat that fails to start no longer leaves an empty chat behind in the
+  navigator.
+
+- When a Home cannot start a chat because of its own fault — its storage will
+  not open, or the Agent's package is missing from disk — it now says so as a
+  server error with the reason, rather than as if your request had been wrong.
+  A refusal, such as a placement still awaiting approval or a set of work
+  targets that cannot be used, still reads as one. The composer keeps your
+  message either way.
+
+- When the desktop cannot match a request to a current account sign-in — the
+  session has lapsed, say — it now refuses to show or change provider keys and
+  model settings, instead of using those of the computer's own installation.
+  Sign in again to continue. Office tasks already admitted still recover.
+
+- A hosted Home whose key changed could be left unable to open the provider
+  keys your account had shared with it. The Hub now drops the copies made for
+  its old key, and your devices share fresh ones at their next exchange.
+
+- A fork keeps its original's isolation, deployment mode and run purpose from
+  the moment it is created, even when setting up its workspace fails.
+
+- Sending the same Office task request again — after a timeout, say — returns
+  the outcome of the first one instead of adding a second message. Earlier
+  messages are unchanged.
 
 ## [0.8.10] — 2026-10-08
 

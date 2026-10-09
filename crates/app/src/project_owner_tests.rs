@@ -2369,24 +2369,35 @@ async fn a_members_composer_is_offered_the_projects_models_and_not_the_owners() 
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-/// A provider that ships no catalog runs the models its declarer named, and a
-/// member declares none on someone else's computer: the project's endpoint is
-/// offered with no model, exactly as a member's unpinned turn resolves it.
+/// A provider that ships no catalog runs the models declared for the key a
+/// turn spends. For the project's own key those are its owner's, and a member
+/// is offered them and its unpinned turns run the first, though it declares
+/// nothing on someone else's computer (DR-0476 §1). Its own declarations, had
+/// it any there, would not stand for the project's key.
 #[tokio::test]
-async fn a_members_composer_names_no_model_the_member_did_not_declare() {
+async fn a_members_composer_offers_the_models_the_owner_declared_for_the_projects_key() {
     let (_root, wb) = open();
-    shared_project_with_member_and_viewer(&wb);
+    let (shared, _) = shared_project_with_member_and_viewer(&wb);
     let app = gated(&wb);
     let owner = session(&wb, CLAIMANT);
-    for (method, uri, body) in [
+    let member = session(&wb, MEMBER);
+    for (method, uri, bearer, body) in [
         (
             "PUT",
             "/account/settings/model_picker.endpoint_models",
-            serde_json::json!({ "value": r#"{"openai-generic":["owner-model"]}"# }),
+            &owner,
+            serde_json::json!({ "value": r#"{"openai-generic":["owner-model","owner-other"]}"# }),
+        ),
+        (
+            "PUT",
+            "/account/settings/model_picker.endpoint_models",
+            &member,
+            serde_json::json!({ "value": r#"{"openai-generic":["members-own-model"]}"# }),
         ),
         (
             "POST",
             "/projects/p-shared/credentials",
+            &owner,
             serde_json::json!({
                 "provider": "openai-generic",
                 "token": "sk-project-key",
@@ -2394,17 +2405,61 @@ async fn a_members_composer_names_no_model_the_member_did_not_declare() {
             }),
         ),
     ] {
-        let (status, response) = send(&app, method, uri, Some(&owner), Some(body)).await;
+        let (status, response) = send(&app, method, uri, Some(bearer), Some(body)).await;
         assert!(status.is_success(), "{method} {uri}: {status} {response}");
     }
-    let (status, owners) = send(&app, "GET", "/projects/p-shared/models", Some(&owner), None).await;
-    assert_eq!(status, StatusCode::OK, "{owners}");
+    for bearer in [&owner, &member] {
+        let (status, access) =
+            send(&app, "GET", "/projects/p-shared/models", Some(bearer), None).await;
+        assert_eq!(status, StatusCode::OK, "{access}");
+        assert_eq!(access["providers"], serde_json::json!(["openai-generic"]));
+        assert_eq!(
+            access["endpoint_models"],
+            serde_json::json!({ "openai-generic": ["owner-model", "owner-other"] }),
+            "the owner's declarations stand for the project's key"
+        );
+        assert_eq!(access["default_provider"], "openai-generic");
+        assert_eq!(access["default_model"], "owner-model");
+    }
+
+    // A member's unpinned turn there runs what its picker names as default.
+    let mut guard = wb.lock_unpoisoned();
+    let chat = guard
+        .create_chat_under_agent(&shared, "member edits")
+        .unwrap_or_else(|_| panic!("an edit chat"))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    guard.claim_chat_owner(&chat, MEMBER);
+    let class = guard.model_execution_class();
     assert_eq!(
-        owners["endpoint_models"],
-        serde_json::json!({ "openai-generic": ["owner-model"] })
+        guard
+            .declared_default_model_for_chat(&chat, MEMBER, "openai-generic", class)
+            .as_deref(),
+        Some("owner-model")
     );
-    assert_eq!(owners["default_model"], "owner-model");
-    let (status, member) = send(
+}
+
+/// A member's turns never fall back to the owner's own account key: with no
+/// key of the project's own, a member is offered nothing and its turns resolve
+/// no provider credential, however many keys the owner keeps for itself
+/// (DR-0476 §2). desk says so rather than listing nothing.
+#[tokio::test]
+async fn a_member_is_offered_nothing_when_the_project_holds_no_key() {
+    let (_root, wb) = open();
+    let (shared, _) = shared_project_with_member_and_viewer(&wb);
+    let app = gated(&wb);
+    let owner = session(&wb, CLAIMANT);
+    let (status, response) = send(
+        &app,
+        "POST",
+        "/account/credentials",
+        Some(&owner),
+        Some(serde_json::json!({ "provider": "anthropic", "token": "sk-owner-key" })),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {response}");
+    let (status, access) = send(
         &app,
         "GET",
         "/projects/p-shared/models",
@@ -2412,11 +2467,31 @@ async fn a_members_composer_names_no_model_the_member_did_not_declare() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{member}");
-    assert_eq!(member["providers"], serde_json::json!(["openai-generic"]));
-    assert_eq!(member["endpoint_models"], serde_json::json!({}));
-    assert_eq!(member["default_provider"], "openai-generic");
-    assert_eq!(member["default_model"], serde_json::Value::Null);
+    assert_eq!(status, StatusCode::OK, "{access}");
+    assert_eq!(
+        access,
+        serde_json::json!({
+            "providers": [],
+            "endpoint_models": {},
+            "default_provider": null,
+            "default_model": null,
+        })
+    );
+    let mut guard = wb.lock_unpoisoned();
+    let chat = guard
+        .create_chat_under_agent(&shared, "member edits")
+        .unwrap_or_else(|_| panic!("an edit chat"))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    guard.claim_chat_owner(&chat, MEMBER);
+    let class = guard.model_execution_class();
+    assert!(guard
+        .linked_providers_for_chat_in_class(&chat, MEMBER, class)
+        .is_empty());
+    assert!(guard
+        .credential_capability_for_chat_in_class(&chat, "anthropic", MEMBER, class)
+        .is_none());
 }
 
 /// The desktop window calls its control plane from another origin, so every

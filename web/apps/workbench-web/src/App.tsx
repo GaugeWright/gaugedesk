@@ -3139,6 +3139,7 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             onPickEffort={(level) => void pickThinking(level)}
             stacked={stacked}
             onAddModel={() => setModelsRequest((n) => n + 1)}
+            unavailable={composerModels().unavailable}
             served={servedModel()}
         />
     );
@@ -3198,6 +3199,14 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 <p class="composer-preview-note" role="note" data-agent-test-note>
                     Test: the draft as it stands, on your usual model and funding, with its own
                     empty files. Test again from the Workshop to pick up edits; delete the chat to end it.
+                </p>
+            </Show>
+            {/* A shared project's chat with nothing to run on says why, in the
+                composer as in the picker: the owner links the project's key,
+                and a member never falls back to the owner's own (DR-0476 §2). */}
+            <Show when={modelChoices().length === 0 && composerModels().unavailable}>
+                <p class="composer-preview-note" role="note" data-composer-model-unavailable>
+                    {composerModels().unavailable}
                 </p>
             </Show>
             {composerModelToolbar(stacked)}

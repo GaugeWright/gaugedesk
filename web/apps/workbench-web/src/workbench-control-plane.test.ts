@@ -7,7 +7,7 @@ import {
     type RawTunnelFacade,
 } from "@gaugewright/control-plane-client";
 import { modelKey, modelOptions } from "@gaugewright/workbench-ui";
-import { composerModelSource, type OwnModelAccess } from "./composer-model-source";
+import { composerModelSource, NO_PROJECT_KEY, type OwnModelAccess } from "./composer-model-source";
 import { MINE, OWNERS, releaseSharedMember, sharedMember } from "./shared-member.fixture";
 import { WorkbenchControlPlane } from "./workbench-control-plane";
 
@@ -2426,6 +2426,37 @@ describe("a member's composer offers the shared project's models (WS-1026)", () 
         expect(models).toContain("openai:gpt-6.1-sol");
     });
 
+    it("offers the models the owner declared for the project's OpenAI-compatible key (DR-0476 §1)", async () => {
+        const { api } = sharedMember("selected", { projectKey: "openai-generic" });
+        await api.bootstrapHome();
+        await api.getWorkspaceCarriage();
+        api.setCurrentProject(null);
+        const shared = await api.sharedProjectModels("proj-shared" as ProjectId);
+        const source = composerModelSource(shared, await ownAccount(api));
+        expect(offered(source)).toEqual(["owner-model (default)", "openai-generic:owner-model"]);
+        expect(source.unavailable).toBeUndefined();
+    });
+
+    it.each([
+        ["signed out", "current"],
+        ["selected", "current"],
+        ["signed out", "before project models"],
+    ] as const)(
+        "says the owner linked no key to the project, rather than listing nothing (own Home %s, owner's Home %s)",
+        async (own, ownerHome) => {
+            const { api } = sharedMember(own, { projectKey: "none", ownerHome });
+            await api.bootstrapHome();
+            await api.getWorkspaceCarriage();
+            api.setCurrentProject(null);
+            const shared = await api.sharedProjectModels("proj-shared" as ProjectId);
+            const source = composerModelSource(shared, await ownAccount(api));
+            // Never the member's own key, nor the owner's own (DR-0476 §2).
+            expect(offered(source)).toEqual([]);
+            expect(source.unavailable).toBe(NO_PROJECT_KEY);
+            expect(NO_PROJECT_KEY).toBe("The owner hasn't linked a model key to this project.");
+        },
+    );
+
     it("offers nothing of the person's own while the project's answer is outstanding", () => {
         const own: OwnModelAccess = {
             credentials: [{ provider: "openai", linked: true }],
@@ -2434,5 +2465,7 @@ describe("a member's composer offers the shared project's models (WS-1026)", () 
             resolvedDefault: { provider: "openai-codex", model: "gpt-6.1-sol" },
         };
         expect(offered(composerModelSource(undefined, own))).toEqual([]);
+        // Nothing is said about a key until the Home has answered.
+        expect(composerModelSource(undefined, own).unavailable).toBeUndefined();
     });
 });

@@ -475,6 +475,9 @@ run_rust() {
 
     echo "== no-default-features =="
     if [ -n "$native" ]; then native_section native-feature-checks; else gate_section no-default-features; fi
+
+    echo "== app release profile =="
+    if [ -n "$native" ]; then native_section app-release; else gate_section app-release; fi
 }
 
 # Whether this bar runs on the native targets: the condition the rust lane
@@ -548,6 +551,8 @@ run_desktop() {
     local prerequisites="${1:-required}"
     echo "== desktop shell =="
     gate_section desktop
+    echo "== desktop release profile =="
+    gate_section desktop-release
 }
 
 # The release ships an MSI, and every gate above is Linux, so a change breaking
@@ -720,7 +725,7 @@ run_all() {
     if [ -n "$via_buck2" ] && native_targets; then
         echo "== native Rust suites and the shells, built together =="
         buck2 build --keep-going //:native-lints //:native-tests //:native-doctests //:native-feature-checks \
-            //:desktop //:mobile //:windows \
+            //:app-release //:desktop //:desktop-release //:mobile //:windows \
             -c "green_bar.run=$GREEN_BAR_RUN" -c "green_bar.prerequisites=$prerequisites" \
             > "$transcripts/together" 2>&1 || true
         grep -E "Commands: [0-9]+" "$transcripts/together" | tail -n 1 || true

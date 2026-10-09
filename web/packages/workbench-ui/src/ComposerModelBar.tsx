@@ -51,6 +51,11 @@ export interface ComposerModelBarProps {
    *  an endpoint with nothing declared — because then the menu would
    *  otherwise be a list with no rows. */
   readonly onAddModel?: () => void;
+  /** Why there is no model to pick where the person cannot add one: a
+   *  project shared with them whose owner linked no key, or declared no
+   *  model for it. Said in the menu, in place of "Add a model…", and named
+   *  on the button, rather than an empty list (DR-0476 §2). */
+  readonly unavailable?: string;
   /** Set when an organization connection funds this project's turns.
    *
    *  The engine binds such a turn to the admitted selection on every axis —
@@ -82,8 +87,11 @@ export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
                 exists, so an unmatched empty value means there is no default
                 to fall back on and the next turn needs a choice. */
           <ComposerMenuButton
-            label={selected()?.label ?? "Select model"}
-            title="Model for this chat — overrides the Agent's default for this conversation only"
+            label={selected()?.label
+              ?? (props.options.length === 0 && props.unavailable ? "No model" : "Select model")}
+            title={props.options.length === 0 && props.unavailable
+              ? props.unavailable
+              : "Model for this chat — overrides the Agent's default for this conversation only"}
             testAttr="model"
             stacked={props.stacked}
             rowLabel="Model"
@@ -114,7 +122,12 @@ export function ComposerModelBar(props: ComposerModelBarProps): JSX.Element {
                     );
                   }}
                 </For>
-                <Show when={props.options.length === 0 && props.onAddModel}>
+                <Show when={props.options.length === 0 && props.unavailable}>
+                  <p class="composer-menu-item foot" role="note" data-model-unavailable>
+                    {props.unavailable}
+                  </p>
+                </Show>
+                <Show when={props.options.length === 0 && !props.unavailable && props.onAddModel}>
                   <button
                     class="composer-menu-item foot"
                     type="button"

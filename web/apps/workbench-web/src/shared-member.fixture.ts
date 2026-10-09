@@ -61,7 +61,12 @@ const agent = (id: string, sharedThrough: string[], chats: string[]) => ({
  * answering it. */
 export function sharedMember(
     own: "selected" | "not answering" | "signed out",
-    options: { readonly ownerHome?: "current" | "before project models" } = {},
+    options: {
+        readonly ownerHome?: "current" | "before project models";
+        /** The key the owner linked to the shared project: an Anthropic key, an
+         * OpenAI-compatible endpoint the owner declared a model for, or none. */
+        readonly projectKey?: "anthropic" | "openai-generic" | "none";
+    } = {},
 ) {
     const dialed: string[] = [];
     const carried: Array<{ home: string; call: string }> = [];
@@ -138,13 +143,25 @@ export function sharedMember(
                 this.reply = { status: 403, body: '{"error":"only the projects shared with you on this computer are reached from elsewhere"}' };
             } else if (fingerprint === OWNERS && call === "GET /projects/proj-shared/models"
                 && options.ownerHome !== "before project models") {
-                // What a member's turn there runs on: the project's own key.
-                this.reply = { status: 200, body: JSON.stringify({
-                    providers: ["anthropic"], endpoint_models: {},
-                    default_provider: "anthropic", default_model: "claude-opus-5-5",
-                }) };
+                // What a member's turn there runs on: the project's own key,
+                // with the models the owner declared for it (DR-0476).
+                const key = options.projectKey ?? "anthropic";
+                this.reply = { status: 200, body: JSON.stringify(key === "none"
+                    ? { providers: [], endpoint_models: {}, default_provider: null, default_model: null }
+                    : key === "openai-generic"
+                        ? {
+                            providers: ["openai-generic"], endpoint_models: { "openai-generic": ["owner-model"] },
+                            default_provider: "openai-generic", default_model: "owner-model",
+                        }
+                        : {
+                            providers: ["anthropic"], endpoint_models: {},
+                            default_provider: "anthropic", default_model: "claude-opus-5-5",
+                        }) };
             } else if (fingerprint === OWNERS && call === "GET /projects/proj-shared/credentials") {
-                this.reply = { status: 200, body: '{"credentials":[{"provider":"anthropic","linked":true}]}' };
+                const key = options.projectKey ?? "anthropic";
+                this.reply = { status: 200, body: JSON.stringify({
+                    credentials: key === "none" ? [] : [{ provider: key, linked: true }],
+                }) };
             } else if (fingerprint === MINE && call === "GET /account/credentials") {
                 // The member's own key, on their own desktop.
                 this.reply = { status: 200, body: '{"credentials":[{"provider":"openai","linked":true}]}' };

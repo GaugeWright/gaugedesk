@@ -2154,10 +2154,12 @@ pub fn isolated_turn_descriptor(
         config.provider,
         &linked,
     );
-    // A provider with no shipped catalog runs the operator's first declared
-    // model when the chat pins none — the same id the picker names as default.
+    // A provider with no shipped catalog runs the first model declared for
+    // the key the turn spends when the chat pins none — the project owner's
+    // for the project's own key (DR-0476 §1) — the same id the picker names
+    // as default.
     let model = resolve_turn_model(gaugedesk_env::var("MODEL"), config.model)
-        .or_else(|| guard.declared_default_model_for_actor(actor, &provider));
+        .or_else(|| guard.declared_default_model_for_chat(chat_id, actor, &provider, class));
     let base_url_override = if provider == "openai-generic" {
         guard.credential_base_url_for_chat_in_class(chat_id, &provider, actor, class)
     } else {
@@ -2919,14 +2921,20 @@ fn run_claimed_engagement_turn(
             )
         };
         task_checkpoint(wb, id, office_authority.as_ref())?;
-        // A provider with no shipped catalog runs the operator's first declared
-        // model when the chat pins none — the same id the picker names as default.
+        // A provider with no shipped catalog runs the first model declared for
+        // the key the turn spends when the chat pins none — the project owner's
+        // for the project's own key (DR-0476 §1) — the same id the picker names
+        // as default.
         let model = organization_selection.as_ref().map_or_else(
             || {
                 resolve_turn_model(gaugedesk_env::var("MODEL"), config.model.clone()).or_else(
                     || {
-                        wb.lock_unpoisoned()
-                            .declared_default_model_for_actor(actor.as_str(), &provider)
+                        wb.lock_unpoisoned().declared_default_model_for_chat(
+                            id,
+                            actor.as_str(),
+                            &provider,
+                            effective_execution_class,
+                        )
                     },
                 )
             },

@@ -1448,17 +1448,19 @@ impl Workbench {
     /// unpinned Panel agent publishes with (DR-0272).
     pub fn work_chat_default_model_in(&self, scope: &str) -> (Option<String>, Option<String>) {
         let linked = self.linked_providers_in_class(scope, self.model_execution_class());
-        self.default_model_over(scope, &linked)
+        self.default_model_over(&linked, |provider| {
+            self.declared_default_model_in(scope, provider)
+        })
     }
 
     /// The provider and model an unpinned turn runs on over `linked`, with
-    /// the models declared in `scope` standing in for a provider that ships
+    /// `declared` naming the first declared model of a provider that ships
     /// no catalog: the host override, then what `linked` makes unambiguous,
     /// then that provider's own default model, then the first declared one.
     fn default_model_over(
         &self,
-        scope: &str,
         linked: &[String],
+        declared: impl Fn(&str) -> Option<String>,
     ) -> (Option<String>, Option<String>) {
         let provider = crate::engine::resolve_default_provider(
             gaugedesk_env::var("MODEL_PROVIDER"),
@@ -1472,24 +1474,68 @@ impl Workbench {
                         .ok()
                         .map(|d| d.model)
                 })
-                .or_else(|| self.declared_default_model_in(scope, provider))
+                .or_else(|| declared(provider))
         });
         (provider, model)
+    }
+
+    /// The model ids declared for `provider` that work in `project_id` runs
+    /// on, for the account whose credentials and settings live in `scope`.
+    ///
+    /// A provider that ships no catalog runs the models declared for the key
+    /// a turn spends. When the project's own key serves `provider` — and the
+    /// project's key wins over the account's, as the credential resolver
+    /// reads them — those are the ones the project's owner declared, which
+    /// the project's members are offered and default to (DR-0476 §1): a
+    /// member keeps no settings on the owner's computer and so declares
+    /// none. Otherwise they are the account's own. A project no account owns,
+    /// an organization's, has no one whose declarations stand for its key, so
+    /// the account's own stand.
+    fn declared_models_for_work(
+        &self,
+        scope: &str,
+        project_id: Option<&str>,
+        provider: &str,
+        class: ModelExecutionClass,
+    ) -> Vec<String> {
+        if !provider_declares_models(provider) {
+            return Vec::new();
+        }
+        let declarer = project_id
+            .filter(|project| {
+                credentials_in_scope(self.store_ref(), &project_scope(project))
+                    .get(provider)
+                    .is_some_and(|record| record.admits(class))
+            })
+            .and_then(|project| match self.project_owner(project)? {
+                crate::project_owner::ProjectOwner::Account(owner) => {
+                    Some(self.account_scope_for_actor(&owner))
+                }
+                crate::project_owner::ProjectOwner::Organization(_) => None,
+            })
+            .unwrap_or_else(|| scope.to_owned());
+        let settings = self.account_settings_in(&declarer).unwrap_or_default();
+        declared_models(
+            settings.get(ENDPOINT_MODELS_SETTING).map(String::as_str),
+            provider,
+        )
     }
 
     /// What a turn in `project_id` can run on for the account whose
     /// credentials and model settings live in `scope`: the providers the turn
     /// resolver chooses among — that account's credentials here, then the
     /// project's own ([`Self::linked_providers_for_chat_in_class`]) — the
-    /// models that account declared for those of them that ship no catalog,
-    /// and the provider and model an unpinned turn runs on.
+    /// declared models of those that ship no catalog
+    /// ([`Self::declared_models_for_work`]), and the provider and model an
+    /// unpinned turn runs on.
     ///
     /// This is the composer's model picker for work in a project, and it is
     /// what a project member reads from the Home that holds a project shared
     /// with it (WS-1026). A member keeps no credentials or settings on that
     /// computer (DR-0451 §2), so it is offered exactly the project's own
-    /// credentials, which its turns spend (DR-0451, DR-0453 §5), and never the
-    /// owner's.
+    /// credentials, which its turns spend (DR-0451, DR-0453 §5), with the
+    /// models the owner declared for them, and never the owner's own account
+    /// key (DR-0476).
     pub fn project_model_access_in(&self, scope: &str, project_id: &str) -> ProjectModelAccess {
         let class = self.model_execution_class();
         let mut providers = self.linked_providers_in_class(scope, class);
@@ -1498,15 +1544,20 @@ impl Workbench {
                 providers.push(provider);
             }
         }
-        let settings = self.account_settings_in(scope).unwrap_or_default();
-        let declared = settings.get(ENDPOINT_MODELS_SETTING).map(String::as_str);
-        let endpoint_models = providers
+        let endpoint_models: BTreeMap<String, Vec<String>> = providers
             .iter()
-            .filter(|provider| provider_declares_models(provider))
-            .map(|provider| (provider.clone(), declared_models(declared, provider)))
+            .map(|provider| {
+                let ids = self.declared_models_for_work(scope, Some(project_id), provider, class);
+                (provider.clone(), ids)
+            })
             .filter(|(_, ids)| !ids.is_empty())
             .collect();
-        let (default_provider, default_model) = self.default_model_over(scope, &providers);
+        let (default_provider, default_model) = self.default_model_over(&providers, |provider| {
+            endpoint_models
+                .get(provider)
+                .and_then(|ids| ids.first())
+                .cloned()
+        });
         ProjectModelAccess {
             providers,
             endpoint_models,
@@ -1515,14 +1566,26 @@ impl Workbench {
         }
     }
 
-    /// [`declared_default_model_in`](Self::declared_default_model_in) for the
-    /// actor behind a turn.
-    pub(crate) fn declared_default_model_for_actor(
+    /// The model an unpinned turn in `chat_id` by `actor` runs on `provider`
+    /// when it ships no catalog: the first declared for the key the turn
+    /// spends ([`Self::declared_models_for_work`]) — the project owner's for
+    /// the project's own key, which is what a member's turn there runs
+    /// (DR-0476 §1), and the actor's own for its own key.
+    pub(crate) fn declared_default_model_for_chat(
         &self,
+        chat_id: &str,
         actor: &str,
         provider: &str,
+        class: ModelExecutionClass,
     ) -> Option<String> {
-        self.declared_default_model_in(&self.account_scope_for_actor(actor), provider)
+        self.declared_models_for_work(
+            &self.account_scope_for_actor(actor),
+            self.credential_project_of_chat(chat_id, actor).as_deref(),
+            provider,
+            class,
+        )
+        .into_iter()
+        .next()
     }
 
     /// Provider ids linked as sealed local account credentials (default scope).
