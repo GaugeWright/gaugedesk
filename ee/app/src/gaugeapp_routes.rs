@@ -33,6 +33,10 @@ use gaugedesk_app::gaugeapp_contract::{
     GaugeAppRejection, GaugeAppScope, GaugeAppSession, ReviewPolicy, GAUGEAPP_CHANGE_KIND,
 };
 use gaugedesk_app::gaugeapp_host::{log_scope, GaugeAppDefinition, GaugeAppPhases};
+use gaugedesk_app::membership_fence::{
+    committed_activation_fact, committed_denial_fact, denial_operation, membership_transitions,
+    InstalledMemberStandingFence, MembershipTransition, StandingFenceOutcome,
+};
 use gaugedesk_app::model_provider_management::projection::{ModelProvidersPage, UnavailableReason};
 use gaugedesk_app::org::{
     sha256_hex, ArchetypeApprovalPolicyRecord, BillingContactRecord, GroupMappingRecord,
@@ -45,6 +49,7 @@ use gaugedesk_app::org::{
 };
 use gaugedesk_app::{LockUnpoisoned, SharedWorkbench, Workbench};
 use gaugedesk_core::abac::Policy;
+use gaugedesk_core::ids::ScopeId;
 use gaugedesk_core::rbac::Capability;
 use gaugedesk_store::{AdmitError, CommandRecordFact};
 use serde::Deserialize;
@@ -941,6 +946,19 @@ impl GaugeAppDefinition for Administration {
         plan: MutationPlan,
         services: &Self::Services,
     ) -> Result<MutationPlan, Box<Response>> {
+        if wb.member_standing_fence().is_some()
+            && gaugedesk_app::membership_fence::changes_member_standing(&plan.facts)
+        {
+            return Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "hosted member standing requires a staged command"
+                    })),
+                )
+                    .into_response(),
+            ));
+        }
         if Self::requires_external_review(&envelope.command_id, services) {
             return Err(Box::new(
                 (
@@ -1084,6 +1102,73 @@ impl GaugeAppDefinition for Administration {
                 })
             })
             .map_err(Box::new)
+    }
+
+    fn begin_staged_review(
+        wb: &mut Workbench,
+        headers: &HeaderMap,
+        session: &GaugeAppSession,
+        review: gaugedesk_app::gaugeapp_host::ExternalReview<'_>,
+        _body: &ReviewBody,
+        services: &Self::Services,
+    ) -> Option<Result<gaugedesk_app::gaugeapp_host::PendingAuthority, Box<Response>>> {
+        let hook = wb.member_standing_fence()?;
+        if !gaugedesk_app::membership_fence::changes_member_standing(&review.plan.facts) {
+            return None;
+        }
+        if !staged_member_command(&review.envelope.command_id) {
+            return Some(Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "hosted member command is not staged" })),
+                )
+                    .into_response(),
+            )));
+        }
+        let plan = match apply_staged_member_plan(
+            wb,
+            headers,
+            session,
+            review.envelope,
+            &review.change.id,
+            review.plan,
+            services,
+        ) {
+            Ok(plan) => plan,
+            Err(response) => return Some(Err(response)),
+        };
+        let owner = ScopeId::from(req_scope(headers).as_str());
+        let transitions = match membership_transitions(wb.store_ref(), &owner, &plan.facts) {
+            Ok(transitions) if !transitions.is_empty() => transitions,
+            Ok(_) => return Some(Err(Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "hosted member command lost its standing transition" })),
+                )
+                    .into_response(),
+            ))),
+            Err(error) => return Some(Err(Box::new(store_error(error)))),
+        };
+        let head = match wb.store_ref().record_scope_head(owner.as_str()) {
+            Ok(head) => head,
+            Err(error) => return Some(Err(Box::new(store_error(error)))),
+        };
+        let staged = StagedMemberReview {
+            session: session.clone(),
+            envelope: review.envelope.clone(),
+            change: review.change.clone(),
+            key: review.key.to_owned(),
+            plan,
+            owner,
+            command_scope: command_scope(headers),
+            expected_head: head,
+            transitions,
+            hook,
+            services: services.clone(),
+        };
+        Some(Ok(gaugedesk_app::gaugeapp_host::PendingAuthority::new(
+            move |wb, headers| execute_staged_member_review(wb, headers, staged),
+        )))
     }
 
     fn accept_stale_proposal(
@@ -4796,6 +4881,263 @@ async fn submit_sso_credential(
     finish_command(&mut guard, &headers, &session, &envelope, &key, None, plan).0
 }
 
+fn staged_member_command(command: &str) -> bool {
+    matches!(
+        command,
+        "organization.delete"
+            | "organization.ownership.transfer"
+            | "people.invitation.cancel"
+            | "people.role.change"
+            | "people.member.deactivate"
+            | "people.member.reactivate"
+    )
+}
+
+fn apply_staged_member_plan(
+    wb: &Workbench,
+    headers: &HeaderMap,
+    session: &GaugeAppSession,
+    envelope: &GaugeAppCommandEnvelope,
+    operation_key: &str,
+    plan: MutationPlan,
+    services: &AdministrationServices,
+) -> Result<MutationPlan, Box<Response>> {
+    let Some(extension) = &services.extension else {
+        return Ok(plan);
+    };
+    let tenant = tenant_id(headers);
+    let prefetched = services
+        .prefetched_command
+        .as_deref()
+        .and_then(|prefetched| prefetched.for_command(&tenant, &session.actor, envelope));
+    extension
+        .apply_prefetched(
+            wb,
+            &tenant,
+            &req_scope(headers),
+            &session.actor,
+            envelope,
+            operation_key,
+            plan,
+            prefetched,
+        )
+        .map_err(extension_error)
+        .map_err(Box::new)
+}
+
+struct StagedMemberReview {
+    session: GaugeAppSession,
+    envelope: GaugeAppCommandEnvelope,
+    change: GaugeAppChangeRecord,
+    key: String,
+    plan: MutationPlan,
+    owner: ScopeId,
+    command_scope: String,
+    expected_head: i64,
+    transitions: Vec<MembershipTransition>,
+    hook: InstalledMemberStandingFence,
+    services: AdministrationServices,
+}
+
+enum PreparedMemberStanding {
+    Denial { member: String, operation: String },
+    Activation { member: String, observed: Value },
+}
+
+async fn execute_staged_member_review(
+    wb: SharedWorkbench,
+    headers: HeaderMap,
+    staged: StagedMemberReview,
+) -> Response {
+    let snapshot = serde_json::to_string(&staged.envelope).expect("GaugeApp command serializes");
+    let operation = denial_operation(&staged.command_scope, &staged.key, &snapshot);
+    let transitions = staged.transitions.clone();
+    let hook = staged.hook.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let mut prepared = Vec::with_capacity(transitions.len());
+        for transition in transitions {
+            match transition {
+                MembershipTransition::Deny {
+                    owner_scope,
+                    member,
+                } => match hook.0.begin_denial(&owner_scope, &member, &operation) {
+                    Ok(StandingFenceOutcome::Committed) => {
+                        prepared.push(PreparedMemberStanding::Denial {
+                            member,
+                            operation: operation.clone(),
+                        })
+                    }
+                    _ => return Err(()),
+                },
+                MembershipTransition::Activate {
+                    owner_scope,
+                    member,
+                } => match hook.0.observe_activation(&owner_scope, &member) {
+                    Ok(observed) => {
+                        prepared.push(PreparedMemberStanding::Activation { member, observed })
+                    }
+                    Err(_) => return Err(()),
+                },
+            }
+        }
+        Ok(prepared)
+    })
+    .await;
+    let Ok(Ok(prepared)) = prepared else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "member standing unavailable" })),
+        )
+            .into_response();
+    };
+
+    let receipts = prepared
+        .iter()
+        .map(|prepared| match prepared {
+            PreparedMemberStanding::Denial { member, .. } => committed_denial_fact(
+                &staged.command_scope,
+                &staged.key,
+                &snapshot,
+                &staged.owner,
+                member,
+            ),
+            PreparedMemberStanding::Activation { member, observed } => committed_activation_fact(
+                &staged.command_scope,
+                &staged.key,
+                &snapshot,
+                &staged.owner,
+                member,
+                observed.clone(),
+            ),
+        })
+        .collect();
+
+    let (response, committed) = {
+        let mut guard = wb.lock_unpoisoned();
+        let current = match <Administration as GaugeAppDefinition>::context(
+            &guard,
+            &headers,
+            "",
+            &staged.services,
+        ) {
+            Ok(context) => context.session,
+            Err(response) => return *response,
+        };
+        if current != staged.session
+            || req_scope(&headers) != staged.owner.as_str()
+            || command_scope(&headers) != staged.command_scope
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "Administration session changed during member review" })),
+            )
+                .into_response();
+        }
+        let changes = match fold_gaugeapp_changes(guard.store_ref(), staged.owner.as_str()) {
+            Ok(changes) => changes,
+            Err(error) => return internal(error),
+        };
+        if changes.get(&staged.change.id) != Some(&staged.change)
+            || decide_reviewed_gaugeapp_command(&current, &staged.envelope).is_err()
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "member review changed during request" })),
+            )
+                .into_response();
+        }
+        let replanned = match plan_command(
+            &guard,
+            &headers,
+            &staged.envelope,
+            staged.services.extension.as_ref(),
+            staged.services.prefetched_command.as_deref(),
+        ) {
+            Ok(plan) => plan,
+            Err(response) => return response,
+        };
+        let replanned = match apply_staged_member_plan(
+            &guard,
+            &headers,
+            &current,
+            &staged.envelope,
+            &staged.change.id,
+            replanned,
+            &staged.services,
+        ) {
+            Ok(plan) => plan,
+            Err(response) => return *response,
+        };
+        if replanned.facts != staged.plan.facts
+            || replanned.notices != staged.plan.notices
+            || replanned.audit_action != staged.plan.audit_action
+            || replanned.audit_target != staged.plan.audit_target
+            || replanned.transient_result != staged.plan.transient_result
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "member command changed during request" })),
+            )
+                .into_response();
+        }
+        gaugedesk_app::gaugeapp_host::finish_staged_command_in::<Administration>(
+            &mut guard,
+            &headers,
+            &current,
+            &staged.envelope,
+            &staged.key,
+            Some(staged.change.clone()),
+            replanned,
+            &staged.command_scope,
+            gaugedesk_app::gaugeapp_host::StagedStandingFacts {
+                expected_scope: staged.owner.as_str().to_owned(),
+                expected_position: staged.expected_head,
+                receipts,
+            },
+        )
+    };
+    if !committed {
+        return if response.status().is_success() {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "member command was already admitted" })),
+            )
+                .into_response()
+        } else {
+            response
+        };
+    }
+
+    let hook = staged.hook.clone();
+    let owner = staged.owner.clone();
+    let completed = tokio::task::spawn_blocking(move || {
+        for prepared in prepared {
+            let outcome = match prepared {
+                PreparedMemberStanding::Denial { member, operation } => {
+                    hook.0.complete_denial(&owner, &member, &operation)
+                }
+                PreparedMemberStanding::Activation { member, observed } => {
+                    hook.0.admit_if_unchanged(&owner, &member, &observed)
+                }
+            };
+            if !matches!(outcome, Ok(StandingFenceOutcome::Committed)) {
+                return Err(());
+            }
+        }
+        Ok(())
+    })
+    .await;
+    if matches!(completed, Ok(Ok(()))) {
+        response
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "member standing awaits recovery" })),
+        )
+            .into_response()
+    }
+}
+
 fn finish_command(
     wb: &mut Workbench,
     headers: &HeaderMap,
@@ -8500,6 +8842,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_organization_delete_denies_every_historical_member_before_erasure() {
+        use gaugedesk_app::membership_fence::{
+            HostedMemberStandingFence, InstalledMemberStandingFence, StandingFenceError,
+            StandingFenceOutcome, COMMITTED_DENIAL_KIND,
+        };
+        use gaugedesk_core::ids::ScopeId;
+        use std::sync::{Mutex, Weak};
+
+        struct Recorder {
+            wb: Weak<Mutex<Workbench>>,
+            begun: Mutex<Vec<String>>,
+            completed: Mutex<Vec<String>>,
+        }
+        impl Recorder {
+            fn unlocked(&self) -> SharedWorkbench {
+                let wb = self.wb.upgrade().unwrap();
+                assert!(wb.try_lock().is_ok(), "Cosmos call held Workbench lock");
+                wb
+            }
+        }
+        impl HostedMemberStandingFence for Recorder {
+            fn observe_activation(
+                &self,
+                _: &ScopeId,
+                _: &str,
+            ) -> Result<Value, StandingFenceError> {
+                panic!("organization deletion cannot activate a member")
+            }
+            fn admit_if_unchanged(
+                &self,
+                _: &ScopeId,
+                _: &str,
+                _: &Value,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                panic!("organization deletion cannot admit a member")
+            }
+            fn begin_denial(
+                &self,
+                owner: &ScopeId,
+                member: &str,
+                _: &str,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                let wb = self.unlocked();
+                assert!(
+                    Org::rebuild_in(wb.lock().unwrap().store_ref(), owner.as_str())
+                        .unwrap()
+                        .org
+                        .is_some()
+                );
+                self.begun.lock().unwrap().push(member.to_owned());
+                Ok(StandingFenceOutcome::Committed)
+            }
+            fn complete_denial(
+                &self,
+                owner: &ScopeId,
+                member: &str,
+                _: &str,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                let wb = self.unlocked();
+                let guard = wb.lock().unwrap();
+                assert_eq!(
+                    guard
+                        .store_ref()
+                        .retained_records(
+                            &format!("gaugeapp:administration:{}", owner.as_str()),
+                            COMMITTED_DENIAL_KIND,
+                        )
+                        .unwrap()
+                        .len(),
+                    2,
+                );
+                self.completed.lock().unwrap().push(member.to_owned());
+                Ok(StandingFenceOutcome::Committed)
+            }
+        }
+
+        let tenant_id = "organization:delete-hosted";
+        let (_dir, shared, app, authorization) = test_app_with_account_authorization_in(tenant_id);
+        let scope = gaugedesk_app::org::tenant_scope(tenant_id);
+        {
+            let mut guard = shared.lock().unwrap();
+            let organization = OrgRecord {
+                id: ORG_ID.into(),
+                op: RecordOp::Upsert,
+                display_name: "Delete Hosted LLC".into(),
+                ..Default::default()
+            };
+            let tenant = gaugedesk_app::tenancy::TenantRef {
+                id: tenant_id.into(),
+                op: RecordOp::Upsert,
+                display_name: "Delete Hosted LLC".into(),
+                role: "owner".into(),
+                personal: false,
+            };
+            let account_scope = guard.account_scope_for(Some("owner-token"));
+            let former = MembershipRecord {
+                id: "person:former".into(),
+                op: RecordOp::Tombstone,
+                org_id: ORG_ID.into(),
+                authority: "person:former".into(),
+                email: "former@example.test".into(),
+                role: "member".into(),
+                status: MembershipStatus::Deprovisioned,
+                managed_by_scim: false,
+                team: None,
+            };
+            guard
+                .store_mut()
+                .append_records_atomically(&[
+                    (
+                        &scope,
+                        "org",
+                        &serde_json::to_string(&organization).unwrap(),
+                    ),
+                    (
+                        &account_scope,
+                        gaugedesk_app::tenancy::TENANT_REF_KIND,
+                        &serde_json::to_string(&tenant).unwrap(),
+                    ),
+                    (
+                        &scope,
+                        "membership",
+                        &serde_json::to_string(&former).unwrap(),
+                    ),
+                ])
+                .unwrap();
+        }
+        let remote = Arc::new(Recorder {
+            wb: Arc::downgrade(&shared),
+            begun: Mutex::new(Vec::new()),
+            completed: Mutex::new(Vec::new()),
+        });
+        shared
+            .lock()
+            .unwrap()
+            .install_member_standing_fence(InstalledMemberStandingFence(remote.clone()));
+        let session = open_in_tenant(&app, Some(tenant_id)).await;
+        let page = session["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|page| page["id"] == "organization")
+            .unwrap();
+        let (status, proposed) = request_in_tenant(
+            &app,
+            Method::POST,
+            "/gaugeapps/administration/commands",
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "page_id": "organization", "command_id": "organization.delete",
+                "expected_basis": page["resource_basis"], "idempotency_key": "delete-hosted",
+                "payload": { "confirmation": "Delete Hosted LLC" }, "client": "web",
+            }),
+            Some("delete-hosted"),
+            Some(tenant_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{proposed}");
+        let proof = authorization
+            .issue_authorization_proof_after_verification(
+                "authority:owner",
+                "organization.delete",
+                gaugedesk_app::account::session_now_ms() / 1_000,
+            )
+            .unwrap();
+        let (status, applied) = request_in_tenant(
+            &app,
+            Method::POST,
+            &format!(
+                "/gaugeapps/administration/proposals/{}/review",
+                proposed["proposal"]["id"].as_str().unwrap()
+            ),
+            json!({
+                "session_id": session["id"], "generation": session["generation"],
+                "app": "administration", "scope": session["scope"],
+                "decision": "accept", "client": "web", "authorization_proof": proof,
+            }),
+            Some("delete-hosted-review"),
+            Some(tenant_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        let mut begun = remote.begun.lock().unwrap().clone();
+        begun.sort();
+        assert_eq!(begun, ["authority:owner", "person:former"]);
+        let mut completed = remote.completed.lock().unwrap().clone();
+        completed.sort();
+        assert_eq!(completed, begun);
+    }
+
+    #[tokio::test]
     async fn verified_domain_removal_is_reviewed_and_preserves_organization_identity() {
         let (_dir, shared, app) = test_app();
         let original = OrgRecord {
@@ -9455,6 +9989,247 @@ mod tests {
         assert_eq!(member.role, "viewer");
         assert_eq!(member.status, MembershipStatus::Deprovisioned);
         assert!(org.grants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hosted_gaugeapp_member_review_stages_standing_outside_lock() {
+        use gaugedesk_app::membership_fence::{
+            HostedMemberStandingFence, InstalledMemberStandingFence, StandingFenceError,
+            StandingFenceOutcome, COMMITTED_ACTIVATION_KIND, COMMITTED_DENIAL_KIND,
+        };
+        use gaugedesk_core::ids::ScopeId;
+        use std::sync::{Mutex, Weak};
+
+        struct TestRemote {
+            wb: Weak<Mutex<Workbench>>,
+            fail_begin: bool,
+            activation: bool,
+            interleave: bool,
+            calls: Mutex<Vec<&'static str>>,
+        }
+        impl TestRemote {
+            fn assert_unlocked(&self) -> SharedWorkbench {
+                let wb = self.wb.upgrade().unwrap();
+                assert!(wb.try_lock().is_ok(), "remote call held Workbench lock");
+                wb
+            }
+        }
+        impl HostedMemberStandingFence for TestRemote {
+            fn observe_activation(
+                &self,
+                _: &ScopeId,
+                _: &str,
+            ) -> Result<Value, StandingFenceError> {
+                assert!(self.activation);
+                self.assert_unlocked();
+                self.calls.lock().unwrap().push("observe");
+                Ok(json!({ "revision": 7 }))
+            }
+            fn admit_if_unchanged(
+                &self,
+                owner: &ScopeId,
+                member: &str,
+                observed: &Value,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                assert!(self.activation);
+                assert_eq!(observed, &json!({ "revision": 7 }));
+                let wb = self.assert_unlocked();
+                let guard = wb.lock().unwrap();
+                assert!(!guard
+                    .store_ref()
+                    .retained_records(
+                        &format!("gaugeapp:administration:{}", owner.as_str()),
+                        COMMITTED_ACTIVATION_KIND,
+                    )
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    Org::rebuild_in(guard.store_ref(), owner.as_str())
+                        .unwrap()
+                        .members[member]
+                        .status,
+                    MembershipStatus::Active
+                );
+                self.calls.lock().unwrap().push("admit");
+                Ok(StandingFenceOutcome::Committed)
+            }
+            fn begin_denial(
+                &self,
+                _: &ScopeId,
+                _: &str,
+                _: &str,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                assert!(!self.activation);
+                let wb = self.assert_unlocked();
+                self.calls.lock().unwrap().push("begin");
+                if self.fail_begin {
+                    Err(StandingFenceError::Unavailable)
+                } else {
+                    if self.interleave {
+                        wb.lock()
+                            .unwrap()
+                            .store_mut()
+                            .append_record("org::organization:hosted", "competing", "write")
+                            .unwrap();
+                    }
+                    Ok(StandingFenceOutcome::Committed)
+                }
+            }
+            fn complete_denial(
+                &self,
+                owner: &ScopeId,
+                member: &str,
+                _: &str,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                assert!(!self.activation);
+                let wb = self.assert_unlocked();
+                let guard = wb.lock().unwrap();
+                assert!(!guard
+                    .store_ref()
+                    .retained_records(
+                        &format!("gaugeapp:administration:{}", owner.as_str()),
+                        COMMITTED_DENIAL_KIND,
+                    )
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    Org::rebuild_in(guard.store_ref(), owner.as_str())
+                        .unwrap()
+                        .members[member]
+                        .status,
+                    MembershipStatus::Deprovisioned
+                );
+                self.calls.lock().unwrap().push("complete");
+                Ok(StandingFenceOutcome::Committed)
+            }
+        }
+
+        for (fail_begin, activation, interleave) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let tenant = "organization:hosted";
+            let (_dir, shared, app) = test_app_as_in("owner", tenant);
+            let scope = gaugedesk_app::org::tenant_scope(tenant);
+            let member = MembershipRecord {
+                id: "person:member".into(),
+                op: RecordOp::Upsert,
+                org_id: ORG_ID.into(),
+                authority: "person:member".into(),
+                email: "member@example.test".into(),
+                role: "member".into(),
+                status: if activation {
+                    MembershipStatus::Deprovisioned
+                } else {
+                    MembershipStatus::Active
+                },
+                managed_by_scim: false,
+                team: None,
+            };
+            {
+                let mut guard = shared.lock().unwrap();
+                guard
+                    .store_mut()
+                    .append_record(
+                        &scope,
+                        "membership",
+                        &serde_json::to_string(&member).unwrap(),
+                    )
+                    .unwrap();
+            }
+            let remote = Arc::new(TestRemote {
+                wb: Arc::downgrade(&shared),
+                fail_begin,
+                activation,
+                interleave,
+                calls: Mutex::new(Vec::new()),
+            });
+            shared
+                .lock()
+                .unwrap()
+                .install_member_standing_fence(InstalledMemberStandingFence(remote.clone()));
+            let session = open_in_tenant(&app, Some(tenant)).await;
+            let (status, page) = request_in_tenant(
+                &app,
+                Method::GET,
+                &format!(
+                    "/gaugeapps/administration/pages/people?session={}&generation={}&scope={}",
+                    session["id"].as_str().unwrap(),
+                    session["generation"].as_str().unwrap(),
+                    session["scope"]["id"].as_str().unwrap(),
+                ),
+                Value::Null,
+                None,
+                Some(tenant),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            let basis = page["page"]["resource_basis"].clone();
+            let (status, proposed) = request_in_tenant(
+                &app,
+                Method::POST,
+                "/gaugeapps/administration/commands",
+                json!({
+                    "session_id": session["id"], "generation": session["generation"],
+                    "app": "administration", "scope": session["scope"],
+                    "page_id": "people", "command_id": if activation { "people.member.reactivate" } else { "people.member.deactivate" },
+                    "expected_basis": basis, "idempotency_key": "hosted-deactivate",
+                    "payload": {"id": "person:member"}, "client": "web",
+                }),
+                Some("hosted-deactivate"),
+                Some(tenant),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{proposed}");
+            let (status, _) = request_in_tenant(
+                &app,
+                Method::POST,
+                &format!(
+                    "/gaugeapps/administration/proposals/{}/review",
+                    proposed["proposal"]["id"].as_str().unwrap()
+                ),
+                json!({
+                    "session_id": session["id"], "generation": session["generation"],
+                    "app": "administration", "scope": session["scope"],
+                    "decision": "accept", "client": "web",
+                }),
+                Some("hosted-deactivate-review"),
+                Some(tenant),
+            )
+            .await;
+            assert_eq!(
+                status,
+                if fail_begin {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else if interleave {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::OK
+                },
+            );
+            let guard = shared.lock().unwrap();
+            let org = Org::rebuild_in(guard.store_ref(), &scope).unwrap();
+            assert_eq!(
+                org.members["person:member"].status,
+                if activation || fail_begin || interleave {
+                    MembershipStatus::Active
+                } else {
+                    MembershipStatus::Deprovisioned
+                }
+            );
+            assert_eq!(
+                remote.calls.lock().unwrap().as_slice(),
+                if fail_begin || interleave {
+                    &["begin"][..]
+                } else if activation {
+                    &["observe", "admit"][..]
+                } else {
+                    &["begin", "complete"][..]
+                }
+            );
+        }
     }
 
     #[tokio::test]

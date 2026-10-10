@@ -68,6 +68,19 @@ pub enum StandingFenceError {
 pub const COMMITTED_DENIAL_KIND: &str = "gaugevault-committed-member-denial-v1";
 pub const COMMITTED_ACTIVATION_KIND: &str = "gaugevault-committed-member-activation-v1";
 
+/// A hosted command must use the staged Cosmos protocol before applying any
+/// fact that can change standing. A malformed organization fact is included so
+/// it cannot bypass the guard by failing to decode here.
+pub fn changes_member_standing(facts: &[CommandRecordFact]) -> bool {
+    facts.iter().any(|fact| {
+        fact.kind == "membership"
+            || (fact.kind == "org"
+                && serde_json::from_str::<OrgRecord>(&fact.payload)
+                    .map(|record| record.op == RecordOp::Tombstone)
+                    .unwrap_or(true))
+    })
+}
+
 fn digest(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
@@ -143,6 +156,78 @@ struct CommittedActivation {
     owner_scope: ScopeId,
     member: String,
     observed: serde_json::Value,
+}
+
+/// The Store command may not commit a membership transition without one exact
+/// receipt for that same owner and member. This checks the full transition set
+/// before the caller appends any facts; recovery repeats its own provenance
+/// check against the committed command after a crash.
+pub fn validate_staged_receipts(
+    store: &Store,
+    owner_scope: &ScopeId,
+    command_scope: &str,
+    key: &str,
+    snapshot: &str,
+    domain_facts: &[CommandRecordFact],
+    receipts: &[CommandRecordFact],
+) -> Result<(), AdmitError> {
+    let invalid = || {
+        AdmitError::Rejected(Rejection {
+            reason: "member-standing receipts do not match the exact command",
+        })
+    };
+    let transitions = membership_transitions(store, owner_scope, domain_facts)?;
+    if transitions.len() != receipts.len() {
+        return Err(invalid());
+    }
+    let mut expected = BTreeMap::new();
+    for transition in transitions {
+        let (member, kind) = match transition {
+            MembershipTransition::Deny { member, .. } => (member, COMMITTED_DENIAL_KIND),
+            MembershipTransition::Activate { member, .. } => (member, COMMITTED_ACTIVATION_KIND),
+        };
+        expected.insert(member, kind);
+    }
+    for fact in receipts {
+        if fact.scope_id != command_scope {
+            return Err(invalid());
+        }
+        let member = match fact.kind.as_str() {
+            COMMITTED_DENIAL_KIND => {
+                let receipt: CommittedDenial =
+                    serde_json::from_str(&fact.payload).map_err(|_| invalid())?;
+                if receipt.command_scope != command_scope
+                    || receipt.key != key
+                    || receipt.snapshot_digest != digest(snapshot)
+                    || receipt.operation != denial_operation(command_scope, key, snapshot)
+                    || receipt.owner_scope != *owner_scope
+                {
+                    return Err(invalid());
+                }
+                receipt.member
+            }
+            COMMITTED_ACTIVATION_KIND => {
+                let receipt: CommittedActivation =
+                    serde_json::from_str(&fact.payload).map_err(|_| invalid())?;
+                if receipt.command_scope != command_scope
+                    || receipt.key != key
+                    || receipt.snapshot_digest != digest(snapshot)
+                    || receipt.owner_scope != *owner_scope
+                {
+                    return Err(invalid());
+                }
+                receipt.member
+            }
+            _ => return Err(invalid()),
+        };
+        if expected.remove(&member) != Some(fact.kind.as_str()) {
+            return Err(invalid());
+        }
+    }
+    if !expected.is_empty() {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn invalid_owner() -> AdmitError {
@@ -501,5 +586,94 @@ mod tests {
         assert_eq!(payload["snapshot_digest"], digest(snapshot));
         assert_eq!(payload["owner_scope"], owner.as_str());
         assert_eq!(payload["member"], "alice");
+    }
+
+    #[test]
+    fn hosted_guard_includes_membership_and_organization_closure() {
+        let owner = ScopeId::from("org::organization:tenant");
+        let membership = CommandRecordFact {
+            scope_id: owner.as_str().into(),
+            kind: "membership".into(),
+            payload: record("alice", MembershipStatus::Active, RecordOp::Upsert),
+        };
+        assert!(changes_member_standing(&[membership]));
+        for op in [RecordOp::Upsert, RecordOp::Tombstone] {
+            let org = OrgRecord {
+                id: "org".into(),
+                op,
+                ..Default::default()
+            };
+            let fact = CommandRecordFact {
+                scope_id: owner.as_str().into(),
+                kind: "org".into(),
+                payload: serde_json::to_string(&org).unwrap(),
+            };
+            assert_eq!(changes_member_standing(&[fact]), op == RecordOp::Tombstone);
+        }
+        assert!(changes_member_standing(&[CommandRecordFact {
+            scope_id: owner.as_str().into(),
+            kind: "org".into(),
+            payload: "not JSON".into(),
+        }]));
+    }
+
+    #[test]
+    fn staged_receipts_cover_every_exact_member_transition() {
+        let owner = ScopeId::from("org::organization:tenant");
+        let store = Store::open_in_memory().unwrap();
+        let command_scope = "command::tenant";
+        let key = "review-one";
+        let snapshot = "reviewed GaugeApp command";
+        let facts = [
+            CommandRecordFact {
+                scope_id: owner.as_str().into(),
+                kind: "membership".into(),
+                payload: record("alice", MembershipStatus::Active, RecordOp::Upsert),
+            },
+            CommandRecordFact {
+                scope_id: owner.as_str().into(),
+                kind: "membership".into(),
+                payload: record("bob", MembershipStatus::Deprovisioned, RecordOp::Upsert),
+            },
+        ];
+        let activation = committed_activation_fact(
+            command_scope,
+            key,
+            snapshot,
+            &owner,
+            "alice",
+            serde_json::json!({"revision": 7}),
+        );
+        let denial = committed_denial_fact(command_scope, key, snapshot, &owner, "bob");
+        assert!(validate_staged_receipts(
+            &store,
+            &owner,
+            command_scope,
+            key,
+            snapshot,
+            &facts,
+            &[denial.clone(), activation.clone()],
+        )
+        .is_ok());
+        assert!(validate_staged_receipts(
+            &store,
+            &owner,
+            command_scope,
+            key,
+            snapshot,
+            &facts,
+            std::slice::from_ref(&denial),
+        )
+        .is_err());
+        assert!(validate_staged_receipts(
+            &store,
+            &owner,
+            command_scope,
+            key,
+            "different snapshot",
+            &facts,
+            &[denial, activation],
+        )
+        .is_err());
     }
 }

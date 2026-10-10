@@ -259,6 +259,14 @@
     {
       "declaration": {
         "owner": "Store",
+        "name": "admit_record_facts_chained_at_scope_head",
+        "signature": "fn admit_record_facts_chained_at_scope_head (& mut self , command_scope : & str , idempotency_key : & str , snapshot_json : & str , facts : & [CommandRecordFact] , chained : Option < ChainedRecordFact < '_ > > , expected_scope : & str , expected_position : i64 ,) -> Result < MaterializedRecordAdmission , AdmitError >"
+      },
+      "classification": "ledger"
+    },
+    {
+      "declaration": {
+        "owner": "Store",
         "name": "admit_record_facts_with_claims",
         "signature": "fn admit_record_facts_with_claims (& mut self , command_scope : & str , idempotency_key : & str , snapshot_json : & str , facts : & [CommandRecordFact] , chained : Option < ChainedRecordFact < '_ > > , claims : & [RecordCommandClaim < '_ >] ,) -> Result < MaterializedRecordAdmission , AdmitError >"
       },
@@ -769,9 +777,19 @@
     {
       "site": {
         "file": "crates/app/src/gaugeapp_host.rs",
-        "callable": "finish_command_in",
+        "callable": "finish_command_with_standing",
         "capability": "admit_record_facts_chained",
         "expression": "wb . store_mut () . admit_record_facts_chained (receipt_scope , key , & snapshot (envelope) , & facts , Some (crate :: audit :: chained_in (& audit_scope , & audit_link)) ,)",
+        "count": 1
+      },
+      "profile": "gaugeapp-command-receipts"
+    },
+    {
+      "site": {
+        "file": "crates/app/src/gaugeapp_host.rs",
+        "callable": "finish_command_with_standing",
+        "capability": "admit_record_facts_chained_at_scope_head",
+        "expression": "wb . store_mut () . admit_record_facts_chained_at_scope_head (receipt_scope , key , & snapshot (envelope) , & facts , Some (crate :: audit :: chained_in (& audit_scope , & audit_link)) , & staged . expected_scope , staged . expected_position ,)",
         "count": 1
       },
       "profile": "gaugeapp-command-receipts"

@@ -117,6 +117,12 @@ pub fn resolve_corporate_login(
     // root custody. A refusal must not leave even an orphaned encrypted key
     // envelope outside the append-only transaction.
     let admission = admission_basis(&org, email)?;
+    if wb.member_standing_fence().is_some() {
+        // The synchronous fold runs under the Workbench lock. A hosted
+        // authority call here would violate that lock boundary, and creating
+        // the account root before refusing could strand custody material.
+        return Err(LoginFoldRefusal::Unavailable);
+    }
     let pending_email = VerifiedEmailRecord::new("pending-account", email, 0)
         .map_err(|_| LoginFoldRefusal::NotAdmitted)?;
     decide_verify_email(&auth, pending_email).map_err(|_| LoginFoldRefusal::NotAdmitted)?;
@@ -383,6 +389,12 @@ fn commit_admission(
     member: MembershipRecord,
     invitation: Option<OrganizationInvitationRecord>,
 ) -> Result<(), LoginFoldRefusal> {
+    if wb.member_standing_fence().is_some() {
+        // Existing linked invitees reach this helper without creating a new
+        // root. Until this fold has an unlocked staged ceremony, no active
+        // membership may bypass the installed hosted fence.
+        return Err(LoginFoldRefusal::Unavailable);
+    }
     let mut facts = current_command_record_facts(wb.store_ref(), auth_facts)
         .map_err(|_| LoginFoldRefusal::Unavailable)?;
     facts.push(CommandRecordFact {
@@ -581,6 +593,90 @@ mod tests {
         assert_eq!(
             wb.store_ref()
                 .records(&pending.store_scope, "membership")
+                .unwrap()
+                .len(),
+            member_count
+        );
+    }
+
+    #[test]
+    fn hosted_login_refuses_new_membership_before_creating_custody_material() {
+        use gaugedesk_app::membership_fence::{
+            HostedMemberStandingFence, InstalledMemberStandingFence, StandingFenceError,
+            StandingFenceOutcome,
+        };
+        use gaugedesk_core::ids::ScopeId;
+
+        struct NoLockedRemote;
+        impl HostedMemberStandingFence for NoLockedRemote {
+            fn observe_activation(
+                &self,
+                _: &ScopeId,
+                _: &str,
+            ) -> Result<serde_json::Value, StandingFenceError> {
+                panic!("remote authority cannot run under the login fold lock")
+            }
+            fn admit_if_unchanged(
+                &self,
+                _: &ScopeId,
+                _: &str,
+                _: &serde_json::Value,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                panic!("remote authority cannot run under the login fold lock")
+            }
+            fn begin_denial(
+                &self,
+                _: &ScopeId,
+                _: &str,
+                _: &str,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                panic!("remote authority cannot run under the login fold lock")
+            }
+            fn complete_denial(
+                &self,
+                _: &ScopeId,
+                _: &str,
+                _: &str,
+            ) -> Result<StandingFenceOutcome, StandingFenceError> {
+                panic!("remote authority cannot run under the login fold lock")
+            }
+        }
+
+        let (mut wb, _dir) = workbench();
+        let pending = seed_org(
+            &mut wb,
+            "organization:acme",
+            Some(SsoAdmissionMode::VerifiedDomainJit),
+        );
+        let existing = identity("idp-subject-existing", "existing@acme.example", true);
+        let admitted = resolve_corporate_login(&mut wb, &pending, &existing).unwrap();
+        let root_count = AccountAuth::rebuild(wb.store_ref()).unwrap().roots.len();
+        let member_count = wb
+            .store_ref()
+            .retained_records(&pending.store_scope, "membership")
+            .unwrap()
+            .len();
+        wb.install_member_standing_fence(InstalledMemberStandingFence(std::sync::Arc::new(
+            NoLockedRemote,
+        )));
+
+        assert_eq!(
+            resolve_corporate_login(&mut wb, &pending, &existing).unwrap(),
+            admitted,
+            "an already active linked member can continue to sign in"
+        );
+        let fresh = identity("idp-subject-fresh", "fresh@acme.example", true);
+        assert_eq!(
+            resolve_corporate_login(&mut wb, &pending, &fresh),
+            Err(LoginFoldRefusal::Unavailable)
+        );
+        assert_eq!(
+            AccountAuth::rebuild(wb.store_ref()).unwrap().roots.len(),
+            root_count
+        );
+        assert_eq!(
+            wb.store_ref()
+                .retained_records(&pending.store_scope, "membership")
                 .unwrap()
                 .len(),
             member_count

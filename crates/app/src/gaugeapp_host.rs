@@ -402,6 +402,21 @@ pub trait GaugeAppDefinition: 'static {
         )))
     }
 
+    /// An owning GaugeApp may stage an already-authorized reviewed command
+    /// through a remote authority before its Store facts are admitted. The
+    /// returned job runs only after the Workbench guard is released and must
+    /// reauthenticate and replan before committing.
+    fn begin_staged_review(
+        _wb: &mut Workbench,
+        _headers: &HeaderMap,
+        _session: &GaugeAppSession,
+        _review: ExternalReview<'_>,
+        _body: &ReviewBody,
+        _services: &Self::Services,
+    ) -> Option<Result<PendingAuthority, Box<Response>>> {
+        None
+    }
+
     fn accept_stale_proposal(
         _wb: &Workbench,
         _envelope: &GaugeAppCommandEnvelope,
@@ -1894,6 +1909,25 @@ fn prepare_review<D: GaugeAppDefinition>(
         Ok(plan) => plan,
         Err(response) => return Ok(*response),
     };
+    if let Some(prepared) = D::begin_staged_review(
+        &mut guard,
+        &headers,
+        &session,
+        ExternalReview {
+            envelope: &envelope,
+            key: &key,
+            change: &change,
+            plan: plan.clone(),
+        },
+        &body,
+        &services,
+    ) {
+        drop(guard);
+        return match prepared {
+            Ok(job) => Err(job),
+            Err(response) => Ok(*response),
+        };
+    }
     let plan = match D::apply_plan(
         &mut guard, &headers, &session, &envelope, &change.id, plan, &services,
     ) {
@@ -1962,10 +1996,109 @@ pub fn finish_command_in<D: GaugeAppDefinition>(
     plan: CommandPlan,
     receipt_scope: &str,
 ) -> (Response, bool) {
+    finish_command_with_standing::<D>(
+        wb,
+        headers,
+        session,
+        envelope,
+        key,
+        change,
+        plan,
+        receipt_scope,
+        None,
+    )
+}
+
+/// A reviewed command whose exact standing transitions were prepared outside
+/// the Workbench lock. Its receipts join the domain facts, applied change and
+/// audit link under the Store head observed before the remote calls.
+pub struct StagedStandingFacts {
+    pub expected_scope: String,
+    pub expected_position: i64,
+    pub receipts: Vec<CommandRecordFact>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn finish_staged_command_in<D: GaugeAppDefinition>(
+    wb: &mut Workbench,
+    headers: &HeaderMap,
+    session: &GaugeAppSession,
+    envelope: &GaugeAppCommandEnvelope,
+    key: &str,
+    change: Option<GaugeAppChangeRecord>,
+    plan: CommandPlan,
+    receipt_scope: &str,
+    staged: StagedStandingFacts,
+) -> (Response, bool) {
+    finish_command_with_standing::<D>(
+        wb,
+        headers,
+        session,
+        envelope,
+        key,
+        change,
+        plan,
+        receipt_scope,
+        Some(staged),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_command_with_standing<D: GaugeAppDefinition>(
+    wb: &mut Workbench,
+    headers: &HeaderMap,
+    session: &GaugeAppSession,
+    envelope: &GaugeAppCommandEnvelope,
+    key: &str,
+    change: Option<GaugeAppChangeRecord>,
+    plan: CommandPlan,
+    receipt_scope: &str,
+    staged: Option<StagedStandingFacts>,
+) -> (Response, bool) {
+    let member_change = crate::membership_fence::changes_member_standing(&plan.facts);
+    if wb.member_standing_fence().is_some() && member_change && staged.is_none() {
+        return (
+            *boxed_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hosted member standing requires a staged command",
+            ),
+            false,
+        );
+    }
+    if let Some(staged) = &staged {
+        if wb.member_standing_fence().is_none()
+            || !member_change
+            || staged.expected_scope != D::record_scope(headers)
+            || staged.receipts.is_empty()
+        {
+            return (
+                *boxed_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "invalid staged member standing",
+                ),
+                false,
+            );
+        }
+        let owner = gaugedesk_core::ids::ScopeId::from(staged.expected_scope.as_str());
+        if let Err(error) = crate::membership_fence::validate_staged_receipts(
+            wb.store_ref(),
+            &owner,
+            receipt_scope,
+            key,
+            &snapshot(envelope),
+            &plan.facts,
+            &staged.receipts,
+        ) {
+            return (D::store_error(error), false);
+        }
+    }
     let mut applied_change = change.unwrap_or_else(|| proposed_change(session, envelope));
     applied_change.status = GaugeAppChangeStatus::Applied;
     applied_change.reviewed_by = Some(session.actor.clone());
     let mut facts = plan.facts.clone();
+    if let Some(staged) = &staged {
+        facts.extend(staged.receipts.iter().cloned());
+    }
     let change_fact = match change_fact::<D>(headers, GAUGEAPP_CHANGE_KIND, &applied_change) {
         Ok(fact) => fact,
         Err(response) => return (*response, false),
@@ -1974,13 +2107,25 @@ pub fn finish_command_in<D: GaugeAppDefinition>(
     let audit_link = crate::audit::link(&session.actor, plan.audit_action, &plan.audit_target);
     let store_scope = D::record_scope(headers);
     let audit_scope = crate::audit::scope_for(&store_scope);
-    let result = match wb.store_mut().admit_record_facts_chained(
-        receipt_scope,
-        key,
-        &snapshot(envelope),
-        &facts,
-        Some(crate::audit::chained_in(&audit_scope, &audit_link)),
-    ) {
+    let result = match if let Some(staged) = &staged {
+        wb.store_mut().admit_record_facts_chained_at_scope_head(
+            receipt_scope,
+            key,
+            &snapshot(envelope),
+            &facts,
+            Some(crate::audit::chained_in(&audit_scope, &audit_link)),
+            &staged.expected_scope,
+            staged.expected_position,
+        )
+    } else {
+        wb.store_mut().admit_record_facts_chained(
+            receipt_scope,
+            key,
+            &snapshot(envelope),
+            &facts,
+            Some(crate::audit::chained_in(&audit_scope, &audit_link)),
+        )
+    } {
         Ok(result) => result,
         Err(error) => return (D::store_error(error), false),
     };
@@ -1993,7 +2138,10 @@ pub fn finish_command_in<D: GaugeAppDefinition>(
         }
     }
     if let Err(response) = D::after_command(wb, headers, session, envelope) {
-        return (*response, false);
+        // The Store command has already committed. A staged caller must still
+        // finish its remote denial even when post-commit cleanup fails; the
+        // ordinary caller's boolean keeps its existing "fresh success" meaning.
+        return (*response, staged.is_some() && !result.replayed);
     }
     let freshly_applied = !result.replayed;
     ((StatusCode::OK, Json(json!({

@@ -485,16 +485,30 @@ impl Sandbox for Seatbelt {
 }
 
 /// Windows: AppContainer / restricted token with a deny-write ACE on the
-/// definition surface (ADR 0030). **Deferred — needs a Windows build/CI host**
-/// (RF-B2): unlike the Linux/macOS backends, there is no CLI wrapper to shell out
-/// to, so this must be a Win32 FFI backend and cannot be built or verified on the
-/// Linux-only toolchain/CI this project runs. `wrap` returns `None`, which is now
-/// **safe** because [`wrap_or_refuse`] fails closed
-/// when a protected definition surface cannot be sandboxed (RF-B1) — so the
-/// Windows hole is shut today; this backend is the *enforcement* that lets
-/// use-mode actually run on Windows.
+/// definition surface (ADR 0030). **Not implemented, and nothing needs it
+/// today** (tracker `WS-535`): GaugeDesk supplies no OS-command executor —
+/// governed `bash` is WhippleScript's Bashkit-backed virtual shell
+/// (`specs/implementation/backend-stack.md`), and the one former caller of
+/// [`wrap_strict`] is compiled out — so no live path spawns a process through
+/// any [`Sandbox`] backend on any OS. The original reason for deferring it, the
+/// lack of a Windows build host, no longer holds: the fleet's Windows host builds
+/// the Windows release (DR-0182). What would make this backend necessary is a
+/// broker that runs real OS commands on a Windows desktop, and that broker
+/// should bring its containment design with it.
 ///
-/// Design when a Windows host is available:
+/// `wrap` returns `None`, which is **safe**: [`wrap_or_refuse`] and
+/// [`wrap_strict`] fail closed when a protected definition surface cannot be
+/// sandboxed (RF-B1), so an OS command on Windows is refused, never run
+/// unsandboxed. Unlike the Linux/macOS backends there is no CLI wrapper to shell
+/// out to, so a real backend is Win32 FFI behind a launcher the argv can name.
+///
+/// The ADR 0030 design below needs revisiting before it is built: an
+/// AppContainer denies reads outside the paths granted to it, unlike the "read
+/// broadly, write narrowly" policy the other backends realize, so a launcher
+/// must either grant read ACLs to everything the program touches or use a
+/// low-integrity restricted token, which keeps broad reads but cannot withhold
+/// network.
+///
 /// - create a per-engagement **AppContainer profile** (a capability SID), and
 ///   launch the runtime with `CreateProcess` + `STARTUPINFOEX`/`PROC_THREAD_ATTRIBUTE_*`
 ///   carrying the AppContainer SID and an explicit (empty/minimal) capability set;

@@ -1570,6 +1570,31 @@ impl Store {
         )
     }
 
+    /// Admit a staged command only against the Store head observed before
+    /// remote authorization, while resolving its audit-chain link inside the
+    /// same transaction. Exact retries replay even after that head advances.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_record_facts_chained_at_scope_head(
+        &mut self,
+        command_scope: &str,
+        idempotency_key: &str,
+        snapshot_json: &str,
+        facts: &[CommandRecordFact],
+        chained: Option<ChainedRecordFact<'_>>,
+        expected_scope: &str,
+        expected_position: i64,
+    ) -> Result<MaterializedRecordAdmission, AdmitError> {
+        self.admit_record_facts_internal(
+            command_scope,
+            idempotency_key,
+            snapshot_json,
+            facts,
+            chained,
+            &[],
+            Some((expected_scope, expected_position)),
+        )
+    }
+
     /// Observe an exact uncompleted command claim in one read. A lagging
     /// mutable status cannot make a command with a durable receipt pending.
     /// This is retained intent evidence, never an execution grant.
@@ -4017,6 +4042,74 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn staged_command_binds_its_audit_link_to_the_same_scope_head_commit() {
+        let mut store = Store::open_in_memory().unwrap();
+        let fact = CommandRecordFact {
+            scope_id: "org::tenant".into(),
+            kind: "membership".into(),
+            payload: "deprovision alice".into(),
+        };
+        let link = |prior: Option<&str>| format!("{}->deprovision", prior.unwrap_or("root"));
+        let first = store
+            .admit_record_facts_chained_at_scope_head(
+                "command::tenant",
+                "deprovision-alice",
+                "exact command",
+                std::slice::from_ref(&fact),
+                Some(ChainedRecordFact {
+                    scope_id: "audit::tenant",
+                    kind: "audit",
+                    link: &link,
+                }),
+                "org::tenant",
+                -1,
+            )
+            .unwrap();
+        assert!(!first.replayed);
+        assert_eq!(first.chained_payload.as_deref(), Some("root->deprovision"));
+        assert_eq!(store.records("org::tenant", "membership").unwrap().len(), 1);
+        assert_eq!(store.records("audit::tenant", "audit").unwrap().len(), 1);
+
+        let stale = store.admit_record_facts_chained_at_scope_head(
+            "command::tenant",
+            "deprovision-bob",
+            "different command",
+            std::slice::from_ref(&fact),
+            Some(ChainedRecordFact {
+                scope_id: "audit::tenant",
+                kind: "audit",
+                link: &link,
+            }),
+            "org::tenant",
+            -1,
+        );
+        assert!(matches!(stale, Err(AdmitError::Rejected(_))));
+        assert!(store
+            .command_for_key("command::tenant", "deprovision-bob")
+            .unwrap()
+            .is_none());
+        assert_eq!(store.records("audit::tenant", "audit").unwrap().len(), 1);
+
+        let replay = store
+            .admit_record_facts_chained_at_scope_head(
+                "command::tenant",
+                "deprovision-alice",
+                "exact command",
+                &[fact],
+                Some(ChainedRecordFact {
+                    scope_id: "audit::tenant",
+                    kind: "audit",
+                    link: &link,
+                }),
+                "org::tenant",
+                -1,
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(store.records("audit::tenant", "audit").unwrap().len(), 1);
     }
 
     #[test]
