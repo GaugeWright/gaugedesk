@@ -1269,7 +1269,7 @@ mod reachability_tests {
 
         // Nothing beyond the shared project.
         for (method, path, body) in [
-            ("GET", "/projects/proj-private/home", None),
+            ("GET", "/projects/proj-private/models", None),
             ("GET", "/account/credentials", None),
             ("GET", "/account/hub-sessions", None),
             (

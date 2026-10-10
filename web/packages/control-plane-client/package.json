@@ -23,7 +23,6 @@
     "./control-plane-workbench": "./src/control-plane-workbench.ts",
     "./home-routing": "./src/home-routing.ts",
     "./home-invitation": "./src/home-invitation.ts",
-    "./project-home": "./src/project-home.ts",
     "./projection-carriage": "./src/projection-carriage.ts",
     "./workspace-delta": "./src/workspace-delta.ts",
     "./generated/tunnel.js": "./src/generated/tunnel.js",

@@ -1,6 +1,6 @@
 //! A project's whip programs, each with its structure and every instance of
 //! it — what the Structure and Instances tabs on a `.whip` file draw, and what
-//! the Project Home rolls up as "whips running".
+//! project work views may present as running whips.
 //!
 //! Two kinds of program run in a project. The inbound gate is a file the
 //! project carries (`gates/inbound.whip`) and its instances live in the gate's

@@ -30,7 +30,7 @@ function navigator(api: ReturnType<typeof sharedMember>["api"], createProjectUna
         onOpenArchetypeSettings: () => undefined,
         onOpenEngagement: () => undefined,
         onOpenModelAccess: () => undefined,
-        onOpenProjectHome: (id, name) => {
+        onOpenProjectSettings: (id, name) => {
             // What the workbench does when a project row is opened.
             api.setCurrentProject(id);
             opened(id, name);

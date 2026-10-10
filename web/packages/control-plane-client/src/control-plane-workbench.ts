@@ -1,7 +1,6 @@
 import { panelProfileFromWire, panelProfileToWire } from "./panel-profile-wire";
 import { type ProjectionCarriage, parseProjectionCarriage } from "./projection-carriage";
 import { parseWorkspaceDelta, type WorkspaceDelta } from "./workspace-delta";
-import { type ProjectHome, parseProjectHome } from "./project-home";
 import {
     engagementId,
     isWorkspaceRecord,
@@ -678,10 +677,6 @@ export async function setProjectNetworkIsolated(
 
 export async function deleteProject(transport: WorkbenchTransport, id: ProjectId): Promise<void> {
     await transport.json("DELETE", `/projects/${id}`);
-}
-
-export async function projectHome(transport: WorkbenchTransport, id: ProjectId): Promise<ProjectHome> {
-    return parseProjectHome(await transport.json("GET", `/projects/${id}/home`));
 }
 
 /** A project's whip programs, each with its structure and every instance of

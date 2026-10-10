@@ -1126,33 +1126,6 @@ pub struct CreateProject {
     pub home_id: Option<gaugedesk_core::ids::HomeId>,
 }
 
-/// `GET /projects/:id/home` — the **project-home rollup** (`UX-2`, `mvp-workbench.md` "Project
-/// Home"): the per-project summary derived **from data** (`INV-5`; never inferred from command
-/// receipts). For each work chat across the project's placements it folds the chat's lifecycle
-/// scopes (chat id = the run/merge scope) into:
-/// - `recent_runs` — `{chat,title,phase,ran}` from each chat's `RunState`, most-recent-first;
-/// - `outputs` — `{chat,title,phase}` from each chat's `MergeState` for chats with a **live**
-///   (non-`Clean`/non-`Init`) output/review state — the review/output summaries;
-/// - `audit` — `{placements,chats,events}`, the audit summary (event counts across the
-///   project's chat scopes; references only, `INV-10`).
-///
-/// 404 on an unknown project. Read-only — placement version/upgrade display is the workspace
-/// projection (`UX-9`), so this rollup is the remaining run/output/audit half.
-pub async fn project_home(
-    State(wb): State<SharedWorkbench>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let wb = wb.lock_unpoisoned();
-    match wb.project_home_value(&id) {
-        Some(value) => (StatusCode::OK, Json(value)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "no such project" })),
-        )
-            .into_response(),
-    }
-}
-
 /// A project's whip programs with their structure and instances.
 pub async fn project_whips(
     State(wb): State<SharedWorkbench>,

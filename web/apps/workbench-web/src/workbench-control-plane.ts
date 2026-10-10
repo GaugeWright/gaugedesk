@@ -41,7 +41,6 @@ import type {
     WorkspaceChange,
     WorkspaceDelta,
     ProjectionCarriage,
-    ProjectHome,
     AccountHome,
     HomeId,
     OpaqueHomeRoute,
@@ -2389,10 +2388,6 @@ export class WorkbenchControlPlane implements ControlPlane {
         resolutions: Readonly<Record<string, "mine" | "theirs">>,
     ): Promise<{ readonly pulled: number }> {
         return workbenchClient.pullProjectUpstream(this.workbenchTransport(), id, sourceCut, forkCut, resolutions);
-    }
-
-    projectHome(id: ProjectId): Promise<ProjectHome> {
-        return workbenchClient.projectHome(this.workbenchTransport(), id);
     }
 
     forkTree(): Promise<import("@gaugewright/control-plane-client").ForkNode[]> {

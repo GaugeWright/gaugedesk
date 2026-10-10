@@ -14,7 +14,6 @@ export * from "./control-plane-domain";
 export * from "./control-plane-federation";
 export * from "./control-plane-transport";
 export * from "./control-plane-workbench";
-export * from "./project-home";
 export * from "./project-organization-models";
 export * from "./registered-host";
 export * from "./fork-tree";

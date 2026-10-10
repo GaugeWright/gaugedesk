@@ -689,7 +689,7 @@ mod tests {
         let (status, _) = response(
             &app,
             "GET",
-            "/projects/foreign/home",
+            "/projects/foreign/models",
             Some("alice-login"),
             Some(&wrong_admission),
         )
@@ -699,7 +699,7 @@ mod tests {
         let (status, _) = response(
             &app,
             "GET",
-            "/projects/foreign/home",
+            "/projects/foreign/models",
             Some("alice-login"),
             Some(&admission),
         )

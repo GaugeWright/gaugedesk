@@ -6089,64 +6089,6 @@ impl Workbench {
         Ok(outcome)
     }
 
-    pub(crate) fn project_home_value(&self, id: &str) -> Option<serde_json::Value> {
-        if !self.library.projects.contains_key(id) {
-            return None;
-        }
-        let placements = self.library.using_instances_of(id).len();
-        let chats = self.library.project_chats(id);
-        let mut recent_runs = Vec::new();
-        let mut outputs = Vec::new();
-        let mut events_total = 0usize;
-        for chat in chats.iter() {
-            let run = self
-                .store_ref()
-                .fold::<RunState>(&chat.id)
-                .unwrap_or_default();
-            recent_runs.push(serde_json::json!({
-                "chat": chat.id,
-                "title": chat.title,
-                "phase": run.phase,
-                "ran": run.admitted_once,
-            }));
-            let merge = self
-                .store_ref()
-                .fold::<MergeState>(&chat.id)
-                .unwrap_or_default();
-            if !matches!(
-                merge.phase,
-                gaugedesk_core::merge::MergePhase::Idle | gaugedesk_core::merge::MergePhase::Clean
-            ) {
-                outputs.push(serde_json::json!({
-                    "chat": chat.id,
-                    "title": chat.title,
-                    "phase": merge.phase,
-                }));
-            }
-            events_total += self
-                .store_ref()
-                .events(&chat.id)
-                .map(|events| events.len())
-                .unwrap_or(0);
-        }
-        recent_runs.sort_by(|left, right| {
-            right["ran"]
-                .as_u64()
-                .unwrap_or(0)
-                .cmp(&left["ran"].as_u64().unwrap_or(0))
-        });
-        Some(serde_json::json!({
-            "project_id": id,
-            "recent_runs": recent_runs,
-            "outputs": outputs,
-            "audit": {
-                "placements": placements,
-                "chats": chats.len(),
-                "events": events_total,
-            },
-        }))
-    }
-
     pub(crate) fn update_project_record(
         &mut self,
         id: &str,

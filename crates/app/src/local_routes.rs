@@ -311,7 +311,6 @@ pub fn routes(federation_on: bool) -> Router<SharedWorkbench> {
             "/projects/{id}",
             put(lr::update_project).delete(lr::delete_project),
         )
-        .route("/projects/{id}/home", get(lr::project_home))
         .route(
             "/projects/{id}/fork",
             post(crate::project_fork::fork_project),

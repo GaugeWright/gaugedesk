@@ -902,7 +902,7 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     let (s, _) = send(
         &app,
         "GET",
-        "/projects/proj-acme/home",
+        "/projects/proj-acme/models",
         None,
         Some("b-token"),
     )
@@ -926,11 +926,11 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
         "ungranted member cannot read the project's chat"
     );
 
-    // The granted member reaches the project's data routes (200 on the project-home rollup).
+    // The granted member reaches the project's data routes (200 on the project model projection).
     let (s, _) = send(
         &app,
         "GET",
-        "/projects/proj-acme/home",
+        "/projects/proj-acme/models",
         None,
         Some("a-token"),
     )
@@ -954,7 +954,7 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     let (s, _) = send(
         &app,
         "GET",
-        "/projects/proj-acme/home",
+        "/projects/proj-acme/models",
         None,
         Some("owner-token"),
     )
@@ -983,7 +983,7 @@ async fn entsec2_scopes_data_routes_to_granted_projects() {
     let (s, _) = send(
         &app,
         "GET",
-        "/projects/proj-acme/home",
+        "/projects/proj-acme/models",
         None,
         Some("a-token"),
     )
@@ -1014,7 +1014,7 @@ async fn organization_administrators_need_project_standing_at_the_enterprise_bou
         wb.rebuild_library();
     }
     for (account, token) in [("owner-auth", "owner-token"), ("admin-a", "admin-a-token")] {
-        let (status, _) = send(&app, "GET", "/projects/ungranted/home", None, Some(token)).await;
+        let (status, _) = send(&app, "GET", "/projects/ungranted/models", None, Some(token)).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
@@ -1038,7 +1038,7 @@ async fn organization_administrators_need_project_standing_at_the_enterprise_bou
         .await;
         assert_eq!(status, StatusCode::OK, "{result}");
         assert_eq!(
-            send(&app, "GET", "/projects/ungranted/home", None, Some(token))
+            send(&app, "GET", "/projects/ungranted/models", None, Some(token))
                 .await
                 .0,
             StatusCode::OK
@@ -1053,7 +1053,7 @@ async fn organization_administrators_need_project_standing_at_the_enterprise_bou
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            send(&app, "GET", "/projects/ungranted/home", None, Some(token))
+            send(&app, "GET", "/projects/ungranted/models", None, Some(token))
                 .await
                 .0,
             StatusCode::FORBIDDEN

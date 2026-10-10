@@ -138,7 +138,6 @@ import {
     OpenSettingsMenu as SettingsMenu,
     type SettingsGaugeAppAction,
     type MenuIdentity,
-    ProjectHomePanel,
     ProjectTrackerPanel,
     type PendingTrackerCompletion,
     ProjectModelAccessPanel,
@@ -969,19 +968,12 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const [engagement, setEngagement] = createSignal<{ id: ProjectId; name: string } | null>(null);
     // LLM-2: the per-project model-access panel (pin a BYOK key at project scope).
     const [modelAccess, setModelAccess] = createSignal<{ id: ProjectId; name: string } | null>(null);
-    // UX-2: the per-project home panel (recent runs, outputs under review, audit rollup).
-    const [projectHome, setProjectHome] = createSignal<{ id: ProjectId; name: string } | null>(null);
     const [projectSettings, setProjectSettings] = createSignal<{ id: ProjectId; name: string } | null>(null);
     const [projectSettingsPage, setProjectSettingsPage] = createSignal<ProjectSettingsPage>("overview");
-    const [routedProject, setRoutedProject] = createSignal<ProjectId | null>(null);
     createEffect(() => {
         const request = props.gaugeApps?.projectRequest?.();
         if (!request) return;
         const id = request.id as ProjectId;
-        // Set the route before mounting the summary resource: its first read
-        // must go to this project's admitted Home, never the account's current
-        // default Home by accident.
-        setRoutedProject(id);
         api.setCurrentProject(id);
         props.gaugeApps?.close();
         closePanelSettings();
@@ -1075,7 +1067,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     const closeProjectSettings = () => {
         setProjectSettings(null);
         setProjectSettingsPage("overview");
-        setRoutedProject(null);
     };
     const refreshProjectSettings = async () => {
         bumpNav();
@@ -1681,7 +1672,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
     createEffect(() => {
         const requested = projectSettings()?.id
             ?? panelSettings()?.projectId
-            ?? (projectHome()?.id === routedProject() ? routedProject() : null);
         const info = chatInfo();
         const project = workRouteProject({
             requested: (requested ?? null) as ProjectId | null,
@@ -2747,11 +2737,10 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
             openedArchetype={agentSettings()?.id ?? null}
             onOpenEngagement={(id, name) => setEngagement({ id, name })}
             onOpenModelAccess={(id, name) => setModelAccess({ id, name })}
-            onOpenProjectHome={(id, name) => {
+            onOpenProjectSettings={(id, name) => {
                 props.gaugeApps?.close();
                 setOpenedPanelAgent(null);
                 closePanelSettings();
-                setRoutedProject(id);
                 api.setCurrentProject(id);
                 setProjectSettings({ id, name });
                 setProjectSettingsPage("overview");
@@ -2762,7 +2751,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                 closeProjectSettings();
                 closePanelSettings();
                 setOpenedPanelAgent(null);
-                setRoutedProject(id);
                 api.setCurrentProject(id);
                 setTutorialsProject(id);
                 workbenchShell.openPane("content", { chatSelected: false, fileSelected: true });
@@ -3675,25 +3663,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                     refreshKey={navRefresh()} completions={trackerCompletions()}
                     onClose={() => setProjectTasks(null)}
                 />}
-            </Show>
-
-            <Show when={projectHome()}>
-                {(e) => (
-                    <ProjectHomePanel
-                        api={api}
-                        project={e().id}
-                        projectName={e().name}
-                        onOpenChat={(chat) => {
-                            setRoutedProject(null);
-                            setProjectHome(null);
-                            openChat(chat as EngagementId);
-                        }}
-                        onClose={() => {
-                            setRoutedProject(null);
-                            setProjectHome(null);
-                        }}
-                    />
-                )}
             </Show>
 
             <Show when={forkTreeFor()}>
@@ -4684,7 +4653,6 @@ function WorkbenchApp(props: WorkbenchAppProps = {}) {
                             onOpenInbox={(inbox) => void openInbox(inbox)}
                             onOpenBackgroundWork={({ project, projectName }) => {
                                 const id = project as ProjectId;
-                                setRoutedProject(id);
                                 api.setCurrentProject(id);
                                 props.gaugeApps?.close();
                                 closePanelSettings();

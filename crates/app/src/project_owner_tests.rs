@@ -472,9 +472,9 @@ async fn hosted_home_routes_and_listings_recheck_current_project_standing() {
             send_with_admission(&app, "GET", &path, Some(&token), None, Some(&admission)).await
         }
     };
-    assert_eq!(read("/projects/own-project/home").await.0, StatusCode::OK);
+    assert_eq!(read("/projects/own-project/models").await.0, StatusCode::OK);
     assert_eq!(
-        read("/projects/other-project/home").await.0,
+        read("/projects/other-project/models").await.0,
         StatusCode::FORBIDDEN
     );
     let (status, workspace) = read("/workspace").await;
@@ -489,7 +489,10 @@ async fn hosted_home_routes_and_listings_recheck_current_project_standing() {
     };
     assert!(!listed(&workspace).contains("other-project"));
     grant(&wb, CLAIMANT, "other-project");
-    assert_eq!(read("/projects/other-project/home").await.0, StatusCode::OK);
+    assert_eq!(
+        read("/projects/other-project/models").await.0,
+        StatusCode::OK
+    );
     assert!(listed(&read("/workspace").await.1).contains("other-project"));
     append(
         &wb,
@@ -503,7 +506,7 @@ async fn hosted_home_routes_and_listings_recheck_current_project_standing() {
     );
     // The earlier Home admission token cannot preserve a revoked grant.
     assert_eq!(
-        read("/projects/other-project/home").await.0,
+        read("/projects/other-project/models").await.0,
         StatusCode::FORBIDDEN
     );
     assert!(!listed(&read("/workspace").await.1).contains("other-project"));
@@ -529,29 +532,29 @@ async fn each_account_creates_its_own_projects_and_reaches_only_those() {
     let theirs = created["id"].as_str().unwrap().to_owned();
     assert_eq!(owner(&wb, &theirs), ProjectOwner::Account(OTHER.into()));
 
-    let home = |id: &str| format!("/projects/{id}/home");
+    let models = |id: &str| format!("/projects/{id}/models");
     assert_eq!(
-        send(&app, "GET", &home(&theirs), Some(&other), None)
+        send(&app, "GET", &models(&theirs), Some(&other), None)
             .await
             .0,
         StatusCode::OK
     );
     assert_eq!(
-        send(&app, "GET", &home(&theirs), Some(&claimant), None)
+        send(&app, "GET", &models(&theirs), Some(&claimant), None)
             .await
             .0,
         StatusCode::FORBIDDEN,
         "the claimant does not reach another account's project"
     );
     assert_eq!(
-        send(&app, "GET", &home(DEFAULT_PROJECT), Some(&other), None)
+        send(&app, "GET", &models(DEFAULT_PROJECT), Some(&other), None)
             .await
             .0,
         StatusCode::FORBIDDEN,
         "another account does not reach the claimant's Personal"
     );
     assert_eq!(
-        send(&app, "GET", &home(DEFAULT_PROJECT), Some(&claimant), None)
+        send(&app, "GET", &models(DEFAULT_PROJECT), Some(&claimant), None)
             .await
             .0,
         StatusCode::OK
@@ -1125,11 +1128,11 @@ async fn signed_out_the_window_is_the_local_account_on_a_claimed_computer() {
     claim(&wb, CLAIMANT);
     wb.lock_unpoisoned().settle_claimed_ownership().unwrap();
     let app = gated(&wb);
-    let home = |id: &str| format!("/projects/{id}/home");
+    let models = |id: &str| format!("/projects/{id}/models");
 
     // The claimant's projects, Personal included, are not the local account's.
     assert_eq!(
-        send(&app, "GET", &home(DEFAULT_PROJECT), None, None)
+        send(&app, "GET", &models(DEFAULT_PROJECT), None, None)
             .await
             .0,
         StatusCode::FORBIDDEN
@@ -1142,7 +1145,7 @@ async fn signed_out_the_window_is_the_local_account_on_a_claimed_computer() {
     assert_eq!(status, StatusCode::CREATED, "{chat}");
     let personal = personal_project_id(crate::LOCAL_AUTHORITY);
     assert_eq!(
-        send(&app, "GET", &home(&personal), None, None).await.0,
+        send(&app, "GET", &models(&personal), None, None).await.0,
         StatusCode::OK
     );
     let (_, workspace) = send(&app, "GET", "/workspace", None, None).await;
@@ -2560,13 +2563,13 @@ async fn the_desktop_window_reaches_a_signed_in_accounts_project_across_origins(
     assert_eq!(allowed_origin(&preflight), vec![ORIGIN.to_owned()]);
 
     // The request it was asking for reaches the route, readable by the window.
-    let read = call("GET", "/projects/own-project/home", Some(&claimant)).await;
+    let read = call("GET", "/projects/own-project/models", Some(&claimant)).await;
     assert_eq!(read.status(), StatusCode::OK);
     assert_eq!(allowed_origin(&read), vec![ORIGIN.to_owned()]);
 
     // A refusal is still a refusal, and the window can read it as one rather
     // than as a network error.
-    let refused = call("GET", "/projects/own-project/home", Some(&other)).await;
+    let refused = call("GET", "/projects/own-project/models", Some(&other)).await;
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);
     assert_eq!(allowed_origin(&refused), vec![ORIGIN.to_owned()]);
     let body = refused.into_body().collect().await.unwrap().to_bytes();

@@ -1659,7 +1659,7 @@ impl Library {
 
     /// All live chats across a **project's** placements (`UX-2`): the union of `chats_in` over
     /// the project's using-instances, **most-recent-first** (`created_position` desc; tie-break
-    /// by id). The work chats whose lifecycle scopes the project-home rollup folds.
+    /// by id). Used by the project work and whip-cost projections.
     pub fn project_chats(&self, project_id: &str) -> Vec<&ChatRecord> {
         let mut v: Vec<&ChatRecord> = self
             .using_instances_of(project_id)

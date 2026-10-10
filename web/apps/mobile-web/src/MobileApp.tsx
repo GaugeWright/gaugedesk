@@ -2003,7 +2003,7 @@ function MobileSession(props: {
                     onOpenArchetypeSettings={() => undefined}
                     onOpenEngagement={() => undefined}
                     onOpenModelAccess={() => undefined}
-                    onOpenProjectHome={openProjectSettings}
+                    onOpenProjectSettings={openProjectSettings}
                     onOpenForkTree={() => undefined}
                     onChatRemoved={(id) => {
                         if (engagement() === id) {

@@ -475,7 +475,7 @@ fn a_member_reaches_its_projects_work_and_nothing_host_wide() {
     for (method, path) in [
         (Method::GET, "/workspace"),
         (Method::GET, "/workspace/events"),
-        (Method::GET, "/projects/proj-1/home"),
+        (Method::GET, "/projects/proj-1/models"),
         // What its composer offers: the project's own credentials (WS-1026).
         (Method::GET, "/projects/proj-1/models"),
         (Method::POST, "/projects/proj-1/settings/sessions"),

@@ -78,7 +78,7 @@ function navigator(targetStatus: "available" | "unavailable") {
         onOpenArchetypeSettings: () => undefined,
         onOpenEngagement: () => undefined,
         onOpenModelAccess: () => undefined,
-        onOpenProjectHome: () => undefined,
+        onOpenProjectSettings: () => undefined,
         onOpenForkTree: () => undefined,
         onChatRemoved: () => undefined,
         onStatus: status,

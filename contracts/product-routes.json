@@ -5252,42 +5252,6 @@
       }
     },
     {
-      "id": "home.project.rollup",
-      "jurisdiction": "private-home",
-      "transport": "http-json",
-      "method": "GET",
-      "path": "/projects/:id/home",
-      "producer": "gaugedesk-app hosted Home composition",
-      "consumer": "WorkbenchControlPlane via @gaugewright/control-plane-client",
-      "authentication": "account-session-and-home-admission",
-      "scope": "person-home-project",
-      "capability": "read-project-home-rollup",
-      "requestSchema": "http/path-project-id",
-      "responseSchema": "gw://schemas/project/home-rollup/v1",
-      "sideEffect": "none",
-      "risk": "important",
-      "compatibility": {
-        "contractVersion": 1,
-        "minimumConsumer": 1,
-        "maximumConsumer": null
-      },
-      "evidence": {
-        "contract": [
-          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#project-production-bundle-lifecycle"
-        ],
-        "authority": [
-          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#project-authority-matrix"
-        ],
-        "journey": [
-          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#project-production-bundle-lifecycle"
-        ],
-        "deployed": [],
-        "property": [
-          "gaugewright-cloud:web/e2e/home-authenticated-wiring.mjs#project-authority-matrix"
-        ]
-      }
-    },
-    {
       "id": "home.project.whips",
       "jurisdiction": "private-home",
       "transport": "http-json",

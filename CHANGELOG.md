@@ -19,6 +19,9 @@ Releases up to and including 0.4.30 are recorded on the
 
 ## [Unreleased]
 
+- Retire the unreachable Project Home summary panel and its unused read route;
+  project rows continue to open Project Settings.
+
 ## [0.9.2] — 2026-10-09
 
 - Remove the old Tutorials work target from Personal when no run or chat uses it.

@@ -217,7 +217,7 @@ export function FacetBrowser(props: {
     /** Open the per-project Engagement pane (hand off / share a project, FED-7). */
     onOpenEngagement: (id: ProjectId, name: string) => void;
     onOpenModelAccess: (id: ProjectId, name: string) => void;
-    onOpenProjectHome: (id: ProjectId, name: string) => void;
+    onOpenProjectSettings: (id: ProjectId, name: string) => void;
     onOpenProjectTasks?: (id: ProjectId, name: string) => void;
     onOpenTutorials?: (id: ProjectId) => void;
     /** Hand the exact tested placement to the managed website-deployment flow. */
@@ -1268,7 +1268,7 @@ export function FacetBrowser(props: {
             if (!props.deltaSync) await refetch();
             props.onStatus(`forked into "${name}"`);
             // Open what was made: the fork's settings say where it came from.
-            props.onOpenProjectHome(forked.id, name);
+            props.onOpenProjectSettings(forked.id, name);
             if (forked.skippedAgents.length) {
                 (props.onFailure ?? props.onStatus)(
                     `"${name}" was made, but not every Agent came across — ${forked.skippedAgents.map((agent) => `${agent.name}: ${agent.reason}`).join("; ")}`,
@@ -1308,7 +1308,7 @@ export function FacetBrowser(props: {
                 { label: "attach Git repository…", hint: "Use its native Git history and explicit apply lifecycle", run: () => props.onAttachTarget?.(p.id, p.name, "external-vcs" as const) },
                 { label: "attach folder…", hint: "Fingerprint the folder and compare before every write", run: () => props.onAttachTarget?.(p.id, p.name, "external-folder" as const) },
             ] : []),
-            { label: "project settings…", hint: "Manage work, Agents, model access, and—outside Personal—sharing", run: () => props.onOpenProjectHome(p.id, p.name) },
+            { label: "project settings…", hint: "Manage work, Agents, model access, and—outside Personal—sharing", run: () => props.onOpenProjectSettings(p.id, p.name) },
             // Tasks is new work, not one of the doors project settings absorbed,
             // so it stays its own entry. Model access and sharing are deliberately
             // absent: they moved inside project settings, and a second door to a
@@ -2202,14 +2202,14 @@ export function FacetBrowser(props: {
                                                 if (e.target !== e.currentTarget) return;
                                                 if (e.key === "Enter" || e.key === " ") {
                                                     e.preventDefault();
-                                                    p.product?.kind === "tutorials" ? props.onOpenTutorials?.(p.id) : props.onOpenProjectHome(p.id, p.name);
+                                                    p.product?.kind === "tutorials" ? props.onOpenTutorials?.(p.id) : props.onOpenProjectSettings(p.id, p.name);
                                                 } else if (e.key === "ArrowRight" && isCollapsed(p.id)) {
                                                     e.preventDefault(); toggleCollapse(p.id);
                                                 } else if (e.key === "ArrowLeft" && !isCollapsed(p.id)) {
                                                     e.preventDefault(); toggleCollapse(p.id);
                                                 }
                                             }}
-                                            onClick={() => { p.product?.kind === "tutorials" ? props.onOpenTutorials?.(p.id) : props.onOpenProjectHome(p.id, p.name); }}
+                                            onClick={() => { p.product?.kind === "tutorials" ? props.onOpenTutorials?.(p.id) : props.onOpenProjectSettings(p.id, p.name); }}
                                             onContextMenu={(e) => openMenu(e, projectMenuItems(p))}
                                         >
                                             {projectCaret(p.id, p.name)}

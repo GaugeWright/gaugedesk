@@ -930,7 +930,7 @@ export function GaugeAppsComposition(): JSX.Element {
             onOpenArchetypeSettings={(_id, name) => openLibraryAgent(project().id, name)}
             onOpenEngagement={(id) => openProjectSettings(id, "Project Permissions")}
             onOpenModelAccess={(id) => openProjectSettings(id, "Project Models")}
-            onOpenProjectHome={(id) => openProjectSettings(id, "Project Work")}
+            onOpenProjectSettings={(id) => openProjectSettings(id, "Project Work")}
             onOpenInbox={(id) => openProjectSettings(id, "Project Work")}
             onAttachTarget={(id) => openProjectSettings(id, "Project Work")}
             onOpenForkTree={openNavChat}
